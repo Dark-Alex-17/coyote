@@ -1,7 +1,6 @@
 /target
 /tmp
 /.env
-*.log# Hestia CLI
 !cli/**
 /.idea/
 /loki.iml
