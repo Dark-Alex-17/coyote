@@ -1,0 +1,69 @@
+# Agent-specific configuration
+# Location `<loki-config-dir>/agents/<agent-name>/config.yaml`
+#
+# Available Environment Variables:
+#   - <agent-name>_MODEL
+#   - <agent-name>_TEMPERATURE
+#   - <agent-name>_TOP_P
+#   - <agent-name>_AGENT_PRELUDE
+#   - <agent-name>_VARIABLES (as JSON array of key-value pairs; e.g. '[{"name": "username", "value": "alex"}]')
+
+model: openai:gpt-4o             # Specify the LLM to use
+temperature: null                # Set default temperature parameter, range (0, 1)
+top_p: null                      # Set default top-p parameter, with a range of (0, 1) or (0, 2) depending on the model
+agent_prelude: null              # Set a session to use when starting the agent. (e.g. temp, default); defaults to globally set agent_prelude
+name: <agent-name>               # Name of the agent, used in the UI and logs
+description: <description>       # Description of the agent, used in the UI
+version: 1                       # Version of the agent
+mcp_servers:                     # Optional list of MCP servers to use for the agent
+  - github                       # Corresponds to the name of an MCP server in the `<loki-config-dir>/functions/mcp.json` file
+global_tools:                    # Optional list of additional global tools to enable for the agent; i.e. not tools specific to the agent
+  - web_search
+  - fs
+  - python
+dynamic_instructions: false      # Whether to use dynamic instructions for the agent; if false, static instructions are used
+instructions: |                  # Static instructions for the agent; ignored if dynamic instructions are used
+  You are a AI agent designed to demonstrate agent capabilities.
+
+  <tools>
+  {{__tools__}}
+  </tools>
+
+  <system>
+  os: {{__os__}}
+  os_family: {{__os_family__}}
+  arch: {{__arch__}}
+  shell: {{__shell__}}
+  locale: {{__locale__}}
+  now: {{__now__}}
+  cwd: {{__cwd__}}
+  </system>
+
+  <user>
+  username: {{username}}
+  </user>
+variables:                      # Optional variables for the agent
+                                # The variables defined above like {{__variable_name__}} are automatically available
+  - name: username
+    description: Your user name
+    default: null               # A default value for this variable; if null, the variable must be provided when starting the agent
+conversation_starters:          # Optional conversation starters for the agent
+  - What is the meaning of life?
+  - Tell me a joke.
+  - What is the capital of France?
+  - How do I make a cake?
+  - What is the best way to learn programming?
+  - How do I improve my writing skills?
+  - What are some good books to read?
+  - How do I stay motivated?
+  - What is the best way to exercise?
+  - How do I manage my time effectively?
+documents:                     # Optional documents to load for the agent
+  - git:/some/repo             # Explicitly tell Loki to use the 'git' document loader using an absolute path
+  - pdf:some-pdf-file.pdf      # Explicitly tell Loki to use the 'pdf' document loader using a relative path
+  - https://some-website.com/some-page
+  - some-file.pdf              # File with relative path to the <loki-config-dir>/agents/<agent-name> directory; i.e. file in the same directory as this config file
+  - ~/some-file.txt            # File in the user's home directory
+  - /absolute/path/to/some-file.md  # File with absolute path
+  - /absolute/path/**/NAME.txt    # Find all NAME.txt files in the specified directory and all its subdirectories
+  - /absolute/path/to/*/README.md # Find all README.md files in all immediate subdirectories of the specified directory (depth=1)
