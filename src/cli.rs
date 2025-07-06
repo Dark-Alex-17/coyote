@@ -1,0 +1,219 @@
+use crate::client::{list_models, ModelType};
+use crate::config::{list_agents, Config};
+use anyhow::{Context, Result};
+use clap::ValueHint;
+use clap::{crate_authors, crate_description, crate_name, crate_version, Parser};
+use clap_complete::ArgValueCompleter;
+use clap_complete::CompletionCandidate;
+use is_terminal::IsTerminal;
+use std::ffi::OsStr;
+use std::io::{stdin, Read};
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+#[command(
+	name = crate_name!(),
+	author = crate_authors!(),
+	version = crate_version!(),
+	about = crate_description!(),
+	help_template = "\
+{before-help}{name} {version}
+{author-with-newline}
+{about-with-newline}
+{usage-heading} {usage}
+
+{all-args}{after-help}
+"
+)]
+pub struct Cli {
+    /// Select a LLM model
+    #[arg(short, long, add = ArgValueCompleter::new(model_completer))]
+    pub model: Option<String>,
+    /// Use the system prompt
+    #[arg(long)]
+    pub prompt: Option<String>,
+    /// Select a role
+    #[arg(short, long, add = ArgValueCompleter::new(role_completer))]
+    pub role: Option<String>,
+    /// Start or join a session
+    #[arg(short = 's', long, add = ArgValueCompleter::new(session_completer))]
+    pub session: Option<Option<String>>,
+    /// Ensure the session is empty
+    #[arg(long)]
+    pub empty_session: bool,
+    /// Ensure the new conversation is saved to the session
+    #[arg(long)]
+    pub save_session: bool,
+    /// Start an agent
+    #[arg(short = 'a', long, add = ArgValueCompleter::new(agent_completer))]
+    pub agent: Option<String>,
+    /// Set agent variables
+    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2)]
+    pub agent_variable: Vec<String>,
+    /// Start a RAG
+    #[arg(long, add = ArgValueCompleter::new(rag_completer))]
+    pub rag: Option<String>,
+    /// Rebuild the RAG to sync document changes
+    #[arg(long)]
+    pub rebuild_rag: bool,
+    /// Execute a macro
+    #[arg(long = "macro", value_name = "MACRO", add = ArgValueCompleter::new(macro_completer))]
+    pub macro_name: Option<String>,
+    /// Serve the LLM API and WebAPP
+    #[arg(long, value_name = "PORT|IP|IP:PORT")]
+    pub serve: Option<Option<String>>,
+    /// Execute commands in natural language
+    #[arg(short = 'e', long)]
+    pub execute: bool,
+    /// Output code only
+    #[arg(short = 'c', long)]
+    pub code: bool,
+    /// Include files, directories, or URLs
+    #[arg(short = 'f', long, value_name = "FILE|URL", value_hint = ValueHint::AnyPath)]
+    pub file: Vec<String>,
+    /// Turn off stream mode
+    #[arg(short = 'S', long)]
+    pub no_stream: bool,
+    /// Display the message without sending it
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Display information
+    #[arg(long)]
+    pub info: bool,
+    /// Build all configured Bash tool scripts
+    #[arg(long)]
+    pub build_tools: bool,
+    /// Sync models updates
+    #[arg(long)]
+    pub sync_models: bool,
+    /// List all available chat models
+    #[arg(long)]
+    pub list_models: bool,
+    /// List all roles
+    #[arg(long)]
+    pub list_roles: bool,
+    /// List all sessions
+    #[arg(long)]
+    pub list_sessions: bool,
+    /// List all agents
+    #[arg(long)]
+    pub list_agents: bool,
+    /// List all RAGs
+    #[arg(long)]
+    pub list_rags: bool,
+    /// List all macros
+    #[arg(long)]
+    pub list_macros: bool,
+    /// Input text
+    #[arg(trailing_var_arg = true)]
+    text: Vec<String>,
+    /// Tail logs
+    #[arg(long)]
+    pub tail_logs: bool,
+    /// Disable colored log output
+    #[arg(long, requires = "tail_logs")]
+    pub disable_log_colors: bool,
+}
+
+impl Cli {
+    pub fn text(&self) -> Result<Option<String>> {
+        let mut stdin_text = String::new();
+        if !stdin().is_terminal() {
+            let _ = stdin()
+                .read_to_string(&mut stdin_text)
+                .context("Invalid stdin pipe")?;
+        };
+        match self.text.is_empty() {
+            true => {
+                if stdin_text.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(stdin_text))
+                }
+            }
+            false => {
+                if self.macro_name.is_some() {
+                    let text = self
+                        .text
+                        .iter()
+                        .map(|v| shell_words::quote(v))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if stdin_text.is_empty() {
+                        Ok(Some(text))
+                    } else {
+                        Ok(Some(format!("{text} -- {stdin_text}")))
+                    }
+                } else {
+                    let text = self.text.join(" ");
+                    if stdin_text.is_empty() {
+                        Ok(Some(text))
+                    } else {
+                        Ok(Some(format!("{text}\n{stdin_text}")))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn model_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    let cur = current.to_string_lossy();
+    match Config::init_bare() {
+        Ok(config) => list_models(&config, ModelType::Chat)
+            .into_iter()
+            .filter(|&m| m.id().starts_with(&*cur))
+            .map(|m| CompletionCandidate::new(m.id()))
+            .collect(),
+        Err(_) => vec![],
+    }
+}
+
+fn role_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    let cur = current.to_string_lossy();
+    Config::list_roles(true)
+        .into_iter()
+        .filter(|r| r.starts_with(&*cur))
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+fn agent_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    let cur = current.to_string_lossy();
+    list_agents()
+        .into_iter()
+        .filter(|a| a.starts_with(&*cur))
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+fn rag_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    let cur = current.to_string_lossy();
+    Config::list_rags()
+        .into_iter()
+        .filter(|r| r.starts_with(&*cur))
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+fn macro_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    let cur = current.to_string_lossy();
+    Config::list_macros()
+        .into_iter()
+        .filter(|m| m.starts_with(&*cur))
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+fn session_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    let cur = current.to_string_lossy();
+    match Config::init_bare() {
+        Ok(config) => config
+            .list_sessions()
+            .into_iter()
+            .filter(|s| s.starts_with(&*cur))
+            .map(CompletionCandidate::new)
+            .collect(),
+        Err(_) => vec![],
+    }
+}
