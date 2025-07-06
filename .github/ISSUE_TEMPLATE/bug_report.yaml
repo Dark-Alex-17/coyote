@@ -1,0 +1,69 @@
+name: Bug Report
+description: Create a report to help us improve
+labels: bug
+body:
+  - type: markdown
+    attributes:
+      value: Thank you for filing a bug report!
+  - type: textarea
+    id: problem
+    attributes:
+      label: Summary
+      description: >
+        Please provide a short summary of the bug, along with any information
+        you feel relevant to replicate the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction-steps
+    attributes:
+      label: Reproduction Steps
+      value: |
+        I tried this:
+
+        1. `loki`
+
+        I expected this to happen:
+
+        Instead, this happened:
+  - type: textarea
+    id: loki-log
+    attributes:
+      label: Loki log
+      description: Include the Loki log file to help diagnose the issue. (`loki --info` to see the log_path)
+      value: |
+        | OS      | Log file location                                     |
+        | ------- | ----------------------------------------------------- |
+        | Linux   | `~/.cache/loki/loki.log`                      |
+        | Mac     | `~/Library/Logs/loki/loki.log`                |
+        | Windows | `C:\Users\<User>\AppData\Local\loki\loki.log` |
+
+        ```
+        please provide a copy of your loki log file here if possible; you may need to redact some of the lines
+        ```
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: Linux / macOS / Windows
+    validations:
+      required: true
+  - type: input
+    id: terminal-emulator
+    attributes:
+      label: Terminal Emulator
+      placeholder: wezterm 20220101-133340-7edc5b5a
+    validations:
+      required: true
+  - type: input
+    id: loki-version
+    attributes:
+      label: Loki Version
+      description: >
+        Loki version (`loki --version` if using a release, `git describe` if building
+        from main).
+        **Make sure that you are using the [latest loki release](https://github.com/Dark-Alex-17/loki/releases) or a newer main build**
+      placeholder: "loki 0.1.0"
+    validations:
+      required: true
