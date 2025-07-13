@@ -20,10 +20,11 @@ use std::{
     path::{Path, PathBuf},
 };
 use strum_macros::AsRefStr;
+use crate::config::ensure_parent_exists;
 
 #[derive(Embed)]
 #[folder = "assets/functions/"]
-struct FunctionAsset;
+struct FunctionAssets;
 
 #[cfg(windows)]
 const PATH_SEP: &str = ";";
@@ -122,7 +123,43 @@ pub struct Functions {
 }
 
 impl Functions {
+		fn install_global_tools() -> Result<()> {
+			ensure_parent_exists(&Config::global_tools_file())?;
+
+			info!("Installing global built-in functions in {}", Config::functions_dir().display());
+
+			for file in FunctionAssets::iter() {
+				debug!("Processing function file: {}", file.as_ref());
+				if file.as_ref().starts_with("scripts/") {
+					debug!("Skipping script file: {}", file.as_ref());
+					continue;
+				}
+
+				let embedded_file = FunctionAssets::get(&file).ok_or_else(|| {
+					anyhow!(
+							"Failed to load embedded function file: {}",
+							file.as_ref()
+						)
+				})?;
+				let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
+				let file_path = Config::functions_dir().join(file.as_ref());
+
+				if file_path.exists() {
+					debug!("Function file already exists, skipping: {}", file_path.display());
+					continue;
+				}
+
+				ensure_parent_exists(&file_path)?;
+				info!("Creating function file: {}", file_path.display());
+				let mut function_file = File::create(&file_path)?;
+				function_file.write_all(content.as_bytes())?;
+			}
+
+			Ok(())
+		}
+
     pub fn init() -> Result<Self> {
+				Self::install_global_tools()?;
         info!(
             "Initializing global functions from {}",
             Config::global_tools_file().display()
@@ -144,6 +181,7 @@ impl Functions {
     }
 
     pub fn init_agent(name: &str, global_tools: &[String]) -> Result<Self> {
+				Self::install_global_tools()?;
         let global_tools_declarations = if !global_tools.is_empty() {
             let enabled_tools = global_tools.join("\n");
             info!("Loading global tools for agent: {name}: {enabled_tools}");
@@ -448,7 +486,7 @@ impl Functions {
             binary_name,
             binary_script_file.display(),
         );
-        let embedded_file = FunctionAsset::get(&format!(
+        let embedded_file = FunctionAssets::get(&format!(
             "scripts/run-{}.{}",
             binary_type.as_ref().to_lowercase(),
             language.to_extension()
@@ -542,7 +580,7 @@ impl Functions {
             binary_name,
             binary_file.display()
         );
-        let embedded_file = FunctionAsset::get(&format!(
+        let embedded_file = FunctionAssets::get(&format!(
             "scripts/run-{}.{}",
             binary_type.as_ref().to_lowercase(),
             language.to_extension()

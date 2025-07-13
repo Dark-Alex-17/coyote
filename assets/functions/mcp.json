@@ -1,0 +1,35 @@
+{
+  "mcpServers": {
+    "github": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-e",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "ghcr.io/github/github-mcp-server"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "{{GITHUB_PERSONAL_ACCESS_TOKEN}}"
+      }
+    },
+    "gitmcp": {
+      "command": "npx",
+      "args": ["mcp-remote", "https://gitmcp.io/docs"]
+    },
+    "docker": {
+      "command": "uvx",
+      "args": ["docker-mcp"]
+    },
+    "slack": {
+      "command": "npx",
+      "args": ["-y", "slack-mcp-server@latest", "--transport", "stdio"],
+      "env": {
+        "SLACK_MCP_XOXC_TOKEN": "{{SLACK_MCP_XOXC_TOKEN}}",
+        "SLACK_MCP_XOXD_TOKEN": "{{SLACK_MCP_XOXD_TOKEN}}",
+        "SLACK_MCP_ADD_MESSAGE_TOOL": true
+      }
+    }
+  }
+}
