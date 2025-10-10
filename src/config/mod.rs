@@ -300,7 +300,7 @@ impl Config {
             Self::load_from_file(&config_path)?
         };
 
-				Agent::install_builtin_agents()?;
+        Agent::install_builtin_agents()?;
 
         config.working_mode = working_mode;
         config.info_flag = info_flag;

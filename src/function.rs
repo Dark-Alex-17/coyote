@@ -3,6 +3,7 @@ use crate::{
     utils::*,
 };
 
+use crate::config::ensure_parent_exists;
 use crate::mcp::{MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX};
 use crate::parsers::{bash, python};
 use anyhow::{anyhow, bail, Context, Result};
@@ -20,7 +21,6 @@ use std::{
     path::{Path, PathBuf},
 };
 use strum_macros::AsRefStr;
-use crate::config::ensure_parent_exists;
 
 #[derive(Embed)]
 #[folder = "assets/functions/"]
@@ -119,41 +119,44 @@ pub struct Functions {
 }
 
 impl Functions {
-		fn install_global_tools() -> Result<()> {
-			info!("Installing global built-in functions in {}", Config::functions_dir().display());
+    fn install_global_tools() -> Result<()> {
+        info!(
+            "Installing global built-in functions in {}",
+            Config::functions_dir().display()
+        );
 
-			for file in FunctionAssets::iter() {
-				debug!("Processing function file: {}", file.as_ref());
-				if file.as_ref().starts_with("scripts/") {
-					debug!("Skipping script file: {}", file.as_ref());
-					continue;
-				}
+        for file in FunctionAssets::iter() {
+            debug!("Processing function file: {}", file.as_ref());
+            if file.as_ref().starts_with("scripts/") {
+                debug!("Skipping script file: {}", file.as_ref());
+                continue;
+            }
 
-				let embedded_file = FunctionAssets::get(&file).ok_or_else(|| {
-					anyhow!(
-							"Failed to load embedded function file: {}",
-							file.as_ref()
-						)
-				})?;
-				let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
-				let file_path = Config::functions_dir().join(file.as_ref());
+            let embedded_file = FunctionAssets::get(&file).ok_or_else(|| {
+                anyhow!("Failed to load embedded function file: {}", file.as_ref())
+            })?;
+            let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
+            let file_path = Config::functions_dir().join(file.as_ref());
 
-				if file_path.exists() {
-					debug!("Function file already exists, skipping: {}", file_path.display());
-					continue;
-				}
+            if file_path.exists() {
+                debug!(
+                    "Function file already exists, skipping: {}",
+                    file_path.display()
+                );
+                continue;
+            }
 
-				ensure_parent_exists(&file_path)?;
-				info!("Creating function file: {}", file_path.display());
-				let mut function_file = File::create(&file_path)?;
-				function_file.write_all(content.as_bytes())?;
-			}
+            ensure_parent_exists(&file_path)?;
+            info!("Creating function file: {}", file_path.display());
+            let mut function_file = File::create(&file_path)?;
+            function_file.write_all(content.as_bytes())?;
+        }
 
-			Ok(())
-		}
+        Ok(())
+    }
 
     pub fn init() -> Result<Self> {
-				Self::install_global_tools()?;
+        Self::install_global_tools()?;
         info!(
             "Initializing global functions from {}",
             Config::global_tools_file().display()
@@ -175,7 +178,7 @@ impl Functions {
     }
 
     pub fn init_agent(name: &str, global_tools: &[String]) -> Result<Self> {
-				Self::install_global_tools()?;
+        Self::install_global_tools()?;
         let global_tools_declarations = if !global_tools.is_empty() {
             let enabled_tools = global_tools.join("\n");
             info!("Loading global tools for agent: {name}: {enabled_tools}");
@@ -526,13 +529,13 @@ impl Functions {
                     language.to_cmd()
                 )
             }
-					Language::Python => {
-						let executable_path = which::which("python")
-							.or_else(|_| which::which("python3"))
-							.map_err(|_| anyhow!("Python executable not found in PATH"))?;
-						let canonicalized_path = fs::canonicalize(&executable_path)?;
-						canonicalized_path.to_string_lossy().into_owned()
-					}
+            Language::Python => {
+                let executable_path = which::which("python")
+                    .or_else(|_| which::which("python3"))
+                    .map_err(|_| anyhow!("Python executable not found in PATH"))?;
+                let canonicalized_path = fs::canonicalize(&executable_path)?;
+                canonicalized_path.to_string_lossy().into_owned()
+            }
             _ => bail!("Unsupported language: {}", language.as_ref()),
         };
         let bin_dir = binary_file
