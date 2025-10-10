@@ -41,7 +41,6 @@ enum BinaryType {
 enum Language {
     Bash,
     Python,
-    Javascript,
     Unsupported,
 }
 
@@ -50,7 +49,6 @@ impl From<&String> for Language {
         match s.to_lowercase().as_str() {
             "sh" => Language::Bash,
             "py" => Language::Python,
-            "js" => Language::Javascript,
             _ => Language::Unsupported,
         }
     }
@@ -62,7 +60,6 @@ impl Language {
         match self {
             Language::Bash => "bash",
             Language::Python => "python",
-            Language::Javascript => "node",
             Language::Unsupported => "sh",
         }
     }
@@ -71,7 +68,6 @@ impl Language {
         match self {
             Language::Bash => "sh",
             Language::Python => "py",
-            Language::Javascript => "js",
             _ => "sh",
         }
     }
@@ -124,8 +120,6 @@ pub struct Functions {
 
 impl Functions {
 		fn install_global_tools() -> Result<()> {
-			ensure_parent_exists(&Config::global_tools_file())?;
-
 			info!("Installing global built-in functions in {}", Config::functions_dir().display());
 
 			for file in FunctionAssets::iter() {
@@ -367,7 +361,6 @@ impl Functions {
                     Language::Unsupported => {
                         bail!("Unsupported tool file extension: {}", language.as_ref())
                     }
-                    _ => bail!("Unsupported tool language: {}", language.as_ref()),
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -533,8 +526,13 @@ impl Functions {
                     language.to_cmd()
                 )
             }
-            Language::Javascript => runtime::which(language.to_cmd())
-                .ok_or_else(|| anyhow!("Unable to find {} in PATH", language.to_cmd()))?,
+					Language::Python => {
+						let executable_path = which::which("python")
+							.or_else(|_| which::which("python3"))
+							.map_err(|_| anyhow!("Python executable not found in PATH"))?;
+						let canonicalized_path = fs::canonicalize(&executable_path)?;
+						canonicalized_path.to_string_lossy().into_owned()
+					}
             _ => bail!("Unsupported language: {}", language.as_ref()),
         };
         let bin_dir = binary_file
