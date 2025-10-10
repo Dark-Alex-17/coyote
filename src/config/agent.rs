@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use inquire::{validator::Validation, Text};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
-use std::{fs::read_to_string, path::Path};
+use std::{fs, fs::read_to_string, path::Path};
+use std::ffi::OsStr;
 
 const DEFAULT_AGENT_NAME: &str = "rag";
 
@@ -46,6 +47,11 @@ impl Agent {
                 .ok_or_else(|| anyhow!("Failed to load embedded agent file: {}", file.as_ref()))?;
             let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
             let file_path = Config::agents_data_dir().join(file.as_ref());
+					let file_extension = file_path
+						.extension()
+						.and_then(OsStr::to_str)
+						.map(|s| s.to_lowercase());
+					let is_script = matches!(file_extension.as_deref(), Some("sh") | Some("py"));
 
             if file_path.exists() {
                 debug!(
@@ -59,6 +65,12 @@ impl Agent {
             info!("Creating agent file: {}", file_path.display());
             let mut agent_file = File::create(&file_path)?;
             agent_file.write_all(content.as_bytes())?;
+
+					#[cfg(unix)]
+					if is_script {
+						use std::os::unix::fs::PermissionsExt;
+						fs::set_permissions(&file_path, fs::Permissions::from_mode(0o755))?;
+					}
         }
 
         Ok(())

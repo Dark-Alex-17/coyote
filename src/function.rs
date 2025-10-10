@@ -137,6 +137,11 @@ impl Functions {
             })?;
             let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
             let file_path = Config::functions_dir().join(file.as_ref());
+						let file_extension = file_path
+							.extension()
+							.and_then(OsStr::to_str)
+							.map(|s| s.to_lowercase());
+						let is_script = matches!(file_extension.as_deref(), Some("sh") | Some("py"));
 
             if file_path.exists() {
                 debug!(
@@ -150,6 +155,12 @@ impl Functions {
             info!("Creating function file: {}", file_path.display());
             let mut function_file = File::create(&file_path)?;
             function_file.write_all(content.as_bytes())?;
+
+					#[cfg(unix)]
+					if is_script {
+						use std::os::unix::fs::PermissionsExt;
+						fs::set_permissions(&file_path, fs::Permissions::from_mode(0o755))?;
+					}
         }
 
         Ok(())
