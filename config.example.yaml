@@ -21,7 +21,7 @@ use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_
 # ---- prelude ----
 repl_prelude: null               # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)
 cmd_prelude: null                # Set a default role or session for CMD mode (e.g. role:<name>, session:<name>, <session>:<role>)
-agent_prelude: null              # Set a session to use when starting an agent (e.g. temp, default)
+agent_session: null              # Set a session to use when starting an agent (e.g. temp, default)
 
 # ---- session ----
 # Controls the persistence of the session. if true, auto save; if false, not save; if null, asking the user

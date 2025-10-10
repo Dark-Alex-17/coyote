@@ -3,17 +3,17 @@ mod input;
 mod role;
 mod session;
 
-pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables};
+pub use self::agent::{Agent, AgentVariables, complete_agent_variables, list_agents};
 pub use self::input::Input;
 pub use self::role::{
-    Role, RoleLike, CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE,
+    CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
 use self::session::Session;
 use mem::take;
 
 use crate::client::{
-    create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
-    Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
+    ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
+    ProviderModels, create_client_config, list_client_types, list_models,
 };
 use crate::function::{FunctionDeclaration, Functions, ToolResult};
 use crate::rag::Rag;
@@ -22,11 +22,11 @@ use crate::repl::{run_repl_command, split_args_text};
 use crate::utils::*;
 
 use crate::mcp::{
-    McpRegistry, MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX,
+    MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX, McpRegistry,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
-use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
+use inquire::{Confirm, MultiSelect, Select, Text, list_option::ListOption, validator::Validation};
 use log::LevelFilter;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::{
     env,
     fs::{
-        create_dir_all, read_dir, read_to_string, remove_dir_all, remove_file, File, OpenOptions,
+        File, OpenOptions, create_dir_all, read_dir, read_to_string, remove_dir_all, remove_file,
     },
     io::Write,
     mem,
@@ -44,7 +44,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use syntect::highlighting::ThemeSet;
-use terminal_colorsaurus::{color_scheme, ColorScheme, QueryOptions};
+use terminal_colorsaurus::{ColorScheme, QueryOptions, color_scheme};
 use tokio::runtime::Handle;
 
 pub const TEMP_ROLE_NAME: &str = "temp";
@@ -131,7 +131,7 @@ pub struct Config {
 
     pub repl_prelude: Option<String>,
     pub cmd_prelude: Option<String>,
-    pub agent_prelude: Option<String>,
+    pub agent_session: Option<String>,
 
     pub save_session: Option<bool>,
     pub compress_threshold: usize,
@@ -213,7 +213,7 @@ impl Default for Config {
 
             repl_prelude: None,
             cmd_prelude: None,
-            agent_prelude: None,
+            agent_session: None,
 
             save_session: None,
             compress_threshold: 4000,
@@ -1629,7 +1629,7 @@ impl Config {
             if config.read().macro_flag {
                 None
             } else {
-                agent.agent_prelude().map(|v| v.to_string())
+                agent.agent_session().map(|v| v.to_string())
             }
         });
         config.write().rag = agent.rag();
@@ -2557,8 +2557,8 @@ impl Config {
         if let Some(v) = read_env_value::<String>(&get_env_name("cmd_prelude")) {
             self.cmd_prelude = v;
         }
-        if let Some(v) = read_env_value::<String>(&get_env_name("agent_prelude")) {
-            self.agent_prelude = v;
+        if let Some(v) = read_env_value::<String>(&get_env_name("agent_session")) {
+            self.agent_session = v;
         }
 
         if let Some(v) = read_env_bool(&get_env_name("save_session")) {

@@ -2,11 +2,11 @@ use super::*;
 
 use crate::{
     client::Model,
-    function::{run_llm_function, Functions},
+    function::{Functions, run_llm_function},
 };
 
 use anyhow::{Context, Result};
-use inquire::{validator::Validation, Text};
+use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::{fs::read_to_string, path::Path};
@@ -283,8 +283,8 @@ impl Agent {
         output
     }
 
-    pub fn agent_prelude(&self) -> Option<&str> {
-        self.config.agent_prelude.as_deref()
+    pub fn agent_session(&self) -> Option<&str> {
+        self.config.agent_session.as_deref()
     }
 
     pub fn variables(&self) -> &AgentVariables {
@@ -446,7 +446,7 @@ pub struct AgentConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_prelude: Option<String>,
+    pub agent_session: Option<String>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -481,8 +481,8 @@ impl AgentConfig {
         let name = &self.name;
         let with_prefix = |v: &str| normalize_env_name(&format!("{name}_{v}"));
 
-        if self.agent_prelude.is_none() {
-            self.agent_prelude = config.agent_prelude.clone();
+        if self.agent_session.is_none() {
+            self.agent_session = config.agent_session.clone();
         }
 
         if let Some(v) = read_env_value::<String>(&with_prefix("model")) {
@@ -494,8 +494,8 @@ impl AgentConfig {
         if let Some(v) = read_env_value::<f64>(&with_prefix("top_p")) {
             self.top_p = v;
         }
-        if let Some(v) = read_env_value::<String>(&with_prefix("agent_prelude")) {
-            self.agent_prelude = v;
+        if let Some(v) = read_env_value::<String>(&with_prefix("agent_session")) {
+            self.agent_session = v;
         }
         if let Ok(v) = env::var(with_prefix("variables")) {
             if let Ok(v) = serde_json::from_str(&v) {
