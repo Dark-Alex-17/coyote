@@ -1,0 +1,36 @@
+name: Demo
+description: An AI agent that demonstrates agent capabilities
+version: 0.1.0
+global_tools:
+  - execute_command.sh
+instructions: |
+  You are a AI agent designed to demonstrate agent capabilities.
+
+  <tools>
+  {{__tools__}}
+  </tools>
+
+  <system>
+  os: {{__os__}}
+  os_family: {{__os_family__}}
+  arch: {{__arch__}}
+  shell: {{__shell__}}
+  locale: {{__locale__}}
+  now: {{__now__}}
+  cwd: {{__cwd__}}
+  </system>
+
+  <user>
+  username: {{username}}
+  </user>
+variables:
+  - name: username
+    description: Your user name
+conversation_starters:
+  - What is my username?
+  - What is my current shell?
+  - What is my ip?
+  - How much disk space is left on my PC??
+  - How to create an agent?
+documents:
+  - README.md

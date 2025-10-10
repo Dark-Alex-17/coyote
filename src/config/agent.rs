@@ -8,12 +8,16 @@ use crate::{
 use anyhow::{Context, Result};
 use inquire::{validator::Validation, Text};
 use std::{fs::read_to_string, path::Path};
-
+use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_AGENT_NAME: &str = "rag";
 
 pub type AgentVariables = IndexMap<String, String>;
+
+#[derive(Embed)]
+#[folder = "assets/agents/"]
+struct AgentAssets;
 
 #[derive(Debug, Clone)]
 pub struct Agent {
@@ -29,6 +33,35 @@ pub struct Agent {
 }
 
 impl Agent {
+	pub fn install_builtin_agents() -> Result<()> {
+		info!("Installing built-in agents in {}", Config::agents_data_dir().display());
+
+		for file in AgentAssets::iter() {
+			debug!("Processing agent file: {}", file.as_ref());
+
+			let embedded_file = AgentAssets::get(&file).ok_or_else(|| {
+				anyhow!(
+							"Failed to load embedded agent file: {}",
+							file.as_ref()
+						)
+			})?;
+			let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
+			let file_path = Config::agents_data_dir().join(file.as_ref());
+
+			if file_path.exists() {
+				debug!("Agent file already exists, skipping: {}", file_path.display());
+				continue;
+			}
+
+			ensure_parent_exists(&file_path)?;
+			info!("Creating agent file: {}", file_path.display());
+			let mut agent_file = File::create(&file_path)?;
+			agent_file.write_all(content.as_bytes())?;
+		}
+
+		Ok(())
+	}
+
     pub async fn init(
         config: &GlobalConfig,
         name: &str,
@@ -530,22 +563,23 @@ pub struct AgentVariable {
 }
 
 pub fn list_agents() -> Vec<String> {
-    let agents_file = Config::config_dir().join("agents.txt");
-    let contents = match read_to_string(agents_file) {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-    contents
-        .split('\n')
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                None
-            } else {
-                Some(line.to_string())
-            }
-        })
-        .collect()
+	let agents_data_dir = Config::agents_data_dir();
+	if !agents_data_dir.exists() {
+		return vec![];
+	}
+
+	let mut agents = Vec::new();
+	if let Ok(entries) = read_dir(agents_data_dir) {
+		for entry in entries.flatten() {
+			if entry.path().is_dir() {
+				if let Some(name) = entry.file_name().to_str() {
+					agents.push(name.to_string());
+				}
+			}
+		}
+	}
+
+	agents
 }
 
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
