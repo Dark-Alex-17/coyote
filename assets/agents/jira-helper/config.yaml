@@ -1,6 +1,7 @@
 name: Jira Agent
 description: An AI agent that can assist with Jira tasks such as creating issues, searching for issues, and updating issues.
 version: 0.1.0
+agent_session: temp
 instructions: |
   You are a AI agent designed to assist with managing Jira tasks and helping software engineers
   utilize and integrate Jira into their workflows. You can create, search, update, assign, link, and comment on issues in Jira.
