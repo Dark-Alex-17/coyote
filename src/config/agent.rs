@@ -2,11 +2,11 @@ use super::*;
 
 use crate::{
     client::Model,
-    function::{Functions, run_llm_function},
+    function::{run_llm_function, Functions},
 };
 
 use anyhow::{Context, Result};
-use inquire::{Text, validator::Validation};
+use inquire::{validator::Validation, Text};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::{fs::read_to_string, path::Path};

@@ -3,17 +3,17 @@ mod input;
 mod role;
 mod session;
 
-pub use self::agent::{Agent, AgentVariables, complete_agent_variables, list_agents};
+pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables};
 pub use self::input::Input;
 pub use self::role::{
-    CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
+    Role, RoleLike, CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE,
 };
 use self::session::Session;
 use mem::take;
 
 use crate::client::{
-    ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
-    ProviderModels, create_client_config, list_client_types, list_models,
+    create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
+    Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
 };
 use crate::function::{FunctionDeclaration, Functions, ToolResult};
 use crate::rag::Rag;
@@ -22,11 +22,11 @@ use crate::repl::{run_repl_command, split_args_text};
 use crate::utils::*;
 
 use crate::mcp::{
-    MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX, McpRegistry,
+    McpRegistry, MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX,
 };
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use indexmap::IndexMap;
-use inquire::{Confirm, MultiSelect, Select, Text, list_option::ListOption, validator::Validation};
+use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
 use log::LevelFilter;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::{
     env,
     fs::{
-        File, OpenOptions, create_dir_all, read_dir, read_to_string, remove_dir_all, remove_file,
+        create_dir_all, read_dir, read_to_string, remove_dir_all, remove_file, File, OpenOptions,
     },
     io::Write,
     mem,
@@ -44,7 +44,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use syntect::highlighting::ThemeSet;
-use terminal_colorsaurus::{ColorScheme, QueryOptions, color_scheme};
+use terminal_colorsaurus::{color_scheme, ColorScheme, QueryOptions};
 use tokio::runtime::Handle;
 
 pub const TEMP_ROLE_NAME: &str = "temp";
