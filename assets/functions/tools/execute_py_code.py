@@ -4,9 +4,9 @@ from contextlib import redirect_stdout
 
 
 def run(code: str):
-    """Execute the python code.
+    """Execute the given Python code.
     Args:
-        code: Python code to execute, such as `print("hello world")`
+        code: The Python code to execute, such as `print("hello world")`
     """
     output = io.StringIO()
     with redirect_stdout(output):
