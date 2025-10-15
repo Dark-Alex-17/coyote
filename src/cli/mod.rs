@@ -1,15 +1,14 @@
-mod secrets;
+mod completer;
 
-use crate::cli::secrets::secrets_completer;
-use crate::client::{list_models, ModelType};
-use crate::config::{list_agents, Config};
+use crate::cli::completer::{
+    agent_completer, macro_completer, model_completer, rag_completer, role_completer,
+    secrets_completer, session_completer,
+};
 use anyhow::{Context, Result};
 use clap::ValueHint;
 use clap::{crate_authors, crate_description, crate_name, crate_version, Parser};
 use clap_complete::ArgValueCompleter;
-use clap_complete::CompletionCandidate;
 use is_terminal::IsTerminal;
-use std::ffi::OsStr;
 use std::io::{stdin, Read};
 
 #[derive(Parser, Debug)]
@@ -172,66 +171,5 @@ impl Cli {
                 }
             }
         }
-    }
-}
-
-fn model_completer(current: &OsStr) -> Vec<CompletionCandidate> {
-    let cur = current.to_string_lossy();
-    match Config::init_bare() {
-        Ok(config) => list_models(&config, ModelType::Chat)
-            .into_iter()
-            .filter(|&m| m.id().starts_with(&*cur))
-            .map(|m| CompletionCandidate::new(m.id()))
-            .collect(),
-        Err(_) => vec![],
-    }
-}
-
-fn role_completer(current: &OsStr) -> Vec<CompletionCandidate> {
-    let cur = current.to_string_lossy();
-    Config::list_roles(true)
-        .into_iter()
-        .filter(|r| r.starts_with(&*cur))
-        .map(CompletionCandidate::new)
-        .collect()
-}
-
-fn agent_completer(current: &OsStr) -> Vec<CompletionCandidate> {
-    let cur = current.to_string_lossy();
-    list_agents()
-        .into_iter()
-        .filter(|a| a.starts_with(&*cur))
-        .map(CompletionCandidate::new)
-        .collect()
-}
-
-fn rag_completer(current: &OsStr) -> Vec<CompletionCandidate> {
-    let cur = current.to_string_lossy();
-    Config::list_rags()
-        .into_iter()
-        .filter(|r| r.starts_with(&*cur))
-        .map(CompletionCandidate::new)
-        .collect()
-}
-
-fn macro_completer(current: &OsStr) -> Vec<CompletionCandidate> {
-    let cur = current.to_string_lossy();
-    Config::list_macros()
-        .into_iter()
-        .filter(|m| m.starts_with(&*cur))
-        .map(CompletionCandidate::new)
-        .collect()
-}
-
-fn session_completer(current: &OsStr) -> Vec<CompletionCandidate> {
-    let cur = current.to_string_lossy();
-    match Config::init_bare() {
-        Ok(config) => config
-            .list_sessions()
-            .into_iter()
-            .filter(|s| s.starts_with(&*cur))
-            .map(CompletionCandidate::new)
-            .collect(),
-        Err(_) => vec![],
     }
 }

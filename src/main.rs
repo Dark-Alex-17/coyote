@@ -10,6 +10,7 @@ mod serve;
 mod utils;
 mod mcp;
 mod parsers;
+mod vault;
 
 #[macro_use]
 extern crate log;
@@ -26,6 +27,7 @@ use crate::repl::Repl;
 use crate::utils::*;
 
 use crate::cli::Cli;
+use crate::vault::Vault;
 use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
@@ -67,7 +69,7 @@ async fn main() -> Result<()> {
         || cli.list_rags
         || cli.list_macros
         || cli.list_sessions;
-    let secrets_flags = cli.add_secret.is_some()
+    let vault_flags = cli.add_secret.is_some()
         || cli.get_secret.is_some()
         || cli.update_secret.is_some()
         || cli.delete_secret.is_some()
@@ -75,8 +77,8 @@ async fn main() -> Result<()> {
 
     let log_path = setup_logger(working_mode.is_serve())?;
 
-    if secrets_flags {
-        return cli.handle_secret_flag(Config::init_bare()?).await;
+    if vault_flags {
+        return Vault::handle_vault_flags(cli, Config::init_bare()?);
     }
 
     let abort_signal = create_abort_signal();

@@ -32,7 +32,7 @@ use std::{env, mem, process};
 
 const MENU_NAME: &str = "completion_menu";
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 36]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -185,6 +185,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 36]> = LazyLock::new(|| {
             AssertState::pass(),
         ),
         ReplCommand::new(".exit", "Exit REPL", AssertState::pass()),
+        ReplCommand::new(
+            ".vault",
+            "View or modify the Loki vault",
+            AssertState::pass(),
+        ),
     ]
 });
 static COMMAND_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\.\S*)\s*").unwrap());
@@ -766,6 +771,42 @@ pub async fn run_repl_command(
                     bail!("Use '.empty session' instead");
                 }
                 _ => unknown_command()?,
+            },
+            ".vault" => match split_first_arg(args) {
+                Some(("add", name)) => {
+                    if let Some(name) = name {
+                        config.read().vault.add_secret(name)?;
+                    } else {
+                        println!("Usage: .vault add <name>");
+                    }
+                }
+                Some(("get", name)) => {
+                    if let Some(name) = name {
+                        config.read().vault.get_secret(name)?;
+                    } else {
+                        println!("Usage: .vault get <name>");
+                    }
+                }
+                Some(("update", name)) => {
+                    if let Some(name) = name {
+                        config.read().vault.update_secret(name)?;
+                    } else {
+                        println!("Usage: .vault update <name>");
+                    }
+                }
+                Some(("delete", name)) => {
+                    if let Some(name) = name {
+                        config.read().vault.delete_secret(name)?;
+                    } else {
+                        println!("Usage: .vault delete <name>");
+                    }
+                }
+                Some(("list", _)) => {
+                    config.read().vault.list_secrets(true)?;
+                }
+                None | Some(_) => {
+                    println!("Usage: .vault <add|get|update|delete|list> [name]")
+                }
             },
             _ => unknown_command()?,
         },
