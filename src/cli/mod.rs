@@ -1,3 +1,6 @@
+mod secrets;
+
+use crate::cli::secrets::secrets_completer;
 use crate::client::{list_models, ModelType};
 use crate::config::{list_agents, Config};
 use anyhow::{Context, Result};
@@ -113,6 +116,21 @@ pub struct Cli {
     /// Disable colored log output
     #[arg(long, requires = "tail_logs")]
     pub disable_log_colors: bool,
+    /// Add a secret to the Loki vault
+    #[arg(long, value_name = "SECRET_NAME", exclusive = true)]
+    pub add_secret: Option<String>,
+    /// Decrypt a secret from the Loki vault and print the plaintext
+    #[arg(long, value_name = "SECRET_NAME", exclusive = true, add = ArgValueCompleter::new(secrets_completer))]
+    pub get_secret: Option<String>,
+    /// Update an existing secret in the Loki vault
+    #[arg(long, value_name = "SECRET_NAME", exclusive = true, add = ArgValueCompleter::new(secrets_completer))]
+    pub update_secret: Option<String>,
+    /// Delete a secret from the Loki vault
+    #[arg(long, value_name = "SECRET_NAME", exclusive = true, add = ArgValueCompleter::new(secrets_completer))]
+    pub delete_secret: Option<String>,
+    /// List all secrets stored in the Loki vault
+    #[arg(long, exclusive = true)]
+    pub list_secrets: bool,
 }
 
 impl Cli {

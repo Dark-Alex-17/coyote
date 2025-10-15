@@ -14,7 +14,6 @@ mod parsers;
 #[macro_use]
 extern crate log;
 
-use crate::cli::Cli;
 use crate::client::{
     call_chat_completions, call_chat_completions_streaming, list_models, ModelType,
 };
@@ -26,6 +25,7 @@ use crate::render::render_error;
 use crate::repl::Repl;
 use crate::utils::*;
 
+use crate::cli::Cli;
 use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
@@ -67,7 +67,18 @@ async fn main() -> Result<()> {
         || cli.list_rags
         || cli.list_macros
         || cli.list_sessions;
+    let secrets_flags = cli.add_secret.is_some()
+        || cli.get_secret.is_some()
+        || cli.update_secret.is_some()
+        || cli.delete_secret.is_some()
+        || cli.list_secrets;
+
     let log_path = setup_logger(working_mode.is_serve())?;
+
+    if secrets_flags {
+        return cli.handle_secret_flag(Config::init_bare()?).await;
+    }
+
     let abort_signal = create_abort_signal();
     let start_mcp_servers = cli.agent.is_none() && cli.role.is_none();
     let config = Arc::new(RwLock::new(

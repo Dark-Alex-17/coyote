@@ -25,6 +25,7 @@ use crate::mcp::{
     McpRegistry, MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX,
 };
 use anyhow::{anyhow, bail, Context, Result};
+use gman::providers::local::LocalProvider;
 use indexmap::IndexMap;
 use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
 use log::LevelFilter;
@@ -120,6 +121,7 @@ pub struct Config {
     pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
+    pub(crate) password_file: Option<PathBuf>,
 
     pub function_calling: bool,
     pub mapping_tools: IndexMap<String, String>,
@@ -159,6 +161,9 @@ pub struct Config {
     pub sync_models_url: Option<String>,
 
     pub clients: Vec<ClientConfig>,
+
+		#[serde(skip)]
+    pub secrets_provider: Option<LocalProvider>,
 
     #[serde(skip)]
     pub macro_flag: bool,
@@ -202,6 +207,7 @@ impl Default for Config {
             editor: None,
             wrap: None,
             wrap_code: false,
+            password_file: None,
 
             function_calling: true,
             mapping_tools: Default::default(),
@@ -240,6 +246,8 @@ impl Default for Config {
             sync_models_url: None,
 
             clients: vec![],
+
+            secrets_provider: None,
 
             macro_flag: false,
             info_flag: false,
@@ -304,6 +312,7 @@ impl Config {
 
         config.working_mode = working_mode;
         config.info_flag = info_flag;
+        config.load_secrets_provider();
 
         let setup = async |config: &mut Self| -> Result<()> {
             config.load_envs();
@@ -358,6 +367,16 @@ impl Config {
         match env::var(get_env_name("config_file")) {
             Ok(value) => PathBuf::from(value),
             Err(_) => Self::local_path(CONFIG_FILE_NAME),
+        }
+    }
+
+    pub fn secrets_password_file(&self) -> PathBuf {
+        match &self.password_file {
+            Some(path) => match path.exists() {
+                true => path.clone(),
+                false => gman::config::Config::local_provider_password_file(),
+            },
+            None => gman::config::Config::local_provider_password_file(),
         }
     }
 
@@ -1949,19 +1968,19 @@ impl Config {
 
     pub fn editor(&self) -> Result<String> {
         EDITOR.get_or_init(move || {
-            let editor = self.editor.clone()
-                .or_else(|| env::var("VISUAL").ok().or_else(|| env::var("EDITOR").ok()))
-                .unwrap_or_else(|| {
-                    if cfg!(windows) {
-                        "notepad".to_string()
-                    } else {
-                        "nano".to_string()
-                    }
-                });
-            which::which(&editor).ok().map(|_| editor)
-        })
-        .clone()
-        .ok_or_else(|| anyhow!("Editor not found. Please add the `editor` configuration or set the $EDITOR or $VISUAL environment variable."))
+			let editor = self.editor.clone()
+				.or_else(|| env::var("VISUAL").ok().or_else(|| env::var("EDITOR").ok()))
+				.unwrap_or_else(|| {
+					if cfg!(windows) {
+						"notepad".to_string()
+					} else {
+						"nano".to_string()
+					}
+				});
+			which::which(&editor).ok().map(|_| editor)
+		})
+			.clone()
+			.ok_or_else(|| anyhow!("Editor not found. Please add the `editor` configuration or set the $EDITOR or $VISUAL environment variable."))
     }
 
     pub fn repl_complete(
@@ -2394,8 +2413,8 @@ impl Config {
             None => String::new(),
         };
         let output = format!(
-            "# CHAT: {summary} [{now}]{scope}\n{raw_input}\n--------\n{tool_calls}{output}\n--------\n\n",
-        );
+			"# CHAT: {summary} [{now}]{scope}\n{raw_input}\n--------\n{tool_calls}{output}\n--------\n\n",
+		);
         file.write_all(output.as_bytes())
             .with_context(|| "Failed to save message")
     }
@@ -2502,6 +2521,23 @@ impl Config {
         let config =
             serde_json::from_value(config).with_context(|| "Failed to load config from env")?;
         Ok(config)
+    }
+
+    fn load_secrets_provider(&mut self) {
+        let secrets_password_file = self.secrets_password_file();
+        if !secrets_password_file.exists() {
+            eprintln!(
+                "Warning: secrets password file '{}' does not exist.",
+                secrets_password_file.display()
+            );
+            return;
+        }
+
+        self.secrets_provider = Some(LocalProvider {
+            password_file: Some(secrets_password_file),
+            git_branch: None,
+            ..LocalProvider::default()
+        });
     }
 
     fn load_envs(&mut self) {

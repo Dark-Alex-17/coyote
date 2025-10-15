@@ -10,9 +10,9 @@ keybindings: emacs               # Choose keybinding style (emacs, vi)
 editor: null                     # Specifies the command used to edit input buffer or session. (e.g. vim, emacs, nano).
 wrap: no                         # Controls text wrapping (no, auto, <max-width>)
 wrap_code: false                 # Enables or disables wrapping of code blocks
+password_file: null              # Path to a file containing the password for the Loki vault
 
 # ---- function-calling ----
-# TODO reference docs for function calling
 function_calling: true           # Enables or disables function calling (Globally).
 mapping_tools:                   # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
