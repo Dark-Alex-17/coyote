@@ -9,7 +9,7 @@ set -e
 # @env USQL_DSN! The database connection url. e.g. pgsql://user:pass@host:port
 # @env LLM_OUTPUT=/dev/stdout The output path
 
-PROMPT_UTILS="${LLM_ROOT_DIR:-$(dirname "${BASH_SOURCE[0]}")/..}/utils/prompt-utils.sh"
+PROMPT_UTILS="${LLM_ROOT_DIR:-$(dirname "${BASH_SOURCE[0]}")/..}/functions/utils/prompt-utils.sh"
 # shellcheck disable=SC1090
 source "$PROMPT_UTILS"
 

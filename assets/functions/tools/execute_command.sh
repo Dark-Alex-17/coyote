@@ -6,7 +6,7 @@ set -e
 
 # @env LLM_OUTPUT=/dev/stdout The output path
 
-PROMPT_UTILS="${LLM_ROOT_DIR:-$(dirname "${BASH_SOURCE[0]}")/..}/utils/prompt-utils.sh"
+PROMPT_UTILS="${LLM_ROOT_DIR:-$(dirname "${BASH_SOURCE[0]}")/..}/functions/utils/prompt-utils.sh"
 # shellcheck disable=SC1090
 source "$PROMPT_UTILS"
 
