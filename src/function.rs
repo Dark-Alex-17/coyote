@@ -141,7 +141,7 @@ impl Functions {
                 .extension()
                 .and_then(OsStr::to_str)
                 .map(|s| s.to_lowercase());
-						#[cfg_attr(not(unix), expect(dead_code))]
+            #[cfg_attr(not(unix), expect(dead_code))]
             let is_script = matches!(file_extension.as_deref(), Some("sh") | Some("py"));
 
             if file_path.exists() {
