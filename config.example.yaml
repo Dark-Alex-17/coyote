@@ -10,7 +10,7 @@ keybindings: emacs               # Choose keybinding style (emacs, vi)
 editor: null                     # Specifies the command used to edit input buffer or session. (e.g. vim, emacs, nano).
 wrap: no                         # Controls text wrapping (no, auto, <max-width>)
 wrap_code: false                 # Enables or disables wrapping of code blocks
-vault_password_file: null        # Path to a file containing the password for the Loki vault
+vault_password_file: null        # Path to a file containing the password for the Loki vault (cannot be a secret template)
 
 # ---- function-calling ----
 function_calling: true           # Enables or disables function calling (Globally).
@@ -116,14 +116,14 @@ clients:
   # See https://platform.openai.com/docs/quickstart
   - type: openai
     api_base: https://api.openai.com/v1               # Optional
-    api_key: xxx
+    api_key: '{{OPENAI_API_KEY}}'                     # You can either hard-code or inject secrets from the Loki vault
     organization_id: org-xxx                          # Optional
 
   # For any platform compatible with OpenAI's API
   - type: openai-compatible
     name: ollama
     api_base: http://localhost:11434/v1
-    api_key: xxx                                      # Optional
+    api_key: '{{OLLAMA_API_KEY}}'                     # Optional; You can either hard-code or inject secrets from the Loki vault
     models:
       - name: deepseek-r1
         max_input_tokens: 131072
@@ -141,7 +141,7 @@ clients:
   # See https://ai.google.dev/docs
   - type: gemini
     api_base: https://generativelanguage.googleapis.com/v1beta
-    api_key: xxx
+    api_key: '{{GEMINI_API_KEY}}'                       # You can either hard-code or inject secrets from the Loki vault
     patch:
       chat_completions:
         '.*':
@@ -158,50 +158,50 @@ clients:
 
   # See https://docs.anthropic.com/claude/reference/getting-started-with-the-api
   - type: claude
-    api_base: https://api.anthropic.com/v1            # Optional
-    api_key: xxx
+    api_base: https://api.anthropic.com/v1              # Optional
+    api_key: '{{ANTHROPIC_API_KEY}}'                    # You can either hard-code or inject secrets from the Loki vault
 
   # See https://docs.mistral.ai/
   - type: openai-compatible
     name: mistral
     api_base: https://api.mistral.ai/v1
-    api_key: xxx
+    api_key: '{{MISTRAL_API_KEY}}'                      # You can either hard-code or inject secrets from the Loki vault
 
   # See https://docs.x.ai/docs
   - type: openai-compatible
     name: xai
     api_base: https://api.x.ai/v1
-    api_key: xxx
+    api_key: '{{XAI_API_KEY}}'                          # You can either hard-code or inject secrets from the Loki vault
 
   # See https://docs.ai21.com/docs/quickstart
   - type: openai-compatible
     name: ai12
     api_base: https://api.ai21.com/studio/v1
-    api_key: xxx
+    api_key: '{{AI21_API_KEY}}'                         # You can either hard-code or inject secrets from the Loki vault
 
   # See https://docs.cohere.com/docs/the-cohere-platform
   - type: cohere
-    api_base: https://api.cohere.ai/v2                # Optional
-    api_key: xxx
+    api_base: https://api.cohere.ai/v2                  # Optional
+    api_key: '{{COHERE_API_KEY}}'                       # You can either hard-code or inject secrets from the Loki vault
 
   # See https://docs.perplexity.ai/docs/getting-started
   - type: openai-compatible
     name: perplexity
     api_base: https://api.perplexity.ai
-    api_key: xxx
+    api_key: '{{PERPLEXITY_API_KEY}}'                   # You can either hard-code or inject secrets from the Loki vault
 
   # See https://console.groq.com/docs/quickstart
   - type: openai-compatible
     name: groq
     api_base: https://api.groq.com/openai/v1
-    api_key: xxx
+    api_key: '{{GROQ_API_KEY}}'                         # You can either hard-code or inject secrets from the Loki vault
 
   # See https://learn.microsoft.com/en-us/azure/ai-services/openai/chatgpt-quickstart
   - type: azure-openai
     api_base: https://{RESOURCE}.openai.azure.com
-    api_key: xxx
+    api_key: '{{AZURE_OPENAI_API_KEY}}'                 # You can either hard-code or inject secrets from the Loki vault
     models:
-      - name: gpt-4o                                  # Model deployment name
+      - name: gpt-4o                                    # Model deployment name
         max_input_tokens: 128000
         supports_vision: true
         supports_function_calling: true
@@ -230,76 +230,76 @@ clients:
 
   # See https://docs.aws.amazon.com/bedrock/latest/userguide/
   - type: bedrock
-    access_key_id: xxx
-    secret_access_key: xxx
+    access_key_id: '{{AWS_ACCESS_KEY_ID}}'              # You can either hard-code or inject secrets from the Loki vault
+    secret_access_key: '{{AWS_SECRET_ACCESS_KEY}}'      # You can either hard-code or inject secrets from the Loki vault
     region: xxx
-    session_token: xxx  # Optional, only needed for temporary credentials
+    session_token: xxx                                  # Optional, only needed for temporary credentials
 
   # See https://developers.cloudflare.com/workers-ai/
   - type: openai-compatible
     name: cloudflare
     api_base: https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1
-    api_key: xxx
+    api_key: '{{CLOUDFLARE_API_KEY}}'                    # You can either hard-code or inject secrets from the Loki vault
 
   # See https://cloud.baidu.com/doc/WENXINWORKSHOP/index.html
   - type: openai-compatible
     name: ernie
     api_base: https://qianfan.baidubce.com/v2
-    api_key: xxx
+    api_key: '{{BAIDU_API_KEY}}'                        # You can either hard-code or inject secrets from the Loki vault
 
   # See https://dashscope.aliyun.com/
   - type: openai-compatible
     name: qianwen
     api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
-    api_key: xxx
+    api_key: '{{ALIYUN_API_KEY}}'                       # You can either hard-code or inject secrets from the Loki vault
 
   # See https://cloud.tencent.com/product/hunyuan
   - type: openai-compatible
     name: hunyuan
     api_base: https://api.hunyuan.cloud.tencent.com/v1
-    api_key: xxx
+    api_key: '{{TENCENT_API_KEY}}'                      # You can either hard-code or inject secrets from the Loki vault
 
   # See https://platform.moonshot.cn/docs/intro
   - type: openai-compatible
     name: moonshot
     api_base: https://api.moonshot.cn/v1
-    api_key: xxx
+    api_key: '{{MOONSHOT_API_KEY}}'                     # You can either hard-code or inject secrets from the Loki vault
 
   # See https://platform.deepseek.com/api-docs/
   - type: openai-compatible
     name: deepseek
     api_base: https://api.deepseek.com
-    api_key: xxx
+    api_key: '{{DEEPSEEK_API_KEY}}'                     # You can either hard-code or inject secrets from the Loki vault
 
   # See https://open.bigmodel.cn/dev/howuse/introduction
   - type: openai-compatible
     name: zhipuai
     api_base: https://open.bigmodel.cn/api/paas/v4
-    api_key: xxx
+    api_key: '{{ZHIPUAI_API_KEY}}'                      # You can either hard-code or inject secrets from the Loki vault
 
   # See https://platform.minimaxi.com/document/Fast%20access
   - type: openai-compatible
     name: minimax
     api_base: https://api.minimax.chat/v1
-    api_key: xxx
+    api_key: '{{MINIMAX_API_KEY}}'                      # You can either hard-code or inject secrets from the Loki vault
 
   # See https://openrouter.ai/docs#quick-start
   - type: openai-compatible
     name: openrouter
     api_base: https://openrouter.ai/api/v1
-    api_key: xxx
+    api_key: '{{OPENROUTER_API_KEY}}'                   # You can either hard-code or inject secrets from the Loki vault
 
   # See https://github.com/marketplace/models
   - type: openai-compatible
     name: github
     api_base: https://models.inference.ai.azure.com
-    api_key: xxx
+    api_key: '{{GITHUB_API_KEY}}'                       # You can either hard-code or inject secrets from the Loki vault
 
   # See https://deepinfra.com/docs
   - type: openai-compatible
     name: deepinfra
     api_base: https://api.deepinfra.com/v1/openai
-    api_key: xxx
+    api_key: '{{DEEPINFRA_API_KEY}}'                    # You can either hard-code or inject secrets from the Loki vault
 
 
   # ----- RAG dedicated -----
@@ -308,10 +308,10 @@ clients:
   - type: openai-compatible
     name: jina
     api_base: https://api.jina.ai/v1
-    api_key: xxx
+    api_key: '{{JINA_API_KEY}}'                         # You can either hard-code or inject secrets from the Loki vault
 
   # See https://docs.voyageai.com/docs/introduction
   - type: openai-compatible
     name: voyageai
     api_base: https://api.voyageai.com/v1
-    api_key: xxx
+    api_key: '{{VOYAGEAI_API_KEY}}'                     # You can either hard-code or inject secrets from the Loki vault
