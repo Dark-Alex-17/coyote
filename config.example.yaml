@@ -173,7 +173,7 @@ clients:
     api_base: https://api.x.ai/v1
     api_key: '{{XAI_API_KEY}}'                          # You can either hard-code or inject secrets from the Loki vault
 
-  # See https://docs.ai21.com/docs/quickstart
+  # See https://docs.ai21.com/docs/overview
   - type: openai-compatible
     name: ai12
     api_base: https://api.ai21.com/studio/v1
@@ -184,7 +184,7 @@ clients:
     api_base: https://api.cohere.ai/v2                  # Optional
     api_key: '{{COHERE_API_KEY}}'                       # You can either hard-code or inject secrets from the Loki vault
 
-  # See https://docs.perplexity.ai/docs/getting-started
+  # See https://docs.perplexity.ai/getting-started/overview
   - type: openai-compatible
     name: perplexity
     api_base: https://api.perplexity.ai
