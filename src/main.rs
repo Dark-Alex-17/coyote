@@ -176,9 +176,12 @@ async fn run(
             Config::use_role_safely(&config, CODE_ROLE, abort_signal.clone()).await?;
         }
         if let Some(session) = &cli.session {
-            config
-                .write()
-                .use_session(session.as_ref().map(|v| v.as_str()))?;
+            Config::use_session_safely(
+                &config,
+                session.as_ref().map(|v| v.as_str()),
+                abort_signal.clone(),
+            )
+            .await?;
         }
         if let Some(rag) = &cli.rag {
             Config::use_rag(&config, Some(rag), abort_signal.clone()).await?;

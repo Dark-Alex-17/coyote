@@ -93,10 +93,10 @@ pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> R
                 "{}",
                 formatdoc!(
                     "
-					Note: The default password file path is '{}'.
-					You have chosen to create a different path: '{}'.
-					Please ensure your configuration is updated accordingly.
-					",
+										Note: The default password file path is '{}'.
+										You have chosen to create a different path: '{}'.
+										Please ensure your configuration is updated accordingly.
+										",
                     vault_password_file.display(),
                     password_file.display()
                 )

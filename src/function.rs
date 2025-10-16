@@ -247,13 +247,6 @@ impl Functions {
         self.declarations.is_empty()
     }
 
-    pub fn has_mcp_functions(&self) -> bool {
-        self.declarations.iter().any(|d| {
-            d.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                || d.name.starts_with(MCP_LIST_META_FUNCTION_NAME_PREFIX)
-        })
-    }
-
     pub fn clear_mcp_meta_functions(&mut self) {
         self.declarations.retain(|d| {
             !d.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
@@ -291,9 +284,9 @@ impl Functions {
                 name: invoke_function_name.clone(),
                 description: formatdoc!(
                     r#"
-					Invoke the specified tool on the {server} MCP server. Always call {invoke_function_name} first to find the
-					correct names of tools before calling '{invoke_function_name}'.
-					"#
+										Invoke the specified tool on the {server} MCP server. Always call {invoke_function_name} first to find the
+										correct names of tools before calling '{invoke_function_name}'.
+										"#
                 ),
                 parameters: JsonSchema {
                     type_value: Some("object".to_string()),
@@ -561,12 +554,12 @@ impl Functions {
             .into_owned();
         let content = formatdoc!(
             r#"
-				@echo off
-				setlocal
+						@echo off
+						setlocal
 
-				set "bin_dir={bin_dir}"
+						set "bin_dir={bin_dir}"
 
-				{run} "{wrapper_binary}" %*"#,
+						{run} "{wrapper_binary}" %*"#,
         );
 
         let mut file = File::create(&binary_file)?;
