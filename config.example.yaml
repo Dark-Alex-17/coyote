@@ -74,7 +74,7 @@ highlight: true                  # Controls syntax highlighting
 light_theme: false               # Activates a light color theme when true. env: LOKI_LIGHT_THEME
 # Custom REPL left/right prompts, TODO reference docs for prompt variables
 left_prompt:
-  '{color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
+  '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
 right_prompt:
   '{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
 
