@@ -50,6 +50,7 @@ impl Agent {
                 .extension()
                 .and_then(OsStr::to_str)
                 .map(|s| s.to_lowercase());
+            #[cfg_attr(not(unix), expect(unused))]
             let is_script = matches!(file_extension.as_deref(), Some("sh") | Some("py"));
 
             if file_path.exists() {
