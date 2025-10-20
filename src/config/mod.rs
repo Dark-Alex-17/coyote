@@ -1983,6 +1983,10 @@ impl Config {
                     .functions
                     .declarations()
                     .iter()
+                    .filter(|v| {
+                        !v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
+                            && !v.name.starts_with(MCP_LIST_META_FUNCTION_NAME_PREFIX)
+                    })
                     .map(|v| v.name.to_string())
                     .collect();
                 if use_tools == "all" {
@@ -2017,7 +2021,16 @@ impl Config {
             }
 
             if let Some(agent) = &self.agent {
-                let mut agent_functions = agent.functions().declarations().to_vec();
+                let mut agent_functions: Vec<FunctionDeclaration> = agent
+                    .functions()
+                    .declarations()
+                    .to_vec()
+                    .into_iter()
+                    .filter(|v| {
+                        !v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
+                            && !v.name.starts_with(MCP_LIST_META_FUNCTION_NAME_PREFIX)
+                    })
+                    .collect();
                 let tool_names: HashSet<String> = agent_functions
                     .iter()
                     .filter_map(|v| {
@@ -2064,7 +2077,7 @@ impl Config {
                             format!("{}_{item}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
                         let item_list_name =
                             format!("{}_{item}", MCP_LIST_META_FUNCTION_NAME_PREFIX);
-                        if let Some(values) = self.mapping_tools.get(item) {
+                        if let Some(values) = self.mapping_mcp_servers.get(item) {
                             server_names.extend(
                                 values
                                     .split(',')
@@ -2105,7 +2118,16 @@ impl Config {
             }
 
             if let Some(agent) = &self.agent {
-                let mut agent_functions = agent.functions().declarations().to_vec();
+                let mut agent_functions: Vec<FunctionDeclaration> = agent
+                    .functions()
+                    .declarations()
+                    .to_vec()
+                    .into_iter()
+                    .filter(|v| {
+                        v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
+                            || v.name.starts_with(MCP_LIST_META_FUNCTION_NAME_PREFIX)
+                    })
+                    .collect();
                 let tool_names: HashSet<String> = agent_functions
                     .iter()
                     .filter_map(|v| {
