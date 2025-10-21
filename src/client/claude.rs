@@ -286,14 +286,22 @@ pub fn claude_build_chat_completions_body(
         body["tools"] = functions
             .iter()
             .map(|v| {
-                json!({
+								if v.parameters.type_value.is_none() {
+									json!({
                     "name": v.name,
                     "description": v.description,
-                    "input_schema": v.parameters,
-                })
-            })
-            .collect();
-    }
+										"input_schema": { "type": "object", "properties": {}, "required": [] },
+                	})
+								} else {
+									json!({
+											"name": v.name,
+											"description": v.description,
+											"input_schema": v.parameters,
+									})
+								}
+						})
+					.collect();
+		}
     Ok(body)
 }
 
