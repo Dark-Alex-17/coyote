@@ -77,6 +77,7 @@ rustpython-ast = "0.4.0"
 colored = "3.0.0"
 clap_complete = { version = "4.5.58", features = ["unstable-dynamic"] }
 gman = "0.2.3"
+clap_complete_nushell = "4.5.9"
 
 [dependencies.reqwest]
 version = "0.12.0"

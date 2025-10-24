@@ -47,6 +47,11 @@ async fn main() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
 
+    if let Some(shell) = cli.completions {
+        let mut cmd = Cli::command();
+        shell.generate_completions(&mut cmd);
+        return Ok(());
+    }
     if cli.tail_logs {
         tail_logs(cli.disable_log_colors).await;
         return Ok(());

@@ -1,7 +1,34 @@
 use crate::client::{list_models, ModelType};
 use crate::config::{list_agents, Config};
-use clap_complete::CompletionCandidate;
+use clap_complete::{generate, CompletionCandidate, Shell};
+use clap_complete_nushell::Nushell;
 use std::ffi::OsStr;
+use std::io;
+
+const LOKI_CLI_NAME: &str = "loki";
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum ShellCompletion {
+    Bash,
+    Elvish,
+    Fish,
+    PowerShell,
+    Zsh,
+    Nushell,
+}
+
+impl ShellCompletion {
+    pub fn generate_completions(self, cmd: &mut clap::Command) {
+        match self {
+            Self::Bash => generate(Shell::Bash, cmd, LOKI_CLI_NAME, &mut io::stdout()),
+            Self::Elvish => generate(Shell::Elvish, cmd, LOKI_CLI_NAME, &mut io::stdout()),
+            Self::Fish => generate(Shell::Fish, cmd, LOKI_CLI_NAME, &mut io::stdout()),
+            Self::PowerShell => generate(Shell::PowerShell, cmd, LOKI_CLI_NAME, &mut io::stdout()),
+            Self::Zsh => generate(Shell::Zsh, cmd, LOKI_CLI_NAME, &mut io::stdout()),
+            Self::Nushell => generate(Nushell, cmd, LOKI_CLI_NAME, &mut io::stdout()),
+        }
+    }
+}
 
 pub(super) fn model_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();

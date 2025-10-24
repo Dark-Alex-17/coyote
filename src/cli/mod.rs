@@ -2,7 +2,7 @@ mod completer;
 
 use crate::cli::completer::{
     agent_completer, macro_completer, model_completer, rag_completer, role_completer,
-    secrets_completer, session_completer,
+    secrets_completer, session_completer, ShellCompletion,
 };
 use anyhow::{Context, Result};
 use clap::ValueHint;
@@ -130,6 +130,9 @@ pub struct Cli {
     /// List all secrets stored in the Loki vault
     #[arg(long, exclusive = true)]
     pub list_secrets: bool,
+    /// Generate static shell completion scripts
+    #[arg(long, value_enum)]
+    pub completions: Option<ShellCompletion>,
 }
 
 impl Cli {
