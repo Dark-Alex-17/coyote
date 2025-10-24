@@ -1,15 +1,15 @@
 mod completer;
 
 use crate::cli::completer::{
-    ShellCompletion, agent_completer, macro_completer, model_completer, rag_completer,
-    role_completer, secrets_completer, session_completer,
+    agent_completer, macro_completer, model_completer, rag_completer, role_completer,
+    secrets_completer, session_completer, ShellCompletion,
 };
 use anyhow::{Context, Result};
 use clap::ValueHint;
-use clap::{Parser, crate_authors, crate_description, crate_name, crate_version};
+use clap::{crate_authors, crate_description, crate_name, crate_version, Parser};
 use clap_complete::ArgValueCompleter;
 use is_terminal::IsTerminal;
-use std::io::{Read, stdin};
+use std::io::{stdin, Read};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
