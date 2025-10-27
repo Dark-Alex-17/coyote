@@ -24,8 +24,9 @@ impl AzureOpenAIClient {
             "api_base",
             "API Base",
             Some("e.g. https://{RESOURCE}.openai.azure.com"),
+						false
         ),
-        ("api_key", "API Key", None),
+        ("api_key", "API Key", None, true),
     ];
 }
 

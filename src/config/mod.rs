@@ -24,7 +24,7 @@ use crate::utils::*;
 use crate::mcp::{
     McpRegistry, MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX,
 };
-use crate::vault::{interpolate_secrets, Vault};
+use crate::vault::{create_vault_password_file, interpolate_secrets, Vault};
 use anyhow::{anyhow, bail, Context, Result};
 use fancy_regex::Regex;
 use indexmap::IndexMap;
@@ -3135,11 +3135,15 @@ async fn create_config_file(config_path: &Path) -> Result<()> {
         process::exit(0);
     }
 
+    let mut vault = Vault::init_bare();
+    create_vault_password_file(&mut vault)?;
+
     let client = Select::new("API Provider (required):", list_client_types()).prompt()?;
 
     let mut config = json!({});
-    let (model, clients_config) = create_client_config(client).await?;
+    let (model, clients_config) = create_client_config(client, &vault).await?;
     config["model"] = model.into();
+    config["vault_password_file"] = vault.password_file()?.display().to_string().into();
     config[CLIENTS_FIELD] = clients_config;
 
     let config_data = serde_yaml::to_string(&config).with_context(|| "Failed to create config")?;

@@ -19,6 +19,28 @@ pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> R
         {
             let file_contents = std::fs::read_to_string(&vault_password_file)?;
             if !file_contents.trim().is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow!("The configured password file '{}' is empty. Please populate it with a password and try again.", vault_password_file.display()))
+            }
+        }
+    } else {
+        Err(anyhow!("A password file is required to utilize the Loki vault. Please configure a password file in your config file and try again."))
+    }
+}
+
+pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
+    let vault_password_file = vault
+        .local_provider
+        .password_file
+        .clone()
+        .ok_or_else(|| anyhow!("Password file is not configured"))?;
+
+    if vault_password_file.exists() {
+        {
+            let file_contents = std::fs::read_to_string(&vault_password_file)?;
+            if !file_contents.trim().is_empty() {
+                debug!("create_vault_password_file was called but the password file already exists and is non-empty");
                 return Ok(());
             }
         }
@@ -91,13 +113,12 @@ pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> R
             .into();
 
         if password_file != vault_password_file {
-            println!(
+            debug!(
                 "{}",
                 formatdoc!(
                     "
-										Note: The default password file path is '{}'.
-										You have chosen to create a different path: '{}'.
-										Please ensure your configuration is updated accordingly.
+										The default password file path is '{}'.
+										User chose to create file at a different path: '{}'.
 										",
                     vault_password_file.display(),
                     password_file.display()
@@ -116,7 +137,7 @@ pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> R
         match password {
             Ok(pw) => {
                 std::fs::write(&password_file, pw.as_bytes())?;
-                local_provider.password_file = Some(password_file);
+                vault.local_provider.password_file = Some(password_file);
                 println!(
                     "✓ Password file '{}' created.",
                     vault_password_file.display()

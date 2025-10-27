@@ -27,8 +27,8 @@ impl VertexAIClient {
     config_get_fn!(location, get_location);
 
     pub const PROMPTS: [PromptAction<'static>; 2] = [
-        ("project_id", "Project ID", None),
-        ("location", "Location", None),
+        ("project_id", "Project ID", None, false),
+        ("location", "Location", None, false),
     ];
 }
 

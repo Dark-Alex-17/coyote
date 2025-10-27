@@ -1,5 +1,7 @@
 mod utils;
 
+use std::path::PathBuf;
+pub use utils::create_vault_password_file;
 pub use utils::interpolate_secrets;
 
 use crate::cli::Cli;
@@ -21,6 +23,17 @@ pub struct Vault {
 }
 
 impl Vault {
+    pub fn init_bare() -> Self {
+        let vault_password_file = Config::default().vault_password_file();
+        let local_provider = LocalProvider {
+            password_file: Some(vault_password_file),
+            git_branch: None,
+            ..LocalProvider::default()
+        };
+
+        Self { local_provider }
+    }
+
     pub fn init(config: &Config) -> Self {
         let vault_password_file = config.vault_password_file();
         let mut local_provider = LocalProvider {
@@ -33,6 +46,13 @@ impl Vault {
             .expect("Failed to initialize password file");
 
         Self { local_provider }
+    }
+
+    pub fn password_file(&self) -> Result<PathBuf> {
+        self.local_provider
+            .password_file
+            .clone()
+            .with_context(|| "A password file is required for the local provider")
     }
 
     pub fn add_secret(&self, secret_name: &str) -> Result<()> {

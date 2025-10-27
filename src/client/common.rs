@@ -7,6 +7,7 @@ use crate::{
     utils::*,
 };
 
+use crate::vault::Vault;
 use anyhow::{bail, Context, Result};
 use fancy_regex::Regex;
 use indexmap::IndexMap;
@@ -343,19 +344,25 @@ pub struct RerankResult {
     pub relevance_score: f64,
 }
 
-pub type PromptAction<'a> = (&'a str, &'a str, Option<&'a str>);
+pub type PromptAction<'a> = (&'a str, &'a str, Option<&'a str>, bool);
 
 pub async fn create_config(
     prompts: &[PromptAction<'static>],
     client: &str,
+    vault: &Vault,
 ) -> Result<(String, Value)> {
     let mut config = json!({
         "type": client,
     });
-    for (key, desc, help_message) in prompts {
+    for (key, desc, help_message, is_secret) in prompts {
         let env_name = format!("{client}_{key}").to_ascii_uppercase();
         let required = std::env::var(&env_name).is_err();
-        let value = prompt_input_string(desc, required, *help_message)?;
+        let value = if !is_secret {
+            prompt_input_string(desc, required, *help_message)?
+        } else {
+            vault.add_secret(&env_name)?;
+            format!("{{{{{}}}}}", env_name)
+        };
         if !value.is_empty() {
             config[key] = value.into();
         }
