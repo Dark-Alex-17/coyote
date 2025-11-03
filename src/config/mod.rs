@@ -24,7 +24,7 @@ use crate::utils::*;
 use crate::mcp::{
     McpRegistry, MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX,
 };
-use crate::vault::{create_vault_password_file, interpolate_secrets, Vault};
+use crate::vault::{create_vault_password_file, interpolate_secrets, GlobalVault, Vault};
 use anyhow::{anyhow, bail, Context, Result};
 use fancy_regex::Regex;
 use indexmap::IndexMap;
@@ -159,7 +159,6 @@ pub struct Config {
     pub left_prompt: Option<String>,
     pub right_prompt: Option<String>,
 
-    pub serve_addr: Option<String>,
     pub user_agent: Option<String>,
     pub save_shell_history: bool,
     pub sync_models_url: Option<String>,
@@ -167,7 +166,7 @@ pub struct Config {
     pub clients: Vec<ClientConfig>,
 
     #[serde(skip)]
-    pub vault: Vault,
+    pub vault: GlobalVault,
 
     #[serde(skip)]
     pub macro_flag: bool,
@@ -244,7 +243,6 @@ impl Default for Config {
             left_prompt: None,
             right_prompt: None,
 
-            serve_addr: None,
             user_agent: None,
             save_shell_history: true,
             sync_models_url: None,
@@ -317,7 +315,9 @@ impl Config {
 
             let (parsed_config, missing_secrets) = interpolate_secrets(&content, &vault);
             if !missing_secrets.is_empty() && !info_flag {
-                debug!("Global config references secrets that are missing from the vault: {missing_secrets:?}");
+                debug!(
+                    "Global config references secrets that are missing from the vault: {missing_secrets:?}"
+                );
                 return Err(anyhow!(formatdoc!(
                     "
 										Global config file references secrets that are missing from the vault: {:?}
@@ -341,7 +341,7 @@ impl Config {
 
             config.working_mode = working_mode;
             config.info_flag = info_flag;
-            config.vault = vault;
+            config.vault = Arc::new(vault);
 
             Agent::install_builtin_agents()?;
 
@@ -769,7 +769,9 @@ impl Config {
                 if let Some(servers) = value.as_ref() {
                     if let Some(registry) = &config.read().mcp_registry {
                         if registry.list_configured_servers().is_empty() {
-                            bail!("No MCP servers are configured. Please configure MCP servers first before setting 'use_mcp_servers'.");
+                            bail!(
+                                "No MCP servers are configured. Please configure MCP servers first before setting 'use_mcp_servers'."
+                            );
                         }
 
                         if !servers.split(',').all(|s| {
@@ -778,7 +780,9 @@ impl Config {
                                 .contains(&s.trim().to_string())
                                 || s == "all"
                         }) {
-                            bail!("Some of the specified MCP servers in 'use_mcp_servers' are configured. Please check your MCP server configuration.");
+                            bail!(
+                                "Some of the specified MCP servers in 'use_mcp_servers' are configured. Please check your MCP server configuration."
+                            );
                         }
                     }
                 }
@@ -2562,8 +2566,8 @@ impl Config {
             None => String::new(),
         };
         let output = format!(
-			"# CHAT: {summary} [{now}]{scope}\n{raw_input}\n--------\n{tool_calls}{output}\n--------\n\n",
-		);
+            "# CHAT: {summary} [{now}]{scope}\n{raw_input}\n--------\n{tool_calls}{output}\n--------\n\n",
+        );
         file.write_all(output.as_bytes())
             .with_context(|| "Failed to save message")
     }

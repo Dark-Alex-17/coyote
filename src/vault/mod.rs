@@ -12,15 +12,17 @@ use fancy_regex::Regex;
 use gman::providers::local::LocalProvider;
 use gman::providers::SecretProvider;
 use inquire::{required, Password, PasswordDisplayMode};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
 
-static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{(.+)}}").unwrap());
+pub static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{(.+)}}").unwrap());
 
 #[derive(Debug, Default, Clone)]
 pub struct Vault {
     local_provider: LocalProvider,
 }
+
+pub type GlobalVault = Arc<Vault>;
 
 impl Vault {
     pub fn init_bare() -> Self {

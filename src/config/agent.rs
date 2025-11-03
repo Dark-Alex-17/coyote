@@ -5,7 +5,9 @@ use crate::{
     function::{run_llm_function, Functions},
 };
 
+use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
+use fancy_regex::Captures;
 use inquire::{validator::Validation, Text};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
@@ -30,6 +32,7 @@ pub struct Agent {
     functions: Functions,
     rag: Option<Arc<Rag>>,
     model: Model,
+    vault: GlobalVault,
 }
 
 impl Agent {
@@ -195,6 +198,7 @@ impl Agent {
             functions,
             rag,
             model,
+            vault: Arc::clone(&config.read().vault),
         })
     }
 
@@ -325,7 +329,13 @@ impl Agent {
             .map(|(k, v)| {
                 (
                     format!("LLM_AGENT_VAR_{}", normalize_env_name(k)),
-                    v.clone(),
+                    SECRET_RE
+                        .replace(v, |caps: &Captures| {
+                            self.vault
+                                .get_secret(caps[1].trim(), false)
+                                .unwrap_or(v.clone())
+                        })
+                        .to_string(),
                 )
             })
             .collect()
