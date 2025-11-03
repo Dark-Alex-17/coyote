@@ -389,13 +389,7 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     } else {
         text.to_string()
     };
-    let output = ChatCompletionsOutput {
-        text,
-        tool_calls,
-        id: data["id"].as_str().map(|v| v.to_string()),
-        input_tokens: data["usage"]["prompt_tokens"].as_u64(),
-        output_tokens: data["usage"]["completion_tokens"].as_u64(),
-    };
+    let output = ChatCompletionsOutput { text, tool_calls };
     Ok(output)
 }
 

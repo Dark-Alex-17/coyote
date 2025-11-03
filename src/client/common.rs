@@ -21,7 +21,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
 
-const MODELS_YAML: &str = include_str!("../../models.yaml");
+pub const MODELS_YAML: &str = include_str!("../../models.yaml");
 
 pub static ALL_PROVIDER_MODELS: LazyLock<Vec<ProviderModels>> = LazyLock::new(|| {
     Config::local_models_override()
@@ -46,8 +46,6 @@ pub trait Client: Sync + Send {
     fn name(&self) -> &str;
 
     fn model(&self) -> &Model;
-
-    fn model_mut(&mut self) -> &mut Model;
 
     fn build_client(&self) -> Result<ReqwestClient> {
         let mut builder = ReqwestClient::builder();
@@ -291,9 +289,6 @@ pub struct ChatCompletionsData {
 pub struct ChatCompletionsOutput {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
-    pub id: Option<String>,
-    pub input_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
 }
 
 impl ChatCompletionsOutput {
@@ -341,7 +336,6 @@ pub type RerankOutput = Vec<RerankResult>;
 #[derive(Debug, Deserialize)]
 pub struct RerankResult {
     pub index: usize,
-    pub relevance_score: f64,
 }
 
 pub type PromptAction<'a> = (&'a str, &'a str, Option<&'a str>, bool);

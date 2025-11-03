@@ -518,13 +518,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         bail!("Invalid response data: {data}");
     }
 
-    let output = ChatCompletionsOutput {
-        text,
-        tool_calls,
-        id: None,
-        input_tokens: data["usage"]["inputTokens"].as_u64(),
-        output_tokens: data["usage"]["outputTokens"].as_u64(),
-    };
+    let output = ChatCompletionsOutput { text, tool_calls };
     Ok(output)
 }
 

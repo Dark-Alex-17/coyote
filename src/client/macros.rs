@@ -159,10 +159,6 @@ macro_rules! client_common_fns {
         fn model(&self) -> &Model {
             &self.model
         }
-
-        fn model_mut(&mut self) -> &mut Model {
-            &mut self.model
-        }
     };
 }
 

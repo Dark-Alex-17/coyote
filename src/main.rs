@@ -5,7 +5,6 @@ mod function;
 mod rag;
 mod render;
 mod repl;
-mod serve;
 #[macro_use]
 mod utils;
 mod mcp;
@@ -58,9 +57,7 @@ async fn main() -> Result<()> {
     }
 
     let text = cli.text()?;
-    let working_mode = if cli.serve.is_some() {
-        WorkingMode::Serve
-    } else if text.is_none() && cli.file.is_empty() {
+    let working_mode = if text.is_none() && cli.file.is_empty() {
         WorkingMode::Repl
     } else {
         WorkingMode::Cmd
@@ -80,7 +77,7 @@ async fn main() -> Result<()> {
         || cli.delete_secret.is_some()
         || cli.list_secrets;
 
-    let log_path = setup_logger(working_mode.is_serve())?;
+    let log_path = setup_logger()?;
 
     if vault_flags {
         return Vault::handle_vault_flags(cli, Config::init_bare()?);
@@ -218,9 +215,6 @@ async fn run(
         let info = config.read().info()?;
         println!("{info}");
         return Ok(());
-    }
-    if let Some(addr) = cli.serve {
-        return serve::run(config, addr).await;
     }
     let is_repl = config.read().working_mode.is_repl();
     if cli.rebuild_rag {
@@ -429,22 +423,15 @@ async fn create_input(
     Ok(input)
 }
 
-fn setup_logger(is_serve: bool) -> Result<Option<PathBuf>> {
-    let (log_level, log_path) = Config::log_config(is_serve)?;
+fn setup_logger() -> Result<Option<PathBuf>> {
+    let (log_level, log_path) = Config::log_config()?;
     if log_level == LevelFilter::Off {
         return Ok(None);
     }
     let encoder = Box::new(PatternEncoder::new(
         "{d(%Y-%m-%d %H:%M:%S%.3f)(utc)} <{i}> [{l}] {f}:{L} - {m}{n}",
     ));
-    let log_filter = match env::var(get_env_name("log_filter")) {
-        Ok(v) => Some(v),
-        Err(_) => match is_serve {
-            true => Some(format!("{}::serve", env!("CARGO_CRATE_NAME"))),
-            false => None,
-        },
-    };
-
+    let log_filter = env::var(get_env_name("log_filter")).ok();
     match log_path.clone() {
         None => {
             let console_appender = ConsoleAppender::builder().encoder(encoder).build();

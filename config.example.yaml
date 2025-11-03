@@ -16,7 +16,7 @@ vault_password_file: null        # Path to a file containing the password for th
 function_calling: true           # Enables or disables function calling (Globally).
 mapping_tools:                   # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
-use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search')
+use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search_loki')
 
 # ---- MCP Servers ----
 mcp_servers: true                # Enables or disables MCP servers (globally).
@@ -85,7 +85,6 @@ right_prompt:
   '{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
 
 # ---- misc ----
-serve_addr: 127.0.0.1:8000                  # Server listening address 
 user_agent: null                            # Set User-Agent HTTP header, use `auto` for loki/<current-version>
 save_shell_history: true                    # Whether to save shell execution command to the history file
 # URL to sync model changes from

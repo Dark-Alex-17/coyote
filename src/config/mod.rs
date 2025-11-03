@@ -78,8 +78,6 @@ const MCP_FILE_NAME: &str = "mcp.json";
 
 const CLIENTS_FIELD: &str = "clients";
 
-const SERVE_ADDR: &str = "127.0.0.1:8000";
-
 const SYNC_MODELS_URL: &str =
     "https://raw.githubusercontent.com/Dark-Alex-17/loki/refs/heads/main/models.yaml";
 
@@ -578,30 +576,17 @@ impl Config {
         flags
     }
 
-    pub fn serve_addr(&self) -> String {
-        self.serve_addr.clone().unwrap_or_else(|| SERVE_ADDR.into())
-    }
-
-    pub fn log_config(is_serve: bool) -> Result<(LevelFilter, Option<PathBuf>)> {
+    pub fn log_config() -> Result<(LevelFilter, Option<PathBuf>)> {
         let log_level = env::var(get_env_name("log_level"))
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(match cfg!(debug_assertions) {
                 true => LevelFilter::Debug,
-                false => {
-                    if is_serve {
-                        LevelFilter::Off
-                    } else {
-                        LevelFilter::Info
-                    }
-                }
+                false => LevelFilter::Info,
             });
         let log_path = match env::var(get_env_name("log_path")) {
             Ok(v) => Some(PathBuf::from(v)),
-            Err(_) => match is_serve {
-                true => None,
-                false => Some(Config::log_path()),
-            },
+            Err(_) => Some(Config::log_path()),
         };
         Ok((log_level, log_path))
     }
@@ -744,7 +729,7 @@ impl Config {
                 display_path(&self.vault_password_file()),
             ),
         ];
-        if let Ok((_, Some(log_path))) = Self::log_config(self.working_mode.is_serve()) {
+        if let Ok((_, Some(log_path))) = Self::log_config() {
             items.push(("log_path", display_path(&log_path)));
         }
         let output = items
@@ -1277,23 +1262,6 @@ impl Config {
         }
 
         Ok(())
-    }
-
-    pub fn all_roles() -> Vec<Role> {
-        let mut roles: HashMap<String, Role> = Role::list_builtin_roles()
-            .iter()
-            .map(|v| (v.name().to_string(), v.clone()))
-            .collect();
-        let names = Self::list_roles(false);
-        for name in names {
-            if let Ok(content) = read_to_string(Self::role_file(&name)) {
-                let role = Role::new(&name, &content);
-                roles.insert(name, role);
-            }
-        }
-        let mut roles: Vec<_> = roles.into_values().collect();
-        roles.sort_unstable_by(|a, b| a.name().cmp(b.name()));
-        roles
     }
 
     pub fn list_roles(with_builtin: bool) -> Vec<String> {
@@ -1921,7 +1889,6 @@ impl Config {
         let prelude = match self.working_mode {
             WorkingMode::Repl => self.repl_prelude.as_ref(),
             WorkingMode::Cmd => self.cmd_prelude.as_ref(),
-            WorkingMode::Serve => return Ok(()),
         };
         let prelude = match prelude {
             Some(v) => {
@@ -2835,10 +2802,6 @@ impl Config {
         if let Some(v) = read_env_value::<String>(&get_env_name("right_prompt")) {
             self.right_prompt = v;
         }
-
-        if let Some(v) = read_env_value::<String>(&get_env_name("serve_addr")) {
-            self.serve_addr = v;
-        }
         if let Some(v) = read_env_value::<String>(&get_env_name("user_agent")) {
             self.user_agent = v;
         }
@@ -2947,7 +2910,6 @@ pub fn load_env_file() -> Result<()> {
 pub enum WorkingMode {
     Cmd,
     Repl,
-    Serve,
 }
 
 impl WorkingMode {
@@ -2956,9 +2918,6 @@ impl WorkingMode {
     }
     pub fn is_repl(&self) -> bool {
         *self == WorkingMode::Repl
-    }
-    pub fn is_serve(&self) -> bool {
-        *self == WorkingMode::Serve
     }
 }
 

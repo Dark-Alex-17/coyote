@@ -111,12 +111,6 @@ impl Role {
             .collect()
     }
 
-    pub fn list_builtin_roles() -> Vec<Self> {
-        RolesAsset::iter()
-            .filter_map(|v| Role::builtin(&v).ok())
-            .collect()
-    }
-
     pub fn has_args(&self) -> bool {
         self.name.contains('#')
     }

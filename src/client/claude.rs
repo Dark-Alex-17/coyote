@@ -2,10 +2,10 @@ use super::*;
 
 use crate::utils::strip_think_tag;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const API_BASE: &str = "https://api.anthropic.com/v1";
 
@@ -301,7 +301,7 @@ pub fn claude_build_chat_completions_body(
 								}
 						})
 					.collect();
-		}
+    }
     Ok(body)
 }
 
@@ -353,9 +353,6 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     let output = ChatCompletionsOutput {
         text: text.to_string(),
         tool_calls,
-        id: data["id"].as_str().map(|v| v.to_string()),
-        input_tokens: data["usage"]["input_tokens"].as_u64(),
-        output_tokens: data["usage"]["output_tokens"].as_u64(),
     };
     Ok(output)
 }

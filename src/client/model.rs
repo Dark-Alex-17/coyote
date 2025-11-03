@@ -118,14 +118,6 @@ impl Model {
         }
     }
 
-    pub fn data(&self) -> &ModelData {
-        &self.data
-    }
-
-    pub fn data_mut(&mut self) -> &mut ModelData {
-        &mut self.data
-    }
-
     pub fn description(&self) -> String {
         match self.model_type() {
             ModelType::Chat => {

@@ -56,17 +56,12 @@ impl SseHandler {
     }
 
     pub fn tool_call(&mut self, call: ToolCall) -> Result<()> {
-        // debug!("HandleCall: {:?}", call);
         self.tool_calls.push(call);
         Ok(())
     }
 
     pub fn abort(&self) -> AbortSignal {
         self.abort_signal.clone()
-    }
-
-    pub fn tool_calls(&self) -> &[ToolCall] {
-        &self.tool_calls
     }
 
     pub fn take(self) -> (String, Vec<ToolCall>) {

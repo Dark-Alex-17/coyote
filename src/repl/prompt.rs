@@ -41,8 +41,8 @@ impl Prompt for ReplPrompt {
             PromptHistorySearchStatus::Passing => "",
             PromptHistorySearchStatus::Failing => "failing ",
         };
-        // NOTE: magic strings, given there is logic on how these compose I am not sure if it
-        // is worth extracting in to static constant
+        // NOTE: magic strings, given there is logic on how these are composed, I'm unsure if it's
+        // worth extracting into a static constant
         Cow::Owned(format!(
             "({}reverse-search: {}) ",
             prefix, history_search.term

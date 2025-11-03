@@ -61,9 +61,6 @@ pub struct Cli {
     /// Execute a macro
     #[arg(long = "macro", value_name = "MACRO", add = ArgValueCompleter::new(macro_completer))]
     pub macro_name: Option<String>,
-    /// Serve the LLM API and WebAPP
-    #[arg(long, value_name = "PORT|IP|IP:PORT")]
-    pub serve: Option<Option<String>>,
     /// Execute commands in natural language
     #[arg(short = 'e', long)]
     pub execute: bool,

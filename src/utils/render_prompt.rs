@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 /// Render REPL prompt
 ///
-/// The template comprises plain text and `{...}`.
+/// The template comprises of plain text and `{...}`.
 ///
 /// The syntax of `{...}`:
 /// - `{var}` - When `var` has a value, replace `var` with the value and eval `template`

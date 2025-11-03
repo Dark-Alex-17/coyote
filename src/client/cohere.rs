@@ -244,12 +244,6 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     if text.is_empty() && tool_calls.is_empty() {
         bail!("Invalid response data: {data}");
     }
-    let output = ChatCompletionsOutput {
-        text,
-        tool_calls,
-        id: data["id"].as_str().map(|v| v.to_string()),
-        input_tokens: data["usage"]["billed_units"]["input_tokens"].as_u64(),
-        output_tokens: data["usage"]["billed_units"]["output_tokens"].as_u64(),
-    };
+    let output = ChatCompletionsOutput { text, tool_calls };
     Ok(output)
 }
