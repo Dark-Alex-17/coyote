@@ -107,7 +107,7 @@ impl McpRegistry {
             serde_json::from_str(&parsed_content).with_context(err)?;
         registry.config = Some(mcp_servers_config);
 
-        if start_mcp_servers && config.mcp_servers {
+        if start_mcp_servers && config.mcp_server_support {
             abortable_run_with_spinner(
                 registry.start_select_mcp_servers(enabled_mcp_servers),
                 "Loading MCP servers",

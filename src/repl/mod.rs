@@ -700,7 +700,7 @@ pub async fn run_repl_command(
                         .mcp_registry
                         .take()
                         .expect("MCP registry should exist");
-                    let enabled_mcp_servers = if config.read().mcp_servers {
+                    let enabled_mcp_servers = if config.read().mcp_server_support {
                         config.read().enabled_mcp_servers.clone()
                     } else {
                         None
@@ -726,7 +726,7 @@ pub async fn run_repl_command(
                             .mcp_registry
                             .take()
                             .expect("MCP registry should exist");
-                        let enabled_mcp_servers = if config.read().mcp_servers {
+                        let enabled_mcp_servers = if config.read().mcp_server_support {
                             config.read().enabled_mcp_servers.clone()
                         } else {
                             None
@@ -760,7 +760,7 @@ pub async fn run_repl_command(
                         .mcp_registry
                         .take()
                         .expect("MCP registry should exist");
-                    let enabled_mcp_servers = if config.read().mcp_servers {
+                    let enabled_mcp_servers = if config.read().mcp_server_support {
                         config.read().enabled_mcp_servers.clone()
                     } else {
                         None

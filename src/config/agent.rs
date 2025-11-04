@@ -96,7 +96,7 @@ impl Agent {
         let mut functions = Functions::init_agent(name, &agent_config.global_tools)?;
 
         config.write().functions.clear_mcp_meta_functions();
-        let mcp_servers = if config.read().mcp_servers {
+        let mcp_servers = if config.read().mcp_server_support {
             (!agent_config.mcp_servers.is_empty()).then(|| agent_config.mcp_servers.join(","))
         } else {
             eprintln!(
@@ -104,7 +104,7 @@ impl Agent {
                 formatdoc!(
                     "
 										This agent uses MCP servers, but MCP support is disabled.
-										To enable it, exit the agent and set 'mcp_servers: true', then try again
+										To enable it, exit the agent and set 'mcp_server_support: true', then try again
 										"
                 )
             );

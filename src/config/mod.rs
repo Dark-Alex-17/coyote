@@ -128,12 +128,12 @@ pub struct Config {
     pub wrap_code: bool,
     vault_password_file: Option<PathBuf>,
 
-    pub function_calling: bool,
+    pub function_calling_support: bool,
     pub mapping_tools: IndexMap<String, String>,
     pub enabled_tools: Option<String>,
     pub visible_tools: Option<Vec<String>>,
 
-    pub mcp_servers: bool,
+    pub mcp_server_support: bool,
     pub mapping_mcp_servers: IndexMap<String, String>,
     pub enabled_mcp_servers: Option<String>,
 
@@ -214,12 +214,12 @@ impl Default for Config {
             wrap_code: false,
             vault_password_file: None,
 
-            function_calling: true,
+            function_calling_support: true,
             mapping_tools: Default::default(),
             enabled_tools: None,
             visible_tools: None,
 
-            mcp_servers: true,
+            mcp_server_support: true,
             mapping_mcp_servers: Default::default(),
             enabled_mcp_servers: None,
 
@@ -714,8 +714,11 @@ impl Config {
             ),
             ("rag_top_k", rag_top_k.to_string()),
             ("dry_run", self.dry_run.to_string()),
-            ("function_calling", self.function_calling.to_string()),
-            ("mcp_servers", self.mcp_servers.to_string()),
+            (
+                "function_calling_support",
+                self.function_calling_support.to_string(),
+            ),
+            ("mcp_server_support", self.mcp_server_support.to_string()),
             ("stream", self.stream.to_string()),
             ("save", self.save.to_string()),
             ("keybindings", self.keybindings.clone()),
@@ -794,7 +797,7 @@ impl Config {
                     }
                 }
                 config.write().set_enabled_mcp_servers(value.clone());
-                if config.read().mcp_servers {
+                if config.read().mcp_server_support {
                     config.write().functions.clear_mcp_meta_functions();
                     let registry = config
                         .write()
@@ -838,14 +841,14 @@ impl Config {
                 let value = value.parse().with_context(|| "Invalid value")?;
                 config.write().dry_run = value;
             }
-            "function_calling" => {
+            "function_calling_support" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
                 if value && config.write().functions.is_empty() {
                     bail!("Function calling cannot be enabled because no functions are installed.")
                 }
-                config.write().function_calling = value;
+                config.write().function_calling_support = value;
             }
-            "mcp_servers" => {
+            "mcp_server_support" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
                 config.write().functions.clear_mcp_meta_functions();
 
@@ -869,7 +872,7 @@ impl Config {
                         .append_mcp_meta_functions(new_registry.list_started_servers());
                 }
                 config.write().mcp_registry = Some(new_registry);
-                config.write().mcp_servers = value;
+                config.write().mcp_server_support = value;
             }
             "stream" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
@@ -1094,7 +1097,7 @@ impl Config {
 
     pub async fn use_role(&mut self, name: &str, abort_signal: AbortSignal) -> Result<()> {
         let role = self.retrieve_role(name)?;
-        let mcp_servers = if self.mcp_servers {
+        let mcp_servers = if self.mcp_server_support {
             role.enabled_mcp_servers()
         } else {
             eprintln!(
@@ -1102,7 +1105,7 @@ impl Config {
                 formatdoc!(
                     "
 										This role uses MCP servers, but MCP support is disabled.
-										To enable it, exit the role and set 'mcp_servers: true', then try again
+										To enable it, exit the role and set 'mcp_server_support: true', then try again
 										"
                 )
             );
@@ -1354,7 +1357,7 @@ impl Config {
         }
         let mut new_session = false;
         if let Some(session) = session.as_mut() {
-            let mcp_servers = if self.mcp_servers {
+            let mcp_servers = if self.mcp_server_support {
                 session.enabled_mcp_servers()
             } else {
                 eprintln!(
@@ -1362,7 +1365,7 @@ impl Config {
                     formatdoc!(
                         "
 												This session uses MCP servers, but MCP support is disabled.
-												To enable it, exit the session and set 'mcp_servers: true', then try again
+												To enable it, exit the session and set 'mcp_server_support: true', then try again
 												"
                     )
                 );
@@ -1775,8 +1778,8 @@ impl Config {
         session_name: Option<&str>,
         abort_signal: AbortSignal,
     ) -> Result<()> {
-        if !config.read().function_calling {
-            bail!("Please enable function calling before using the agent.");
+        if !config.read().function_calling_support {
+            bail!("Please enable function calling support before using the agent.");
         }
         if config.read().agent.is_some() {
             bail!("Already in an agent, please run '.exit agent' first to exit the current agent.");
@@ -1955,7 +1958,7 @@ impl Config {
 
     fn select_enabled_functions(&self, role: &Role) -> Vec<FunctionDeclaration> {
         let mut functions = vec![];
-        if self.function_calling {
+        if self.function_calling_support {
             if let Some(enabled_tools) = role.enabled_tools() {
                 let mut tool_names: HashSet<String> = Default::default();
                 let declaration_names: HashSet<String> = self
@@ -2034,7 +2037,7 @@ impl Config {
 
     fn select_enabled_mcp_servers(&self, role: &Role) -> Vec<FunctionDeclaration> {
         let mut mcp_functions = vec![];
-        if self.mcp_servers {
+        if self.mcp_server_support {
             if let Some(enabled_mcp_servers) = role.enabled_mcp_servers() {
                 let mut server_names: HashSet<String> = Default::default();
                 let mcp_declaration_names: HashSet<String> = self
@@ -2198,8 +2201,8 @@ impl Config {
                         "rag_top_k",
                         "max_output_tokens",
                         "dry_run",
-                        "function_calling",
-                        "mcp_servers",
+                        "function_calling_support",
+                        "mcp_server_support",
                         "stream",
                         "save",
                         "highlight",
@@ -2232,7 +2235,7 @@ impl Config {
                 "dry_run" => complete_bool(self.dry_run),
                 "stream" => complete_bool(self.stream),
                 "save" => complete_bool(self.save),
-                "function_calling" => complete_bool(self.function_calling),
+                "function_calling_support" => complete_bool(self.function_calling_support),
                 "enabled_tools" => {
                     let mut prefix = String::new();
                     let mut ignores = HashSet::new();
@@ -2252,7 +2255,7 @@ impl Config {
                         .map(|v| format!("{prefix}{v}"))
                         .collect()
                 }
-                "mcp_servers" => complete_bool(self.mcp_servers),
+                "mcp_server_support" => complete_bool(self.mcp_server_support),
                 "enabled_mcp_servers" => {
                     let mut prefix = String::new();
                     let mut ignores = HashSet::new();
@@ -2729,8 +2732,8 @@ impl Config {
             self.wrap_code = v;
         }
 
-        if let Some(Some(v)) = read_env_bool(&get_env_name("function_calling")) {
-            self.function_calling = v;
+        if let Some(Some(v)) = read_env_bool(&get_env_name("function_calling_support")) {
+            self.function_calling_support = v;
         }
         if let Ok(v) = env::var(get_env_name("mapping_tools")) {
             if let Ok(v) = serde_json::from_str(&v) {
@@ -2739,6 +2742,18 @@ impl Config {
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("enabled_tools")) {
             self.enabled_tools = v;
+        }
+
+        if let Some(Some(v)) = read_env_bool(&get_env_name("mcp_server_support")) {
+            self.mcp_server_support = v;
+        }
+        if let Ok(v) = env::var(get_env_name("mapping_mcp_servers")) {
+            if let Ok(v) = serde_json::from_str(&v) {
+                self.mapping_mcp_servers = v;
+            }
+        }
+        if let Some(v) = read_env_value::<String>(&get_env_name("enabled_mcp_servers")) {
+            self.enabled_mcp_servers = v;
         }
 
         if let Some(v) = read_env_value::<String>(&get_env_name("repl_prelude")) {
@@ -2846,17 +2861,17 @@ impl Config {
         .await?;
         match mcp_registry.is_empty() {
             false => {
-                if self.mcp_servers {
+                if self.mcp_server_support {
                     self.functions
                         .append_mcp_meta_functions(mcp_registry.list_started_servers());
                 } else {
                     debug!(
-                        "Skipping global MCP functions registration since mcp_servers was 'false'"
+                        "Skipping global MCP functions registration since 'mcp_server_support' was 'false'"
                     );
                 }
             }
             _ => debug!(
-                "Skipping global MCP functions registration since start_mcp_servers was 'false'"
+                "Skipping global MCP functions registration since 'start_mcp_servers' was 'false'"
             ),
         }
         self.mcp_registry = Some(mcp_registry);

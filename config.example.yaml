@@ -44,7 +44,7 @@ visible_tools:                   # Which tools are visible to be compiled (and a
 #  - web_search_tavily.sh
 
 # ---- MCP Servers ----
-mcp_servers: true                # Enables or disables MCP servers (globally).
+mcp_server_support: true         # Enables or disables MCP servers (globally).
 mapping_mcp_servers:             # Alias for an MCP server or set of servers
   git: github,gitmcp
 enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 'github,slack')
