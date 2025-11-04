@@ -5,10 +5,10 @@
 set -e
 
 main() {
-    root_dir="{config_dir}/functions"
+    root_dir="{root_dir}"
     parse_argv "$@"
     setup_env
-    tool_path="$root_dir/tools/{function_name}.sh"
+    tool_path="{tool_path}.sh"
     run
 }
 
@@ -24,6 +24,7 @@ setup_env() {
     export LLM_ROOT_DIR="$root_dir"
     export LLM_TOOL_NAME="{function_name}"
     export LLM_TOOL_CACHE_DIR="$LLM_ROOT_DIR/cache/{function_name}"
+    export LLM_PROMPT_UTILS_FILE="{prompt_utils_file}"
 }
 
 load_env() {

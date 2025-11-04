@@ -74,6 +74,8 @@ const FUNCTIONS_BIN_DIR_NAME: &str = "bin";
 const AGENTS_DIR_NAME: &str = "agents";
 const GLOBAL_TOOLS_DIR_NAME: &str = "tools";
 const GLOBAL_TOOLS_FILE_NAME: &str = "tools.txt";
+const GLOBAL_TOOLS_UTILS_DIR_NAME: &str = "utils";
+const BASH_PROMPT_UTILS_FILE_NAME: &str = "prompt-utils.sh";
 const MCP_FILE_NAME: &str = "mcp.json";
 
 const CLIENTS_FIELD: &str = "clients";
@@ -490,6 +492,14 @@ impl Config {
 
     pub fn global_tools_dir() -> PathBuf {
         Self::functions_dir().join(GLOBAL_TOOLS_DIR_NAME)
+    }
+
+    pub fn global_utils_dir() -> PathBuf {
+        Self::functions_dir().join(GLOBAL_TOOLS_UTILS_DIR_NAME)
+    }
+
+    pub fn bash_prompt_utils_file() -> PathBuf {
+        Self::global_utils_dir().join(BASH_PROMPT_UTILS_FILE_NAME)
     }
 
     pub fn session_file(&self, name: &str) -> PathBuf {

@@ -32,8 +32,8 @@ const PATH_SEP: &str = ";";
 const PATH_SEP: &str = ":";
 
 #[derive(AsRefStr)]
-enum BinaryType {
-    Tool,
+enum BinaryType<'a> {
+    Tool(Option<&'a str>),
     Agent,
 }
 
@@ -169,6 +169,7 @@ impl Functions {
 
     pub fn init() -> Result<Self> {
         Self::install_global_tools()?;
+        Self::clear_global_functions_bin_dir()?;
         info!(
             "Initializing global functions from {}",
             Config::global_tools_file().display()
@@ -191,6 +192,8 @@ impl Functions {
 
     pub fn init_agent(name: &str, global_tools: &[String]) -> Result<Self> {
         Self::install_global_tools()?;
+        Self::clear_agent_bin_dir(name)?;
+
         let global_tools_declarations = if !global_tools.is_empty() {
             let enabled_tools = global_tools.join("\n");
             info!("Loading global tools for agent: {name}: {enabled_tools}");
@@ -200,7 +203,7 @@ impl Functions {
                 "Building global function binaries required by agent: {name} in {}",
                 Config::functions_bin_dir().display()
             );
-            Self::build_global_function_binaries(&enabled_tools)?;
+            Self::build_global_function_binaries(&enabled_tools, Some(name))?;
             tools_declarations
         } else {
             debug!("No global tools found for agent: {}", name);
@@ -381,17 +384,7 @@ impl Functions {
         }
     }
 
-    fn build_global_function_binaries(enabled_tools: &str) -> Result<()> {
-        let bin_dir = Config::functions_bin_dir();
-        if !bin_dir.exists() {
-            fs::create_dir_all(&bin_dir)?;
-        }
-        info!(
-            "Clearing existing function binaries in {}",
-            bin_dir.display()
-        );
-        clear_dir(&bin_dir)?;
-
+    fn build_global_function_binaries(enabled_tools: &str, agent_name: Option<&str>) -> Result<()> {
         for line in enabled_tools.lines() {
             if line.starts_with('#') {
                 continue;
@@ -417,7 +410,7 @@ impl Functions {
                 bail!("Unsupported tool file extension: {}", language.as_ref());
             }
 
-            Self::build_binaries(binary_name, language, BinaryType::Tool)?;
+            Self::build_binaries(binary_name, language, BinaryType::Tool(agent_name))?;
         }
 
         Ok(())
@@ -427,10 +420,10 @@ impl Functions {
         let enabled_tools = fs::read_to_string(&tools_txt_path)
             .with_context(|| format!("failed to load functions at {}", tools_txt_path.display()))?;
 
-        Self::build_global_function_binaries(&enabled_tools)
+        Self::build_global_function_binaries(&enabled_tools, None)
     }
 
-    fn build_agent_tool_binaries(name: &str) -> Result<()> {
+    fn clear_agent_bin_dir(name: &str) -> Result<()> {
         let agent_bin_directory = Config::agent_bin_dir(name);
         if !agent_bin_directory.exists() {
             debug!(
@@ -446,6 +439,25 @@ impl Functions {
             clear_dir(&agent_bin_directory)?;
         }
 
+        Ok(())
+    }
+
+    fn clear_global_functions_bin_dir() -> Result<()> {
+        let bin_dir = Config::functions_bin_dir();
+        if !bin_dir.exists() {
+            fs::create_dir_all(&bin_dir)?;
+        }
+
+        info!(
+            "Clearing existing function binaries in {}",
+            bin_dir.display()
+        );
+        clear_dir(&bin_dir)?;
+
+        Ok(())
+    }
+
+    fn build_agent_tool_binaries(name: &str) -> Result<()> {
         let language = Language::from(
             &Config::agent_functions_file(name)?
                 .extension()
@@ -471,9 +483,14 @@ impl Functions {
     ) -> Result<()> {
         use native::runtime;
         let (binary_file, binary_script_file) = match binary_type {
-            BinaryType::Tool => (
+            BinaryType::Tool(None) => (
                 Config::functions_bin_dir().join(format!("{binary_name}.cmd")),
                 Config::functions_bin_dir()
+                    .join(format!("run-{binary_name}.{}", language.to_extension())),
+            ),
+            BinaryType::Tool(Some(agent_name)) => (
+                Config::agent_bin_dir(agent_name).join(format!("{binary_name}.cmd")),
+                Config::agent_bin_dir(agent_name)
                     .join(format!("run-{binary_name}.{}", language.to_extension())),
             ),
             BinaryType::Agent => (
@@ -501,10 +518,36 @@ impl Functions {
         })?;
         let content_template = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
         let content = match binary_type {
-            BinaryType::Tool => content_template.replace("{function_name}", binary_name),
-            BinaryType::Agent => content_template.replace("{agent_name}", binary_name),
+            BinaryType::Tool(None) => {
+                let root_dir = Config::functions_dir();
+                let tool_path = format!(
+                    "{}/{binary_name}",
+                    &Config::global_tools_dir().to_string_lossy()
+                );
+                content_template
+                    .replace("{function_name}", binary_name)
+                    .replace("{root_dir}", &root_dir.to_string_lossy())
+                    .replace("{tool_path}", &tool_path)
+            }
+            BinaryType::Tool(Some(agent_name)) => {
+                let root_dir = Config::agent_data_dir(agent_name);
+                let tool_path = format!(
+                    "{}/{binary_name}",
+                    &Config::global_tools_dir().to_string_lossy()
+                );
+                content_template
+                    .replace("{function_name}", binary_name)
+                    .replace("{root_dir}", &root_dir.to_string_lossy())
+                    .replace("{tool_path}", &tool_path)
+            }
+            BinaryType::Agent => content_template
+                .replace("{agent_name}", binary_name)
+                .replace("{config_dir}", &Config::config_dir().to_string_lossy()),
         }
-        .replace("{config_dir}", &Config::config_dir().to_string_lossy());
+        .replace(
+            "{prompt_utils_file}",
+            &Config::bash_prompt_utils_file().to_string_lossy(),
+        );
         if binary_script_file.exists() {
             fs::remove_file(&binary_script_file)?;
         }
@@ -578,7 +621,10 @@ impl Functions {
         use std::os::unix::prelude::PermissionsExt;
 
         let binary_file = match binary_type {
-            BinaryType::Tool => Config::functions_bin_dir().join(binary_name),
+            BinaryType::Tool(None) => Config::functions_bin_dir().join(binary_name),
+            BinaryType::Tool(Some(agent_name)) => {
+                Config::agent_bin_dir(agent_name).join(binary_name)
+            }
             BinaryType::Agent => Config::agent_bin_dir(binary_name).join(binary_name),
         };
         info!(
@@ -600,10 +646,36 @@ impl Functions {
         })?;
         let content_template = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
         let content = match binary_type {
-            BinaryType::Tool => content_template.replace("{function_name}", binary_name),
-            BinaryType::Agent => content_template.replace("{agent_name}", binary_name),
+            BinaryType::Tool(None) => {
+                let root_dir = Config::functions_dir();
+                let tool_path = format!(
+                    "{}/{binary_name}",
+                    &Config::global_tools_dir().to_string_lossy()
+                );
+                content_template
+                    .replace("{function_name}", binary_name)
+                    .replace("{root_dir}", &root_dir.to_string_lossy())
+                    .replace("{tool_path}", &tool_path)
+            }
+            BinaryType::Tool(Some(agent_name)) => {
+                let root_dir = Config::agent_data_dir(agent_name);
+                let tool_path = format!(
+                    "{}/{binary_name}",
+                    &Config::global_tools_dir().to_string_lossy()
+                );
+                content_template
+                    .replace("{function_name}", binary_name)
+                    .replace("{root_dir}", &root_dir.to_string_lossy())
+                    .replace("{tool_path}", &tool_path)
+            }
+            BinaryType::Agent => content_template
+                .replace("{agent_name}", binary_name)
+                .replace("{config_dir}", &Config::config_dir().to_string_lossy()),
         }
-        .replace("{config_dir}", &Config::config_dir().to_string_lossy());
+        .replace(
+            "{prompt_utils_file}",
+            &Config::bash_prompt_utils_file().to_string_lossy(),
+        );
         if binary_file.exists() {
             fs::remove_file(&binary_file)?;
         }
@@ -696,6 +768,11 @@ impl ToolCall {
             Some(agent) => self.extract_call_config_from_agent(config, agent)?,
             None => self.extract_call_config_from_config(config)?,
         };
+        let agent_name = config
+            .read()
+            .agent
+            .as_ref()
+            .map(|agent| agent.name().to_owned());
 
         let json_data = if self.arguments.is_object() {
             self.arguments.clone()
@@ -754,7 +831,7 @@ impl ToolCall {
                 let result = registry_arc.invoke(server, tool, arguments).await?;
                 serde_json::to_value(result)?
             }
-            _ => match run_llm_function(cmd_name, cmd_args, envs)? {
+            _ => match run_llm_function(cmd_name, cmd_args, envs, agent_name)? {
                 Some(contents) => serde_json::from_str(&contents)
                     .ok()
                     .unwrap_or_else(|| json!({"output": contents})),
@@ -812,15 +889,17 @@ pub fn run_llm_function(
     cmd_name: String,
     cmd_args: Vec<String>,
     mut envs: HashMap<String, String>,
+    agent_name: Option<String>,
 ) -> Result<Option<String>> {
     let mut bin_dirs: Vec<PathBuf> = vec![];
-    if cmd_args.len() > 1 {
-        let dir = Config::agent_bin_dir(&cmd_name);
+    if let Some(agent_name) = agent_name {
+        let dir = Config::agent_bin_dir(&agent_name);
         if dir.exists() {
             bin_dirs.push(dir);
         }
+    } else {
+        bin_dirs.push(Config::functions_bin_dir());
     }
-    bin_dirs.push(Config::functions_bin_dir());
     let current_path = env::var("PATH").context("No PATH environment variable")?;
     let prepend_path = bin_dirs
         .iter()

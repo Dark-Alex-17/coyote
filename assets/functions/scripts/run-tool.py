@@ -31,10 +31,10 @@ def main():
     raw_data = parse_argv()
     tool_data = parse_raw_data(raw_data)
 
-    root_dir = "{config_dir}/functions"
+    root_dir = "{root_dir}"
     setup_env(root_dir)
 
-    tool_path = os.path.join(root_dir, "tools/{function_name}.py")
+    tool_path = "{tool_path}.py"
     run(tool_path, "run", tool_data)
 
 
