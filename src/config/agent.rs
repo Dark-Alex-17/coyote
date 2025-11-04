@@ -418,7 +418,7 @@ impl RoleLike for Agent {
         self.config.top_p
     }
 
-    fn use_tools(&self) -> Option<String> {
+    fn enabled_tools(&self) -> Option<String> {
         self.config.global_tools.clone().join(",").into()
     }
 
@@ -439,7 +439,7 @@ impl RoleLike for Agent {
         self.config.top_p = value;
     }
 
-    fn set_use_tools(&mut self, value: Option<String>) {
+    fn set_enabled_tools(&mut self, value: Option<String>) {
         match value {
             Some(tools) => {
                 let tools = tools

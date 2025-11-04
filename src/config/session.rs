@@ -25,7 +25,7 @@ pub struct Session {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    use_tools: Option<String>,
+    enabled_tools: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     use_mcp_servers: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,8 +156,8 @@ impl Session {
         if let Some(top_p) = self.top_p() {
             data["top_p"] = top_p.into();
         }
-        if let Some(use_tools) = self.use_tools() {
-            data["use_tools"] = use_tools.into();
+        if let Some(enabled_tools) = self.enabled_tools() {
+            data["enabled_tools"] = enabled_tools.into();
         }
         if let Some(use_mcp_servers) = self.use_mcp_servers() {
             data["use_mcp_servers"] = use_mcp_servers.into();
@@ -204,8 +204,8 @@ impl Session {
             items.push(("top_p", top_p.to_string()));
         }
 
-        if let Some(use_tools) = self.use_tools() {
-            items.push(("use_tools", use_tools));
+        if let Some(enabled_tools) = self.enabled_tools() {
+            items.push(("enabled_tools", enabled_tools));
         }
 
         if let Some(use_mcp_servers) = self.use_mcp_servers() {
@@ -280,7 +280,7 @@ impl Session {
         self.model_id = role.model().id();
         self.temperature = role.temperature();
         self.top_p = role.top_p();
-        self.use_tools = role.use_tools();
+        self.enabled_tools = role.enabled_tools();
         self.use_mcp_servers = role.use_mcp_servers();
         self.model = role.model().clone();
         self.role_name = convert_option_string(role.name());
@@ -587,8 +587,8 @@ impl RoleLike for Session {
         self.top_p
     }
 
-    fn use_tools(&self) -> Option<String> {
-        self.use_tools.clone()
+    fn enabled_tools(&self) -> Option<String> {
+        self.enabled_tools.clone()
     }
 
     fn use_mcp_servers(&self) -> Option<String> {
@@ -618,9 +618,9 @@ impl RoleLike for Session {
         }
     }
 
-    fn set_use_tools(&mut self, value: Option<String>) {
-        if self.use_tools != value {
-            self.use_tools = value;
+    fn set_enabled_tools(&mut self, value: Option<String>) {
+        if self.enabled_tools != value {
+            self.enabled_tools = value;
             self.dirty = true;
         }
     }

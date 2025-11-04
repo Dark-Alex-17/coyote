@@ -1,3 +1,3 @@
 ---
-use_tools: all
+enabled_tools: all
 ---

@@ -16,8 +16,8 @@ vault_password_file: null        # Path to a file containing the password for th
 function_calling: true           # Enables or disables function calling (Globally).
 mapping_tools:                   # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
-use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search_loki')
-visible_tools:                   # Which tools are visible to be compiled (and are thus able to be defined in 'use_tools')
+enabled_tools: null              # Which tools to enable by default. (e.g. 'fs,web_search_loki')
+visible_tools:                   # Which tools are visible to be compiled (and are thus able to be defined in 'enabled_tools')
 #  - demo_py.py
 #  - demo_sh.sh
   - execute_command.sh
