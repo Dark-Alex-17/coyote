@@ -57,7 +57,7 @@ impl McpRegistry {
     pub async fn init(
         log_path: Option<PathBuf>,
         start_mcp_servers: bool,
-        use_mcp_servers: Option<String>,
+        enabled_mcp_servers: Option<String>,
         abort_signal: AbortSignal,
         config: &Config,
     ) -> Result<Self> {
@@ -109,7 +109,7 @@ impl McpRegistry {
 
         if start_mcp_servers && config.mcp_servers {
             abortable_run_with_spinner(
-                registry.start_select_mcp_servers(use_mcp_servers),
+                registry.start_select_mcp_servers(enabled_mcp_servers),
                 "Loading MCP servers",
                 abort_signal,
             )
@@ -121,7 +121,7 @@ impl McpRegistry {
 
     pub async fn reinit(
         registry: McpRegistry,
-        use_mcp_servers: Option<String>,
+        enabled_mcp_servers: Option<String>,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
         debug!("Reinitializing MCP registry");
@@ -134,7 +134,7 @@ impl McpRegistry {
         .await?;
 
         abortable_run_with_spinner(
-            new_registry.start_select_mcp_servers(use_mcp_servers),
+            new_registry.start_select_mcp_servers(enabled_mcp_servers),
             "Loading MCP servers",
             abort_signal,
         )
@@ -143,13 +143,16 @@ impl McpRegistry {
         Ok(new_registry)
     }
 
-    async fn start_select_mcp_servers(&mut self, use_mcp_servers: Option<String>) -> Result<()> {
+    async fn start_select_mcp_servers(
+        &mut self,
+        enabled_mcp_servers: Option<String>,
+    ) -> Result<()> {
         if self.config.is_none() {
             debug!("MCP config is not present; assuming MCP servers are disabled globally. Skipping MCP initialization");
             return Ok(());
         }
 
-        if let Some(servers) = use_mcp_servers {
+        if let Some(servers) = enabled_mcp_servers {
             debug!("Starting selected MCP servers: {:?}", servers);
             let config = self
                 .config

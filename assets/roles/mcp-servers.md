@@ -1,3 +1,3 @@
 ---
-use_mcp_servers: all
+enabled_mcp_servers: all
 ---

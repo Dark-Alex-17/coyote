@@ -1,5 +1,5 @@
 ---
-use_mcp_servers: slack
+enabled_mcp_servers: slack
 temperature: 0.2
 ---
 You are an expert Slack assistant designed to assist with Slack workspaces via the slack MCP server. 

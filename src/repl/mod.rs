@@ -700,13 +700,13 @@ pub async fn run_repl_command(
                         .mcp_registry
                         .take()
                         .expect("MCP registry should exist");
-                    let use_mcp_servers = if config.read().mcp_servers {
-                        config.read().use_mcp_servers.clone()
+                    let enabled_mcp_servers = if config.read().mcp_servers {
+                        config.read().enabled_mcp_servers.clone()
                     } else {
                         None
                     };
                     let registry =
-                        McpRegistry::reinit(registry, use_mcp_servers, abort_signal.clone())
+                        McpRegistry::reinit(registry, enabled_mcp_servers, abort_signal.clone())
                             .await?;
                     if !registry.is_empty() {
                         config
@@ -726,14 +726,17 @@ pub async fn run_repl_command(
                             .mcp_registry
                             .take()
                             .expect("MCP registry should exist");
-                        let use_mcp_servers = if config.read().mcp_servers {
-                            config.read().use_mcp_servers.clone()
+                        let enabled_mcp_servers = if config.read().mcp_servers {
+                            config.read().enabled_mcp_servers.clone()
                         } else {
                             None
                         };
-                        let registry =
-                            McpRegistry::reinit(registry, use_mcp_servers, abort_signal.clone())
-                                .await?;
+                        let registry = McpRegistry::reinit(
+                            registry,
+                            enabled_mcp_servers,
+                            abort_signal.clone(),
+                        )
+                        .await?;
                         if !registry.is_empty() {
                             config
                                 .write()
@@ -757,13 +760,13 @@ pub async fn run_repl_command(
                         .mcp_registry
                         .take()
                         .expect("MCP registry should exist");
-                    let use_mcp_servers = if config.read().mcp_servers {
-                        config.read().use_mcp_servers.clone()
+                    let enabled_mcp_servers = if config.read().mcp_servers {
+                        config.read().enabled_mcp_servers.clone()
                     } else {
                         None
                     };
                     let registry =
-                        McpRegistry::reinit(registry, use_mcp_servers, abort_signal.clone())
+                        McpRegistry::reinit(registry, enabled_mcp_servers, abort_signal.clone())
                             .await?;
                     if !registry.is_empty() {
                         config

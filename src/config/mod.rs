@@ -135,7 +135,7 @@ pub struct Config {
 
     pub mcp_servers: bool,
     pub mapping_mcp_servers: IndexMap<String, String>,
-    pub use_mcp_servers: Option<String>,
+    pub enabled_mcp_servers: Option<String>,
 
     pub repl_prelude: Option<String>,
     pub cmd_prelude: Option<String>,
@@ -221,7 +221,7 @@ impl Default for Config {
 
             mcp_servers: true,
             mapping_mcp_servers: Default::default(),
-            use_mcp_servers: None,
+            enabled_mcp_servers: None,
 
             repl_prelude: None,
             cmd_prelude: None,
@@ -648,7 +648,7 @@ impl Config {
                 self.temperature,
                 self.top_p,
                 self.enabled_tools.clone(),
-                self.use_mcp_servers.clone(),
+                self.enabled_mcp_servers.clone(),
             );
             role
         }
@@ -696,8 +696,8 @@ impl Config {
             ("top_p", format_option_value(&role.top_p())),
             ("enabled_tools", format_option_value(&role.enabled_tools())),
             (
-                "use_mcp_servers",
-                format_option_value(&role.use_mcp_servers()),
+                "enabled_mcp_servers",
+                format_option_value(&role.enabled_mcp_servers()),
             ),
             (
                 "max_output_tokens",
@@ -771,13 +771,13 @@ impl Config {
                 let value = parse_value(value)?;
                 config.write().set_enabled_tools(value);
             }
-            "use_mcp_servers" => {
+            "enabled_mcp_servers" => {
                 let value: Option<String> = parse_value(value)?;
                 if let Some(servers) = value.as_ref() {
                     if let Some(registry) = &config.read().mcp_registry {
                         if registry.list_configured_servers().is_empty() {
                             bail!(
-                                "No MCP servers are configured. Please configure MCP servers first before setting 'use_mcp_servers'."
+                                "No MCP servers are configured. Please configure MCP servers first before setting 'enabled_mcp_servers'."
                             );
                         }
 
@@ -788,12 +788,12 @@ impl Config {
                                 || s == "all"
                         }) {
                             bail!(
-                                "Some of the specified MCP servers in 'use_mcp_servers' are configured. Please check your MCP server configuration."
+                                "Some of the specified MCP servers in 'enabled_mcp_servers' are configured. Please check your MCP server configuration."
                             );
                         }
                     }
                 }
-                config.write().set_use_mcp_servers(value.clone());
+                config.write().set_enabled_mcp_servers(value.clone());
                 if config.read().mcp_servers {
                     config.write().functions.clear_mcp_meta_functions();
                     let registry = config
@@ -854,13 +854,14 @@ impl Config {
                     .mcp_registry
                     .take()
                     .expect("MCP registry should be initialized");
-                let use_mcp_servers = if value {
-                    config.read().use_mcp_servers.clone()
+                let enabled_mcp_servers = if value {
+                    config.read().enabled_mcp_servers.clone()
                 } else {
                     None
                 };
                 let new_registry =
-                    McpRegistry::reinit(registry, use_mcp_servers, abort_signal.clone()).await?;
+                    McpRegistry::reinit(registry, enabled_mcp_servers, abort_signal.clone())
+                        .await?;
                 if !new_registry.is_empty() && value {
                     config
                         .write()
@@ -977,10 +978,10 @@ impl Config {
         }
     }
 
-    pub fn set_use_mcp_servers(&mut self, value: Option<String>) {
+    pub fn set_enabled_mcp_servers(&mut self, value: Option<String>) {
         match self.role_like_mut() {
-            Some(role_like) => role_like.set_use_mcp_servers(value),
-            None => self.use_mcp_servers = value,
+            Some(role_like) => role_like.set_enabled_mcp_servers(value),
+            None => self.enabled_mcp_servers = value,
         }
     }
 
@@ -1094,7 +1095,7 @@ impl Config {
     pub async fn use_role(&mut self, name: &str, abort_signal: AbortSignal) -> Result<()> {
         let role = self.retrieve_role(name)?;
         let mcp_servers = if self.mcp_servers {
-            role.use_mcp_servers()
+            role.enabled_mcp_servers()
         } else {
             eprintln!(
                 "{}",
@@ -1354,7 +1355,7 @@ impl Config {
         let mut new_session = false;
         if let Some(session) = session.as_mut() {
             let mcp_servers = if self.mcp_servers {
-                session.use_mcp_servers()
+                session.enabled_mcp_servers()
             } else {
                 eprintln!(
                     "{}",
@@ -2034,7 +2035,7 @@ impl Config {
     fn select_enabled_mcp_servers(&self, role: &Role) -> Vec<FunctionDeclaration> {
         let mut mcp_functions = vec![];
         if self.mcp_servers {
-            if let Some(use_mcp_servers) = role.use_mcp_servers() {
+            if let Some(enabled_mcp_servers) = role.enabled_mcp_servers() {
                 let mut server_names: HashSet<String> = Default::default();
                 let mcp_declaration_names: HashSet<String> = self
                     .functions
@@ -2046,10 +2047,10 @@ impl Config {
                     })
                     .map(|v| v.name.to_string())
                     .collect();
-                if use_mcp_servers == "all" {
+                if enabled_mcp_servers == "all" {
                     server_names.extend(mcp_declaration_names);
                 } else {
-                    for item in use_mcp_servers.split(',') {
+                    for item in enabled_mcp_servers.split(',') {
                         let item = item.trim();
                         let item_invoke_name =
                             format!("{}_{item}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
@@ -2190,7 +2191,7 @@ impl Config {
                         "temperature",
                         "top_p",
                         "enabled_tools",
-                        "use_mcp_servers",
+                        "enabled_mcp_servers",
                         "save_session",
                         "compress_threshold",
                         "rag_reranker_model",
@@ -2252,7 +2253,7 @@ impl Config {
                         .collect()
                 }
                 "mcp_servers" => complete_bool(self.mcp_servers),
-                "use_mcp_servers" => {
+                "enabled_mcp_servers" => {
                     let mut prefix = String::new();
                     let mut ignores = HashSet::new();
                     if let Some((v, _)) = args[1].rsplit_once(',') {
@@ -2838,7 +2839,7 @@ impl Config {
         let mcp_registry = McpRegistry::init(
             log_path,
             start_mcp_servers,
-            self.use_mcp_servers.clone(),
+            self.enabled_mcp_servers.clone(),
             abort_signal.clone(),
             self,
         )
@@ -2952,7 +2953,7 @@ pub async fn macro_execute(
     config.temperature = role.temperature();
     config.top_p = role.top_p();
     config.enabled_tools = role.enabled_tools().clone();
-    config.use_mcp_servers = role.use_mcp_servers().clone();
+    config.enabled_mcp_servers = role.enabled_mcp_servers().clone();
     config.macro_flag = true;
     config.model = role.model().clone();
     config.role = None;

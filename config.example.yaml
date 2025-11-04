@@ -47,7 +47,7 @@ visible_tools:                   # Which tools are visible to be compiled (and a
 mcp_servers: true                # Enables or disables MCP servers (globally).
 mapping_mcp_servers:             # Alias for an MCP server or set of servers
   git: github,gitmcp
-use_mcp_servers: null            # Which MCP servers to use by default (e.g. 'github,slack')
+enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 'github,slack')
 
 # ---- prelude ----
 repl_prelude: null               # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)

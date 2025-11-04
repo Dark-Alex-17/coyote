@@ -422,7 +422,7 @@ impl RoleLike for Agent {
         self.config.global_tools.clone().join(",").into()
     }
 
-    fn use_mcp_servers(&self) -> Option<String> {
+    fn enabled_mcp_servers(&self) -> Option<String> {
         self.config.mcp_servers.clone().join(",").into()
     }
 
@@ -455,7 +455,7 @@ impl RoleLike for Agent {
         }
     }
 
-    fn set_use_mcp_servers(&mut self, value: Option<String>) {
+    fn set_enabled_mcp_servers(&mut self, value: Option<String>) {
         match value {
             Some(servers) => {
                 let servers = servers

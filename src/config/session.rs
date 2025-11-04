@@ -27,7 +27,7 @@ pub struct Session {
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled_tools: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    use_mcp_servers: Option<String>,
+    enabled_mcp_servers: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     save_session: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,8 +159,8 @@ impl Session {
         if let Some(enabled_tools) = self.enabled_tools() {
             data["enabled_tools"] = enabled_tools.into();
         }
-        if let Some(use_mcp_servers) = self.use_mcp_servers() {
-            data["use_mcp_servers"] = use_mcp_servers.into();
+        if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
+            data["enabled_mcp_servers"] = enabled_mcp_servers.into();
         }
         if let Some(save_session) = self.save_session() {
             data["save_session"] = save_session.into();
@@ -208,8 +208,8 @@ impl Session {
             items.push(("enabled_tools", enabled_tools));
         }
 
-        if let Some(use_mcp_servers) = self.use_mcp_servers() {
-            items.push(("use_mcp_servers", use_mcp_servers));
+        if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
+            items.push(("enabled_mcp_servers", enabled_mcp_servers));
         }
 
         if let Some(save_session) = self.save_session() {
@@ -281,7 +281,7 @@ impl Session {
         self.temperature = role.temperature();
         self.top_p = role.top_p();
         self.enabled_tools = role.enabled_tools();
-        self.use_mcp_servers = role.use_mcp_servers();
+        self.enabled_mcp_servers = role.enabled_mcp_servers();
         self.model = role.model().clone();
         self.role_name = convert_option_string(role.name());
         self.role_prompt = role.prompt().to_string();
@@ -591,8 +591,8 @@ impl RoleLike for Session {
         self.enabled_tools.clone()
     }
 
-    fn use_mcp_servers(&self) -> Option<String> {
-        self.use_mcp_servers.clone()
+    fn enabled_mcp_servers(&self) -> Option<String> {
+        self.enabled_mcp_servers.clone()
     }
 
     fn set_model(&mut self, model: Model) {
@@ -625,9 +625,9 @@ impl RoleLike for Session {
         }
     }
 
-    fn set_use_mcp_servers(&mut self, value: Option<String>) {
-        if self.use_mcp_servers != value {
-            self.use_mcp_servers = value;
+    fn set_enabled_mcp_servers(&mut self, value: Option<String>) {
+        if self.enabled_mcp_servers != value {
+            self.enabled_mcp_servers = value;
             self.dirty = true;
         }
     }
