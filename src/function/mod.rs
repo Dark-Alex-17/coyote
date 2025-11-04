@@ -167,25 +167,19 @@ impl Functions {
         Ok(())
     }
 
-    pub fn init() -> Result<Self> {
+    pub fn init(visible_tools: &[String]) -> Result<Self> {
         Self::install_global_tools()?;
         Self::clear_global_functions_bin_dir()?;
-        info!(
-            "Initializing global functions from {}",
-            Config::global_tools_file().display()
-        );
 
         let declarations = Self {
-            declarations: Self::build_global_tool_declarations_from_path(
-                &Config::global_tools_file(),
-            )?,
+            declarations: Self::build_global_tool_declarations(visible_tools)?,
         };
 
         info!(
             "Building global function binaries in {}",
             Config::functions_bin_dir().display()
         );
-        Self::build_global_function_binaries_from_path(Config::global_tools_file())?;
+        Self::build_global_function_binaries(visible_tools, None)?;
 
         Ok(declarations)
     }
@@ -195,15 +189,14 @@ impl Functions {
         Self::clear_agent_bin_dir(name)?;
 
         let global_tools_declarations = if !global_tools.is_empty() {
-            let enabled_tools = global_tools.join("\n");
-            info!("Loading global tools for agent: {name}: {enabled_tools}");
-            let tools_declarations = Self::build_global_tool_declarations(&enabled_tools)?;
+            info!("Loading global tools for agent: {name}: {global_tools:?}");
+            let tools_declarations = Self::build_global_tool_declarations(global_tools)?;
 
             info!(
                 "Building global function binaries required by agent: {name} in {}",
                 Config::functions_bin_dir().display()
             );
-            Self::build_global_function_binaries(&enabled_tools, Some(name))?;
+            Self::build_global_function_binaries(global_tools, Some(name))?;
             tools_declarations
         } else {
             debug!("No global tools found for agent: {}", name);
@@ -311,29 +304,18 @@ impl Functions {
         }
     }
 
-    fn build_global_tool_declarations(enabled_tools: &str) -> Result<Vec<FunctionDeclaration>> {
+    fn build_global_tool_declarations(
+        enabled_tools: &[String],
+    ) -> Result<Vec<FunctionDeclaration>> {
         let global_tools_directory = Config::global_tools_dir();
         let mut function_declarations = Vec::new();
 
-        for line in enabled_tools.lines() {
-            if line.starts_with('#') {
-                continue;
-            }
-
-            let declaration = Self::generate_declarations(&global_tools_directory.join(line))?;
+        for tool in enabled_tools {
+            let declaration = Self::generate_declarations(&global_tools_directory.join(tool))?;
             function_declarations.extend(declaration);
         }
 
         Ok(function_declarations)
-    }
-
-    fn build_global_tool_declarations_from_path(
-        tools_txt_path: &PathBuf,
-    ) -> Result<Vec<FunctionDeclaration>> {
-        let enabled_tools = fs::read_to_string(tools_txt_path)
-            .with_context(|| format!("failed to load functions at {}", tools_txt_path.display()))?;
-
-        Self::build_global_tool_declarations(&enabled_tools)
     }
 
     fn generate_declarations(tools_file_path: &Path) -> Result<Vec<FunctionDeclaration>> {
@@ -384,26 +366,25 @@ impl Functions {
         }
     }
 
-    fn build_global_function_binaries(enabled_tools: &str, agent_name: Option<&str>) -> Result<()> {
-        for line in enabled_tools.lines() {
-            if line.starts_with('#') {
-                continue;
-            }
-
+    fn build_global_function_binaries(
+        enabled_tools: &[String],
+        agent_name: Option<&str>,
+    ) -> Result<()> {
+        for tool in enabled_tools {
             let language = Language::from(
-                &Path::new(line)
+                &Path::new(&tool)
                     .extension()
                     .and_then(OsStr::to_str)
                     .map(|s| s.to_lowercase())
                     .ok_or_else(|| {
-                        anyhow::format_err!("Unable to extract file extension from path: {line:?}")
+                        anyhow::format_err!("Unable to extract file extension from path: {tool:?}")
                     })?,
             );
-            let binary_name = Path::new(line)
+            let binary_name = Path::new(&tool)
                 .file_stem()
                 .and_then(OsStr::to_str)
                 .ok_or_else(|| {
-                    anyhow::format_err!("Unable to extract file name from path: {line:?}")
+                    anyhow::format_err!("Unable to extract file name from path: {tool:?}")
                 })?;
 
             if language == Language::Unsupported {
@@ -414,13 +395,6 @@ impl Functions {
         }
 
         Ok(())
-    }
-
-    fn build_global_function_binaries_from_path(tools_txt_path: PathBuf) -> Result<()> {
-        let enabled_tools = fs::read_to_string(&tools_txt_path)
-            .with_context(|| format!("failed to load functions at {}", tools_txt_path.display()))?;
-
-        Self::build_global_function_binaries(&enabled_tools, None)
     }
 
     fn clear_agent_bin_dir(name: &str) -> Result<()> {
