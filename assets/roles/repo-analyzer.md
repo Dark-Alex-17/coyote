@@ -1,6 +1,6 @@
 ---
 name: repo-analyzer
-use_tools: fs_cat,fs_ls,fs_write,fs_patch,execute_command
+enabled_tools: fs_cat,fs_ls,fs_write,fs_patch,execute_command
 ---
 **Context:** The task requires the AI to analyze the {{__cwd__}} repository and provide comprehensive insights into
 various aspects such as directory structure, design patterns, coding conventions, libraries, architecture, module

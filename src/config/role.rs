@@ -28,12 +28,12 @@ pub trait RoleLike {
     fn model(&self) -> &Model;
     fn temperature(&self) -> Option<f64>;
     fn top_p(&self) -> Option<f64>;
-    fn use_tools(&self) -> Option<String>;
+    fn enabled_tools(&self) -> Option<String>;
     fn use_mcp_servers(&self) -> Option<String>;
     fn set_model(&mut self, model: Model);
     fn set_temperature(&mut self, value: Option<f64>);
     fn set_top_p(&mut self, value: Option<f64>);
-    fn set_use_tools(&mut self, value: Option<String>);
+    fn set_enabled_tools(&mut self, value: Option<String>);
     fn set_use_mcp_servers(&mut self, value: Option<String>);
 }
 
@@ -52,7 +52,7 @@ pub struct Role {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    use_tools: Option<String>,
+    enabled_tools: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     use_mcp_servers: Option<String>,
 
@@ -85,7 +85,9 @@ impl Role {
                             "model" => role.model_id = value.as_str().map(|v| v.to_string()),
                             "temperature" => role.temperature = value.as_f64(),
                             "top_p" => role.top_p = value.as_f64(),
-                            "use_tools" => role.use_tools = value.as_str().map(|v| v.to_string()),
+                            "enabled_tools" => {
+                                role.enabled_tools = value.as_str().map(|v| v.to_string())
+                            }
                             "use_mcp_servers" => {
                                 role.use_mcp_servers = value.as_str().map(|v| v.to_string())
                             }
@@ -126,8 +128,8 @@ impl Role {
         if let Some(top_p) = self.top_p() {
             metadata.push(format!("top_p: {top_p}"));
         }
-        if let Some(use_tools) = self.use_tools() {
-            metadata.push(format!("use_tools: {use_tools}"));
+        if let Some(enabled_tools) = self.enabled_tools() {
+            metadata.push(format!("enabled_tools: {enabled_tools}"));
         }
         if let Some(use_mcp_servers) = self.use_mcp_servers() {
             metadata.push(format!("use_mcp_servers: {use_mcp_servers}"));
@@ -168,9 +170,9 @@ impl Role {
         let model = role_like.model();
         let temperature = role_like.temperature();
         let top_p = role_like.top_p();
-        let use_tools = role_like.use_tools();
+        let enabled_tools = role_like.enabled_tools();
         let use_mcp_servers = role_like.use_mcp_servers();
-        self.batch_set(model, temperature, top_p, use_tools, use_mcp_servers);
+        self.batch_set(model, temperature, top_p, enabled_tools, use_mcp_servers);
     }
 
     pub fn batch_set(
@@ -178,7 +180,7 @@ impl Role {
         model: &Model,
         temperature: Option<f64>,
         top_p: Option<f64>,
-        use_tools: Option<String>,
+        enabled_tools: Option<String>,
         use_mcp_servers: Option<String>,
     ) {
         self.set_model(model.clone());
@@ -188,8 +190,8 @@ impl Role {
         if top_p.is_some() {
             self.set_top_p(top_p);
         }
-        if use_tools.is_some() {
-            self.set_use_tools(use_tools);
+        if enabled_tools.is_some() {
+            self.set_enabled_tools(enabled_tools);
         }
         if use_mcp_servers.is_some() {
             self.set_use_mcp_servers(use_mcp_servers);
@@ -285,8 +287,8 @@ impl RoleLike for Role {
         self.top_p
     }
 
-    fn use_tools(&self) -> Option<String> {
-        self.use_tools.clone()
+    fn enabled_tools(&self) -> Option<String> {
+        self.enabled_tools.clone()
     }
 
     fn use_mcp_servers(&self) -> Option<String> {
@@ -308,8 +310,8 @@ impl RoleLike for Role {
         self.top_p = value;
     }
 
-    fn set_use_tools(&mut self, value: Option<String>) {
-        self.use_tools = value;
+    fn set_enabled_tools(&mut self, value: Option<String>) {
+        self.enabled_tools = value;
     }
 
     fn set_use_mcp_servers(&mut self, value: Option<String>) {

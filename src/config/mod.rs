@@ -130,7 +130,7 @@ pub struct Config {
 
     pub function_calling: bool,
     pub mapping_tools: IndexMap<String, String>,
-    pub use_tools: Option<String>,
+    pub enabled_tools: Option<String>,
     pub visible_tools: Option<Vec<String>>,
 
     pub mcp_servers: bool,
@@ -216,7 +216,7 @@ impl Default for Config {
 
             function_calling: true,
             mapping_tools: Default::default(),
-            use_tools: None,
+            enabled_tools: None,
             visible_tools: None,
 
             mcp_servers: true,
@@ -647,7 +647,7 @@ impl Config {
                 &self.model,
                 self.temperature,
                 self.top_p,
-                self.use_tools.clone(),
+                self.enabled_tools.clone(),
                 self.use_mcp_servers.clone(),
             );
             role
@@ -694,7 +694,7 @@ impl Config {
             ("model", role.model().id()),
             ("temperature", format_option_value(&role.temperature())),
             ("top_p", format_option_value(&role.top_p())),
-            ("use_tools", format_option_value(&role.use_tools())),
+            ("enabled_tools", format_option_value(&role.enabled_tools())),
             (
                 "use_mcp_servers",
                 format_option_value(&role.use_mcp_servers()),
@@ -767,9 +767,9 @@ impl Config {
                 let value = parse_value(value)?;
                 config.write().set_top_p(value);
             }
-            "use_tools" => {
+            "enabled_tools" => {
                 let value = parse_value(value)?;
-                config.write().set_use_tools(value);
+                config.write().set_enabled_tools(value);
             }
             "use_mcp_servers" => {
                 let value: Option<String> = parse_value(value)?;
@@ -970,10 +970,10 @@ impl Config {
         }
     }
 
-    pub fn set_use_tools(&mut self, value: Option<String>) {
+    pub fn set_enabled_tools(&mut self, value: Option<String>) {
         match self.role_like_mut() {
-            Some(role_like) => role_like.set_use_tools(value),
-            None => self.use_tools = value,
+            Some(role_like) => role_like.set_enabled_tools(value),
+            None => self.enabled_tools = value,
         }
     }
 
@@ -1955,7 +1955,7 @@ impl Config {
     fn select_enabled_functions(&self, role: &Role) -> Vec<FunctionDeclaration> {
         let mut functions = vec![];
         if self.function_calling {
-            if let Some(use_tools) = role.use_tools() {
+            if let Some(enabled_tools) = role.enabled_tools() {
                 let mut tool_names: HashSet<String> = Default::default();
                 let declaration_names: HashSet<String> = self
                     .functions
@@ -1967,10 +1967,10 @@ impl Config {
                     })
                     .map(|v| v.name.to_string())
                     .collect();
-                if use_tools == "all" {
+                if enabled_tools == "all" {
                     tool_names.extend(declaration_names);
                 } else {
-                    for item in use_tools.split(',') {
+                    for item in enabled_tools.split(',') {
                         let item = item.trim();
                         if let Some(values) = self.mapping_tools.get(item) {
                             tool_names.extend(
@@ -2189,7 +2189,7 @@ impl Config {
                     let mut values = vec![
                         "temperature",
                         "top_p",
-                        "use_tools",
+                        "enabled_tools",
                         "use_mcp_servers",
                         "save_session",
                         "compress_threshold",
@@ -2232,7 +2232,7 @@ impl Config {
                 "stream" => complete_bool(self.stream),
                 "save" => complete_bool(self.save),
                 "function_calling" => complete_bool(self.function_calling),
-                "use_tools" => {
+                "enabled_tools" => {
                     let mut prefix = String::new();
                     let mut ignores = HashSet::new();
                     if let Some((v, _)) = args[1].rsplit_once(',') {
@@ -2736,8 +2736,8 @@ impl Config {
                 self.mapping_tools = v;
             }
         }
-        if let Some(v) = read_env_value::<String>(&get_env_name("use_tools")) {
-            self.use_tools = v;
+        if let Some(v) = read_env_value::<String>(&get_env_name("enabled_tools")) {
+            self.enabled_tools = v;
         }
 
         if let Some(v) = read_env_value::<String>(&get_env_name("repl_prelude")) {
@@ -2951,7 +2951,7 @@ pub async fn macro_execute(
     let mut config = config.read().clone();
     config.temperature = role.temperature();
     config.top_p = role.top_p();
-    config.use_tools = role.use_tools().clone();
+    config.enabled_tools = role.enabled_tools().clone();
     config.use_mcp_servers = role.use_mcp_servers().clone();
     config.macro_flag = true;
     config.model = role.model().clone();
