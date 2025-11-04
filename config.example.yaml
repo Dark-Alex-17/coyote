@@ -17,6 +17,31 @@ function_calling: true           # Enables or disables function calling (Globall
 mapping_tools:                   # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
 use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search_loki')
+visible_tools:                   # Which tools are visible to be compiled (and are thus able to be defined in 'use_tools')
+#  - demo_py.py
+#  - demo_sh.sh
+  - execute_command.sh
+#  - execute_py_code.py
+#  - execute_sql_code.sh
+#  - fetch_url_via_curl.sh
+#  - fetch_url_via_jina.sh
+  - fs_cat.sh
+  - fs_ls.sh
+#  - fs_mkdir.sh
+#  - fs_patch.sh
+#  - fs_write.sh
+  - get_current_time.sh
+#  - get_current_weather.py
+  - get_current_weather.sh
+  - query_jira_issues.sh
+#  - search_arxiv.sh
+#  - search_wikipedia.sh
+#  - search_wolframalpha.sh
+#  - send_mail.sh
+#  - send_twilio.sh
+#  - web_search_loki.sh
+#  - web_search_perplexity.sh
+#  - web_search_tavily.sh
 
 # ---- MCP Servers ----
 mcp_servers: true                # Enables or disables MCP servers (globally).
