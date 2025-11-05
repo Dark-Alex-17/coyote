@@ -1,7 +1,7 @@
 use crate::config::{Config, GlobalConfig, RoleLike};
 use crate::repl::{run_repl_command, split_args_text};
 use crate::utils::{multiline_text, AbortSignal};
-use anyhow::anyhow;
+use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use parking_lot::RwLock;
 use serde::Deserialize;
@@ -13,7 +13,7 @@ pub async fn macro_execute(
     name: &str,
     args: Option<&str>,
     abort_signal: AbortSignal,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let macro_value = Config::load_macro(name)?;
     let (mut new_args, text) = split_args_text(args.unwrap_or_default(), cfg!(windows));
     if !text.is_empty() {
@@ -53,7 +53,7 @@ pub struct Macro {
 }
 
 impl Macro {
-    pub fn resolve_variables(&self, args: &[String]) -> anyhow::Result<IndexMap<String, String>> {
+    pub fn resolve_variables(&self, args: &[String]) -> Result<IndexMap<String, String>> {
         let mut output = IndexMap::new();
         for (i, variable) in self.variables.iter().enumerate() {
             let value = if variable.rest && i == self.variables.len() - 1 {
