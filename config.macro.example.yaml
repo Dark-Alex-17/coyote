@@ -1,0 +1,15 @@
+variables:                                        # A list of positional variables that the macro uses
+  - name: positional_1                            # The name of the positional variable.
+    default: null                                 # Since no default value is provided, this argument is required; 'null' by default
+    rest: false                                   # Do not collect all remaining arguments into this variable; 'false' by default
+  - name: positional_2_with_default_value
+    default: '2'                                  # A default value for the positional argument if no value is provided
+    rest: false
+  - name: collect_remaining_args
+    rest: true                                    # Collect all remaining arguments into this variable
+                                                  # Since no 'default' is defined, at least one additional argument is required
+steps:                                            # The sequence of REPL commands to execute
+  - .info
+  - .agent {{positional_1}}
+  - What is 2 + {{positional_2_with_default_value}}?
+  - '{{collect_remaining_args}}'
