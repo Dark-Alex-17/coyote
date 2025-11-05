@@ -744,7 +744,7 @@ impl Config {
         }
         let output = items
             .iter()
-            .map(|(name, value)| format!("{name:<24}{value}\n"))
+            .map(|(name, value)| format!("{name:<30}{value}\n"))
             .collect::<Vec<String>>()
             .join("");
         Ok(output)
