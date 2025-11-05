@@ -364,6 +364,7 @@ impl Config {
             config.setup_model()?;
             config.setup_document_loaders();
             config.setup_user_agent();
+            Macro::install_macros()?;
             Ok(())
         };
         let ret = setup(&mut config).await;

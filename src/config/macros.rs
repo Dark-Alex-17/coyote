@@ -1,11 +1,18 @@
-use crate::config::{Config, GlobalConfig, RoleLike};
+use crate::config::{ensure_parent_exists, Config, GlobalConfig, RoleLike};
 use crate::repl::{run_repl_command, split_args_text};
 use crate::utils::{multiline_text, AbortSignal};
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use parking_lot::RwLock;
+use rust_embed::Embed;
 use serde::Deserialize;
+use std::fs::File;
+use std::io::Write;
 use std::sync::Arc;
+
+#[derive(Embed)]
+#[folder = "assets/macros"]
+struct MacroAssets;
 
 #[async_recursion::async_recursion]
 pub async fn macro_execute(
@@ -53,6 +60,36 @@ pub struct Macro {
 }
 
 impl Macro {
+    pub fn install_macros() -> Result<()> {
+        info!(
+            "Installing built-in macros in {}",
+            Config::macros_dir().display()
+        );
+
+        for file in MacroAssets::iter() {
+            debug!("Processing macro file: {}", file.as_ref());
+            let embedded_file = MacroAssets::get(&file)
+                .ok_or_else(|| anyhow!("Failed to load embedded macro file: {}", file.as_ref()))?;
+            let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
+            let file_path = Config::macros_dir().join(file.as_ref());
+
+            if file_path.exists() {
+                debug!(
+                    "Macro file already exists, skipping: {}",
+                    file_path.display()
+                );
+                continue;
+            }
+
+            ensure_parent_exists(&file_path)?;
+            info!("Creating macro file: {}", file_path.display());
+            let mut macro_file = File::create(&file_path)?;
+            macro_file.write_all(content.as_bytes())?;
+        }
+
+        Ok(())
+    }
+
     pub fn resolve_variables(&self, args: &[String]) -> Result<IndexMap<String, String>> {
         let mut output = IndexMap::new();
         for (i, variable) in self.variables.iter().enumerate() {
