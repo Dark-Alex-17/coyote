@@ -278,8 +278,6 @@ impl McpRegistry {
             for (id, server) in servers {
                 let tools = server.list_tools(None).await?;
                 let resources = server.list_resources(None).await.unwrap_or_default();
-                // TODO implement prompt sampling for MCP servers
-                // let prompts = server.service.list_prompts(None).await.unwrap_or_default();
                 out.push(json!({
                   "server": id,
                   "tools": tools,
