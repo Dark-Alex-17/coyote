@@ -1,4 +1,4 @@
-Provide only code without comments or explanations.
+Output code only without comments or explanations.
 ### INPUT:
 async sleep in js
 ### OUTPUT:
