@@ -1,9 +1,9 @@
-# ---- llm ----
+# ---- LLM ----
 model: openai:gpt-4o             # Specify the LLM to use
 temperature: null                # Set default temperature parameter (0, 1)
 top_p: null                      # Set default top-p parameter, with a range of (0, 1) or (0, 2) depending on the model
 
-# ---- behavior ----
+# ---- Behavior ----
 stream: true                     # Controls whether to use the stream-style API.
 save: true                       # Indicates whether to persist the message
 keybindings: emacs               # Choose keybinding style (emacs, vi)
@@ -12,7 +12,8 @@ wrap: no                         # Controls text wrapping (no, auto, <max-width>
 wrap_code: false                 # Enables or disables wrapping of code blocks
 vault_password_file: null        # Path to a file containing the password for the Loki vault (cannot be a secret template)
 
-# ---- function-calling ----
+# ---- Function Calling ----
+# See the [Tools documentation](./docs/TOOLS.md) for more details
 function_calling: true           # Enables or disables function calling (Globally).
 mapping_tools:                   # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
@@ -44,17 +45,18 @@ visible_tools:                   # Which tools are visible to be compiled (and a
 #  - web_search_tavily.sh
 
 # ---- MCP Servers ----
+# See the [MCP Servers documentation](./docs/MCP-SERVERS.md) for more details
 mcp_server_support: true         # Enables or disables MCP servers (globally).
 mapping_mcp_servers:             # Alias for an MCP server or set of servers
   git: github,gitmcp
 enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 'github,slack')
 
-# ---- prelude ----
+# ---- Prelude ----
 repl_prelude: null               # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)
 cmd_prelude: null                # Set a default role or session for CMD mode (e.g. role:<name>, session:<name>, <session>:<role>)
 agent_session: null              # Set a session to use when starting an agent (e.g. temp, default)
 
-# ---- session ----
+# ---- Session ----
 # Controls the persistence of the session. if true, auto save; if false, not save; if null, asking the user
 save_session: null
 # Compress session when token count reaches or exceeds this threshold
@@ -65,9 +67,9 @@ summarize_prompt: 'Summarize the discussion briefly in 200 words or less to use 
 summary_prompt: 'This is a summary of the chat history as a recap: '
 
 # ---- RAG ----
-# See [RAG-Guide](TODO /RAG-Guide link) for more details.
+# See the [RAG Docs](./docs/RAG.md) for more details.
 rag_embedding_model: null        # Specifies the embedding model used for context retrieval
-rag_reranker_model: null         # Specifies the reranker model used for sorting retrieved documents
+rag_reranker_model: null         # Specifies the reranker model used for sorting retrieved documents; Loki uses Reciprocal Rank Fusion by default
 rag_top_k: 5                     # Specifies the number of documents to retrieve for answering queries
 rag_chunk_size: null             # Defines the size of chunks for document processing in characters
 rag_chunk_overlap: null          # Defines the overlap between chunks
@@ -91,16 +93,21 @@ rag_template: |
   <user_query>
   __INPUT__
   </user_query>
-
 # Define document loaders to control how RAG and `.file`/`--file` load files of specific formats.
 document_loaders:
   # You can add custom loaders using the following syntax:
   #   <file-extension>: <command-to-load-the-file>
   # Note: Use `$1` for input file and `$2` for output file. If `$2` is omitted, use stdout as output.
-  pdf: 'pdftotext $1 -'                         # Load .pdf file, see https://poppler.freedesktop.org to set up pdftotext
-  docx: 'pandoc --to plain $1'                  # Load .docx file, see https://pandoc.org to set up pandoc
+  pdf: 'pdftotext $1 -'                                                                 # Use pdftotext to convert a PDF file to text
+  # (see https://poppler.freedesktop.org for details on how to install pdftotext)
+  docx: 'pandoc --to plain $1'                                                          # Use pandoc to convert a .docx file to text
+  # (see https://pandoc.org for details on how to install pandoc)
+  jina: 'curl -fsSL https://r.jina.ai/$1 -H "Authorization: Bearer {{JINA_API_KEY}}'    # Use Jina to translate a website into text;
+  # Requires a Jina API key to be added to the Loki vault
+  git: >                                                                                # Use yek to load a git repository into the knowledgebase (https://github.com/bodo-run/yek)
+    sh -c "yek $1 --json | jq 'map({ path: .filename, contents: .content })'"
 
-# ---- appearance ----
+# ---- Appearance ----
 highlight: true                  # Controls syntax highlighting
 light_theme: false               # Activates a light color theme when true. env: LOKI_LIGHT_THEME
 # Custom REPL left/right prompts, TODO reference docs for prompt variables
@@ -109,13 +116,13 @@ left_prompt:
 right_prompt:
   '{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
 
-# ---- misc ----
+# ---- Miscellaneous ----
 user_agent: null                            # Set User-Agent HTTP header, use `auto` for loki/<current-version>
 save_shell_history: true                    # Whether to save shell execution command to the history file
 # URL to sync model changes from
 sync_models_url: https://raw.githubusercontent.com/Dark-Alex-17/loki/refs/heads/main/models.yaml
 
-# ---- clients ----
+# ---- Clients ----
 clients:
   # All clients have the following configuration:
   # - type: xxxx
