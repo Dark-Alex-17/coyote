@@ -4,12 +4,12 @@ temperature: null                # Set default temperature parameter (0, 1)
 top_p: null                      # Set default top-p parameter, with a range of (0, 1) or (0, 2) depending on the model
 
 # ---- Behavior ----
-stream: true                     # Controls whether to use the stream-style API.
-save: true                       # Indicates whether to persist the message
+stream: true                     # Controls whether to use the stream-style APIs when querying for completions from clients.
+save: true                       # Indicates whether to persist the conversation to messages.md for posterity
 keybindings: emacs               # Choose keybinding style (emacs, vi)
-editor: null                     # Specifies the command used to edit input buffer or session. (e.g. vim, emacs, nano).
+editor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $EDITOR
 wrap: no                         # Controls text wrapping (no, auto, <max-width>)
-wrap_code: false                 # Enables or disables wrapping of code blocks
+wrap_code: false                 # Enables or disables the wrapping of code blocks
 vault_password_file: null        # Path to a file containing the password for the Loki vault (cannot be a secret template)
 
 # ---- Function Calling ----
