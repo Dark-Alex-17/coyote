@@ -530,6 +530,16 @@ impl AgentConfig {
         if let Some(v) = read_env_value::<f64>(&with_prefix("top_p")) {
             self.top_p = v;
         }
+        if let Ok(v) = env::var(with_prefix("global_tools")) {
+            if let Ok(v) = serde_json::from_str(&v) {
+                self.global_tools = v;
+            }
+        }
+        if let Ok(v) = env::var(with_prefix("mcp_servers")) {
+            if let Ok(v) = serde_json::from_str(&v) {
+                self.mcp_servers = v;
+            }
+        }
         if let Some(v) = read_env_value::<String>(&with_prefix("agent_session")) {
             self.agent_session = v;
         }
