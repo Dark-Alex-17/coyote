@@ -11,9 +11,6 @@ editor: null                     # Specifies the editor used to edit the input b
 wrap: no                         # Controls text wrapping (no, auto, <max-width>)
 wrap_code: false                 # Enables or disables the wrapping of code blocks
 
-# ---- Vault ----
-vault_password_file: null        # Path to a file containing the password for the Loki vault (cannot be a secret template)
-
 # ---- Prelude ----
 repl_prelude: null               # Set a default session or role for REPL mode to use (e.g. role:<name>, session:<name>, <session>:<role>)
 cmd_prelude: null                # Set a default session or role for CMD mode to use (e.g. role:<name>, session:<name>, <session>:<role>)
@@ -33,6 +30,10 @@ user_agent: null                            # Set User-Agent HTTP header, use `a
 save_shell_history: true                    # Whether to save shell execution command to the history file
 # URL to sync model changes from
 sync_models_url: https://raw.githubusercontent.com/Dark-Alex-17/loki/refs/heads/main/models.yaml
+
+# ---- Vault ----
+# See the [Vault documentation](./docs/VAULT.md) for more information on the Loki vault
+vault_password_file: null        # Path to a file containing the password for the Loki vault (cannot be a secret template)
 
 # ---- Function Calling ----
 # See the [Tools documentation](./docs/TOOLS.md) for more details
