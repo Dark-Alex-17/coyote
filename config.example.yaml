@@ -12,6 +12,26 @@ wrap: no                         # Controls text wrapping (no, auto, <max-width>
 wrap_code: false                 # Enables or disables the wrapping of code blocks
 vault_password_file: null        # Path to a file containing the password for the Loki vault (cannot be a secret template)
 
+# ---- Prelude ----
+repl_prelude: null               # Set a default session or role for REPL mode to use (e.g. role:<name>, session:<name>, <session>:<role>)
+cmd_prelude: null                # Set a default session or role for CMD mode to use (e.g. role:<name>, session:<name>, <session>:<role>)
+agent_session: null              # Set a session to use when starting an agent (e.g. temp, default)
+
+# ---- Appearance ----
+highlight: true                  # Controls syntax highlighting
+light_theme: false               # Activates a light color theme when true. env: LOKI_LIGHT_THEME
+# Custom REPL left/right prompts; see the [REPL Prompt Documentation](./docs/REPL-PROMPT.md) for more information
+left_prompt:
+  '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
+right_prompt:
+  '{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
+
+# ---- Miscellaneous ----
+user_agent: null                            # Set User-Agent HTTP header, use `auto` for loki/<current-version>
+save_shell_history: true                    # Whether to save shell execution command to the history file
+# URL to sync model changes from
+sync_models_url: https://raw.githubusercontent.com/Dark-Alex-17/loki/refs/heads/main/models.yaml
+
 # ---- Function Calling ----
 # See the [Tools documentation](./docs/TOOLS.md) for more details
 function_calling: true           # Enables or disables function calling (Globally).
@@ -51,20 +71,14 @@ mapping_mcp_servers:             # Alias for an MCP server or set of servers
   git: github,gitmcp
 enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 'github,slack')
 
-# ---- Prelude ----
-repl_prelude: null               # Set a default session or role for REPL mode to use (e.g. role:<name>, session:<name>, <session>:<role>)
-cmd_prelude: null                # Set a default session or role for CMD mode to use (e.g. role:<name>, session:<name>, <session>:<role>)
-agent_session: null              # Set a session to use when starting an agent (e.g. temp, default)
-
 # ---- Session ----
-# Controls the persistence of the session. if true, auto save; if false, not save; if null, asking the user
-save_session: null
-# Compress session when token count reaches or exceeds this threshold
-compress_threshold: 4000
-# Text prompt used for creating a concise summary of session message
-summarize_prompt: 'Summarize the discussion briefly in 200 words or less to use as a prompt for future context.'
-# Text prompt used for including the summary of the entire session
-summary_prompt: 'This is a summary of the chat history as a recap: '
+# See the [Session documentation](./docs/SESSIONS.md) for more information
+save_session: null               # Controls the persistence of the session. If true, auto save; if false, don't auto-save save; if null, ask the user what to do
+compress_threshold: 4000         # Compress the session when the token count reaches or exceeds this threshold
+summarize_prompt: >              # The text prompt used for creating a concise summary of session message
+  'Summarize the discussion briefly in 200 words or less to use as a prompt for future context.'
+summary_prompt: >                # The text prompt used for including the summary of the entire session as context to the model
+  'This is a summary of the chat history as a recap: '
 
 # ---- RAG ----
 # See the [RAG Docs](./docs/RAG.md) for more details.
@@ -106,21 +120,6 @@ document_loaders:
   # Requires a Jina API key to be added to the Loki vault
   git: >                                                                                # Use yek to load a git repository into the knowledgebase (https://github.com/bodo-run/yek)
     sh -c "yek $1 --json | jq 'map({ path: .filename, contents: .content })'"
-
-# ---- Appearance ----
-highlight: true                  # Controls syntax highlighting
-light_theme: false               # Activates a light color theme when true. env: LOKI_LIGHT_THEME
-# Custom REPL left/right prompts; see the [REPL Prompt Documentation](./docs/REPL-PROMPT.md) for more information
-left_prompt:
-  '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
-right_prompt:
-  '{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
-
-# ---- Miscellaneous ----
-user_agent: null                            # Set User-Agent HTTP header, use `auto` for loki/<current-version>
-save_shell_history: true                    # Whether to save shell execution command to the history file
-# URL to sync model changes from
-sync_models_url: https://raw.githubusercontent.com/Dark-Alex-17/loki/refs/heads/main/models.yaml
 
 # ---- Clients ----
 clients:
