@@ -110,7 +110,7 @@ document_loaders:
 # ---- Appearance ----
 highlight: true                  # Controls syntax highlighting
 light_theme: false               # Activates a light color theme when true. env: LOKI_LIGHT_THEME
-# Custom REPL left/right prompts, TODO reference docs for prompt variables
+# Custom REPL left/right prompts; see the [REPL Prompt Documentation](./docs/REPL-PROMPT.md) for more information
 left_prompt:
   '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
 right_prompt:
@@ -247,10 +247,10 @@ clients:
   - type: vertexai
     project_id: xxx
     location: xxx
-    # Specifies an application-default-credentials (adc) file
-    # Run `gcloud auth application-default login` to init the adc file
-    # see https://cloud.google.com/docs/authentication/external/set-up-adc
-    adc_file: <gcloud-config-dir>/application_default_credentials.json>  # Optional field
+    # Specifies an application default credentials (adc) file
+    # Run `gcloud auth application-default login` to initialize the ADC file
+    # see https://cloud.google.com/docs/authentication/external/set-up-adc for more information
+    adc_file: <gcloud-config-dir>/application_default_credentials.json  # Optional
     patch:
       chat_completions:
         'gemini-.*':
