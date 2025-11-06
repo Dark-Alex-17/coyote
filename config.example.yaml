@@ -10,6 +10,8 @@ keybindings: emacs               # Choose keybinding style (emacs, vi)
 editor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $EDITOR
 wrap: no                         # Controls text wrapping (no, auto, <max-width>)
 wrap_code: false                 # Enables or disables the wrapping of code blocks
+
+# ---- Vault ----
 vault_password_file: null        # Path to a file containing the password for the Loki vault (cannot be a secret template)
 
 # ---- Prelude ----
