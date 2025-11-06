@@ -19,17 +19,19 @@ agent_session: null              # Set a session to use when starting an agent (
 # ---- Appearance ----
 highlight: true                  # Controls syntax highlighting
 light_theme: false               # Activates a light color theme when true. env: LOKI_LIGHT_THEME
+
+# ---- Miscellaneous ----
+user_agent: null                 # Set User-Agent HTTP header, use `auto` for loki/<current-version>
+save_shell_history: true         # Whether to save shell execution command to the history file
+sync_models_url: >               # URL to sync model changes from
+  https://raw.githubusercontent.com/Dark-Alex-17/loki/refs/heads/main/models.yaml
+
+# ---- REPL Prompt ----
 # Custom REPL left/right prompts; see the [REPL Prompt Documentation](./docs/REPL-PROMPT.md) for more information
 left_prompt:
   '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
 right_prompt:
   '{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
-
-# ---- Miscellaneous ----
-user_agent: null                            # Set User-Agent HTTP header, use `auto` for loki/<current-version>
-save_shell_history: true                    # Whether to save shell execution command to the history file
-# URL to sync model changes from
-sync_models_url: https://raw.githubusercontent.com/Dark-Alex-17/loki/refs/heads/main/models.yaml
 
 # ---- Vault ----
 # See the [Vault documentation](./docs/VAULT.md) for more information on the Loki vault
