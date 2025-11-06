@@ -17,7 +17,7 @@ agent_session: null              # Set a session to use when starting the agent.
 name: <agent-name>               # Name of the agent, used in the UI and logs
 description: <description>       # Description of the agent, used in the UI
 version: 1                       # Version of the agent
-mcp_servers:                     # Optional list of MCP servers to use for the agent
+mcp_servers:                     # Optional list of MCP servers that the agent utilizes
   - github                       # Corresponds to the name of an MCP server in the `<loki-config-dir>/functions/mcp.json` file
 global_tools:                    # Optional list of additional global tools to enable for the agent; i.e. not tools specific to the agent
   - web_search
