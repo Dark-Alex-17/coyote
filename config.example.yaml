@@ -4,7 +4,7 @@ temperature: null                # Set default temperature parameter (0, 1)
 top_p: null                      # Set default top-p parameter, with a range of (0, 1) or (0, 2) depending on the model
 
 # ---- Behavior ----
-stream: true                     # Controls whether to use the stream-style APIs when querying for completions from clients.
+stream: true                     # Controls whether to use the stream-style APIs when querying for completions from LLM clients.
 save: true                       # Indicates whether to persist the conversation to messages.md for posterity
 keybindings: emacs               # Choose keybinding style (emacs, vi)
 editor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $EDITOR
