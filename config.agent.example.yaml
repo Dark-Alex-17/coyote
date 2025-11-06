@@ -5,6 +5,8 @@
 #   - <agent-name>_MODEL
 #   - <agent-name>_TEMPERATURE
 #   - <agent-name>_TOP_P
+#   - <agent-name>_GLOBAL_TOOLS (as a JSON string array)
+#   - <agent-name>_MCP_SERVERS (as a JSON string array)
 #   - <agent-name>_AGENT_SESSION
 #   - <agent-name>_VARIABLES (as JSON array of key-value pairs; e.g. '[{"name": "username", "value": "alex"}]')
 
