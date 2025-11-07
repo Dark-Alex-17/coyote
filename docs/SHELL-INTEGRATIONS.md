@@ -82,12 +82,18 @@ $ find . -name '*.ts' -type f -exec awk 'NR>100{exit 1}' {} \; -print
 ```
 
 To use the CLI helper, add the content of the appropriate integration script for your shell to your shell configuration file:
-* [Bash Integration](../scripts/shell-integration/bash-integration.sh) (add to: `~/.bashrc`)
-* [Zsh Integration](../scripts/shell-integration/zsh-integration.zsh) (add to: `~/.zshrc`)
-* [Elvish Integration](../scripts/shell-integration/elvish-integration.elv) (add to: `~/.elvish/rc.elv`)
-* [Fish Integration](../scripts/shell-integration/fish-integration.fish) (add to: `~/.config/fish/config.fish`)
-* [Nushell Integration](../scripts/shell-integration/nushell-integration.nu) (add to: `~/.config/nushell/config.nu`)
-* [PowerShell Integration](../scripts/shell-integration/powershell-integration.ps1) (add to: `$PROFILE`)
+* [Bash Integration](../scripts/shell-integration/integration.bash) (add to: `~/.bashrc`)
+* [Zsh Integration](../scripts/shell-integration/integration.zsh) (add to: `~/.zshrc`)
+* [Elvish Integration](../scripts/shell-integration/integration.elv) (add to: `~/.elvish/rc.elv`)
+* [Fish Integration](../scripts/shell-integration/integration.fish) (add to: `~/.config/fish/config.fish`)
+* [Nushell Integration](../scripts/shell-integration/integration.nu) (add to: `~/.config/nushell/config.nu`)
+* [PowerShell Integration](../scripts/shell-integration/integration.ps1) (add to: `$PROFILE`)
+
+## Explain Commands
+In addition to the Shell Assistant, Loki has a built-in role that explains shell commands to you to decipher their 
+language. So if Loki generates a command that you're unsure of what it does, simply pass it to the `explain-shell` role:
+
+![Explain Shell Role](./images/shell_integrations/explain-shell.png)
 
 ## Code Generation
 Users can also directly generate code snippets from natural language prompts using the `-c,--code` flag.
