@@ -1,3 +1,9 @@
+## v0.1.0 (2025-11-07)
+
+### Refactor
+
+- Updated to the most recent Rust version with 2024 syntax
+
 ## v0.2.0 (2025-11-07)
 
 ## v0.1.1 (2025-11-07)
