@@ -731,7 +731,7 @@ impl Config {
             ("theme", format_option_value(&self.theme)),
             ("config_file", display_path(&Self::config_file())),
             ("env_file", display_path(&Self::env_file())),
-						("agents_dir", display_path(&Self::agents_data_dir())),
+            ("agents_dir", display_path(&Self::agents_data_dir())),
             ("roles_dir", display_path(&Self::roles_dir())),
             ("sessions_dir", display_path(&self.sessions_dir())),
             ("rags_dir", display_path(&Self::rags_dir())),
