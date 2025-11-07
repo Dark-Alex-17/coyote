@@ -7,6 +7,19 @@ functions as a universal secret management tool.
 
 ![Vault Demo](./images/vault/vault-demo.gif)
 
+## Quick Links
+<!--toc:start-->
+- [Usage](#usage)
+  - [CLI Usage](#cli-usage)
+  - [REPL Usage](#repl-usage)
+- [Motivation](#motivation)
+- [How it works](#how-it-works)
+- [Supported Files](#supported-files)
+- [Environment Variable Secret Injection in Agents](#environment-variable-secret-injection-in-agents)
+<!--toc:end-->
+
+---
+
 ## Usage
 The Loki vault can be used in one of two ways: via the CLI or via the REPL for interactive usage.
 
@@ -97,10 +110,11 @@ At runtime, Loki will detect the templated secret and replace it with the decryp
 ## Supported Files
 At the time of writing, the following files support Loki secret injection:
 
-| File Type            | Description                       | Limitations                                                    |
-|----------------------|-----------------------------------|----------------------------------------------------------------|
-| `config.yaml`        | The main Loki configuration file  | Cannot use secret injection on the `vault_password_file` field |
-| `functions/mcp.json` | The MCP server configuration file |                                                                |
+| File Type               | Description                       | Limitations                                                                                                                               |
+|-------------------------|-----------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| `config.yaml`           | The main Loki configuration file  | Cannot use secret injection on the `vault_password_file` field                                                                            |
+| `functions/mcp.json`    | The MCP server configuration file |                                                                                                                                           |
+| `<agent>/tools.<py/sh>` | Tool files for agents             | Specific configuration and only supported for Agents, not all global tools ([see below](#environment-variable-secret-injection-in-agents) |
 
 
 Note that all paths are relative to the Loki configuration directory. The directory varies by system, so you can find yours by
@@ -109,3 +123,39 @@ running
 ```shell
 dirname $(loki --info | grep config_file | awk '{print $2}')
 ```
+
+## Environment Variable Secret Injection in Agents
+Secrets from the Loki vault can be injected into agent `tools.sh/tools.py` as environment variables. This is done as 
+follows:
+
+1. Ensure a secret named `MY_USERNAME` is in your Loki vault.
+2. Set the name of the secret as the default value for a variable
+   `<agent>/config.yaml`
+   ```yaml
+   name: Username
+   description: An AI agent that demonstrates agent capabilities
+   instructions: |
+     You are a AI agent designed to demonstrate agent capabilities.
+   variables:
+     - name: username
+       description: Your user name
+       # Configure the secret you want to inject using the same templating mentioned above; i.e. wrap the 
+       # case-sensitive name in '{{}}'
+       default: '{{MY_USERNAME}}'
+   ```
+3. Reference the variable in your `<agent>/tools.<py/sh>` file using the familiar variable injection name; that is, 
+   since the name of the variable is `username`, the environment variable that will be provided to the tool call will
+   be named `LLM_AGENT_VAR_USERNAME`
+   `tools.sh`
+   ```bash
+   #!/usr/bin/env bash
+   # @env LLM_OUTPUT=/dev/stdout The output path
+   
+   # @cmd Get my username
+   get_my_username() {
+      echo "$LLM_AGENT_VAR_USERNAME" >> "$LLM_OUTPUT"        
+   }
+   ```
+
+For more information about variable usage within agents, refer to the [Variables section](./AGENTS.md#user-defined-variables) of the [Agents README](./AGENTS.md)
+
