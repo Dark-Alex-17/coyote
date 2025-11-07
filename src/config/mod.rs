@@ -84,7 +84,7 @@ const CLIENTS_FIELD: &str = "clients";
 const SYNC_MODELS_URL: &str =
     "https://raw.githubusercontent.com/Dark-Alex-17/loki/refs/heads/main/models.yaml";
 
-const SUMMARIZE_PROMPT: &str =
+const SUMMARIZATION_PROMPT: &str =
     "Summarize the discussion briefly in 200 words or less to use as a prompt for future context.";
 const SUMMARY_PROMPT: &str = "This is a summary of the chat history as a recap: ";
 
@@ -145,7 +145,7 @@ pub struct Config {
 
     pub save_session: Option<bool>,
     pub compression_threshold: usize,
-    pub summarize_prompt: Option<String>,
+    pub summarization_prompt: Option<String>,
     pub summary_prompt: Option<String>,
 
     pub rag_embedding_model: Option<String>,
@@ -231,7 +231,7 @@ impl Default for Config {
 
             save_session: None,
             compression_threshold: 4000,
-            summarize_prompt: None,
+            summarization_prompt: None,
             summary_prompt: None,
 
             rag_embedding_model: None,
@@ -1561,9 +1561,9 @@ impl Config {
 
         let prompt = config
             .read()
-            .summarize_prompt
+            .summarization_prompt
             .clone()
-            .unwrap_or_else(|| SUMMARIZE_PROMPT.into());
+            .unwrap_or_else(|| SUMMARIZATION_PROMPT.into());
         let input = Input::from_str(config, &prompt, None);
         let summary = input.fetch_chat_text().await?;
         let summary_prompt = config
@@ -2779,8 +2779,8 @@ impl Config {
         if let Some(Some(v)) = read_env_value::<usize>(&get_env_name("compression_threshold")) {
             self.compression_threshold = v;
         }
-        if let Some(v) = read_env_value::<String>(&get_env_name("summarize_prompt")) {
-            self.summarize_prompt = v;
+        if let Some(v) = read_env_value::<String>(&get_env_name("summarization_prompt")) {
+            self.summarization_prompt = v;
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("summary_prompt")) {
             self.summary_prompt = v;
