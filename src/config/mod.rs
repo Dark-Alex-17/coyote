@@ -144,7 +144,7 @@ pub struct Config {
     pub agent_session: Option<String>,
 
     pub save_session: Option<bool>,
-    pub compress_threshold: usize,
+    pub compression_threshold: usize,
     pub summarize_prompt: Option<String>,
     pub summary_prompt: Option<String>,
 
@@ -230,7 +230,7 @@ impl Default for Config {
             agent_session: None,
 
             save_session: None,
-            compress_threshold: 4000,
+            compression_threshold: 4000,
             summarize_prompt: None,
             summary_prompt: None,
 
@@ -710,7 +710,10 @@ impl Config {
                     .unwrap_or_else(|| "null".into()),
             ),
             ("save_session", format_option_value(&self.save_session)),
-            ("compress_threshold", self.compress_threshold.to_string()),
+            (
+                "compression_threshold",
+                self.compression_threshold.to_string(),
+            ),
             (
                 "rag_reranker_model",
                 format_option_value(&rag_reranker_model),
@@ -829,9 +832,9 @@ impl Config {
                 let value = parse_value(value)?;
                 config.write().set_save_session(value);
             }
-            "compress_threshold" => {
+            "compression_threshold" => {
                 let value = parse_value(value)?;
-                config.write().set_compress_threshold(value);
+                config.write().set_compression_threshold(value);
             }
             "rag_reranker_model" => {
                 let value = parse_value(value)?;
@@ -1000,11 +1003,11 @@ impl Config {
         }
     }
 
-    pub fn set_compress_threshold(&mut self, value: Option<usize>) {
+    pub fn set_compression_threshold(&mut self, value: Option<usize>) {
         if let Some(session) = self.session.as_mut() {
-            session.set_compress_threshold(value);
+            session.set_compression_threshold(value);
         } else {
-            self.compress_threshold = value.unwrap_or_default();
+            self.compression_threshold = value.unwrap_or_default();
         }
     }
 
@@ -1513,18 +1516,18 @@ impl Config {
     }
 
     pub fn maybe_compress_session(config: GlobalConfig) {
-        let mut need_compress = false;
+        let mut needs_compression = false;
         {
             let mut config = config.write();
-            let compress_threshold = config.compress_threshold;
+            let compression_threshold = config.compression_threshold;
             if let Some(session) = config.session.as_mut() {
-                if session.need_compress(compress_threshold) {
+                if session.needs_compression(compression_threshold) {
                     session.set_compressing(true);
-                    need_compress = true;
+                    needs_compression = true;
                 }
             }
         };
-        if !need_compress {
+        if !needs_compression {
             return;
         }
         let color = if config.read().light_theme() {
@@ -2200,7 +2203,7 @@ impl Config {
                         "enabled_tools",
                         "enabled_mcp_servers",
                         "save_session",
-                        "compress_threshold",
+                        "compression_threshold",
                         "rag_reranker_model",
                         "rag_top_k",
                         "max_output_tokens",
@@ -2773,8 +2776,8 @@ impl Config {
         if let Some(v) = read_env_bool(&get_env_name("save_session")) {
             self.save_session = v;
         }
-        if let Some(Some(v)) = read_env_value::<usize>(&get_env_name("compress_threshold")) {
-            self.compress_threshold = v;
+        if let Some(Some(v)) = read_env_value::<usize>(&get_env_name("compression_threshold")) {
+            self.compression_threshold = v;
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("summarize_prompt")) {
             self.summarize_prompt = v;

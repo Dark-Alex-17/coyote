@@ -31,7 +31,7 @@ pub struct Session {
     #[serde(skip_serializing_if = "Option::is_none")]
     save_session: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    compress_threshold: Option<usize>,
+    compression_threshold: Option<usize>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     role_name: Option<String>,
@@ -216,8 +216,8 @@ impl Session {
             items.push(("save_session", save_session.to_string()));
         }
 
-        if let Some(compress_threshold) = self.compress_threshold {
-            items.push(("compress_threshold", compress_threshold.to_string()));
+        if let Some(compression_threshold) = self.compression_threshold {
+            items.push(("compression_threshold", compression_threshold.to_string()));
         }
 
         if let Some(max_input_tokens) = self.model().max_input_tokens() {
@@ -320,18 +320,20 @@ impl Session {
         self.save_session_this_time = true;
     }
 
-    pub fn set_compress_threshold(&mut self, value: Option<usize>) {
-        if self.compress_threshold != value {
-            self.compress_threshold = value;
+    pub fn set_compression_threshold(&mut self, value: Option<usize>) {
+        if self.compression_threshold != value {
+            self.compression_threshold = value;
             self.dirty = true;
         }
     }
 
-    pub fn need_compress(&self, global_compress_threshold: usize) -> bool {
+    pub fn needs_compression(&self, global_compression_threshold: usize) -> bool {
         if self.compressing {
             return false;
         }
-        let threshold = self.compress_threshold.unwrap_or(global_compress_threshold);
+        let threshold = self
+            .compression_threshold
+            .unwrap_or(global_compression_threshold);
         if threshold < 1 {
             return false;
         }

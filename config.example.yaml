@@ -79,7 +79,7 @@ enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 
 # ---- Session ----
 # See the [Session documentation](./docs/SESSIONS.md) for more information
 save_session: null               # Controls the persistence of the session. If true, auto save; if false, don't auto-save save; if null, ask the user what to do
-compress_threshold: 4000         # Compress the session when the token count reaches or exceeds this threshold
+compression_threshold: 4000      # Compress the session when the token count reaches or exceeds this threshold
 summarize_prompt: >              # The text prompt used for creating a concise summary of session message
   'Summarize the discussion briefly in 200 words or less to use as a prompt for future context.'
 summary_prompt: >                # The text prompt used for including the summary of the entire session as context to the model
