@@ -1,5 +1,5 @@
 use crate::function::{FunctionDeclaration, JsonSchema};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use argc::{ChoiceValue, CommandValue, FlagOptionValue};
 use indexmap::IndexMap;
 use std::fs::File;
@@ -95,10 +95,10 @@ fn with_description(mut schema: JsonSchema, describe: &str) -> JsonSchema {
 }
 
 fn with_enum(mut schema: JsonSchema, choice: &Option<ChoiceValue>) -> JsonSchema {
-    if let Some(ChoiceValue::Values(values)) = choice {
-        if !values.is_empty() {
-            schema.enum_value = Some(values.clone());
-        }
+    if let Some(ChoiceValue::Values(values)) = choice
+        && !values.is_empty()
+    {
+        schema.enum_value = Some(values.clone());
     }
     schema
 }

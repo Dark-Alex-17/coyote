@@ -6,12 +6,12 @@ use crate::{
 use crate::config::ensure_parent_exists;
 use crate::mcp::{MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX};
 use crate::parsers::{bash, python};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Write;

@@ -3,7 +3,7 @@ use anyhow::Context;
 #[cfg(not(any(target_os = "android", target_os = "emscripten")))]
 mod internal {
     use arboard::Clipboard;
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::sync::{LazyLock, Mutex};
 
     static CLIPBOARD: LazyLock<Mutex<Option<Clipboard>>> =

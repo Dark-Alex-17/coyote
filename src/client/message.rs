@@ -119,10 +119,10 @@ impl MessageContent {
                 }
                 for tool_result in tool_results {
                     let mut parts = vec!["Call".to_string()];
-                    if let Some((agent_name, functions)) = agent_info {
-                        if functions.contains(&tool_result.call.name) {
-                            parts.push(agent_name.clone())
-                        }
+                    if let Some((agent_name, functions)) = agent_info
+                        && functions.contains(&tool_result.call.name)
+                    {
+                        parts.push(agent_name.clone())
                     }
                     parts.push(tool_result.call.name.clone());
                     parts.push(tool_result.call.arguments.to_string());

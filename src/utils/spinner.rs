@@ -1,10 +1,10 @@
-use super::{poll_abort_signal, wait_abort_signal, AbortSignal, IS_STDOUT_TERMINAL};
+use super::{AbortSignal, IS_STDOUT_TERMINAL, poll_abort_signal, wait_abort_signal};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use crossterm::{cursor, queue, style, terminal};
 use std::{
     future::Future,
-    io::{stdout, Write},
+    io::{Write, stdout},
     time::Duration,
 };
 use tokio::{

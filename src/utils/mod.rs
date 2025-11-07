@@ -29,7 +29,7 @@ pub use self::variables::*;
 
 use anyhow::{Context, Result};
 use fancy_regex::Regex;
-use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use is_terminal::IsTerminal;
 use std::borrow::Cow;
 use std::sync::LazyLock;

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use fancy_regex::Regex;
 use indexmap::IndexSet;
 use path_absolutize::Absolutize;
@@ -97,11 +97,12 @@ pub fn to_absolute_path(path: &str) -> Result<String> {
 
 pub fn resolve_home_dir(path: &str) -> String {
     let mut path = path.to_string();
-    if path.starts_with("~/") || path.starts_with("~\\") {
-        if let Some(home_dir) = dirs::home_dir() {
-            path.replace_range(..1, &home_dir.display().to_string());
-        }
+    if (path.starts_with("~/") || path.starts_with("~\\"))
+        && let Some(home_dir) = dirs::home_dir()
+    {
+        path.replace_range(..1, &home_dir.display().to_string());
     }
+
     path
 }
 
@@ -241,22 +242,20 @@ fn add_file(files: &mut IndexSet<String>, suffixes: Option<&Vec<String>>, path: 
 
 fn is_valid_extension(suffixes: Option<&Vec<String>>, path: &Path) -> bool {
     let filename_regex = Regex::new(r"^.+\.*").unwrap();
-    if let Some(suffixes) = suffixes {
-        if !suffixes.is_empty() {
-            if let Ok(Some(_)) = filename_regex.find(&suffixes.join(",")) {
-                let file_name = path
-                    .file_name()
-                    .and_then(|v| v.to_str())
-                    .expect("invalid filename")
-                    .to_string();
-                return suffixes.contains(&file_name);
-            } else if let Some(extension) =
-                path.extension().map(|v| v.to_string_lossy().to_string())
-            {
-                return suffixes.contains(&extension);
-            }
-            return false;
+    if let Some(suffixes) = suffixes
+        && !suffixes.is_empty()
+    {
+        if let Ok(Some(_)) = filename_regex.find(&suffixes.join(",")) {
+            let file_name = path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .expect("invalid filename")
+                .to_string();
+            return suffixes.contains(&file_name);
+        } else if let Some(extension) = path.extension().map(|v| v.to_string_lossy().to_string()) {
+            return suffixes.contains(&extension);
         }
+        return false;
     }
     true
 }

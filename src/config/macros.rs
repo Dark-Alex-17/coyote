@@ -1,7 +1,7 @@
-use crate::config::{ensure_parent_exists, Config, GlobalConfig, RoleLike};
+use crate::config::{Config, GlobalConfig, RoleLike, ensure_parent_exists};
 use crate::repl::{run_repl_command, split_args_text};
-use crate::utils::{multiline_text, AbortSignal};
-use anyhow::{anyhow, Result};
+use crate::utils::{AbortSignal, multiline_text};
+use anyhow::{Result, anyhow};
 use indexmap::IndexMap;
 use parking_lot::RwLock;
 use rust_embed::Embed;

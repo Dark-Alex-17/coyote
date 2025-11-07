@@ -2,10 +2,10 @@ use super::openai::*;
 use super::openai_compatible::*;
 use super::*;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const API_BASE: &str = "https://api.cohere.ai/v2";
 
@@ -49,10 +49,10 @@ fn prepare_chat_completions(
 
     let url = format!("{}/chat", api_base.trim_end_matches('/'));
     let mut body = openai_build_chat_completions_body(data, &self_.model);
-    if let Some(obj) = body.as_object_mut() {
-        if let Some(top_p) = obj.remove("top_p") {
-            obj.insert("p".to_string(), top_p);
-        }
+    if let Some(obj) = body.as_object_mut()
+        && let Some(top_p) = obj.remove("top_p")
+    {
+        obj.insert("p".to_string(), top_p);
     }
 
     let mut request_data = RequestData::new(url, body);
@@ -218,10 +218,10 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
 
     let mut tool_calls = vec![];
     if let Some(calls) = data["message"]["tool_calls"].as_array() {
-        if text.is_empty() {
-            if let Some(tool_plain) = data["message"]["tool_plan"].as_str() {
-                text = tool_plain.to_string();
-            }
+        if text.is_empty()
+            && let Some(tool_plain) = data["message"]["tool_plan"].as_str()
+        {
+            text = tool_plain.to_string();
         }
         for call in calls {
             if let (Some(name), Some(arguments), Some(id)) = (

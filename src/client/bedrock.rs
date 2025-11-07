@@ -2,7 +2,7 @@ use super::*;
 
 use crate::utils::{base64_decode, encode_uri, hex_encode, hmac_sha256, sha256, strip_think_tag};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use aws_smithy_eventstream::frame::{DecodedFrame, MessageFrameDecoder};
 use aws_smithy_eventstream::smithy::parse_response_headers;
 use bytes::BytesMut;
@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use indexmap::IndexMap;
 use reqwest::{Client as ReqwestClient, Method, RequestBuilder};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BedrockConfig {
@@ -222,29 +222,29 @@ async fn chat_completions_streaming(
                     debug!("stream-data: {smithy_type} {data}");
                     match smithy_type {
                         "contentBlockStart" => {
-                            if let Some(tool_use) = data["start"]["toolUse"].as_object() {
-                                if let (Some(id), Some(name)) = (
+                            if let Some(tool_use) = data["start"]["toolUse"].as_object()
+                                && let (Some(id), Some(name)) = (
                                     json_str_from_map(tool_use, "toolUseId"),
                                     json_str_from_map(tool_use, "name"),
-                                ) {
-                                    if !function_name.is_empty() {
-                                        if function_arguments.is_empty() {
-                                            function_arguments = String::from("{}");
-                                        }
-                                        let arguments: Value =
+                                )
+                            {
+                                if !function_name.is_empty() {
+                                    if function_arguments.is_empty() {
+                                        function_arguments = String::from("{}");
+                                    }
+                                    let arguments: Value =
                                         function_arguments.parse().with_context(|| {
                                             format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
                                         })?;
-                                        handler.tool_call(ToolCall::new(
-                                            function_name.clone(),
-                                            arguments,
-                                            Some(function_id.clone()),
-                                        ))?;
-                                    }
-                                    function_arguments.clear();
-                                    function_name = name.into();
-                                    function_id = id.into();
+                                    handler.tool_call(ToolCall::new(
+                                        function_name.clone(),
+                                        arguments,
+                                        Some(function_id.clone()),
+                                    ))?;
                                 }
+                                function_arguments.clear();
+                                function_name = name.into();
+                                function_id = id.into();
                             }
                         }
                         "contentBlockDelta" => {
@@ -291,7 +291,9 @@ async fn chat_completions_streaming(
                     bail!("Invalid response data: {data} (smithy_type: {smithy_type})")
                 }
                 _ => {
-                    bail!("Unrecognized message, message_type: {message_type}, smithy_type: {smithy_type}",);
+                    bail!(
+                        "Unrecognized message, message_type: {message_type}, smithy_type: {smithy_type}",
+                    );
                 }
             }
         }
@@ -494,18 +496,18 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
                 if let Some(text) = json_str_from_map(reasoning_text, "text") {
                     reasoning = Some(text.to_string());
                 }
-            } else if let Some(tool_use) = item["toolUse"].as_object() {
-                if let (Some(id), Some(name), Some(input)) = (
+            } else if let Some(tool_use) = item["toolUse"].as_object()
+                && let (Some(id), Some(name), Some(input)) = (
                     json_str_from_map(tool_use, "toolUseId"),
                     json_str_from_map(tool_use, "name"),
                     tool_use.get("input"),
-                ) {
-                    tool_calls.push(ToolCall::new(
-                        name.to_string(),
-                        input.clone(),
-                        Some(id.to_string()),
-                    ))
-                }
+                )
+            {
+                tool_calls.push(ToolCall::new(
+                    name.to_string(),
+                    input.clone(),
+                    Some(id.to_string()),
+                ))
             }
         }
     }

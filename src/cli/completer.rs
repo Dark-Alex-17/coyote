@@ -1,6 +1,6 @@
-use crate::client::{list_models, ModelType};
-use crate::config::{list_agents, Config};
-use clap_complete::{generate, CompletionCandidate, Shell};
+use crate::client::{ModelType, list_models};
+use crate::config::{Config, list_agents};
+use clap_complete::{CompletionCandidate, Shell, generate};
 use clap_complete_nushell::Nushell;
 use std::ffi::OsStr;
 use std::io;

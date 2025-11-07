@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use std::io::{stdout, Write};
+use std::io::{Write, stdout};
 
 /// Reads a single character from stdin without requiring Enter
 /// Returns the character if it's one of the valid options, or the default if Enter is pressed

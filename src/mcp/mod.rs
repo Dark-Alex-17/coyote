@@ -1,16 +1,16 @@
 use crate::config::Config;
-use crate::utils::{abortable_run_with_spinner, AbortSignal};
+use crate::utils::{AbortSignal, abortable_run_with_spinner};
 use crate::vault::interpolate_secrets;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::future::BoxFuture;
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use indoc::formatdoc;
 use rmcp::model::{CallToolRequestParam, CallToolResult};
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -148,7 +148,9 @@ impl McpRegistry {
         enabled_mcp_servers: Option<String>,
     ) -> Result<()> {
         if self.config.is_none() {
-            debug!("MCP config is not present; assuming MCP servers are disabled globally. Skipping MCP initialization");
+            debug!(
+                "MCP config is not present; assuming MCP servers are disabled globally. Skipping MCP initialization"
+            );
             return Ok(());
         }
 

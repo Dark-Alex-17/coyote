@@ -9,9 +9,9 @@ use crate::config::Config;
 use crate::vault::utils::ensure_password_file_initialized;
 use anyhow::{Context, Result};
 use fancy_regex::Regex;
-use gman::providers::local::LocalProvider;
 use gman::providers::SecretProvider;
-use inquire::{required, Password, PasswordDisplayMode};
+use gman::providers::local::LocalProvider;
+use inquire::{Password, PasswordDisplayMode, required};
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
 

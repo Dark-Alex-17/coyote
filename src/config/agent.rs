@@ -2,13 +2,13 @@ use super::*;
 
 use crate::{
     client::Model,
-    function::{run_llm_function, Functions},
+    function::{Functions, run_llm_function},
 };
 
 use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
 use fancy_regex::Captures;
-use inquire::{validator::Validation, Text};
+use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::{ffi::OsStr, path::Path};
@@ -530,23 +530,23 @@ impl AgentConfig {
         if let Some(v) = read_env_value::<f64>(&with_prefix("top_p")) {
             self.top_p = v;
         }
-        if let Ok(v) = env::var(with_prefix("global_tools")) {
-            if let Ok(v) = serde_json::from_str(&v) {
-                self.global_tools = v;
-            }
+        if let Ok(v) = env::var(with_prefix("global_tools"))
+            && let Ok(v) = serde_json::from_str(&v)
+        {
+            self.global_tools = v;
         }
-        if let Ok(v) = env::var(with_prefix("mcp_servers")) {
-            if let Ok(v) = serde_json::from_str(&v) {
-                self.mcp_servers = v;
-            }
+        if let Ok(v) = env::var(with_prefix("mcp_servers"))
+            && let Ok(v) = serde_json::from_str(&v)
+        {
+            self.mcp_servers = v;
         }
         if let Some(v) = read_env_value::<String>(&with_prefix("agent_session")) {
             self.agent_session = v;
         }
-        if let Ok(v) = env::var(with_prefix("variables")) {
-            if let Ok(v) = serde_json::from_str(&v) {
-                self.variables = v;
-            }
+        if let Ok(v) = env::var(with_prefix("variables"))
+            && let Ok(v) = serde_json::from_str(&v)
+        {
+            self.variables = v;
         }
     }
 
@@ -619,10 +619,10 @@ pub fn list_agents() -> Vec<String> {
     let mut agents = Vec::new();
     if let Ok(entries) = read_dir(agents_data_dir) {
         for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    agents.push(name.to_string());
-                }
+            if entry.path().is_dir()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                agents.push(name.to_string());
             }
         }
     }

@@ -4,9 +4,9 @@ use super::*;
 use crate::client::{Message, MessageContent, MessageRole};
 use crate::render::MarkdownRender;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use fancy_regex::Regex;
-use inquire::{validator::Validation, Confirm, Text};
+use inquire::{Confirm, Text, validator::Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -98,10 +98,10 @@ impl Session {
             session.path = Some(path.display().to_string());
         }
 
-        if let Some(role_name) = &session.role_name {
-            if let Ok(role) = config.retrieve_role(role_name) {
-                session.role_prompt = role.prompt().to_string();
-            }
+        if let Some(role_name) = &session.role_name
+            && let Ok(role) = config.retrieve_role(role_name)
+        {
+            session.role_prompt = role.prompt().to_string();
         }
 
         session.update_tokens();
@@ -473,23 +473,25 @@ impl Session {
 
     pub fn guard_empty(&self) -> Result<()> {
         if !self.is_empty() {
-            bail!("Cannot perform this operation because the session has messages, please `.empty session` first.");
+            bail!(
+                "Cannot perform this operation because the session has messages, please `.empty session` first."
+            );
         }
         Ok(())
     }
 
     pub fn add_message(&mut self, input: &Input, output: &str) -> Result<()> {
         if input.continue_output().is_some() {
-            if let Some(message) = self.messages.last_mut() {
-                if let MessageContent::Text(text) = &mut message.content {
-                    *text = format!("{text}{output}");
-                }
+            if let Some(message) = self.messages.last_mut()
+                && let MessageContent::Text(text) = &mut message.content
+            {
+                *text = format!("{text}{output}");
             }
         } else if input.regenerate() {
-            if let Some(message) = self.messages.last_mut() {
-                if let MessageContent::Text(text) = &mut message.content {
-                    *text = output.to_string();
-                }
+            if let Some(message) = self.messages.last_mut()
+                && let MessageContent::Text(text) = &mut message.content
+            {
+                *text = output.to_string();
             }
         } else {
             if self.messages.is_empty() {
@@ -553,14 +555,14 @@ impl Session {
         if len == 0 {
             messages = input.role().build_messages(input);
             need_add_msg = false;
-        } else if len == 1 && self.compressed_messages.len() >= 2 {
-            if let Some(index) = self
+        } else if len == 1
+            && self.compressed_messages.len() >= 2
+            && let Some(index) = self
                 .compressed_messages
                 .iter()
                 .rposition(|v| v.role == MessageRole::User)
-            {
-                messages.extend(self.compressed_messages[index..].to_vec());
-            }
+        {
+            messages.extend(self.compressed_messages[index..].to_vec());
         }
         if need_add_msg {
             messages.push(Message::new(MessageRole::User, input.message_content()));

@@ -1,8 +1,8 @@
 use super::*;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use http::header::CONTENT_TYPE;
 use reqwest::Url;
 use scraper::{Html, Selector};

@@ -1,6 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
-use html_to_markdown::{markdown, TagHandler};
+use html_to_markdown::{TagHandler, markdown};
 
 pub fn html_to_md(html: &str) -> String {
     let mut handlers: Vec<TagHandler> = vec![

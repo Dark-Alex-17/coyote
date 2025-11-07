@@ -1,4 +1,4 @@
-use super::{ReplCommand, REPL_COMMANDS};
+use super::{REPL_COMMANDS, ReplCommand};
 
 use crate::{config::GlobalConfig, utils::fuzzy_filter};
 

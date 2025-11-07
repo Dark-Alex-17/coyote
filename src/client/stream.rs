@@ -1,7 +1,7 @@
-use super::{catch_error, ToolCall};
+use super::{ToolCall, catch_error};
 use crate::utils::AbortSignal;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{Stream, StreamExt};
 use reqwest::RequestBuilder;
 use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
@@ -214,11 +214,11 @@ impl JsonStreamParser {
                 }
                 '}' => {
                     self.balances.pop();
-                    if self.balances.is_empty() {
-                        if let Some(start) = self.start.take() {
-                            let value: String = self.buffer[start..=i].iter().collect();
-                            handle(&value)?;
-                        }
+                    if self.balances.is_empty()
+                        && let Some(start) = self.start.take()
+                    {
+                        let value: String = self.buffer[start..=i].iter().collect();
+                        handle(&value)?;
                     }
                 }
                 ']' => {

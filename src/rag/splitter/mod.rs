@@ -120,10 +120,10 @@ impl RecursiveCharacterTextSplitter {
                     }
                 };
 
-                if prev_chunk.is_some() {
-                    if let Some(chunk_overlap_header) = chunk_overlap_header {
-                        page_content += chunk_overlap_header;
-                    }
+                if prev_chunk.is_some()
+                    && let Some(chunk_overlap_header) = chunk_overlap_header
+                {
+                    page_content += chunk_overlap_header;
                 }
 
                 let metadata = metadatas[i].clone();
@@ -240,11 +240,7 @@ impl RecursiveCharacterTextSplitter {
 
     fn join_docs(&self, docs: &[String], separator: &str) -> Option<String> {
         let text = docs.join(separator).trim().to_string();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        if text.is_empty() { None } else { Some(text) }
     }
 }
 
@@ -309,7 +305,7 @@ mod tests {
     use super::*;
     use indexmap::IndexMap;
     use pretty_assertions::assert_eq;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn build_metadata(source: &str) -> Value {
         json!({ "source": source })

@@ -1,13 +1,12 @@
 use super::{
-    list_all_models, list_client_names,
+    ApiPatch, MessageContentToolCalls, RequestPatch, list_all_models, list_client_names,
     message::{Message, MessageContent, MessageContentPart},
-    ApiPatch, MessageContentToolCalls, RequestPatch,
 };
 
 use crate::config::Config;
 use crate::utils::{estimate_token_length, strip_think_tag};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::Display;
@@ -275,10 +274,10 @@ impl Model {
 
     pub fn guard_max_input_tokens(&self, messages: &[Message]) -> Result<()> {
         let total_tokens = self.total_tokens(messages) + BASIS_TOKENS;
-        if let Some(max_input_tokens) = self.data.max_input_tokens {
-            if total_tokens >= max_input_tokens {
-                bail!("Exceed max_input_tokens limit")
-            }
+        if let Some(max_input_tokens) = self.data.max_input_tokens
+            && total_tokens >= max_input_tokens
+        {
+            bail!("Exceed max_input_tokens limit")
         }
         Ok(())
     }

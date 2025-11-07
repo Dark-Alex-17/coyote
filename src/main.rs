@@ -15,11 +15,12 @@ mod vault;
 extern crate log;
 
 use crate::client::{
-    call_chat_completions, call_chat_completions_streaming, list_models, ModelType,
+    ModelType, call_chat_completions, call_chat_completions_streaming, list_models,
 };
 use crate::config::{
-    ensure_parent_exists, list_agents, load_env_file, macro_execute, Agent, Config, GlobalConfig,
-    Input, WorkingMode, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE, TEMP_SESSION_NAME,
+    Agent, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, GlobalConfig, Input, SHELL_ROLE,
+    TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, load_env_file,
+    macro_execute,
 };
 use crate::render::render_error;
 use crate::repl::Repl;
@@ -27,7 +28,7 @@ use crate::utils::*;
 
 use crate::cli::Cli;
 use crate::vault::Vault;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use inquire::Text;

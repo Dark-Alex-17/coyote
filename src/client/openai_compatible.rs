@@ -4,7 +4,7 @@ use super::*;
 use anyhow::{Context, Result};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpenAICompatibleConfig {
@@ -124,12 +124,12 @@ pub async fn generic_rerank(builder: RequestBuilder, _model: &Model) -> Result<R
     if !status.is_success() {
         catch_error(&data, status.as_u16())?;
     }
-    if data.get("results").is_none() && data.get("data").is_some() {
-        if let Some(data_obj) = data.as_object_mut() {
-            if let Some(value) = data_obj.remove("data") {
-                data_obj.insert("results".to_string(), value);
-            }
-        }
+    if data.get("results").is_none()
+        && data.get("data").is_some()
+        && let Some(data_obj) = data.as_object_mut()
+        && let Some(value) = data_obj.remove("data")
+    {
+        data_obj.insert("results".to_string(), value);
     }
     let res_body: GenericRerankResBody =
         serde_json::from_value(data).context("Invalid rerank data")?;

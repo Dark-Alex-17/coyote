@@ -7,11 +7,11 @@ use crate::utils::*;
 mod serde_vectors;
 mod splitter;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use bm25::{Language, SearchEngine, SearchEngineBuilder};
 use hnsw_rs::prelude::*;
 use indexmap::{IndexMap, IndexSet};
-use inquire::{required, validator::Validation, Confirm, Select, Text};
+use inquire::{Confirm, Select, Text, required, validator::Validation};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -434,19 +434,18 @@ impl Rag {
         } in loaded_documents
         {
             let hash = sha256(&contents);
-            if let Some(file_ids) = to_deleted.get_mut(&hash) {
-                if let Some((i, _)) = file_ids
+            if let Some(file_ids) = to_deleted.get_mut(&hash)
+                && let Some((i, _)) = file_ids
                     .iter()
                     .enumerate()
                     .find(|(_, v)| self.data.files[*v].path == path)
-                {
-                    if file_ids.len() == 1 {
-                        to_deleted.swap_remove(&hash);
-                    } else {
-                        file_ids.remove(i);
-                    }
-                    continue;
+            {
+                if file_ids.len() == 1 {
+                    to_deleted.swap_remove(&hash);
+                } else {
+                    file_ids.remove(i);
                 }
+                continue;
             }
             let extension = metadata
                 .swap_remove(EXTENSION_METADATA)
@@ -679,7 +678,7 @@ impl Rag {
                     Err(e) => {
                         return Err(e).with_context(|| {
                             format!("Failed to create embedding after {retry_limit} attempts")
-                        })?
+                        })?;
                     }
                 }
             };
@@ -926,11 +925,7 @@ fn add_documents() -> Result<Vec<String>> {
         .split(';')
         .filter_map(|v| {
             let v = v.trim().to_string();
-            if v.is_empty() {
-                None
-            } else {
-                Some(v)
-            }
+            if v.is_empty() { None } else { Some(v) }
         })
         .collect();
     Ok(paths)

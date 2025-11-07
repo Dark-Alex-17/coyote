@@ -8,23 +8,23 @@ use self::prompt::ReplPrompt;
 
 use crate::client::{call_chat_completions, call_chat_completions_streaming};
 use crate::config::{
-    macro_execute, AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage,
-    StateFlags,
+    AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage, StateFlags,
+    macro_execute,
 };
 use crate::render::render_error;
 use crate::utils::{
-    abortable_run_with_spinner, create_abort_signal, dimmed_text, set_text, temp_file, AbortSignal,
+    AbortSignal, abortable_run_with_spinner, create_abort_signal, dimmed_text, set_text, temp_file,
 };
 
 use crate::mcp::McpRegistry;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
 use reedline::CursorConfig;
 use reedline::{
-    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
     ColumnarMenu, EditCommand, EditMode, Emacs, KeyCode, KeyModifiers, Keybindings, Reedline,
-    ReedlineEvent, ReedlineMenu, ValidationResult, Validator, Vi,
+    ReedlineEvent, ReedlineMenu, ValidationResult, Validator, Vi, default_emacs_keybindings,
+    default_vi_insert_keybindings, default_vi_normal_keybindings,
 };
 use reedline::{MenuBuilder, Signal};
 use std::sync::LazyLock;
@@ -382,10 +382,10 @@ pub async fn run_repl_command(
     abort_signal: AbortSignal,
     mut line: &str,
 ) -> Result<bool> {
-    if let Ok(Some(captures)) = MULTILINE_RE.captures(line) {
-        if let Some(text_match) = captures.get(1) {
-            line = text_match.as_str();
-        }
+    if let Ok(Some(captures)) = MULTILINE_RE.captures(line)
+        && let Some(text_match) = captures.get(1)
+    {
+        line = text_match.as_str();
     }
     match parse_command(line) {
         Some((cmd, args)) => match cmd {

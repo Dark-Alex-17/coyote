@@ -4,18 +4,18 @@ mod macros;
 mod role;
 mod session;
 
-pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables};
+pub use self::agent::{Agent, AgentVariables, complete_agent_variables, list_agents};
 pub use self::input::Input;
 pub use self::role::{
-    Role, RoleLike, CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE,
+    CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
 use self::session::Session;
 pub use macros::macro_execute;
 use mem::take;
 
 use crate::client::{
-    create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
-    Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
+    ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
+    ProviderModels, create_client_config, list_client_types, list_models,
 };
 use crate::function::{FunctionDeclaration, Functions, ToolResult};
 use crate::rag::Rag;
@@ -24,14 +24,14 @@ use crate::utils::*;
 
 use crate::config::macros::Macro;
 use crate::mcp::{
-    McpRegistry, MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX,
+    MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX, McpRegistry,
 };
-use crate::vault::{create_vault_password_file, interpolate_secrets, GlobalVault, Vault};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::vault::{GlobalVault, Vault, create_vault_password_file, interpolate_secrets};
+use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
 use indexmap::IndexMap;
 use indoc::formatdoc;
-use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
+use inquire::{Confirm, MultiSelect, Select, Text, list_option::ListOption, validator::Validation};
 use log::LevelFilter;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,7 @@ use std::sync::LazyLock;
 use std::{
     env,
     fs::{
-        create_dir_all, read_dir, read_to_string, remove_dir_all, remove_file, File, OpenOptions,
+        File, OpenOptions, create_dir_all, read_dir, read_to_string, remove_dir_all, remove_file,
     },
     io::Write,
     mem,
@@ -50,7 +50,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use syntect::highlighting::ThemeSet;
-use terminal_colorsaurus::{color_scheme, ColorScheme, QueryOptions};
+use terminal_colorsaurus::{ColorScheme, QueryOptions, color_scheme};
 use tokio::runtime::Handle;
 
 pub const TEMP_ROLE_NAME: &str = "temp";
@@ -547,10 +547,10 @@ impl Config {
 
         for entry in read_dir(Self::agent_data_dir(name))? {
             let entry = entry?;
-            if let Some(file) = entry.file_name().to_str() {
-                if allowed.contains(&file) {
-                    return Ok(entry.path());
-                }
+            if let Some(file) = entry.file_name().to_str()
+                && allowed.contains(&file)
+            {
+                return Ok(entry.path());
             }
         }
 
@@ -783,24 +783,24 @@ impl Config {
             }
             "enabled_mcp_servers" => {
                 let value: Option<String> = parse_value(value)?;
-                if let Some(servers) = value.as_ref() {
-                    if let Some(registry) = &config.read().mcp_registry {
-                        if registry.list_configured_servers().is_empty() {
-                            bail!(
-                                "No MCP servers are configured. Please configure MCP servers first before setting 'enabled_mcp_servers'."
-                            );
-                        }
+                if let Some(servers) = value.as_ref()
+                    && let Some(registry) = &config.read().mcp_registry
+                {
+                    if registry.list_configured_servers().is_empty() {
+                        bail!(
+                            "No MCP servers are configured. Please configure MCP servers first before setting 'enabled_mcp_servers'."
+                        );
+                    }
 
-                        if !servers.split(',').all(|s| {
-                            registry
-                                .list_configured_servers()
-                                .contains(&s.trim().to_string())
-                                || s == "all"
-                        }) {
-                            bail!(
-                                "Some of the specified MCP servers in 'enabled_mcp_servers' are configured. Please check your MCP server configuration."
-                            );
-                        }
+                    if !servers.split(',').all(|s| {
+                        registry
+                            .list_configured_servers()
+                            .contains(&s.trim().to_string())
+                            || s == "all"
+                    }) {
+                        bail!(
+                            "Some of the specified MCP servers in 'enabled_mcp_servers' are configured. Please check your MCP server configuration."
+                        );
                     }
                 }
                 config.write().set_enabled_mcp_servers(value.clone());
@@ -1399,18 +1399,16 @@ impl Config {
                     output,
                     continuous,
                 }) = &self.last_message
+                    && (*continuous && !output.is_empty())
+                    && self.agent.is_some() == input.with_agent()
                 {
-                    if (*continuous && !output.is_empty())
-                        && self.agent.is_some() == input.with_agent()
-                    {
-                        let ans = Confirm::new(
-                            "Start a session that incorporates the last question and answer?",
-                        )
-                        .with_default(false)
-                        .prompt()?;
-                        if ans {
-                            session.add_message(input, output)?;
-                        }
+                    let ans = Confirm::new(
+                        "Start a session that incorporates the last question and answer?",
+                    )
+                    .with_default(false)
+                    .prompt()?;
+                    if ans {
+                        session.add_message(input, output)?;
                     }
                 }
             }
@@ -1520,11 +1518,11 @@ impl Config {
         {
             let mut config = config.write();
             let compression_threshold = config.compression_threshold;
-            if let Some(session) = config.session.as_mut() {
-                if session.needs_compression(compression_threshold) {
-                    session.set_compressing(true);
-                    needs_compression = true;
-                }
+            if let Some(session) = config.session.as_mut()
+                && session.needs_compression(compression_threshold)
+            {
+                session.set_compressing(true);
+                needs_compression = true;
             }
         };
         if !needs_compression {
@@ -1587,11 +1585,11 @@ impl Config {
 
     pub fn maybe_autoname_session(config: GlobalConfig) {
         let mut need_autoname = false;
-        if let Some(session) = config.write().session.as_mut() {
-            if session.need_autoname() {
-                session.set_autonaming(true);
-                need_autoname = true;
-            }
+        if let Some(session) = config.write().session.as_mut()
+            && session.need_autoname()
+        {
+            session.set_autonaming(true);
+            need_autoname = true;
         }
         if !need_autoname {
             return;
@@ -2439,15 +2437,15 @@ impl Config {
                 .unwrap_or_default()
                 .to_string(),
         );
-        if let Some(temperature) = role.temperature() {
-            if temperature != 0.0 {
-                output.insert("temperature", temperature.to_string());
-            }
+        if let Some(temperature) = role.temperature()
+            && temperature != 0.0
+        {
+            output.insert("temperature", temperature.to_string());
         }
-        if let Some(top_p) = role.top_p() {
-            if top_p != 0.0 {
-                output.insert("top_p", top_p.to_string());
-            }
+        if let Some(top_p) = role.top_p()
+            && top_p != 0.0
+        {
+            output.insert("top_p", top_p.to_string());
         }
         if self.dry_run {
             output.insert("dry_run", "true".to_string());
@@ -2458,10 +2456,10 @@ impl Config {
         if self.save {
             output.insert("save", "true".to_string());
         }
-        if let Some(wrap) = &self.wrap {
-            if wrap != "no" {
-                output.insert("wrap", wrap.clone());
-            }
+        if let Some(wrap) = &self.wrap
+            && wrap != "no"
+        {
+            output.insert("wrap", wrap.clone());
         }
         if !role.is_derived() {
             output.insert("role", role.name().to_string());
@@ -2724,10 +2722,10 @@ impl Config {
         if let Some(Some(v)) = read_env_bool(&get_env_name("save")) {
             self.save = v;
         }
-        if let Ok(v) = env::var(get_env_name("keybindings")) {
-            if v == "vi" {
-                self.keybindings = v;
-            }
+        if let Ok(v) = env::var(get_env_name("keybindings"))
+            && v == "vi"
+        {
+            self.keybindings = v;
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("editor")) {
             self.editor = v;
@@ -2742,10 +2740,10 @@ impl Config {
         if let Some(Some(v)) = read_env_bool(&get_env_name("function_calling_support")) {
             self.function_calling_support = v;
         }
-        if let Ok(v) = env::var(get_env_name("mapping_tools")) {
-            if let Ok(v) = serde_json::from_str(&v) {
-                self.mapping_tools = v;
-            }
+        if let Ok(v) = env::var(get_env_name("mapping_tools"))
+            && let Ok(v) = serde_json::from_str(&v)
+        {
+            self.mapping_tools = v;
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("enabled_tools")) {
             self.enabled_tools = v;
@@ -2754,10 +2752,10 @@ impl Config {
         if let Some(Some(v)) = read_env_bool(&get_env_name("mcp_server_support")) {
             self.mcp_server_support = v;
         }
-        if let Ok(v) = env::var(get_env_name("mapping_mcp_servers")) {
-            if let Ok(v) = serde_json::from_str(&v) {
-                self.mapping_mcp_servers = v;
-            }
+        if let Ok(v) = env::var(get_env_name("mapping_mcp_servers"))
+            && let Ok(v) = serde_json::from_str(&v)
+        {
+            self.mapping_mcp_servers = v;
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("enabled_mcp_servers")) {
             self.enabled_mcp_servers = v;
@@ -2805,10 +2803,10 @@ impl Config {
             self.rag_template = v;
         }
 
-        if let Ok(v) = env::var(get_env_name("document_loaders")) {
-            if let Ok(v) = serde_json::from_str(&v) {
-                self.document_loaders = v;
-            }
+        if let Ok(v) = env::var(get_env_name("document_loaders"))
+            && let Ok(v) = serde_json::from_str(&v)
+        {
+            self.document_loaders = v;
         }
 
         if let Some(Some(v)) = read_env_bool(&get_env_name("highlight")) {
@@ -2820,14 +2818,14 @@ impl Config {
         if self.highlight && self.theme.is_none() {
             if let Some(v) = read_env_value::<String>(&get_env_name("theme")) {
                 self.theme = v;
-            } else if *IS_STDOUT_TERMINAL {
-                if let Ok(color_scheme) = color_scheme(QueryOptions::default()) {
-                    let theme = match color_scheme {
-                        ColorScheme::Dark => "dark",
-                        ColorScheme::Light => "light",
-                    };
-                    self.theme = Some(theme.into());
-                }
+            } else if *IS_STDOUT_TERMINAL
+                && let Ok(color_scheme) = color_scheme(QueryOptions::default())
+            {
+                let theme = match color_scheme {
+                    ColorScheme::Dark => "dark",
+                    ColorScheme::Light => "light",
+                };
+                self.theme = Some(theme.into());
             }
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("left_prompt")) {
@@ -2934,7 +2932,7 @@ pub fn load_env_file() -> Result<()> {
             continue;
         }
         if let Some((key, value)) = line.split_once('=') {
-            env::set_var(key.trim(), value.trim());
+            unsafe { env::set_var(key.trim(), value.trim()) };
         }
     }
     Ok(())

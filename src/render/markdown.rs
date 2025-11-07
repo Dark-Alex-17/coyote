@@ -1,7 +1,7 @@
 use crate::utils::decode_bin;
 
 use ansi_colours::AsRGB;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use crossterm::style::{Color, Stylize};
 use crossterm::terminal;
 use std::collections::HashMap;
@@ -122,10 +122,10 @@ impl MarkdownRender {
                     line_type = LineType::Normal;
                 }
                 LineType::CodeBegin => {
-                    if code_syntax.is_none() {
-                        if let Some(syntax) = self.syntax_set.find_syntax_by_first_line(line) {
-                            code_syntax = Some(syntax.clone());
-                        }
+                    if code_syntax.is_none()
+                        && let Some(syntax) = self.syntax_set.find_syntax_by_first_line(line)
+                    {
+                        code_syntax = Some(syntax.clone());
                     }
                     line_type = LineType::CodeInner;
                     is_code = true;

@@ -1,7 +1,7 @@
 use super::*;
 
-use base64::{engine::general_purpose::STANDARD, Engine};
-use serde::{de, Deserializer, Serializer};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use serde::{Deserializer, Serializer, de};
 
 pub fn serialize<S>(
     vectors: &IndexMap<DocumentId, Vec<f32>>,

@@ -1,13 +1,13 @@
 use super::*;
 
 use crate::client::{
-    init_client, patch_messages, ChatCompletionsData, Client, ImageUrl, Message, MessageContent,
-    MessageContentPart, MessageContentToolCalls, MessageRole, Model,
+    ChatCompletionsData, Client, ImageUrl, Message, MessageContent, MessageContentPart,
+    MessageContentToolCalls, MessageRole, Model, init_client, patch_messages,
 };
 use crate::function::ToolResult;
-use crate::utils::{base64_encode, is_loader_protocol, sha256, AbortSignal};
+use crate::utils::{AbortSignal, base64_encode, is_loader_protocol, sha256};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use indexmap::IndexSet;
 use std::{collections::HashMap, fs::File, io::Read};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};

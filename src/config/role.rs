@@ -64,11 +64,11 @@ impl Role {
     pub fn new(name: &str, content: &str) -> Self {
         let mut metadata = "";
         let mut prompt = content.trim();
-        if let Ok(Some(caps)) = RE_METADATA.captures(content) {
-            if let (Some(metadata_value), Some(prompt_value)) = (caps.get(1), caps.get(2)) {
-                metadata = metadata_value.as_str().trim();
-                prompt = prompt_value.as_str().trim();
-            }
+        if let Ok(Some(caps)) = RE_METADATA.captures(content)
+            && let (Some(metadata_value), Some(prompt_value)) = (caps.get(1), caps.get(2))
+        {
+            metadata = metadata_value.as_str().trim();
+            prompt = prompt_value.as_str().trim();
         }
         let mut prompt = prompt.to_string();
         interpolate_variables(&mut prompt);
@@ -77,23 +77,20 @@ impl Role {
             prompt,
             ..Default::default()
         };
-        if !metadata.is_empty() {
-            if let Ok(value) = serde_yaml::from_str::<Value>(metadata) {
-                if let Some(value) = value.as_object() {
-                    for (key, value) in value {
-                        match key.as_str() {
-                            "model" => role.model_id = value.as_str().map(|v| v.to_string()),
-                            "temperature" => role.temperature = value.as_f64(),
-                            "top_p" => role.top_p = value.as_f64(),
-                            "enabled_tools" => {
-                                role.enabled_tools = value.as_str().map(|v| v.to_string())
-                            }
-                            "enabled_mcp_servers" => {
-                                role.enabled_mcp_servers = value.as_str().map(|v| v.to_string())
-                            }
-                            _ => (),
-                        }
+        if !metadata.is_empty()
+            && let Ok(value) = serde_yaml::from_str::<Value>(metadata)
+            && let Some(value) = value.as_object()
+        {
+            for (key, value) in value {
+                match key.as_str() {
+                    "model" => role.model_id = value.as_str().map(|v| v.to_string()),
+                    "temperature" => role.temperature = value.as_f64(),
+                    "top_p" => role.top_p = value.as_f64(),
+                    "enabled_tools" => role.enabled_tools = value.as_str().map(|v| v.to_string()),
+                    "enabled_mcp_servers" => {
+                        role.enabled_mcp_servers = value.as_str().map(|v| v.to_string())
                     }
+                    _ => (),
                 }
             }
         }

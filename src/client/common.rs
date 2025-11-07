@@ -2,21 +2,21 @@ use super::*;
 
 use crate::{
     config::{Config, GlobalConfig, Input},
-    function::{eval_tool_calls, FunctionDeclaration, ToolCall, ToolResult},
+    function::{FunctionDeclaration, ToolCall, ToolResult, eval_tool_calls},
     render::render_stream,
     utils::*,
 };
 
 use crate::vault::Vault;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use fancy_regex::Regex;
 use indexmap::IndexMap;
 use inquire::{
-    list_option::ListOption, required, validator::Validation, MultiSelect, Select, Text,
+    MultiSelect, Select, Text, list_option::ListOption, required, validator::Validation,
 };
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
@@ -180,11 +180,11 @@ pub trait Client: Sync + Send {
         };
         for (key, patch) in patch_map {
             let key = ESCAPE_SLASH_RE.replace_all(&key, r"\/");
-            if let Ok(regex) = Regex::new(&format!("^({key})$")) {
-                if let Ok(true) = regex.is_match(self.model().name()) {
-                    request_data.apply_patch(patch);
-                    return;
-                }
+            if let Ok(regex) = Regex::new(&format!("^({key})$"))
+                && let Ok(true) = regex.is_match(self.model().name())
+            {
+                request_data.apply_patch(patch);
+                return;
             }
         }
     }

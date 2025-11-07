@@ -2,8 +2,8 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -69,19 +69,19 @@ pub async fn wait_abort_signal(abort_signal: &AbortSignal) {
 }
 
 pub fn poll_abort_signal(abort_signal: &AbortSignal) -> Result<bool> {
-    if event::poll(Duration::from_millis(25))? {
-        if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
-                    abort_signal.set_ctrlc();
-                    return Ok(true);
-                }
-                KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
-                    abort_signal.set_ctrld();
-                    return Ok(true);
-                }
-                _ => {}
+    if event::poll(Duration::from_millis(25))?
+        && let Event::Key(key) = event::read()?
+    {
+        match key.code {
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                abort_signal.set_ctrlc();
+                return Ok(true);
             }
+            KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+                abort_signal.set_ctrld();
+                return Ok(true);
+            }
+            _ => {}
         }
     }
     Ok(false)

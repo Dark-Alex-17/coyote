@@ -1,9 +1,9 @@
 use crate::function::{FunctionDeclaration, JsonSchema};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ast::{Stmt, StmtFunctionDef};
 use indexmap::IndexMap;
 use rustpython_ast::{Constant, Expr, UnaryOp};
-use rustpython_parser::{ast, Mode};
+use rustpython_parser::{Mode, ast};
 use serde_json::Value;
 use std::fs::File;
 use std::io::Read;
@@ -104,12 +104,11 @@ fn python_to_function_declarations(
 
 fn get_docstring_from_body(body: &[Stmt]) -> Option<String> {
     let first = body.first()?;
-    if let Stmt::Expr(expr_stmt) = first {
-        if let Expr::Constant(constant) = &*expr_stmt.value {
-            if let Constant::Str(s) = &constant.value {
-                return Some(s.clone());
-            }
-        }
+    if let Stmt::Expr(expr_stmt) = first
+        && let Expr::Constant(constant) = &*expr_stmt.value
+        && let Constant::Str(s) = &constant.value
+    {
+        return Some(s.clone());
     }
     None
 }
@@ -351,10 +350,10 @@ fn build_parameters_schema(params: &[Param], _description: &str) -> JsonSchema {
             "str"
         };
 
-        if let Some(d) = &p.doc_desc {
-            if !d.is_empty() {
-                schema.description = Some(d.clone());
-            }
+        if let Some(d) = &p.doc_desc
+            && !d.is_empty()
+        {
+            schema.description = Some(d.clone());
         }
 
         apply_type_to_schema(ty, &mut schema);

@@ -1,6 +1,6 @@
 use super::{MarkdownRender, SseEvent};
 
-use crate::utils::{poll_abort_signal, spawn_spinner, AbortSignal};
+use crate::utils::{AbortSignal, poll_abort_signal, spawn_spinner};
 
 use anyhow::Result;
 use crossterm::{
@@ -8,7 +8,7 @@ use crossterm::{
     terminal::{self, disable_raw_mode, enable_raw_mode},
 };
 use std::{
-    io::{stdout, Stdout, Write},
+    io::{Stdout, Write, stdout},
     time::Duration,
 };
 use textwrap::core::display_width;

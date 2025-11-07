@@ -1,11 +1,11 @@
 use crate::config::ensure_parent_exists;
-use crate::vault::{Vault, SECRET_RE};
-use anyhow::anyhow;
+use crate::vault::{SECRET_RE, Vault};
 use anyhow::Result;
+use anyhow::anyhow;
 use gman::providers::local::LocalProvider;
 use indoc::formatdoc;
 use inquire::validator::Validation;
-use inquire::{min_length, required, Confirm, Password, PasswordDisplayMode, Text};
+use inquire::{Confirm, Password, PasswordDisplayMode, Text, min_length, required};
 use std::borrow::Cow;
 use std::path::PathBuf;
 
@@ -21,11 +21,16 @@ pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> R
             if !file_contents.trim().is_empty() {
                 Ok(())
             } else {
-                Err(anyhow!("The configured password file '{}' is empty. Please populate it with a password and try again.", vault_password_file.display()))
+                Err(anyhow!(
+                    "The configured password file '{}' is empty. Please populate it with a password and try again.",
+                    vault_password_file.display()
+                ))
             }
         }
     } else {
-        Err(anyhow!("A password file is required to utilize the Loki vault. Please configure a password file in your config file and try again."))
+        Err(anyhow!(
+            "A password file is required to utilize the Loki vault. Please configure a password file in your config file and try again."
+        ))
     }
 }
 
@@ -40,7 +45,9 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
         {
             let file_contents = std::fs::read_to_string(&vault_password_file)?;
             if !file_contents.trim().is_empty() {
-                debug!("create_vault_password_file was called but the password file already exists and is non-empty");
+                debug!(
+                    "create_vault_password_file was called but the password file already exists and is non-empty"
+                );
                 return Ok(());
             }
         }
@@ -56,7 +63,10 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
         .prompt()?;
 
         if !ans {
-            return Err(anyhow!("The configured password file '{}' is empty. Please populate it with a password and try again.", vault_password_file.display()));
+            return Err(anyhow!(
+                "The configured password file '{}' is empty. Please populate it with a password and try again.",
+                vault_password_file.display()
+            ));
         }
 
         let password = Password::new("Enter a password to encrypt all vault secrets:")
@@ -85,7 +95,9 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
             .prompt()?;
 
         if !ans {
-            return Err(anyhow!("A password file is required to utilize the Loki vault. Please configure a password file in your config file and try again."));
+            return Err(anyhow!(
+                "A password file is required to utilize the Loki vault. Please configure a password file in your config file and try again."
+            ));
         }
 
         let password_file: PathBuf = Text::new("Enter the path to the password file to create:")
