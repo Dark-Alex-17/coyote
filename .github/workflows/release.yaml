@@ -1,130 +1,458 @@
-name: Release
+name: Create release
+
+permissions:
+  pull-requests: write
+  contents: write
 
 on:
-  push:
-    tags:
-    - v[0-9]+.[0-9]+.[0-9]+*
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: "Specify the type of version bump"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 jobs:
-  release:
-    name: Publish GitHub Release
-    permissions:
-      contents: write
-    outputs:
-      rc: ${{ steps.check-tag.outputs.rc }}
+  bump-version:
+    name: bump-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH for Git
+        if: env.ACT != 'true'
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.RELEASE_BOT_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
 
+      - name: Checkout repository
+        if: env.ACT != 'true'
+        uses: actions/checkout@v3
+        with:
+          ssh-key: ${{ secrets.RELEASE_BOT_SSH_KEY }}
+          fetch-depth: 0
+
+      - name: Checkout repository
+        if: env.ACT == 'true'
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install Commitizen
+        run: |
+          python -m pip install --upgrade pip
+          pip install commitizen
+          npm install -g conventional-changelog-cli
+
+      - name: Configure Git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version with Commitizen
+        run: |
+          cz bump --yes --increment ${{ github.event.inputs.bump_type }}
+
+      - name: Amend commit message to include '[skip ci]'
+        run: |
+          git commit --amend --no-edit -m "$(git log -1 --pretty=%B) [skip ci]"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Get the new version tag
+        id: version
+        run: |
+          mkdir -p artifacts
+          NEW_TAG=$(cz version --project)
+          echo "New version: $NEW_TAG"
+          echo "version=$NEW_TAG" >> $GITHUB_ENV
+          echo "$NEW_TAG" > artifacts/release-version
+
+      - name: Get the previous version tag
+        id: prev_version
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 ${GITHUB_SHA}^)
+          echo "Previous tag: $PREV_TAG"
+          echo "prev_version=$PREV_TAG" >> $GITHUB_ENV
+
+      - name: Bump Cargo.toml version
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          VERSION: ${{ env.version }}
+        run: |
+          set -euo pipefail
+          : "${VERSION:?env.version is empty}"
+
+          # Ignore Act's local artifact dir noise
+          echo artifacts/ >> .git/info/exclude || true
+
+          # Edit the version line right after name="loki"
+          sed -E -i '
+            /^[[:space:]]*name[[:space:]]*=[[:space:]]*"loki"[[:space:]]*$/ {
+              n
+              s|^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]*"|version = "'"$VERSION"'"|
+            }
+          ' Cargo.toml
+
+          cargo update || true
+
+          # Git config that helps in Act
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          git status --porcelain
+          git diff --name-only -- Cargo.toml Cargo.lock || true
+
+          if ! git diff --quiet -- Cargo.toml Cargo.lock; then
+            git add -u -- Cargo.toml Cargo.lock
+            git commit -m "chore: bump Cargo.toml to $VERSION"
+          else
+            echo "No changes to commit (already at $VERSION)"
+          fi
+
+      - name: Generate changelog for the version bump
+        id: changelog
+        run: |
+          conventional-changelog -p conventionalcommits -i CHANGELOG.md --from ${{ env.prev_version }} --to v${{ env.version }} > artifacts/changelog.md
+
+      - name: Push changes
+        if: env.ACT != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push origin --follow-tags
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload the changed Cargo files (Act)
+        if: env.ACT == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bumped-cargo-files
+          path: |
+            Cargo.toml
+            Cargo.lock
+
+  publish-github-release:
+    name: build-release
+    needs: [bump-version]
+    runs-on: ${{ matrix.os }}
+    env:
+      RUST_BACKTRACE: 1
+      BUILD_CMD: cargo
     strategy:
+      fail-fast: true
       matrix:
         include:
-        - target: aarch64-unknown-linux-musl
-          os: ubuntu-latest
-          use-cross: true
-          cargo-flags: ""
-        - target: aarch64-apple-darwin
-          os: macos-latest
-          use-cross: true
-          cargo-flags: ""
-        - target: aarch64-pc-windows-msvc
-          os: windows-latest
-          use-cross: true
-          cargo-flags: ""
-        - target: x86_64-apple-darwin
-          os: macos-latest
-          cargo-flags: ""
-        - target: x86_64-pc-windows-msvc
-          os: windows-latest
-          cargo-flags: ""
-        - target: x86_64-unknown-linux-musl
-          os: ubuntu-latest
-          use-cross: true
-          cargo-flags: ""
-
-    runs-on: ${{matrix.os}}
-    env:
-      BUILD_CMD: cargo
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use-cross: true
+            cargo-flags: ""
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use-cross: true
+            cargo-flags: ""
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            use-cross: true
+            cargo-flags: ""
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cargo-flags: ""
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cargo-flags: ""
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use-cross: true
+            cargo-flags: ""
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cargo-flags: ""
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Check if actor is repository owner
+        if: ${{ github.actor != github.repository_owner && env.ACT != 'true' }}
+        run: |
+          echo "You are not authorized to run this workflow."
+          exit 1
 
-    - name: Check Tag
-      id: check-tag
-      shell: bash
-      run: |
-        ver=${GITHUB_REF##*/}
-        echo "version=$ver" >> $GITHUB_OUTPUT
-        if [[ "$ver" =~ [0-9]+.[0-9]+.[0-9]+$ ]]; then
-          echo "rc=false" >> $GITHUB_OUTPUT
-        else
-          echo "rc=true" >> $GITHUB_OUTPUT
-        fi
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
+      - name: Ensure repository is up-to-date
+        if: env.ACT != 'true'
+        run: |
+          git fetch --all
+          git pull
 
-    - name: Install Rust Toolchain Components
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: ${{ matrix.target }}
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
 
-    - name: Install cross
-      if: matrix.use-cross
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cross
+      - name: Ensure repository is up-to-date
+        if: env.ACT != 'true'
+        run: |
+          git fetch --all
+          git pull
 
-    - name: Overwrite build command env variable
-      if: matrix.use-cross
-      shell: bash
-      run: echo "BUILD_CMD=cross" >> $GITHUB_ENV
-  
-    - name: Show Version Information (Rust, cargo, GCC)
-      shell: bash
-      run: |
-        gcc --version || true
-        rustup -V
-        rustup toolchain list
-        rustup default
-        cargo -V
-        rustc -V
-      
-    - name: Build
-      shell: bash
-      run: $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }}
+      - name: Set environment variables
+        shell: bash
+        run: |
+          release_version="$(cat ./artifacts/release-version)"
+          echo "RELEASE_VERSION=$release_version" >> $GITHUB_ENV
 
-    - name: Build Archive
-      shell: bash
-      id: package
-      env:
-        target: ${{ matrix.target }}
-        version:  ${{ steps.check-tag.outputs.version }}
-      run: |
-        set -euxo pipefail
+      - name: Validate release environment variables
+        run: |
+          echo "Release version: ${{ env.RELEASE_VERSION }}"
+          echo "Changelog body: $(cat artifacts/changelog.md)"
 
-        bin=${GITHUB_REPOSITORY##*/}
-        dist_dir=`pwd`/dist
-        name=$bin-$version-$target
-        executable=target/$target/release/$bin
+      - name: Get bumped Cargo files (Act)
+        if: env.ACT == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: bumped-cargo-files
+          path: ${{ github.workspace }}
 
-        if [[ "$RUNNER_OS" == "Windows" ]]; then
-          executable=$executable.exe
-        fi
+      - uses: dtolnay/rust-toolchain@stable
+        name: Set Rust toolchain
+        with:
+          targets: ${{ matrix.target }}
 
-        mkdir $dist_dir
-        cp $executable $dist_dir
-        cd $dist_dir
+      - name: Install cross
+        if: matrix.use-cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
-        if [[ "$RUNNER_OS" == "Windows" ]]; then
+      - name: Overwrite build command env variable
+        if: matrix.use-cross
+        shell: bash
+        run: echo "BUILD_CMD=cross" >> $GITHUB_ENV
+
+      - name: Install latest LLVM/Clang
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          # omit the version to get the latest stable for your Ubuntu (24.04 "noble" on ubuntu-latest)
+          sudo ./llvm.sh all
+          # ensure libclang dev package is present (adjust the "22" if a newer major exists)
+          sudo apt-get update
+          sudo apt-get install -y libclang-20-dev libclang-dev
+
+      - name: Show Version Information (Rust, cargo, GCC)
+        shell: bash
+        run: |
+          gcc --version || true
+          rustup -V
+          rustup toolchain list
+          rustup default
+          cargo -V
+          rustc -V
+
+      - name: Build
+        shell: bash
+        run: $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }}
+
+      - name: Verify file
+        shell: bash
+        run: |
+          file target/${{ matrix.target }}/release/loki
+
+      - name: Test
+        if: matrix.target != 'aarch64-apple-darwin' && matrix.target != 'aarch64-pc-windows-msvc'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [[ "${{ matrix.use-cross || 'false' }}" == 'true' ]]; then
+            cross test --release --locked --target=${{ matrix.target }} --verbose
+          else
+            cargo test  --release --locked --target=${{ matrix.target }} --verbose
+          fi
+
+      - name: Build Archive
+        shell: bash
+        id: package
+        env:
+          target: ${{ matrix.target }}
+        run: |
+          set -euxo pipefail
+
+          bin=${GITHUB_REPOSITORY##*/}
+          dist_dir=`pwd`/dist
+          name=$bin-$target
+          executable=target/$target/release/$bin
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            executable=$executable.exe
+          fi
+
+          mkdir $dist_dir
+          cp $executable $dist_dir
+          cd $dist_dir
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
             archive=$dist_dir/$name.zip
+            sha=$dist_dir/$name.sha256
             7z a $archive *
+            certutil -hashfile $archive sha256 | grep -E [A-Fa-f0-9]{64} > $sha
             echo "archive=dist/$name.zip" >> $GITHUB_OUTPUT
-        else
+            echo "sha=dist/$name.sha256" >> $GITHUB_OUTPUT
+          else
             archive=$dist_dir/$name.tar.gz
+            sha=$dist_dir/$name.sha256
             tar -czf $archive *
+            shasum -a 256 $archive > $sha
             echo "archive=dist/$name.tar.gz" >> $GITHUB_OUTPUT
-        fi
+            echo "sha=dist/$name.sha256" >> $GITHUB_OUTPUT
+          fi
 
-    - name: Publish Archive
-      uses: softprops/action-gh-release@v2
-      if: ${{ startsWith(github.ref, 'refs/tags/') }}
-      with:
-        draft: false
-        files: ${{ steps.package.outputs.archive }}
-        prerelease: ${{ steps.check-tag.outputs.rc == 'true' }}
+      - name: Publish Archive and SHA
+        if: env.ACT != 'true'
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: |
+            ${{ steps.package.outputs.archive }} 
+            ${{ steps.package.outputs.sha }}
+          tag_name: v${{ env.RELEASE_VERSION }}
+          name: "v${{ env.RELEASE_VERSION }}"
+          body_path: artifacts/changelog.md
+          prerelease: false
+
+      - name: Add artifacts
+        shell: bash
+        run: |
+          [[ -d artifacts ]] || mkdir -p artifacts
+          cp ${{ steps.package.outputs.archive }} artifacts/
+          cp ${{ steps.package.outputs.sha }} artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-v${{ env.RELEASE_VERSION }}-${{ matrix.target }}
+          path: artifacts
+          overwrite: true
+
+  publish-homebrew-formula:
+    needs: [publish-github-release]
+    name: Update Homebrew formulas
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if actor is repository owner
+        if: ${{ github.actor != github.repository_owner  && env.ACT != 'true' }}
+        run: |
+          echo "You are not authorized to run this workflow."
+          exit 1
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Get release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Set release assets and version
+        shell: bash
+        run: |
+          # Set environment variables
+          macos_sha="$(cat ./artifacts/loki-x86_64-apple-darwin.sha256 | awk '{print $1}')"
+          echo "MACOS_SHA=$macos_sha" >> $GITHUB_ENV
+          macos_sha_arm="$(cat ./artifacts/loki-aarch64-apple-darwin.sha256 | awk '{print $1}')"
+          echo "MACOS_SHA_ARM=$macos_sha_arm" >> $GITHUB_ENV
+          linux_sha="$(cat ./artifacts/loki-x86_64-unknown-linux-musl.sha256 | awk '{print $1}')"
+          echo "LINUX_SHA=$linux_sha" >> $GITHUB_ENV
+          release_version="$(cat ./artifacts/release-version)"
+          echo "RELEASE_VERSION=$release_version" >> $GITHUB_ENV
+
+      - name: Validate release environment variables
+        run: |
+          echo "Release SHA macos: ${{ env.MACOS_SHA }}"
+          echo "Release SHA macos-arm: ${{ env.MACOS_SHA_ARM }}"
+          echo "Release SHA linux musl: ${{ env.LINUX_SHA }}"
+          echo "Release version: ${{ env.RELEASE_VERSION }}"
+
+      - name: Execute Homebrew packaging script
+        if: env.ACT != 'true'
+        run: |
+          # run packaging script
+          python "./deployment/homebrew/packager.py" ${{ env.RELEASE_VERSION }} "./deployment/homebrew/loki.rb.template" "./loki.rb" ${{ env.MACOS_SHA }} ${{ env.MACOS_SHA_ARM }} ${{ env.LINUX_SHA }}
+
+      - name: Push changes to Homebrew tap
+        if: env.ACT != 'true'
+        env:
+          TOKEN: ${{ secrets.LOKI_GITHUB_TOKEN }}
+        run: |
+          # push to Git
+          git config --global user.name "Dark-Alex-17"
+          git config --global user.email "alex.j.tusa@gmail.com"
+          git clone https://Dark-Alex-17:${{ secrets.LOKI_GITHUB_TOKEN }}@github.com/Dark-Alex-17/homebrew-loki.git
+          rm homebrew-loki/Formula/loki.rb
+          cp loki.rb homebrew-loki/Formula
+          cd homebrew-loki
+          git add .
+          git diff-index --quiet HEAD || git commit -am "Update formula for G-Man release ${{ env.RELEASE_VERSION }}"
+          git push https://$TOKEN@github.com/Dark-Alex-17/homebrew-loki.git
+
+  publish-crate:
+    needs: publish-github-release
+    name: Publish Crate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if actor is repository owner
+        if: ${{ github.actor != github.repository_owner  && env.ACT != 'true' }}
+        run: |
+          echo "You are not authorized to run this workflow."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get bumped Cargo files (Act)
+        if: env.ACT == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: bumped-cargo-files
+          path: ${{ github.workspace }}
+
+      - name: Ensure repository is up-to-date
+        if: env.ACT != 'true'
+        run: |
+          git fetch --all
+          git pull
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: katyo/publish-crates@v2
+        if: env.ACT != 'true'
+        with:
+          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
