@@ -1,6 +1,5 @@
 # Customize REPL Prompt
 
-[//]: # (TODO link to this doc from the main README)
 The prompt you see when you start the Loki REPL can be customized to your liking. This is achieved via the `left_prompt`
 and `right_prompt` settings in the global Loki configuration file:
 
