@@ -1,6 +1,6 @@
 [package]
 name = "loki-ai"
-version = "0.1.1"
+version = "0.1.0"
 edition = "2021"
 authors = ["Alex Clarke <alex.j.tusa@gmail.com>"]
 description = "An all-in-one, batteries included LLM CLI Tool"
