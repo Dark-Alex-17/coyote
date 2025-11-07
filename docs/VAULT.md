@@ -121,7 +121,7 @@ Note that all paths are relative to the Loki configuration directory. The direct
 running
 
 ```shell
-dirname $(loki --info | grep config_file | awk '{print $2}')
+loki --info | grep config_dir | awk '{print $2}'
 ```
 
 ## Environment Variable Secret Injection in Agents
