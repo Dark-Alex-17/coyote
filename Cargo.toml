@@ -1,6 +1,6 @@
 [package]
 name = "loki-ai"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Alex Clarke <alex.j.tusa@gmail.com>"]
 description = "An all-in-one, batteries included LLM CLI Tool"
@@ -21,12 +21,24 @@ reedline = "0.40.0"
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = { version = "1.0.93", features = ["preserve_order"] }
 serde_yaml = "0.9.17"
-tokio = { version = "1.34.0", features = ["rt", "time", "macros", "signal", "rt-multi-thread", "full"] }
+tokio = { version = "1.34.0", features = [
+  "rt",
+  "time",
+  "macros",
+  "signal",
+  "rt-multi-thread",
+  "full",
+] }
 tokio-graceful = "0.2.2"
-tokio-stream = { version = "0.1.15", default-features = false, features = ["sync"] }
+tokio-stream = { version = "0.1.15", default-features = false, features = [
+  "sync",
+] }
 crossterm = "0.28.1"
 chrono = "0.4.23"
-bincode = { version = "2.0.0", features = ["serde", "std"], default-features = false }
+bincode = { version = "2.0.0", features = [
+  "serde",
+  "std",
+], default-features = false }
 parking_lot = "0.12.1"
 fancy-regex = "0.14.0"
 base64 = "0.22.0"
@@ -57,7 +69,9 @@ path-absolutize = "3.1.1"
 hnsw_rs = "0.3.0"
 rayon = "1.10.0"
 uuid = { version = "1.9.1", features = ["v4"] }
-scraper = { version = "0.23.1", default-features = false, features = ["deterministic"] }
+scraper = { version = "0.23.1", default-features = false, features = [
+  "deterministic",
+] }
 sys-locale = "0.3.1"
 html_to_markdown = "0.1.0"
 rust-embed = "8.5.0"
@@ -81,7 +95,13 @@ clap_complete_nushell = "4.5.9"
 
 [dependencies.reqwest]
 version = "0.12.0"
-features = ["json", "multipart", "socks", "rustls-tls", "rustls-tls-native-roots"]
+features = [
+  "json",
+  "multipart",
+  "socks",
+  "rustls-tls",
+  "rustls-tls-native-roots",
+]
 default-features = false
 
 [dependencies.syntect]
@@ -93,7 +113,9 @@ features = ["parsing", "regex-onig", "plist-load"]
 crossterm = { version = "0.28.1", features = ["use-dev-tty"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-arboard = { version = "3.3.0", default-features = false, features = ["wayland-data-control"] }
+arboard = { version = "3.3.0", default-features = false, features = [
+  "wayland-data-control",
+] }
 
 [target.'cfg(not(any(target_os = "linux", target_os = "android", target_os = "emscripten")))'.dependencies]
 arboard = { version = "3.3.0", default-features = false }
