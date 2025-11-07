@@ -1,5 +1,12 @@
 # Loki: All-in-one, batteries-included LLM CLI Tool
 
+![Test](https://github.com/Dark-Alex-17/loki/actions/workflows/ci.yml/badge.svg)
+![LOC](https://tokei.rs/b1/github/Dark-Alex-17/loki?category=code)
+[![crates.io link](https://img.shields.io/crates/v/loki-ai.svg)](https://crates.io/crates/loki-ai)
+![Release](https://img.shields.io/github/v/release/Dark-Alex-17/loki?color=%23c694ff)
+![Crate.io downloads](https://img.shields.io/crates/d/loki-ai?label=Crate%20downloads)
+[![GitHub Downloads](https://img.shields.io/github/downloads/Dark-Alex-17/loki/total.svg?label=GitHub%20downloads)](https://github.com/Dark-Alex-17/loki/releases)
+
 Loki is an all-in-one, batteries-included, LLM CLI tool featuring Shell Assistant, CLI & REPL Mode, RAG, AI Tools & 
 Agents, and More.
 
@@ -79,10 +86,10 @@ interaction with Jira, and they are used within agents and tools.
 If you have Cargo installed, then you can install `loki` from Crates.io:
 
 ```shell
-cargo install loki
+cargo install loki-ai # Binary name is `loki`
 
 # If you encounter issues installing, try installing with '--locked'
-cargo install --locked loki
+cargo install --locked loki-ai
 ```
 
 ### Homebrew (Mac/Linux)
