@@ -38,7 +38,7 @@ right_prompt:
 vault_password_file: null        # Path to a file containing the password for the Loki vault (cannot be a secret template)
 
 # ---- Function Calling ----
-# See the [Tools documentation](./docs/TOOLS.md) for more details
+# See the [Tools documentation](./docs/function-calling/TOOLS.md) for more details
 function_calling: true           # Enables or disables function calling (Globally).
 mapping_tools:                   # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
@@ -127,6 +127,7 @@ document_loaders:
     sh -c "yek $1 --json | jq 'map({ path: .filename, contents: .content })'"
 
 # ---- Clients ----
+# See the [Clients documentation](./docs/clients/CLIENTS.md) for more details
 clients:
   # All clients have the following configuration:
   # - type: xxxx
