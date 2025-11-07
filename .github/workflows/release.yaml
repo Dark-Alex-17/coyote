@@ -417,7 +417,7 @@ jobs:
           cp loki.rb homebrew-loki/Formula
           cd homebrew-loki
           git add .
-          git diff-index --quiet HEAD || git commit -am "Update formula for G-Man release ${{ env.RELEASE_VERSION }}"
+          git diff-index --quiet HEAD || git commit -am "Update formula for Loki release ${{ env.RELEASE_VERSION }}"
           git push https://$TOKEN@github.com/Dark-Alex-17/homebrew-loki.git
 
   publish-crate:
