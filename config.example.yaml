@@ -82,7 +82,7 @@ save_session: null               # Controls the persistence of the session. If t
 compression_threshold: 4000      # Compress the session when the token count reaches or exceeds this threshold
 summarization_prompt: >          # The text prompt used for creating a concise summary of session message
   'Summarize the discussion briefly in 200 words or less to use as a prompt for future context.'
-summary_prompt: >                # The text prompt used for including the summary of the entire session as context to the model
+summary_context_prompt: >        # The text prompt used for including the summary of the entire session as context to the model
   'This is a summary of the chat history as a recap: '
 
 # ---- RAG ----
