@@ -143,10 +143,10 @@ clients:
   #       max_batch_size: 100
   #     - name: xxxx                                  # Reranker model
   #       type: reranker 
-  #   patch:                                          # Patch api
-  #     chat_completions:                             # Api type, possible values: chat_completions, embeddings, and rerank
+  #   patch:                                          # Patch API calls
+  #     chat_completions:                             # API type; Possible values: chat_completions, embeddings, and rerank
   #       <regex>:                                    # The regex to match model names, e.g. '.*' 'gpt-4o' 'gpt-4o|gpt-4-.*'
-  #         url: ''                                   # Patch request url
+  #         url: ''                                   # Patch request URL
   #         body:                                     # Patch request body
   #           <json>
   #         headers:                                  # Patch request headers
