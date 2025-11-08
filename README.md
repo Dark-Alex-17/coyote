@@ -1,6 +1,6 @@
 # Loki: All-in-one, batteries-included LLM CLI Tool
 
-![Test](https://github.com/Dark-Alex-17/loki/actions/workflows/ci.yml/badge.svg)
+![Test](https://github.com/Dark-Alex-17/loki/actions/workflows/ci.yaml/badge.svg)
 ![LOC](https://tokei.rs/b1/github/Dark-Alex-17/loki?category=code)
 [![crates.io link](https://img.shields.io/crates/v/loki-ai.svg)](https://crates.io/crates/loki-ai)
 ![Release](https://img.shields.io/github/v/release/Dark-Alex-17/loki?color=%23c694ff)
