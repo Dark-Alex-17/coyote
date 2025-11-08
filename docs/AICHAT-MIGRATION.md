@@ -3,8 +3,8 @@ Loki originally started as a fork of AIChat but has since evolved into its own s
 
 As a result, there's some changes you'll need to make to your AIChat configuration to be able to use Loki.
 
-Be sure you've followed the [first-time setup steps](../README.md#first-time-setup) so that the Loki configuration 
-directory and subdirectories exist and is populated with the built-in defaults.
+Be sure you've run `loki` at least once so that the Loki configuration directory and subdirectories exist and is
+populated with the built-in defaults.
 
 ## Global Configuration File
 You should be able to copy/paste your AIChat configuration file into your Loki configuration directory. Since the 

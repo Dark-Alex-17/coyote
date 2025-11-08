@@ -164,21 +164,6 @@ guide you through the process when you first attempt to access the vault. So, to
 loki --list-secrets
 ```
 
-### First Time Setup
-In order for Loki to function correctly, you'll need to add a few secrets to the Loki vault so the MCP servers can
-function.
-
-**GitHub MCP Server:**
-* `GITHUB_PERSONAL_ACCESS_TOKEN` - A GitHub Personal Access Token with `repo` and `workflow` scopes.
-  See [Creating a GitHub Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
-
-#### Add the secrets to the Loki vault
-You can add the secrets to the Loki vault using the following commands (First time use will prompt you to create a vault 
-password file):
-```sh
-loki --add-secret GITHUB_PERSONAL_ACCESS_TOKEN
-```
-
 ### Tab-Completions
 You can also enable tab completions to make using Loki easier. To do so, add the following to your shell profile:
 ```shell
