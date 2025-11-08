@@ -1,3 +1,9 @@
+## v0.1.2 (2025-11-08)
+
+### Refactor
+
+- Gave the GitHub MCP server a default placeholder value that doesn't require the vault
+
 ## v0.1.1 (2025-11-08)
 
 ## v0.1.0 (2025-11-07)
