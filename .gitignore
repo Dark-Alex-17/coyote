@@ -2,5 +2,6 @@
 /tmp
 /.env
 !cli/**
-/.idea/
+.idea/
 /loki.iml
+/.idea/
