@@ -19,7 +19,6 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 
 ## Quick Links
 * [AIChat Migration Guide](./docs/AICHAT-MIGRATION.md): Coming from AIChat? Follow the migration guide to get started.
-* [History](#history): A history of how Loki came to be.
 * [Installation](#install): Install Loki
 * [Getting Started](#getting-started): Get started with Loki by doing first-run setup steps.
 * [REPL](./docs/REPL.md): Interactive Read-Eval-Print Loop for conversational interactions with LLMs and Loki.
@@ -41,21 +40,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [Client Configurations](./docs/clients/CLIENTS.md): Configuration instructions for various LLM providers.
     * [Patching API Requests](./docs/clients/PATCHES.md): Learn how to patch API requests for advanced customization.
 * [Custom Themes](./docs/THEMES.md): Change the look and feel of Loki to your preferences with custom themes.
-
----
-
-## History
-Loki originally started as a fork of the fantastic [AIChat CLI](https://github.com/sigoden/aichat). The purpose was to 
-simply fix a bug in how MCP servers worked with AIChat so that I could specify different ones for agents. However, it 
-has since evolved far beyond that and become a passion project with a life of its own!
-
-Loki now has first class MCP server support (with support for local and remote servers alike), a built-in vault for 
-interpolating secrets in configuration files, built-in agents, built-in macros, dynamic tab completions, integrated
-custom functions (no `argc` dependency), improved documentation, and much more with many more plans for the future!
-
-The original kudos goes out to all the developers of the wonderful AIChat project!
-
----
+* [History](#history): A history of how Loki came to be.
 
 ## Prerequisites
 Loki requires the following tools to be installed on your system:
@@ -256,6 +241,21 @@ The appearance of Loki can be modified using the following settings:
 |----------------------|---------------|------------------------------------------------------------------------------------------------------------------|
 | `user_agent`         | `null`        | The name of the `User-Agent` that should be passed in the `User-Agent` header on all requests to model providers |
 | `save_shell_history` | `true`        | Enables or disables REPL command history                                                                         |
+
+---
+
+## History
+Loki originally started as a fork of the fantastic [AIChat CLI](https://github.com/sigoden/aichat). The purpose was to 
+simply fix a bug in how MCP servers worked with AIChat so that I could specify different ones for agents. However, it 
+has since evolved far beyond that and become a passion project with a life of its own!
+
+Loki now has first class MCP server support (with support for local and remote servers alike), a built-in vault for 
+interpolating secrets in configuration files, built-in agents, built-in macros, dynamic tab completions, integrated
+custom functions (no `argc` dependency), improved documentation, and much more with many more plans for the future!
+
+The original kudos goes out to all the developers of the wonderful AIChat project!
+
+---
 
 ## Creator
 * [Alex Clarke](https://github.com/Dark-Alex-17)
