@@ -11,21 +11,12 @@
         "ghcr.io/github/github-mcp-server"
       ],
       "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "{{GITHUB_PERSONAL_ACCESS_TOKEN}}"
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "YOUR_GITHUB_TOKEN"
       }
     },
     "docker": {
       "command": "uvx",
       "args": ["mcp-server-docker"]
-    },
-    "slack": {
-      "command": "npx",
-      "args": ["-y", "slack-mcp-server@latest", "--transport", "stdio"],
-      "env": {
-        "SLACK_MCP_XOXC_TOKEN": "{{SLACK_MCP_XOXC_TOKEN}}",
-        "SLACK_MCP_XOXD_TOKEN": "{{SLACK_MCP_XOXD_TOKEN}}",
-        "SLACK_MCP_ADD_MESSAGE_TOOL": true
-      }
     }
   }
 }
