@@ -24,7 +24,8 @@ use crate::utils::*;
 
 use crate::config::macros::Macro;
 use crate::mcp::{
-    MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX, McpRegistry,
+    MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
+    MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpRegistry,
 };
 use crate::vault::{GlobalVault, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
@@ -1972,7 +1973,8 @@ impl Config {
                     .iter()
                     .filter(|v| {
                         !v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                            && !v.name.starts_with(MCP_LIST_META_FUNCTION_NAME_PREFIX)
+                            && !v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
+                            && !v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
                     })
                     .map(|v| v.name.to_string())
                     .collect();
@@ -2015,7 +2017,8 @@ impl Config {
                     .into_iter()
                     .filter(|v| {
                         !v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                            && !v.name.starts_with(MCP_LIST_META_FUNCTION_NAME_PREFIX)
+                            && !v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
+                            && !v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
                     })
                     .collect();
                 let tool_names: HashSet<String> = agent_functions
@@ -2051,7 +2054,8 @@ impl Config {
                     .iter()
                     .filter(|v| {
                         v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                            || v.name.starts_with(MCP_LIST_META_FUNCTION_NAME_PREFIX)
+                            || v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
+                            || v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
                     })
                     .map(|v| v.name.to_string())
                     .collect();
@@ -2062,8 +2066,10 @@ impl Config {
                         let item = item.trim();
                         let item_invoke_name =
                             format!("{}_{item}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
-                        let item_list_name =
-                            format!("{}_{item}", MCP_LIST_META_FUNCTION_NAME_PREFIX);
+                        let item_search_name =
+                            format!("{}_{item}", MCP_SEARCH_META_FUNCTION_NAME_PREFIX);
+                        let item_describe_name =
+                            format!("{}_{item}", MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX);
                         if let Some(values) = self.mapping_mcp_servers.get(item) {
                             server_names.extend(
                                 values
@@ -2077,7 +2083,12 @@ impl Config {
                                             ),
                                             format!(
                                                 "{}_{}",
-                                                MCP_LIST_META_FUNCTION_NAME_PREFIX,
+                                                MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+                                                v.to_string()
+                                            ),
+                                            format!(
+                                                "{}_{}",
+                                                MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
                                                 v.to_string()
                                             ),
                                         ]
@@ -2086,7 +2097,8 @@ impl Config {
                             )
                         } else if mcp_declaration_names.contains(&item_invoke_name) {
                             server_names.insert(item_invoke_name);
-                            server_names.insert(item_list_name);
+                            server_names.insert(item_search_name);
+                            server_names.insert(item_describe_name);
                         }
                     }
                 }
@@ -2112,7 +2124,8 @@ impl Config {
                     .into_iter()
                     .filter(|v| {
                         v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                            || v.name.starts_with(MCP_LIST_META_FUNCTION_NAME_PREFIX)
+                            || v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
+                            || v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
                     })
                     .collect();
                 let tool_names: HashSet<String> = agent_functions

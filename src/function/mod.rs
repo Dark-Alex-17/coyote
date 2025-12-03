@@ -4,7 +4,10 @@ use crate::{
 };
 
 use crate::config::ensure_parent_exists;
-use crate::mcp::{MCP_INVOKE_META_FUNCTION_NAME_PREFIX, MCP_LIST_META_FUNCTION_NAME_PREFIX};
+use crate::mcp::{
+    MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
+    MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+};
 use crate::parsers::{bash, python};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
@@ -247,19 +250,13 @@ impl Functions {
     pub fn clear_mcp_meta_functions(&mut self) {
         self.declarations.retain(|d| {
             !d.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                && !d.name.starts_with(MCP_LIST_META_FUNCTION_NAME_PREFIX)
+                && !d.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
+                && !d.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
         });
     }
 
     pub fn append_mcp_meta_functions(&mut self, mcp_servers: Vec<String>) {
         let mut invoke_function_properties = IndexMap::new();
-        invoke_function_properties.insert(
-            "server".to_string(),
-            JsonSchema {
-                type_value: Some("string".to_string()),
-                ..Default::default()
-            },
-        );
         invoke_function_properties.insert(
             "tool".to_string(),
             JsonSchema {
@@ -275,32 +272,85 @@ impl Functions {
             },
         );
 
+        let mut search_function_properties = IndexMap::new();
+        search_function_properties.insert(
+            "query".to_string(),
+            JsonSchema {
+                type_value: Some("string".to_string()),
+                description: Some("Generalized explanation of what you want to do".into()),
+                ..Default::default()
+            },
+        );
+        search_function_properties.insert(
+            "top_k".to_string(),
+            JsonSchema {
+                type_value: Some("integer".to_string()),
+                description: Some("How many results to return, between 1 and 20".into()),
+                default: Some(Value::from(8usize)),
+                ..Default::default()
+            },
+        );
+
+        let mut describe_function_properties = IndexMap::new();
+        describe_function_properties.insert(
+            "tool".to_string(),
+            JsonSchema {
+                type_value: Some("string".to_string()),
+                description: Some("The name of the tool; e.g., search_issues".into()),
+                ..Default::default()
+            },
+        );
+
         for server in mcp_servers {
+            let search_function_name = format!("{}_{server}", MCP_SEARCH_META_FUNCTION_NAME_PREFIX);
+            let describe_function_name = format!("{}_{server}", MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX);
             let invoke_function_name = format!("{}_{server}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
             let invoke_function_declaration = FunctionDeclaration {
                 name: invoke_function_name.clone(),
                 description: formatdoc!(
                     r#"
-										Invoke the specified tool on the {server} MCP server. Always call {invoke_function_name} first to find the
-										correct names of tools before calling '{invoke_function_name}'.
+										Invoke the specified tool on the {server} MCP server. Always call {describe_function_name} first to
+										find the correct invocation schema for the given tool.
 										"#
                 ),
                 parameters: JsonSchema {
                     type_value: Some("object".to_string()),
                     properties: Some(invoke_function_properties.clone()),
-                    required: Some(vec!["server".to_string(), "tool".to_string()]),
+                    required: Some(vec!["tool".to_string()]),
                     ..Default::default()
                 },
                 agent: false,
             };
-            let list_functions_declaration = FunctionDeclaration {
-                name: format!("{}_{}", MCP_LIST_META_FUNCTION_NAME_PREFIX, server),
-                description: format!("List all the available tools for the {server} MCP server"),
-                parameters: JsonSchema::default(),
+            let search_functions_declaration = FunctionDeclaration {
+                name: search_function_name.clone(),
+                description: formatdoc!(
+                    r#"
+                    Find candidate tools by keywords for the {server} MCP server. Returns small suggestions; fetch
+                    schemas with {describe_function_name}.
+                    "#
+                ),
+                parameters: JsonSchema {
+                    type_value: Some("object".to_string()),
+                    properties: Some(search_function_properties.clone()),
+                    required: Some(vec!["query".to_string()]),
+                    ..Default::default()
+                },
+                agent: false,
+            };
+            let describe_functions_declaration = FunctionDeclaration {
+                name: describe_function_name.clone(),
+                description: "Get the full JSON schema for exactly one MCP tool.".to_string(),
+                parameters: JsonSchema {
+                    type_value: Some("object".to_string()),
+                    properties: Some(describe_function_properties.clone()),
+                    required: Some(vec!["tool".to_string()]),
+                    ..Default::default()
+                },
                 agent: false,
             };
             self.declarations.push(invoke_function_declaration);
-            self.declarations.push(list_functions_declaration);
+            self.declarations.push(search_functions_declaration);
+            self.declarations.push(describe_functions_declaration);
         }
     }
 
@@ -771,39 +821,14 @@ impl ToolCall {
         }
 
         let output = match cmd_name.as_str() {
-            _ if cmd_name.starts_with(MCP_LIST_META_FUNCTION_NAME_PREFIX) => {
-                let registry_arc = {
-                    let cfg = config.read();
-                    cfg.mcp_registry
-                        .clone()
-                        .with_context(|| "MCP is not configured")?
-                };
-
-                registry_arc.catalog().await?
+            _ if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) => {
+                Self::search_mcp_tools(config, &cmd_name, &json_data)?
+            }
+            _ if cmd_name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX) => {
+                Self::describe_mcp_tool(config, &cmd_name, json_data).await?
             }
             _ if cmd_name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX) => {
-                let server = json_data
-                    .get("server")
-                    .ok_or_else(|| anyhow!("Missing 'server' in arguments"))?
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Invalid 'server' in arguments"))?;
-                let tool = json_data
-                    .get("tool")
-                    .ok_or_else(|| anyhow!("Missing 'tool' in arguments"))?
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Invalid 'tool' in arguments"))?;
-                let arguments = json_data
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                let registry_arc = {
-                    let cfg = config.read();
-                    cfg.mcp_registry
-                        .clone()
-                        .with_context(|| "MCP is not configured")?
-                };
-                let result = registry_arc.invoke(server, tool, arguments).await?;
-                serde_json::to_value(result)?
+                Self::invoke_mcp_tool(config, &cmd_name, &json_data).await?
             }
             _ => match run_llm_function(cmd_name, cmd_args, envs, agent_name)? {
                 Some(contents) => serde_json::from_str(&contents)
@@ -814,6 +839,82 @@ impl ToolCall {
         };
 
         Ok(output)
+    }
+
+    async fn describe_mcp_tool(
+        config: &GlobalConfig,
+        cmd_name: &str,
+        json_data: Value,
+    ) -> Result<Value> {
+        let server_id = cmd_name.replace(&format!("{MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX}_"), "");
+        let tool = json_data
+            .get("tool")
+            .ok_or_else(|| anyhow!("Missing 'tool' in arguments"))?
+            .as_str()
+            .ok_or_else(|| anyhow!("Invalid 'tool' in arguments"))?;
+        let registry_arc = {
+            let cfg = config.read();
+            cfg.mcp_registry
+                .clone()
+                .with_context(|| "MCP is not configured")?
+        };
+
+        let result = registry_arc.describe(&server_id, tool).await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    fn search_mcp_tools(config: &GlobalConfig, cmd_name: &str, json_data: &Value) -> Result<Value> {
+        let server = cmd_name.replace(&format!("{MCP_SEARCH_META_FUNCTION_NAME_PREFIX}_"), "");
+        let query = json_data
+            .get("query")
+            .ok_or_else(|| anyhow!("Missing 'query' in arguments"))?
+            .as_str()
+            .ok_or_else(|| anyhow!("Invalid 'query' in arguments"))?;
+        let top_k = json_data
+            .get("top_k")
+            .cloned()
+            .unwrap_or_else(|| Value::from(8u64))
+            .as_u64()
+            .ok_or_else(|| anyhow!("Invalid 'top_k' in arguments"))? as usize;
+        let registry_arc = {
+            let cfg = config.read();
+            cfg.mcp_registry
+                .clone()
+                .with_context(|| "MCP is not configured")?
+        };
+
+        let catalog_items = registry_arc
+            .search_tools_server(&server, query, top_k)
+            .into_iter()
+            .map(|it| serde_json::to_value(&it).unwrap_or_default())
+            .collect();
+        Ok(Value::Array(catalog_items))
+    }
+
+    async fn invoke_mcp_tool(
+        config: &GlobalConfig,
+        cmd_name: &str,
+        json_data: &Value,
+    ) -> Result<Value> {
+        let server = cmd_name.replace(&format!("{MCP_INVOKE_META_FUNCTION_NAME_PREFIX}_"), "");
+        let tool = json_data
+            .get("tool")
+            .ok_or_else(|| anyhow!("Missing 'tool' in arguments"))?
+            .as_str()
+            .ok_or_else(|| anyhow!("Invalid 'tool' in arguments"))?;
+        let arguments = json_data
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let registry_arc = {
+            let cfg = config.read();
+            cfg.mcp_registry
+                .clone()
+                .with_context(|| "MCP is not configured")?
+        };
+
+        let result = registry_arc.invoke(&server, tool, arguments).await?;
+        Ok(serde_json::to_value(result)?)
     }
 
     fn extract_call_config_from_agent(
