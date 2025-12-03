@@ -303,7 +303,8 @@ impl Functions {
 
         for server in mcp_servers {
             let search_function_name = format!("{}_{server}", MCP_SEARCH_META_FUNCTION_NAME_PREFIX);
-            let describe_function_name = format!("{}_{server}", MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX);
+            let describe_function_name =
+                format!("{}_{server}", MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX);
             let invoke_function_name = format!("{}_{server}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
             let invoke_function_declaration = FunctionDeclaration {
                 name: invoke_function_name.clone(),
