@@ -114,7 +114,7 @@ At the time of writing, the following files support Loki secret injection:
 |-------------------------|-----------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
 | `config.yaml`           | The main Loki configuration file  | Cannot use secret injection on the `vault_password_file` field                                                                            |
 | `functions/mcp.json`    | The MCP server configuration file |                                                                                                                                           |
-| `<agent>/tools.<py/sh>` | Tool files for agents             | Specific configuration and only supported for Agents, not all global tools ([see below](#environment-variable-secret-injection-in-agents) |
+| `<agent>/tools.<py/sh>` | Tool files for agents             | Specific configuration and only supported for Agents, not all global tools ([see below](#environment-variable-secret-injection-in-agents)) |
 
 
 Note that all paths are relative to the Loki configuration directory. The directory varies by system, so you can find yours by
