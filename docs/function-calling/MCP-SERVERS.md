@@ -83,9 +83,7 @@ enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 
 ```
 
 A special note about `enabled_mcp_servers`: a user can set this to `all` to enable all configured MCP servers in the 
-`functions/mcp.json` configuration. However, **this should be used with caution**. When there is a significant number 
-of configured MCP servers, enabling all MCP servers may overwhelm the context length of a model, and quickly exceed 
-token limits.
+`functions/mcp.json` configuration.
 
 (See the [Configuration Example](../../config.example.yaml) file for an example global configuration with all options.)
 
