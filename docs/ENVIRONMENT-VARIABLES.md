@@ -84,7 +84,7 @@ You can also customize the location of full agent configurations using the follo
 
 | Environment Variable         | Description                                                                                                                         |
 |------------------------------|-------------------------------------------------------------------------------------------------------------------------------------|
-| `<AGENT_NAME>_CONFIG_FILE    | Customize the location of the agent's configuration file; e.g. `SQL_CONFIG_FILE`                                                    |
+| `<AGENT_NAME>_CONFIG_FILE`   | Customize the location of the agent's configuration file; e.g. `SQL_CONFIG_FILE`                                                    |
 | `<AGENT_NAME>_MODEL`         | Customize the `model` used for the agent; e.g `SQL_MODEL`                                                                           |
 | `<AGENT_NAME>_TEMPERATURE`   | Customize the `temperature` used for the agent; e.g. `SQL_TEMPERATURE`                                                              |
 | `<AGENT_NAME>_TOP_P`         | Customize the `top_p` used for the agent; e.g. `SQL_TOP_P`                                                                          |
