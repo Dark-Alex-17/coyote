@@ -800,7 +800,7 @@ impl Config {
                             || s == "all"
                     }) {
                         bail!(
-                            "Some of the specified MCP servers in 'enabled_mcp_servers' are configured. Please check your MCP server configuration."
+                            "Some of the specified MCP servers in 'enabled_mcp_servers' are not fully configured. Please check your MCP server configuration."
                         );
                     }
                 }
