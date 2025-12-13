@@ -1,3 +1,9 @@
+## v0.1.3 (2025-12-13)
+
+### Feat
+
+- Improved MCP implementation to minimize the tokens needed to utilize it so it doesn't quickly overwhelm the token space for a given model
+
 ## v0.1.2 (2025-11-08)
 
 ### Refactor
