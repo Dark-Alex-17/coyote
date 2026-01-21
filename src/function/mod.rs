@@ -756,6 +756,10 @@ pub struct ToolCall {
     pub name: String,
     pub arguments: Value,
     pub id: Option<String>,
+    /// Gemini 3's thought signature for stateful reasoning in function calling.
+    /// Must be preserved and sent back when submitting function responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 type CallConfig = (String, String, Vec<String>, HashMap<String, String>);
@@ -785,7 +789,13 @@ impl ToolCall {
             name,
             arguments,
             id,
+            thought_signature: None,
         }
+    }
+
+    pub fn with_thought_signature(mut self, thought_signature: Option<String>) -> Self {
+        self.thought_signature = thought_signature;
+        self
     }
 
     pub async fn eval(&self, config: &GlobalConfig) -> Result<Value> {

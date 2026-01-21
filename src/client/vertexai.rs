@@ -219,7 +219,14 @@ pub async fn gemini_chat_completions_streaming(
                         part["functionCall"]["name"].as_str(),
                         part["functionCall"]["args"].as_object(),
                     ) {
-                        handler.tool_call(ToolCall::new(name.to_string(), json!(args), None))?;
+                        let thought_signature = part["thoughtSignature"]
+                          .as_str()
+                          .or_else(|| part["thought_signature"].as_str())
+                          .map(|s| s.to_string());
+                        handler.tool_call(
+                            ToolCall::new(name.to_string(), json!(args), None)
+                              .with_thought_signature(thought_signature),
+                        )?;
                     }
                 }
             } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
@@ -280,7 +287,14 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
                 part["functionCall"]["name"].as_str(),
                 part["functionCall"]["args"].as_object(),
             ) {
-                tool_calls.push(ToolCall::new(name.to_string(), json!(args), None));
+                let thought_signature = part["thoughtSignature"]
+                  .as_str()
+                  .or_else(|| part["thought_signature"].as_str())
+                  .map(|s| s.to_string());
+                tool_calls.push(
+                    ToolCall::new(name.to_string(), json!(args), None)
+                      .with_thought_signature(thought_signature),
+                );
             }
         }
     }
@@ -347,12 +361,16 @@ pub fn gemini_build_chat_completions_body(
                     },
                     MessageContent::ToolCalls(MessageContentToolCalls { tool_results, .. }) => {
                         let model_parts: Vec<Value> = tool_results.iter().map(|tool_result| {
-                            json!({
+                            let mut part = json!({
                                 "functionCall": {
                                     "name": tool_result.call.name,
                                     "args": tool_result.call.arguments,
                                 }
-                            })
+                            });
+                            if let Some(sig) = &tool_result.call.thought_signature {
+                                part["thoughtSignature"] = json!(sig);
+                            }
+                            part
                         }).collect();
                         let function_parts: Vec<Value> = tool_results.into_iter().map(|tool_result| {
                             json!({
