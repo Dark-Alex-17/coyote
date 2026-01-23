@@ -17,6 +17,7 @@ loki --info | grep 'config_dir' | awk '{print $2}'
 - [Files and Directory Related Variables](#files-and-directory-related-variables)
 - [Agent Related Variables](#agent-related-variables)
 - [Logging Related Variables](#logging-related-variables)
+- [Miscellaneous Variables](#miscellaneous-variables)
 <!--toc:end-->
 
 ---
@@ -104,3 +105,8 @@ The following variables can be used to change the log level of Loki or the locat
 
 **Pro-Tip:** You can always tail the Loki logs using the `--tail-logs` flag. If you need to disable color output, you
 can also pass the `--disable-log-colors` flag as well.
+
+## Miscellaneous Variables
+| Environment Variable | Description                                                                                      | Default Value |
+|----------------------|--------------------------------------------------------------------------------------------------|---------------|
+| `AUTO_CONFIRM`       | Bypass all `guard_*` checks in the bash prompt helpers; useful for agent composition and routing |               |

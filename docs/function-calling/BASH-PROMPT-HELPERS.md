@@ -207,7 +207,9 @@ open_link https://www.google.com
 ```
 
 ### guard_operation
-Prompt for permission to run an operation
+Prompt for permission to run an operation.
+
+Can be disabled by setting the environment variable `AUTO_CONFIRM`.
 
 **Example:**
 ```bash
@@ -216,7 +218,9 @@ _run_sql
 ```
 
 ### guard_path
-Prompt for permission to perform path operations
+Prompt for permission to perform path operations.
+
+Can be disabled by setting the environment variable `AUTO_CONFIRM`.
 
 **Example:***
 ```bash

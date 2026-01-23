@@ -507,12 +507,14 @@ open_link() {
 
 guard_operation() {
   if [[ -t 1 ]]; then
-    ans="$(confirm "${1:-Are you sure you want to continue?}")"
+  	if [[ -z "$AUTO_CONFIRM" ]]; then
+			ans="$(confirm "${1:-Are you sure you want to continue?}")"
 
-    if [[ "$ans" == 0 ]]; then
-      error "Operation aborted!" 2>&1
-      exit 1
-    fi
+			if [[ "$ans" == 0 ]]; then
+				error "Operation aborted!" 2>&1
+				exit 1
+			fi
+		fi
   fi
 }
 
@@ -657,13 +659,13 @@ guard_path() {
     path="$(_to_real_path "$1")"
     confirmation_prompt="$2"
 
-    if [[ ! "$path" == "$(pwd)"* ]]; then
-      ans="$(confirm "$confirmation_prompt")"
+    if [[ ! "$path" == "$(pwd)"* && -z "$AUTO_CONFIRM" ]]; then
+			ans="$(confirm "$confirmation_prompt")"
 
-      if [[ "$ans" == 0 ]]; then
-        error "Operation aborted!" >&2
-        exit 1
-      fi
+			if [[ "$ans" == 0 ]]; then
+				error "Operation aborted!" >&2
+				exit 1
+			fi
     fi
   fi
 }
