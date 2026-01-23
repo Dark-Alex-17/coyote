@@ -2607,8 +2607,11 @@ impl Config {
             None => return Ok(()),
         };
         if !agent.defined_variables().is_empty() && agent.shared_variables().is_empty() {
-            let new_variables =
-                Agent::init_agent_variables(agent.defined_variables(), self.info_flag)?;
+            let new_variables = Agent::init_agent_variables(
+                agent.defined_variables(),
+                self.agent_variables.as_ref(),
+                self.info_flag,
+            )?;
             agent.set_shared_variables(new_variables);
         }
         if !self.info_flag {
@@ -2626,8 +2629,11 @@ impl Config {
             let shared_variables = agent.shared_variables().clone();
             let session_variables =
                 if !agent.defined_variables().is_empty() && shared_variables.is_empty() {
-                    let new_variables =
-                        Agent::init_agent_variables(agent.defined_variables(), self.info_flag)?;
+                    let new_variables = Agent::init_agent_variables(
+                        agent.defined_variables(),
+                        self.agent_variables.as_ref(),
+                        self.info_flag,
+                    )?;
                     agent.set_shared_variables(new_variables.clone());
                     new_variables
                 } else {

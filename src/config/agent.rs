@@ -204,6 +204,7 @@ impl Agent {
 
     pub fn init_agent_variables(
         agent_variables: &[AgentVariable],
+        pre_set_variables: Option<&AgentVariables>,
         no_interaction: bool,
     ) -> Result<AgentVariables> {
         let mut output = IndexMap::new();
@@ -214,6 +215,10 @@ impl Agent {
         let mut unset_variables = vec![];
         for agent_variable in agent_variables {
             let key = agent_variable.name.clone();
+            if let Some(value) = pre_set_variables.and_then(|v| v.get(&key)) {
+                output.insert(key, value.clone());
+                continue;
+            }
             if let Some(value) = agent_variable.default.clone() {
                 output.insert(key, value);
                 continue;
