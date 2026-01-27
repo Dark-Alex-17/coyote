@@ -245,15 +245,10 @@ The appearance of Loki can be modified using the following settings:
 ---
 
 ## History
-Loki originally started as a fork of the fantastic [AIChat CLI](https://github.com/sigoden/aichat). The purpose was to 
-simply fix a bug in how MCP servers worked with AIChat so that I could specify different ones for agents. However, it 
-has since evolved far beyond that and become a passion project with a life of its own!
 
-Loki now has first class MCP server support (with support for local and remote servers alike), a built-in vault for 
-interpolating secrets in configuration files, built-in agents, built-in macros, dynamic tab completions, integrated
-custom functions (no `argc` dependency), improved documentation, and much more with many more plans for the future!
+Loki began as a fork of [AIChat CLI](https://github.com/sigoden/aichat) and has since evolved into an independent project.
 
-The original kudos goes out to all the developers of the wonderful AIChat project!
+See [CREDITS.md](./CREDITS.md) for full attribution and background.
 
 ---
 
