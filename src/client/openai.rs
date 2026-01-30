@@ -164,7 +164,7 @@ pub async fn openai_chat_completions_streaming(
                         function_arguments = String::from("{}");
                     }
                     let arguments: Value = function_arguments.parse().with_context(|| {
-                        format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
+                        format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
                     })?;
                     handler.tool_call(ToolCall::new(
                         function_name.clone(),
@@ -370,7 +370,7 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
                 call["id"].as_str(),
             ) {
                 let arguments: Value = arguments.parse().with_context(|| {
-                    format!("Tool call '{name}' have non-JSON arguments '{arguments}'")
+                    format!("Tool call '{name}' has non-JSON arguments '{arguments}'")
                 })?;
                 tool_calls.push(ToolCall::new(
                     name.to_string(),

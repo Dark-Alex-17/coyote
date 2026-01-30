@@ -234,7 +234,7 @@ async fn chat_completions_streaming(
                                     }
                                     let arguments: Value =
                                         function_arguments.parse().with_context(|| {
-                                            format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
+                                            format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
                                         })?;
                                     handler.tool_call(ToolCall::new(
                                         function_name.clone(),
@@ -272,7 +272,7 @@ async fn chat_completions_streaming(
                                     function_arguments = String::from("{}");
                                 }
                                 let arguments: Value = function_arguments.parse().with_context(|| {
-                                    format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
+                                    format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
                                 })?;
                                 handler.tool_call(ToolCall::new(
                                     function_name.clone(),

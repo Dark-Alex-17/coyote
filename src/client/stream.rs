@@ -57,6 +57,7 @@ impl SseHandler {
 
     pub fn tool_call(&mut self, call: ToolCall) -> Result<()> {
         self.tool_calls.push(call);
+
         Ok(())
     }
 

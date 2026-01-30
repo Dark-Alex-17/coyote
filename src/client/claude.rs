@@ -95,7 +95,7 @@ pub async fn claude_chat_completions_streaming(
                         if !function_name.is_empty() {
                             let arguments: Value =
                                 function_arguments.parse().with_context(|| {
-                                    format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
+                                    format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
                                 })?;
                             handler.tool_call(ToolCall::new(
                                 function_name.clone(),
@@ -134,7 +134,7 @@ pub async fn claude_chat_completions_streaming(
                             json!({})
                         } else {
                             function_arguments.parse().with_context(|| {
-                                format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
+                                format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
                             })?
                         };
                         handler.tool_call(ToolCall::new(
