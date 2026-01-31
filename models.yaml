@@ -659,6 +659,14 @@
 #  - https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/gemini
 - provider: vertexai
   models:
+    - name: gemini-3-pro-preview
+      hipaa_safe: true
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0
+      output_price: 0
+      supports_vision: true
+      supports_function_calling: true
     - name: gemini-2.5-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
