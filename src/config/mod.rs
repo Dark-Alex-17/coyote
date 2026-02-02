@@ -17,7 +17,7 @@ use crate::client::{
     ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
     ProviderModels, create_client_config, list_client_types, list_models,
 };
-use crate::function::{FunctionDeclaration, Functions, ToolResult};
+use crate::function::{FunctionDeclaration, Functions, ToolCallTracker, ToolResult};
 use crate::rag::Rag;
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::*;
@@ -199,6 +199,8 @@ pub struct Config {
     pub rag: Option<Arc<Rag>>,
     #[serde(skip)]
     pub agent: Option<Agent>,
+    #[serde(skip)]
+    pub(crate) tool_call_tracker: Option<ToolCallTracker>,
 }
 
 impl Default for Config {
@@ -271,6 +273,7 @@ impl Default for Config {
             session: None,
             rag: None,
             agent: None,
+            tool_call_tracker: Some(ToolCallTracker::default()),
         }
     }
 }
