@@ -93,10 +93,13 @@ pub async fn claude_chat_completions_streaming(
                         data["content_block"]["id"].as_str(),
                     ) {
                         if !function_name.is_empty() {
-                            let arguments: Value =
+                            let arguments: Value = if function_arguments.is_empty() {
+                                json!({})
+                            } else {
                                 function_arguments.parse().with_context(|| {
                                     format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
-                                })?;
+                                })?
+                            };
                             handler.tool_call(ToolCall::new(
                                 function_name.clone(),
                                 arguments,
@@ -286,7 +289,7 @@ pub fn claude_build_chat_completions_body(
         body["tools"] = functions
             .iter()
             .map(|v| {
-								if v.parameters.type_value.is_none() {
+								if v.parameters.is_empty_properties() {
 									json!({
                     "name": v.name,
                     "description": v.description,
