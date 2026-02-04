@@ -285,7 +285,7 @@ impl Agent {
     }
 
     pub fn banner(&self) -> String {
-        self.config.banner()
+        self.config.banner(&self.conversation_starters())
     }
 
     pub fn name(&self) -> &str {
@@ -300,16 +300,25 @@ impl Agent {
         self.rag.clone()
     }
 
-    pub fn conversation_starters(&self) -> &[String] {
-        &self.config.conversation_starters
+    pub fn conversation_starters(&self) -> Vec<String> {
+        self.config
+            .conversation_starters
+            .iter()
+            .map(|starter| self.interpolate_text(starter))
+            .collect()
     }
 
     pub fn interpolated_instructions(&self) -> String {
-        let mut output = self
+        let output = self
             .session_dynamic_instructions
             .clone()
             .or_else(|| self.shared_dynamic_instructions.clone())
             .unwrap_or_else(|| self.config.instructions.clone());
+        self.interpolate_text(&output)
+    }
+
+    fn interpolate_text(&self, text: &str) -> String {
+        let mut output = text.to_string();
         for (k, v) in self.variables() {
             output = output.replace(&format!("{{{{{k}}}}}"), v)
         }
@@ -555,12 +564,11 @@ impl AgentConfig {
         }
     }
 
-    fn banner(&self) -> String {
+    fn banner(&self, conversation_starters: &[String]) -> String {
         let AgentConfig {
             name,
             description,
             version,
-            conversation_starters,
             ..
         } = self;
         let starters = if conversation_starters.is_empty() {
