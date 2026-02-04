@@ -23,6 +23,7 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs, io,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 use strum_macros::AsRefStr;
 
@@ -847,13 +848,29 @@ impl ToolCall {
 
         let output = match cmd_name.as_str() {
             _ if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) => {
-                Self::search_mcp_tools(config, &cmd_name, &json_data)?
+                Self::search_mcp_tools(config, &cmd_name, &json_data).unwrap_or_else(|e| {
+                    let error_msg = format!("MCP search failed: {e}");
+                    println!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    json!({"tool_call_error": error_msg})
+                })
             }
             _ if cmd_name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX) => {
-                Self::describe_mcp_tool(config, &cmd_name, json_data).await?
+                Self::describe_mcp_tool(config, &cmd_name, json_data)
+                    .await
+                    .unwrap_or_else(|e| {
+                        let error_msg = format!("MCP describe failed: {e}");
+                        println!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        json!({"tool_call_error": error_msg})
+                    })
             }
             _ if cmd_name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX) => {
-                Self::invoke_mcp_tool(config, &cmd_name, &json_data).await?
+                Self::invoke_mcp_tool(config, &cmd_name, &json_data)
+                    .await
+                    .unwrap_or_else(|e| {
+                        let error_msg = format!("MCP tool invocation failed: {e}");
+                        println!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        json!({"tool_call_error": error_msg})
+                    })
             }
             _ => match run_llm_function(cmd_name, cmd_args, envs, agent_name) {
                 Ok(Some(contents)) => serde_json::from_str(&contents)
@@ -1019,21 +1036,36 @@ pub fn run_llm_function(
     #[cfg(windows)]
     let cmd_name = polyfill_cmd_name(&cmd_name, &bin_dirs);
 
-    let exit_code = run_command(&cmd_name, &cmd_args, Some(envs))
+    let output = Command::new(&cmd_name)
+        .args(&cmd_args)
+        .envs(envs)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|child| child.wait_with_output())
         .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
+
+    let exit_code = output.status.code().unwrap_or_default();
     if exit_code != 0 {
-        let tool_error_message =
-            format!("⚠️ Tool call '{command_name}' threw exit code {exit_code} ⚠️");
-        println!("{}", warning_text(&tool_error_message));
-        let tool_error_json = format!("{{\"tool_call_error\":\"{}\"}}", &tool_error_message);
-        return Ok(Some(tool_error_json));
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            eprintln!("{stderr}");
+        }
+        let tool_error_message = format!("Tool call '{command_name}' exited with code {exit_code}");
+        println!("{}", warning_text(&format!("⚠️ {tool_error_message} ⚠️")));
+        let mut error_json = json!({"tool_call_error": tool_error_message});
+        if !stderr.is_empty() {
+            error_json["stderr"] = json!(stderr);
+        }
+        debug!("Tool call error: {error_json:?}");
+        return Ok(Some(error_json.to_string()));
     }
     let mut output = None;
     if temp_file.exists() {
         let contents =
             fs::read_to_string(temp_file).context("Failed to retrieve tool call output")?;
         if !contents.is_empty() {
-            debug!("Tool {cmd_name} output: {}", contents);
+            debug!("Tool {command_name} output: {}", contents);
             output = Some(contents);
         }
     };
