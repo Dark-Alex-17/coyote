@@ -9,5 +9,5 @@ set -e
 
 main() {
     # shellcheck disable=SC2154
-    ls -1 "$argc_path" >> "$LLM_OUTPUT"
+    ls -1 "$argc_path" >> "$LLM_OUTPUT" 2>&1 || echo "No such path: $argc_path" >> "$LLM_OUTPUT"
 }

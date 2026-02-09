@@ -10,5 +10,5 @@ set -e
 
 main() {
     # shellcheck disable=SC2154
-    cat "$argc_path" >> "$LLM_OUTPUT"
+		cat "$argc_path" >> "$LLM_OUTPUT" 2>&1 || echo "No such file or path: $argc_path" >> "$LLM_OUTPUT"
 }
