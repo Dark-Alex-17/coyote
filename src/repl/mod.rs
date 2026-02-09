@@ -933,7 +933,79 @@ async fn ask(
                 config.write().agent.as_mut().unwrap().reset_continuation();
             }
             Config::maybe_autoname_session(config.clone());
-            Config::maybe_compress_session(config.clone());
+
+            let needs_compression = {
+                let cfg = config.read();
+                let compression_threshold = cfg.compression_threshold;
+                cfg.session
+                    .as_ref()
+                    .is_some_and(|s| s.needs_compression(compression_threshold))
+            };
+
+            if needs_compression {
+                let agent_can_continue_after_compress = {
+                    let cfg = config.read();
+                    cfg.agent.as_ref().is_some_and(|agent| {
+                        agent.auto_continue_enabled()
+                            && agent.continuation_count() < agent.max_auto_continues()
+                            && agent.todo_list().has_incomplete()
+                    })
+                };
+
+                {
+                    let mut cfg = config.write();
+                    if let Some(session) = cfg.session.as_mut() {
+                        session.set_compressing(true);
+                    }
+                }
+
+                let color = if config.read().light_theme() {
+                    nu_ansi_term::Color::LightGray
+                } else {
+                    nu_ansi_term::Color::DarkGray
+                };
+                eprintln!("\n📢 {}", color.italic().paint("Compressing the session."),);
+
+                if let Err(err) = Config::compress_session(config).await {
+                    log::warn!("Failed to compress the session: {err}");
+                }
+                if let Some(session) = config.write().session.as_mut() {
+                    session.set_compressing(false);
+                }
+
+                if agent_can_continue_after_compress {
+                    let full_prompt = {
+                        let mut cfg = config.write();
+                        let agent = cfg.agent.as_mut().expect("agent checked above");
+                        agent.increment_continuation();
+                        let count = agent.continuation_count();
+                        let max = agent.max_auto_continues();
+
+                        let todo_state = agent.todo_list().render_for_model();
+                        let remaining = agent.todo_list().incomplete_count();
+                        let prompt = agent.continuation_prompt();
+
+                        let color = if cfg.light_theme() {
+                            nu_ansi_term::Color::LightGray
+                        } else {
+                            nu_ansi_term::Color::DarkGray
+                        };
+                        eprintln!(
+                            "\n📋 {}",
+                            color.italic().paint(format!(
+                                "Auto-continuing after compression ({count}/{max}): {remaining} incomplete todo(s) remain"
+                            ))
+                        );
+
+                        format!("{prompt}\n\n{todo_state}")
+                    };
+                    let continuation_input = Input::from_str(config, &full_prompt, None);
+                    return ask(config, abort_signal, continuation_input, false).await;
+                }
+            } else {
+                Config::maybe_compress_session(config.clone());
+            }
+
             Ok(())
         }
     }
