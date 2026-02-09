@@ -16,6 +16,10 @@ loki --info | grep functions_dir | awk '{print $2}'
   - [Enabling/Disabling Global Tools](#enablingdisabling-global-tools)
   - [Role Configuration](#role-configuration)
   - [Agent Configuration](#agent-configuration)
+- [Tool Error Handling](#tool-error-handling)
+  - [Native/Shell Tool Errors](#nativeshell-tool-errors)
+  - [MCP Errors](#mcp-tool-errors)
+  - [Why Tool Error Handling Is Important](#why-this-matters)
 <!--toc:end-->
 
 ---
@@ -137,3 +141,47 @@ The values for `mapping_tools` are inherited from the [global configuration](#gl
 For more information about agents, refer to the [Agents](../AGENTS.md) documentation.
 
 For a full example configuration for an agent, see the [Agent Configuration Example](../../config.agent.example.yaml) file.
+
+---
+
+## Tool Error Handling
+When tools fail, Loki captures error information and passes it back to the model so it can diagnose issues and 
+potentially retry or adjust its approach.
+
+### Native/Shell Tool Errors
+When a shell-based tool exits with a non-zero exit code, the model receives:
+
+```json
+{
+  "tool_call_error": "Tool call 'my_tool' exited with code 1",
+  "stderr": "Error: file not found: config.json"
+}
+```
+
+The `stderr` field contains the actual error output from the tool, giving the model context about what went wrong.
+If the tool produces no stderr output, only the `tool_call_error` field is included.
+
+**Note:** Tool stdout streams to your terminal in real-time so you can see progress. Only stderr is captured for 
+error reporting.
+
+### MCP Tool Errors
+When an MCP (Model Context Protocol) tool invocation fails due to connection issues, timeouts, or server errors,
+the model receives:
+
+```json
+{
+  "tool_call_error": "MCP tool invocation failed: connection refused"
+}
+```
+
+This allows the model to understand that an external service failed and take appropriate action (retry, use an 
+alternative approach, or inform the user).
+
+### Why This Matters
+Without proper error propagation, models would only know that "something went wrong" without understanding *what*
+went wrong. By including stderr output and detailed error messages, models can:
+
+- Diagnose the root cause of failures
+- Suggest fixes (e.g., "the file doesn't exist, should I create it?")
+- Retry with corrected parameters
+- Fall back to alternative approaches when appropriate

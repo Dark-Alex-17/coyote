@@ -1,3 +1,4 @@
+use super::todo::TodoList;
 use super::*;
 
 use crate::{
@@ -14,6 +15,18 @@ use serde::{Deserialize, Serialize};
 use std::{ffi::OsStr, path::Path};
 
 const DEFAULT_AGENT_NAME: &str = "rag";
+const DEFAULT_TODO_INSTRUCTIONS: &str = "\
+\n## Task Tracking\n\
+You have built-in task tracking tools. Use them to track your progress:\n\
+- `todo__init`: Initialize a todo list with a goal. Call this at the start of every multi-step task.\n\
+- `todo__add`: Add individual tasks. Add all planned steps before starting work.\n\
+- `todo__done`: Mark a task done by id. Call this immediately after completing each step.\n\
+- `todo__list`: Show the current todo list.\n\
+\n\
+RULES:\n\
+- Always create a todo list before starting work.\n\
+- Mark each task done as soon as you finish it — do not batch.\n\
+- If you stop with incomplete tasks, the system will automatically prompt you to continue.";
 
 pub type AgentVariables = IndexMap<String, String>;
 
@@ -33,6 +46,9 @@ pub struct Agent {
     rag: Option<Arc<Rag>>,
     model: Model,
     vault: GlobalVault,
+    todo_list: TodoList,
+    continuation_count: usize,
+    last_continuation_response: Option<String>,
 }
 
 impl Agent {
@@ -188,6 +204,10 @@ impl Agent {
             None
         };
 
+        if agent_config.auto_continue {
+            functions.append_todo_functions();
+        }
+
         Ok(Self {
             name: name.to_string(),
             config: agent_config,
@@ -199,6 +219,9 @@ impl Agent {
             rag,
             model,
             vault: Arc::clone(&config.read().vault),
+            todo_list: TodoList::default(),
+            continuation_count: 0,
+            last_continuation_response: None,
         })
     }
 
@@ -309,11 +332,16 @@ impl Agent {
     }
 
     pub fn interpolated_instructions(&self) -> String {
-        let output = self
+        let mut output = self
             .session_dynamic_instructions
             .clone()
             .or_else(|| self.shared_dynamic_instructions.clone())
             .unwrap_or_else(|| self.config.instructions.clone());
+
+        if self.config.auto_continue && self.config.inject_todo_instructions {
+            output.push_str(DEFAULT_TODO_INSTRUCTIONS);
+        }
+
         self.interpolate_text(&output)
     }
 
@@ -374,6 +402,67 @@ impl Agent {
     pub fn exit_session(&mut self) {
         self.session_variables = None;
         self.session_dynamic_instructions = None;
+    }
+
+    pub fn auto_continue_enabled(&self) -> bool {
+        self.config.auto_continue
+    }
+
+    pub fn max_auto_continues(&self) -> usize {
+        self.config.max_auto_continues
+    }
+
+    pub fn continuation_count(&self) -> usize {
+        self.continuation_count
+    }
+
+    pub fn increment_continuation(&mut self) {
+        self.continuation_count += 1;
+    }
+
+    pub fn reset_continuation(&mut self) {
+        self.continuation_count = 0;
+        self.last_continuation_response = None;
+    }
+
+    pub fn is_stale_response(&self, response: &str) -> bool {
+        self.last_continuation_response
+            .as_ref()
+            .is_some_and(|last| last == response)
+    }
+
+    pub fn set_last_continuation_response(&mut self, response: String) {
+        self.last_continuation_response = Some(response);
+    }
+
+    pub fn todo_list(&self) -> &TodoList {
+        &self.todo_list
+    }
+
+    pub fn init_todo_list(&mut self, goal: &str) {
+        self.todo_list = TodoList::new(goal);
+    }
+
+    pub fn add_todo(&mut self, task: &str) -> usize {
+        self.todo_list.add(task)
+    }
+
+    pub fn mark_todo_done(&mut self, id: usize) -> bool {
+        self.todo_list.mark_done(id)
+    }
+
+    pub fn continuation_prompt(&self) -> String {
+        self.config.continuation_prompt.clone().unwrap_or_else(|| {
+            "[SYSTEM REMINDER - TODO CONTINUATION]\n\
+                 You have incomplete tasks in your todo list. \
+                 Continue with the next pending item. \
+                 Call tools immediately. Do not explain what you will do."
+                .to_string()
+        })
+    }
+
+    pub fn compression_threshold(&self) -> Option<usize> {
+        self.config.compression_threshold
     }
 
     pub fn is_dynamic_instructions(&self) -> bool {
@@ -498,6 +587,14 @@ pub struct AgentConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<String>,
     #[serde(default)]
+    pub auto_continue: bool,
+    #[serde(default = "default_max_auto_continues")]
+    pub max_auto_continues: usize,
+    #[serde(default = "default_true")]
+    pub inject_todo_instructions: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_threshold: Option<usize>,
+    #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub version: String,
@@ -505,6 +602,8 @@ pub struct AgentConfig {
     pub mcp_servers: Vec<String>,
     #[serde(default)]
     pub global_tools: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_prompt: Option<String>,
     #[serde(default)]
     pub instructions: String,
     #[serde(default)]
@@ -515,6 +614,14 @@ pub struct AgentConfig {
     pub conversation_starters: Vec<String>,
     #[serde(default)]
     pub documents: Vec<String>,
+}
+
+fn default_max_auto_continues() -> usize {
+    10
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl AgentConfig {

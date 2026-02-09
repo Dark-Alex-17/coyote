@@ -826,6 +826,14 @@ pub async fn run_repl_command(
             _ => unknown_command()?,
         },
         None => {
+            if config
+                .read()
+                .agent
+                .as_ref()
+                .is_some_and(|a| a.continuation_count() > 0)
+            {
+                config.write().agent.as_mut().unwrap().reset_continuation();
+            }
             let input = Input::from_str(config, line, None);
             ask(config, abort_signal.clone(), input, true).await?;
         }
@@ -874,9 +882,60 @@ async fn ask(
         )
         .await
     } else {
-        Config::maybe_autoname_session(config.clone());
-        Config::maybe_compress_session(config.clone());
-        Ok(())
+        let should_continue = {
+            let cfg = config.read();
+            if let Some(agent) = &cfg.agent {
+                agent.auto_continue_enabled()
+                    && agent.continuation_count() < agent.max_auto_continues()
+                    && !agent.is_stale_response(&output)
+                    && agent.todo_list().has_incomplete()
+            } else {
+                false
+            }
+        };
+
+        if should_continue {
+            let full_prompt = {
+                let mut cfg = config.write();
+                let agent = cfg.agent.as_mut().expect("agent checked above");
+                agent.set_last_continuation_response(output.clone());
+                agent.increment_continuation();
+                let count = agent.continuation_count();
+                let max = agent.max_auto_continues();
+
+                let todo_state = agent.todo_list().render_for_model();
+                let remaining = agent.todo_list().incomplete_count();
+                let prompt = agent.continuation_prompt();
+
+                let color = if cfg.light_theme() {
+                    nu_ansi_term::Color::LightGray
+                } else {
+                    nu_ansi_term::Color::DarkGray
+                };
+                eprintln!(
+                    "\n📋 {}",
+                    color.italic().paint(format!(
+                        "Auto-continuing ({count}/{max}): {remaining} incomplete todo(s) remain"
+                    ))
+                );
+
+                format!("{prompt}\n\n{todo_state}")
+            };
+            let continuation_input = Input::from_str(config, &full_prompt, None);
+            ask(config, abort_signal, continuation_input, false).await
+        } else {
+            if config
+                .read()
+                .agent
+                .as_ref()
+                .is_some_and(|a| a.continuation_count() > 0)
+            {
+                config.write().agent.as_mut().unwrap().reset_continuation();
+            }
+            Config::maybe_autoname_session(config.clone());
+            Config::maybe_compress_session(config.clone());
+            Ok(())
+        }
     }
 }
 

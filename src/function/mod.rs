@@ -1,3 +1,5 @@
+pub(crate) mod todo;
+
 use crate::{
     config::{Agent, Config, GlobalConfig},
     utils::*,
@@ -26,6 +28,7 @@ use std::{
     process::{Command, Stdio},
 };
 use strum_macros::AsRefStr;
+use todo::TODO_FUNCTION_PREFIX;
 
 #[derive(Embed)]
 #[folder = "assets/functions/"]
@@ -260,6 +263,10 @@ impl Functions {
 
     pub fn is_empty(&self) -> bool {
         self.declarations.is_empty()
+    }
+
+    pub fn append_todo_functions(&mut self) {
+        self.declarations.extend(todo::todo_function_declarations());
     }
 
     pub fn clear_mcp_meta_functions(&mut self) {
@@ -850,7 +857,7 @@ impl ToolCall {
             _ if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) => {
                 Self::search_mcp_tools(config, &cmd_name, &json_data).unwrap_or_else(|e| {
                     let error_msg = format!("MCP search failed: {e}");
-                    println!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
                     json!({"tool_call_error": error_msg})
                 })
             }
@@ -859,7 +866,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP describe failed: {e}");
-                        println!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -868,9 +875,16 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP tool invocation failed: {e}");
-                        println!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
                         json!({"tool_call_error": error_msg})
                     })
+            }
+            _ if cmd_name.starts_with(TODO_FUNCTION_PREFIX) => {
+                todo::handle_todo_tool(config, &cmd_name, &json_data).unwrap_or_else(|e| {
+                    let error_msg = format!("Todo tool failed: {e}");
+                    eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    json!({"tool_call_error": error_msg})
+                })
             }
             _ => match run_llm_function(cmd_name, cmd_args, envs, agent_name) {
                 Ok(Some(contents)) => serde_json::from_str(&contents)
@@ -1052,7 +1066,7 @@ pub fn run_llm_function(
             eprintln!("{stderr}");
         }
         let tool_error_message = format!("Tool call '{command_name}' exited with code {exit_code}");
-        println!("{}", warning_text(&format!("⚠️ {tool_error_message} ⚠️")));
+        eprintln!("{}", warning_text(&format!("⚠️ {tool_error_message} ⚠️")));
         let mut error_json = json!({"tool_call_error": tool_error_message});
         if !stderr.is_empty() {
             error_json["stderr"] = json!(stderr);

@@ -3,6 +3,7 @@ mod input;
 mod macros;
 mod role;
 mod session;
+pub(crate) mod todo;
 
 pub use self::agent::{Agent, AgentVariables, complete_agent_variables, list_agents};
 pub use self::input::Input;
@@ -1573,8 +1574,18 @@ impl Config {
             .summary_context_prompt
             .clone()
             .unwrap_or_else(|| SUMMARY_CONTEXT_PROMPT.into());
+
+        let todo_prefix = config
+            .read()
+            .agent
+            .as_ref()
+            .map(|agent| agent.todo_list())
+            .filter(|todos| !todos.is_empty())
+            .map(|todos| format!("[ACTIVE TODO LIST]\n{}\n\n", todos.render_for_model()))
+            .unwrap_or_default();
+
         if let Some(session) = config.write().session.as_mut() {
-            session.compress(format!("{summary_context_prompt}{summary}"));
+            session.compress(format!("{todo_prefix}{summary_context_prompt}{summary}"));
         }
         config.write().discontinuous_last_message();
         Ok(())

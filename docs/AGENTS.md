@@ -34,6 +34,7 @@ If you're looking for more example agents, refer to the [built-in agents](../ass
   - [Python-Based Agent Tools](#python-based-agent-tools)
   - [Bash-Based Agent Tools](#bash-based-agent-tools)
 - [5. Conversation Starters](#5-conversation-starters)
+- [6. Todo System & Auto-Continuation](#6-todo-system--auto-continuation)
 - [Built-In Agents](#built-in-agents)
 <!--toc:end-->
 
@@ -81,6 +82,11 @@ global_tools:                        # Optional list of additional global tools 
   - web_search
   - fs
   - python
+# Todo System & Auto-Continuation (see "Todo System & Auto-Continuation" section below)
+auto_continue: false                 # Enable automatic continuation when incomplete todos remain
+max_auto_continues: 10               # Maximum continuation attempts before stopping
+inject_todo_instructions: true       # Inject todo tool instructions into system prompt
+continuation_prompt: null            # Custom prompt for continuations (optional)
 ```
 
 As mentioned previously: Agents utilize function calling to extend a model's capabilities. However, agents operate in 
@@ -420,6 +426,50 @@ conversation_starters:
 ```
 
 ![Example Conversation Starters](./images/agents/conversation-starters.gif)
+
+## 6. Todo System & Auto-Continuation
+
+Loki includes a built-in task tracking system designed to improve the reliability of agents, especially when using
+smaller language models. The Todo System helps models:
+
+- Break complex tasks into manageable steps
+- Track progress through multi-step workflows
+- Automatically continue work until all tasks are complete
+
+### Quick Configuration
+
+```yaml
+# agents/my-agent/config.yaml
+auto_continue: true              # Enable auto-continuation
+max_auto_continues: 10           # Max continuation attempts
+inject_todo_instructions: true   # Include the default todo instructions into prompt
+```
+
+### How It Works
+
+1. When `inject_todo_instructions` is enabled, agents receive instructions on using four built-in tools:
+    - `todo__init`: Initialize a todo list with a goal
+    - `todo__add`: Add a task to the list
+    - `todo__done`: Mark a task complete
+    - `todo__list`: View current todo state
+   
+   These instructions are a reasonable default that detail how to use Loki's To-Do System. If you wish, 
+   you can disable the injection of the default instructions and specify your own instructions for how 
+   to use the To-Do System into your main `instructions` for the agent.
+
+2. When `auto_continue` is enabled and the model stops with incomplete tasks, Loki automatically sends a
+   continuation prompt with the current todo state, nudging the model to continue working.
+
+3. This continues until all tasks are done or `max_auto_continues` is reached.
+
+### When to Use
+
+- Multistep tasks where the model might lose track
+- Smaller models that need more structure
+- Workflows requiring guaranteed completion of all steps
+
+For complete documentation including all configuration options, tool details, and best practices, see the
+[Todo System Guide](./TODO-SYSTEM.md).
 
 ## Built-In Agents
 Loki comes packaged with some useful built-in agents:

@@ -299,6 +299,9 @@ impl Session {
         self.role_prompt = agent.interpolated_instructions();
         self.agent_variables = agent.variables().clone();
         self.agent_instructions = self.role_prompt.clone();
+        if let Some(threshold) = agent.compression_threshold() {
+            self.set_compression_threshold(Some(threshold));
+        }
     }
 
     pub fn agent_variables(&self) -> &AgentVariables {
