@@ -41,7 +41,7 @@ vault_password_file: null        # Path to a file containing the password for th
 # See the [Tools documentation](./docs/function-calling/TOOLS.md) for more details
 function_calling: true           # Enables or disables function calling (Globally).
 mapping_tools:                   # Alias for a tool or toolset
-  fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
+  fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write,fs_read,fs_glob,fs_grep'
 enabled_tools: null              # Which tools to enable by default. (e.g. 'fs,web_search_loki')
 visible_tools:                   # Which tools are visible to be compiled (and are thus able to be defined in 'enabled_tools')
 #  - demo_py.py
@@ -53,6 +53,9 @@ visible_tools:                   # Which tools are visible to be compiled (and a
 #  - fetch_url_via_jina.sh
   - fs_cat.sh
   - fs_ls.sh
+#  - fs_read.sh
+#  - fs_glob.sh
+#  - fs_grep.sh
 #  - fs_mkdir.sh
 #  - fs_patch.sh
 #  - fs_write.sh
