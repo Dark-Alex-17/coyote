@@ -473,8 +473,11 @@ For complete documentation including all configuration options, tool details, an
 
 ## Built-In Agents
 Loki comes packaged with some useful built-in agents:
+
 * `coder`: An agent to assist you with all your coding tasks
 * `demo`: An example agent to use for reference when learning to create your own agents
+* `explore`: An agent designed to help you explore and understand your codebase
 * `jira-helper`: An agent that assists you with all your Jira-related tasks
+* `oracle`: An agent for high-level architecture, design decisions, and complex debugging
+* `sisyphus`: A powerhouse agent for writing complex code and acting as a natural language interface for your codebase (similar to ClaudeCode, Gemini CLI, Codex, or OpenCode)
 * `sql`: A universal SQL agent that enables you to talk to any relational database in natural language
-
