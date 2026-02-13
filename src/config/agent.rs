@@ -25,7 +25,7 @@ You have built-in task tracking tools. Use them to track your progress:\n\
 \n\
 RULES:\n\
 - Always create a todo list before starting work.\n\
-- Mark each task done as soon as you finish it — do not batch.\n\
+- Mark each task done as soon as you finish it; do not batch.\n\
 - If you stop with incomplete tasks, the system will automatically prompt you to continue.";
 
 pub type AgentVariables = IndexMap<String, String>;

@@ -60,7 +60,7 @@ inject_todo_instructions: true   # Include todo instructions in system prompt
 continuation_prompt: |           # Optional: customize the continuation prompt
   [CONTINUE]
   You have unfinished tasks. Proceed with the next pending item.
-  Do not explain—just execute.
+  Do not explain; just execute.
 ```
 
 ### Default Continuation Prompt
@@ -229,6 +229,6 @@ automatically. If you're seeing loops:
 ---
 
 ## Additional Docs
-- [Agents](./AGENTS.md) — Full agent configuration guide
-- [Function Calling](./function-calling/TOOLS.md) — How tools work in Loki
-- [Sessions](./SESSIONS.md) — How conversation state is managed
+- [Agents](./AGENTS.md) - Full agent configuration guide
+- [Function Calling](./function-calling/TOOLS.md) - How tools work in Loki
+- [Sessions](./SESSIONS.md) - How conversation state is managed
