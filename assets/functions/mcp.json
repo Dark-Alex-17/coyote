@@ -14,6 +14,10 @@
         "GITHUB_PERSONAL_ACCESS_TOKEN": "YOUR_GITHUB_TOKEN"
       }
     },
+    "atlassian": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote@0.1.13", "https://mcp.atlassian.com/v1/sse"]
+    },
     "docker": {
       "command": "uvx",
       "args": ["mcp-server-docker"]

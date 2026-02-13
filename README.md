@@ -47,7 +47,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 Loki requires the following tools to be installed on your system:
 * [jq](https://github.com/jqlang/jq)
     * `brew install jq`
-* [jira (optional)](https://github.com/ankitpokhrel/jira-cli/wiki/Installation) (For the `jira-helper` agent)
+* [jira (optional)](https://github.com/ankitpokhrel/jira-cli/wiki/Installation) (For the `query_jira_issues` tool)
     * `brew tap ankitpokhrel/jira-cli && brew install jira-cli`
     * You'll need to [create a JIRA API token](https://id.atlassian.com/manage-profile/security/api-tokens) for authentication
     * Then, save it as an environment variable to your shell profile:
