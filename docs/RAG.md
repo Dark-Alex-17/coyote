@@ -265,12 +265,14 @@ When you use RAG in Loki, after Loki performs the lookup for relevant chunks of 
 will add the retrieved text chunks as context to your query before sending it to the model. The format of this context
 is determined by the `rag_template` setting in your global Loki configuration file.
 
-This template utilizes two placeholders:
+This template utilizes three placeholders:
 * `__INPUT__`: The user's actual query
 * `__CONTEXT__`: The context retrieved from RAG
+* `__SOURCES__`: A numbered list of the source file paths or URLs that the retrieved context came from
 
 These placeholders are replaced with the corresponding values into the template and make up what's actually passed to 
-the model at query-time.
+the model at query-time. The `__SOURCES__` placeholder enables the model to cite which documents its answer is based on,
+which is especially useful when building knowledge-base assistants that need to provide verifiable references.
 
 The default template that Loki uses is the following:
 
@@ -281,6 +283,10 @@ Answer the query based on the context while respecting the rules. (user query, s
 __CONTEXT__
 </context>
 
+<sources>
+__SOURCES__
+</sources>
+
 <rules>
 - If you don't know, just say so.
 - If you are not sure, ask for clarification.
@@ -288,6 +294,7 @@ __CONTEXT__
 - If the context appears unreadable or of poor quality, tell the user then answer as best as you can.
 - If the answer is not in the context but you think you know the answer, explain that to the user then answer with your own knowledge.
 - Answer directly and without using xml tags.
+- When using information from the context, cite the relevant source from the <sources> section.
 </rules>
 
 <user_query>
@@ -296,4 +303,5 @@ __INPUT__
 ```
 
 You can customize this template by specifying the `rag_template` setting in your global Loki configuration file. Your 
-template *must* include both the `__INPUT__` and `__CONTEXT__` placeholders in order for it to be valid.
+template *must* include both the `__INPUT__` and `__CONTEXT__` placeholders in order for it to be valid. The 
+`__SOURCES__` placeholder is optional. If it is omitted, source references will not be included in the prompt.

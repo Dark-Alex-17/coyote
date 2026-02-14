@@ -298,16 +298,48 @@ impl Rag {
         top_k: usize,
         rerank_model: Option<&str>,
         abort_signal: AbortSignal,
-    ) -> Result<(String, Vec<DocumentId>)> {
+    ) -> Result<(String, String, Vec<DocumentId>)> {
         let ret = abortable_run_with_spinner(
             self.hybird_search(text, top_k, rerank_model),
             "Searching",
             abort_signal,
         )
         .await;
-        let (ids, documents): (Vec<_>, Vec<_>) = ret?.into_iter().unzip();
-        let embeddings = documents.join("\n\n");
-        Ok((embeddings, ids))
+        let results = ret?;
+        let ids: Vec<_> = results.iter().map(|(id, _)| *id).collect();
+        let embeddings = results
+            .iter()
+            .map(|(id, content)| {
+                let source = self.resolve_source(id);
+                format!("[Source: {source}]\n{content}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let sources = self.format_sources(&ids);
+        Ok((embeddings, sources, ids))
+    }
+
+    fn resolve_source(&self, id: &DocumentId) -> String {
+        let (file_index, _) = id.split();
+        self.data
+            .files
+            .get(&file_index)
+            .map(|f| f.path.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn format_sources(&self, ids: &[DocumentId]) -> String {
+        let mut seen = IndexSet::new();
+        for id in ids {
+            let (file_index, _) = id.split();
+            if let Some(file) = self.data.files.get(&file_index) {
+                seen.insert(file.path.clone());
+            }
+        }
+        seen.into_iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub async fn sync_documents(

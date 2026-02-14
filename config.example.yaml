@@ -95,13 +95,17 @@ rag_reranker_model: null         # Specifies the reranker model used for sorting
 rag_top_k: 5                     # Specifies the number of documents to retrieve for answering queries
 rag_chunk_size: null             # Defines the size of chunks for document processing in characters
 rag_chunk_overlap: null          # Defines the overlap between chunks
-# Defines the query structure using variables like __CONTEXT__ and __INPUT__ to tailor searches to specific needs
+# Defines the query structure using variables like __CONTEXT__, __SOURCES__, and __INPUT__ to tailor searches to specific needs
 rag_template: |
   Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
 
   <context>
   __CONTEXT__
   </context>
+
+  <sources>
+  __SOURCES__
+  </sources>
 
   <rules>
   - If you don't know, just say so.
@@ -110,6 +114,7 @@ rag_template: |
   - If the context appears unreadable or of poor quality, tell the user then answer as best as you can.
   - If the answer is not in the context but you think you know the answer, explain that to the user then answer with your own knowledge.
   - Answer directly and without using xml tags.
+  - When using information from the context, cite the relevant source from the <sources> section.
   </rules>
 
   <user_query>

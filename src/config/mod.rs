@@ -96,6 +96,10 @@ const RAG_TEMPLATE: &str = r#"Answer the query based on the context while respec
 __CONTEXT__
 </context>
 
+<sources>
+__SOURCES__
+</sources>
+
 <rules>
 - If you don't know, just say so.
 - If you are not sure, ask for clarification.
@@ -103,6 +107,7 @@ __CONTEXT__
 - If the context appears unreadable or of poor quality, tell the user then answer as best as you can.
 - If the answer is not in the context but you think you know the answer, explain that to the user then answer with your own knowledge.
 - Answer directly and without using xml tags.
+- When using information from the context, cite the relevant source from the <sources> section.
 </rules>
 
 <user_query>
@@ -1756,10 +1761,10 @@ impl Config {
         abort_signal: AbortSignal,
     ) -> Result<String> {
         let (reranker_model, top_k) = rag.get_config();
-        let (embeddings, ids) = rag
+        let (embeddings, sources, ids) = rag
             .search(text, top_k, reranker_model.as_deref(), abort_signal)
             .await?;
-        let text = config.read().rag_template(&embeddings, text);
+        let text = config.read().rag_template(&embeddings, &sources, text);
         rag.set_last_sources(&ids);
         Ok(text)
     }
@@ -1781,7 +1786,7 @@ impl Config {
         }
     }
 
-    pub fn rag_template(&self, embeddings: &str, text: &str) -> String {
+    pub fn rag_template(&self, embeddings: &str, sources: &str, text: &str) -> String {
         if embeddings.is_empty() {
             return text.to_string();
         }
@@ -1789,6 +1794,7 @@ impl Config {
             .as_deref()
             .unwrap_or(RAG_TEMPLATE)
             .replace("__CONTEXT__", embeddings)
+            .replace("__SOURCES__", sources)
             .replace("__INPUT__", text)
     }
 
