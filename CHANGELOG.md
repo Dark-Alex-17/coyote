@@ -1,3 +1,34 @@
+## v0.2.0 (2026-02-14)
+
+### Feat
+
+- Simplified sisyphus prompt to improve functionality
+- Supported the injection of RAG sources into the prompt, not just via the `.sources rag` command in the REPL so models can directly reference the documents that supported their responses
+- Created the Sisyphus agent to make Loki function like Claude Code, Gemini, Codex, etc.
+- Created the Oracle agent to handle high-level architectural decisions and design questions about a given codebase
+- Updated the coder agent to be much more task-focused and to be delegated to by Sisyphus
+- Created the explore agent for exploring codebases to help answer questions
+- Use the official atlassian MCP server for the jira-helper agent
+- Created fs_glob to enable more targeted file exploration utilities
+- Created a new tool 'fs_grep' to search a given file's contents for relevant lines to reduce token usage for smaller models
+- Created the new fs_read tool to enable controlled reading of a file
+- Let agent level variables be defined to bypass guard protections for tool invocations
+- Implemented a built-in task management system to help smaller LLMs complete larger multistep tasks and minimize context drift
+- Improved tool and MCP invocation error handling by returning stderr to the model when it is available
+- Added variable interpolation for conversation starters in agents
+- Implemented retry logic for failed tool invocations so the LLM can learn from the result and try again; Also implemented chain loop detection to prevent loops
+- Added gemini-3-pro to the supported vertexai models
+- Added an environment variable that lets users bypass guard operations in bash scripts. This is useful for agent routing
+- Added support for thought-signatures for Gemini 3+ models
+
+### Fix
+
+- Improved continuation prompt to not make broad todo-items
+- Allow auto-continuation to work in agents after a session is compressed and if there's still unfinish items in the to-do list
+- fs_ls and fs_cat outputs should always redirect to "$LLM_OUTPUT" including on errors.
+- Claude tool calls work incorrectly when tool doesn't require any arguments or flags; would provide an empty JSON object or error on no args
+- Fixed a bug where --agent-variable values were not being passed to the agents
+
 ## v0.1.3 (2025-12-13)
 
 ### Feat
