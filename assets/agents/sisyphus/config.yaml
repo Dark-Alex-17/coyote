@@ -119,65 +119,20 @@ instructions: |
   ```
   1. start_task --goal "Add user profiles API endpoint"
   2. todo__init --goal "Add user profiles API endpoint"
-  3. todo__add --task "Explore existing API patterns and code conventions"
-  4. todo__add --task "Implement profile endpoint"
-  5. todo__add --task "Verify implementation with build/test"
-  6. todo__add --task "Write/update tests for new/updated code (if necessary)"
-  7. todo__add --task "Verify tests pass"
-  8. todo__add --task "Clean-up code and clear any linter warnings"
-  9. todo__add --task "Verify clean-up with build/test"
-  10. delegate_to_agent --agent explore --task "Find existing API endpoint patterns, structures, and conventions"
-  11. todo__done --id 1
-  11. delegate_to_agent --agent coder --task "Create user profiles endpoint following existing patterns"
-  12. todo__done --id 2
-  13. run_build
-  14. run_tests
-  15. todo__done --id 3
-  16. delegate_to_agent --agent coder --task "Write and/or update tests for the new endpoint and any affected code (if necessary)"
-  17. todo__done --id 4
-  18. run_tests
-  19. todo__done --id 5
-  20. delegate_to_agent --agent coder --task "Clean up code and fix linter warnings in the new endpoint implementation"
-  21. todo__done --id 6
-  22. run_build
-  23. run_tests
-  24. todo__done --id 7
-  25. end_task
-  ```
-
-  ### Example 2: Implementation task with build errors (explore <-> coder)
-
-  User: "Add a new API endpoint for user profiles"
-
-  ```
-  1. start_task --goal "Add user profiles API endpoint"
-  2. todo__init --goal "Add user profiles API endpoint"
   3. todo__add --task "Explore existing API patterns"
   4. todo__add --task "Implement profile endpoint"
-  5. todo__add --task "Verify implementation with build/test"
-  6. todo__add --task "Clean-up code and clear any linter warnings"
-  7. todo__add --task "Verify clean-up with build/test"
-  8. delegate_to_agent --agent explore --task "Find existing API endpoint patterns and structures"
-  9. todo__done --id 1
-  10. delegate_to_agent --agent coder --task "Create user profiles endpoint following existing patterns"
-  11. todo__done --id 2
-  12. run_build
-  13. todo__add --task "Fix compilation errors"
-  14. todo__add --task "Verify fixes with build/test"
-  15. delegate_to_agent --agent coder --task "Fix compilation errors from the new endpoint implementation"
-  16. todo__done --id 5
-  17. run_build
-  18. run_tests
-  19. todo__done --id 6
-  20. todo__done --id 3
-  21. delegate_to_agent --agent coder --task "Clean up code and fix linter warnings in the new endpoint implementation"
-  22. todo__done --id 4
-  23. run_build
-  24. run_tests
-  25. todo__done --id 7
+  5. todo__add --task "Verify with build/test"
+  6. delegate_to_agent --agent explore --task "Find existing API endpoint patterns and structures"
+  7. todo__done --id 1
+  8. delegate_to_agent --agent coder --task "Create user profiles endpoint following existing patterns"
+  9. todo__done --id 2
+  10. run_build
+  11. run_tests
+  12. todo__done --id 3
+  13. end_task
   ```
 
-  ### Example 3: Architecture/design question (explore -> oracle)
+  ### Example 2: Architecture/design question (explore -> oracle)
 
   User: "How should I structure the authentication for this app?"
 
@@ -193,7 +148,7 @@ instructions: |
   9. end_task
   ```
 
-  ### Example 4: Vague/open-ended question (oracle directly)
+  ### Example 3: Vague/open-ended question (oracle directly)
 
   User: "What do you think of this codebase structure?"
 
