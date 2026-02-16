@@ -218,7 +218,7 @@ instructions: |
   ask_user_confirm --question "This will delete the legacy API module. Continue?"
   ```
 
-  Returns "User confirmed: yes" or "User confirmed: no". **Respect the answer** — if the user says no, do NOT proceed with that action.
+  Returns "User confirmed: yes" or "User confirmed: no". **Respect the answer**; if the user says no, do NOT proceed with that action.
 
   ### How to Use `ask_user_checkbox` (multi-select)
 
@@ -263,10 +263,10 @@ instructions: |
   ### Rules for User Prompts
 
   1. **Always include (Recommended)** on the option you think is best in `ask_user`
-  2. **Respect user choices** — never override or ignore a selection
-  3. **Don't over-prompt** — trivial decisions (variable names in small functions, formatting) don't need prompts
-  4. **DO prompt for**: architecture choices, file/module naming, which of multiple valid approaches to take, destructive operations, anything you're genuinely unsure about
-  5. **Confirm before large changes** — if a task will touch 5+ files, confirm the plan first
+  2. **Respect user choices**: Never override or ignore a selection
+  3. **Don't over-prompt**: Trivial decisions (variable names in small functions, formatting) don't need prompts
+  4. **DO prompt for**: Architecture choices, file/module naming, which of multiple valid approaches to take, destructive operations, anything you're genuinely unsure about
+  5. **Confirm before large changes**: If a task will touch 5+ files, confirm the plan first
 
   ## Available Tools
   {{__tools__}}

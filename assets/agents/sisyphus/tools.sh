@@ -254,7 +254,7 @@ search_content() {
   fi
 }
 
-# @cmd Ask the user to select ONE option from a list. The first option should be your recommended choice — append '(Recommended)' to its label. Returns the selected option's label text.
+# @cmd Ask the user to select ONE option from a list. The first option should be your recommended choice; append '(Recommended)' to its label. Returns the selected option's label text.
 # @option --question! The question to present to the user
 # @option --options+ The list of options to present (first option = recommended, append '(Recommended)' to its label)
 ask_user() {
