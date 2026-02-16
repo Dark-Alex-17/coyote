@@ -253,3 +253,101 @@ search_content() {
     warn "No matches found for: ${pattern}" >> "$LLM_OUTPUT"
   fi
 }
+
+# @cmd Ask the user to select ONE option from a list. The first option should be your recommended choice — append '(Recommended)' to its label. Returns the selected option's label text.
+# @option --question! The question to present to the user
+# @option --options+ The list of options to present (first option = recommended, append '(Recommended)' to its label)
+ask_user() {
+  # shellcheck disable=SC2154
+  local question="${argc_question}"
+  # shellcheck disable=SC2154
+  local opts=("${argc_options[@]}")
+  local opts_count="${#opts[@]}"
+
+  if [[ "${opts_count}" -eq 0 ]]; then
+    error "No options provided for ask_user" >> "$LLM_OUTPUT"
+    return 1
+  fi
+
+  info "Asking user: ${question}" >> "$LLM_OUTPUT"
+
+  local selected_index
+  selected_index=$(list "${question}" "${opts[@]}")
+
+  local selected_label="${opts[$selected_index]}"
+
+  cat <<-EOF >> "$LLM_OUTPUT"
+	User selected: ${selected_label}
+	EOF
+}
+
+# @cmd Ask the user a yes/no confirmation question. Returns 'yes' or 'no'.
+# @option --question! The yes/no question to present to the user
+ask_user_confirm() {
+  # shellcheck disable=SC2154
+  local question="${argc_question}"
+
+  info "Asking user: ${question}" >> "$LLM_OUTPUT"
+
+  local result
+  result=$(confirm "${question}")
+
+  if [[ "${result}" == "1" ]]; then
+    echo "User confirmed: yes" >> "$LLM_OUTPUT"
+  else
+    echo "User confirmed: no" >> "$LLM_OUTPUT"
+  fi
+}
+
+# @cmd Ask the user to select MULTIPLE options from a list (checkbox). Returns the labels of all selected items.
+# @option --question! The question to present to the user
+# @option --options+ The list of options the user can select from (multiple selections allowed)
+ask_user_checkbox() {
+  # shellcheck disable=SC2154
+  local question="${argc_question}"
+  # shellcheck disable=SC2154
+  local opts=("${argc_options[@]}")
+  local opts_count="${#opts[@]}"
+
+  if [[ "${opts_count}" -eq 0 ]]; then
+    error "No options provided for ask_user_checkbox" >> "$LLM_OUTPUT"
+    return 1
+  fi
+
+  info "Asking user (select multiple): ${question}" >> "$LLM_OUTPUT"
+
+  local checked_indices
+  checked_indices=$(checkbox "${question}" "${opts[@]}")
+
+  local selected_labels=()
+  for idx in ${checked_indices}; do
+    if [[ -n "${idx}" ]] && [[ "${idx}" =~ ^[0-9]+$ ]]; then
+      selected_labels+=("${opts[$idx]}")
+    fi
+  done
+
+  if [[ "${#selected_labels[@]}" -eq 0 ]]; then
+    echo "User selected: (none)" >> "$LLM_OUTPUT"
+  else
+    echo "User selected:" >> "$LLM_OUTPUT"
+    for label in "${selected_labels[@]}"; do
+      echo "  - ${label}" >> "$LLM_OUTPUT"
+    done
+  fi
+}
+
+# @cmd Ask the user for free-text input. Returns whatever the user typed.
+# @option --question! The prompt/question to present to the user
+ask_user_input() {
+  # shellcheck disable=SC2154
+  local question="${argc_question}"
+
+  info "Asking user: ${question}" >> "$LLM_OUTPUT"
+
+  local user_text
+  user_text=$(input "${question}")
+
+  cat <<-EOF >> "$LLM_OUTPUT"
+	User input: ${user_text}
+	EOF
+}
