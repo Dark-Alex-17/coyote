@@ -55,6 +55,7 @@ use std::{
 use syntect::highlighting::ThemeSet;
 use terminal_colorsaurus::{ColorScheme, QueryOptions, color_scheme};
 use tokio::runtime::Handle;
+use crate::supervisor::mailbox::Inbox;
 
 pub const TEMP_ROLE_NAME: &str = "temp";
 pub const TEMP_RAG_NAME: &str = "temp";
@@ -210,6 +211,10 @@ pub struct Config {
     pub(crate) tool_call_tracker: Option<ToolCallTracker>,
     #[serde(skip)]
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
+    #[serde(skip)]
+    pub current_depth: usize,
+    #[serde(skip)]
+    pub inbox: Option<Arc<Inbox>>,
 }
 
 impl Default for Config {
@@ -284,6 +289,8 @@ impl Default for Config {
             agent: None,
             tool_call_tracker: Some(ToolCallTracker::default()),
             supervisor: None,
+            current_depth: 0,
+            inbox: None,
         }
     }
 }
