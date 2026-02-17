@@ -225,10 +225,6 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
     ]
 }
 
-// ---------------------------------------------------------------------------
-// Dispatch
-// ---------------------------------------------------------------------------
-
 pub async fn handle_supervisor_tool(
     config: &GlobalConfig,
     cmd_name: &str,
@@ -253,21 +249,6 @@ pub async fn handle_supervisor_tool(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Child agent execution loop
-// ---------------------------------------------------------------------------
-
-/// Run a child agent to completion, returning its accumulated text output.
-///
-/// This mirrors `start_directive` in main.rs but:
-///   - Uses `call_chat_completions(print=false)` so nothing goes to stdout
-///   - Returns the output text instead of printing it
-///   - Loops on tool calls just like `start_directive`'s recursion
-///
-/// Returns a boxed future to break the recursive type cycle:
-///   handle_spawn → tokio::spawn(run_child_agent) → call_chat_completions
-///   → eval_tool_calls → ToolCall::eval → handle_supervisor_tool → handle_spawn
-/// Without boxing, the compiler cannot prove Send for the recursive async type.
 fn run_child_agent(
     child_config: GlobalConfig,
     initial_input: Input,
@@ -283,8 +264,8 @@ fn run_child_agent(
 
             let (output, tool_results) = call_chat_completions(
                 &input,
-                false, // print=false — silent, no stdout
-                false, // extract_code=false
+                false,
+                false,
                 client.as_ref(),
                 abort_signal.clone(),
             )
@@ -305,17 +286,12 @@ fn run_child_agent(
                 break;
             }
 
-            // Feed tool results back for the next round (mirrors start_directive recursion)
             input = input.merge_tool_results(output, tool_results);
         }
 
         Ok(accumulated_output)
     })
 }
-
-// ---------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------
 
 async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
     let agent_name = args
@@ -330,18 +306,15 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
         .to_string();
     let _task_id = args.get("task_id").and_then(Value::as_str);
 
-    // Generate a unique agent ID
     let short_uuid = &Uuid::new_v4().to_string()[..8];
     let agent_id = format!("agent_{agent_name}_{short_uuid}");
 
-    // --- Validate capacity ---
-    // Read the supervisor to check capacity, then drop locks before doing async work
     let (max_depth, current_depth) = {
         let cfg = config.read();
         let supervisor = cfg
             .supervisor
             .as_ref()
-            .ok_or_else(|| anyhow!("No supervisor active — agent spawning not enabled"))?;
+            .ok_or_else(|| anyhow!("No supervisor active; Agent spawning not enabled"))?;
         let sup = supervisor.read();
         if sup.active_count() >= sup.max_concurrent() {
             return Ok(json!({
@@ -363,7 +336,6 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
         }));
     }
 
-    // --- Build an isolated child Config ---
     let child_inbox = Arc::new(Inbox::new());
 
     let child_config: GlobalConfig = {
@@ -384,16 +356,13 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
         Arc::new(RwLock::new(child_cfg))
     };
 
-    // Load the target agent into the child config
     let child_abort = create_abort_signal();
     Config::use_agent(&child_config, &agent_name, None, child_abort.clone()).await?;
 
-    // Create the initial input from the prompt
     let input = Input::from_str(&child_config, &prompt, None);
 
     debug!("Spawning child agent '{agent_name}' as '{agent_id}'");
 
-    // --- Spawn the agent task ---
     let spawn_agent_id = agent_id.clone();
     let spawn_agent_name = agent_name.clone();
     let spawn_abort = child_abort.clone();
@@ -417,7 +386,6 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
         }
     });
 
-    // Register the handle with the supervisor
     let handle = AgentHandle {
         id: agent_id.clone(),
         agent_name: agent_name.clone(),
@@ -463,7 +431,6 @@ async fn handle_check(config: &GlobalConfig, args: &Value) -> Result<Value> {
 
     match is_finished {
         Some(true) => {
-            // Finished — collect the result
             handle_collect(config, args).await
         }
         Some(false) => Ok(json!({
@@ -484,7 +451,6 @@ async fn handle_collect(config: &GlobalConfig, args: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'id' is required"))?;
 
-    // Extract the join handle while holding the lock, then drop the lock before awaiting
     let handle = {
         let cfg = config.read();
         let supervisor = cfg
@@ -497,7 +463,6 @@ async fn handle_collect(config: &GlobalConfig, args: &Value) -> Result<Value> {
 
     match handle {
         Some(handle) => {
-            // Await the join handle OUTSIDE of any lock
             let result = handle
                 .join_handle
                 .await

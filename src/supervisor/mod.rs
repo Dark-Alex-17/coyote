@@ -35,8 +35,6 @@ pub struct AgentHandle {
     pub join_handle: JoinHandle<Result<AgentResult>>,
 }
 
-/// Lives as an `Arc<parking_lot::RwLock<Supervisor>>` alongside GlobalConfig,
-/// NOT inside it — avoids adding lock contention to the shared Config.
 pub struct Supervisor {
     handles: HashMap<String, AgentHandle>,
     task_queue: TaskQueue,

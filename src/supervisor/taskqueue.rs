@@ -122,13 +122,13 @@ impl TaskQueue {
     }
 
     pub fn claim(&mut self, task_id: &str, owner: &str) -> bool {
-        if let Some(task) = self.tasks.get_mut(task_id) {
-            if task.is_runnable() && task.owner.is_none() {
-                task.owner = Some(owner.to_string());
-                task.status = TaskStatus::InProgress;
-                return true;
-            }
+        if let Some(task) = self.tasks.get_mut(task_id) &&
+         task.is_runnable() && task.owner.is_none() {
+            task.owner = Some(owner.to_string());
+            task.status = TaskStatus::InProgress;
+            return true;
         }
+
         false
     }
 
@@ -146,8 +146,6 @@ impl TaskQueue {
         tasks
     }
 
-    // DFS cycle detection: would adding task_id -> blocked_by create a cycle?
-    // A cycle exists if blocked_by can reach task_id through existing dependencies.
     fn would_create_cycle(&self, task_id: &str, blocked_by: &str) -> bool {
         let mut visited = HashSet::new();
         let mut stack = vec![blocked_by.to_string()];
@@ -156,11 +154,10 @@ impl TaskQueue {
             if current == task_id {
                 return true;
             }
-            if visited.insert(current.clone()) {
-                if let Some(task) = self.tasks.get(&current) {
-                    for dep in &task.blocked_by {
-                        stack.push(dep.clone());
-                    }
+            if visited.insert(current.clone()) &&
+             let Some(task) = self.tasks.get(&current) {
+                for dep in &task.blocked_by {
+                    stack.push(dep.clone());
                 }
             }
         }
