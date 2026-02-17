@@ -28,6 +28,7 @@ use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
     MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpRegistry,
 };
+use crate::supervisor::Supervisor;
 use crate::vault::{GlobalVault, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
@@ -207,6 +208,8 @@ pub struct Config {
     pub agent: Option<Agent>,
     #[serde(skip)]
     pub(crate) tool_call_tracker: Option<ToolCallTracker>,
+    #[serde(skip)]
+    pub supervisor: Option<Arc<RwLock<Supervisor>>>,
 }
 
 impl Default for Config {
@@ -280,6 +283,7 @@ impl Default for Config {
             rag: None,
             agent: None,
             tool_call_tracker: Some(ToolCallTracker::default()),
+            supervisor: None,
         }
     }
 }
@@ -1818,8 +1822,17 @@ impl Config {
                 agent.agent_session().map(|v| v.to_string())
             }
         });
+        let should_init_supervisor = agent.can_spawn_agents();
+        let max_concurrent = agent.max_concurrent_agents();
+        let max_depth = agent.max_agent_depth();
         config.write().rag = agent.rag();
         config.write().agent = Some(agent);
+        if should_init_supervisor {
+            config.write().supervisor = Some(Arc::new(RwLock::new(Supervisor::new(
+                max_concurrent,
+                max_depth,
+            ))));
+        }
         if let Some(session) = session {
             Config::use_session_safely(config, Some(&session), abort_signal).await?;
         } else {

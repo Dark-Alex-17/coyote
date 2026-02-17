@@ -208,6 +208,10 @@ impl Agent {
             functions.append_todo_functions();
         }
 
+        if agent_config.can_spawn_agents {
+            functions.append_supervisor_functions();
+        }
+
         Ok(Self {
             name: name.to_string(),
             config: agent_config,
@@ -410,6 +414,18 @@ impl Agent {
 
     pub fn max_auto_continues(&self) -> usize {
         self.config.max_auto_continues
+    }
+
+    pub fn can_spawn_agents(&self) -> bool {
+        self.config.can_spawn_agents
+    }
+
+    pub fn max_concurrent_agents(&self) -> usize {
+        self.config.max_concurrent_agents
+    }
+
+    pub fn max_agent_depth(&self) -> usize {
+        self.config.max_agent_depth
     }
 
     pub fn continuation_count(&self) -> usize {

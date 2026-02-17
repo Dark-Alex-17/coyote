@@ -1,12 +1,14 @@
 pub mod mailbox;
 pub mod taskqueue;
 
+use fmt::{Debug, Formatter};
 use crate::utils::AbortSignal;
 use mailbox::Inbox;
 use taskqueue::TaskQueue;
 
 use anyhow::{Result, bail};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
@@ -126,5 +128,15 @@ impl Supervisor {
         for handle in self.handles.values() {
             handle.abort_signal.set_ctrlc();
         }
+    }
+}
+
+impl Debug for Supervisor {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Supervisor")
+            .field("active_agents", &self.handles.len())
+            .field("max_concurrent", &self.max_concurrent)
+            .field("max_depth", &self.max_depth)
+            .finish()
     }
 }

@@ -1,3 +1,4 @@
+pub(crate) mod supervisor;
 pub(crate) mod todo;
 
 use crate::{
@@ -28,6 +29,7 @@ use std::{
     process::{Command, Stdio},
 };
 use strum_macros::AsRefStr;
+use supervisor::SUPERVISOR_FUNCTION_PREFIX;
 use todo::TODO_FUNCTION_PREFIX;
 
 #[derive(Embed)]
@@ -267,6 +269,11 @@ impl Functions {
 
     pub fn append_todo_functions(&mut self) {
         self.declarations.extend(todo::todo_function_declarations());
+    }
+
+    pub fn append_supervisor_functions(&mut self) {
+        self.declarations
+            .extend(supervisor::supervisor_function_declarations());
     }
 
     pub fn clear_mcp_meta_functions(&mut self) {
@@ -885,6 +892,15 @@ impl ToolCall {
                     eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
                     json!({"tool_call_error": error_msg})
                 })
+            }
+            _ if cmd_name.starts_with(SUPERVISOR_FUNCTION_PREFIX) => {
+                supervisor::handle_supervisor_tool(config, &cmd_name, &json_data).unwrap_or_else(
+                    |e| {
+                        let error_msg = format!("Supervisor tool failed: {e}");
+                        eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        json!({"tool_call_error": error_msg})
+                    },
+                )
             }
             _ => match run_llm_function(cmd_name, cmd_args, envs, agent_name) {
                 Ok(Some(contents)) => serde_json::from_str(&contents)
