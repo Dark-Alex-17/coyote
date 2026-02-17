@@ -590,6 +590,12 @@ pub struct AgentConfig {
     pub agent_session: Option<String>,
     #[serde(default)]
     pub auto_continue: bool,
+    #[serde(default)]
+    pub can_spawn_agents: bool,
+    #[serde(default = "default_max_concurrent_agents")]
+    pub max_concurrent_agents: usize,
+    #[serde(default = "default_max_agent_depth")]
+    pub max_agent_depth: usize,
     #[serde(default = "default_max_auto_continues")]
     pub max_auto_continues: usize,
     #[serde(default = "default_true")]
@@ -620,6 +626,14 @@ pub struct AgentConfig {
 
 fn default_max_auto_continues() -> usize {
     10
+}
+
+fn default_max_concurrent_agents() -> usize {
+    4
+}
+
+fn default_max_agent_depth() -> usize {
+    3
 }
 
 fn default_true() -> bool {

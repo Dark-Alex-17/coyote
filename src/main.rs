@@ -9,6 +9,7 @@ mod repl;
 mod utils;
 mod mcp;
 mod parsers;
+mod supervisor;
 mod vault;
 
 #[macro_use]
