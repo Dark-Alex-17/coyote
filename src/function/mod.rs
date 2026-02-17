@@ -276,6 +276,11 @@ impl Functions {
             .extend(supervisor::supervisor_function_declarations());
     }
 
+    pub fn append_teammate_functions(&mut self) {
+        self.declarations
+            .extend(supervisor::teammate_function_declarations());
+    }
+
     pub fn clear_mcp_meta_functions(&mut self) {
         self.declarations.retain(|d| {
             !d.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)

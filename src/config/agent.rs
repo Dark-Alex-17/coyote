@@ -6,6 +6,9 @@ use crate::{
     function::{Functions, run_llm_function},
 };
 
+use crate::config::prompts::{
+    DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS, DEFAULT_TODO_INSTRUCTIONS,
+};
 use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
 use fancy_regex::Captures;
@@ -13,7 +16,6 @@ use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::{ffi::OsStr, path::Path};
-use crate::config::prompts::{DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TODO_INSTRUCTIONS};
 
 const DEFAULT_AGENT_NAME: &str = "rag";
 
@@ -200,6 +202,8 @@ impl Agent {
             functions.append_supervisor_functions();
         }
 
+        functions.append_teammate_functions();
+
         agent_config.replace_tools_placeholder(&functions);
 
         Ok(Self {
@@ -339,6 +343,8 @@ impl Agent {
         if self.config.can_spawn_agents && self.config.inject_spawn_instructions {
             output.push_str(DEFAULT_SPAWN_INSTRUCTIONS);
         }
+
+        output.push_str(DEFAULT_TEAMMATE_INSTRUCTIONS);
 
         self.interpolate_text(&output)
     }

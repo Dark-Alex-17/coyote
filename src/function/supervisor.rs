@@ -119,43 +119,6 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}send_message"),
-            description: "Send a text message to a running subagent's inbox.".to_string(),
-            parameters: JsonSchema {
-                type_value: Some("object".to_string()),
-                properties: Some(IndexMap::from([
-                    (
-                        "id".to_string(),
-                        JsonSchema {
-                            type_value: Some("string".to_string()),
-                            description: Some("The target agent ID".into()),
-                            ..Default::default()
-                        },
-                    ),
-                    (
-                        "message".to_string(),
-                        JsonSchema {
-                            type_value: Some("string".to_string()),
-                            description: Some("The message text to send".into()),
-                            ..Default::default()
-                        },
-                    ),
-                ])),
-                required: Some(vec!["id".to_string(), "message".to_string()]),
-                ..Default::default()
-            },
-            agent: false,
-        },
-        FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}check_inbox"),
-            description: "Check for and drain all pending messages in your inbox.".to_string(),
-            parameters: JsonSchema {
-                type_value: Some("object".to_string()),
-                ..Default::default()
-            },
-            agent: false,
-        },
-        FunctionDeclaration {
             name: format!("{SUPERVISOR_FUNCTION_PREFIX}task_create"),
             description: "Create a task in the task queue. Returns the task ID.".to_string(),
             parameters: JsonSchema {
@@ -234,6 +197,48 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
                     },
                 )])),
                 required: Some(vec!["task_id".to_string()]),
+                ..Default::default()
+            },
+            agent: false,
+        },
+    ]
+}
+
+pub fn teammate_function_declarations() -> Vec<FunctionDeclaration> {
+    vec![
+        FunctionDeclaration {
+            name: format!("{SUPERVISOR_FUNCTION_PREFIX}send_message"),
+            description: "Send a text message to a sibling or child agent's inbox. Use to share cross-cutting findings or coordinate with teammates.".to_string(),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
+                properties: Some(IndexMap::from([
+                    (
+                        "id".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some("The target agent ID".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "message".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some("The message text to send".into()),
+                            ..Default::default()
+                        },
+                    ),
+                ])),
+                required: Some(vec!["id".to_string(), "message".to_string()]),
+                ..Default::default()
+            },
+            agent: false,
+        },
+        FunctionDeclaration {
+            name: format!("{SUPERVISOR_FUNCTION_PREFIX}check_inbox"),
+            description: "Check for and drain all pending messages in your inbox from sibling agents or your parent.".to_string(),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
                 ..Default::default()
             },
             agent: false,

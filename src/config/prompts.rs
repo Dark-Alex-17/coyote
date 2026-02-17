@@ -29,8 +29,6 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     | `agent__collect` | Blocking wait: wait for an agent to finish, return its output. |
     | `agent__list` | List all spawned agents and their status. |
     | `agent__cancel` | Cancel a running agent by ID. |
-    | `agent__send_message` | Send a text message to a sibling or child agent's inbox. |
-    | `agent__check_inbox` | Check your own inbox for messages from other agents. |
     | `agent__task_create` | Create a task in the dependency-aware task queue. |
     | `agent__task_list` | List all tasks and their status/dependencies. |
     | `agent__task_complete` | Mark a task done; returns any newly unblocked tasks. Auto-dispatches agents for tasks with a designated agent. |
@@ -69,14 +67,6 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
 
     **NEVER spawn sequentially when tasks are independent.** Parallel is always better.
 
-    ### Teammate Messaging
-
-    Sibling agents (spawned by the same parent) can communicate directly:
-        - `agent__send_message --to <agent_id> --content \"your message\"`: Send to a running sibling
-        - `agent__check_inbox`: Check for messages from siblings or parent
-
-    Use teammate messaging when agents need to coordinate or share intermediate findings.
-
     ### Task Queue (for complex dependency chains)
 
     When tasks have ordering requirements, use the task queue:
@@ -95,3 +85,16 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     agent__task_complete --task_id task_1
     ```
 "};
+
+pub(in crate::config) const DEFAULT_TEAMMATE_INSTRUCTIONS: &str = indoc! {"
+    ## Teammate Messaging
+
+    You have tools to communicate with other agents running alongside you:
+        - `agent__send_message --id <agent_id> --message \"...\"`: Send a message to a sibling or parent agent.
+        - `agent__check_inbox`: Check for messages sent to you by other agents.
+
+    If you are working alongside other agents (e.g. reviewing different files, exploring different areas):
+        - **Check your inbox** before finalizing your work to incorporate any cross-cutting findings from teammates.
+        - **Send messages** to teammates when you discover something that affects their work.
+        - Messages are delivered to the agent's inbox and read on their next `check_inbox` call."
+};
