@@ -1,8 +1,8 @@
 pub mod mailbox;
 pub mod taskqueue;
 
-use fmt::{Debug, Formatter};
 use crate::utils::AbortSignal;
+use fmt::{Debug, Formatter};
 use mailbox::Inbox;
 use taskqueue::TaskQueue;
 

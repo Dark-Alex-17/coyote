@@ -4,6 +4,7 @@ mod macros;
 mod role;
 mod session;
 pub(crate) mod todo;
+mod prompts;
 
 pub use self::agent::{Agent, AgentVariables, complete_agent_variables, list_agents};
 pub use self::input::Input;

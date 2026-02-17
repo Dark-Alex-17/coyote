@@ -13,20 +13,9 @@ use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::{ffi::OsStr, path::Path};
+use crate::config::prompts::{DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TODO_INSTRUCTIONS};
 
 const DEFAULT_AGENT_NAME: &str = "rag";
-const DEFAULT_TODO_INSTRUCTIONS: &str = "\
-\n## Task Tracking\n\
-You have built-in task tracking tools. Use them to track your progress:\n\
-- `todo__init`: Initialize a todo list with a goal. Call this at the start of every multi-step task.\n\
-- `todo__add`: Add individual tasks. Add all planned steps before starting work.\n\
-- `todo__done`: Mark a task done by id. Call this immediately after completing each step.\n\
-- `todo__list`: Show the current todo list.\n\
-\n\
-RULES:\n\
-- Always create a todo list before starting work.\n\
-- Mark each task done as soon as you finish it; do not batch.\n\
-- If you stop with incomplete tasks, the system will automatically prompt you to continue.";
 
 pub type AgentVariables = IndexMap<String, String>;
 
@@ -347,6 +336,10 @@ impl Agent {
             output.push_str(DEFAULT_TODO_INSTRUCTIONS);
         }
 
+        if self.config.can_spawn_agents && self.config.inject_spawn_instructions {
+            output.push_str(DEFAULT_SPAWN_INSTRUCTIONS);
+        }
+
         self.interpolate_text(&output)
     }
 
@@ -625,6 +618,8 @@ pub struct AgentConfig {
     pub max_auto_continues: usize,
     #[serde(default = "default_true")]
     pub inject_todo_instructions: bool,
+    #[serde(default = "default_true")]
+    pub inject_spawn_instructions: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compression_threshold: Option<usize>,
     #[serde(default)]

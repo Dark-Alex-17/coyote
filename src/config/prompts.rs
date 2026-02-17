@@ -1,0 +1,97 @@
+use indoc::indoc;
+
+pub(in crate::config) const DEFAULT_TODO_INSTRUCTIONS: &str = indoc! {"
+    ## Task Tracking
+    You have built-in task tracking tools. Use them to track your progress:
+        - `todo__init`: Initialize a todo list with a goal. Call this at the start of every multi-step task.
+        - `todo__add`: Add individual tasks. Add all planned steps before starting work.
+        - `todo__done`: Mark a task done by id. Call this immediately after completing each step.
+        - `todo__list`: Show the current todo list.
+
+    RULES:
+        - Always create a todo list before starting work.
+        - Mark each task done as soon as you finish it; do not batch.
+        - If you stop with incomplete tasks, the system will automatically prompt you to continue."
+};
+
+pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
+    ## Agent Spawning System
+
+    You have built-in tools for spawning and managing subagents. These run **in parallel** as
+    background tasks inside the same process; no shell overhead, true concurrency.
+
+    ### Available Agent Tools
+
+    | Tool | Purpose |
+    |------|----------|
+    | `agent__spawn` | Spawn a subagent in the background. Returns an `id` immediately. |
+    | `agent__check` | Non-blocking check: is the agent done yet? Returns PENDING or result. |
+    | `agent__collect` | Blocking wait: wait for an agent to finish, return its output. |
+    | `agent__list` | List all spawned agents and their status. |
+    | `agent__cancel` | Cancel a running agent by ID. |
+    | `agent__send_message` | Send a text message to a sibling or child agent's inbox. |
+    | `agent__check_inbox` | Check your own inbox for messages from other agents. |
+    | `agent__task_create` | Create a task in the dependency-aware task queue. |
+    | `agent__task_list` | List all tasks and their status/dependencies. |
+    | `agent__task_complete` | Mark a task done; returns any newly unblocked tasks. Auto-dispatches agents for tasks with a designated agent. |
+
+    ### Core Pattern: Spawn -> Continue -> Collect
+
+    ```
+    # 1. Spawn agents in parallel
+    agent__spawn --agent explore --prompt \"Find auth middleware patterns in src/\"
+    agent__spawn --agent explore --prompt \"Find error handling patterns in src/\"
+    # Both return IDs immediately, e.g. agent_explore_a1b2c3d4, agent_explore_e5f6g7h8
+
+    # 2. Continue your own work while they run (or spawn more agents)
+
+    # 3. Check if done (non-blocking)
+    agent__check --id agent_explore_a1b2c3d4
+
+    # 4. Collect results when ready (blocking)
+    agent__collect --id agent_explore_a1b2c3d4
+    agent__collect --id agent_explore_e5f6g7h8
+    ```
+
+    ### Parallel Spawning (DEFAULT for multi-agent work)
+
+    When a task needs multiple agents, **spawn them all at once**, then collect:
+
+    ```
+    # Spawn explore and oracle simultaneously
+    agent__spawn --agent explore --prompt \"Find all database query patterns\"
+    agent__spawn --agent oracle --prompt \"Evaluate pros/cons of connection pooling approaches\"
+
+    # Collect both results
+    agent__collect --id <explore_id>
+    agent__collect --id <oracle_id>
+    ```
+
+    **NEVER spawn sequentially when tasks are independent.** Parallel is always better.
+
+    ### Teammate Messaging
+
+    Sibling agents (spawned by the same parent) can communicate directly:
+        - `agent__send_message --to <agent_id> --content \"your message\"`: Send to a running sibling
+        - `agent__check_inbox`: Check for messages from siblings or parent
+
+    Use teammate messaging when agents need to coordinate or share intermediate findings.
+
+    ### Task Queue (for complex dependency chains)
+
+    When tasks have ordering requirements, use the task queue:
+
+    ```
+    # Create tasks with dependencies (optional: auto-dispatch with --agent)
+    agent__task_create --subject \"Explore existing patterns\"
+    agent__task_create --subject \"Implement feature\" --blocked_by [\"task_1\"] --agent coder --prompt \"Implement based on patterns found\"
+    agent__task_create --subject \"Write tests\" --blocked_by [\"task_2\"]
+
+    # Check what's runnable
+    agent__task_list
+
+    # After completing a task, mark it done to unblock dependents
+    # If dependents have --agent set, they auto-dispatch
+    agent__task_complete --task_id task_1
+    ```
+"};
