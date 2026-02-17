@@ -29,6 +29,7 @@ use crate::mcp::{
     MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpRegistry,
 };
 use crate::supervisor::Supervisor;
+use crate::supervisor::mailbox::Inbox;
 use crate::vault::{GlobalVault, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
@@ -55,7 +56,6 @@ use std::{
 use syntect::highlighting::ThemeSet;
 use terminal_colorsaurus::{ColorScheme, QueryOptions, color_scheme};
 use tokio::runtime::Handle;
-use crate::supervisor::mailbox::Inbox;
 
 pub const TEMP_ROLE_NAME: &str = "temp";
 pub const TEMP_RAG_NAME: &str = "temp";

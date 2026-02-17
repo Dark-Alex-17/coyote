@@ -140,7 +140,6 @@ impl Agent {
         }
 
         config.write().mcp_registry = Some(new_mcp_registry);
-        agent_config.replace_tools_placeholder(&functions);
 
         agent_config.load_envs(&config.read());
 
@@ -211,6 +210,8 @@ impl Agent {
         if agent_config.can_spawn_agents {
             functions.append_supervisor_functions();
         }
+
+        agent_config.replace_tools_placeholder(&functions);
 
         Ok(Self {
             name: name.to_string(),
