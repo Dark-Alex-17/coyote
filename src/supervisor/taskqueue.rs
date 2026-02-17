@@ -20,10 +20,18 @@ pub struct TaskNode {
     pub owner: Option<String>,
     pub blocked_by: HashSet<String>,
     pub blocks: HashSet<String>,
+    pub dispatch_agent: Option<String>,
+    pub prompt: Option<String>,
 }
 
 impl TaskNode {
-    pub fn new(id: String, subject: String, description: String) -> Self {
+    pub fn new(
+        id: String,
+        subject: String,
+        description: String,
+        dispatch_agent: Option<String>,
+        prompt: Option<String>,
+    ) -> Self {
         Self {
             id,
             subject,
@@ -32,6 +40,8 @@ impl TaskNode {
             owner: None,
             blocked_by: HashSet::new(),
             blocks: HashSet::new(),
+            dispatch_agent,
+            prompt,
         }
     }
 
@@ -54,10 +64,16 @@ impl TaskQueue {
         }
     }
 
-    pub fn create(&mut self, subject: String, description: String) -> String {
+    pub fn create(
+        &mut self,
+        subject: String,
+        description: String,
+        dispatch_agent: Option<String>,
+        prompt: Option<String>,
+    ) -> String {
         let id = self.next_id.to_string();
         self.next_id += 1;
-        let task = TaskNode::new(id.clone(), subject, description);
+        let task = TaskNode::new(id.clone(), subject, description, dispatch_agent, prompt);
         self.tasks.insert(id.clone(), task);
         id
     }
@@ -122,8 +138,10 @@ impl TaskQueue {
     }
 
     pub fn claim(&mut self, task_id: &str, owner: &str) -> bool {
-        if let Some(task) = self.tasks.get_mut(task_id) &&
-         task.is_runnable() && task.owner.is_none() {
+        if let Some(task) = self.tasks.get_mut(task_id)
+            && task.is_runnable()
+            && task.owner.is_none()
+        {
             task.owner = Some(owner.to_string());
             task.status = TaskStatus::InProgress;
             return true;
@@ -154,8 +172,9 @@ impl TaskQueue {
             if current == task_id {
                 return true;
             }
-            if visited.insert(current.clone()) &&
-             let Some(task) = self.tasks.get(&current) {
+            if visited.insert(current.clone())
+                && let Some(task) = self.tasks.get(&current)
+            {
                 for dep in &task.blocked_by {
                     stack.push(dep.clone());
                 }
@@ -173,8 +192,13 @@ mod tests {
     #[test]
     fn test_create_and_list() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("Research".into(), "Research auth patterns".into());
-        let id2 = queue.create("Implement".into(), "Write the code".into());
+        let id1 = queue.create(
+            "Research".into(),
+            "Research auth patterns".into(),
+            None,
+            None,
+        );
+        let id2 = queue.create("Implement".into(), "Write the code".into(), None, None);
 
         assert_eq!(id1, "1");
         assert_eq!(id2, "2");
@@ -184,8 +208,8 @@ mod tests {
     #[test]
     fn test_dependency_and_completion() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("Step 1".into(), "".into());
-        let id2 = queue.create("Step 2".into(), "".into());
+        let id1 = queue.create("Step 1".into(), "".into(), None, None);
+        let id2 = queue.create("Step 2".into(), "".into(), None, None);
 
         queue.add_dependency(&id2, &id1).unwrap();
 
@@ -201,9 +225,9 @@ mod tests {
     #[test]
     fn test_fan_in_dependency() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("A".into(), "".into());
-        let id2 = queue.create("B".into(), "".into());
-        let id3 = queue.create("C (needs A and B)".into(), "".into());
+        let id1 = queue.create("A".into(), "".into(), None, None);
+        let id2 = queue.create("B".into(), "".into(), None, None);
+        let id3 = queue.create("C (needs A and B)".into(), "".into(), None, None);
 
         queue.add_dependency(&id3, &id1).unwrap();
         queue.add_dependency(&id3, &id2).unwrap();
@@ -222,8 +246,8 @@ mod tests {
     #[test]
     fn test_cycle_detection() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("A".into(), "".into());
-        let id2 = queue.create("B".into(), "".into());
+        let id1 = queue.create("A".into(), "".into(), None, None);
+        let id2 = queue.create("B".into(), "".into(), None, None);
 
         queue.add_dependency(&id2, &id1).unwrap();
         let result = queue.add_dependency(&id1, &id2);
@@ -234,7 +258,7 @@ mod tests {
     #[test]
     fn test_self_dependency_rejected() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("A".into(), "".into());
+        let id1 = queue.create("A".into(), "".into(), None, None);
         let result = queue.add_dependency(&id1, &id1);
         assert!(result.is_err());
     }
@@ -242,7 +266,7 @@ mod tests {
     #[test]
     fn test_claim() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("Task".into(), "".into());
+        let id1 = queue.create("Task".into(), "".into(), None, None);
 
         assert!(queue.claim(&id1, "worker-1"));
         assert!(!queue.claim(&id1, "worker-2"));

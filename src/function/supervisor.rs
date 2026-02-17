@@ -1,6 +1,6 @@
 use super::{FunctionDeclaration, JsonSchema};
-use crate::client::call_chat_completions;
-use crate::config::{Config, GlobalConfig, Input};
+use crate::client::{Model, ModelType, call_chat_completions};
+use crate::config::{Config, GlobalConfig, Input, Role, RoleLike};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
 use crate::utils::{AbortSignal, create_abort_signal};
@@ -189,6 +189,22 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
                             ..Default::default()
                         },
                     ),
+                    (
+                        "agent".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some("Agent to auto-spawn when this task becomes runnable (e.g. 'explore', 'coder'). If set, an agent will be spawned automatically when all dependencies complete.".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "prompt".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some("Prompt to send to the auto-spawned agent. Required if agent is set.".into()),
+                            ..Default::default()
+                        },
+                    ),
                 ])),
                 required: Some(vec!["subject".to_string()]),
                 ..Default::default()
@@ -244,7 +260,7 @@ pub async fn handle_supervisor_tool(
         "check_inbox" => handle_check_inbox(config),
         "task_create" => handle_task_create(config, args),
         "task_list" => handle_task_list(config),
-        "task_complete" => handle_task_complete(config, args),
+        "task_complete" => handle_task_complete(config, args).await,
         _ => bail!("Unknown supervisor action: {action}"),
     }
 }
@@ -262,14 +278,9 @@ fn run_child_agent(
             let client = input.create_client()?;
             child_config.write().before_chat_completion(&input)?;
 
-            let (output, tool_results) = call_chat_completions(
-                &input,
-                false,
-                false,
-                client.as_ref(),
-                abort_signal.clone(),
-            )
-            .await?;
+            let (output, tool_results) =
+                call_chat_completions(&input, false, false, client.as_ref(), abort_signal.clone())
+                    .await?;
 
             child_config
                 .write()
@@ -341,6 +352,7 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
     let child_config: GlobalConfig = {
         let mut child_cfg = config.read().clone();
 
+        child_cfg.parent_supervisor = child_cfg.supervisor.clone();
         child_cfg.agent = None;
         child_cfg.session = None;
         child_cfg.rag = None;
@@ -352,6 +364,7 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
         child_cfg.save = false;
         child_cfg.current_depth = current_depth;
         child_cfg.inbox = Some(Arc::clone(&child_inbox));
+        child_cfg.self_agent_id = Some(agent_id.clone());
 
         Arc::new(RwLock::new(child_cfg))
     };
@@ -430,9 +443,7 @@ async fn handle_check(config: &GlobalConfig, args: &Value) -> Result<Value> {
     };
 
     match is_finished {
-        Some(true) => {
-            handle_collect(config, args).await
-        }
+        Some(true) => handle_collect(config, args).await,
         Some(false) => Ok(json!({
             "status": "pending",
             "id": id,
@@ -469,12 +480,14 @@ async fn handle_collect(config: &GlobalConfig, args: &Value) -> Result<Value> {
                 .map_err(|e| anyhow!("Agent task panicked: {e}"))?
                 .map_err(|e| anyhow!("Agent failed: {e}"))?;
 
+            let output = summarize_output(config, &result.agent_name, &result.output).await?;
+
             Ok(json!({
                 "status": "completed",
                 "id": result.id,
                 "agent": result.agent_name,
                 "exit_status": format!("{:?}", result.exit_status),
-                "output": result.output,
+                "output": output,
             }))
         }
         None => Ok(json!({
@@ -551,22 +564,31 @@ fn handle_send_message(config: &GlobalConfig, args: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("'message' is required"))?;
 
     let cfg = config.read();
-    let supervisor = cfg
+
+    // Determine sender identity: self_agent_id (child), agent name (parent), or "parent"
+    let sender = cfg
+        .self_agent_id
+        .clone()
+        .or_else(|| cfg.agent.as_ref().map(|a| a.name().to_string()))
+        .unwrap_or_else(|| "parent".to_string());
+
+    // Try local supervisor first (parent → child routing)
+    let inbox = cfg
         .supervisor
         .as_ref()
-        .ok_or_else(|| anyhow!("No supervisor active"))?;
-    let sup = supervisor.read();
+        .and_then(|sup| sup.read().inbox(id).cloned());
 
-    match sup.inbox(id) {
+    // Fall back to parent_supervisor (sibling → sibling routing)
+    let inbox = inbox.or_else(|| {
+        cfg.parent_supervisor
+            .as_ref()
+            .and_then(|sup| sup.read().inbox(id).cloned())
+    });
+
+    match inbox {
         Some(inbox) => {
-            let parent_name = cfg
-                .agent
-                .as_ref()
-                .map(|a| a.name().to_string())
-                .unwrap_or_else(|| "parent".to_string());
-
             inbox.deliver(Envelope {
-                from: parent_name,
+                from: sender,
                 to: id.to_string(),
                 payload: EnvelopePayload::Text {
                     content: message.to_string(),
@@ -581,7 +603,7 @@ fn handle_send_message(config: &GlobalConfig, args: &Value) -> Result<Value> {
         }
         None => Ok(json!({
             "status": "error",
-            "message": format!("No agent found with id '{id}'"),
+            "message": format!("No agent found with id '{id}'. Agent may not exist or may have already completed."),
         })),
     }
 }
@@ -633,6 +655,12 @@ fn handle_task_create(config: &GlobalConfig, args: &Value) -> Result<Value> {
                 .collect()
         })
         .unwrap_or_default();
+    let dispatch_agent = args.get("agent").and_then(Value::as_str).map(String::from);
+    let task_prompt = args.get("prompt").and_then(Value::as_str).map(String::from);
+
+    if dispatch_agent.is_some() && task_prompt.is_none() {
+        bail!("'prompt' is required when 'agent' is set");
+    }
 
     let cfg = config.read();
     let supervisor = cfg
@@ -641,9 +669,12 @@ fn handle_task_create(config: &GlobalConfig, args: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("No supervisor active"))?;
     let mut sup = supervisor.write();
 
-    let task_id = sup
-        .task_queue_mut()
-        .create(subject.to_string(), description.to_string());
+    let task_id = sup.task_queue_mut().create(
+        subject.to_string(),
+        description.to_string(),
+        dispatch_agent.clone(),
+        task_prompt,
+    );
 
     let mut dep_errors = vec![];
     for dep_id in &blocked_by {
@@ -656,6 +687,10 @@ fn handle_task_create(config: &GlobalConfig, args: &Value) -> Result<Value> {
         "status": "ok",
         "task_id": task_id,
     });
+
+    if dispatch_agent.is_some() {
+        result["auto_dispatch"] = json!(true);
+    }
 
     if !dep_errors.is_empty() {
         result["warnings"] = json!(dep_errors);
@@ -684,6 +719,8 @@ fn handle_task_list(config: &GlobalConfig) -> Result<Value> {
                 "owner": t.owner,
                 "blocked_by": t.blocked_by.iter().collect::<Vec<_>>(),
                 "blocks": t.blocks.iter().collect::<Vec<_>>(),
+                "agent": t.dispatch_agent,
+                "prompt": t.prompt,
             })
         })
         .collect();
@@ -691,37 +728,151 @@ fn handle_task_list(config: &GlobalConfig) -> Result<Value> {
     Ok(json!({ "tasks": tasks }))
 }
 
-fn handle_task_complete(config: &GlobalConfig, args: &Value) -> Result<Value> {
+async fn handle_task_complete(config: &GlobalConfig, args: &Value) -> Result<Value> {
     let task_id = args
         .get("task_id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'task_id' is required"))?;
 
-    let cfg = config.read();
-    let supervisor = cfg
-        .supervisor
-        .as_ref()
-        .ok_or_else(|| anyhow!("No supervisor active"))?;
-    let mut sup = supervisor.write();
+    let (newly_runnable, dispatchable) = {
+        let cfg = config.read();
+        let supervisor = cfg
+            .supervisor
+            .as_ref()
+            .ok_or_else(|| anyhow!("No supervisor active"))?;
+        let mut sup = supervisor.write();
 
-    let newly_runnable_ids = sup.task_queue_mut().complete(task_id);
+        let newly_runnable_ids = sup.task_queue_mut().complete(task_id);
 
-    let newly_runnable: Vec<Value> = newly_runnable_ids
-        .iter()
-        .filter_map(|id| {
-            sup.task_queue().get(id).map(|t| {
-                json!({
+        let mut newly_runnable = Vec::new();
+        let mut to_dispatch: Vec<(String, String, String)> = Vec::new();
+
+        for id in &newly_runnable_ids {
+            if let Some(t) = sup.task_queue().get(id) {
+                newly_runnable.push(json!({
                     "id": t.id,
                     "subject": t.subject,
                     "description": t.description,
-                })
-            })
-        })
-        .collect();
+                    "agent": t.dispatch_agent,
+                }));
 
-    Ok(json!({
+                if let (Some(agent), Some(prompt)) = (&t.dispatch_agent, &t.prompt) {
+                    to_dispatch.push((id.clone(), agent.clone(), prompt.clone()));
+                }
+            }
+        }
+
+        let mut dispatchable = Vec::new();
+        for (tid, agent, prompt) in to_dispatch {
+            if sup.task_queue_mut().claim(&tid, &format!("auto:{agent}")) {
+                dispatchable.push((agent, prompt));
+            }
+        }
+
+        (newly_runnable, dispatchable)
+    };
+
+    let mut spawned = Vec::new();
+    for (agent, prompt) in &dispatchable {
+        let spawn_args = json!({
+            "agent": agent,
+            "prompt": prompt,
+        });
+        match handle_spawn(config, &spawn_args).await {
+            Ok(result) => {
+                let agent_id = result
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                debug!("Auto-dispatched agent '{}' for task queue", agent_id);
+                spawned.push(result);
+            }
+            Err(e) => {
+                spawned.push(json!({
+                    "status": "error",
+                    "agent": agent,
+                    "message": format!("Auto-dispatch failed: {e}"),
+                }));
+            }
+        }
+    }
+
+    let mut result = json!({
         "status": "ok",
         "task_id": task_id,
         "newly_runnable": newly_runnable,
-    }))
+    });
+
+    if !spawned.is_empty() {
+        result["auto_dispatched"] = json!(spawned);
+    }
+
+    Ok(result)
+}
+
+const SUMMARIZATION_PROMPT: &str = r#"You are a precise summarization assistant. Your job is to condense a sub-agent's output into a compact summary that preserves all actionable information.
+
+Rules:
+- Preserve ALL code snippets, file paths, error messages, and concrete recommendations
+- Remove conversational filler, thinking-out-loud, and redundant explanations
+- Keep the summary under 30% of the original length
+- Use bullet points for multiple findings
+- If the output contains a final answer or conclusion, lead with it"#;
+
+async fn summarize_output(config: &GlobalConfig, agent_name: &str, output: &str) -> Result<String> {
+    let (threshold, summarization_model_id) = {
+        let cfg = config.read();
+        match cfg.agent.as_ref() {
+            Some(agent) => (
+                agent.summarization_threshold(),
+                agent.summarization_model().map(|s| s.to_string()),
+            ),
+            None => return Ok(output.to_string()),
+        }
+    };
+
+    if output.len() < threshold {
+        debug!(
+            "Output from '{}' is {} chars (threshold {}), skipping summarization",
+            agent_name,
+            output.len(),
+            threshold
+        );
+        return Ok(output.to_string());
+    }
+
+    debug!(
+        "Output from '{}' is {} chars (threshold {}), summarizing...",
+        agent_name,
+        output.len(),
+        threshold
+    );
+
+    let model = {
+        let cfg = config.read();
+        match summarization_model_id {
+            Some(ref model_id) => Model::retrieve_model(&cfg, model_id, ModelType::Chat)?,
+            None => cfg.current_model().clone(),
+        }
+    };
+
+    let mut role = Role::new("summarizer", SUMMARIZATION_PROMPT);
+    role.set_model(model);
+
+    let user_message = format!(
+        "Summarize the following sub-agent output from '{}':\n\n{}",
+        agent_name, output
+    );
+    let input = Input::from_str(config, &user_message, Some(role));
+
+    let summary = input.fetch_chat_text().await?;
+
+    debug!(
+        "Summarized output from '{}': {} chars -> {} chars",
+        agent_name,
+        output.len(),
+        summary.len()
+    );
+
+    Ok(summary)
 }

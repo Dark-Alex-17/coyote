@@ -212,6 +212,10 @@ pub struct Config {
     #[serde(skip)]
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     #[serde(skip)]
+    pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
+    #[serde(skip)]
+    pub self_agent_id: Option<String>,
+    #[serde(skip)]
     pub current_depth: usize,
     #[serde(skip)]
     pub inbox: Option<Arc<Inbox>>,
@@ -289,6 +293,8 @@ impl Default for Config {
             agent: None,
             tool_call_tracker: Some(ToolCallTracker::default()),
             supervisor: None,
+            parent_supervisor: None,
+            self_agent_id: None,
             current_depth: 0,
             inbox: None,
         }

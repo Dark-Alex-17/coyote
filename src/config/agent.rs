@@ -429,6 +429,14 @@ impl Agent {
         self.config.max_agent_depth
     }
 
+    pub fn summarization_model(&self) -> Option<&str> {
+        self.config.summarization_model.as_deref()
+    }
+
+    pub fn summarization_threshold(&self) -> usize {
+        self.config.summarization_threshold
+    }
+
     pub fn continuation_count(&self) -> usize {
         self.continuation_count
     }
@@ -639,6 +647,10 @@ pub struct AgentConfig {
     pub conversation_starters: Vec<String>,
     #[serde(default)]
     pub documents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summarization_model: Option<String>,
+    #[serde(default = "default_summarization_threshold")]
+    pub summarization_threshold: usize,
 }
 
 fn default_max_auto_continues() -> usize {
@@ -655,6 +667,10 @@ fn default_max_agent_depth() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_summarization_threshold() -> usize {
+    4000
 }
 
 impl AgentConfig {
