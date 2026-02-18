@@ -15,7 +15,6 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentExitStatus {
     Completed,
-    Cancelled,
     Failed(String),
 }
 
@@ -93,18 +92,6 @@ impl Supervisor {
 
     pub fn is_finished(&self, id: &str) -> Option<bool> {
         self.handles.get(id).map(|h| h.join_handle.is_finished())
-    }
-
-    pub fn take_if_finished(&mut self, id: &str) -> Option<AgentHandle> {
-        if self
-            .handles
-            .get(id)
-            .is_some_and(|h| h.join_handle.is_finished())
-        {
-            self.handles.remove(id)
-        } else {
-            None
-        }
     }
 
     pub fn take(&mut self, id: &str) -> Option<AgentHandle> {

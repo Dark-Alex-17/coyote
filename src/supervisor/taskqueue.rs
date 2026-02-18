@@ -150,10 +150,6 @@ impl TaskQueue {
         false
     }
 
-    pub fn runnable_tasks(&self) -> Vec<&TaskNode> {
-        self.tasks.values().filter(|t| t.is_runnable()).collect()
-    }
-
     pub fn get(&self, task_id: &str) -> Option<&TaskNode> {
         self.tasks.get(task_id)
     }

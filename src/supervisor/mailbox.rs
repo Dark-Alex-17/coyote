@@ -48,10 +48,6 @@ impl Inbox {
 
         msgs
     }
-
-    pub fn pending_count(&self) -> usize {
-        self.messages.lock().len()
-    }
 }
 
 impl Clone for Inbox {
