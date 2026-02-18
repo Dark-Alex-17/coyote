@@ -887,7 +887,6 @@ async fn ask(
             if let Some(agent) = &cfg.agent {
                 agent.auto_continue_enabled()
                     && agent.continuation_count() < agent.max_auto_continues()
-                    && !agent.is_stale_response(&output)
                     && agent.todo_list().has_incomplete()
             } else {
                 false

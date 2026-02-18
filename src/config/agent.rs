@@ -456,12 +456,6 @@ impl Agent {
         self.last_continuation_response = None;
     }
 
-    pub fn is_stale_response(&self, response: &str) -> bool {
-        self.last_continuation_response
-            .as_ref()
-            .is_some_and(|last| last == response)
-    }
-
     pub fn set_last_continuation_response(&mut self, response: String) {
         self.last_continuation_response = Some(response);
     }
