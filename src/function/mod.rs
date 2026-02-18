@@ -127,7 +127,10 @@ pub async fn eval_tool_calls(
     if !output.is_empty() {
         let (has_escalations, summary) = {
             let cfg = config.read();
-            if cfg.current_depth == 0 && let Some(ref queue) = cfg.root_escalation_queue && queue.has_pending() {
+            if cfg.current_depth == 0
+                && let Some(ref queue) = cfg.root_escalation_queue
+                && queue.has_pending()
+            {
                 (true, queue.pending_summary())
             } else {
                 (false, vec![])
