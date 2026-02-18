@@ -121,7 +121,7 @@ _cursor_blink_off() {
 }
 
 _cursor_to() {
-  echo -en "\033[$1;$2H" >&2
+  echo -en "\033[$1;${2:-1}H" >&2
 }
 
 # shellcheck disable=SC2154
@@ -133,7 +133,7 @@ _key_input() {
     _read_stdin -rsn2 b
   fi
 
-  declare input="${a}${b}"
+  declare input="${a}${b:-}"
   case "$input" in
     "${ESC}[A" | "k") echo up ;;
     "${ESC}[B" | "j") echo down ;;

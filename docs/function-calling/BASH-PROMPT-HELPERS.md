@@ -66,12 +66,12 @@ Prompt for text input
 
 **Example With Validation:**
 ```bash
-text=$(with_validation 'input "Please enter something:"' validate_present)
+text=$(with_validation 'input "Please enter something:"' validate_present 2>/dev/tty)
 ```
 
 **Example Without Validation:**
 ```bash
-text=$(input "Please enter something:")
+text=$(input "Please enter something:" 2>/dev/tty)
 ```
 
 ### confirm
@@ -81,7 +81,7 @@ Show a confirm dialog with options for yes/no
 
 **Example:**
 ```bash
-confirmed=$(confirm "Do the thing?")
+confirmed=$(confirm "Do the thing?" 2>/dev/tty)
 if [[ $confirmed == "0" ]]; then echo "No"; else echo "Yes"; fi
 ```
 
@@ -94,7 +94,7 @@ keys that then returns the chosen option.
 **Example:**
 ```bash
 options=("one" "two" "three" "four")
-choice=$(list "Select an item" "${options[@]}")
+choice=$(list "Select an item" "${options[@]}" 2>/dev/tty)
 echo "Your choice: ${options[$choice]}"
 ```
 
@@ -107,7 +107,7 @@ and enter keys that then returns the chosen options.
 **Example:**
 ```bash
 options=("one" "two" "three" "four")
-checked=$(checkbox "Select one or more items" "${options[@]}")
+checked=$(checkbox "Select one or more items" "${options[@]}" 2>/dev/tty)
 echo "Your choices: ${checked}"
 ```
 
@@ -124,12 +124,12 @@ validate_password() {
     exit 1
   fi
 }
-pass=$(with_validate 'password "Enter your password"' validate_password)
+pass=$(with_validate 'password "Enter your password"' validate_password 2>/dev/tty)
 ```
 
 **Example Without Validation:**
 ```bash
-pass="$(password "Enter your password:")"
+pass="$(password "Enter your password:" 2>/dev/tty)"
 ```
 
 ### editor
@@ -137,7 +137,7 @@ Open the default editor (`$EDITOR`); if none is set, default back to `vi`
 
 **Example:**
 ```bash
-text=$(editor "Please enter something in the editor")
+text=$(editor "Please enter something in the editor" 2>/dev/tty)
 echo -e "You wrote:\n${text}"
 ```
 
@@ -150,7 +150,7 @@ validation functions returns 0.
 **Example:**
 ```bash
 # Using the built-in 'validate_present' validator
-text=$(with_validate 'input "Please enter something and confirm with enter"' validate_present)
+text=$(with_validate 'input "Please enter something and confirm with enter"' validate_present 2>/dev/tty)
 
 # Using a custom validator; e.g. for password
 validate_password() {
@@ -159,7 +159,7 @@ validate_password() {
     exit 1
   fi
 }
-pass=$(with_validate 'password "Enter random password"' validate_password)
+pass=$(with_validate 'password "Enter random password"' validate_password 2>/dev/tty)
 ```
 
 ### validate_present
@@ -169,7 +169,7 @@ Validate that the prompt returned a value.
 
 **Example:**
 ```bash
-text=$(with_validate 'input "Please enter something and confirm with enter"' validate_present)
+text=$(with_validate 'input "Please enter something and confirm with enter"' validate_present 2>/dev/tty)
 ```
 
 ### detect_os
