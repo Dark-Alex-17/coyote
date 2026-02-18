@@ -861,7 +861,7 @@ impl ToolCall {
 
         let prompt = format!("Call {cmd_name} {}", cmd_args.join(" "));
 
-        if *IS_STDOUT_TERMINAL {
+        if *IS_STDOUT_TERMINAL && config.read().current_depth == 0 {
             println!("{}", dimmed_text(&prompt));
         }
 
