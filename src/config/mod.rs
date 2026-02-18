@@ -19,6 +19,7 @@ use crate::client::{
     ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
     ProviderModels, create_client_config, list_client_types, list_models,
 };
+use crate::function::user_interaction::USER_FUNCTION_PREFIX;
 use crate::function::{FunctionDeclaration, Functions, ToolCallTracker, ToolResult};
 use crate::rag::Rag;
 use crate::render::{MarkdownRender, RenderOptions};
@@ -2064,6 +2065,20 @@ impl Config {
                     .collect();
             }
 
+            if self.agent.is_none() {
+                let existing: HashSet<String> = functions.iter().map(|f| f.name.clone()).collect();
+                let builtin_functions: Vec<FunctionDeclaration> = self
+                    .functions
+                    .declarations()
+                    .iter()
+                    .filter(|v| {
+                        v.name.starts_with(USER_FUNCTION_PREFIX) && !existing.contains(&v.name)
+                    })
+                    .cloned()
+                    .collect();
+                functions.extend(builtin_functions);
+            }
+
             if let Some(agent) = &self.agent {
                 let mut agent_functions: Vec<FunctionDeclaration> = agent
                     .functions()
@@ -2921,6 +2936,9 @@ impl Config {
 
     fn load_functions(&mut self) -> Result<()> {
         self.functions = Functions::init(self.visible_tools.as_ref().unwrap_or(&Vec::new()))?;
+        if self.working_mode.is_repl() {
+            self.functions.append_user_interaction_functions();
+        }
         Ok(())
     }
 
