@@ -6,7 +6,7 @@ use bm25::{Document, Language, SearchEngine, SearchEngineBuilder};
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use indoc::formatdoc;
-use rmcp::model::{CallToolRequestParam, CallToolResult};
+use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
@@ -395,9 +395,11 @@ impl McpRegistry {
         let tool = tool.to_owned();
         Box::pin(async move {
             let server = server?;
-            let call_tool_request = CallToolRequestParam {
+            let call_tool_request = CallToolRequestParams {
                 name: Cow::Owned(tool.to_owned()),
                 arguments: arguments.as_object().cloned(),
+                meta: None,
+                task: None,
             };
 
             let result = server.call_tool(call_tool_request).await?;
