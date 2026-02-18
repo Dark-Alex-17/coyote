@@ -201,6 +201,24 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             },
             agent: false,
         },
+        FunctionDeclaration {
+            name: format!("{SUPERVISOR_FUNCTION_PREFIX}task_fail"),
+            description: "Mark a task as failed. Dependents will remain blocked.".to_string(),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
+                properties: Some(IndexMap::from([(
+                    "task_id".to_string(),
+                    JsonSchema {
+                        type_value: Some("string".to_string()),
+                        description: Some("The task ID to mark as failed".into()),
+                        ..Default::default()
+                    },
+                )])),
+                required: Some(vec!["task_id".to_string()]),
+                ..Default::default()
+            },
+            agent: false,
+        },
     ]
 }
 
@@ -266,6 +284,7 @@ pub async fn handle_supervisor_tool(
         "task_create" => handle_task_create(config, args),
         "task_list" => handle_task_list(config),
         "task_complete" => handle_task_complete(config, args).await,
+        "task_fail" => handle_task_fail(config, args),
         _ => bail!("Unknown supervisor action: {action}"),
     }
 }
@@ -817,6 +836,39 @@ async fn handle_task_complete(config: &GlobalConfig, args: &Value) -> Result<Val
     }
 
     Ok(result)
+}
+
+fn handle_task_fail(config: &GlobalConfig, args: &Value) -> Result<Value> {
+    let task_id = args
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("'task_id' is required"))?;
+
+    let cfg = config.read();
+    let supervisor = cfg
+        .supervisor
+        .as_ref()
+        .ok_or_else(|| anyhow!("No supervisor active"))?;
+    let mut sup = supervisor.write();
+
+    let task = sup.task_queue().get(task_id);
+    if task.is_none() {
+        return Ok(json!({
+            "status": "error",
+            "message": format!("Task '{task_id}' not found"),
+        }));
+    }
+
+    let blocked_dependents: Vec<String> = task.unwrap().blocks.iter().cloned().collect();
+
+    sup.task_queue_mut().fail(task_id);
+
+    Ok(json!({
+        "status": "ok",
+        "task_id": task_id,
+        "blocked_dependents": blocked_dependents,
+        "message": format!("Task '{task_id}' marked as failed. {} dependent task(s) will remain blocked.", blocked_dependents.len()),
+    }))
 }
 
 const SUMMARIZATION_PROMPT: &str = r#"You are a precise summarization assistant. Your job is to condense a sub-agent's output into a compact summary that preserves all actionable information.

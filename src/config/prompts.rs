@@ -32,6 +32,7 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     | `agent__task_create` | Create a task in the dependency-aware task queue. |
     | `agent__task_list` | List all tasks and their status/dependencies. |
     | `agent__task_complete` | Mark a task done; returns any newly unblocked tasks. Auto-dispatches agents for tasks with a designated agent. |
+    | `agent__task_fail` | Mark a task as failed. Dependents remain blocked. |
 
     ### Core Pattern: Spawn -> Continue -> Collect
 
