@@ -439,6 +439,10 @@ impl Agent {
         self.config.summarization_threshold
     }
 
+    pub fn escalation_timeout(&self) -> u64 {
+        self.config.escalation_timeout
+    }
+
     pub fn continuation_count(&self) -> usize {
         self.continuation_count
     }
@@ -655,6 +659,8 @@ pub struct AgentConfig {
     pub summarization_model: Option<String>,
     #[serde(default = "default_summarization_threshold")]
     pub summarization_threshold: usize,
+    #[serde(default = "default_escalation_timeout")]
+    pub escalation_timeout: u64,
 }
 
 fn default_max_auto_continues() -> usize {
@@ -675,6 +681,10 @@ fn default_true() -> bool {
 
 fn default_summarization_threshold() -> usize {
     4000
+}
+
+fn default_escalation_timeout() -> u64 {
+    300
 }
 
 impl AgentConfig {

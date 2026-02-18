@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 
 pub const USER_FUNCTION_PREFIX: &str = "user__";
 
-const ESCALATION_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_ESCALATION_TIMEOUT_SECS: u64 = 300;
 
 pub fn user_interaction_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
@@ -206,7 +206,7 @@ async fn handle_escalated(config: &GlobalConfig, action: &str, args: &Value) -> 
             .collect()
     });
 
-    let (from_agent_id, from_agent_name, root_queue) = {
+    let (from_agent_id, from_agent_name, root_queue, timeout_secs) = {
         let cfg = config.read();
         let agent_id = cfg
             .self_agent_id
@@ -221,7 +221,12 @@ async fn handle_escalated(config: &GlobalConfig, action: &str, args: &Value) -> 
             .root_escalation_queue
             .clone()
             .ok_or_else(|| anyhow!("No escalation queue available; cannot reach parent agent"))?;
-        (agent_id, agent_name, queue)
+        let timeout = cfg
+            .agent
+            .as_ref()
+            .map(|a| a.escalation_timeout())
+            .unwrap_or(DEFAULT_ESCALATION_TIMEOUT_SECS);
+        (agent_id, agent_name, queue, timeout)
     };
 
     let escalation_id = new_escalation_id();
@@ -238,7 +243,8 @@ async fn handle_escalated(config: &GlobalConfig, action: &str, args: &Value) -> 
 
     root_queue.submit(request);
 
-    match tokio::time::timeout(ESCALATION_TIMEOUT, rx).await {
+    let timeout = Duration::from_secs(timeout_secs);
+    match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(reply)) => Ok(json!({ "answer": reply })),
         Ok(Err(_)) => Ok(json!({
             "error": "Escalation was cancelled. The parent agent dropped the request",
@@ -246,8 +252,7 @@ async fn handle_escalated(config: &GlobalConfig, action: &str, args: &Value) -> 
         })),
         Err(_) => Ok(json!({
             "error": format!(
-                "Escalation timed out after {} seconds waiting for user response",
-                ESCALATION_TIMEOUT.as_secs()
+                "Escalation timed out after {timeout_secs} seconds waiting for user response"
             ),
             "fallback": "Make your best judgment and proceed",
         })),
