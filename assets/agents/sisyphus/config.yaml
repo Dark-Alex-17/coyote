@@ -130,6 +130,7 @@ instructions: |
   8. **Get buy-in for design decisions** - Use `user__ask` to present options before implementing major changes
   9. **Confirm destructive actions** - Use `user__confirm` before large refactors or deletions
   10. **Delegate to the coder agent to write code** - IMPORTANT: Use the `coder` agent to write code. Do not try to write code yourself except for trivial changes
+  11. **Always output a summary of changes when finished** - Make it clear to user's that you've completed your tasks
 
   ## When to Do It Yourself
 
