@@ -640,13 +640,13 @@ fn handle_send_message(config: &GlobalConfig, args: &Value) -> Result<Value> {
         .or_else(|| cfg.agent.as_ref().map(|a| a.name().to_string()))
         .unwrap_or_else(|| "parent".to_string());
 
-    // Try local supervisor first (parent → child routing)
+    // Try local supervisor first (parent -> child routing)
     let inbox = cfg
         .supervisor
         .as_ref()
         .and_then(|sup| sup.read().inbox(id).cloned());
 
-    // Fall back to parent_supervisor (sibling → sibling routing)
+    // Fall back to parent_supervisor (sibling -> sibling routing)
     let inbox = inbox.or_else(|| {
         cfg.parent_supervisor
             .as_ref()
