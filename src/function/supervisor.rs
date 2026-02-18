@@ -1,6 +1,7 @@
 use super::{FunctionDeclaration, JsonSchema};
 use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::{Config, GlobalConfig, Input, Role, RoleLike};
+use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
 use crate::utils::{AbortSignal, create_abort_signal};
@@ -16,6 +17,37 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub const SUPERVISOR_FUNCTION_PREFIX: &str = "agent__";
+
+pub fn escalation_function_declarations() -> Vec<FunctionDeclaration> {
+    vec![FunctionDeclaration {
+        name: format!("{SUPERVISOR_FUNCTION_PREFIX}reply_escalation"),
+        description: "Reply to a pending escalation from a child agent. The child is blocked waiting for this reply. Use this after seeing pending_escalations notifications.".to_string(),
+        parameters: JsonSchema {
+            type_value: Some("object".to_string()),
+            properties: Some(IndexMap::from([
+                (
+                    "escalation_id".to_string(),
+                    JsonSchema {
+                        type_value: Some("string".to_string()),
+                        description: Some("The escalation ID from the pending_escalations notification".into()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "reply".to_string(),
+                    JsonSchema {
+                        type_value: Some("string".to_string()),
+                        description: Some("Your answer to the child agent's question. For ask/confirm questions, use the exact option text. For input questions, provide the text response.".into()),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+            required: Some(vec!["escalation_id".to_string(), "reply".to_string()]),
+            ..Default::default()
+        },
+        agent: false,
+    }]
+}
 
 pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
@@ -285,6 +317,7 @@ pub async fn handle_supervisor_tool(
         "task_list" => handle_task_list(config),
         "task_complete" => handle_task_complete(config, args).await,
         "task_fail" => handle_task_fail(config, args),
+        "reply_escalation" => handle_reply_escalation(config, args),
         _ => bail!("Unknown supervisor action: {action}"),
     }
 }
@@ -376,6 +409,13 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
     }
 
     let child_inbox = Arc::new(Inbox::new());
+
+    {
+        let mut cfg = config.write();
+        if cfg.root_escalation_queue.is_none() {
+            cfg.root_escalation_queue = Some(Arc::new(EscalationQueue::new()));
+        }
+    }
 
     let child_config: GlobalConfig = {
         let mut child_cfg = config.read().clone();
@@ -660,6 +700,41 @@ fn handle_check_inbox(config: &GlobalConfig) -> Result<Value> {
         None => Ok(json!({
             "messages": [],
             "count": 0,
+        })),
+    }
+}
+
+fn handle_reply_escalation(config: &GlobalConfig, args: &Value) -> Result<Value> {
+    let escalation_id = args
+        .get("escalation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("'escalation_id' is required"))?;
+    let reply = args
+        .get("reply")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("'reply' is required"))?;
+
+    let queue = {
+        let cfg = config.read();
+        cfg.root_escalation_queue
+            .clone()
+            .ok_or_else(|| anyhow!("No escalation queue available"))?
+    };
+
+    match queue.take(escalation_id) {
+        Some(request) => {
+            let from_agent = request.from_agent_name.clone();
+            let question = request.question.clone();
+            let _ = request.reply_tx.send(reply.to_string());
+            Ok(json!({
+                "status": "ok",
+                "message": format!("Reply sent to agent '{from_agent}' for escalation '{escalation_id}'"),
+                "original_question": question,
+            }))
+        }
+        None => Ok(json!({
+            "status": "error",
+            "message": format!("No pending escalation found with id '{escalation_id}'. It may have already been replied to or timed out."),
         })),
     }
 }

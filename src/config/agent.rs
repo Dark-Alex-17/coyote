@@ -204,6 +204,7 @@ impl Agent {
         }
 
         functions.append_teammate_functions();
+        functions.append_user_interaction_functions();
 
         agent_config.replace_tools_placeholder(&functions);
 

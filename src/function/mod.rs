@@ -123,6 +123,31 @@ pub async fn eval_tool_calls(
     if is_all_null {
         output = vec![];
     }
+
+    if !output.is_empty() {
+        let (has_escalations, summary) = {
+            let cfg = config.read();
+            if cfg.current_depth == 0 && let Some(ref queue) = cfg.root_escalation_queue && queue.has_pending() {
+                (true, queue.pending_summary())
+            } else {
+                (false, vec![])
+            }
+        };
+
+        if has_escalations {
+            let notification = json!({
+                "pending_escalations": summary,
+                "instruction": "Child agents are BLOCKED waiting for your reply. Call agent__reply_escalation for each pending escalation to unblock them."
+            });
+            let synthetic_call = ToolCall::new(
+                "__escalation_notification".to_string(),
+                json!({}),
+                Some("escalation_check".to_string()),
+            );
+            output.push(ToolResult::new(synthetic_call, notification));
+        }
+    }
+
     Ok(output)
 }
 
@@ -276,6 +301,8 @@ impl Functions {
     pub fn append_supervisor_functions(&mut self) {
         self.declarations
             .extend(supervisor::supervisor_function_declarations());
+        self.declarations
+            .extend(supervisor::escalation_function_declarations());
     }
 
     pub fn append_teammate_functions(&mut self) {

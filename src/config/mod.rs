@@ -30,6 +30,7 @@ use crate::mcp::{
     MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpRegistry,
 };
 use crate::supervisor::Supervisor;
+use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::Inbox;
 use crate::vault::{GlobalVault, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
@@ -220,6 +221,8 @@ pub struct Config {
     pub current_depth: usize,
     #[serde(skip)]
     pub inbox: Option<Arc<Inbox>>,
+    #[serde(skip)]
+    pub root_escalation_queue: Option<Arc<EscalationQueue>>,
 }
 
 impl Default for Config {
@@ -298,6 +301,7 @@ impl Default for Config {
             self_agent_id: None,
             current_depth: 0,
             inbox: None,
+            root_escalation_queue: None,
         }
     }
 }

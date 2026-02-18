@@ -1,3 +1,4 @@
+pub mod escalation;
 pub mod mailbox;
 pub mod taskqueue;
 

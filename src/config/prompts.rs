@@ -85,6 +85,21 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     # If dependents have --agent set, they auto-dispatch
     agent__task_complete --task_id task_1
     ```
+
+    ### Escalation Handling
+
+    Child agents may need user input but cannot prompt the user directly. When this happens,
+    you will see `pending_escalations` in your tool results listing blocked children and their questions.
+
+    | Tool | Purpose |
+    |------|----------|
+    | `agent__reply_escalation` | Unblock a child agent by answering its escalated question. |
+
+    When you see a pending escalation:
+    1. Read the child's question and options.
+    2. If you can answer from context, call `agent__reply_escalation` with your answer.
+    3. If you need the user's input, call the appropriate `user__*` tool yourself, then relay the answer via `agent__reply_escalation`.
+    4. **Respond promptly**; the child agent is blocked and waiting (5-minute timeout).
 "};
 
 pub(in crate::config) const DEFAULT_TEAMMATE_INSTRUCTIONS: &str = indoc! {"
