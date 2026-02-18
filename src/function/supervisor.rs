@@ -128,6 +128,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             description: "List all currently running subagents and their status.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
+                properties: Some(IndexMap::new()),
                 ..Default::default()
             },
             agent: false,
@@ -211,6 +212,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             description: "List all tasks in the task queue with their status and dependencies.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
+                properties: Some(IndexMap::new()),
                 ..Default::default()
             },
             agent: false,
@@ -289,6 +291,7 @@ pub fn teammate_function_declarations() -> Vec<FunctionDeclaration> {
             description: "Check for and drain all pending messages in your inbox from sibling agents or your parent.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
+                properties: Some(IndexMap::new()),
                 ..Default::default()
             },
             agent: false,

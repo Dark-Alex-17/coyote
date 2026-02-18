@@ -71,6 +71,7 @@ pub fn todo_function_declarations() -> Vec<FunctionDeclaration> {
             description: "Display the current todo list with status of each item.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
+                properties: Some(IndexMap::new()),
                 ..Default::default()
             },
             agent: false,
