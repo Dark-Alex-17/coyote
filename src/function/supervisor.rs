@@ -305,6 +305,10 @@ fn run_child_agent(
             input = input.merge_tool_results(output, tool_results);
         }
 
+        if let Some(ref supervisor) = child_config.read().supervisor {
+            supervisor.read().cancel_all();
+        }
+
         Ok(accumulated_output)
     })
 }

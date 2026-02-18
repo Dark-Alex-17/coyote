@@ -1,10 +1,10 @@
 mod agent;
 mod input;
 mod macros;
+mod prompts;
 mod role;
 mod session;
 pub(crate) mod todo;
-mod prompts;
 
 pub use self::agent::{Agent, AgentVariables, complete_agent_variables, list_agents};
 pub use self::input::Input;
@@ -1898,6 +1898,10 @@ impl Config {
         self.exit_session()?;
         self.load_functions()?;
         if self.agent.take().is_some() {
+            if let Some(ref supervisor) = self.supervisor {
+                supervisor.read().cancel_all();
+            }
+            self.supervisor.take();
             self.rag.take();
             self.discontinuous_last_message();
         }
