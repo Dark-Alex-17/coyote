@@ -1,5 +1,6 @@
 pub(crate) mod supervisor;
 pub(crate) mod todo;
+pub(crate) mod user_interaction;
 
 use crate::{
     config::{Agent, Config, GlobalConfig},
@@ -31,6 +32,7 @@ use std::{
 use strum_macros::AsRefStr;
 use supervisor::SUPERVISOR_FUNCTION_PREFIX;
 use todo::TODO_FUNCTION_PREFIX;
+use user_interaction::USER_FUNCTION_PREFIX;
 
 #[derive(Embed)]
 #[folder = "assets/functions/"]
@@ -279,6 +281,11 @@ impl Functions {
     pub fn append_teammate_functions(&mut self) {
         self.declarations
             .extend(supervisor::teammate_function_declarations());
+    }
+
+    pub fn append_user_interaction_functions(&mut self) {
+        self.declarations
+            .extend(user_interaction::user_interaction_function_declarations());
     }
 
     pub fn clear_mcp_meta_functions(&mut self) {
@@ -903,6 +910,15 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("Supervisor tool failed: {e}");
+                        eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        json!({"tool_call_error": error_msg})
+                    })
+            }
+            _ if cmd_name.starts_with(USER_FUNCTION_PREFIX) => {
+                user_interaction::handle_user_tool(config, &cmd_name, &json_data)
+                    .await
+                    .unwrap_or_else(|e| {
+                        let error_msg = format!("User interaction failed: {e}");
                         eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
                         json!({"tool_call_error": error_msg})
                     })

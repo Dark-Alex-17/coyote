@@ -8,6 +8,7 @@ use crate::{
 
 use crate::config::prompts::{
     DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS, DEFAULT_TODO_INSTRUCTIONS,
+    DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
 use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
@@ -345,6 +346,7 @@ impl Agent {
         }
 
         output.push_str(DEFAULT_TEAMMATE_INSTRUCTIONS);
+        output.push_str(DEFAULT_USER_INTERACTION_INSTRUCTIONS);
 
         self.interpolate_text(&output)
     }

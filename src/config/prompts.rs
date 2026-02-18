@@ -99,3 +99,16 @@ pub(in crate::config) const DEFAULT_TEAMMATE_INSTRUCTIONS: &str = indoc! {"
         - **Send messages** to teammates when you discover something that affects their work.
         - Messages are delivered to the agent's inbox and read on their next `check_inbox` call."
 };
+
+pub(in crate::config) const DEFAULT_USER_INTERACTION_INSTRUCTIONS: &str = indoc! {"
+    ## User Interaction
+
+    You have built-in tools to interact with the user directly:
+        - `user__ask --question \"...\" --options [\"A\", \"B\", \"C\"]`: Present a selection prompt. Returns the chosen option.
+        - `user__confirm --question \"...\"`: Ask a yes/no question. Returns \"yes\" or \"no\".
+        - `user__input --question \"...\"`: Request free-form text input from the user.
+        - `user__checkbox --question \"...\" --options [\"A\", \"B\", \"C\"]`: Multi-select prompt. Returns an array of selected options.
+
+    Use these tools when you need user decisions, preferences, or clarification.
+    If you are running as a subagent, these questions are automatically escalated to the root agent for resolution."
+};
