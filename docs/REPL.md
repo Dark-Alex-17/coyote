@@ -50,6 +50,9 @@ things like
 * **Configurable Keybindings:** You can switch between `emacs` style keybindings or `vi` style keybindings
 * [**Custom REPL Prompt:**](./REPL-PROMPT.md) You can even customize the REPL prompt to display information about the 
   current context in the prompt
+* **Built-in user interaction tools:** When function calling is enabled in the REPL, the `user__ask`, `user__confirm`,
+  `user__input`, and `user__checkbox` tools are always available for interactive prompts. These are not injected in the
+  one-shot CLI mode.
 
 ---
 

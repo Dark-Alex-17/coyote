@@ -24,6 +24,16 @@ auto_continue: false             # Enable automatic continuation when incomplete
 max_auto_continues: 10           # Maximum number of automatic continuations before stopping
 inject_todo_instructions: true   # Inject the default todo tool usage instructions into the agent's system prompt
 continuation_prompt: null        # Custom prompt used when auto-continuing (optional; uses default if null)
+# Sub-Agent Spawning System
+# Enable this agent to spawn and manage child agents in parallel.
+# See docs/AGENTS.md for detailed documentation.
+can_spawn_agents: false          # Enable the agent to spawn child agents
+max_concurrent_agents: 4         # Maximum number of agents that can run simultaneously
+max_agent_depth: 3               # Maximum nesting depth for sub-agents (prevents runaway spawning)
+inject_spawn_instructions: true  # Inject the default agent spawning instructions into the agent's system prompt
+summarization_model: null        # Model to use for summarizing sub-agent output (e.g. 'openai:gpt-4o-mini'); defaults to current model
+summarization_threshold: 4000   # Character threshold above which sub-agent output is summarized before returning to parent
+escalation_timeout: 300          # Seconds a sub-agent waits for a user interaction response before timing out (default: 5 minutes)
 mcp_servers:                     # Optional list of MCP servers that the agent utilizes
   - github                       # Corresponds to the name of an MCP server in the `<loki-config-dir>/functions/mcp.json` file
 global_tools:                    # Optional list of additional global tools to enable for the agent; i.e. not tools specific to the agent

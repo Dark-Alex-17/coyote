@@ -35,6 +35,18 @@ If you're looking for more example agents, refer to the [built-in agents](../ass
   - [Bash-Based Agent Tools](#bash-based-agent-tools)
 - [5. Conversation Starters](#5-conversation-starters)
 - [6. Todo System & Auto-Continuation](#6-todo-system--auto-continuation)
+- [7. Sub-Agent Spawning System](#7-sub-agent-spawning-system)
+  - [Configuration](#spawning-configuration)
+  - [Spawning & Collecting Agents](#spawning--collecting-agents)
+  - [Task Queue with Dependencies](#task-queue-with-dependencies)
+  - [Active Task Dispatch](#active-task-dispatch)
+  - [Output Summarization](#output-summarization)
+  - [Teammate Messaging](#teammate-messaging)
+  - [Runaway Safeguards](#runaway-safeguards)
+- [8. User Interaction Tools](#8-user-interaction-tools)
+  - [Available Tools](#user-interaction-available-tools)
+  - [Escalation (Sub-Agent to User)](#escalation-sub-agent-to-user)
+- [9. Auto-Injected Prompts](#9-auto-injected-prompts)
 - [Built-In Agents](#built-in-agents)
 <!--toc:end-->
 
@@ -87,6 +99,14 @@ auto_continue: false                 # Enable automatic continuation when incomp
 max_auto_continues: 10               # Maximum continuation attempts before stopping
 inject_todo_instructions: true       # Inject todo tool instructions into system prompt
 continuation_prompt: null            # Custom prompt for continuations (optional)
+# Sub-Agent Spawning (see "Sub-Agent Spawning System" section below)
+can_spawn_agents: false              # Enable spawning child agents
+max_concurrent_agents: 4             # Max simultaneous child agents
+max_agent_depth: 3                   # Max nesting depth (prevents runaway)
+inject_spawn_instructions: true      # Inject spawning instructions into system prompt
+summarization_model: null            # Model for summarizing sub-agent output (e.g. 'openai:gpt-4o-mini')
+summarization_threshold: 4000        # Char count above which sub-agent output is summarized
+escalation_timeout: 300              # Seconds sub-agents wait for escalated user input (default: 5 min)
 ```
 
 As mentioned previously: Agents utilize function calling to extend a model's capabilities. However, agents operate in 
@@ -471,13 +491,230 @@ inject_todo_instructions: true   # Include the default todo instructions into pr
 For complete documentation including all configuration options, tool details, and best practices, see the
 [Todo System Guide](./TODO-SYSTEM.md).
 
+## 7. Sub-Agent Spawning System
+
+Loki agents can spawn and manage child agents that run **in parallel** as background tasks inside the same process.
+This enables orchestrator-style agents that delegate specialized work to other agents, similar to how tools like
+Claude Code or OpenCode handle complex multi-step tasks.
+
+For a working example of an orchestrator agent that uses sub-agent spawning, see the built-in
+[sisyphus](../assets/agents/sisyphus) agent. For an example of the teammate messaging pattern with parallel sub-agents, 
+see the [code-reviewer](../assets/agents/code-reviewer) agent.
+
+### Spawning Configuration
+
+| Setting                     | Type    | Default       | Description                                                                    |
+|-----------------------------|---------|---------------|--------------------------------------------------------------------------------|
+| `can_spawn_agents`          | boolean | `false`       | Enable this agent to spawn child agents                                        |
+| `max_concurrent_agents`     | integer | `4`           | Maximum number of child agents that can run simultaneously                     |
+| `max_agent_depth`           | integer | `3`           | Maximum nesting depth for sub-agents (prevents runaway spawning chains)        |
+| `inject_spawn_instructions` | boolean | `true`        | Inject the default spawning instructions into the agent's system prompt        |
+| `summarization_model`       | string  | current model | Model to use for summarizing long sub-agent output (e.g. `openai:gpt-4o-mini`) |
+| `summarization_threshold`   | integer | `4000`        | Character count above which sub-agent output is summarized before returning    |
+| `escalation_timeout`        | integer | `300`         | Seconds a sub-agent waits for an escalated user interaction response           |
+
+**Example configuration:**
+```yaml
+# agents/my-orchestrator/config.yaml
+can_spawn_agents: true
+max_concurrent_agents: 6
+max_agent_depth: 2
+inject_spawn_instructions: true
+summarization_model: openai:gpt-4o-mini
+summarization_threshold: 3000
+escalation_timeout: 600
+```
+
+### Spawning & Collecting Agents
+
+When `can_spawn_agents` is enabled, the agent receives tools for spawning and managing child agents:
+
+| Tool             | Description                                                             |
+|------------------|-------------------------------------------------------------------------|
+| `agent__spawn`   | Spawn a child agent in the background. Returns an agent ID immediately. |
+| `agent__check`   | Non-blocking check: is the agent done? Returns `PENDING` or the result. |
+| `agent__collect` | Blocking wait: wait for an agent to finish, return its output.          |
+| `agent__list`    | List all spawned agents and their status.                               |
+| `agent__cancel`  | Cancel a running agent by ID.                                           |
+
+The core pattern is **Spawn -> Continue -> Collect**:
+
+```
+# 1. Spawn agents in parallel (returns IDs immediately)
+agent__spawn --agent explore --prompt "Find auth middleware patterns in src/"
+agent__spawn --agent explore --prompt "Find error handling patterns in src/"
+
+# 2. Continue your own work while they run
+
+# 3. Check if done (non-blocking)
+agent__check --id agent_explore_a1b2c3d4
+
+# 4. Collect results when ready (blocking)
+agent__collect --id agent_explore_a1b2c3d4
+agent__collect --id agent_explore_e5f6g7h8
+```
+
+Any agent defined in your `<loki-config-dir>/agents/` directory can be spawned as a child. Child agents:
+- Run in a fully isolated environment (separate session, config, and tools)
+- Have their output suppressed from the terminal (no spinner, no tool call logging)
+- Return their accumulated output to the parent when collected
+
+### Task Queue with Dependencies
+
+For complex workflows where tasks have ordering requirements, the spawning system includes a dependency-aware
+task queue:
+
+| Tool                   | Description                                                                 |
+|------------------------|-----------------------------------------------------------------------------|
+| `agent__task_create`   | Create a task with optional dependencies and auto-dispatch agent.           |
+| `agent__task_list`     | List all tasks with their status, dependencies, and assignments.            |
+| `agent__task_complete` | Mark a task done. Returns newly unblocked tasks and auto-dispatches agents. |
+| `agent__task_fail`     | Mark a task as failed. Dependents remain blocked.                           |
+
+```
+# Create tasks with dependency ordering
+agent__task_create --subject "Explore existing patterns"
+agent__task_create --subject "Implement feature" --blocked_by ["task_1"]
+agent__task_create --subject "Write tests" --blocked_by ["task_2"]
+
+# Mark tasks complete to unblock dependents
+agent__task_complete --task_id task_1
+```
+
+### Active Task Dispatch
+
+Tasks can optionally specify an agent to auto-spawn when the task becomes runnable:
+
+```
+agent__task_create \
+  --subject "Implement the auth module" \
+  --blocked_by ["task_1"] \
+  --agent coder \
+  --prompt "Implement auth module based on patterns found in task_1"
+```
+
+When `task_1` completes and the dependent task becomes unblocked, an agent is automatically spawned with the
+specified prompt. No manual intervention needed. This enables fully automated multi-step pipelines.
+
+### Output Summarization
+
+When a child agent produces long output, it can be automatically summarized before returning to the parent.
+This keeps parent context windows manageable.
+
+- If the output exceeds `summarization_threshold` characters (default: 4000), it is sent through an LLM
+  summarization pass
+- The `summarization_model` setting lets you use a cheaper/faster model for summarization (e.g. `gpt-4o-mini`)
+- If `summarization_model` is not set, the parent's current model is used
+- The summarization preserves all actionable information: code snippets, file paths, error messages, and
+  concrete recommendations
+
+### Teammate Messaging
+
+All agents (including children) automatically receive tools for **direct sibling-to-sibling messaging**:
+
+| Tool                  | Description                                         |
+|-----------------------|-----------------------------------------------------|
+| `agent__send_message` | Send a text message to another agent's inbox by ID. |
+| `agent__check_inbox`  | Drain all pending messages from your inbox.         |
+
+This enables coordination patterns where child agents share cross-cutting findings:
+
+```
+# Agent A discovers something relevant to Agent B
+agent__send_message --id agent_reviewer_b1c2d3e4 --message "Found a security issue in auth.rs line 42"
+
+# Agent B checks inbox before finalizing
+agent__check_inbox
+```
+
+Messages are routed through the parent's supervisor. A parent can message its children, and children can message
+their siblings. For a working example of the teammate pattern, see the built-in
+[code-reviewer](../assets/agents/code-reviewer) agent, which spawns file-specific reviewers that share
+cross-cutting findings with each other.
+
+### Runaway Safeguards
+
+The spawning system includes built-in safeguards to prevent runaway agent chains:
+
+- **`max_concurrent_agents`:** Caps how many agents can run at once (default: 4). Spawn attempts beyond this
+  limit return an error asking the agent to wait or cancel existing agents.
+- **`max_agent_depth`:** Caps nesting depth (default: 3). A child agent spawning its own child increments the
+  depth counter. Attempts beyond the limit are rejected.
+- **`can_spawn_agents`:** Only agents with this flag set to `true` can spawn children. By default, spawning is
+  disabled. This means child agents cannot spawn their own children unless you explicitly create them with
+  `can_spawn_agents: true` in their config.
+
+## 8. User Interaction Tools
+
+Loki includes built-in tools for agents (and the REPL) to interactively prompt the user for input. These tools
+are **always available**. No configuration needed. They are automatically injected into every agent and into
+REPL mode when function calling is enabled.
+
+### User Interaction Available Tools
+
+| Tool             | Description                             | Returns                          |
+|------------------|-----------------------------------------|----------------------------------|
+| `user__ask`      | Present a single-select list of options | The selected option string       |
+| `user__confirm`  | Ask a yes/no question                   | `"yes"` or `"no"`                |
+| `user__input`    | Request free-form text input            | The text entered by the user     |
+| `user__checkbox` | Present a multi-select checkbox list    | Array of selected option strings |
+
+**Parameters:**
+
+- `user__ask`: `--question "..." --options ["Option A", "Option B", "Option C"]`
+- `user__confirm`: `--question "..."`
+- `user__input`: `--question "..."`
+- `user__checkbox`: `--question "..." --options ["Option A", "Option B", "Option C"]`
+
+At the top level (depth 0), these tools render interactive terminal prompts directly using arrow-key navigation,
+checkboxes, and text input fields.
+
+### Escalation (Sub-Agent to User)
+
+When a **child agent** (depth > 0) calls a `user__*` tool, it cannot prompt the terminal directly. Instead,
+the request is **automatically escalated** to the root agent:
+
+1. The child agent calls `user__ask(...)` and **blocks**, waiting for a reply
+2. The root agent sees a `pending_escalations` notification in its next tool results
+3. The root agent either answers from context or prompts the user itself, then calls
+   `agent__reply_escalation` to unblock the child
+4. The child receives the reply and continues
+
+The escalation timeout is configurable via `escalation_timeout` in the agent's `config.yaml` (default: 300
+seconds / 5 minutes). If the timeout expires, the child receives a fallback message asking it to use its
+best judgment.
+
+| Tool                      | Description                                                              |
+|---------------------------|--------------------------------------------------------------------------|
+| `agent__reply_escalation` | Reply to a pending child escalation, unblocking the waiting child agent. |
+
+This tool is automatically available to any agent with `can_spawn_agents: true`.
+
+## 9. Auto-Injected Prompts
+
+Loki automatically appends usage instructions to your agent's system prompt for each enabled built-in system.
+These instructions are injected into both **static and dynamic instructions** after your own instructions,
+ensuring agents always know how to use their available tools.
+
+| System             | Injected When                                                  | Toggle                      |
+|--------------------|----------------------------------------------------------------|-----------------------------|
+| Todo tools         | `auto_continue: true` AND `inject_todo_instructions: true`     | `inject_todo_instructions`  |
+| Spawning tools     | `can_spawn_agents: true` AND `inject_spawn_instructions: true` | `inject_spawn_instructions` |
+| Teammate messaging | Always (all agents)                                            | None (always injected)      |
+| User interaction   | Always (all agents)                                            | None (always injected)      |
+
+If you prefer to write your own instructions for a system, set the corresponding `inject_*` flag to `false`
+and include your custom instructions in the agent's `instructions` field. The built-in tools will still be
+available; only the auto-injected prompt text is suppressed.
+
 ## Built-In Agents
 Loki comes packaged with some useful built-in agents:
 
 * `coder`: An agent to assist you with all your coding tasks
+* `code-reviewer`: A [CodeRabbit](https://coderabbit.ai)-style code reviewer that spawns per-file reviewers using the teammate messaging pattern
 * `demo`: An example agent to use for reference when learning to create your own agents
 * `explore`: An agent designed to help you explore and understand your codebase
 * `jira-helper`: An agent that assists you with all your Jira-related tasks
 * `oracle`: An agent for high-level architecture, design decisions, and complex debugging
-* `sisyphus`: A powerhouse agent for writing complex code and acting as a natural language interface for your codebase (similar to ClaudeCode, Gemini CLI, Codex, or OpenCode)
+* `sisyphus`: A powerhouse orchestrator agent for writing complex code and acting as a natural language interface for your codebase (similar to ClaudeCode, Gemini CLI, Codex, or OpenCode). Uses sub-agent spawning to delegate to `explore`, `coder`, and `oracle`.
 * `sql`: A universal SQL agent that enables you to talk to any relational database in natural language

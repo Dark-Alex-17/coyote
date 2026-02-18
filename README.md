@@ -35,7 +35,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [RAG](./docs/RAG.md): Retrieval-Augmented Generation for enhanced information retrieval and generation.
 * [Sessions](/docs/SESSIONS.md): Manage and persist conversational contexts and settings across multiple interactions.
 * [Roles](./docs/ROLES.md): Customize model behavior for specific tasks or domains.
-* [Agents](/docs/AGENTS.md): Leverage AI agents to perform complex tasks and workflows.
+* [Agents](/docs/AGENTS.md): Leverage AI agents to perform complex tasks and workflows, including sub-agent spawning, teammate messaging, and user interaction tools.
     * [Todo System](./docs/TODO-SYSTEM.md): Built-in task tracking for improved agent reliability with smaller models.
 * [Environment Variables](./docs/ENVIRONMENT-VARIABLES.md): Override and customize your Loki configuration at runtime with environment variables.
 * [Client Configurations](./docs/clients/CLIENTS.md): Configuration instructions for various LLM providers.
