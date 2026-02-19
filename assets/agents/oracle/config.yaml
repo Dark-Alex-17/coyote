@@ -14,7 +14,6 @@ global_tools:
   - fs_grep.sh
   - fs_glob.sh
   - fs_ls.sh
-  - execute_command.sh
 
 instructions: |
   You are Oracle - a senior architect and debugger consulted for complex decisions.
