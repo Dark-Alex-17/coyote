@@ -4,7 +4,7 @@ version: 2.0.0
 temperature: 0.1
 top_p: 0.95
 
-agent_session: sisyphus
+agent_session: temp
 auto_continue: true
 max_auto_continues: 25
 inject_todo_instructions: true
