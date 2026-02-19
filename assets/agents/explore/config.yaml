@@ -14,6 +14,7 @@ global_tools:
   - fs_grep.sh
   - fs_glob.sh
   - fs_ls.sh
+  - web_search_loki.sh
 
 instructions: |
   You are a codebase explorer. Your job: Search, find, report. Nothing else.
