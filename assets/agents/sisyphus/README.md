@@ -35,7 +35,7 @@ global_tools:
   - fs_glob.sh
   - fs_ls.sh
   - web_search_loki.sh
-  # - execute_command.sh
+  - execute_command.sh
 
 # ...
 ```
