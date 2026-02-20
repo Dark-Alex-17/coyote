@@ -1064,7 +1064,7 @@ impl ToolCall {
                         function_name.clone(),
                         function_name,
                         vec![],
-                        Default::default(),
+                        agent.variable_envs(),
                     ))
                 }
             }
