@@ -197,7 +197,8 @@ impl McpRegistry {
         }
 
         let desired_ids = self.resolve_server_ids(enabled_mcp_servers);
-        let ids_to_start: Vec<String> = desired_ids.into_iter()
+        let ids_to_start: Vec<String> = desired_ids
+            .into_iter()
             .filter(|id| !self.servers.contains_key(id))
             .collect();
 
@@ -301,18 +302,20 @@ impl McpRegistry {
 
     fn resolve_server_ids(&self, enabled_mcp_servers: Option<String>) -> Vec<String> {
         if let Some(config) = &self.config
-             && let Some(servers) = enabled_mcp_servers {
-                if servers == "all" {
-                    config.mcp_servers.keys().cloned().collect()
-                } else {
-                    let enabled_servers: HashSet<String> =
-                        servers.split(',').map(|s| s.trim().to_string()).collect();
-                    config.mcp_servers
-                        .keys()
-                        .filter(|id| enabled_servers.contains(*id))
-                        .cloned()
-                        .collect()
-                }
+            && let Some(servers) = enabled_mcp_servers
+        {
+            if servers == "all" {
+                config.mcp_servers.keys().cloned().collect()
+            } else {
+                let enabled_servers: HashSet<String> =
+                    servers.split(',').map(|s| s.trim().to_string()).collect();
+                config
+                    .mcp_servers
+                    .keys()
+                    .filter(|id| enabled_servers.contains(*id))
+                    .cloned()
+                    .collect()
+            }
         } else {
             vec![]
         }
@@ -330,7 +333,9 @@ impl McpRegistry {
             if let Some(server) = self.servers.remove(&id) {
                 match Arc::try_unwrap(server) {
                     Ok(server_inner) => {
-                        server_inner.cancel().await
+                        server_inner
+                            .cancel()
+                            .await
                             .with_context(|| format!("Failed to stop MCP server: {id}"))?;
                         info!("Stopped MCP server: {id}");
                     }

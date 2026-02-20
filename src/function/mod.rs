@@ -1121,12 +1121,12 @@ pub fn run_llm_function(
     envs.insert("FORCE_COLOR".into(), "1".into());
 
     let mut child = Command::new(&cmd_name)
-      .args(&cmd_args)
-      .envs(envs)
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .spawn()
-      .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
+        .args(&cmd_args)
+        .envs(envs)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
 
     let stdout = child.stdout.take().expect("Failed to capture stdout");
     let mut stderr = child.stderr.take().expect("Failed to capture stderr");
@@ -1136,7 +1136,9 @@ pub fn run_llm_function(
         let mut reader = stdout;
         let mut out = io::stdout();
         while let Ok(n) = reader.read(&mut buffer) {
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             let chunk = &buffer[0..n];
             let mut last_pos = 0;
             for (i, &byte) in chunk.iter().enumerate() {
@@ -1159,7 +1161,9 @@ pub fn run_llm_function(
         buf
     });
 
-    let status = child.wait().map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
+    let status = child
+        .wait()
+        .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
     let _ = stdout_thread.join();
     let stderr_bytes = stderr_thread.join().unwrap_or_default();
 
