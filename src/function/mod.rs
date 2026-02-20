@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::{
     collections::{HashMap, HashSet},
     env, fs, io,
@@ -1117,18 +1117,55 @@ pub fn run_llm_function(
     #[cfg(windows)]
     let cmd_name = polyfill_cmd_name(&cmd_name, &bin_dirs);
 
-    let output = Command::new(&cmd_name)
-        .args(&cmd_args)
-        .envs(envs)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|child| child.wait_with_output())
-        .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
+    envs.insert("CLICOLOR_FORCE".into(), "1".into());
+    envs.insert("FORCE_COLOR".into(), "1".into());
 
-    let exit_code = output.status.code().unwrap_or_default();
+    let mut child = Command::new(&cmd_name)
+      .args(&cmd_args)
+      .envs(envs)
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .spawn()
+      .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
+
+    let stdout = child.stdout.take().expect("Failed to capture stdout");
+    let mut stderr = child.stderr.take().expect("Failed to capture stderr");
+
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buffer = [0; 1024];
+        let mut reader = stdout;
+        let mut out = io::stdout();
+        while let Ok(n) = reader.read(&mut buffer) {
+            if n == 0 { break; }
+            let chunk = &buffer[0..n];
+            let mut last_pos = 0;
+            for (i, &byte) in chunk.iter().enumerate() {
+                if byte == b'\n' {
+                    let _ = out.write_all(&chunk[last_pos..i]);
+                    let _ = out.write_all(b"\r\n");
+                    last_pos = i + 1;
+                }
+            }
+            if last_pos < n {
+                let _ = out.write_all(&chunk[last_pos..n]);
+            }
+            let _ = out.flush();
+        }
+    });
+
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    let status = child.wait().map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
+    let _ = stdout_thread.join();
+    let stderr_bytes = stderr_thread.join().unwrap_or_default();
+
+    let exit_code = status.code().unwrap_or_default();
     if exit_code != 0 {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
         if !stderr.is_empty() {
             eprintln!("{stderr}");
         }
