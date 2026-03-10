@@ -2,7 +2,6 @@ name: explore
 description: Fast codebase exploration agent - finds patterns, structures, and relevant files
 version: 1.0.0
 temperature: 0.1
-top_p: 0.95
 
 variables:
   - name: project_dir

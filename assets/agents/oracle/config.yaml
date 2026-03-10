@@ -2,7 +2,6 @@ name: oracle
 description: High-IQ advisor for architecture, debugging, and complex decisions
 version: 1.0.0
 temperature: 0.2
-top_p: 0.95
 
 variables:
   - name: project_dir

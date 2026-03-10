@@ -2,7 +2,6 @@ name: coder
 description: Implementation agent - writes code, follows patterns, verifies with builds
 version: 1.0.0
 temperature: 0.1
-top_p: 0.95
 
 auto_continue: true
 max_auto_continues: 15
