@@ -6,7 +6,6 @@ use gman::providers::local::LocalProvider;
 use indoc::formatdoc;
 use inquire::validator::Validation;
 use inquire::{Confirm, Password, PasswordDisplayMode, Text, min_length, required};
-use std::borrow::Cow;
 use std::path::PathBuf;
 
 pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> Result<()> {
@@ -166,18 +165,30 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
     Ok(())
 }
 
-pub fn interpolate_secrets<'a>(content: &'a str, vault: &Vault) -> (Cow<'a, str>, Vec<String>) {
+pub fn interpolate_secrets(content: &str, vault: &Vault) -> (String, Vec<String>) {
     let mut missing_secrets = vec![];
-    let parsed_content = SECRET_RE.replace_all(content, |caps: &fancy_regex::Captures<'_>| {
-        let secret = vault.get_secret(caps[1].trim(), false);
-        match secret {
-            Ok(s) => s,
-            Err(_) => {
-                missing_secrets.push(caps[1].to_string());
-                "".to_string()
+    let parsed_content: String = content
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with('#') {
+                return line.to_string();
             }
-        }
-    });
+
+            SECRET_RE
+                .replace_all(line, |caps: &fancy_regex::Captures<'_>| {
+                    let secret = vault.get_secret(caps[1].trim(), false);
+                    match secret {
+                        Ok(s) => s,
+                        Err(_) => {
+                            missing_secrets.push(caps[1].to_string());
+                            "".to_string()
+                        }
+                    }
+                })
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     (parsed_content, missing_secrets)
 }
