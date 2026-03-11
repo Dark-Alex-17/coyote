@@ -27,13 +27,17 @@ pub struct ClaudeConfig {
 impl ClaudeClient {
     config_get_fn!(api_key, get_api_key);
     config_get_fn!(api_base, get_api_base);
-    
+
     create_oauth_supported_client_config!();
 }
 
 #[async_trait::async_trait]
 impl Client for ClaudeClient {
     client_common_fns!();
+
+    fn supports_oauth(&self) -> bool {
+        self.config.auth.as_deref() == Some("oauth")
+    }
 
     async fn chat_completions_inner(
         &self,

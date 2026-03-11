@@ -166,6 +166,7 @@ clients:
 
 ```sh
 loki --authenticate my-claude-oauth
+# Or via the REPL: .authenticate
 ```
 
 For full details, see the [authentication documentation](./docs/clients/CLIENTS.md#authentication).

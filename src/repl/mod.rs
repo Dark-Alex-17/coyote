@@ -6,7 +6,7 @@ use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
-use crate::client::{call_chat_completions, call_chat_completions_streaming};
+use crate::client::{call_chat_completions, call_chat_completions_streaming, init_client, oauth};
 use crate::config::{
     AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage, StateFlags,
     macro_execute,
@@ -17,6 +17,7 @@ use crate::utils::{
 };
 
 use crate::mcp::McpRegistry;
+use crate::resolve_oauth_client;
 use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
@@ -32,10 +33,15 @@ use std::{env, mem, process};
 
 const MENU_NAME: &str = "completion_menu";
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 38]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
+        ReplCommand::new(
+            ".authenticate",
+            "Authenticate the current model client via OAuth (if configured)",
+            AssertState::pass(),
+        ),
         ReplCommand::new(
             ".edit config",
             "Modify configuration file",
@@ -421,6 +427,18 @@ pub async fn run_repl_command(
                 }
                 None => println!("Usage: .model <name>"),
             },
+            ".authenticate" => {
+                let client = init_client(config, None)?;
+                if !client.supports_oauth() {
+                    bail!(
+                        "Client '{}' doesn't either support OAuth or isn't configured to use it (i.e. uses an API key instead)",
+                        client.name()
+                    );
+                }
+                let clients = config.read().clients.clone();
+                let (client_name, provider) = resolve_oauth_client(Some(client.name()), &clients)?;
+                oauth::run_oauth_flow(&provider, &client_name).await?;
+            }
             ".prompt" => match args {
                 Some(text) => {
                     config.write().use_prompt(text)?;

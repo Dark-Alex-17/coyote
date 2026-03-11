@@ -47,6 +47,10 @@ pub trait Client: Sync + Send {
 
     fn model(&self) -> &Model;
 
+    fn supports_oauth(&self) -> bool {
+        false
+    }
+
     fn build_client(&self) -> Result<ReqwestClient> {
         let mut builder = ReqwestClient::builder();
         let extra = self.extra_config();

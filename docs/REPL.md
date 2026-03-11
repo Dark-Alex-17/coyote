@@ -23,6 +23,7 @@ You can enter the REPL by simply typing `loki` without any follow-up flags or ar
     - [`.edit` - Modify configuration files](#edit---modify-configuration-files)
     - [`.delete` - Delete configurations from Loki](#delete---delete-configurations-from-loki)
     - [`.info` - Display information about the current mode](#info---display-information-about-the-current-mode)
+    - [`.authenticate` - Authenticate the current model client via OAuth](#authenticate---authenticate-the-current-model-client-via-oauth)
     - [`.exit` - Exit an agent/role/session/rag or the Loki REPL itself](#exit---exit-an-agentrolesessionrag-or-the-loki-repl-itself)
     - [`.help` - Show the help guide](#help---show-the-help-guide)
 <!--toc:end-->
@@ -236,6 +237,11 @@ The following entities are supported:
 | `.info session` | Display information about the active session                |
 | `.info agent`   | Display information about the active agent                  |
 | `.info rag`     | Display information about the active RAG                    |
+
+### `.authenticate` - Authenticate the current model client via OAuth
+The `.authenticate` command will start the OAuth flow for the current model client if
+* The client supports OAuth (See the [clients documentation](./clients/CLIENTS.md#providers-that-support-oauth) for supported clients)
+* The client is configured in your Loki configuration to use OAuth via the `auth: oauth` property
 
 ### `.exit` - Exit an agent/role/session/rag or the Loki REPL itself
 The `.exit` command is used to move between modes in the Loki REPL.

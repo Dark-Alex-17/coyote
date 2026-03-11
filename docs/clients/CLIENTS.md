@@ -129,14 +129,16 @@ Run the `--authenticate` flag with the client name:
 loki --authenticate my-claude-oauth
 ```
 
-This opens your browser for the OAuth authorization flow. After authorizing, paste the authorization code back into
-the terminal. Loki stores the tokens in `~/.cache/loki/oauth` and automatically refreshes them when they expire.
-
-If you have only one OAuth-configured client, you can omit the name:
+Or if you have only one OAuth-configured client, you can omit the name:
 
 ```sh
 loki --authenticate
 ```
+
+Alternatively, you can use the REPL command `.authenticate`.
+
+This opens your browser for the OAuth authorization flow. After authorizing, paste the authorization code back into
+the terminal. Loki stores the tokens in `~/.cache/loki/oauth` and automatically refreshes them when they expire.
 
 **Step 3: Use normally**
 
