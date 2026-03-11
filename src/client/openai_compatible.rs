@@ -21,7 +21,7 @@ impl OpenAICompatibleClient {
     config_get_fn!(api_base, get_api_base);
     config_get_fn!(api_key, get_api_key);
 
-    pub const PROMPTS: [PromptAction<'static>; 0] = [];
+    create_client_config!([]);
 }
 
 impl_client_trait!(

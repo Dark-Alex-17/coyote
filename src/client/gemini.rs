@@ -4,7 +4,7 @@ use super::*;
 use anyhow::{Context, Result};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -23,7 +23,7 @@ impl GeminiClient {
     config_get_fn!(api_key, get_api_key);
     config_get_fn!(api_base, get_api_base);
 
-    pub const PROMPTS: [PromptAction<'static>; 1] = [("api_key", "API Key", None, true)];
+    create_client_config!([("api_key", "API Key", None, true)]);
 }
 
 impl_client_trait!(

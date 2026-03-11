@@ -546,7 +546,7 @@ pub fn json_str_from_map<'a>(
     map.get(field_name).and_then(|v| v.as_str())
 }
 
-async fn set_client_models_config(client_config: &mut Value, client: &str) -> Result<String> {
+pub async fn set_client_models_config(client_config: &mut Value, client: &str) -> Result<String> {
     if let Some(provider) = ALL_PROVIDER_MODELS.iter().find(|v| v.provider == client) {
         let models: Vec<String> = provider
             .models

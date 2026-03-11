@@ -18,16 +18,16 @@ pub struct AzureOpenAIConfig {
 impl AzureOpenAIClient {
     config_get_fn!(api_base, get_api_base);
     config_get_fn!(api_key, get_api_key);
-
-    pub const PROMPTS: [PromptAction<'static>; 2] = [
+    
+    create_client_config!([
         (
             "api_base",
             "API Base",
             Some("e.g. https://{RESOURCE}.openai.azure.com"),
-						false
+            false,
         ),
         ("api_key", "API Key", None, true),
-    ];
+    ]);
 }
 
 impl_client_trait!(

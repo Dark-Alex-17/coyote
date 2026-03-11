@@ -27,8 +27,8 @@ pub struct ClaudeConfig {
 impl ClaudeClient {
     config_get_fn!(api_key, get_api_key);
     config_get_fn!(api_base, get_api_base);
-
-    pub const PROMPTS: [PromptAction<'static>; 1] = [("api_key", "API Key", None, true)];
+    
+    create_oauth_supported_client_config!();
 }
 
 #[async_trait::async_trait]

@@ -2,10 +2,10 @@ use super::*;
 
 use crate::utils::strip_think_tag;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const API_BASE: &str = "https://api.openai.com/v1";
 
@@ -25,7 +25,7 @@ impl OpenAIClient {
     config_get_fn!(api_key, get_api_key);
     config_get_fn!(api_base, get_api_base);
 
-    pub const PROMPTS: [PromptAction<'static>; 1] = [("api_key", "API Key", None, true)];
+    create_client_config!([("api_key", "API Key", None, true)]);
 }
 
 impl_client_trait!(
@@ -114,7 +114,9 @@ pub async fn openai_chat_completions_streaming(
                     function_arguments = String::from("{}");
                 }
                 let arguments: Value = function_arguments.parse().with_context(|| {
-                    format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
+                    format!(
+                        "Tool call '{function_name}' has non-JSON arguments '{function_arguments}'"
+                    )
                 })?;
                 handler.tool_call(ToolCall::new(
                     function_name.clone(),
