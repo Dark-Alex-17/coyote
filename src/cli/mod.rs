@@ -127,6 +127,9 @@ pub struct Cli {
     /// List all secrets stored in the Loki vault
     #[arg(long, exclusive = true)]
     pub list_secrets: bool,
+    /// Authenticate with an LLM provider using OAuth (e.g., --authenticate client_name)
+    #[arg(long, exclusive = true, value_name = "CLIENT_NAME")]
+    pub authenticate: Option<Option<String>>,
     /// Generate static shell completion scripts
     #[arg(long, value_name = "SHELL", value_enum)]
     pub completions: Option<ShellCompletion>,

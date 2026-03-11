@@ -489,14 +489,6 @@ pub async fn call_chat_completions_streaming(
     }
 }
 
-pub fn noop_prepare_embeddings<T>(_client: &T, _data: &EmbeddingsData) -> Result<RequestData> {
-    bail!("The client doesn't support embeddings api")
-}
-
-pub async fn noop_embeddings(_builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {
-    bail!("The client doesn't support embeddings api")
-}
-
 pub fn noop_prepare_rerank<T>(_client: &T, _data: &RerankData) -> Result<RequestData> {
     bail!("The client doesn't support rerank api")
 }

@@ -428,6 +428,14 @@ impl Config {
         base_dir.join(env!("CARGO_CRATE_NAME"))
     }
 
+    pub fn oauth_tokens_path() -> PathBuf {
+        Self::cache_path().join("oauth")
+    }
+
+    pub fn token_file(client_name: &str) -> PathBuf {
+        Self::oauth_tokens_path().join(format!("{client_name}_oauth_tokens.json"))
+    }
+
     pub fn log_path() -> PathBuf {
         Config::cache_path().join(format!("{}.log", env!("CARGO_CRATE_NAME")))
     }

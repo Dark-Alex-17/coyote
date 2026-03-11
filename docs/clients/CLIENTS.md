@@ -14,6 +14,7 @@ loki --info | grep 'config_file' | awk '{print $2}'
 <!--toc:start-->
 - [Supported Clients](#supported-clients)
 - [Client Configuration](#client-configuration)
+- [Authentication](#authentication)
 - [Extra Settings](#extra-settings)
 <!--toc:end-->
 
@@ -51,12 +52,13 @@ clients:
 The client metadata uniquely identifies the client in Loki so you can reference it across your configurations. The 
 available settings are listed below:
 
-| Setting  | Description                                                                                   |
-|----------|-----------------------------------------------------------------------------------------------|
-| `name`   | The name of the client (e.g. `openai`, `gemini`, etc.)                                        |
-| `models` | See the [model settings](#model-settings) documentation below                                 |
-| `patch`  | See the [client patch configuration](./PATCHES.md#client-configuration-patches) documentation |
-| `extra`  | See the [extra settings](#extra-settings) documentation below                                 |
+| Setting  | Description                                                                                                |
+|----------|------------------------------------------------------------------------------------------------------------|
+| `name`   | The name of the client (e.g. `openai`, `gemini`, etc.)                                                     |
+| `auth`   | Authentication method: `oauth` for OAuth, or omit to use `api_key` (see [Authentication](#authentication)) |
+| `models` | See the [model settings](#model-settings) documentation below                                              |
+| `patch`  | See the [client patch configuration](./PATCHES.md#client-configuration-patches) documentation              |
+| `extra`  | See the [extra settings](#extra-settings) documentation below                                              |
 
 Be sure to also check provider-specific configurations for any extra fields that are added for authentication purposes.
 
@@ -82,6 +84,73 @@ The `models` array lists the available models from the model client. Each one ha
 | `max_tokens_per_chunk`      |          | `embedding` | The maximum chunk size supported by the embedding model                                                                                                                                                                                       |
 | `default_chunk_size`        |          | `embedding` | The default chunk size to use with the given model                                                                                                                                                                                            |
 | `max_batch_size`            |          | `embedding` | The maximum batch size that the given embedding model supports                                                                                                                                                                                |
+
+## Authentication
+
+Loki clients support two authentication methods: **API keys** and **OAuth**. Each client entry in your configuration
+must use one or the other.
+
+### API Key Authentication
+
+Most clients authenticate using an API key. Simply set the `api_key` field directly or inject it from the
+[Loki vault](../VAULT.md):
+
+```yaml
+clients:
+  - type: claude
+    api_key: '{{ANTHROPIC_API_KEY}}'
+```
+
+API keys can also be provided via environment variables named `{CLIENT_NAME}_API_KEY` (e.g. `OPENAI_API_KEY`,
+`GEMINI_API_KEY`). See the [environment variables documentation](../ENVIRONMENT-VARIABLES.md#client-related-variables)
+for details.
+
+### OAuth Authentication
+
+For [providers that support OAuth](#providers-that-support-oauth), you can authenticate using your existing subscription instead of an API key. This uses
+the OAuth 2.0 PKCE flow.
+
+**Step 1: Configure the client**
+
+Add a client entry with `auth: oauth` and no `api_key`:
+
+```yaml
+clients:
+  - type: claude
+    name: my-claude-oauth
+    auth: oauth
+```
+
+**Step 2: Authenticate**
+
+Run the `--authenticate` flag with the client name:
+
+```sh
+loki --authenticate my-claude-oauth
+```
+
+This opens your browser for the OAuth authorization flow. After authorizing, paste the authorization code back into
+the terminal. Loki stores the tokens in `~/.cache/loki/oauth` and automatically refreshes them when they expire.
+
+If you have only one OAuth-configured client, you can omit the name:
+
+```sh
+loki --authenticate
+```
+
+**Step 3: Use normally**
+
+Once authenticated, the client works like any other. Loki uses the stored OAuth tokens automatically:
+
+```sh
+loki -m my-claude-oauth:claude-sonnet-4-20250514 "Hello!"
+```
+
+> **Note:** You can have multiple clients for the same provider. For example: you can have one with an API key and 
+> another with OAuth. Use the `name` field to distinguish them.
+
+### Providers That Support OAuth
+* Claude
 
 ## Extra Settings
 Loki also lets you customize some extra settings for interacting with APIs:

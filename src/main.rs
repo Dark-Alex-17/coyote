@@ -16,7 +16,7 @@ mod vault;
 extern crate log;
 
 use crate::client::{
-    ModelType, call_chat_completions, call_chat_completions_streaming, list_models,
+    ModelType, call_chat_completions, call_chat_completions_streaming, list_models, oauth,
 };
 use crate::config::{
     Agent, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, GlobalConfig, Input, SHELL_ROLE,
@@ -29,15 +29,17 @@ use crate::utils::*;
 
 use crate::cli::Cli;
 use crate::vault::Vault;
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
-use inquire::Text;
+use client::ClientConfig;
+use inquire::{Select, Text};
 use log::LevelFilter;
 use log4rs::append::console::ConsoleAppender;
 use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
+use oauth::OAuthProvider;
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::{env, mem, process, sync::Arc};
@@ -80,6 +82,13 @@ async fn main() -> Result<()> {
         || cli.list_secrets;
 
     let log_path = setup_logger()?;
+
+    if let Some(client_arg) = &cli.authenticate {
+        let config = Config::init_bare()?;
+        let (client_name, provider) = resolve_oauth_client(client_arg.as_deref(), &config.clients)?;
+        oauth::run_oauth_flow(&provider, &client_name).await?;
+        return Ok(());
+    }
 
     if vault_flags {
         return Vault::handle_vault_flags(cli, Config::init_bare()?);
@@ -503,4 +512,34 @@ fn init_console_logger(
     config_builder
         .build(Root::builder().appender("console").build(root_log_level))
         .unwrap()
+}
+
+fn resolve_oauth_client(
+    explicit: Option<&str>,
+    clients: &[ClientConfig],
+) -> Result<(String, impl OAuthProvider)> {
+    if let Some(name) = explicit {
+        let provider_type = oauth::resolve_provider_type(name, clients)
+            .ok_or_else(|| anyhow!("Client '{name}' not found or doesn't support OAuth"))?;
+        let provider = oauth::get_oauth_provider(provider_type).unwrap();
+        return Ok((name.to_string(), provider));
+    }
+
+    let candidates = oauth::list_oauth_capable_clients(clients);
+    match candidates.len() {
+        0 => bail!("No OAuth-capable clients configured."),
+        1 => {
+            let name = &candidates[0];
+            let provider_type = oauth::resolve_provider_type(name, clients).unwrap();
+            let provider = oauth::get_oauth_provider(provider_type).unwrap();
+            Ok((name.clone(), provider))
+        }
+        _ => {
+            let choice =
+                Select::new("Select a client to authenticate:", candidates.clone()).prompt()?;
+            let provider_type = oauth::resolve_provider_type(&choice, clients).unwrap();
+            let provider = oauth::get_oauth_provider(provider_type).unwrap();
+            Ok((choice, provider))
+        }
+    }
 }

@@ -1,6 +1,8 @@
 mod access_token;
+mod claude_oauth;
 mod common;
 mod message;
+pub mod oauth;
 #[macro_use]
 mod macros;
 mod model;

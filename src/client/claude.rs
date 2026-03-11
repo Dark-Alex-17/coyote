@@ -1,9 +1,12 @@
+use super::access_token::get_access_token;
+use super::claude_oauth::ClaudeOAuthProvider;
+use super::oauth::{self, OAuthProvider};
 use super::*;
 
 use crate::utils::strip_think_tag;
 
 use anyhow::{Context, Result, bail};
-use reqwest::RequestBuilder;
+use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -14,6 +17,7 @@ pub struct ClaudeConfig {
     pub name: Option<String>,
     pub api_key: Option<String>,
     pub api_base: Option<String>,
+    pub auth: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
@@ -27,22 +31,37 @@ impl ClaudeClient {
     pub const PROMPTS: [PromptAction<'static>; 1] = [("api_key", "API Key", None, true)];
 }
 
-impl_client_trait!(
-    ClaudeClient,
-    (
-        prepare_chat_completions,
-        claude_chat_completions,
-        claude_chat_completions_streaming
-    ),
-    (noop_prepare_embeddings, noop_embeddings),
-    (noop_prepare_rerank, noop_rerank),
-);
+#[async_trait::async_trait]
+impl Client for ClaudeClient {
+    client_common_fns!();
 
-fn prepare_chat_completions(
+    async fn chat_completions_inner(
+        &self,
+        client: &ReqwestClient,
+        data: ChatCompletionsData,
+    ) -> Result<ChatCompletionsOutput> {
+        let request_data = prepare_chat_completions(self, client, data).await?;
+        let builder = self.request_builder(client, request_data);
+        claude_chat_completions(builder, self.model()).await
+    }
+
+    async fn chat_completions_streaming_inner(
+        &self,
+        client: &ReqwestClient,
+        handler: &mut SseHandler,
+        data: ChatCompletionsData,
+    ) -> Result<()> {
+        let request_data = prepare_chat_completions(self, client, data).await?;
+        let builder = self.request_builder(client, request_data);
+        claude_chat_completions_streaming(builder, handler, self.model()).await
+    }
+}
+
+async fn prepare_chat_completions(
     self_: &ClaudeClient,
+    client: &ReqwestClient,
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
-    let api_key = self_.get_api_key()?;
     let api_base = self_
         .get_api_base()
         .unwrap_or_else(|_| API_BASE.to_string());
@@ -53,7 +72,33 @@ fn prepare_chat_completions(
     let mut request_data = RequestData::new(url, body);
 
     request_data.header("anthropic-version", "2023-06-01");
-    request_data.header("x-api-key", api_key);
+
+    let uses_oauth = self_.config.auth.as_deref() == Some("oauth");
+
+    if uses_oauth {
+        let provider = ClaudeOAuthProvider;
+        let ready = oauth::prepare_oauth_access_token(client, &provider, self_.name()).await?;
+        if !ready {
+            bail!(
+                "OAuth configured but no tokens found for '{}'. Run: loki --authenticate {}",
+                self_.name(),
+                self_.name()
+            );
+        }
+        let token = get_access_token(self_.name())?;
+        request_data.bearer_auth(token);
+        for (key, value) in provider.extra_request_headers() {
+            request_data.header(key, value);
+        }
+    } else if let Ok(api_key) = self_.get_api_key() {
+        request_data.header("x-api-key", api_key);
+    } else {
+        bail!(
+            "No authentication configured for '{}'. Set `api_key` or use `auth: oauth` with `loki --authenticate {}`.",
+            self_.name(),
+            self_.name()
+        );
+    }
 
     Ok(request_data)
 }

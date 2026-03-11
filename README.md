@@ -39,6 +39,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
     * [Todo System](./docs/TODO-SYSTEM.md): Built-in task tracking for improved agent reliability with smaller models.
 * [Environment Variables](./docs/ENVIRONMENT-VARIABLES.md): Override and customize your Loki configuration at runtime with environment variables.
 * [Client Configurations](./docs/clients/CLIENTS.md): Configuration instructions for various LLM providers.
+    * [Authentication (API Key & OAuth)](./docs/clients/CLIENTS.md#authentication): Authenticate with API keys or OAuth for subscription-based access.
     * [Patching API Requests](./docs/clients/PATCHES.md): Learn how to patch API requests for advanced customization.
 * [Custom Themes](./docs/THEMES.md): Change the look and feel of Loki to your preferences with custom themes.
 * [History](#history): A history of how Loki came to be.
@@ -149,6 +150,25 @@ guide you through the process when you first attempt to access the vault. So, to
 ```sh
 loki --list-secrets
 ```
+
+### Authentication
+Each client in your configuration needs authentication (with a few exceptions; e.g. ollama). Most clients use an API key
+(set via `api_key` in the config or through the [vault](./docs/VAULT.md)). For providers that support OAuth (e.g. Claude Pro/Max 
+subscribers), you can authenticate with your existing subscription instead:
+
+```yaml
+# In your config.yaml
+clients:
+  - type: claude
+    name: my-claude-oauth
+    auth: oauth # Indicate you want to authenticate with OAuth instead of an API key
+```
+
+```sh
+loki --authenticate my-claude-oauth
+```
+
+For full details, see the [authentication documentation](./docs/clients/CLIENTS.md#authentication).
 
 ### Tab-Completions
 You can also enable tab completions to make using Loki easier. To do so, add the following to your shell profile:

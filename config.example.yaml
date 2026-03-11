@@ -210,6 +210,7 @@ clients:
   - type: claude
     api_base: https://api.anthropic.com/v1              # Optional
     api_key: '{{ANTHROPIC_API_KEY}}'                    # You can either hard-code or inject secrets from the Loki vault
+    auth: null                                          # When set to 'oauth', Loki will use OAuth instead of an API key; Authenticate with `loki --authenticate`
 
   # See https://docs.mistral.ai/
   - type: openai-compatible
