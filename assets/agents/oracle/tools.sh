@@ -14,21 +14,38 @@ _project_dir() {
   (cd "${dir}" 2>/dev/null && pwd) || echo "${dir}"
 }
 
+# Normalize a path to be relative to project root.
+# Strips the project_dir prefix if the LLM passes an absolute path.
+_normalize_path() {
+  local input_path="$1"
+  local project_dir
+  project_dir=$(_project_dir)
+
+  if [[ "${input_path}" == /* ]]; then
+    input_path="${input_path#"${project_dir}"/}"
+  fi
+
+  input_path="${input_path#./}"
+  echo "${input_path}"
+}
+
 # @cmd Read a file for analysis
 # @option --path! Path to the file (relative to project root)
 read_file() {
   local project_dir
   project_dir=$(_project_dir)
+  local file_path
   # shellcheck disable=SC2154
-  local full_path="${project_dir}/${argc_path}"
+  file_path=$(_normalize_path "${argc_path}")
+  local full_path="${project_dir}/${file_path}"
   
   if [[ ! -f "${full_path}" ]]; then
-    error "File not found: ${argc_path}" >> "$LLM_OUTPUT"
+    error "File not found: ${file_path}" >> "$LLM_OUTPUT"
     return 1
   fi
 
   {
-  	info "Reading: ${argc_path}"
+  	info "Reading: ${file_path}"
   	echo ""
   	cat "${full_path}"
   } >> "$LLM_OUTPUT"
@@ -80,6 +97,7 @@ search_code() {
     grep -v '/target/' | \
     grep -v '/node_modules/' | \
     grep -v '/.git/' | \
+    sed "s|^${project_dir}/||" | \
     head -30) || true
   
   if [[ -n "${results}" ]]; then
@@ -113,7 +131,8 @@ analyze_with_command() {
 # @cmd List directory contents
 # @option --path Path to list (default: project root)
 list_directory() {
-  local dir_path="${argc_path:-.}"
+  local dir_path
+  dir_path=$(_normalize_path "${argc_path:-.}")
   local project_dir
   project_dir=$(_project_dir)
   local full_path="${project_dir}/${dir_path}"

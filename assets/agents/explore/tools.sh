@@ -14,6 +14,21 @@ _project_dir() {
   (cd "${dir}" 2>/dev/null && pwd) || echo "${dir}"
 }
 
+# Normalize a path to be relative to project root.
+# Strips the project_dir prefix if the LLM passes an absolute path.
+_normalize_path() {
+  local input_path="$1"
+  local project_dir
+  project_dir=$(_project_dir)
+
+  if [[ "${input_path}" == /* ]]; then
+    input_path="${input_path#"${project_dir}"/}"
+  fi
+
+  input_path="${input_path#./}"
+  echo "${input_path}"
+}
+
 # @cmd Get project structure and layout
 get_structure() {
   local project_dir
@@ -78,6 +93,7 @@ search_content() {
     grep -v '/node_modules/' | \
     grep -v '/.git/' | \
     grep -v '/dist/' | \
+    sed "s|^${project_dir}/||" | \
     head -30) || true
   
   if [[ -n "${results}" ]]; then
@@ -91,8 +107,9 @@ search_content() {
 # @option --path! Path to the file (relative to project root)
 # @option --lines Maximum lines to read (default: 200)
 read_file() {
+  local file_path
 	# shellcheck disable=SC2154
-  local file_path="${argc_path}"
+  file_path=$(_normalize_path "${argc_path}")
   local max_lines="${argc_lines:-200}"
   local project_dir
   project_dir=$(_project_dir)
@@ -122,7 +139,8 @@ read_file() {
 # @cmd Find similar files to a given file (for pattern matching)
 # @option --path! Path to the reference file
 find_similar() {
-  local file_path="${argc_path}"
+  local file_path
+  file_path=$(_normalize_path "${argc_path}")
   local project_dir
   project_dir=$(_project_dir)
   
@@ -138,7 +156,7 @@ find_similar() {
     ! -name "$(basename "${file_path}")" \
     ! -name "*test*" \
     ! -name "*spec*" \
-    2>/dev/null | head -5)
+    2>/dev/null | sed "s|^${project_dir}/||" | head -5)
   
   if [[ -n "${results}" ]]; then
     echo "${results}" >> "$LLM_OUTPUT"
@@ -147,7 +165,7 @@ find_similar() {
       ! -name "$(basename "${file_path}")" \
       ! -name "*test*" \
       -not -path '*/target/*' \
-      2>/dev/null | head -5)
+      2>/dev/null | sed "s|^${project_dir}/||" | head -5)
     if [[ -n "${results}" ]]; then
       echo "${results}" >> "$LLM_OUTPUT"
     else
