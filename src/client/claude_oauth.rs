@@ -29,6 +29,10 @@ impl OAuthProvider for ClaudeOAuthProvider {
         "org:create_api_key user:profile user:inference"
     }
 
+    fn extra_authorize_params(&self) -> Vec<(&str, &str)> {
+        vec![("code", "true")]
+    }
+
     fn extra_token_headers(&self) -> Vec<(&str, &str)> {
         vec![("anthropic-beta", BETA_HEADER)]
     }
