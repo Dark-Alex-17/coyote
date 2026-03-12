@@ -1,8 +1,11 @@
+use super::access_token::get_access_token;
+use super::gemini_oauth::GeminiOAuthProvider;
+use super::oauth;
 use super::vertexai::*;
 use super::*;
 
-use anyhow::{Context, Result};
-use reqwest::RequestBuilder;
+use anyhow::{Context, Result, bail};
+use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -13,6 +16,7 @@ pub struct GeminiConfig {
     pub name: Option<String>,
     pub api_key: Option<String>,
     pub api_base: Option<String>,
+    pub auth: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
@@ -23,25 +27,64 @@ impl GeminiClient {
     config_get_fn!(api_key, get_api_key);
     config_get_fn!(api_base, get_api_base);
 
-    create_client_config!([("api_key", "API Key", None, true)]);
+    create_oauth_supported_client_config!();
 }
 
-impl_client_trait!(
-    GeminiClient,
-    (
-        prepare_chat_completions,
-        gemini_chat_completions,
-        gemini_chat_completions_streaming
-    ),
-    (prepare_embeddings, embeddings),
-    (noop_prepare_rerank, noop_rerank),
-);
+#[async_trait::async_trait]
+impl Client for GeminiClient {
+    client_common_fns!();
 
-fn prepare_chat_completions(
+    fn supports_oauth(&self) -> bool {
+        self.config.auth.as_deref() == Some("oauth")
+    }
+
+    async fn chat_completions_inner(
+        &self,
+        client: &ReqwestClient,
+        data: ChatCompletionsData,
+    ) -> Result<ChatCompletionsOutput> {
+        let request_data = prepare_chat_completions(self, client, data).await?;
+        let builder = self.request_builder(client, request_data);
+        gemini_chat_completions(builder, self.model()).await
+    }
+
+    async fn chat_completions_streaming_inner(
+        &self,
+        client: &ReqwestClient,
+        handler: &mut SseHandler,
+        data: ChatCompletionsData,
+    ) -> Result<()> {
+        let request_data = prepare_chat_completions(self, client, data).await?;
+        let builder = self.request_builder(client, request_data);
+        gemini_chat_completions_streaming(builder, handler, self.model()).await
+    }
+
+    async fn embeddings_inner(
+        &self,
+        client: &ReqwestClient,
+        data: &EmbeddingsData,
+    ) -> Result<EmbeddingsOutput> {
+        let request_data = prepare_embeddings(self, client, data).await?;
+        let builder = self.request_builder(client, request_data);
+        embeddings(builder, self.model()).await
+    }
+
+    async fn rerank_inner(
+        &self,
+        client: &ReqwestClient,
+        data: &RerankData,
+    ) -> Result<RerankOutput> {
+        let request_data = noop_prepare_rerank(self, data)?;
+        let builder = self.request_builder(client, request_data);
+        noop_rerank(builder, self.model()).await
+    }
+}
+
+async fn prepare_chat_completions(
     self_: &GeminiClient,
+    client: &ReqwestClient,
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
-    let api_key = self_.get_api_key()?;
     let api_base = self_
         .get_api_base()
         .unwrap_or_else(|_| API_BASE.to_string());
@@ -59,26 +102,61 @@ fn prepare_chat_completions(
     );
 
     let body = gemini_build_chat_completions_body(data, &self_.model)?;
-
     let mut request_data = RequestData::new(url, body);
 
-    request_data.header("x-goog-api-key", api_key);
+    let uses_oauth = self_.config.auth.as_deref() == Some("oauth");
+
+    if uses_oauth {
+        let provider = GeminiOAuthProvider;
+        let ready = oauth::prepare_oauth_access_token(client, &provider, self_.name()).await?;
+        if !ready {
+            bail!(
+                "OAuth configured but no tokens found for '{}'. Run: loki --authenticate {}",
+                self_.name(),
+                self_.name()
+            );
+        }
+        let token = get_access_token(self_.name())?;
+        request_data.bearer_auth(token);
+    } else if let Ok(api_key) = self_.get_api_key() {
+        request_data.header("x-goog-api-key", api_key);
+    } else {
+        bail!(
+            "No authentication configured for '{}'. Set `api_key` or use `auth: oauth` with `loki --authenticate {}`.",
+            self_.name(),
+            self_.name()
+        );
+    }
 
     Ok(request_data)
 }
 
-fn prepare_embeddings(self_: &GeminiClient, data: &EmbeddingsData) -> Result<RequestData> {
-    let api_key = self_.get_api_key()?;
+async fn prepare_embeddings(
+    self_: &GeminiClient,
+    client: &ReqwestClient,
+    data: &EmbeddingsData,
+) -> Result<RequestData> {
     let api_base = self_
         .get_api_base()
         .unwrap_or_else(|_| API_BASE.to_string());
 
-    let url = format!(
-        "{}/models/{}:batchEmbedContents?key={}",
-        api_base.trim_end_matches('/'),
-        self_.model.real_name(),
-        api_key
-    );
+    let uses_oauth = self_.config.auth.as_deref() == Some("oauth");
+
+    let url = if uses_oauth {
+        format!(
+            "{}/models/{}:batchEmbedContents",
+            api_base.trim_end_matches('/'),
+            self_.model.real_name(),
+        )
+    } else {
+        let api_key = self_.get_api_key()?;
+        format!(
+            "{}/models/{}:batchEmbedContents?key={}",
+            api_base.trim_end_matches('/'),
+            self_.model.real_name(),
+            api_key
+        )
+    };
 
     let model_id = format!("models/{}", self_.model.real_name());
 
@@ -89,21 +167,28 @@ fn prepare_embeddings(self_: &GeminiClient, data: &EmbeddingsData) -> Result<Req
             json!({
                 "model": model_id,
                 "content": {
-                    "parts": [
-                        {
-                            "text": text
-                        }
-                    ]
+                    "parts": [{ "text": text }]
                 },
             })
         })
         .collect();
 
-    let body = json!({
-        "requests": requests,
-    });
+    let body = json!({ "requests": requests });
+    let mut request_data = RequestData::new(url, body);
 
-    let request_data = RequestData::new(url, body);
+    if uses_oauth {
+        let provider = GeminiOAuthProvider;
+        let ready = oauth::prepare_oauth_access_token(client, &provider, self_.name()).await?;
+        if !ready {
+            bail!(
+                "OAuth configured but no tokens found for '{}'. Run: loki --authenticate {}",
+                self_.name(),
+                self_.name()
+            );
+        }
+        let token = get_access_token(self_.name())?;
+        request_data.bearer_auth(token);
+    }
 
     Ok(request_data)
 }

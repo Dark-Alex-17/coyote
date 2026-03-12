@@ -1,6 +1,7 @@
 mod access_token;
 mod claude_oauth;
 mod common;
+mod gemini_oauth;
 mod message;
 pub mod oauth;
 #[macro_use]

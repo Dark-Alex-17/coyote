@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
     if let Some(client_arg) = &cli.authenticate {
         let config = Config::init_bare()?;
         let (client_name, provider) = resolve_oauth_client(client_arg.as_deref(), &config.clients)?;
-        oauth::run_oauth_flow(&provider, &client_name).await?;
+        oauth::run_oauth_flow(&*provider, &client_name).await?;
         return Ok(());
     }
 
@@ -517,7 +517,7 @@ fn init_console_logger(
 fn resolve_oauth_client(
     explicit: Option<&str>,
     clients: &[ClientConfig],
-) -> Result<(String, impl OAuthProvider)> {
+) -> Result<(String, Box<dyn OAuthProvider>)> {
     if let Some(name) = explicit {
         let provider_type = oauth::resolve_provider_type(name, clients)
             .ok_or_else(|| anyhow!("Client '{name}' not found or doesn't support OAuth"))?;
