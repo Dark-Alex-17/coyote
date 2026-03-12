@@ -14,11 +14,28 @@ _project_dir() {
   (cd "${dir}" 2>/dev/null && pwd) || echo "${dir}"
 }
 
+# Normalize a path to be relative to project root.
+# Strips the project_dir prefix if the LLM passes an absolute path.
+# Usage: local rel_path; rel_path=$(_normalize_path "/abs/or/rel/path")
+_normalize_path() {
+  local input_path="$1"
+  local project_dir
+  project_dir=$(_project_dir)
+
+  if [[ "${input_path}" == /* ]]; then
+    input_path="${input_path#"${project_dir}"/}"
+  fi
+
+  input_path="${input_path#./}"
+  echo "${input_path}"
+}
+
 # @cmd Read a file's contents before modifying
 # @option --path! Path to the file (relative to project root)
 read_file() {
+  local file_path
 	# shellcheck disable=SC2154
-  local file_path="${argc_path}"
+  file_path=$(_normalize_path "${argc_path}")
   local project_dir
   project_dir=$(_project_dir)
   local full_path="${project_dir}/${file_path}"
@@ -39,7 +56,8 @@ read_file() {
 # @option --path! Path for the file (relative to project root)
 # @option --content! Complete file contents to write
 write_file() {
-  local file_path="${argc_path}"
+  local file_path
+  file_path=$(_normalize_path "${argc_path}")
   # shellcheck disable=SC2154
   local content="${argc_content}"
   local project_dir
@@ -47,7 +65,7 @@ write_file() {
   local full_path="${project_dir}/${file_path}"
   
   mkdir -p "$(dirname "${full_path}")"
-  echo "${content}" > "${full_path}"
+  printf '%s' "${content}" > "${full_path}"
   
   green "Wrote: ${file_path}" >> "$LLM_OUTPUT"
 }
@@ -55,7 +73,8 @@ write_file() {
 # @cmd Find files similar to a given path (for pattern matching)
 # @option --path! Path to find similar files for
 find_similar_files() {
-  local file_path="${argc_path}"
+  local file_path
+  file_path=$(_normalize_path "${argc_path}")
   local project_dir
   project_dir=$(_project_dir)
   
@@ -71,14 +90,14 @@ find_similar_files() {
     ! -name "$(basename "${file_path}")" \
     ! -name "*test*" \
     ! -name "*spec*" \
-    2>/dev/null | head -3)
+    2>/dev/null | sed "s|^${project_dir}/||" | head -3)
   
   if [[ -z "${results}" ]]; then
     results=$(find "${project_dir}/src" -type f -name "*.${ext}" \
       ! -name "*test*" \
       ! -name "*spec*" \
       -not -path '*/target/*' \
-      2>/dev/null | head -3)
+      2>/dev/null | sed "s|^${project_dir}/||" | head -3)
   fi
   
   if [[ -n "${results}" ]]; then
@@ -186,6 +205,7 @@ search_code() {
     grep -v '/target/' | \
     grep -v '/node_modules/' | \
     grep -v '/.git/' | \
+    sed "s|^${project_dir}/||" | \
     head -20) || true
   
   if [[ -n "${results}" ]]; then
