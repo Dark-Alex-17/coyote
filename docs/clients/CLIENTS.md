@@ -137,8 +137,29 @@ loki --authenticate
 
 Alternatively, you can use the REPL command `.authenticate`.
 
-This opens your browser for the OAuth authorization flow. After authorizing, paste the authorization code back into
-the terminal. Loki stores the tokens in `~/.cache/loki/oauth` and automatically refreshes them when they expire.
+This opens your browser for the OAuth authorization flow. Depending on the provider, Loki will either start a
+temporary localhost server to capture the callback automatically (e.g. Gemini) or ask you to paste the authorization
+code back into the terminal (e.g. Claude). Loki stores the tokens in `~/.cache/loki/oauth` and automatically refreshes
+them when they expire.
+
+#### Gemini OAuth Note
+Loki uses the following scopes for OAuth with Gemini:
+* https://www.googleapis.com/auth/generative-language.peruserquota 
+* https://www.googleapis.com/auth/userinfo.email
+* https://www.googleapis.com/auth/generative-language.retriever (Sensitive)
+
+Since the `generative-language.retriever` scope is a sensitive scope, Google needs to verify Loki, which requires full
+branding (logo, official website, privacy policy, terms of service, etc.). The Loki app is open-source and is designed 
+to be used as a simple CLI. As such, there's no terms of service or privacy policy associated with it, and thus Google 
+cannot verify Loki. 
+
+So, when you kick off OAuth with Gemini, you may see a page similar to the following:
+![](../images/clients/gemini-oauth-page.png)
+
+Simply click the `Advanced` link and click `Go to Loki (unsafe)` to continue the OAuth flow.
+
+![](../images/clients/gemini-oauth-unverified.png)
+![](../images/clients/gemini-oauth-unverified-allow.png)
 
 **Step 3: Use normally**
 
@@ -153,6 +174,7 @@ loki -m my-claude-oauth:claude-sonnet-4-20250514 "Hello!"
 
 ### Providers That Support OAuth
 * Claude
+* Gemini
 
 ## Extra Settings
 Loki also lets you customize some extra settings for interacting with APIs:

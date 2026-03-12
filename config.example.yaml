@@ -192,6 +192,8 @@ clients:
   - type: gemini
     api_base: https://generativelanguage.googleapis.com/v1beta
     api_key: '{{GEMINI_API_KEY}}'                       # You can either hard-code or inject secrets from the Loki vault
+    auth: null                                          # When set to 'oauth', Loki will use OAuth instead of an API key
+                                                        # Authenticate with `loki --authenticate` or `.authenticate` in the REPL
     patch:
       chat_completions:
         '.*':

@@ -154,7 +154,7 @@ loki --list-secrets
 ### Authentication
 Each client in your configuration needs authentication (with a few exceptions; e.g. ollama). Most clients use an API key
 (set via `api_key` in the config or through the [vault](./docs/VAULT.md)). For providers that support OAuth (e.g. Claude Pro/Max 
-subscribers), you can authenticate with your existing subscription instead:
+subscribers, Google Gemini), you can authenticate with your existing subscription instead:
 
 ```yaml
 # In your config.yaml
