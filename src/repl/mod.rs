@@ -428,7 +428,8 @@ pub async fn run_repl_command(
                 None => println!("Usage: .model <name>"),
             },
             ".authenticate" => {
-                let client = init_client(config, None)?;
+                let current_model = config.read().current_model().clone();
+                let client = init_client(config, Some(current_model))?;
                 if !client.supports_oauth() {
                     bail!(
                         "Client '{}' doesn't either support OAuth or isn't configured to use it (i.e. uses an API key instead)",
