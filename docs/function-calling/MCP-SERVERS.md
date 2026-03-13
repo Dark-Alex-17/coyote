@@ -55,6 +55,7 @@ Loki ships with a `functions/mcp.json` file that includes some useful MCP server
 * [github](https://github.com/github/github-mcp-server) - Interact with GitHub repositories, issues, pull requests, and more.
 * [docker](https://github.com/ckreiling/mcp-server-docker) - Manage your local Docker containers with natural language
 * [slack](https://github.com/korotovsky/slack-mcp-server) - Interact with Slack
+* [ddg-search](https://github.com/nickclyde/duckduckgo-mcp-server) - Perform web searches with the DuckDuckGo search engine
 
 ## Loki Configuration
 MCP servers, like tools, can be used in a handful of contexts:
