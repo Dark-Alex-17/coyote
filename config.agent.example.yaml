@@ -32,7 +32,7 @@ max_concurrent_agents: 4         # Maximum number of agents that can run simulta
 max_agent_depth: 3               # Maximum nesting depth for sub-agents (prevents runaway spawning)
 inject_spawn_instructions: true  # Inject the default agent spawning instructions into the agent's system prompt
 summarization_model: null        # Model to use for summarizing sub-agent output (e.g. 'openai:gpt-4o-mini'); defaults to current model
-summarization_threshold: 4000   # Character threshold above which sub-agent output is summarized before returning to parent
+summarization_threshold: 4000    # Character threshold above which sub-agent output is summarized before returning to parent
 escalation_timeout: 300          # Seconds a sub-agent waits for a user interaction response before timing out (default: 5 minutes)
 mcp_servers:                     # Optional list of MCP servers that the agent utilizes
   - github                       # Corresponds to the name of an MCP server in the `<loki-config-dir>/functions/mcp.json` file
