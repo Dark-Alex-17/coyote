@@ -714,6 +714,7 @@ Loki comes packaged with some useful built-in agents:
 * `code-reviewer`: A [CodeRabbit](https://coderabbit.ai)-style code reviewer that spawns per-file reviewers using the teammate messaging pattern
 * `demo`: An example agent to use for reference when learning to create your own agents
 * `explore`: An agent designed to help you explore and understand your codebase
+* `file-reviewer`: An agent designed to perform code-review on a single file (used by the `code-reviewer` agent)
 * `jira-helper`: An agent that assists you with all your Jira-related tasks
 * `oracle`: An agent for high-level architecture, design decisions, and complex debugging
 * `sisyphus`: A powerhouse orchestrator agent for writing complex code and acting as a natural language interface for your codebase (similar to ClaudeCode, Gemini CLI, Codex, or OpenCode). Uses sub-agent spawning to delegate to `explore`, `coder`, and `oracle`.
