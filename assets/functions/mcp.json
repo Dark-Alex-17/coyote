@@ -21,6 +21,10 @@
     "docker": {
       "command": "uvx",
       "args": ["mcp-server-docker"]
+    },
+    "ddg-search": {
+      "command": "uvx",
+      "args": ["duckduckgo-mcp-server"]
     }
   }
 }

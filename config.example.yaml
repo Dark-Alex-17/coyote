@@ -77,7 +77,7 @@ visible_tools:                   # Which tools are visible to be compiled (and a
 mcp_server_support: true         # Enables or disables MCP servers (globally).
 mapping_mcp_servers:             # Alias for an MCP server or set of servers
   git: github,gitmcp
-enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 'github,slack')
+enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 'github,slack,ddg-search')
 
 # ---- Session ----
 # See the [Session documentation](./docs/SESSIONS.md) for more information
