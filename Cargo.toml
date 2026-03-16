@@ -19,7 +19,7 @@ bytes = "1.4.0"
 clap = { version = "4.5.40", features = ["cargo", "derive", "wrap_help"] }
 dirs = "6.0.0"
 futures-util = "0.3.29"
-inquire = "0.7.0"
+inquire = "0.9.4"
 is-terminal = "0.4.9"
 reedline = "0.40.0"
 serde = { version = "1.0.152", features = ["derive"] }
