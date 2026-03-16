@@ -1,6 +1,6 @@
+mod inquire;
 mod markdown;
 mod stream;
-mod inquire;
 
 pub use inquire::prompt_theme;
 

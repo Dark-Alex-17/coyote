@@ -23,7 +23,7 @@ use crate::config::{
     TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, load_env_file,
     macro_execute,
 };
-use crate::render::{render_error, prompt_theme};
+use crate::render::{prompt_theme, render_error};
 use crate::repl::Repl;
 use crate::utils::*;
 
