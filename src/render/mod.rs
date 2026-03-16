@@ -1,5 +1,8 @@
 mod markdown;
 mod stream;
+mod inquire;
+
+pub use inquire::prompt_theme;
 
 pub use self::markdown::{MarkdownRender, RenderOptions};
 use self::stream::{markdown_stream, raw_stream};

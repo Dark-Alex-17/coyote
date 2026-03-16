@@ -23,7 +23,7 @@ use crate::config::{
     TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, load_env_file,
     macro_execute,
 };
-use crate::render::render_error;
+use crate::render::{render_error, prompt_theme};
 use crate::repl::Repl;
 use crate::utils::*;
 
@@ -33,7 +33,7 @@ use anyhow::{Result, anyhow, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use client::ClientConfig;
-use inquire::{Select, Text};
+use inquire::{Select, Text, set_global_render_config};
 use log::LevelFilter;
 use log4rs::append::console::ConsoleAppender;
 use log4rs::append::file::FileAppender;
@@ -106,6 +106,14 @@ async fn main() -> Result<()> {
         )
         .await?,
     ));
+
+    {
+        let cfg = config.read();
+        if cfg.highlight {
+            set_global_render_config(prompt_theme(cfg.render_options()?)?)
+        }
+    }
+
     if let Err(err) = run(config, cli, text, abort_signal).await {
         render_error(err);
         process::exit(1);
