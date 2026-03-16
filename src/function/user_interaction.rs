@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 pub const USER_FUNCTION_PREFIX: &str = "user__";
 
 const DEFAULT_ESCALATION_TIMEOUT_SECS: u64 = 300;
+const CUSTOM_MULTI_CHOICE_ANSWER_OPTION: &str = "Other (custom)";
 
 pub fn user_interaction_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
@@ -151,9 +152,14 @@ fn handle_direct_ask(args: &Value) -> Result<Value> {
         .get("question")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'question' is required"))?;
-    let options = parse_options(args)?;
+    let mut options = parse_options(args)?;
+    options.push(CUSTOM_MULTI_CHOICE_ANSWER_OPTION.to_string());
 
-    let answer = Select::new(question, options).prompt()?;
+    let mut answer = Select::new(question, options).prompt()?;
+
+    if answer == CUSTOM_MULTI_CHOICE_ANSWER_OPTION {
+        answer = Text::new("Custom response:").prompt()?
+    }
 
     Ok(json!({ "answer": answer }))
 }
