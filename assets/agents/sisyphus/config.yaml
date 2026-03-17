@@ -22,12 +22,13 @@ variables:
     description: Auto-confirm command execution
     default: '1'
 
+mcp_servers:
+  - ddg-search
 global_tools:
   - fs_read.sh
   - fs_grep.sh
   - fs_glob.sh
   - fs_ls.sh
-  - web_search_loki.sh
   - execute_command.sh
 
 instructions: |

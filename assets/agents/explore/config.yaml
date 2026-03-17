@@ -8,12 +8,13 @@ variables:
     description: Project directory to explore
     default: '.'
 
+mcp_servers:
+  - ddg-search
 global_tools:
   - fs_read.sh
   - fs_grep.sh
   - fs_glob.sh
   - fs_ls.sh
-  - web_search_loki.sh
 
 instructions: |
   You are a codebase explorer. Your job: Search, find, report. Nothing else.
