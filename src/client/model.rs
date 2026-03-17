@@ -177,6 +177,10 @@ impl Model {
         self.data.max_output_tokens
     }
 
+    pub fn supports_function_calling(&self) -> bool {
+        self.data.supports_function_calling
+    }
+
     pub fn no_stream(&self) -> bool {
         self.data.no_stream
     }

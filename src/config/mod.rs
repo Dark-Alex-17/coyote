@@ -1842,6 +1842,12 @@ impl Config {
             bail!("Already in an agent, please run '.exit agent' first to exit the current agent.");
         }
         let agent = Agent::init(config, agent_name, abort_signal.clone()).await?;
+        if !agent.model().supports_function_calling() {
+            eprintln!(
+                "Warning: The model '{}' does not support function calling. Agent tools (including todo, spawning, and user interaction) will not be available.",
+                agent.model().id()
+            );
+        }
         let session = session_name.map(|v| v.to_string()).or_else(|| {
             if config.read().macro_flag {
                 None
