@@ -402,7 +402,6 @@ invoke_agent_with_summary() {
     summary=$(echo "${output}" | sed -n '/^## Recommendation/,/^## /{/^## Recommendation/d;/^## /d;p}' | sed '/^$/d' | head -10)
   fi
 
-  # Failsafe: extract up to 5 meaningful lines if no markers found
   if [[ -z "${summary}" ]]; then
     summary=$(echo "${output}" | grep -v "^$" | grep -v "^#" | grep -v "^\-\-\-" | tail -10 | head -5)
   fi
@@ -411,7 +410,11 @@ invoke_agent_with_summary() {
     append_context "${agent}" "${summary}"
   fi
 
-  echo "${output}"
+  if [[ -z "${output}" ]] || [[ -z "$(echo "${output}" | tr -d '[:space:]')" ]]; then
+		echo "[${agent} agent completed but produced no text output. The agent may have performed work via tool calls (file writes, builds, etc.) that did not generate visible text. Check the project directory for changes.]"
+	else
+		echo "${output}"
+	fi
 }
 
 ###########################

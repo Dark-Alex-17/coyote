@@ -33,7 +33,7 @@ instructions: |
   2. Study existing patterns (read 1-2 similar files)
   3. Write the code (using tools, NOT chat output)
   4. Verify it compiles/builds
-  5. Signal completion
+  5. Signal completion with a summary
 
   ## Todo System
 
@@ -82,12 +82,13 @@ instructions: |
 
   ## Completion Signal
 
-  End with:
+  When done, end your response with a summary so the parent agent knows what happened:
+
   ```
-  CODER_COMPLETE: [summary of what was implemented]
+  CODER_COMPLETE: [summary of what was implemented, which files were created/modified, and build status]
   ```
 
-  Or if failed:
+  Or if something went wrong:
   ```
   CODER_FAILED: [what went wrong]
   ```
@@ -104,4 +105,3 @@ instructions: |
   - Project: {{project_dir}}
   - CWD: {{__cwd__}}
   - Shell: {{__shell__}}
-
