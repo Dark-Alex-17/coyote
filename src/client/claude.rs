@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 const API_BASE: &str = "https://api.anthropic.com/v1";
+const CLAUDE_CODE_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaudeConfig {
@@ -94,6 +95,7 @@ async fn prepare_chat_completions(
         for (key, value) in provider.extra_request_headers() {
             request_data.header(key, value);
         }
+        inject_oauth_system_prompt(&mut request_data.body);
     } else if let Ok(api_key) = self_.get_api_key() {
         request_data.header("x-api-key", api_key);
     } else {
@@ -105,6 +107,43 @@ async fn prepare_chat_completions(
     }
 
     Ok(request_data)
+}
+
+/// Anthropic requires OAuth-authenticated requests to include a Claude Code
+/// system prompt prefix in order to consider a request body as "valid".
+///
+/// This behavior was discovered 2026-03-17.
+///
+/// So this function injects the Claude Code system prompt into the request
+/// body to make it a valid request.
+fn inject_oauth_system_prompt(body: &mut Value) {
+    let prefix_block = json!({
+        "type": "text",
+        "text": CLAUDE_CODE_PREFIX,
+    });
+
+    match body.get("system") {
+        Some(Value::String(existing)) => {
+            let existing_block = json!({
+                "type": "text",
+                "text": existing,
+            });
+            body["system"] = json!([prefix_block, existing_block]);
+        }
+        Some(Value::Array(_)) => {
+            if let Some(arr) = body["system"].as_array_mut() {
+                let already_injected = arr
+                    .iter()
+                    .any(|block| block["text"].as_str() == Some(CLAUDE_CODE_PREFIX));
+                if !already_injected {
+                    arr.insert(0, prefix_block);
+                }
+            }
+        }
+        _ => {
+            body["system"] = json!([prefix_block]);
+        }
+    }
 }
 
 pub async fn claude_chat_completions(
