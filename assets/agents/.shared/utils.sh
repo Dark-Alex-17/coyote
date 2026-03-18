@@ -2,68 +2,6 @@
 # Shared Agent Utilities - Minimal, focused helper functions
 set -euo pipefail
 
-#############################
-## CONTEXT FILE MANAGEMENT ##
-#############################
-
-get_context_file() {
-  local project_dir="${LLM_AGENT_VAR_PROJECT_DIR:-.}"
-  echo "${project_dir}/.loki-context"
-}
-
-# Initialize context file for a new task
-# Usage: init_context "Task description"
-init_context() {
-  local task="$1"
-  local project_dir="${LLM_AGENT_VAR_PROJECT_DIR:-.}"
-  local context_file
-  context_file=$(get_context_file)
-  
-  cat > "${context_file}" <<EOF
-## Project: ${project_dir}
-## Task: ${task}
-## Started: $(date -Iseconds)
-
-### Prior Findings
-
-EOF
-}
-
-# Append findings to the context file
-# Usage: append_context "agent_name" "finding summary
-append_context() {
-  local agent="$1"
-  local finding="$2"
-  local context_file
-  context_file=$(get_context_file)
-
-  if [[ -f "${context_file}" ]]; then
-    {
-      echo ""
-      echo "[${agent}]:"
-      echo "${finding}"
-    } >> "${context_file}"
-  fi
-}
-
-# Read the current context (returns empty string if no context)
-# Usage: context=$(read_context)
-read_context() {
-  local context_file
-  context_file=$(get_context_file)
-  
-  if [[ -f "${context_file}" ]]; then
-    cat "${context_file}"
-  fi
-}
-
-# Clear the context file
-clear_context() {
-  local context_file
-  context_file=$(get_context_file)
-  rm -f "${context_file}"
-}
-
 #######################
 ## PROJECT DETECTION ##
 #######################
@@ -279,9 +217,9 @@ _detect_with_llm() {
   evidence=$(_gather_project_evidence "${dir}")
   local prompt
   prompt=$(cat <<-EOF
-		
+
 		Analyze this project directory and determine the project type, primary language, and the correct shell commands to build, test, and check (lint/typecheck) it.
-		
+
 		EOF
 	)
   prompt+=$'\n'"${evidence}"$'\n'
@@ -346,75 +284,6 @@ detect_project() {
   fi
 
   echo '{"type":"unknown","build":"","test":"","check":""}'
-}
-
-######################
-## AGENT INVOCATION ##
-######################
-
-# Invoke a subagent with optional context injection
-# Usage: invoke_agent <agent_name> <prompt> [extra_args...]
-invoke_agent() {
-  local agent="$1"
-  local prompt="$2"
-  shift 2
-
-  local context
-  context=$(read_context)
-
-  local full_prompt
-  if [[ -n "${context}" ]]; then
-    full_prompt="## Orchestrator Context
-
-The orchestrator (sisyphus) has gathered this context from prior work:
-
-<context>
-${context}
-</context>
-
-## Your Task
-
-${prompt}"
-  else
-    full_prompt="${prompt}"
-  fi
-
-  env AUTO_CONFIRM=true loki --agent "${agent}" "$@" "${full_prompt}" 2>&1
-}
-
-# Invoke a subagent and capture a summary of its findings
-# Usage: result=$(invoke_agent_with_summary "explore" "find auth patterns")
-invoke_agent_with_summary() {
-  local agent="$1"
-  local prompt="$2"
-  shift 2
-
-  local output
-  output=$(invoke_agent "${agent}" "${prompt}" "$@")
-
-  local summary=""
-
-  if echo "${output}" | grep -q "FINDINGS:"; then
-    summary=$(echo "${output}" | sed -n '/FINDINGS:/,/^[A-Z_]*COMPLETE/p' | grep "^- " | sed 's/^- /  - /')
-  elif echo "${output}" | grep -q "CODER_COMPLETE:"; then
-    summary=$(echo "${output}" | grep "CODER_COMPLETE:" | sed 's/CODER_COMPLETE: *//')
-  elif echo "${output}" | grep -q "ORACLE_COMPLETE"; then
-    summary=$(echo "${output}" | sed -n '/^## Recommendation/,/^## /{/^## Recommendation/d;/^## /d;p}' | sed '/^$/d' | head -10)
-  fi
-
-  if [[ -z "${summary}" ]]; then
-    summary=$(echo "${output}" | grep -v "^$" | grep -v "^#" | grep -v "^\-\-\-" | tail -10 | head -5)
-  fi
-
-  if [[ -n "${summary}" ]]; then
-    append_context "${agent}" "${summary}"
-  fi
-
-  if [[ -z "${output}" ]] || [[ -z "$(echo "${output}" | tr -d '[:space:]')" ]]; then
-		echo "[${agent} agent completed but produced no text output. The agent may have performed work via tool calls (file writes, builds, etc.) that did not generate visible text. Check the project directory for changes.]"
-	else
-		echo "${output}"
-	fi
 }
 
 ###########################
