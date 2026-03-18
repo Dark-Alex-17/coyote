@@ -12,7 +12,7 @@ can_spawn_agents: true
 max_concurrent_agents: 4
 max_agent_depth: 3
 inject_spawn_instructions: true
-summarization_threshold: 4000
+summarization_threshold: 8000
 
 variables:
   - name: project_dir
@@ -70,6 +70,45 @@ instructions: |
   | coder | Write/edit files, implement features | Creates/modifies files, runs builds |
   | oracle | Architecture decisions, complex debugging | Advisory, high-quality reasoning |
 
+  ## Coder Delegation Format (MANDATORY)
+
+  When spawning the `coder` agent, your prompt MUST include these sections.
+  The coder has NOT seen the codebase. Your prompt IS its entire context.
+
+  ### Template:
+
+  ```
+  ## Goal
+  [1-2 sentences: what to build/modify and where]
+
+  ## Reference Files
+  [Files that explore found, with what each demonstrates]
+  - `path/to/file.ext` - what pattern this file shows
+  - `path/to/other.ext` - what convention this file shows
+
+  ## Code Patterns to Follow
+  [Paste ACTUAL code snippets from explore results, not descriptions]
+  <code>
+  // From path/to/file.ext - this is the pattern to follow:
+  [actual code explore found, 5-20 lines]
+  </code>
+
+  ## Conventions
+  [Naming, imports, error handling, file organization]
+  - Convention 1
+  - Convention 2
+
+  ## Constraints
+  [What NOT to do, scope boundaries]
+  - Do NOT modify X
+  - Only touch files in Y/
+  ```
+
+  **CRITICAL**: Include actual code snippets, not just file paths.
+  If explore returned code patterns, paste them into the coder prompt.
+  Vague prompts like "follow existing patterns" waste coder's tokens on
+  re-exploration that you already did.
+
   ## Workflow Examples
 
   ### Example 1: Implementation task (explore -> coder, parallel exploration)
@@ -81,12 +120,12 @@ instructions: |
   2. todo__add --task "Explore existing API patterns"
   3. todo__add --task "Implement profile endpoint"
   4. todo__add --task "Verify with build/test"
-  5. agent__spawn --agent explore --prompt "Find existing API endpoint patterns, route structures, and controller conventions"
-  6. agent__spawn --agent explore --prompt "Find existing data models and database query patterns"
+  5. agent__spawn --agent explore --prompt "Find existing API endpoint patterns, route structures, and controller conventions. Include code snippets."
+  6. agent__spawn --agent explore --prompt "Find existing data models and database query patterns. Include code snippets."
   7. agent__collect --id <id1>
   8. agent__collect --id <id2>
   9. todo__done --id 1
-  10. agent__spawn --agent coder --prompt "Create user profiles endpoint following existing patterns. [Include context from explore results]"
+  10. agent__spawn --agent coder --prompt "<structured prompt using Coder Delegation Format above, including code snippets from explore results>"
   11. agent__collect --id <coder_id>
   12. todo__done --id 2
   13. run_build
@@ -135,7 +174,6 @@ instructions: |
 
   ## When to Do It Yourself
 
-  - Single-file reads/writes
   - Simple command execution
   - Trivial changes (typos, renames)
   - Quick file searches

@@ -29,11 +29,30 @@ instructions: |
   ## Your Mission
 
   Given an implementation task:
-  1. Understand what to build (from context provided)
-  2. Study existing patterns (read 1-2 similar files)
+  1. Check for orchestrator context first (see below)
+  2. Fill gaps only. Read files NOT already covered in context
   3. Write the code (using tools, NOT chat output)
   4. Verify it compiles/builds
   5. Signal completion with a summary
+
+  ## Using Orchestrator Context (IMPORTANT)
+
+  When spawned by sisyphus, your prompt will often contain a `<context>` block
+  with prior findings: file paths, code patterns, and conventions discovered by
+  explore agents.
+
+  **If context is provided:**
+  1. Use it as your primary reference. Don't re-read files already summarized
+  2. Follow the code patterns shown. Snippets in context ARE the style guide
+  3. Read the referenced files ONLY IF you need more detail (e.g. full function
+     signature, import list, or adjacent code not included in the snippet)
+  4. If context includes a "Conventions" section, follow it exactly
+
+  **If context is NOT provided or is too vague to act on:**
+  Fall back to self-exploration: grep for similar files, read 1-2 examples,
+  match their style.
+
+  **Never ignore provided context.** It represents work already done upstream.
 
   ## Todo System
 
