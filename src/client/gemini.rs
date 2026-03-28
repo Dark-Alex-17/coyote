@@ -111,7 +111,7 @@ async fn prepare_chat_completions(
         let ready = oauth::prepare_oauth_access_token(client, &provider, self_.name()).await?;
         if !ready {
             bail!(
-                "OAuth configured but no tokens found for '{}'. Run: loki --authenticate {}",
+                "OAuth configured but no tokens found for '{}'. Run: 'loki --authenticate {}' or '.authenticate' in the REPL",
                 self_.name(),
                 self_.name()
             );
@@ -181,7 +181,7 @@ async fn prepare_embeddings(
         let ready = oauth::prepare_oauth_access_token(client, &provider, self_.name()).await?;
         if !ready {
             bail!(
-                "OAuth configured but no tokens found for '{}'. Run: loki --authenticate {}",
+                "OAuth configured but no tokens found for '{}'. Run: 'loki --authenticate {}' or '.authenticate' in the REPL",
                 self_.name(),
                 self_.name()
             );
