@@ -124,3 +124,6 @@ instructions: |
   - Project: {{project_dir}}
   - CWD: {{__cwd__}}
   - Shell: {{__shell__}}
+  
+  ## Available tools:
+  {{__tools__}}
