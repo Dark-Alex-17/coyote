@@ -68,6 +68,9 @@ instructions: |
   ## Context
   - Project: {{project_dir}}
   - CWD: {{__cwd__}}
+  
+  ## Available Tools:
+  {{__tools__}}
 
 conversation_starters:
   - 'Find how authentication is implemented'

@@ -108,3 +108,6 @@ instructions: |
   ## Context
   - Project: {{project_dir}}
   - CWD: {{__cwd__}}
+  
+  ## Available Tools:
+  {{__tools__}}

@@ -75,6 +75,9 @@ instructions: |
   ## Context
   - Project: {{project_dir}}
   - CWD: {{__cwd__}}
+  
+  ## Available Tools:
+  {{__tools__}}
 
 conversation_starters:
   - 'Review this architecture design'
