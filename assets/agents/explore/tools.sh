@@ -60,7 +60,7 @@ search_files() {
   echo "" >> "$LLM_OUTPUT"
   
   local results
-  results=$(search_files "${pattern}" "${project_dir}")
+  results=$(_search_files "${pattern}" "${project_dir}")
   
   if [[ -n "${results}" ]]; then
     echo "${results}" >> "$LLM_OUTPUT"

@@ -290,7 +290,7 @@ detect_project() {
 ## FILE SEARCH UTILITIES ##
 ###########################
 
-search_files() {
+_search_files() {
   local pattern="$1"
   local dir="${2:-.}"
   
