@@ -181,7 +181,7 @@ fn handle_direct_input(args: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'question' is required"))?;
 
-    let answer = Text::new(question).prompt()?;
+    let answer = Text::new(&format!("{question}\nYour answer: ")).prompt()?;
 
     Ok(json!({ "answer": answer }))
 }
