@@ -33,7 +33,7 @@ use std::{env, mem, process};
 
 const MENU_NAME: &str = "completion_menu";
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 38]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 39]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -135,6 +135,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 38]> = LazyLock::new(|| {
         ReplCommand::new(
             ".exit agent",
             "Leave agent",
+            AssertState::True(StateFlags::AGENT),
+        ),
+        ReplCommand::new(
+            ".clear todo",
+            "Clear the todo list and stop auto-continuation",
             AssertState::True(StateFlags::AGENT),
         ),
         ReplCommand::new(
@@ -803,6 +808,25 @@ pub async fn run_repl_command(
             ".clear" => match args {
                 Some("messages") => {
                     bail!("Use '.empty session' instead");
+                }
+                Some("todo") => {
+                    let mut cfg = config.write();
+                    match cfg.agent.as_mut() {
+                        Some(agent) => {
+                            if !agent.auto_continue_enabled() {
+                                bail!(
+                                    "The todo system is not enabled for this agent. Set 'auto_continue: true' in the agent's config.yaml to enable it."
+                                );
+                            }
+                            if agent.todo_list().is_empty() {
+                                println!("Todo list is already empty.");
+                            } else {
+                                agent.clear_todo_list();
+                                println!("Todo list cleared.");
+                            }
+                        }
+                        None => bail!("No active agent"),
+                    }
                 }
                 _ => unknown_command()?,
             },

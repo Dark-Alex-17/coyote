@@ -7,10 +7,12 @@ pub(in crate::config) const DEFAULT_TODO_INSTRUCTIONS: &str = indoc! {"
         - `todo__add`: Add individual tasks. Add all planned steps before starting work.
         - `todo__done`: Mark a task done by id. Call this immediately after completing each step.
         - `todo__list`: Show the current todo list.
+        - `todo__clear`: Clear the entire todo list and reset the goal. Use when the user cancels or changes direction.
 
     RULES:
         - Always create a todo list before starting work.
         - Mark each task done as soon as you finish it; do not batch.
+        - If the user cancels the current task or changes direction, call `todo__clear` immediately.
         - If you stop with incomplete tasks, the system will automatically prompt you to continue."
 };
 

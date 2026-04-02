@@ -76,6 +76,16 @@ pub fn todo_function_declarations() -> Vec<FunctionDeclaration> {
             },
             agent: false,
         },
+        FunctionDeclaration {
+            name: format!("{TODO_FUNCTION_PREFIX}clear"),
+            description: "Clear the entire todo list and reset the goal. Use when the current task has been canceled or invalidated.".to_string(),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
+                properties: Some(IndexMap::new()),
+                ..Default::default()
+            },
+            agent: false,
+        },
     ]
 }
 
@@ -152,6 +162,17 @@ pub fn handle_todo_tool(config: &GlobalConfig, cmd_name: &str, args: &Value) -> 
                         Ok(serde_json::to_value(list)
                             .unwrap_or(json!({"error": "serialization failed"})))
                     }
+                }
+                None => bail!("No active agent"),
+            }
+        }
+        "clear" => {
+            let mut cfg = config.write();
+            let agent = cfg.agent.as_mut();
+            match agent {
+                Some(agent) => {
+                    agent.clear_todo_list();
+                    Ok(json!({"status": "ok", "message": "Todo list cleared"}))
                 }
                 None => bail!("No active agent"),
             }

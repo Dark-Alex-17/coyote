@@ -117,6 +117,22 @@ Display the current todo list with status of each item.
 
 **Returns:** The full todo list with goal, progress, and item statuses
 
+### `todo__clear`
+Clear the entire todo list and reset the goal. Use when the current task has been canceled or invalidated.
+
+**Parameters:** None
+
+**Returns:** Confirmation that the todo list was cleared
+
+### REPL Command: `.clear todo`
+You can also clear the todo list manually from the REPL by typing `.clear todo`. This is useful when:
+- You gave a custom response that changes or cancels the current task
+- The agent is stuck in auto-continuation with stale todos
+- You want to start fresh without leaving and re-entering the agent
+
+**Note:** This command is only available when an agent with `auto_continue: true` is active. If the todo
+system isn't enabled for the current agent, the command will display an error message.
+
 ## Auto-Continuation
 When `auto_continue` is enabled, Loki automatically sends a continuation prompt if:
 

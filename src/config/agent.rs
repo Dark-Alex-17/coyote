@@ -476,6 +476,11 @@ impl Agent {
         self.todo_list.mark_done(id)
     }
 
+    pub fn clear_todo_list(&mut self) {
+        self.todo_list.clear();
+        self.reset_continuation();
+    }
+
     pub fn continuation_prompt(&self) -> String {
         self.config.continuation_prompt.clone().unwrap_or_else(|| {
             formatdoc! {"

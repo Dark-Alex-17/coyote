@@ -467,11 +467,12 @@ inject_todo_instructions: true   # Include the default todo instructions into pr
 
 ### How It Works
 
-1. When `inject_todo_instructions` is enabled, agents receive instructions on using four built-in tools:
+1. When `inject_todo_instructions` is enabled, agents receive instructions on using five built-in tools:
     - `todo__init`: Initialize a todo list with a goal
     - `todo__add`: Add a task to the list
     - `todo__done`: Mark a task complete
     - `todo__list`: View current todo state
+    - `todo__clear`: Clear the entire todo list and reset the goal
    
    These instructions are a reasonable default that detail how to use Loki's To-Do System. If you wish, 
    you can disable the injection of the default instructions and specify your own instructions for how 

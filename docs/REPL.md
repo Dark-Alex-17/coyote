@@ -120,13 +120,14 @@ For more information on sessions and how to use them in Loki, refer to the [sess
 Loki lets you build OpenAI GPT-style agents. The following commands let you interact with and manage your agents in 
 Loki:
 
-| Command              | Description                                                |
-|----------------------|------------------------------------------------------------|
-| `.agent`             | Use an agent                                               |
-| `.starter`           | Display and use conversation starters for the active agent |
-| `.edit agent-config` | Open the agent configuration in your preferred text editor |
-| `.info agent`        | Display information about the active agent                 |
-| `.exit agent`        | Leave the active agent                                     |
+| Command              | Description                                                                                   |
+|----------------------|-----------------------------------------------------------------------------------------------|
+| `.agent`             | Use an agent                                                                                  |
+| `.starter`           | Display and use conversation starters for the active agent                                    |
+| `.clear todo`        | Clear the todo list and stop auto-continuation (requires `auto_continue: true` on the agent)  |
+| `.edit agent-config` | Open the agent configuration in your preferred text editor                                    |
+| `.info agent`        | Display information about the active agent                                                    |
+| `.exit agent`        | Leave the active agent                                                                        |
 
 ![agent](./images/agents/sql.gif)
 

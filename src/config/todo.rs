@@ -67,6 +67,11 @@ impl TodoList {
         self.todos.is_empty()
     }
 
+    pub fn clear(&mut self) {
+        self.goal.clear();
+        self.todos.clear();
+    }
+
     pub fn render_for_model(&self) -> String {
         let mut lines = Vec::new();
         if !self.goal.is_empty() {
@@ -147,6 +152,21 @@ mod tests {
         assert!(rendered.contains("Progress: 1/2 completed"));
         assert!(rendered.contains("✓ 1. Discover"));
         assert!(rendered.contains("○ 2. Map"));
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut list = TodoList::new("Some goal");
+        list.add("Task 1");
+        list.add("Task 2");
+        list.mark_done(1);
+        assert!(!list.is_empty());
+
+        list.clear();
+        assert!(list.is_empty());
+        assert!(list.goal.is_empty());
+        assert_eq!(list.todos.len(), 0);
+        assert!(!list.has_incomplete());
     }
 
     #[test]
