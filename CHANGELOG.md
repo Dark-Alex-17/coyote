@@ -1,3 +1,74 @@
+## v0.3.0 (2026-04-02)
+
+### Feat
+
+- Added `todo__clear` function to the todo system and updated REPL commands to have a .clear todo as well for significant changes in agent direction
+- Added available tools to prompts for sisyphus and code-reviewer agent families
+- Added available tools to coder prompt
+- Improved token efficiency when delegating from sisyphus -> coder
+- modified sisyphus agents to use the new ddg-search MCP server for web searches instead of built-in model searches
+- Added support for specifying a custom response to multiple-choice prompts when nothing suits the user's needs
+- Supported theming in the inquire prompts in the REPL
+- Added the duckduckgo-search MCP server for searching the web (in addition to the built-in tools for web searches)
+- Support for Gemini OAuth
+- Support authenticating or refreshing OAuth for supported clients from within the REPL
+- Allow first-runs to select OAuth for supported providers
+- Support OAuth authentication flows for Claude
+- Improved MCP server spinup and spindown when switching contexts or settings in the REPL: Modify existing config rather than stopping all servers always and re-initializing if unnecessary
+- Allow the explore agent to run search queries for understanding docs or API specs
+- Allow the oracle to perform web searches for deeper research
+- Added web search support to the main sisyphus agent to answer user queries
+- Created a CodeRabbit-style code-reviewer agent
+- Added configuration option in agents to indicate the timeout for user input before proceeding (defaults to 5 minutes)
+- Added support for sub-agents to escalate user interaction requests from any depth to the parent agents for user interactions
+- built-in user interaction tools to remove the need for the list/confirm/etc prompts in prompt tools and to enhance user interactions in Loki
+- Experimental update to sisyphus to use the new parallel agent spawning system
+- Added an agent configuration property that allows auto-injecting sub-agent spawning instructions (when using the built-in sub-agent spawning system)
+- Auto-dispatch support of sub-agents and support for the teammate pattern between subagents
+- Full passive task queue integration for parallelization of subagents
+- Implemented initial scaffolding for built-in sub-agent spawning tool call operations
+- Initial models for agent parallelization
+- Added interactive prompting between the LLM and the user in Sisyphus using the built-in Bash utils scripts
+
+### Fix
+
+- Clarified user text input interaction
+- recursion bug with similarly named Bash search functions in the explore agent
+- updated the error for unauthenticated oauth to include the REPL .authenticated command
+- Corrected a bug in the coder agent that wasn't outputting a summary of the changes made, so the parent Sisyphus agent has no idea if the agent worked or not
+- Claude code system prompt injected into claude requests to make them valid once again
+- Do not inject tools when models don't support them; detect this conflict before API calls happen
+- The REPL .authenticate command works from within sessions, agents, and roles with pre-configured models
+- Implemented the path normalization fix for the oracle and explore agents
+- Updated the atlassian MCP server endpoint to account for future deprecation
+- Fixed a bug in the coder agent that was causing the agent to create absolute paths from the current directory
+- the updated regex for secrets injection broke MCP server secrets interpolation because the regex greedily matched on new lines, replacing too much content. This fix just ignores commented out lines in YAML files by skipping commented out lines.
+- Don't try to inject secrets into commented-out lines in the config
+- Removed top_p parameter from some agents so they can work across model providers
+- Improved sub-agent stdout and stderr output for users to follow
+- Inject agent variables into environment variables for global tool calls when invoked from agents to modify global tool behavior
+- Removed the unnecessary execute_commands tool from the oracle agent
+- Added auto_confirm to the coder agent so sub-agent spawning doesn't freeze
+- Fixed a bug in the new supervisor and todo built-ins that was causing errors with OpenAI models
+- Added condition to sisyphus to always output a summary to clearly indicate completion
+- Updated the sisyphus prompt to explicitly tell it to delegate to the coder agent when it wants to write any code at all except for trivial changes
+- Added back in the auto_confirm variable into sisyphus
+- Removed the now unnecessary is_stale_response that was breaking auto-continuing with parallel agents
+- Bypassed enabled_tools for user interaction tools so if function calling is enabled at all, the LLM has access to the user interaction tools when in REPL mode
+- When parallel agents run, only write to stdout from the parent and only display the parent's throbber
+- Forgot to implement support for failing a task and keep all dependents blocked
+- Clean up orphaned sub-agents when the parent agent
+- Fixed the bash prompt utils so that they correctly show output when being run by a tool invocation
+- Forgot to automatically add the bidirectional communication back up to parent agents from sub-agents (i.e. need to be able to check inbox and send messages)
+- Agent delegation tools were not being passed into the {{__tools__}} placeholder so agents weren't delegating to subagents
+
+### Refactor
+
+- Made the oauth module more generic so it can support loopback OAuth (not just manual)
+- Changed the default session name for Sisyphus to temp (to require users to explicitly name sessions they wish to save)
+- Updated the sisyphus agent to use the built-in user interaction tools instead of custom bash-based tools
+- Cleaned up some left-over implementation stubs
+
 ## v0.2.0 (2026-02-14)
 
 ### Feat
