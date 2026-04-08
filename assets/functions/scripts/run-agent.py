@@ -50,7 +50,13 @@ def parse_raw_data(data):
 
 def parse_argv():
     agent_func = sys.argv[1]
-    agent_data = sys.argv[2]
+
+    tool_data_file = os.environ.get("LLM_TOOL_DATA_FILE")
+    if tool_data_file and os.path.isfile(tool_data_file):
+        with open(tool_data_file, "r", encoding="utf-8") as f:
+            agent_data = f.read()
+    else:
+        agent_data = sys.argv[2]
 
     if (not agent_data) or (not agent_func):
         print("Usage: ./{agent_name}.py <agent-func> <agent-data>", file=sys.stderr)

@@ -3137,6 +3137,7 @@ dependencies = [
  "crossterm 0.28.1",
  "dirs",
  "duct",
+ "dunce",
  "fancy-regex",
  "futures-util",
  "fuzzy-matcher",
