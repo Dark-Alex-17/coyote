@@ -22,7 +22,7 @@ dunce = "1.0.5"
 futures-util = "0.3.29"
 inquire = "0.9.4"
 is-terminal = "0.4.9"
-reedline = "0.40.0"
+reedline = "0.46.0"
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = { version = "1.0.93", features = ["preserve_order"] }
 serde_yaml = "0.9.17"
@@ -38,7 +38,7 @@ tokio-graceful = "0.2.2"
 tokio-stream = { version = "0.1.15", default-features = false, features = [
   "sync",
 ] }
-crossterm = "0.28.1"
+crossterm = "0.29.0"
 chrono = "0.4.23"
 bincode = { version = "2.0.0", features = [
   "serde",
