@@ -613,6 +613,7 @@ impl Functions {
             )
         })?;
         let content_template = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
+        let to_script_path = |p: &str| -> String { p.replace('\\', "/") };
         let content = match binary_type {
             BinaryType::Tool(None) => {
                 let root_dir = Config::functions_dir();
@@ -622,8 +623,8 @@ impl Functions {
                 );
                 content_template
                     .replace("{function_name}", binary_name)
-                    .replace("{root_dir}", &root_dir.to_string_lossy())
-                    .replace("{tool_path}", &tool_path)
+                    .replace("{root_dir}", &to_script_path(&root_dir.to_string_lossy()))
+                    .replace("{tool_path}", &to_script_path(&tool_path))
             }
             BinaryType::Tool(Some(agent_name)) => {
                 let root_dir = Config::agent_data_dir(agent_name);
@@ -633,16 +634,19 @@ impl Functions {
                 );
                 content_template
                     .replace("{function_name}", binary_name)
-                    .replace("{root_dir}", &root_dir.to_string_lossy())
-                    .replace("{tool_path}", &tool_path)
+                    .replace("{root_dir}", &to_script_path(&root_dir.to_string_lossy()))
+                    .replace("{tool_path}", &to_script_path(&tool_path))
             }
             BinaryType::Agent => content_template
                 .replace("{agent_name}", binary_name)
-                .replace("{config_dir}", &Config::config_dir().to_string_lossy()),
+                .replace(
+                    "{config_dir}",
+                    &to_script_path(&Config::config_dir().to_string_lossy()),
+                ),
         }
         .replace(
             "{prompt_utils_file}",
-            &Config::bash_prompt_utils_file().to_string_lossy(),
+            &to_script_path(&Config::bash_prompt_utils_file().to_string_lossy()),
         );
         if binary_script_file.exists() {
             fs::remove_file(&binary_script_file)?;
@@ -666,7 +670,7 @@ impl Functions {
                     .join(".venv")
                     .join("Scripts")
                     .join("activate.bat");
-                let canonicalized_path = fs::canonicalize(&executable_path)?;
+                let canonicalized_path = dunce::canonicalize(&executable_path)?;
                 format!(
                     "call \"{}\" && {}",
                     canonicalized_path.to_string_lossy(),
@@ -677,19 +681,16 @@ impl Functions {
                 let executable_path = which::which("python")
                     .or_else(|_| which::which("python3"))
                     .map_err(|_| anyhow!("Python executable not found in PATH"))?;
-                let canonicalized_path = fs::canonicalize(&executable_path)?;
+                let canonicalized_path = dunce::canonicalize(&executable_path)?;
                 canonicalized_path.to_string_lossy().into_owned()
             }
             _ => bail!("Unsupported language: {}", language.as_ref()),
         };
         let bin_dir = binary_file
             .parent()
-            .expect("Failed to get parent directory of binary file")
-            .canonicalize()?
-            .to_string_lossy()
-            .into_owned();
-        let wrapper_binary = binary_script_file
-            .canonicalize()?
+            .expect("Failed to get parent directory of binary file");
+        let bin_dir = dunce::canonicalize(bin_dir)?.to_string_lossy().into_owned();
+        let wrapper_binary = dunce::canonicalize(&binary_script_file)?
             .to_string_lossy()
             .into_owned();
         let content = formatdoc!(
@@ -1116,6 +1117,20 @@ pub fn run_llm_function(
 
     #[cfg(windows)]
     let cmd_name = polyfill_cmd_name(&cmd_name, &bin_dirs);
+
+    #[cfg(windows)]
+    let cmd_args = {
+        let mut args = cmd_args;
+        if let Some(json_data) = args.pop() {
+            let tool_data_file = temp_file("-tool-data-", ".json");
+            fs::write(&tool_data_file, &json_data)?;
+            envs.insert(
+                "LLM_TOOL_DATA_FILE".into(),
+                tool_data_file.display().to_string(),
+            );
+        }
+        args
+    };
 
     envs.insert("CLICOLOR_FORCE".into(), "1".into());
     envs.insert("FORCE_COLOR".into(), "1".into());

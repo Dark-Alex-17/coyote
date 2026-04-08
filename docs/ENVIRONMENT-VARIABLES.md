@@ -107,6 +107,7 @@ The following variables can be used to change the log level of Loki or the locat
 can also pass the `--disable-log-colors` flag as well.
 
 ## Miscellaneous Variables
-| Environment Variable | Description                                                                                      | Default Value |
-|----------------------|--------------------------------------------------------------------------------------------------|---------------|
-| `AUTO_CONFIRM`       | Bypass all `guard_*` checks in the bash prompt helpers; useful for agent composition and routing |               |
+| Environment Variable | Description                                                                                                                                                                                                                                                                                                                    | Default Value |
+|----------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|
+| `AUTO_CONFIRM`       | Bypass all `guard_*` checks in the bash prompt helpers; useful for agent composition and routing                                                                                                                                                                                                                               |               |
+| `LLM_TOOL_DATA_FILE` | Set automatically by Loki on Windows. Points to a temporary file containing the JSON tool call data. <br>Tool scripts (`run-tool.sh`, `run-agent.sh`, etc.) read from this file instead of command-line args <br>to avoid JSON escaping issues when data passes through `cmd.exe` → bash. **Not intended to be set by users.** |               |

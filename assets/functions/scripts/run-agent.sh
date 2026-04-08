@@ -14,7 +14,11 @@ main() {
 
 parse_argv() {
 		agent_func="$1"
-		agent_data="$2"
+    if [[ -n "$LLM_TOOL_DATA_FILE" ]] && [[ -f "$LLM_TOOL_DATA_FILE" ]]; then
+      	agent_data="$(cat "$LLM_TOOL_DATA_FILE")"
+    else
+				agent_data="$2"
+    fi
     if [[ -z "$agent_data" ]] || [[ -z "$agent_func" ]]; then
         die "usage: ./{agent_name}.sh <agent-func> <agent-data>"
     fi
@@ -57,7 +61,6 @@ run() {
     if [[ "$OS" == "Windows_NT" ]]; then
         set -o igncr
         tools_path="$(cygpath -w "$tools_path")"
-        tool_data="$(echo "$tool_data" | sed 's/\\/\\\\/g')"
     fi
 
     jq_script="$(cat <<-'EOF'
