@@ -584,7 +584,7 @@ impl Config {
     }
 
     pub fn agent_functions_file(name: &str) -> Result<PathBuf> {
-        let allowed = ["tools.sh", "tools.py", "tools.js"];
+        let allowed = ["tools.sh", "tools.py", "tools.ts", "tools.js"];
 
         for entry in read_dir(Self::agent_data_dir(name))? {
             let entry = entry?;
