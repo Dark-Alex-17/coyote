@@ -89,6 +89,26 @@ impl Language {
     }
 }
 
+fn extract_shebang_runtime(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let reader = io::BufReader::new(file);
+    let first_line = io::BufRead::lines(reader).next()?.ok()?;
+    let shebang = first_line.strip_prefix("#!")?;
+    let cmd = shebang.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    if let Some(after_env) = cmd.strip_prefix("/usr/bin/env ") {
+        let runtime = after_env.trim();
+        if runtime.is_empty() {
+            return None;
+        }
+        Some(runtime.to_string())
+    } else {
+        Some(cmd.to_string())
+    }
+}
+
 pub async fn eval_tool_calls(
     config: &GlobalConfig,
     mut calls: Vec<ToolCall>,
@@ -522,7 +542,14 @@ impl Functions {
                 bail!("Unsupported tool file extension: {}", language.as_ref());
             }
 
-            Self::build_binaries(binary_name, language, BinaryType::Tool(agent_name))?;
+            let tool_path = Config::global_tools_dir().join(tool);
+            let custom_runtime = extract_shebang_runtime(&tool_path);
+            Self::build_binaries(
+                binary_name,
+                language,
+                BinaryType::Tool(agent_name),
+                custom_runtime.as_deref(),
+            )?;
         }
 
         Ok(())
@@ -563,8 +590,9 @@ impl Functions {
     }
 
     fn build_agent_tool_binaries(name: &str) -> Result<()> {
+        let tools_file = Config::agent_functions_file(name)?;
         let language = Language::from(
-            &Config::agent_functions_file(name)?
+            &tools_file
                 .extension()
                 .and_then(OsStr::to_str)
                 .map(|s| s.to_lowercase())
@@ -577,7 +605,8 @@ impl Functions {
             bail!("Unsupported tool file extension: {}", language.as_ref());
         }
 
-        Self::build_binaries(name, language, BinaryType::Agent)
+        let custom_runtime = extract_shebang_runtime(&tools_file);
+        Self::build_binaries(name, language, BinaryType::Agent, custom_runtime.as_deref())
     }
 
     #[cfg(windows)]
@@ -585,6 +614,7 @@ impl Functions {
         binary_name: &str,
         language: Language,
         binary_type: BinaryType,
+        custom_runtime: Option<&str>,
     ) -> Result<()> {
         use native::runtime;
         let (binary_file, binary_script_file) = match binary_type {
@@ -669,38 +699,42 @@ impl Functions {
             binary_file.display()
         );
 
-        let run = match language {
-            Language::Bash => {
-                let shell = runtime::bash_path().ok_or_else(|| anyhow!("Shell not found"))?;
-                format!("{shell} --noprofile --norc")
+        let run = if let Some(rt) = custom_runtime {
+            rt.to_string()
+        } else {
+            match language {
+                Language::Bash => {
+                    let shell = runtime::bash_path().ok_or_else(|| anyhow!("Shell not found"))?;
+                    format!("{shell} --noprofile --norc")
+                }
+                Language::Python if Path::new(".venv").exists() => {
+                    let executable_path = env::current_dir()?
+                        .join(".venv")
+                        .join("Scripts")
+                        .join("activate.bat");
+                    let canonicalized_path = dunce::canonicalize(&executable_path)?;
+                    format!(
+                        "call \"{}\" && {}",
+                        canonicalized_path.to_string_lossy(),
+                        language.to_cmd()
+                    )
+                }
+                Language::Python => {
+                    let executable_path = which::which("python")
+                        .or_else(|_| which::which("python3"))
+                        .map_err(|_| anyhow!("Python executable not found in PATH"))?;
+                    let canonicalized_path = dunce::canonicalize(&executable_path)?;
+                    canonicalized_path.to_string_lossy().into_owned()
+                }
+                Language::TypeScript => {
+                    let npx_path = which::which("npx").map_err(|_| {
+                        anyhow!("npx executable not found in PATH (required for TypeScript tools)")
+                    })?;
+                    let canonicalized_path = dunce::canonicalize(&npx_path)?;
+                    format!("{} tsx", canonicalized_path.to_string_lossy())
+                }
+                _ => bail!("Unsupported language: {}", language.as_ref()),
             }
-            Language::Python if Path::new(".venv").exists() => {
-                let executable_path = env::current_dir()?
-                    .join(".venv")
-                    .join("Scripts")
-                    .join("activate.bat");
-                let canonicalized_path = dunce::canonicalize(&executable_path)?;
-                format!(
-                    "call \"{}\" && {}",
-                    canonicalized_path.to_string_lossy(),
-                    language.to_cmd()
-                )
-            }
-            Language::Python => {
-                let executable_path = which::which("python")
-                    .or_else(|_| which::which("python3"))
-                    .map_err(|_| anyhow!("Python executable not found in PATH"))?;
-                let canonicalized_path = dunce::canonicalize(&executable_path)?;
-                canonicalized_path.to_string_lossy().into_owned()
-            }
-            Language::TypeScript => {
-                let npx_path = which::which("npx").map_err(|_| {
-                    anyhow!("npx executable not found in PATH (required for TypeScript tools)")
-                })?;
-                let canonicalized_path = dunce::canonicalize(&npx_path)?;
-                format!("{} tsx", canonicalized_path.to_string_lossy())
-            }
-            _ => bail!("Unsupported language: {}", language.as_ref()),
         };
         let bin_dir = binary_file
             .parent()
@@ -730,6 +764,7 @@ impl Functions {
         binary_name: &str,
         language: Language,
         binary_type: BinaryType,
+        custom_runtime: Option<&str>,
     ) -> Result<()> {
         use std::os::unix::prelude::PermissionsExt;
 
@@ -758,7 +793,7 @@ impl Functions {
             )
         })?;
         let content_template = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
-        let content = match binary_type {
+        let mut content = match binary_type {
             BinaryType::Tool(None) => {
                 let root_dir = Config::functions_dir();
                 let tool_path = format!(
@@ -790,6 +825,12 @@ impl Functions {
             &Config::bash_prompt_utils_file().to_string_lossy(),
         );
 
+        if let Some(rt) = custom_runtime
+            && let Some(newline_pos) = content.find('\n')
+        {
+            content = format!("#!/usr/bin/env {rt}{}", &content[newline_pos..]);
+        }
+
         if language == Language::TypeScript {
             let bin_dir = binary_file
                 .parent()
@@ -802,7 +843,11 @@ impl Functions {
             sf.write_all(content.as_bytes())?;
             fs::set_permissions(&script_file, fs::Permissions::from_mode(0o755))?;
 
-            let wrapper = format!("#!/bin/sh\nexec tsx \"{}\" \"$@\"\n", script_file.display());
+            let ts_runtime = custom_runtime.unwrap_or("tsx");
+            let wrapper = format!(
+                "#!/bin/sh\nexec {ts_runtime} \"{}\" \"$@\"\n",
+                script_file.display()
+            );
             if binary_file.exists() {
                 fs::remove_file(&binary_file)?;
             }

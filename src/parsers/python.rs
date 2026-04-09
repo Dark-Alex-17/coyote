@@ -15,10 +15,6 @@ impl ScriptedLanguage for PythonLanguage {
         tree_sitter_python::LANGUAGE.into()
     }
 
-    fn default_runtime(&self) -> &str {
-        "python"
-    }
-
     fn lang_name(&self) -> &str {
         "python"
     }

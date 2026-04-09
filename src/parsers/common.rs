@@ -17,15 +17,9 @@ pub(crate) struct Param {
 pub(crate) trait ScriptedLanguage {
     fn ts_language(&self) -> tree_sitter::Language;
 
-    fn default_runtime(&self) -> &str;
-
     fn lang_name(&self) -> &str;
 
-    fn find_functions<'a>(
-        &self,
-        root: Node<'a>,
-        src: &str,
-    ) -> Vec<(Node<'a>, Node<'a>)>;
+    fn find_functions<'a>(&self, root: Node<'a>, src: &str) -> Vec<(Node<'a>, Node<'a>)>;
 
     fn function_name<'a>(&self, func_node: Node<'a>, src: &'a str) -> Result<&'a str>;
 
@@ -175,31 +169,6 @@ pub(crate) fn named_child(node: Node<'_>, index: usize) -> Option<Node<'_>> {
     node.named_children(&mut cursor).nth(index)
 }
 
-pub(crate) fn extract_runtime(tree: &tree_sitter::Tree, src: &str, default: &str) -> String {
-    let root = tree.root_node();
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        let text = match child.kind() {
-            "hash_bang_line" | "comment" => match child.utf8_text(src.as_bytes()) {
-                Ok(t) => t,
-                Err(_) => continue,
-            },
-            _ => break,
-        };
-
-        if let Some(cmd) = text.strip_prefix("#!") {
-            let cmd = cmd.trim();
-            if let Some(after_env) = cmd.strip_prefix("/usr/bin/env ") {
-                return after_env.trim().to_string();
-            }
-            return cmd.to_string();
-        }
-
-        break;
-    }
-    default.to_string()
-}
-
 pub(crate) fn generate_declarations<L: ScriptedLanguage>(
     lang: &L,
     src: &str,
@@ -225,8 +194,6 @@ pub(crate) fn generate_declarations<L: ScriptedLanguage>(
             lang.lang_name()
         );
     }
-
-    let _runtime = extract_runtime(&tree, src, lang.default_runtime());
 
     let mut out = Vec::new();
     for (wrapper, func) in lang.find_functions(tree.root_node(), src) {
