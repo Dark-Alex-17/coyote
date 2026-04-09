@@ -87,6 +87,29 @@ function loadEnv(filePath: string): void {
   }
 }
 
+function extractParamNames(fn: Function): string[] {
+  const src = fn.toString();
+  const match = src.match(/^(?:async\s+)?function\s*\w*\s*\(([^)]*)\)/);
+  if (!match) {
+    return [];
+  }
+  return match[1]
+    .split(",")
+    .map((p) => p.trim().replace(/[:=?].*/s, "").trim())
+    .filter(Boolean);
+}
+
+function spreadArgs(
+  fn: Function,
+  data: Record<string, unknown>,
+): unknown[] {
+  const names = extractParamNames(fn);
+  if (names.length === 0) {
+    return [];
+  }
+  return names.map((name) => data[name]);
+}
+
 async function run(
   toolPath: string,
   toolFunc: string,
@@ -98,7 +121,9 @@ async function run(
     throw new Error(`No module function '${toolFunc}' at '${toolPath}'`);
   }
 
-  const value = await mod[toolFunc](toolData);
+  const fn = mod[toolFunc] as Function;
+  const args = spreadArgs(fn, toolData);
+  const value = await fn(...args);
   returnToLlm(value);
   dumpResult("{function_name}");
 }
