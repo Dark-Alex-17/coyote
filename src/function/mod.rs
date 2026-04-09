@@ -689,7 +689,7 @@ impl Functions {
         let bin_dir = binary_file
             .parent()
             .expect("Failed to get parent directory of binary file");
-        let bin_dir = dunce::canonicalize(bin_dir)?.to_string_lossy().into_owned();
+        let canonical_bin_dir = dunce::canonicalize(bin_dir)?.to_string_lossy().into_owned();
         let wrapper_binary = dunce::canonicalize(&binary_script_file)?
             .to_string_lossy()
             .into_owned();
@@ -698,7 +698,7 @@ impl Functions {
 						@echo off
 						setlocal
 
-						set "bin_dir={bin_dir}"
+						set "bin_dir={canonical_bin_dir}"
 
 						{run} "{wrapper_binary}" %*"#,
         );
