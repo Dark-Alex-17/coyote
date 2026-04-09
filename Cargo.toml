@@ -100,7 +100,7 @@ clap_complete = { version = "4.5.58", features = ["unstable-dynamic"] }
 gman = "0.4.1"
 clap_complete_nushell = "4.5.9"
 open = "5"
-rand = "0.10.0"
+rand = { version = "0.10.0", features = ["default"] }
 url = "2.5.8"
 
 [dependencies.reqwest]
