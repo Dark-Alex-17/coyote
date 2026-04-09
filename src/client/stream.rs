@@ -342,7 +342,7 @@ mod tests {
 
     use bytes::Bytes;
     use futures_util::stream;
-    use rand::Rng;
+    use rand::random_range;
     use serde_json::json;
 
     #[test]
@@ -392,10 +392,9 @@ mod tests {
     }
 
     fn split_chunks(text: &str) -> Vec<Vec<u8>> {
-        let mut rng = rand::rng();
         let len = text.len();
-        let cut1 = rng.random_range(1..len - 1);
-        let cut2 = rng.random_range(cut1 + 1..len);
+        let cut1 = random_range(1..len - 1);
+        let cut2 = random_range(cut1 + 1..len);
         let chunk1 = text.as_bytes()[..cut1].to_vec();
         let chunk2 = text.as_bytes()[cut1..cut2].to_vec();
         let chunk3 = text.as_bytes()[cut2..].to_vec();
