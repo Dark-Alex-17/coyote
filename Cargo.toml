@@ -91,14 +91,16 @@ strum_macros = "0.27.2"
 indoc = "2.0.6"
 rmcp = { version = "0.16.0", features = ["client", "transport-child-process"] }
 num_cpus = "1.17.0"
-rustpython-parser = "0.4.0"
-rustpython-ast = "0.4.0"
+tree-sitter = "0.26.8"
+tree-sitter-language = "0.1"
+tree-sitter-python = "0.25.0"
+tree-sitter-typescript = "0.23"
 colored = "3.0.0"
 clap_complete = { version = "4.5.58", features = ["unstable-dynamic"] }
-gman = "0.3.0"
+gman = "0.4.1"
 clap_complete_nushell = "4.5.9"
 open = "5"
-rand = "0.9.0"
+rand = { version = "0.10.0", features = ["default"] }
 url = "2.5.8"
 
 [dependencies.reqwest]

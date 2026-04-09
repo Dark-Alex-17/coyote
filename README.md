@@ -28,6 +28,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [Function Calling](./docs/function-calling/TOOLS.md#Tools): Leverage function calling capabilities to extend Loki's functionality with custom tools
     * [Creating Custom Tools](./docs/function-calling/CUSTOM-TOOLS.md): You can create your own custom tools to enhance Loki's capabilities.
         * [Create Custom Python Tools](./docs/function-calling/CUSTOM-TOOLS.md#custom-python-based-tools)
+        * [Create Custom TypeScript Tools](./docs/function-calling/CUSTOM-TOOLS.md#custom-typescript-based-tools)
         * [Create Custom Bash Tools](./docs/function-calling/CUSTOM-BASH-TOOLS.md)
             * [Bash Prompt Utilities](./docs/function-calling/BASH-PROMPT-HELPERS.md)
 * [First-Class MCP Server Support](./docs/function-calling/MCP-SERVERS.md): Easily connect and interact with MCP servers for advanced functionality.

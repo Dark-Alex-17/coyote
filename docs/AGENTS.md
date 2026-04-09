@@ -33,6 +33,7 @@ If you're looking for more example agents, refer to the [built-in agents](../ass
   - [.env File Support](#env-file-support)
   - [Python-Based Agent Tools](#python-based-agent-tools)
   - [Bash-Based Agent Tools](#bash-based-agent-tools)
+  - [TypeScript-Based Agent Tools](#typescript-based-agent-tools)
 - [5. Conversation Starters](#5-conversation-starters)
 - [6. Todo System & Auto-Continuation](#6-todo-system--auto-continuation)
 - [7. Sub-Agent Spawning System](#7-sub-agent-spawning-system)
@@ -62,10 +63,12 @@ Agent configurations often have the following directory structure:
         ├── tools.sh
             or
         ├── tools.py
+            or
+        ├── tools.ts
 ```
 
 This means that agent configurations often are only two files: the agent configuration file (`config.yaml`), and the 
-tool definitions (`agents/my-agent/tools.sh` or `tools.py`).
+tool definitions (`agents/my-agent/tools.sh`, `tools.py`, or `tools.ts`).
 
 To see a full example configuration file, refer to the [example agent config file](../config.agent.example.yaml).
 
@@ -114,10 +117,10 @@ isolated environment, so in order for an agent to use a tool or MCP server that 
 explicitly state which tools and/or MCP servers the agent uses. Otherwise, it is assumed that the agent doesn't use any 
 tools outside its own custom defined tools.
 
-And if you don't define a `agents/my-agent/tools.sh` or `agents/my-agent/tools.py`, then the agent is really just a 
+And if you don't define a `agents/my-agent/tools.sh`, `agents/my-agent/tools.py`, or `agents/my-agent/tools.ts`, then the agent is really just a 
 `role`.
 
-You'll notice there's no settings for agent-specific tooling. This is because they are handled separately and 
+You'll notice there are no settings for agent-specific tooling. This is because they are handled separately and 
 automatically. See the [Building Tools for Agents](#4-building-tools-for-agents) section below for more information.
 
 To see a full example configuration file, refer to the [example agent config file](../config.agent.example.yaml).
@@ -205,7 +208,7 @@ variables:
 ### Dynamic Instructions
 Sometimes you may find it useful to dynamically generate instructions on startup. Whether that be via a call to Loki
 itself to generate them, or by some other means. Loki supports this type of behavior using a special function defined
-in your `agents/my-agent/tools.py` or `agents/my-agent/tools.sh`.
+in your `agents/my-agent/tools.py`, `agents/my-agent/tools.sh`, or `agents/my-agent/tools.ts`.
 
 **Example: Instructions for a JSON-reader agent that specializes on each JSON input it receives**
 `agents/json-reader/tools.py`:
@@ -306,8 +309,8 @@ EOF
 }
 ```
 
-For more information on how to create custom tools for your agent and the structure of the `agent/my-agent/tools.sh` or 
-`agent/my-agent/tools.py` files, refer to the [Building Tools for Agents](#4-building-tools-for-agents) section below.
+For more information on how to create custom tools for your agent and the structure of the `agent/my-agent/tools.sh`,
+`agent/my-agent/tools.py`, or `agent/my-agent/tools.ts` files, refer to the [Building Tools for Agents](#4-building-tools-for-agents) section below.
 
 #### Variables
 All the same variable interpolations supported by static instructions is also supported by dynamic instructions. For 
@@ -337,10 +340,11 @@ defining a single function that gets executed at runtime (e.g. `main` for bash t
 tools define a number of *subcommands*.
 
 ### Limitations
-You can only utilize either a bash-based `<loki-config-dir>/agents/my-agent/tools.sh` or a Python-based 
-`<loki-config-dir>/agents/my-agent/tools.py`. However, if it's easier to achieve a task in one language vs the other, 
+You can only utilize one of: a bash-based `<loki-config-dir>/agents/my-agent/tools.sh`, a Python-based 
+`<loki-config-dir>/agents/my-agent/tools.py`, or a TypeScript-based `<loki-config-dir>/agents/my-agent/tools.ts`. 
+However, if it's easier to achieve a task in one language vs the other, 
 you're free to define other scripts in your agent's configuration directory and reference them from the main 
-`tools.py/sh` file. **Any scripts *not* named `tools.{py,sh}` will not be picked up by Loki's compiler**, meaning they 
+tools file. **Any scripts *not* named `tools.{py,sh,ts}` will not be picked up by Loki's compiler**, meaning they 
 can be used like any other set of scripts.
 
 It's important to keep in mind the following:
@@ -427,6 +431,55 @@ the same syntax ad formatting as is used to create custom bash tools globally.
 
 For more information on how to write, [build and test](function-calling/CUSTOM-BASH-TOOLS.md#execute-and-test-your-bash-tools) tools in bash, refer to the 
 [custom bash tools documentation](function-calling/CUSTOM-BASH-TOOLS.md).
+
+### TypeScript-Based Agent Tools
+TypeScript-based agent tools work exactly the same as TypeScript global tools. Instead of a single `run` function,
+you define as many exported functions as you like. Non-exported functions are private helpers and are invisible to the 
+LLM.
+
+**Example:**
+`agents/my-agent/tools.ts`
+```typescript
+/**
+ * Get your IP information
+ */
+export async function get_ip_info(): Promise<string> {
+  const resp = await fetch("https://httpbin.org/ip");
+  return await resp.text();
+}
+
+/**
+ * Find your public IP address using AWS
+ */
+export async function get_ip_address_from_aws(): Promise<string> {
+  const resp = await fetch("https://checkip.amazonaws.com");
+  return await resp.text();
+}
+
+// Non-exported helper — invisible to the LLM
+function formatResponse(data: string): string {
+  return data.trim();
+}
+```
+
+Loki automatically compiles each exported function as a separate tool for the LLM to call. Just make sure you
+follow the same JSDoc and parameter conventions as you would when creating custom TypeScript tools.
+
+TypeScript agent tools also support dynamic instructions via an exported `_instructions()` function:
+
+```typescript
+import { readFileSync } from "fs";
+
+/**
+ * Generates instructions for the agent dynamically
+ */
+export function _instructions(): string {
+  const schema = readFileSync("schema.json", "utf-8");
+  return `You are an AI agent that works with the following schema:\n${schema}`;
+}
+```
+
+For more information on how to build tools in TypeScript, refer to the [custom TypeScript tools documentation](function-calling/CUSTOM-TOOLS.md#custom-typescript-based-tools).
 
 ## 5. Conversation Starters
 It's often helpful to also have some conversation starters so users know what kinds of things the agent is capable of 
