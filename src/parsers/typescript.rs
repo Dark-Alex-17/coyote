@@ -15,10 +15,6 @@ impl ScriptedLanguage for TypeScriptLanguage {
         tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
     }
 
-    fn default_runtime(&self) -> &str {
-        "npx tsx"
-    }
-
     fn lang_name(&self) -> &str {
         "typescript"
     }

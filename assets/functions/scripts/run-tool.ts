@@ -2,8 +2,8 @@
 
 // Usage: ./{function_name}.ts <tool-data>
 
-import { readFileSync, writeFileSync, existsSync, statSync } from "fs";
-import { join, basename } from "path";
+import { readFileSync, writeFileSync, existsSync } from "fs";
+import { join } from "path";
 import { pathToFileURL } from "url";
 
 async function main(): Promise<void> {
