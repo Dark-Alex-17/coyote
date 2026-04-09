@@ -12,7 +12,7 @@ use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
     MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
 };
-use crate::parsers::{bash, python};
+use crate::parsers::{bash, python, typescript};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use indoc::formatdoc;
@@ -53,6 +53,7 @@ enum BinaryType<'a> {
 enum Language {
     Bash,
     Python,
+    TypeScript,
     Unsupported,
 }
 
@@ -61,6 +62,7 @@ impl From<&String> for Language {
         match s.to_lowercase().as_str() {
             "sh" => Language::Bash,
             "py" => Language::Python,
+            "ts" => Language::TypeScript,
             _ => Language::Unsupported,
         }
     }
@@ -72,6 +74,7 @@ impl Language {
         match self {
             Language::Bash => "bash",
             Language::Python => "python",
+            Language::TypeScript => "npx tsx",
             Language::Unsupported => "sh",
         }
     }
@@ -80,6 +83,7 @@ impl Language {
         match self {
             Language::Bash => "sh",
             Language::Python => "py",
+            Language::TypeScript => "ts",
             _ => "sh",
         }
     }
@@ -473,6 +477,11 @@ impl Functions {
                         file_name,
                         tools_file_path.parent(),
                     ),
+                    Language::TypeScript => typescript::generate_typescript_declarations(
+                        tool_file,
+                        file_name,
+                        tools_file_path.parent(),
+                    ),
                     Language::Unsupported => {
                         bail!("Unsupported tool file extension: {}", language.as_ref())
                     }
@@ -684,6 +693,13 @@ impl Functions {
                 let canonicalized_path = dunce::canonicalize(&executable_path)?;
                 canonicalized_path.to_string_lossy().into_owned()
             }
+            Language::TypeScript => {
+                let npx_path = which::which("npx").map_err(|_| {
+                    anyhow!("npx executable not found in PATH (required for TypeScript tools)")
+                })?;
+                let canonicalized_path = dunce::canonicalize(&npx_path)?;
+                format!("{} tsx", canonicalized_path.to_string_lossy())
+            }
             _ => bail!("Unsupported language: {}", language.as_ref()),
         };
         let bin_dir = binary_file
@@ -773,13 +789,34 @@ impl Functions {
             "{prompt_utils_file}",
             &Config::bash_prompt_utils_file().to_string_lossy(),
         );
-        if binary_file.exists() {
-            fs::remove_file(&binary_file)?;
-        }
-        let mut file = File::create(&binary_file)?;
-        file.write_all(content.as_bytes())?;
 
-        fs::set_permissions(&binary_file, fs::Permissions::from_mode(0o755))?;
+        if language == Language::TypeScript {
+            let bin_dir = binary_file
+                .parent()
+                .expect("Failed to get parent directory of binary file");
+            let script_file = bin_dir.join(format!("run-{binary_name}.ts"));
+            if script_file.exists() {
+                fs::remove_file(&script_file)?;
+            }
+            let mut sf = File::create(&script_file)?;
+            sf.write_all(content.as_bytes())?;
+            fs::set_permissions(&script_file, fs::Permissions::from_mode(0o755))?;
+
+            let wrapper = format!("#!/bin/sh\nexec tsx \"{}\" \"$@\"\n", script_file.display());
+            if binary_file.exists() {
+                fs::remove_file(&binary_file)?;
+            }
+            let mut wf = File::create(&binary_file)?;
+            wf.write_all(wrapper.as_bytes())?;
+            fs::set_permissions(&binary_file, fs::Permissions::from_mode(0o755))?;
+        } else {
+            if binary_file.exists() {
+                fs::remove_file(&binary_file)?;
+            }
+            let mut file = File::create(&binary_file)?;
+            file.write_all(content.as_bytes())?;
+            fs::set_permissions(&binary_file, fs::Permissions::from_mode(0o755))?;
+        }
 
         Ok(())
     }
