@@ -1,4 +1,5 @@
 use crate::client::{ModelType, list_models};
+use crate::config::paths;
 use crate::config::{Config, list_agents};
 use clap_complete::{CompletionCandidate, Shell, generate};
 use clap_complete_nushell::Nushell;
@@ -33,7 +34,7 @@ impl ShellCompletion {
 pub(super) fn model_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
     match Config::init_bare() {
-        Ok(config) => list_models(&config, ModelType::Chat)
+        Ok(config) => list_models(&config.to_app_config(), ModelType::Chat)
             .into_iter()
             .filter(|&m| m.id().starts_with(&*cur))
             .map(|m| CompletionCandidate::new(m.id()))
@@ -44,7 +45,7 @@ pub(super) fn model_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
 pub(super) fn role_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    Config::list_roles(true)
+    paths::list_roles(true)
         .into_iter()
         .filter(|r| r.starts_with(&*cur))
         .map(CompletionCandidate::new)
@@ -62,7 +63,7 @@ pub(super) fn agent_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
 pub(super) fn rag_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    Config::list_rags()
+    paths::list_rags()
         .into_iter()
         .filter(|r| r.starts_with(&*cur))
         .map(CompletionCandidate::new)
@@ -71,7 +72,7 @@ pub(super) fn rag_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
 pub(super) fn macro_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    Config::list_macros()
+    paths::list_macros()
         .into_iter()
         .filter(|m| m.starts_with(&*cur))
         .map(CompletionCandidate::new)

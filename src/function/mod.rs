@@ -3,11 +3,12 @@ pub(crate) mod todo;
 pub(crate) mod user_interaction;
 
 use crate::{
-    config::{Agent, Config, GlobalConfig},
+    config::{Agent, RequestContext},
     utils::*,
 };
 
 use crate::config::ensure_parent_exists;
+use crate::config::paths;
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
     MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
@@ -110,7 +111,7 @@ fn extract_shebang_runtime(path: &Path) -> Option<String> {
 }
 
 pub async fn eval_tool_calls(
-    config: &GlobalConfig,
+    ctx: &mut RequestContext,
     mut calls: Vec<ToolCall>,
 ) -> Result<Vec<ToolResult>> {
     let mut output = vec![];
@@ -123,9 +124,7 @@ pub async fn eval_tool_calls(
     }
     let mut is_all_null = true;
     for call in calls {
-        if let Some(checker) = &config.read().tool_call_tracker
-            && let Some(msg) = checker.check_loop(&call.clone())
-        {
+        if let Some(msg) = ctx.tool_scope.tool_tracker.check_loop(&call.clone()) {
             let dup_msg = format!("{{\"tool_call_loop_alert\":{}}}", &msg.trim());
             println!(
                 "{}",
@@ -136,7 +135,7 @@ pub async fn eval_tool_calls(
             is_all_null = false;
             continue;
         }
-        let mut result = call.eval(config).await?;
+        let mut result = call.eval(ctx).await?;
         if result.is_null() {
             result = json!("DONE");
         } else {
@@ -149,16 +148,13 @@ pub async fn eval_tool_calls(
     }
 
     if !output.is_empty() {
-        let (has_escalations, summary) = {
-            let cfg = config.read();
-            if cfg.current_depth == 0
-                && let Some(ref queue) = cfg.root_escalation_queue
-                && queue.has_pending()
-            {
-                (true, queue.pending_summary())
-            } else {
-                (false, vec![])
-            }
+        let (has_escalations, summary) = if ctx.current_depth() == 0
+            && let Some(queue) = ctx.root_escalation_queue()
+            && queue.has_pending()
+        {
+            (true, queue.pending_summary())
+        } else {
+            (false, vec![])
         };
 
         if has_escalations {
@@ -199,7 +195,7 @@ impl Functions {
     fn install_global_tools() -> Result<()> {
         info!(
             "Installing global built-in functions in {}",
-            Config::functions_dir().display()
+            paths::functions_dir().display()
         );
 
         for file in FunctionAssets::iter() {
@@ -213,7 +209,7 @@ impl Functions {
                 anyhow!("Failed to load embedded function file: {}", file.as_ref())
             })?;
             let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
-            let file_path = Config::functions_dir().join(file.as_ref());
+            let file_path = paths::functions_dir().join(file.as_ref());
             let file_extension = file_path
                 .extension()
                 .and_then(OsStr::to_str)
@@ -254,7 +250,7 @@ impl Functions {
 
         info!(
             "Building global function binaries in {}",
-            Config::functions_bin_dir().display()
+            paths::functions_bin_dir().display()
         );
         Self::build_global_function_binaries(visible_tools, None)?;
 
@@ -271,7 +267,7 @@ impl Functions {
 
             info!(
                 "Building global function binaries required by agent: {name} in {}",
-                Config::functions_bin_dir().display()
+                paths::functions_bin_dir().display()
             );
             Self::build_global_function_binaries(global_tools, Some(name))?;
             tools_declarations
@@ -279,7 +275,7 @@ impl Functions {
             debug!("No global tools found for agent: {}", name);
             Vec::new()
         };
-        let agent_script_declarations = match Config::agent_functions_file(name) {
+        let agent_script_declarations = match paths::agent_functions_file(name) {
             Ok(path) if path.exists() => {
                 info!(
                     "Loading functions script for agent: {name} from {}",
@@ -290,7 +286,7 @@ impl Functions {
 
                 info!(
                     "Building function binary for agent: {name} in {}",
-                    Config::agent_bin_dir(name).display()
+                    paths::agent_bin_dir(name).display()
                 );
                 Self::build_agent_tool_binaries(name)?;
                 script_declarations
@@ -340,14 +336,6 @@ impl Functions {
     pub fn append_user_interaction_functions(&mut self) {
         self.declarations
             .extend(user_interaction::user_interaction_function_declarations());
-    }
-
-    pub fn clear_mcp_meta_functions(&mut self) {
-        self.declarations.retain(|d| {
-            !d.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                && !d.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                && !d.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-        });
     }
 
     pub fn append_mcp_meta_functions(&mut self, mcp_servers: Vec<String>) {
@@ -453,7 +441,7 @@ impl Functions {
     fn build_global_tool_declarations(
         enabled_tools: &[String],
     ) -> Result<Vec<FunctionDeclaration>> {
-        let global_tools_directory = Config::global_tools_dir();
+        let global_tools_directory = paths::global_tools_dir();
         let mut function_declarations = Vec::new();
 
         for tool in enabled_tools {
@@ -542,7 +530,7 @@ impl Functions {
                 bail!("Unsupported tool file extension: {}", language.as_ref());
             }
 
-            let tool_path = Config::global_tools_dir().join(tool);
+            let tool_path = paths::global_tools_dir().join(tool);
             let custom_runtime = extract_shebang_runtime(&tool_path);
             Self::build_binaries(
                 binary_name,
@@ -556,7 +544,7 @@ impl Functions {
     }
 
     fn clear_agent_bin_dir(name: &str) -> Result<()> {
-        let agent_bin_directory = Config::agent_bin_dir(name);
+        let agent_bin_directory = paths::agent_bin_dir(name);
         if !agent_bin_directory.exists() {
             debug!(
                 "Creating agent bin directory: {}",
@@ -575,7 +563,7 @@ impl Functions {
     }
 
     fn clear_global_functions_bin_dir() -> Result<()> {
-        let bin_dir = Config::functions_bin_dir();
+        let bin_dir = paths::functions_bin_dir();
         if !bin_dir.exists() {
             fs::create_dir_all(&bin_dir)?;
         }
@@ -590,7 +578,7 @@ impl Functions {
     }
 
     fn build_agent_tool_binaries(name: &str) -> Result<()> {
-        let tools_file = Config::agent_functions_file(name)?;
+        let tools_file = paths::agent_functions_file(name)?;
         let language = Language::from(
             &tools_file
                 .extension()
@@ -619,18 +607,18 @@ impl Functions {
         use native::runtime;
         let (binary_file, binary_script_file) = match binary_type {
             BinaryType::Tool(None) => (
-                Config::functions_bin_dir().join(format!("{binary_name}.cmd")),
-                Config::functions_bin_dir()
+                paths::functions_bin_dir().join(format!("{binary_name}.cmd")),
+                paths::functions_bin_dir()
                     .join(format!("run-{binary_name}.{}", language.to_extension())),
             ),
             BinaryType::Tool(Some(agent_name)) => (
-                Config::agent_bin_dir(agent_name).join(format!("{binary_name}.cmd")),
-                Config::agent_bin_dir(agent_name)
+                paths::agent_bin_dir(agent_name).join(format!("{binary_name}.cmd")),
+                paths::agent_bin_dir(agent_name)
                     .join(format!("run-{binary_name}.{}", language.to_extension())),
             ),
             BinaryType::Agent => (
-                Config::agent_bin_dir(binary_name).join(format!("{binary_name}.cmd")),
-                Config::agent_bin_dir(binary_name)
+                paths::agent_bin_dir(binary_name).join(format!("{binary_name}.cmd")),
+                paths::agent_bin_dir(binary_name)
                     .join(format!("run-{binary_name}.{}", language.to_extension())),
             ),
         };
@@ -655,7 +643,7 @@ impl Functions {
         let to_script_path = |p: &str| -> String { p.replace('\\', "/") };
         let content = match binary_type {
             BinaryType::Tool(None) => {
-                let root_dir = Config::functions_dir();
+                let root_dir = paths::functions_dir();
                 let tool_path = format!(
                     "{}/{binary_name}",
                     &Config::global_tools_dir().to_string_lossy()
@@ -666,7 +654,7 @@ impl Functions {
                     .replace("{tool_path}", &to_script_path(&tool_path))
             }
             BinaryType::Tool(Some(agent_name)) => {
-                let root_dir = Config::agent_data_dir(agent_name);
+                let root_dir = paths::agent_data_dir(agent_name);
                 let tool_path = format!(
                     "{}/{binary_name}",
                     &Config::global_tools_dir().to_string_lossy()
@@ -680,12 +668,12 @@ impl Functions {
                 .replace("{agent_name}", binary_name)
                 .replace(
                     "{config_dir}",
-                    &to_script_path(&Config::config_dir().to_string_lossy()),
+                    &to_script_path(&paths::config_dir().to_string_lossy()),
                 ),
         }
         .replace(
             "{prompt_utils_file}",
-            &to_script_path(&Config::bash_prompt_utils_file().to_string_lossy()),
+            &to_script_path(&paths::bash_prompt_utils_file().to_string_lossy()),
         );
         if binary_script_file.exists() {
             fs::remove_file(&binary_script_file)?;
@@ -769,11 +757,11 @@ impl Functions {
         use std::os::unix::prelude::PermissionsExt;
 
         let binary_file = match binary_type {
-            BinaryType::Tool(None) => Config::functions_bin_dir().join(binary_name),
+            BinaryType::Tool(None) => paths::functions_bin_dir().join(binary_name),
             BinaryType::Tool(Some(agent_name)) => {
-                Config::agent_bin_dir(agent_name).join(binary_name)
+                paths::agent_bin_dir(agent_name).join(binary_name)
             }
-            BinaryType::Agent => Config::agent_bin_dir(binary_name).join(binary_name),
+            BinaryType::Agent => paths::agent_bin_dir(binary_name).join(binary_name),
         };
         info!(
             "Building binary for function: {} ({})",
@@ -795,10 +783,10 @@ impl Functions {
         let content_template = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
         let mut content = match binary_type {
             BinaryType::Tool(None) => {
-                let root_dir = Config::functions_dir();
+                let root_dir = paths::functions_dir();
                 let tool_path = format!(
                     "{}/{binary_name}",
-                    &Config::global_tools_dir().to_string_lossy()
+                    &paths::global_tools_dir().to_string_lossy()
                 );
                 content_template
                     .replace("{function_name}", binary_name)
@@ -806,10 +794,10 @@ impl Functions {
                     .replace("{tool_path}", &tool_path)
             }
             BinaryType::Tool(Some(agent_name)) => {
-                let root_dir = Config::agent_data_dir(agent_name);
+                let root_dir = paths::agent_data_dir(agent_name);
                 let tool_path = format!(
                     "{}/{binary_name}",
-                    &Config::global_tools_dir().to_string_lossy()
+                    &paths::global_tools_dir().to_string_lossy()
                 );
                 content_template
                     .replace("{function_name}", binary_name)
@@ -818,11 +806,11 @@ impl Functions {
             }
             BinaryType::Agent => content_template
                 .replace("{agent_name}", binary_name)
-                .replace("{config_dir}", &Config::config_dir().to_string_lossy()),
+                .replace("{config_dir}", &paths::config_dir().to_string_lossy()),
         }
         .replace(
             "{prompt_utils_file}",
-            &Config::bash_prompt_utils_file().to_string_lossy(),
+            &paths::bash_prompt_utils_file().to_string_lossy(),
         );
 
         if let Some(rt) = custom_runtime
@@ -952,16 +940,15 @@ impl ToolCall {
         self
     }
 
-    pub async fn eval(&self, config: &GlobalConfig) -> Result<Value> {
-        let (call_name, cmd_name, mut cmd_args, envs) = match &config.read().agent {
-            Some(agent) => self.extract_call_config_from_agent(config, agent)?,
-            None => self.extract_call_config_from_config(config)?,
+    pub async fn eval(&self, ctx: &mut RequestContext) -> Result<Value> {
+        let agent = ctx.agent.clone();
+        let functions = ctx.tool_scope.functions.clone();
+        let current_depth = ctx.current_depth();
+        let agent_name = agent.as_ref().map(|agent| agent.name().to_owned());
+        let (call_name, cmd_name, mut cmd_args, envs) = match agent.as_ref() {
+            Some(agent) => self.extract_call_config_from_agent(&functions, agent)?,
+            None => self.extract_call_config_from_ctx(&functions)?,
         };
-        let agent_name = config
-            .read()
-            .agent
-            .as_ref()
-            .map(|agent| agent.name().to_owned());
 
         let json_data = if self.arguments.is_object() {
             self.arguments.clone()
@@ -981,20 +968,22 @@ impl ToolCall {
 
         let prompt = format!("Call {cmd_name} {}", cmd_args.join(" "));
 
-        if *IS_STDOUT_TERMINAL && config.read().current_depth == 0 {
+        if *IS_STDOUT_TERMINAL && current_depth == 0 {
             println!("{}", dimmed_text(&prompt));
         }
 
         let output = match cmd_name.as_str() {
             _ if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) => {
-                Self::search_mcp_tools(config, &cmd_name, &json_data).unwrap_or_else(|e| {
-                    let error_msg = format!("MCP search failed: {e}");
-                    eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
-                    json!({"tool_call_error": error_msg})
-                })
+                Self::search_mcp_tools(ctx, &cmd_name, &json_data)
+                    .await
+                    .unwrap_or_else(|e| {
+                        let error_msg = format!("MCP search failed: {e}");
+                        eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        json!({"tool_call_error": error_msg})
+                    })
             }
             _ if cmd_name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX) => {
-                Self::describe_mcp_tool(config, &cmd_name, json_data)
+                Self::describe_mcp_tool(ctx, &cmd_name, json_data)
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP describe failed: {e}");
@@ -1003,7 +992,7 @@ impl ToolCall {
                     })
             }
             _ if cmd_name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX) => {
-                Self::invoke_mcp_tool(config, &cmd_name, &json_data)
+                Self::invoke_mcp_tool(ctx, &cmd_name, &json_data)
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP tool invocation failed: {e}");
@@ -1012,14 +1001,14 @@ impl ToolCall {
                     })
             }
             _ if cmd_name.starts_with(TODO_FUNCTION_PREFIX) => {
-                todo::handle_todo_tool(config, &cmd_name, &json_data).unwrap_or_else(|e| {
+                todo::handle_todo_tool(ctx, &cmd_name, &json_data).unwrap_or_else(|e| {
                     let error_msg = format!("Todo tool failed: {e}");
                     eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
                     json!({"tool_call_error": error_msg})
                 })
             }
             _ if cmd_name.starts_with(SUPERVISOR_FUNCTION_PREFIX) => {
-                supervisor::handle_supervisor_tool(config, &cmd_name, &json_data)
+                supervisor::handle_supervisor_tool(ctx, &cmd_name, &json_data)
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("Supervisor tool failed: {e}");
@@ -1028,7 +1017,7 @@ impl ToolCall {
                     })
             }
             _ if cmd_name.starts_with(USER_FUNCTION_PREFIX) => {
-                user_interaction::handle_user_tool(config, &cmd_name, &json_data)
+                user_interaction::handle_user_tool(ctx, &cmd_name, &json_data)
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("User interaction failed: {e}");
@@ -1051,7 +1040,7 @@ impl ToolCall {
     }
 
     async fn describe_mcp_tool(
-        config: &GlobalConfig,
+        ctx: &RequestContext,
         cmd_name: &str,
         json_data: Value,
     ) -> Result<Value> {
@@ -1061,18 +1050,19 @@ impl ToolCall {
             .ok_or_else(|| anyhow!("Missing 'tool' in arguments"))?
             .as_str()
             .ok_or_else(|| anyhow!("Invalid 'tool' in arguments"))?;
-        let registry_arc = {
-            let cfg = config.read();
-            cfg.mcp_registry
-                .clone()
-                .with_context(|| "MCP is not configured")?
-        };
-
-        let result = registry_arc.describe(&server_id, tool).await?;
+        let result = ctx
+            .tool_scope
+            .mcp_runtime
+            .describe(&server_id, tool)
+            .await?;
         Ok(serde_json::to_value(result)?)
     }
 
-    fn search_mcp_tools(config: &GlobalConfig, cmd_name: &str, json_data: &Value) -> Result<Value> {
+    async fn search_mcp_tools(
+        ctx: &RequestContext,
+        cmd_name: &str,
+        json_data: &Value,
+    ) -> Result<Value> {
         let server = cmd_name.replace(&format!("{MCP_SEARCH_META_FUNCTION_NAME_PREFIX}_"), "");
         let query = json_data
             .get("query")
@@ -1085,15 +1075,12 @@ impl ToolCall {
             .unwrap_or_else(|| Value::from(8u64))
             .as_u64()
             .ok_or_else(|| anyhow!("Invalid 'top_k' in arguments"))? as usize;
-        let registry_arc = {
-            let cfg = config.read();
-            cfg.mcp_registry
-                .clone()
-                .with_context(|| "MCP is not configured")?
-        };
 
-        let catalog_items = registry_arc
-            .search_tools_server(&server, query, top_k)
+        let catalog_items = ctx
+            .tool_scope
+            .mcp_runtime
+            .search(&server, query, top_k)
+            .await?
             .into_iter()
             .map(|it| serde_json::to_value(&it).unwrap_or_default())
             .collect();
@@ -1101,7 +1088,7 @@ impl ToolCall {
     }
 
     async fn invoke_mcp_tool(
-        config: &GlobalConfig,
+        ctx: &RequestContext,
         cmd_name: &str,
         json_data: &Value,
     ) -> Result<Value> {
@@ -1115,20 +1102,18 @@ impl ToolCall {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let registry_arc = {
-            let cfg = config.read();
-            cfg.mcp_registry
-                .clone()
-                .with_context(|| "MCP is not configured")?
-        };
 
-        let result = registry_arc.invoke(&server, tool, arguments).await?;
+        let result = ctx
+            .tool_scope
+            .mcp_runtime
+            .invoke(&server, tool, arguments)
+            .await?;
         Ok(serde_json::to_value(result)?)
     }
 
     fn extract_call_config_from_agent(
         &self,
-        config: &GlobalConfig,
+        functions: &Functions,
         agent: &Agent,
     ) -> Result<CallConfig> {
         let function_name = self.name.clone();
@@ -1151,13 +1136,13 @@ impl ToolCall {
                     ))
                 }
             }
-            None => self.extract_call_config_from_config(config),
+            None => self.extract_call_config_from_ctx(functions),
         }
     }
 
-    fn extract_call_config_from_config(&self, config: &GlobalConfig) -> Result<CallConfig> {
+    fn extract_call_config_from_ctx(&self, functions: &Functions) -> Result<CallConfig> {
         let function_name = self.name.clone();
-        match config.read().functions.contains(&function_name) {
+        match functions.contains(&function_name) {
             true => Ok((
                 function_name.clone(),
                 function_name,
@@ -1179,12 +1164,12 @@ pub fn run_llm_function(
     let mut command_name = cmd_name.clone();
     if let Some(agent_name) = agent_name {
         command_name = cmd_args[0].clone();
-        let dir = Config::agent_bin_dir(&agent_name);
+        let dir = paths::agent_bin_dir(&agent_name);
         if dir.exists() {
             bin_dirs.push(dir);
         }
     } else {
-        bin_dirs.push(Config::functions_bin_dir());
+        bin_dirs.push(paths::functions_bin_dir());
     }
     let current_path = env::var("PATH").context("No PATH environment variable")?;
     let prepend_path = bin_dirs

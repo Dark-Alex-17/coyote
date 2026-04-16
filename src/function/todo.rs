@@ -1,5 +1,5 @@
 use super::{FunctionDeclaration, JsonSchema};
-use crate::config::GlobalConfig;
+use crate::config::RequestContext;
 
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
@@ -89,7 +89,7 @@ pub fn todo_function_declarations() -> Vec<FunctionDeclaration> {
     ]
 }
 
-pub fn handle_todo_tool(config: &GlobalConfig, cmd_name: &str, args: &Value) -> Result<Value> {
+pub fn handle_todo_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) -> Result<Value> {
     let action = cmd_name
         .strip_prefix(TODO_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
@@ -97,8 +97,7 @@ pub fn handle_todo_tool(config: &GlobalConfig, cmd_name: &str, args: &Value) -> 
     match action {
         "init" => {
             let goal = args.get("goal").and_then(Value::as_str).unwrap_or_default();
-            let mut cfg = config.write();
-            let agent = cfg.agent.as_mut();
+            let agent = ctx.agent.as_mut();
             match agent {
                 Some(agent) => {
                     agent.init_todo_list(goal);
@@ -112,8 +111,7 @@ pub fn handle_todo_tool(config: &GlobalConfig, cmd_name: &str, args: &Value) -> 
             if task.is_empty() {
                 return Ok(json!({"error": "task description is required"}));
             }
-            let mut cfg = config.write();
-            let agent = cfg.agent.as_mut();
+            let agent = ctx.agent.as_mut();
             match agent {
                 Some(agent) => {
                     let id = agent.add_todo(task);
@@ -132,8 +130,7 @@ pub fn handle_todo_tool(config: &GlobalConfig, cmd_name: &str, args: &Value) -> 
                 .map(|v| v as usize);
             match id {
                 Some(id) => {
-                    let mut cfg = config.write();
-                    let agent = cfg.agent.as_mut();
+                    let agent = ctx.agent.as_mut();
                     match agent {
                         Some(agent) => {
                             if agent.mark_todo_done(id) {
@@ -151,8 +148,7 @@ pub fn handle_todo_tool(config: &GlobalConfig, cmd_name: &str, args: &Value) -> 
             }
         }
         "list" => {
-            let cfg = config.read();
-            let agent = cfg.agent.as_ref();
+            let agent = ctx.agent.as_ref();
             match agent {
                 Some(agent) => {
                     let list = agent.todo_list();
@@ -167,8 +163,7 @@ pub fn handle_todo_tool(config: &GlobalConfig, cmd_name: &str, args: &Value) -> 
             }
         }
         "clear" => {
-            let mut cfg = config.write();
-            let agent = cfg.agent.as_mut();
+            let agent = ctx.agent.as_mut();
             match agent {
                 Some(agent) => {
                     agent.clear_todo_list();

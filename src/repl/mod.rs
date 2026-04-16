@@ -7,8 +7,9 @@ use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
 use crate::client::{call_chat_completions, call_chat_completions_streaming, init_client, oauth};
+use crate::config::paths;
 use crate::config::{
-    AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage, StateFlags,
+    AgentVariables, AppConfig, AssertState, Input, LastMessage, RequestContext, StateFlags,
     macro_execute,
 };
 use crate::render::render_error;
@@ -16,11 +17,11 @@ use crate::utils::{
     AbortSignal, abortable_run_with_spinner, create_abort_signal, dimmed_text, set_text, temp_file,
 };
 
-use crate::mcp::McpRegistry;
 use crate::resolve_oauth_client;
 use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
+use parking_lot::RwLock;
 use reedline::CursorConfig;
 use reedline::{
     ColumnarMenu, EditCommand, EditMode, Emacs, KeyCode, KeyModifiers, Keybindings, Reedline,
@@ -29,7 +30,7 @@ use reedline::{
 };
 use reedline::{MenuBuilder, Signal};
 use std::sync::LazyLock;
-use std::{env, mem, process};
+use std::{env, process, sync::Arc};
 
 const MENU_NAME: &str = "completion_menu";
 
@@ -208,21 +209,22 @@ static MULTILINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^\s*:::\s*(.*)\s*:::\s*$").unwrap());
 
 pub struct Repl {
-    config: GlobalConfig,
+    ctx: Arc<RwLock<RequestContext>>,
     editor: Reedline,
     prompt: ReplPrompt,
     abort_signal: AbortSignal,
 }
 
 impl Repl {
-    pub fn init(config: &GlobalConfig) -> Result<Self> {
-        let editor = Self::create_editor(config)?;
-
-        let prompt = ReplPrompt::new(config);
+    pub fn init(ctx: RequestContext) -> Result<Self> {
+        let app = Arc::clone(&ctx.app.config);
+        let ctx = Arc::new(RwLock::new(ctx));
+        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref())?;
+        let prompt = ReplPrompt::new(Arc::clone(&ctx));
         let abort_signal = create_abort_signal();
 
         Ok(Self {
-            config: config.clone(),
+            ctx,
             editor,
             prompt,
             abort_signal,
@@ -230,9 +232,7 @@ impl Repl {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        if AssertState::False(StateFlags::AGENT | StateFlags::RAG)
-            .assert(self.config.read().state())
-        {
+        if AssertState::False(StateFlags::AGENT | StateFlags::RAG).assert(self.ctx.read().state()) {
             print!(
                 r#"Welcome to {} {}
 Type ".help" for additional help.
@@ -250,7 +250,11 @@ Type ".help" for additional help.
             match sig {
                 Ok(Signal::Success(line)) => {
                     self.abort_signal.reset();
-                    match run_repl_command(&self.config, self.abort_signal.clone(), &line).await {
+                    let result = {
+                        let mut ctx = self.ctx.write();
+                        run_repl_command(&mut ctx, self.abort_signal.clone(), &line).await
+                    };
+                    match result {
                         Ok(exit) => {
                             if exit {
                                 break;
@@ -273,15 +277,15 @@ Type ".help" for additional help.
                 _ => {}
             }
         }
-        self.config.write().exit_session()?;
+        self.ctx.write().exit_session()?;
         Ok(())
     }
 
-    fn create_editor(config: &GlobalConfig) -> Result<Reedline> {
-        let completer = ReplCompleter::new(config);
-        let highlighter = ReplHighlighter::new(config);
+    fn create_editor(ctx: Arc<RwLock<RequestContext>>, app: &AppConfig) -> Result<Reedline> {
+        let completer = ReplCompleter::new(Arc::clone(&ctx));
+        let highlighter = ReplHighlighter::new();
         let menu = Self::create_menu();
-        let edit_mode = Self::create_edit_mode(config);
+        let edit_mode = Self::create_edit_mode(app);
         let cursor_config = CursorConfig {
             vi_insert: Some(SetCursorStyle::BlinkingBar),
             vi_normal: Some(SetCursorStyle::SteadyBlock),
@@ -299,7 +303,7 @@ Type ".help" for additional help.
             .with_validator(Box::new(ReplValidator))
             .with_ansi_colors(true);
 
-        if let Ok(cmd) = config.read().editor() {
+        if let Ok(cmd) = app.editor() {
             let temp_file = temp_file("-repl-", ".md");
             let command = process::Command::new(cmd);
             editor = editor.with_buffer_editor(command, temp_file);
@@ -334,8 +338,8 @@ Type ".help" for additional help.
         );
     }
 
-    fn create_edit_mode(config: &GlobalConfig) -> Box<dyn EditMode> {
-        let edit_mode: Box<dyn EditMode> = if config.read().keybindings == "vi" {
+    fn create_edit_mode(app: &AppConfig) -> Box<dyn EditMode> {
+        let edit_mode: Box<dyn EditMode> = if app.keybindings == "vi" {
             let mut insert_keybindings = default_vi_insert_keybindings();
             Self::extra_keybindings(&mut insert_keybindings);
             Box::new(Vi::new(insert_keybindings, default_vi_normal_keybindings()))
@@ -389,7 +393,7 @@ impl Validator for ReplValidator {
 }
 
 pub async fn run_repl_command(
-    config: &GlobalConfig,
+    ctx: &mut RequestContext,
     abort_signal: AbortSignal,
     mut line: &str,
 ) -> Result<bool> {
@@ -405,66 +409,74 @@ pub async fn run_repl_command(
             }
             ".info" => match args {
                 Some("role") => {
-                    let info = config.read().role_info()?;
+                    let info = ctx.role_info()?;
                     print!("{info}");
                 }
                 Some("session") => {
-                    let info = config.read().session_info()?;
+                    let app = Arc::clone(&ctx.app.config);
+                    let info = ctx.session_info(app.as_ref())?;
                     print!("{info}");
                 }
                 Some("rag") => {
-                    let info = config.read().rag_info()?;
+                    let info = ctx.rag_info()?;
                     print!("{info}");
                 }
                 Some("agent") => {
-                    let info = config.read().agent_info()?;
+                    let info = ctx.agent_info()?;
                     print!("{info}");
                 }
                 Some(_) => unknown_command()?,
                 None => {
-                    let output = config.read().sysinfo()?;
+                    let app = Arc::clone(&ctx.app.config);
+                    let output = ctx.sysinfo(app.as_ref())?;
                     print!("{output}");
                 }
             },
             ".model" => match args {
                 Some(name) => {
-                    config.write().set_model(name)?;
+                    let app = Arc::clone(&ctx.app.config);
+                    ctx.set_model_on_role_like(app.as_ref(), name)?;
                 }
                 None => println!("Usage: .model <name>"),
             },
             ".authenticate" => {
-                let current_model = config.read().current_model().clone();
-                let client = init_client(config, Some(current_model))?;
+                let current_model = ctx.current_model().clone();
+                let app = Arc::clone(&ctx.app.config);
+                let client = init_client(&app, current_model)?;
                 if !client.supports_oauth() {
                     bail!(
                         "Client '{}' doesn't either support OAuth or isn't configured to use it (i.e. uses an API key instead)",
                         client.name()
                     );
                 }
-                let clients = config.read().clients.clone();
+                let clients = ctx.app.config.clients.clone();
                 let (client_name, provider) = resolve_oauth_client(Some(client.name()), &clients)?;
                 oauth::run_oauth_flow(&*provider, &client_name).await?;
             }
             ".prompt" => match args {
                 Some(text) => {
-                    config.write().use_prompt(text)?;
+                    let app = Arc::clone(&ctx.app.config);
+                    ctx.use_prompt(app.as_ref(), text)?;
                 }
                 None => println!("Usage: .prompt <text>..."),
             },
             ".role" => match args {
                 Some(args) => match args.split_once(['\n', ' ']) {
                     Some((name, text)) => {
-                        let role = config.read().retrieve_role(name.trim())?;
-                        let input = Input::from_str(config, text, Some(role));
-                        ask(config, abort_signal.clone(), input, false).await?;
+                        let app = Arc::clone(&ctx.app.config);
+                        let role = ctx.retrieve_role(app.as_ref(), name.trim())?;
+                        let input = Input::from_str(ctx, text, Some(role));
+                        ask(ctx, abort_signal.clone(), input, false).await?;
                     }
                     None => {
                         let name = args;
-                        if !Config::has_role(name) {
-                            config.write().new_role(name)?;
+                        let app = Arc::clone(&ctx.app.config);
+                        if !paths::has_role(name) {
+                            ctx.new_role(app.as_ref(), name)?;
                         }
 
-                        Config::use_role_safely(config, name, abort_signal.clone()).await?;
+                        ctx.use_role(app.as_ref(), name, abort_signal.clone())
+                            .await?;
                     }
                 },
                 None => println!(
@@ -474,11 +486,26 @@ pub async fn run_repl_command(
                 ),
             },
             ".session" => {
-                Config::use_session_safely(config, args, abort_signal.clone()).await?;
-                Config::maybe_autoname_session(config.clone());
+                let app = Arc::clone(&ctx.app.config);
+                ctx.use_session(app.as_ref(), args, abort_signal.clone())
+                    .await?;
+                if ctx.maybe_autoname_session() {
+                    let color = if app.light_theme() {
+                        nu_ansi_term::Color::LightGray
+                    } else {
+                        nu_ansi_term::Color::DarkGray
+                    };
+                    eprintln!("\n📢 {}", color.italic().paint("Autonaming the session."),);
+                    if let Err(err) = ctx.autoname_session(app.as_ref()).await {
+                        log::warn!("Failed to autonaming the session: {err}");
+                    }
+                    if let Some(session) = ctx.session.as_mut() {
+                        session.set_autonaming(false);
+                    }
+                }
             }
             ".rag" => {
-                Config::use_rag(config, args, abort_signal.clone()).await?;
+                ctx.use_rag(args, abort_signal.clone()).await?;
             }
             ".agent" => match split_first_arg(args) {
                 Some((agent_name, args)) => {
@@ -497,13 +524,11 @@ pub async fn run_repl_command(
                         bail!("Some variable values are not key=value pairs");
                     }
                     if !variables.is_empty() {
-                        config.write().agent_variables = Some(variables);
+                        ctx.agent_variables = Some(variables.clone());
                     }
-                    let ret =
-                        Config::use_agent(config, agent_name, session_name, abort_signal.clone())
-                            .await;
-                    config.write().agent_variables = None;
-                    ret?;
+                    let app = Arc::clone(&ctx.app.config);
+                    ctx.use_agent(app.as_ref(), agent_name, session_name, abort_signal.clone())
+                        .await?;
                 }
                 None => {
                     println!(r#"Usage: .agent <agent-name> [session-name] [key=value]..."#)
@@ -512,7 +537,7 @@ pub async fn run_repl_command(
             ".starter" => match args {
                 Some(id) => {
                     let mut text = None;
-                    if let Some(agent) = config.read().agent.as_ref() {
+                    if let Some(agent) = ctx.agent.as_ref() {
                         for (i, value) in agent.conversation_starters().iter().enumerate() {
                             if (i + 1).to_string() == id {
                                 text = Some(value.clone());
@@ -522,8 +547,8 @@ pub async fn run_repl_command(
                     match text {
                         Some(text) => {
                             println!("{}", dimmed_text(&format!(">> {text}")));
-                            let input = Input::from_str(config, &text, None);
-                            ask(config, abort_signal.clone(), input, true).await?;
+                            let input = Input::from_str(ctx, &text, None);
+                            ask(ctx, abort_signal.clone(), input, true).await?;
                         }
                         None => {
                             bail!("Invalid starter value");
@@ -531,50 +556,43 @@ pub async fn run_repl_command(
                     }
                 }
                 None => {
-                    let banner = config.read().agent_banner()?;
-                    config.read().print_markdown(&banner)?;
+                    let banner = ctx.agent_banner()?;
+                    ctx.app.config.print_markdown(&banner)?;
                 }
             },
             ".save" => match split_first_arg(args) {
                 Some(("role", name)) => {
-                    config.write().save_role(name)?;
+                    ctx.save_role(name)?;
                 }
                 Some(("session", name)) => {
-                    config.write().save_session(name)?;
+                    ctx.save_session(name)?;
                 }
                 _ => {
                     println!(r#"Usage: .save <role|session> [name]"#)
                 }
             },
             ".edit" => {
-                if config.read().macro_flag {
+                if ctx.macro_flag {
                     bail!("Cannot perform this operation because you are in a macro")
                 }
                 match args {
                     Some("config") => {
-                        config.read().edit_config()?;
+                        ctx.edit_config()?;
                     }
                     Some("role") => {
-                        let mut cfg = {
-                            let mut guard = config.write();
-                            mem::take(&mut *guard)
-                        };
-
-                        cfg.edit_role(abort_signal.clone()).await?;
-
-                        {
-                            let mut guard = config.write();
-                            *guard = cfg;
-                        }
+                        let app = Arc::clone(&ctx.app.config);
+                        ctx.edit_role(app.as_ref(), abort_signal.clone()).await?;
                     }
                     Some("session") => {
-                        config.write().edit_session()?;
+                        let app = Arc::clone(&ctx.app.config);
+                        ctx.edit_session(app.as_ref())?;
                     }
                     Some("rag-docs") => {
-                        Config::edit_rag_docs(config, abort_signal.clone()).await?;
+                        ctx.edit_rag_docs(abort_signal.clone()).await?;
                     }
                     Some("agent-config") => {
-                        config.write().edit_agent_config()?;
+                        let app = Arc::clone(&ctx.app.config);
+                        ctx.edit_agent_config(app.as_ref())?;
                     }
                     _ => {
                         println!(r#"Usage: .edit <config|role|session|rag-docs|agent-config>"#)
@@ -584,7 +602,7 @@ pub async fn run_repl_command(
             ".compress" => match args {
                 Some("session") => {
                     abortable_run_with_spinner(
-                        Config::compress_session(config),
+                        ctx.compress_session(),
                         "Compressing",
                         abort_signal.clone(),
                     )
@@ -597,7 +615,7 @@ pub async fn run_repl_command(
             },
             ".empty" => match args {
                 Some("session") => {
-                    config.write().empty_session()?;
+                    ctx.empty_session()?;
                 }
                 _ => {
                     println!(r#"Usage: .empty session"#)
@@ -605,7 +623,7 @@ pub async fn run_repl_command(
             },
             ".rebuild" => match args {
                 Some("rag") => {
-                    Config::rebuild_rag(config, abort_signal.clone()).await?;
+                    ctx.rebuild_rag(abort_signal.clone()).await?;
                 }
                 _ => {
                     println!(r#"Usage: .rebuild rag"#)
@@ -613,7 +631,7 @@ pub async fn run_repl_command(
             },
             ".sources" => match args {
                 Some("rag") => {
-                    let output = Config::rag_sources(config)?;
+                    let output = ctx.rag_sources()?;
                     println!("{output}");
                 }
                 _ => {
@@ -622,10 +640,11 @@ pub async fn run_repl_command(
             },
             ".macro" => match split_first_arg(args) {
                 Some((name, extra)) => {
-                    if !Config::has_macro(name) && extra.is_none() {
-                        config.write().new_macro(name)?;
+                    let app = Arc::clone(&ctx.app.config);
+                    if !paths::has_macro(name) && extra.is_none() {
+                        ctx.new_macro(app.as_ref(), name)?;
                     } else {
-                        macro_execute(config, name, extra, abort_signal.clone()).await?;
+                        macro_execute(ctx, name, extra, abort_signal.clone()).await?;
                     }
                 }
                 None => println!("Usage: .macro <name> <text>..."),
@@ -634,14 +653,14 @@ pub async fn run_repl_command(
                 Some(args) => {
                     let (files, text) = split_args_text(args, cfg!(windows));
                     let input = Input::from_files_with_spinner(
-                        config,
+                        ctx,
                         text,
                         files,
                         None,
                         abort_signal.clone(),
                     )
                     .await?;
-                    ask(config, abort_signal.clone(), input, true).await?;
+                    ask(ctx, abort_signal.clone(), input, true).await?;
                 }
                 None => println!(
                     r#"Usage: .file <file|dir|url|cmd|loader:resource|%%>... [-- <text>...]
@@ -658,8 +677,7 @@ pub async fn run_repl_command(
             ".continue" => {
                 let LastMessage {
                     mut input, output, ..
-                } = match config
-                    .read()
+                } = match ctx
                     .last_message
                     .as_ref()
                     .filter(|v| v.continuous && !v.output.is_empty())
@@ -669,25 +687,21 @@ pub async fn run_repl_command(
                     None => bail!("Unable to continue the response"),
                 };
                 input.set_continue_output(&output);
-                ask(config, abort_signal.clone(), input, true).await?;
+                ask(ctx, abort_signal.clone(), input, true).await?;
             }
             ".regenerate" => {
-                let LastMessage { mut input, .. } = match config
-                    .read()
-                    .last_message
-                    .as_ref()
-                    .filter(|v| v.continuous)
-                    .cloned()
-                {
-                    Some(v) => v,
-                    None => bail!("Unable to regenerate the response"),
-                };
-                input.set_regenerate();
-                ask(config, abort_signal.clone(), input, true).await?;
+                let LastMessage { mut input, .. } =
+                    match ctx.last_message.as_ref().filter(|v| v.continuous).cloned() {
+                        Some(v) => v,
+                        None => bail!("Unable to regenerate the response"),
+                    };
+                let app = Arc::clone(&ctx.app.config);
+                input.set_regenerate(ctx.extract_role(&app));
+                ask(ctx, abort_signal.clone(), input, true).await?;
             }
             ".set" => match args {
                 Some(args) => {
-                    Config::update(config, args, abort_signal).await?;
+                    ctx.update(args, abort_signal).await?;
                 }
                 _ => {
                     println!("Usage: .set <key> <value>...")
@@ -695,15 +709,14 @@ pub async fn run_repl_command(
             },
             ".delete" => match args {
                 Some(args) => {
-                    Config::delete(config, args)?;
+                    ctx.delete(args)?;
                 }
                 _ => {
                     println!("Usage: .delete <role|session|rag|macro|agent-data>")
                 }
             },
             ".copy" => {
-                let output = match config
-                    .read()
+                let output = match ctx
                     .last_message
                     .as_ref()
                     .filter(|v| !v.output.is_empty())
@@ -716,89 +729,29 @@ pub async fn run_repl_command(
             }
             ".exit" => match args {
                 Some("role") => {
-                    config.write().exit_role()?;
-                    config.write().functions.clear_mcp_meta_functions();
-
-                    let registry = config
-                        .write()
-                        .mcp_registry
-                        .take()
-                        .expect("MCP registry should exist");
-                    let enabled_mcp_servers = if config.read().mcp_server_support {
-                        config.read().enabled_mcp_servers.clone()
-                    } else {
-                        None
-                    };
-                    let registry =
-                        McpRegistry::reinit(registry, enabled_mcp_servers, abort_signal.clone())
-                            .await?;
-                    if !registry.is_empty() {
-                        config
-                            .write()
-                            .functions
-                            .append_mcp_meta_functions(registry.list_started_servers());
-                    }
-                    config.write().mcp_registry = Some(registry);
+                    ctx.exit_role()?;
+                    let app = Arc::clone(&ctx.app.config);
+                    ctx.bootstrap_tools(app.as_ref(), true, abort_signal.clone())
+                        .await?;
                 }
                 Some("session") => {
-                    if config.read().agent.is_some() {
-                        config.write().exit_agent_session()?;
-                        config.write().functions.clear_mcp_meta_functions();
-
-                        let registry = config
-                            .write()
-                            .mcp_registry
-                            .take()
-                            .expect("MCP registry should exist");
-                        let enabled_mcp_servers = if config.read().mcp_server_support {
-                            config.read().enabled_mcp_servers.clone()
-                        } else {
-                            None
-                        };
-                        let registry = McpRegistry::reinit(
-                            registry,
-                            enabled_mcp_servers,
-                            abort_signal.clone(),
-                        )
-                        .await?;
-                        if !registry.is_empty() {
-                            config
-                                .write()
-                                .functions
-                                .append_mcp_meta_functions(registry.list_started_servers());
-                        }
-                        config.write().mcp_registry = Some(registry);
+                    if ctx.agent.is_some() {
+                        ctx.exit_agent_session()?;
                     } else {
-                        config.write().exit_session()?;
+                        ctx.exit_session()?;
                     }
+                    let app = Arc::clone(&ctx.app.config);
+                    ctx.bootstrap_tools(app.as_ref(), true, abort_signal.clone())
+                        .await?;
                 }
                 Some("rag") => {
-                    config.write().exit_rag()?;
+                    ctx.exit_rag()?;
                 }
                 Some("agent") => {
-                    config.write().exit_agent()?;
-                    config.write().functions.clear_mcp_meta_functions();
-
-                    let registry = config
-                        .write()
-                        .mcp_registry
-                        .take()
-                        .expect("MCP registry should exist");
-                    let enabled_mcp_servers = if config.read().mcp_server_support {
-                        config.read().enabled_mcp_servers.clone()
-                    } else {
-                        None
-                    };
-                    let registry =
-                        McpRegistry::reinit(registry, enabled_mcp_servers, abort_signal.clone())
-                            .await?;
-                    if !registry.is_empty() {
-                        config
-                            .write()
-                            .functions
-                            .append_mcp_meta_functions(registry.list_started_servers());
-                    }
-                    config.write().mcp_registry = Some(registry);
+                    let app = Arc::clone(&ctx.app.config);
+                    ctx.exit_agent(app.as_ref())?;
+                    ctx.bootstrap_tools(app.as_ref(), true, abort_signal.clone())
+                        .await?;
                 }
                 Some(_) => unknown_command()?,
                 None => {
@@ -810,8 +763,7 @@ pub async fn run_repl_command(
                     bail!("Use '.empty session' instead");
                 }
                 Some("todo") => {
-                    let mut cfg = config.write();
-                    match cfg.agent.as_mut() {
+                    let cleared = match ctx.agent.as_mut() {
                         Some(agent) => {
                             if !agent.auto_continue_enabled() {
                                 bail!(
@@ -820,47 +772,50 @@ pub async fn run_repl_command(
                             }
                             if agent.todo_list().is_empty() {
                                 println!("Todo list is already empty.");
+                                false
                             } else {
                                 agent.clear_todo_list();
                                 println!("Todo list cleared.");
+                                true
                             }
                         }
                         None => bail!("No active agent"),
-                    }
+                    };
+                    let _ = cleared;
                 }
                 _ => unknown_command()?,
             },
             ".vault" => match split_first_arg(args) {
                 Some(("add", name)) => {
                     if let Some(name) = name {
-                        config.read().vault.add_secret(name)?;
+                        ctx.app.vault.add_secret(name)?;
                     } else {
                         println!("Usage: .vault add <name>");
                     }
                 }
                 Some(("get", name)) => {
                     if let Some(name) = name {
-                        config.read().vault.get_secret(name, true)?;
+                        ctx.app.vault.get_secret(name, true)?;
                     } else {
                         println!("Usage: .vault get <name>");
                     }
                 }
                 Some(("update", name)) => {
                     if let Some(name) = name {
-                        config.read().vault.update_secret(name)?;
+                        ctx.app.vault.update_secret(name)?;
                     } else {
                         println!("Usage: .vault update <name>");
                     }
                 }
                 Some(("delete", name)) => {
                     if let Some(name) = name {
-                        config.read().vault.delete_secret(name)?;
+                        ctx.app.vault.delete_secret(name)?;
                     } else {
                         println!("Usage: .vault delete <name>");
                     }
                 }
                 Some(("list", _)) => {
-                    config.read().vault.list_secrets(true)?;
+                    ctx.app.vault.list_secrets(true)?;
                 }
                 None | Some(_) => {
                     println!("Usage: .vault <add|get|update|delete|list> [name]")
@@ -869,20 +824,13 @@ pub async fn run_repl_command(
             _ => unknown_command()?,
         },
         None => {
-            if config
-                .read()
-                .agent
-                .as_ref()
-                .is_some_and(|a| a.continuation_count() > 0)
-            {
-                config.write().agent.as_mut().unwrap().reset_continuation();
-            }
-            let input = Input::from_str(config, line, None);
-            ask(config, abort_signal.clone(), input, true).await?;
+            reset_agent_continuation(ctx);
+            let input = Input::from_str(ctx, line, None);
+            ask(ctx, abort_signal.clone(), input, true).await?;
         }
     }
 
-    if !config.read().macro_flag {
+    if !ctx.macro_flag {
         println!();
     }
 
@@ -891,7 +839,7 @@ pub async fn run_repl_command(
 
 #[async_recursion::async_recursion]
 async fn ask(
-    config: &GlobalConfig,
+    ctx: &mut RequestContext,
     abort_signal: AbortSignal,
     mut input: Input,
     with_embeddings: bool,
@@ -902,44 +850,41 @@ async fn ask(
     if with_embeddings {
         input.use_embeddings(abort_signal.clone()).await?;
     }
-    while config.read().is_compressing_session() {
+    while ctx.is_compressing_session() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     let client = input.create_client()?;
-    config.write().before_chat_completion(&input)?;
+    let app = Arc::clone(&ctx.app.config);
+    ctx.before_chat_completion(&input)?;
     let (output, tool_results) = if input.stream() {
-        call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await?
+        call_chat_completions_streaming(&input, client.as_ref(), ctx, abort_signal.clone()).await?
     } else {
-        call_chat_completions(&input, true, false, client.as_ref(), abort_signal.clone()).await?
+        call_chat_completions(
+            &input,
+            true,
+            false,
+            client.as_ref(),
+            ctx,
+            abort_signal.clone(),
+        )
+        .await?
     };
-    config
-        .write()
-        .after_chat_completion(&input, &output, &tool_results)?;
+    ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
     if !tool_results.is_empty() {
         ask(
-            config,
+            ctx,
             abort_signal,
             input.merge_tool_results(output, tool_results),
             false,
         )
         .await
     } else {
-        let should_continue = {
-            let cfg = config.read();
-            if let Some(agent) = &cfg.agent {
-                agent.auto_continue_enabled()
-                    && agent.continuation_count() < agent.max_auto_continues()
-                    && agent.todo_list().has_incomplete()
-            } else {
-                false
-            }
-        };
+        let should_continue = agent_should_continue(ctx);
 
         if should_continue {
             let full_prompt = {
-                let mut cfg = config.write();
-                let agent = cfg.agent.as_mut().expect("agent checked above");
+                let agent = ctx.agent.as_mut().expect("agent checked above");
                 agent.set_last_continuation_response(output.clone());
                 agent.increment_continuation();
                 let count = agent.continuation_count();
@@ -949,7 +894,7 @@ async fn ask(
                 let remaining = agent.todo_list().incomplete_count();
                 let prompt = agent.continuation_prompt();
 
-                let color = if cfg.light_theme() {
+                let color = if app.light_theme() {
                     nu_ansi_term::Color::LightGray
                 } else {
                     nu_ansi_term::Color::DarkGray
@@ -963,62 +908,54 @@ async fn ask(
 
                 format!("{prompt}\n\n{todo_state}")
             };
-            let continuation_input = Input::from_str(config, &full_prompt, None);
-            ask(config, abort_signal, continuation_input, false).await
+            let continuation_input = Input::from_str(ctx, &full_prompt, None);
+            ask(ctx, abort_signal, continuation_input, false).await
         } else {
-            if config
-                .read()
-                .agent
-                .as_ref()
-                .is_some_and(|a| a.continuation_count() > 0)
-            {
-                config.write().agent.as_mut().unwrap().reset_continuation();
+            reset_agent_continuation(ctx);
+            if ctx.maybe_autoname_session() {
+                let color = if app.light_theme() {
+                    nu_ansi_term::Color::LightGray
+                } else {
+                    nu_ansi_term::Color::DarkGray
+                };
+                eprintln!("\n📢 {}", color.italic().paint("Autonaming the session."),);
+                if let Err(err) = ctx.autoname_session(app.as_ref()).await {
+                    log::warn!("Failed to autonaming the session: {err}");
+                }
+                if let Some(session) = ctx.session.as_mut() {
+                    session.set_autonaming(false);
+                }
             }
-            Config::maybe_autoname_session(config.clone());
 
-            let needs_compression = {
-                let cfg = config.read();
-                let compression_threshold = cfg.compression_threshold;
-                cfg.session
-                    .as_ref()
-                    .is_some_and(|s| s.needs_compression(compression_threshold))
-            };
+            let needs_compression = ctx
+                .session
+                .as_ref()
+                .is_some_and(|s| s.needs_compression(app.compression_threshold));
 
             if needs_compression {
-                let agent_can_continue_after_compress = {
-                    let cfg = config.read();
-                    cfg.agent.as_ref().is_some_and(|agent| {
-                        agent.auto_continue_enabled()
-                            && agent.continuation_count() < agent.max_auto_continues()
-                            && agent.todo_list().has_incomplete()
-                    })
-                };
+                let agent_can_continue_after_compress = agent_should_continue(ctx);
 
-                {
-                    let mut cfg = config.write();
-                    if let Some(session) = cfg.session.as_mut() {
-                        session.set_compressing(true);
-                    }
+                if let Some(session) = ctx.session.as_mut() {
+                    session.set_compressing(true);
                 }
 
-                let color = if config.read().light_theme() {
+                let color = if app.light_theme() {
                     nu_ansi_term::Color::LightGray
                 } else {
                     nu_ansi_term::Color::DarkGray
                 };
                 eprintln!("\n📢 {}", color.italic().paint("Compressing the session."),);
 
-                if let Err(err) = Config::compress_session(config).await {
+                if let Err(err) = ctx.compress_session().await {
                     log::warn!("Failed to compress the session: {err}");
                 }
-                if let Some(session) = config.write().session.as_mut() {
+                if let Some(session) = ctx.session.as_mut() {
                     session.set_compressing(false);
                 }
 
                 if agent_can_continue_after_compress {
                     let full_prompt = {
-                        let mut cfg = config.write();
-                        let agent = cfg.agent.as_mut().expect("agent checked above");
+                        let agent = ctx.agent.as_mut().expect("agent checked above");
                         agent.increment_continuation();
                         let count = agent.continuation_count();
                         let max = agent.max_auto_continues();
@@ -1027,7 +964,7 @@ async fn ask(
                         let remaining = agent.todo_list().incomplete_count();
                         let prompt = agent.continuation_prompt();
 
-                        let color = if cfg.light_theme() {
+                        let color = if app.light_theme() {
                             nu_ansi_term::Color::LightGray
                         } else {
                             nu_ansi_term::Color::DarkGray
@@ -1041,15 +978,31 @@ async fn ask(
 
                         format!("{prompt}\n\n{todo_state}")
                     };
-                    let continuation_input = Input::from_str(config, &full_prompt, None);
-                    return ask(config, abort_signal, continuation_input, false).await;
+                    let continuation_input = Input::from_str(ctx, &full_prompt, None);
+                    return ask(ctx, abort_signal, continuation_input, false).await;
                 }
-            } else {
-                Config::maybe_compress_session(config.clone());
             }
 
             Ok(())
         }
+    }
+}
+
+fn agent_should_continue(ctx: &RequestContext) -> bool {
+    ctx.agent.as_ref().is_some_and(|agent| {
+        agent.auto_continue_enabled()
+            && agent.continuation_count() < agent.max_auto_continues()
+            && agent.todo_list().has_incomplete()
+    })
+}
+
+fn reset_agent_continuation(ctx: &mut RequestContext) {
+    if ctx
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.continuation_count() > 0)
+    {
+        ctx.agent.as_mut().unwrap().reset_continuation();
     }
 }
 
