@@ -375,6 +375,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn role_new_parses_prompt() {
+        let role = Role::new("test", "You are a helpful assistant");
+        assert_eq!(role.name(), "test");
+        assert_eq!(role.prompt(), "You are a helpful assistant");
+    }
+
+    #[test]
+    fn role_new_parses_metadata() {
+        let content =
+            "---\nmodel: openai:gpt-4\ntemperature: 0.7\ntop_p: 0.9\n---\nYou are helpful";
+        let role = Role::new("test", content);
+        assert_eq!(role.model_id(), Some("openai:gpt-4"));
+        assert_eq!(role.temperature(), Some(0.7));
+        assert_eq!(role.top_p(), Some(0.9));
+        assert_eq!(role.prompt(), "You are helpful");
+    }
+
+    #[test]
+    fn role_new_parses_enabled_tools() {
+        let content = "---\nenabled_tools: tool1,tool2\n---\nPrompt";
+        let role = Role::new("test", content);
+        assert_eq!(role.enabled_tools(), Some("tool1,tool2".to_string()));
+    }
+
+    #[test]
+    fn role_new_parses_enabled_mcp_servers() {
+        let content = "---\nenabled_mcp_servers: github,jira\n---\nPrompt";
+        let role = Role::new("test", content);
+        assert_eq!(role.enabled_mcp_servers(), Some("github,jira".to_string()));
+    }
+
+    #[test]
+    fn role_new_no_metadata_has_none_fields() {
+        let role = Role::new("test", "Just a prompt");
+        assert_eq!(role.model_id(), None);
+        assert_eq!(role.temperature(), None);
+        assert_eq!(role.top_p(), None);
+        assert_eq!(role.enabled_tools(), None);
+        assert_eq!(role.enabled_mcp_servers(), None);
+    }
+
+    #[test]
+    fn role_builtin_shell_loads() {
+        let role = Role::builtin("shell").unwrap();
+        assert_eq!(role.name(), "shell");
+        assert!(!role.prompt().is_empty());
+    }
+
+    #[test]
+    fn role_builtin_code_loads() {
+        let role = Role::builtin("code").unwrap();
+        assert_eq!(role.name(), "code");
+        assert!(!role.prompt().is_empty());
+    }
+
+    #[test]
+    fn role_builtin_nonexistent_errors() {
+        let result = Role::builtin("nonexistent_role_xyz");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn role_default_has_empty_fields() {
+        let role = Role::default();
+        assert_eq!(role.name(), "");
+        assert_eq!(role.prompt(), "");
+        assert_eq!(role.model_id(), None);
+    }
+
+    #[test]
+    fn role_set_model_updates_model() {
+        let mut role = Role::new("test", "prompt");
+        let model = Model::default();
+        role.set_model(model.clone());
+        assert_eq!(role.model().id(), model.id());
+    }
+
+    #[test]
+    fn role_set_temperature_works() {
+        let mut role = Role::new("test", "prompt");
+        role.set_temperature(Some(0.5));
+        assert_eq!(role.temperature(), Some(0.5));
+    }
+
+    #[test]
+    fn role_export_includes_metadata() {
+        let content = "---\ntemperature: 0.8\n---\nMy prompt";
+        let role = Role::new("test", content);
+        let exported = role.export();
+        assert!(exported.contains("temperature"));
+        assert!(exported.contains("My prompt"));
+    }
+
+    #[test]
     fn test_parse_structure_prompt1() {
         let prompt = r#"
 System message

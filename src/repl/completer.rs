@@ -1,9 +1,11 @@
 use super::{REPL_COMMANDS, ReplCommand};
 
-use crate::{config::GlobalConfig, utils::fuzzy_filter};
+use crate::{config::RequestContext, utils::fuzzy_filter};
 
+use parking_lot::RwLock;
 use reedline::{Completer, Span, Suggestion};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 impl Completer for ReplCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
@@ -27,7 +29,8 @@ impl Completer for ReplCompleter {
             return suggestions;
         }
 
-        let state = self.config.read().state();
+        let ctx = self.ctx.read();
+        let state = ctx.state();
 
         let command_filter = parts
             .iter()
@@ -49,16 +52,12 @@ impl Completer for ReplCompleter {
             let span = Span::new(parts[parts_len - 1].1, pos);
             let args_line = &line[parts[1].1..];
             let args: Vec<&str> = parts.iter().skip(1).map(|(v, _)| *v).collect();
-            suggestions.extend(
-                self.config
-                    .read()
-                    .repl_complete(cmd, &args, args_line)
-                    .iter()
-                    .map(|(value, description)| {
-                        let description = description.as_deref().unwrap_or_default();
-                        create_suggestion(value, description, span)
-                    }),
-            )
+            suggestions.extend(ctx.repl_complete(cmd, &args, args_line).iter().map(
+                |(value, description)| {
+                    let description = description.as_deref().unwrap_or_default();
+                    create_suggestion(value, description, span)
+                },
+            ))
         }
 
         if suggestions.is_empty() {
@@ -80,13 +79,13 @@ impl Completer for ReplCompleter {
 }
 
 pub struct ReplCompleter {
-    config: GlobalConfig,
+    ctx: Arc<RwLock<RequestContext>>,
     commands: Vec<ReplCommand>,
     groups: HashMap<&'static str, usize>,
 }
 
 impl ReplCompleter {
-    pub fn new(config: &GlobalConfig) -> Self {
+    pub fn new(ctx: Arc<RwLock<RequestContext>>) -> Self {
         let mut groups = HashMap::new();
 
         let commands: Vec<ReplCommand> = REPL_COMMANDS.to_vec();
@@ -97,7 +96,7 @@ impl ReplCompleter {
         }
 
         Self {
-            config: config.clone(),
+            ctx,
             commands,
             groups,
         }
