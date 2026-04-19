@@ -1,21 +1,17 @@
 use crate::config::Config;
+use crate::config::paths;
 use crate::utils::{AbortSignal, abortable_run_with_spinner};
 use crate::vault::interpolate_secrets;
 use anyhow::{Context, Result, anyhow};
-use bm25::{Document, Language, SearchEngine, SearchEngineBuilder};
-use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use indoc::formatdoc;
-use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -24,7 +20,7 @@ pub const MCP_INVOKE_META_FUNCTION_NAME_PREFIX: &str = "mcp_invoke";
 pub const MCP_SEARCH_META_FUNCTION_NAME_PREFIX: &str = "mcp_search";
 pub const MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX: &str = "mcp_describe";
 
-type ConnectedServer = RunningService<RoleClient, ()>;
+pub type ConnectedServer = RunningService<RoleClient, ()>;
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CatalogItem {
@@ -35,49 +31,34 @@ pub struct CatalogItem {
 
 #[derive(Debug)]
 struct ServerCatalog {
-    engine: SearchEngine<String>,
     items: HashMap<String, CatalogItem>,
-}
-
-impl ServerCatalog {
-    pub fn build_bm25(items: &HashMap<String, CatalogItem>) -> SearchEngine<String> {
-        let docs = items.values().map(|it| {
-            let contents = format!("{}\n{}\nserver:{}", it.name, it.description, it.server);
-            Document {
-                id: it.name.clone(),
-                contents,
-            }
-        });
-        SearchEngineBuilder::<String>::with_documents(Language::English, docs).build()
-    }
 }
 
 impl Clone for ServerCatalog {
     fn clone(&self) -> Self {
         Self {
-            engine: Self::build_bm25(&self.items),
             items: self.items.clone(),
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct McpServersConfig {
+pub(crate) struct McpServersConfig {
     #[serde(rename = "mcpServers")]
-    mcp_servers: HashMap<String, McpServer>,
+    pub mcp_servers: HashMap<String, McpServer>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct McpServer {
-    command: String,
-    args: Option<Vec<String>>,
-    env: Option<HashMap<String, JsonField>>,
-    cwd: Option<String>,
+pub(crate) struct McpServer {
+    pub command: String,
+    pub args: Option<Vec<String>>,
+    pub env: Option<HashMap<String, JsonField>>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-enum JsonField {
+pub(crate) enum JsonField {
     Str(String),
     Bool(bool),
     Int(i64),
@@ -103,25 +84,25 @@ impl McpRegistry {
             log_path,
             ..Default::default()
         };
-        if !Config::mcp_config_file().try_exists().with_context(|| {
+        if !paths::mcp_config_file().try_exists().with_context(|| {
             format!(
                 "Failed to check MCP config file at {}",
-                Config::mcp_config_file().display()
+                paths::mcp_config_file().display()
             )
         })? {
             debug!(
                 "MCP config file does not exist at {}, skipping MCP initialization",
-                Config::mcp_config_file().display()
+                paths::mcp_config_file().display()
             );
             return Ok(registry);
         }
         let err = || {
             format!(
                 "Failed to load MCP config file at {}",
-                Config::mcp_config_file().display()
+                paths::mcp_config_file().display()
             )
         };
-        let content = tokio::fs::read_to_string(Config::mcp_config_file())
+        let content = tokio::fs::read_to_string(paths::mcp_config_file())
             .await
             .with_context(err)?;
 
@@ -153,34 +134,6 @@ impl McpRegistry {
             )
             .await?;
         }
-
-        Ok(registry)
-    }
-
-    pub async fn reinit(
-        mut registry: McpRegistry,
-        enabled_mcp_servers: Option<String>,
-        abort_signal: AbortSignal,
-    ) -> Result<Self> {
-        debug!("Reinitializing MCP registry");
-
-        let desired_ids = registry.resolve_server_ids(enabled_mcp_servers.clone());
-        let desired_set: HashSet<String> = desired_ids.iter().cloned().collect();
-
-        debug!("Stopping unused MCP servers");
-        abortable_run_with_spinner(
-            registry.stop_unused_servers(&desired_set),
-            "Stopping unused MCP servers",
-            abort_signal.clone(),
-        )
-        .await?;
-
-        abortable_run_with_spinner(
-            registry.start_select_mcp_servers(enabled_mcp_servers),
-            "Loading MCP servers",
-            abort_signal,
-        )
-        .await?;
 
         Ok(registry)
     }
@@ -229,48 +182,14 @@ impl McpRegistry {
         &self,
         id: String,
     ) -> Result<(String, Arc<ConnectedServer>, ServerCatalog)> {
-        let server = self
+        let spec = self
             .config
             .as_ref()
             .and_then(|c| c.mcp_servers.get(&id))
             .with_context(|| format!("MCP server not found in config: {id}"))?;
-        let mut cmd = Command::new(&server.command);
-        if let Some(args) = &server.args {
-            cmd.args(args);
-        }
-        if let Some(env) = &server.env {
-            let env: HashMap<String, String> = env
-                .iter()
-                .map(|(k, v)| match v {
-                    JsonField::Str(s) => (k.clone(), s.clone()),
-                    JsonField::Bool(b) => (k.clone(), b.to_string()),
-                    JsonField::Int(i) => (k.clone(), i.to_string()),
-                })
-                .collect();
-            cmd.envs(env);
-        }
-        if let Some(cwd) = &server.cwd {
-            cmd.current_dir(cwd);
-        }
 
-        let transport = if let Some(log_path) = self.log_path.as_ref() {
-            cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+        let service = spawn_mcp_server(spec, self.log_path.as_deref()).await?;
 
-            let log_file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_path)?;
-            let (transport, _) = TokioChildProcess::builder(cmd).stderr(log_file).spawn()?;
-            transport
-        } else {
-            TokioChildProcess::new(cmd)?
-        };
-
-        let service = Arc::new(
-            ().serve(transport)
-                .await
-                .with_context(|| format!("Failed to start MCP server: {}", &server.command))?,
-        );
         let tools = service.list_tools(None).await?;
         debug!("Available tools for MCP server {id}: {tools:?}");
 
@@ -290,10 +209,7 @@ impl McpRegistry {
             items_map.insert(it.name.clone(), it);
         });
 
-        let catalog = ServerCatalog {
-            engine: ServerCatalog::build_bm25(&items_map),
-            items: items_map,
-        };
+        let catalog = ServerCatalog { items: items_map };
 
         info!("Started MCP server: {id}");
 
@@ -321,118 +237,67 @@ impl McpRegistry {
         }
     }
 
-    pub async fn stop_unused_servers(&mut self, keep_ids: &HashSet<String>) -> Result<()> {
-        let mut ids_to_remove = Vec::new();
-        for (id, _) in self.servers.iter() {
-            if !keep_ids.contains(id) {
-                ids_to_remove.push(id.clone());
-            }
-        }
-
-        for id in ids_to_remove {
-            if let Some(server) = self.servers.remove(&id) {
-                match Arc::try_unwrap(server) {
-                    Ok(server_inner) => {
-                        server_inner
-                            .cancel()
-                            .await
-                            .with_context(|| format!("Failed to stop MCP server: {id}"))?;
-                        info!("Stopped MCP server: {id}");
-                    }
-                    Err(_) => {
-                        info!("Detaching from MCP server: {id} (still in use)");
-                    }
-                }
-                self.catalogs.remove(&id);
-            }
-        }
-        Ok(())
+    pub fn running_servers(&self) -> &HashMap<String, Arc<ConnectedServer>> {
+        &self.servers
     }
 
     pub fn list_started_servers(&self) -> Vec<String> {
         self.servers.keys().cloned().collect()
     }
 
-    pub fn list_configured_servers(&self) -> Vec<String> {
-        if let Some(config) = &self.config {
-            config.mcp_servers.keys().cloned().collect()
-        } else {
-            vec![]
-        }
-    }
-
-    pub fn search_tools_server(&self, server: &str, query: &str, top_k: usize) -> Vec<CatalogItem> {
-        let Some(catalog) = self.catalogs.get(server) else {
-            return vec![];
-        };
-        let engine = &catalog.engine;
-        let raw = engine.search(query, top_k.min(20));
-
-        raw.into_iter()
-            .filter_map(|r| catalog.items.get(&r.document.id))
-            .take(top_k)
-            .cloned()
-            .collect()
-    }
-
-    pub async fn describe(&self, server_id: &str, tool: &str) -> Result<Value> {
-        let server = self
-            .servers
-            .iter()
-            .filter(|(id, _)| &server_id == id)
-            .map(|(_, s)| s.clone())
-            .next()
-            .ok_or(anyhow!("{server_id} MCP server not found in config"))?;
-
-        let tool_schema = server
-            .list_tools(None)
-            .await?
-            .tools
-            .into_iter()
-            .find(|it| it.name == tool)
-            .ok_or(anyhow!(
-                "{tool} not found in {server_id} MCP server catalog"
-            ))?
-            .input_schema;
-        Ok(json!({
-            "type": "object",
-            "properties": {
-                "tool": {
-                    "type": "string",
-                },
-                "arguments": tool_schema
-            }
-        }))
-    }
-
-    pub fn invoke(
-        &self,
-        server: &str,
-        tool: &str,
-        arguments: Value,
-    ) -> BoxFuture<'static, Result<CallToolResult>> {
-        let server = self
-            .servers
-            .get(server)
-            .cloned()
-            .with_context(|| format!("Invoked MCP server does not exist: {server}"));
-
-        let tool = tool.to_owned();
-        Box::pin(async move {
-            let server = server?;
-            let call_tool_request = CallToolRequestParams {
-                name: Cow::Owned(tool.to_owned()),
-                arguments: arguments.as_object().cloned(),
-                meta: None,
-                task: None,
-            };
-
-            let result = server.call_tool(call_tool_request).await?;
-            Ok(result)
-        })
-    }
-
     pub fn is_empty(&self) -> bool {
         self.servers.is_empty()
     }
+
+    pub fn mcp_config(&self) -> Option<&McpServersConfig> {
+        self.config.as_ref()
+    }
+
+    pub fn log_path(&self) -> Option<&PathBuf> {
+        self.log_path.as_ref()
+    }
+}
+
+pub(crate) async fn spawn_mcp_server(
+    spec: &McpServer,
+    log_path: Option<&Path>,
+) -> Result<Arc<ConnectedServer>> {
+    let mut cmd = Command::new(&spec.command);
+    if let Some(args) = &spec.args {
+        cmd.args(args);
+    }
+    if let Some(env) = &spec.env {
+        let env: HashMap<String, String> = env
+            .iter()
+            .map(|(k, v)| match v {
+                JsonField::Str(s) => (k.clone(), s.clone()),
+                JsonField::Bool(b) => (k.clone(), b.to_string()),
+                JsonField::Int(i) => (k.clone(), i.to_string()),
+            })
+            .collect();
+        cmd.envs(env);
+    }
+    if let Some(cwd) = &spec.cwd {
+        cmd.current_dir(cwd);
+    }
+
+    let transport = if let Some(log_path) = log_path {
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
+        let (transport, _) = TokioChildProcess::builder(cmd).stderr(log_file).spawn()?;
+        transport
+    } else {
+        TokioChildProcess::new(cmd)?
+    };
+
+    let service = Arc::new(
+        ().serve(transport)
+            .await
+            .with_context(|| format!("Failed to start MCP server: {}", &spec.command))?,
+    );
+    Ok(service)
 }

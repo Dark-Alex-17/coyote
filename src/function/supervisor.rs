@@ -1,12 +1,11 @@
 use super::{FunctionDeclaration, JsonSchema};
 use crate::client::{Model, ModelType, call_chat_completions};
-use crate::config::{Config, GlobalConfig, Input, Role, RoleLike};
-use crate::supervisor::escalation::EscalationQueue;
+use crate::config::{Agent, AppState, Input, RequestContext, Role, RoleLike};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
-use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
+use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor};
 use crate::utils::{AbortSignal, create_abort_signal};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use indexmap::IndexMap;
 use log::debug;
@@ -300,7 +299,7 @@ pub fn teammate_function_declarations() -> Vec<FunctionDeclaration> {
 }
 
 pub async fn handle_supervisor_tool(
-    config: &GlobalConfig,
+    ctx: &mut RequestContext,
     cmd_name: &str,
     args: &Value,
 ) -> Result<Value> {
@@ -309,42 +308,47 @@ pub async fn handle_supervisor_tool(
         .unwrap_or(cmd_name);
 
     match action {
-        "spawn" => handle_spawn(config, args).await,
-        "check" => handle_check(config, args).await,
-        "collect" => handle_collect(config, args).await,
-        "list" => handle_list(config),
-        "cancel" => handle_cancel(config, args),
-        "send_message" => handle_send_message(config, args),
-        "check_inbox" => handle_check_inbox(config),
-        "task_create" => handle_task_create(config, args),
-        "task_list" => handle_task_list(config),
-        "task_complete" => handle_task_complete(config, args).await,
-        "task_fail" => handle_task_fail(config, args),
-        "reply_escalation" => handle_reply_escalation(config, args),
+        "spawn" => handle_spawn(ctx, args).await,
+        "check" => handle_check(ctx, args).await,
+        "collect" => handle_collect(ctx, args).await,
+        "list" => handle_list(ctx),
+        "cancel" => handle_cancel(ctx, args),
+        "send_message" => handle_send_message(ctx, args),
+        "check_inbox" => handle_check_inbox(ctx),
+        "task_create" => handle_task_create(ctx, args),
+        "task_list" => handle_task_list(ctx),
+        "task_complete" => handle_task_complete(ctx, args).await,
+        "task_fail" => handle_task_fail(ctx, args),
+        "reply_escalation" => handle_reply_escalation(ctx, args),
         _ => bail!("Unknown supervisor action: {action}"),
     }
 }
 
 fn run_child_agent(
-    child_config: GlobalConfig,
+    mut child_ctx: RequestContext,
     initial_input: Input,
     abort_signal: AbortSignal,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
         let mut accumulated_output = String::new();
         let mut input = initial_input;
+        let app = Arc::clone(&child_ctx.app.config);
 
         loop {
             let client = input.create_client()?;
-            child_config.write().before_chat_completion(&input)?;
+            child_ctx.before_chat_completion(&input)?;
 
-            let (output, tool_results) =
-                call_chat_completions(&input, false, false, client.as_ref(), abort_signal.clone())
-                    .await?;
+            let (output, tool_results) = call_chat_completions(
+                &input,
+                false,
+                false,
+                client.as_ref(),
+                &mut child_ctx,
+                abort_signal.clone(),
+            )
+            .await?;
 
-            child_config
-                .write()
-                .after_chat_completion(&input, &output, &tool_results)?;
+            child_ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
 
             if !output.is_empty() {
                 if !accumulated_output.is_empty() {
@@ -360,7 +364,7 @@ fn run_child_agent(
             input = input.merge_tool_results(output, tool_results);
         }
 
-        if let Some(ref supervisor) = child_config.read().supervisor {
+        if let Some(supervisor) = child_ctx.supervisor.clone() {
             supervisor.read().cancel_all();
         }
 
@@ -368,7 +372,58 @@ fn run_child_agent(
     })
 }
 
-async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
+async fn populate_agent_mcp_runtime(ctx: &mut RequestContext, server_ids: &[String]) -> Result<()> {
+    if !ctx.app.config.mcp_server_support {
+        return Ok(());
+    }
+
+    let app = Arc::clone(&ctx.app);
+    let server_specs = app
+        .mcp_config
+        .as_ref()
+        .map(|mcp_config| {
+            server_ids
+                .iter()
+                .filter_map(|id| {
+                    mcp_config
+                        .mcp_servers
+                        .get(id)
+                        .cloned()
+                        .map(|spec| (id.clone(), spec))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    for (id, spec) in server_specs {
+        let handle = app
+            .mcp_factory
+            .acquire(&id, &spec, app.mcp_log_path.as_deref())
+            .await?;
+        ctx.tool_scope.mcp_runtime.insert(id, handle);
+    }
+
+    Ok(())
+}
+
+fn sync_agent_functions_to_ctx(ctx: &mut RequestContext) -> Result<()> {
+    let server_names = ctx.tool_scope.mcp_runtime.server_names();
+    let functions = {
+        let agent = ctx
+            .agent
+            .as_mut()
+            .with_context(|| "Agent should be initialized")?;
+        if !server_names.is_empty() {
+            agent.append_mcp_meta_functions(server_names);
+        }
+        agent.functions().clone()
+    };
+
+    ctx.tool_scope.functions = functions;
+    Ok(())
+}
+
+async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let agent_name = args
         .get("agent")
         .and_then(Value::as_str)
@@ -385,10 +440,10 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
     let agent_id = format!("agent_{agent_name}_{short_uuid}");
 
     let (max_depth, current_depth) = {
-        let cfg = config.read();
-        let supervisor = cfg
+        let supervisor = ctx
             .supervisor
             .as_ref()
+            .cloned()
             .ok_or_else(|| anyhow!("No supervisor active; Agent spawning not enabled"))?;
         let sup = supervisor.read();
         if sup.active_count() >= sup.max_concurrent() {
@@ -401,7 +456,7 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
                 ),
             }));
         }
-        (sup.max_depth(), cfg.current_depth + 1)
+        (sup.max_depth(), ctx.current_depth + 1)
     };
 
     if current_depth > max_depth {
@@ -413,37 +468,68 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
 
     let child_inbox = Arc::new(Inbox::new());
 
-    {
-        let mut cfg = config.write();
-        if cfg.root_escalation_queue.is_none() {
-            cfg.root_escalation_queue = Some(Arc::new(EscalationQueue::new()));
-        }
-    }
-
-    let child_config: GlobalConfig = {
-        let mut child_cfg = config.read().clone();
-
-        child_cfg.parent_supervisor = child_cfg.supervisor.clone();
-        child_cfg.agent = None;
-        child_cfg.session = None;
-        child_cfg.rag = None;
-        child_cfg.supervisor = None;
-        child_cfg.last_message = None;
-        child_cfg.tool_call_tracker = None;
-
-        child_cfg.stream = false;
-        child_cfg.save = false;
-        child_cfg.current_depth = current_depth;
-        child_cfg.inbox = Some(Arc::clone(&child_inbox));
-        child_cfg.self_agent_id = Some(agent_id.clone());
-
-        Arc::new(RwLock::new(child_cfg))
-    };
+    ctx.ensure_root_escalation_queue();
 
     let child_abort = create_abort_signal();
-    Config::use_agent(&child_config, &agent_name, None, child_abort.clone()).await?;
 
-    let input = Input::from_str(&child_config, &prompt, None);
+    if !ctx.app.config.function_calling_support {
+        bail!("Please enable function calling support before using the agent.");
+    }
+
+    let app_config = Arc::clone(&ctx.app.config);
+    let current_model = ctx.current_model().clone();
+    let info_flag = ctx.info_flag;
+    let child_app_state = Arc::new(AppState {
+        config: Arc::new(app_config.as_ref().clone()),
+        vault: ctx.app.vault.clone(),
+        mcp_factory: ctx.app.mcp_factory.clone(),
+        rag_cache: ctx.app.rag_cache.clone(),
+        mcp_config: ctx.app.mcp_config.clone(),
+        mcp_log_path: ctx.app.mcp_log_path.clone(),
+    });
+    let agent = Agent::init(
+        app_config.as_ref(),
+        child_app_state.as_ref(),
+        &current_model,
+        info_flag,
+        &agent_name,
+        child_abort.clone(),
+    )
+    .await?;
+
+    let agent_mcp_servers = agent.mcp_server_names().to_vec();
+    let session = agent.agent_session().map(|v| v.to_string());
+    let should_init_supervisor = agent.can_spawn_agents();
+    let max_concurrent = agent.max_concurrent_agents();
+    let max_depth = agent.max_agent_depth();
+    let mut child_ctx = RequestContext::new_for_child(
+        Arc::clone(&child_app_state),
+        ctx,
+        current_depth,
+        Arc::clone(&child_inbox),
+        agent_id.clone(),
+    );
+    child_ctx.rag = agent.rag();
+    child_ctx.agent = Some(agent);
+    if should_init_supervisor {
+        child_ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(
+            max_concurrent,
+            max_depth,
+        ))));
+    }
+
+    if let Some(session) = session {
+        child_ctx
+            .use_session(app_config.as_ref(), Some(&session), child_abort.clone())
+            .await?;
+        sync_agent_functions_to_ctx(&mut child_ctx)?;
+    } else {
+        populate_agent_mcp_runtime(&mut child_ctx, &agent_mcp_servers).await?;
+        sync_agent_functions_to_ctx(&mut child_ctx)?;
+        child_ctx.init_agent_shared_variables()?;
+    }
+
+    let input = Input::from_str(&child_ctx, &prompt, None);
 
     debug!("Spawning child agent '{agent_name}' as '{agent_id}'");
 
@@ -452,7 +538,7 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
     let spawn_abort = child_abort.clone();
 
     let join_handle = tokio::spawn(async move {
-        let result = run_child_agent(child_config, input, spawn_abort).await;
+        let result = run_child_agent(child_ctx, input, spawn_abort).await;
 
         match result {
             Ok(output) => Ok(AgentResult {
@@ -479,15 +565,13 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
         join_handle,
     };
 
-    {
-        let cfg = config.read();
-        let supervisor = cfg
-            .supervisor
-            .as_ref()
-            .ok_or_else(|| anyhow!("No supervisor active"))?;
-        let mut sup = supervisor.write();
-        sup.register(handle)?;
-    }
+    let supervisor = ctx
+        .supervisor
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| anyhow!("No supervisor active"))?;
+    let mut sup = supervisor.write();
+    sup.register(handle)?;
 
     Ok(json!({
         "status": "ok",
@@ -497,24 +581,24 @@ async fn handle_spawn(config: &GlobalConfig, args: &Value) -> Result<Value> {
     }))
 }
 
-async fn handle_check(config: &GlobalConfig, args: &Value) -> Result<Value> {
+async fn handle_check(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let id = args
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'id' is required"))?;
 
     let is_finished = {
-        let cfg = config.read();
-        let supervisor = cfg
+        let supervisor = ctx
             .supervisor
             .as_ref()
+            .cloned()
             .ok_or_else(|| anyhow!("No supervisor active"))?;
         let sup = supervisor.read();
         sup.is_finished(id)
     };
 
     match is_finished {
-        Some(true) => handle_collect(config, args).await,
+        Some(true) => handle_collect(ctx, args).await,
         Some(false) => Ok(json!({
             "status": "pending",
             "id": id,
@@ -527,17 +611,17 @@ async fn handle_check(config: &GlobalConfig, args: &Value) -> Result<Value> {
     }
 }
 
-async fn handle_collect(config: &GlobalConfig, args: &Value) -> Result<Value> {
+async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let id = args
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'id' is required"))?;
 
     let handle = {
-        let cfg = config.read();
-        let supervisor = cfg
+        let supervisor = ctx
             .supervisor
             .as_ref()
+            .cloned()
             .ok_or_else(|| anyhow!("No supervisor active"))?;
         let mut sup = supervisor.write();
         sup.take(id)
@@ -551,7 +635,7 @@ async fn handle_collect(config: &GlobalConfig, args: &Value) -> Result<Value> {
                 .map_err(|e| anyhow!("Agent task panicked: {e}"))?
                 .map_err(|e| anyhow!("Agent failed: {e}"))?;
 
-            let output = summarize_output(config, &result.agent_name, &result.output).await?;
+            let output = summarize_output(ctx, &result.agent_name, &result.output).await?;
 
             Ok(json!({
                 "status": "completed",
@@ -568,11 +652,11 @@ async fn handle_collect(config: &GlobalConfig, args: &Value) -> Result<Value> {
     }
 }
 
-fn handle_list(config: &GlobalConfig) -> Result<Value> {
-    let cfg = config.read();
-    let supervisor = cfg
+fn handle_list(ctx: &mut RequestContext) -> Result<Value> {
+    let supervisor = ctx
         .supervisor
         .as_ref()
+        .cloned()
         .ok_or_else(|| anyhow!("No supervisor active"))?;
     let sup = supervisor.read();
 
@@ -596,16 +680,16 @@ fn handle_list(config: &GlobalConfig) -> Result<Value> {
     }))
 }
 
-fn handle_cancel(config: &GlobalConfig, args: &Value) -> Result<Value> {
+fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let id = args
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'id' is required"))?;
 
-    let cfg = config.read();
-    let supervisor = cfg
+    let supervisor = ctx
         .supervisor
         .as_ref()
+        .cloned()
         .ok_or_else(|| anyhow!("No supervisor active"))?;
     let mut sup = supervisor.write();
 
@@ -624,7 +708,7 @@ fn handle_cancel(config: &GlobalConfig, args: &Value) -> Result<Value> {
     }
 }
 
-fn handle_send_message(config: &GlobalConfig, args: &Value) -> Result<Value> {
+fn handle_send_message(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let id = args
         .get("id")
         .and_then(Value::as_str)
@@ -634,24 +718,19 @@ fn handle_send_message(config: &GlobalConfig, args: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'message' is required"))?;
 
-    let cfg = config.read();
-
-    // Determine sender identity: self_agent_id (child), agent name (parent), or "parent"
-    let sender = cfg
+    let sender = ctx
         .self_agent_id
         .clone()
-        .or_else(|| cfg.agent.as_ref().map(|a| a.name().to_string()))
+        .or_else(|| ctx.agent.as_ref().map(|a| a.name().to_string()))
         .unwrap_or_else(|| "parent".to_string());
 
-    // Try local supervisor first (parent -> child routing)
-    let inbox = cfg
+    let inbox = ctx
         .supervisor
         .as_ref()
         .and_then(|sup| sup.read().inbox(id).cloned());
 
-    // Fall back to parent_supervisor (sibling -> sibling routing)
     let inbox = inbox.or_else(|| {
-        cfg.parent_supervisor
+        ctx.parent_supervisor
             .as_ref()
             .and_then(|sup| sup.read().inbox(id).cloned())
     });
@@ -679,9 +758,8 @@ fn handle_send_message(config: &GlobalConfig, args: &Value) -> Result<Value> {
     }
 }
 
-fn handle_check_inbox(config: &GlobalConfig) -> Result<Value> {
-    let cfg = config.read();
-    match &cfg.inbox {
+fn handle_check_inbox(ctx: &mut RequestContext) -> Result<Value> {
+    match ctx.inbox.as_ref() {
         Some(inbox) => {
             let messages: Vec<Value> = inbox
                 .drain()
@@ -707,7 +785,7 @@ fn handle_check_inbox(config: &GlobalConfig) -> Result<Value> {
     }
 }
 
-fn handle_reply_escalation(config: &GlobalConfig, args: &Value) -> Result<Value> {
+fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let escalation_id = args
         .get("escalation_id")
         .and_then(Value::as_str)
@@ -717,12 +795,10 @@ fn handle_reply_escalation(config: &GlobalConfig, args: &Value) -> Result<Value>
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'reply' is required"))?;
 
-    let queue = {
-        let cfg = config.read();
-        cfg.root_escalation_queue
-            .clone()
-            .ok_or_else(|| anyhow!("No escalation queue available"))?
-    };
+    let queue = ctx
+        .escalation_queue
+        .clone()
+        .ok_or_else(|| anyhow!("No escalation queue available"))?;
 
     match queue.take(escalation_id) {
         Some(request) => {
@@ -742,7 +818,7 @@ fn handle_reply_escalation(config: &GlobalConfig, args: &Value) -> Result<Value>
     }
 }
 
-fn handle_task_create(config: &GlobalConfig, args: &Value) -> Result<Value> {
+fn handle_task_create(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let subject = args
         .get("subject")
         .and_then(Value::as_str)
@@ -768,10 +844,10 @@ fn handle_task_create(config: &GlobalConfig, args: &Value) -> Result<Value> {
         bail!("'prompt' is required when 'agent' is set");
     }
 
-    let cfg = config.read();
-    let supervisor = cfg
+    let supervisor = ctx
         .supervisor
         .as_ref()
+        .cloned()
         .ok_or_else(|| anyhow!("No supervisor active"))?;
     let mut sup = supervisor.write();
 
@@ -805,11 +881,11 @@ fn handle_task_create(config: &GlobalConfig, args: &Value) -> Result<Value> {
     Ok(result)
 }
 
-fn handle_task_list(config: &GlobalConfig) -> Result<Value> {
-    let cfg = config.read();
-    let supervisor = cfg
+fn handle_task_list(ctx: &mut RequestContext) -> Result<Value> {
+    let supervisor = ctx
         .supervisor
         .as_ref()
+        .cloned()
         .ok_or_else(|| anyhow!("No supervisor active"))?;
     let sup = supervisor.read();
 
@@ -834,17 +910,17 @@ fn handle_task_list(config: &GlobalConfig) -> Result<Value> {
     Ok(json!({ "tasks": tasks }))
 }
 
-async fn handle_task_complete(config: &GlobalConfig, args: &Value) -> Result<Value> {
+async fn handle_task_complete(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let task_id = args
         .get("task_id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'task_id' is required"))?;
 
     let (newly_runnable, dispatchable) = {
-        let cfg = config.read();
-        let supervisor = cfg
+        let supervisor = ctx
             .supervisor
             .as_ref()
+            .cloned()
             .ok_or_else(|| anyhow!("No supervisor active"))?;
         let mut sup = supervisor.write();
 
@@ -884,7 +960,7 @@ async fn handle_task_complete(config: &GlobalConfig, args: &Value) -> Result<Val
             "agent": agent,
             "prompt": prompt,
         });
-        match handle_spawn(config, &spawn_args).await {
+        match handle_spawn(ctx, &spawn_args).await {
             Ok(result) => {
                 let agent_id = result
                     .get("id")
@@ -916,16 +992,16 @@ async fn handle_task_complete(config: &GlobalConfig, args: &Value) -> Result<Val
     Ok(result)
 }
 
-fn handle_task_fail(config: &GlobalConfig, args: &Value) -> Result<Value> {
+fn handle_task_fail(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let task_id = args
         .get("task_id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'task_id' is required"))?;
 
-    let cfg = config.read();
-    let supervisor = cfg
+    let supervisor = ctx
         .supervisor
         .as_ref()
+        .cloned()
         .ok_or_else(|| anyhow!("No supervisor active"))?;
     let mut sup = supervisor.write();
 
@@ -958,17 +1034,12 @@ Rules:
 - Use bullet points for multiple findings
 - If the output contains a final answer or conclusion, lead with it"#;
 
-async fn summarize_output(config: &GlobalConfig, agent_name: &str, output: &str) -> Result<String> {
-    let (threshold, summarization_model_id) = {
-        let cfg = config.read();
-        match cfg.agent.as_ref() {
-            Some(agent) => (
-                agent.summarization_threshold(),
-                agent.summarization_model().map(|s| s.to_string()),
-            ),
-            None => return Ok(output.to_string()),
-        }
+async fn summarize_output(ctx: &RequestContext, agent_name: &str, output: &str) -> Result<String> {
+    let Some(agent) = ctx.agent.as_ref() else {
+        return Ok(output.to_string());
     };
+    let threshold = agent.summarization_threshold();
+    let summarization_model_id = agent.summarization_model().map(|s| s.to_string());
 
     if output.len() < threshold {
         debug!(
@@ -987,12 +1058,11 @@ async fn summarize_output(config: &GlobalConfig, agent_name: &str, output: &str)
         threshold
     );
 
-    let model = {
-        let cfg = config.read();
-        match summarization_model_id {
-            Some(ref model_id) => Model::retrieve_model(&cfg, model_id, ModelType::Chat)?,
-            None => cfg.current_model().clone(),
+    let model = match summarization_model_id {
+        Some(ref model_id) => {
+            Model::retrieve_model(ctx.app.config.as_ref(), model_id, ModelType::Chat)?
         }
+        None => ctx.current_model().clone(),
     };
 
     let mut role = Role::new("summarizer", SUMMARIZATION_PROMPT);
@@ -1002,7 +1072,7 @@ async fn summarize_output(config: &GlobalConfig, agent_name: &str, output: &str)
         "Summarize the following sub-agent output from '{}':\n\n{}",
         agent_name, output
     );
-    let input = Input::from_str(config, &user_message, Some(role));
+    let input = Input::from_str(ctx, &user_message, Some(role));
 
     let summary = input.fetch_chat_text().await?;
 

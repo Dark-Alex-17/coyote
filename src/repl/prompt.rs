@@ -1,28 +1,30 @@
-use crate::config::GlobalConfig;
+use crate::config::RequestContext;
 
+use parking_lot::RwLock;
 use reedline::{Prompt, PromptHistorySearch, PromptHistorySearchStatus};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct ReplPrompt {
-    config: GlobalConfig,
+    ctx: Arc<RwLock<RequestContext>>,
 }
 
 impl ReplPrompt {
-    pub fn new(config: &GlobalConfig) -> Self {
-        Self {
-            config: config.clone(),
-        }
+    pub fn new(ctx: Arc<RwLock<RequestContext>>) -> Self {
+        Self { ctx }
     }
 }
 
 impl Prompt for ReplPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Owned(self.config.read().render_prompt_left())
+        let ctx = self.ctx.read();
+        Cow::Owned(ctx.render_prompt_left(ctx.app.config.as_ref()))
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Owned(self.config.read().render_prompt_right())
+        let ctx = self.ctx.read();
+        Cow::Owned(ctx.render_prompt_right(ctx.app.config.as_ref()))
     }
 
     fn render_prompt_indicator(&self, _prompt_mode: reedline::PromptEditMode) -> Cow<'_, str> {

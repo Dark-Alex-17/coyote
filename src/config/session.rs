@@ -67,11 +67,11 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(config: &Config, name: &str) -> Self {
-        let role = config.extract_role();
+    pub fn new_from_ctx(ctx: &RequestContext, app: &AppConfig, name: &str) -> Self {
+        let role = ctx.extract_role(app);
         let mut session = Self {
             name: name.to_string(),
-            save_session: config.save_session,
+            save_session: app.save_session,
             ..Default::default()
         };
         session.set_role(role);
@@ -79,13 +79,18 @@ impl Session {
         session
     }
 
-    pub fn load(config: &Config, name: &str, path: &Path) -> Result<Self> {
+    pub fn load_from_ctx(
+        ctx: &RequestContext,
+        app: &AppConfig,
+        name: &str,
+        path: &Path,
+    ) -> Result<Self> {
         let content = read_to_string(path)
             .with_context(|| format!("Failed to load session {} at {}", name, path.display()))?;
         let mut session: Self =
             serde_yaml::from_str(&content).with_context(|| format!("Invalid session {name}"))?;
 
-        session.model = Model::retrieve_model(config, &session.model_id, ModelType::Chat)?;
+        session.model = Model::retrieve_model(app, &session.model_id, ModelType::Chat)?;
 
         if let Some(autoname) = name.strip_prefix("_/") {
             session.name = TEMP_SESSION_NAME.to_string();
@@ -99,7 +104,7 @@ impl Session {
         }
 
         if let Some(role_name) = &session.role_name
-            && let Ok(role) = config.retrieve_role(role_name)
+            && let Ok(role) = ctx.retrieve_role(app, role_name)
         {
             session.role_prompt = role.prompt().to_string();
         }
@@ -662,5 +667,174 @@ impl AutoName {
     }
     pub fn need(&self) -> bool {
         !self.naming && self.chat_history.is_some() && self.name.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{Message, MessageContent, MessageRole, Model};
+    use crate::config::{AppState, Config};
+    use std::sync::Arc;
+
+    #[test]
+    fn session_default_is_empty() {
+        let session = Session::default();
+        assert!(session.is_empty());
+        assert_eq!(session.name(), "");
+        assert_eq!(session.role_name(), None);
+        assert!(!session.dirty());
+    }
+
+    #[test]
+    fn session_new_from_ctx_captures_save_session() {
+        let cfg = Config::default();
+        let app_config = Arc::new(cfg.to_app_config());
+        let app_state = Arc::new(AppState {
+            config: app_config.clone(),
+            vault: cfg.vault.clone(),
+            mcp_factory: Arc::new(mcp_factory::McpFactory::default()),
+            rag_cache: Arc::new(rag_cache::RagCache::default()),
+            mcp_config: None,
+            mcp_log_path: None,
+        });
+        let ctx = cfg.to_request_context(app_state);
+        let session = Session::new_from_ctx(&ctx, &app_config, "test-session");
+
+        assert_eq!(session.name(), "test-session");
+        assert_eq!(session.save_session(), app_config.save_session);
+        assert!(session.is_empty());
+        assert!(!session.dirty());
+    }
+
+    #[test]
+    fn session_set_role_captures_role_info() {
+        let mut session = Session::default();
+        let content = "---\ntemperature: 0.5\n---\nYou are a coder";
+        let mut role = Role::new("coder", content);
+        role.set_model(Model::default());
+
+        session.set_role(role);
+
+        assert_eq!(session.role_name(), Some("coder"));
+        assert_eq!(session.temperature(), Some(0.5));
+        assert!(session.dirty());
+    }
+
+    #[test]
+    fn session_clear_role() {
+        let mut session = Session::default();
+        let mut role = Role::new("test", "prompt");
+        role.set_model(Model::default());
+        session.set_role(role);
+
+        assert_eq!(session.role_name(), Some("test"));
+
+        session.clear_role();
+
+        assert_eq!(session.role_name(), None);
+    }
+
+    #[test]
+    fn session_guard_empty_passes_when_empty() {
+        let session = Session::default();
+        assert!(session.guard_empty().is_ok());
+    }
+
+    #[test]
+    fn session_needs_compression_threshold() {
+        let session = Session::default();
+        assert!(!session.needs_compression(4000));
+    }
+
+    #[test]
+    fn session_needs_compression_returns_false_when_compressing() {
+        let mut session = Session::default();
+        session.set_compressing(true);
+        assert!(!session.needs_compression(0));
+    }
+
+    #[test]
+    fn session_needs_compression_returns_false_when_threshold_zero() {
+        let session = Session::default();
+        assert!(!session.needs_compression(0));
+    }
+
+    #[test]
+    fn session_set_compressing_flag() {
+        let mut session = Session::default();
+        assert!(!session.compressing());
+        session.set_compressing(true);
+        assert!(session.compressing());
+        session.set_compressing(false);
+        assert!(!session.compressing());
+    }
+
+    #[test]
+    fn session_set_save_session_this_time() {
+        let mut session = Session::default();
+        assert!(!session.save_session_this_time);
+        session.set_save_session_this_time();
+        assert!(session.save_session_this_time);
+    }
+
+    #[test]
+    fn session_save_session_returns_configured_value() {
+        let mut session = Session::default();
+        assert_eq!(session.save_session(), None);
+        session.set_save_session(Some(true));
+        assert_eq!(session.save_session(), Some(true));
+        session.set_save_session(Some(false));
+        assert_eq!(session.save_session(), Some(false));
+        session.set_save_session(None);
+        assert_eq!(session.save_session(), None);
+    }
+
+    #[test]
+    fn session_compress_moves_messages() {
+        let mut session = Session::default();
+        session.messages.push(Message::new(
+            MessageRole::System,
+            MessageContent::Text("system prompt".to_string()),
+        ));
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("hello".to_string()),
+        ));
+
+        assert_eq!(session.messages.len(), 2);
+        assert!(session.compressed_messages.is_empty());
+
+        session.compress("Summary of conversation".to_string());
+
+        assert!(!session.compressed_messages.is_empty());
+        assert_eq!(session.messages.len(), 1);
+        assert!(session.dirty());
+    }
+
+    #[test]
+    fn session_is_not_empty_after_compress() {
+        let mut session = Session::default();
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("hello".to_string()),
+        ));
+
+        session.compress("Summary".to_string());
+
+        assert!(!session.is_empty());
+    }
+
+    #[test]
+    fn session_need_autoname_default_false() {
+        let session = Session::default();
+        assert!(!session.need_autoname());
+    }
+
+    #[test]
+    fn session_set_autonaming_doesnt_panic_without_autoname() {
+        let mut session = Session::default();
+        session.set_autonaming(true);
+        assert!(!session.need_autoname());
     }
 }

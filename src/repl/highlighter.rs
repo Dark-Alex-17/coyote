@@ -1,6 +1,6 @@
 use super::REPL_COMMANDS;
 
-use crate::{config::GlobalConfig, utils::NO_COLOR};
+use crate::utils::NO_COLOR;
 
 use nu_ansi_term::{Color, Style};
 use reedline::{Highlighter, StyledText};
@@ -11,7 +11,7 @@ const MATCH_COLOR: Color = Color::Green;
 pub struct ReplHighlighter;
 
 impl ReplHighlighter {
-    pub fn new(_config: &GlobalConfig) -> Self {
+    pub fn new() -> Self {
         Self
     }
 }
