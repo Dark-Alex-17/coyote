@@ -24,7 +24,7 @@ macro_rules! register_client {
         $(
             #[derive(Debug)]
             pub struct $client {
-                global_config: $crate::config::GlobalConfig,
+                app_config: std::sync::Arc<$crate::config::AppConfig>,
                 config: $config,
                 model: $crate::client::Model,
             }
@@ -32,8 +32,8 @@ macro_rules! register_client {
             impl $client {
                 pub const NAME: &'static str = $name;
 
-                pub fn init(global_config: &$crate::config::GlobalConfig, model: &$crate::client::Model) -> Option<Box<dyn Client>> {
-                    let config = global_config.read().clients.iter().find_map(|client_config| {
+                pub fn init(app_config: &std::sync::Arc<$crate::config::AppConfig>, model: &$crate::client::Model) -> Option<Box<dyn Client>> {
+                    let config = app_config.clients.iter().find_map(|client_config| {
                         if let ClientConfig::$config(c) = client_config {
                             if Self::name(c) == model.client_name() {
                                 return Some(c.clone())
@@ -43,7 +43,7 @@ macro_rules! register_client {
                     })?;
 
                     Some(Box::new(Self {
-                        global_config: global_config.clone(),
+                        app_config: std::sync::Arc::clone(app_config),
                         config,
                         model: model.clone(),
                     }))
@@ -72,10 +72,9 @@ macro_rules! register_client {
 
         )+
 
-        pub fn init_client(config: &$crate::config::GlobalConfig, model: Option<$crate::client::Model>) -> anyhow::Result<Box<dyn Client>> {
-            let model = model.unwrap_or_else(|| config.read().model.clone());
+        pub fn init_client(app_config: &std::sync::Arc<$crate::config::AppConfig>, model: $crate::client::Model) -> anyhow::Result<Box<dyn Client>> {
             None
-            $(.or_else(|| $client::init(config, &model)))+
+            $(.or_else(|| $client::init(app_config, &model)))+
             .ok_or_else(|| {
                 anyhow::anyhow!("Invalid model '{}'", model.id())
             })
@@ -101,7 +100,7 @@ macro_rules! register_client {
 
         static ALL_CLIENT_NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
-        pub fn list_client_names(config: &$crate::config::Config) -> Vec<&'static String> {
+        pub fn list_client_names(config: &$crate::config::AppConfig) -> Vec<&'static String> {
             let names = ALL_CLIENT_NAMES.get_or_init(|| {
                 config
                     .clients
@@ -117,7 +116,7 @@ macro_rules! register_client {
 
         static ALL_MODELS: std::sync::OnceLock<Vec<$crate::client::Model>> = std::sync::OnceLock::new();
 
-        pub fn list_all_models(config: &$crate::config::Config) -> Vec<&'static $crate::client::Model> {
+        pub fn list_all_models(config: &$crate::config::AppConfig) -> Vec<&'static $crate::client::Model> {
             let models = ALL_MODELS.get_or_init(|| {
                 config
                     .clients
@@ -131,7 +130,7 @@ macro_rules! register_client {
             models.iter().collect()
         }
 
-        pub fn list_models(config: &$crate::config::Config, model_type: $crate::client::ModelType) -> Vec<&'static $crate::client::Model> {
+        pub fn list_models(config: &$crate::config::AppConfig, model_type: $crate::client::ModelType) -> Vec<&'static $crate::client::Model> {
             list_all_models(config).into_iter().filter(|v| v.model_type() == model_type).collect()
         }
     };
@@ -140,8 +139,8 @@ macro_rules! register_client {
 #[macro_export]
 macro_rules! client_common_fns {
     () => {
-        fn global_config(&self) -> &$crate::config::GlobalConfig {
-            &self.global_config
+        fn app_config(&self) -> &$crate::config::AppConfig {
+            &self.app_config
         }
 
         fn extra_config(&self) -> Option<&$crate::client::ExtraConfig> {

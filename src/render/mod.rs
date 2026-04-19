@@ -8,18 +8,18 @@ pub use self::markdown::{MarkdownRender, RenderOptions};
 use self::stream::{markdown_stream, raw_stream};
 
 use crate::utils::{AbortSignal, IS_STDOUT_TERMINAL, error_text, pretty_error};
-use crate::{client::SseEvent, config::GlobalConfig};
+use crate::{client::SseEvent, config::AppConfig};
 
 use anyhow::Result;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 pub async fn render_stream(
     rx: UnboundedReceiver<SseEvent>,
-    config: &GlobalConfig,
+    app: &AppConfig,
     abort_signal: AbortSignal,
 ) -> Result<()> {
-    let ret = if *IS_STDOUT_TERMINAL && config.read().highlight {
-        let render_options = config.read().render_options()?;
+    let ret = if *IS_STDOUT_TERMINAL && app.highlight {
+        let render_options = app.render_options()?;
         let mut render = MarkdownRender::init(render_options)?;
         markdown_stream(rx, &mut render, &abort_signal).await
     } else {

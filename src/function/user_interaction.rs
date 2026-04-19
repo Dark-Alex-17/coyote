@@ -1,5 +1,5 @@
 use super::{FunctionDeclaration, JsonSchema};
-use crate::config::GlobalConfig;
+use crate::config::RequestContext;
 use crate::supervisor::escalation::{EscalationRequest, new_escalation_id};
 
 use anyhow::{Result, anyhow};
@@ -120,7 +120,7 @@ pub fn user_interaction_function_declarations() -> Vec<FunctionDeclaration> {
 }
 
 pub async fn handle_user_tool(
-    config: &GlobalConfig,
+    ctx: &mut RequestContext,
     cmd_name: &str,
     args: &Value,
 ) -> Result<Value> {
@@ -128,12 +128,12 @@ pub async fn handle_user_tool(
         .strip_prefix(USER_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
 
-    let depth = config.read().current_depth;
+    let depth = ctx.current_depth;
 
     if depth == 0 {
         handle_direct(action, args)
     } else {
-        handle_escalated(config, action, args).await
+        handle_escalated(ctx, action, args).await
     }
 }
 
@@ -198,7 +198,7 @@ fn handle_direct_checkbox(args: &Value) -> Result<Value> {
     Ok(json!({ "answers": answers }))
 }
 
-async fn handle_escalated(config: &GlobalConfig, action: &str, args: &Value) -> Result<Value> {
+async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> Result<Value> {
     let question = args
         .get("question")
         .and_then(Value::as_str)
@@ -212,28 +212,24 @@ async fn handle_escalated(config: &GlobalConfig, action: &str, args: &Value) -> 
             .collect()
     });
 
-    let (from_agent_id, from_agent_name, root_queue, timeout_secs) = {
-        let cfg = config.read();
-        let agent_id = cfg
-            .self_agent_id
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        let agent_name = cfg
-            .agent
-            .as_ref()
-            .map(|a| a.name().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let queue = cfg
-            .root_escalation_queue
-            .clone()
-            .ok_or_else(|| anyhow!("No escalation queue available; cannot reach parent agent"))?;
-        let timeout = cfg
-            .agent
-            .as_ref()
-            .map(|a| a.escalation_timeout())
-            .unwrap_or(DEFAULT_ESCALATION_TIMEOUT_SECS);
-        (agent_id, agent_name, queue, timeout)
-    };
+    let from_agent_id = ctx
+        .self_agent_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let from_agent_name = ctx
+        .agent
+        .as_ref()
+        .map(|a| a.name().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let root_queue = ctx
+        .root_escalation_queue()
+        .cloned()
+        .ok_or_else(|| anyhow!("No escalation queue available; cannot reach parent agent"))?;
+    let timeout_secs = ctx
+        .agent
+        .as_ref()
+        .map(|a| a.escalation_timeout())
+        .unwrap_or(DEFAULT_ESCALATION_TIMEOUT_SECS);
 
     let escalation_id = new_escalation_id();
     let (tx, rx) = oneshot::channel();
