@@ -309,6 +309,13 @@ impl Default for Config {
     }
 }
 
+pub fn install_builtins() -> Result<()> {
+    Agent::install_builtin_agents()?;
+    Macro::install_macros()?;
+    Functions::install_builtin_global_tools()?;
+    Ok(())
+}
+
 impl Config {
     pub fn init_bare() -> Result<Self> {
         let h = Handle::current();
@@ -381,8 +388,6 @@ impl Config {
             config.info_flag = info_flag;
             config.vault = Arc::new(vault);
 
-            Agent::install_builtin_agents()?;
-
             config.load_envs();
 
             if let Some(wrap) = config.wrap.clone() {
@@ -397,7 +402,6 @@ impl Config {
             config.setup_model()?;
             config.setup_document_loaders();
             config.setup_user_agent();
-            Macro::install_macros()?;
             Ok(())
         };
         let ret = setup(&mut config).await;

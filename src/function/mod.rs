@@ -192,7 +192,7 @@ pub struct Functions {
 }
 
 impl Functions {
-    fn install_global_tools() -> Result<()> {
+    pub fn install_builtin_global_tools() -> Result<()> {
         info!(
             "Installing global built-in functions in {}",
             paths::functions_dir().display()
@@ -241,7 +241,6 @@ impl Functions {
     }
 
     pub fn init(visible_tools: &[String]) -> Result<Self> {
-        Self::install_global_tools()?;
         Self::clear_global_functions_bin_dir()?;
 
         let declarations = Self {
@@ -258,7 +257,6 @@ impl Functions {
     }
 
     pub fn init_agent(name: &str, global_tools: &[String]) -> Result<Self> {
-        Self::install_global_tools()?;
         Self::clear_agent_bin_dir(name)?;
 
         let global_tools_declarations = if !global_tools.is_empty() {
