@@ -5,6 +5,7 @@ use crate::{
     function::{Functions, run_llm_function},
 };
 
+use super::rag_cache::RagKey;
 use crate::config::paths;
 use crate::config::prompts::{
     DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS, DEFAULT_TODO_INSTRUCTIONS,
@@ -17,7 +18,6 @@ use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::{ffi::OsStr, path::Path};
-use super::rag_cache::RagKey;
 
 const DEFAULT_AGENT_NAME: &str = "rag";
 

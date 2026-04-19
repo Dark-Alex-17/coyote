@@ -22,8 +22,8 @@ use crate::client::{
 use crate::config::paths;
 use crate::config::{
     Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, RequestContext,
-    SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, load_env_file,
-    macro_execute,
+    SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, install_builtins,
+    list_agents, load_env_file, macro_execute,
 };
 use crate::render::{prompt_theme, render_error};
 use crate::repl::Repl;
@@ -81,6 +81,8 @@ async fn main() -> Result<()> {
         || cli.list_secrets;
 
     let log_path = setup_logger()?;
+
+    install_builtins()?;
 
     if let Some(client_arg) = &cli.authenticate {
         let config = Config::init_bare()?;

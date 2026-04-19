@@ -103,23 +103,14 @@ impl Rag {
         Ok(rag)
     }
 
-    pub fn load(
-        app: &AppConfig,
-        name: &str,
-        path: &Path,
-    ) -> Result<Self> {
+    pub fn load(app: &AppConfig, name: &str, path: &Path) -> Result<Self> {
         let err = || format!("Failed to load rag '{name}' at '{}'", path.display());
         let content = fs::read_to_string(path).with_context(err)?;
         let data: RagData = serde_yaml::from_str(&content).with_context(err)?;
         Self::create(app, name, path, data)
     }
 
-    pub fn create(
-        app: &AppConfig,
-        name: &str,
-        path: &Path,
-        data: RagData,
-    ) -> Result<Self> {
+    pub fn create(app: &AppConfig, name: &str, path: &Path, data: RagData) -> Result<Self> {
         let hnsw = data.build_hnsw();
         let bm25 = data.build_bm25();
         let embedding_model =

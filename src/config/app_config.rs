@@ -19,7 +19,7 @@
 //! Runtime-only state (current role, session, agent, supervisor, etc.)
 //! lives on [`RequestContext`](super::request_context::RequestContext).
 
-use crate::client::{list_models, ClientConfig};
+use crate::client::{ClientConfig, list_models};
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, get_env_name};
 
