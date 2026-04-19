@@ -19,7 +19,7 @@
 //! Runtime-only state (current role, session, agent, supervisor, etc.)
 //! lives on [`RequestContext`](super::request_context::RequestContext).
 
-use crate::client::ClientConfig;
+use crate::client::{list_models, ClientConfig};
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, get_env_name};
 
@@ -150,6 +150,31 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    #[allow(dead_code)]
+    pub fn from_config(config: super::Config) -> Result<Self> {
+        let mut app_config = config.to_app_config();
+        app_config.load_envs();
+        if let Some(wrap) = app_config.wrap.clone() {
+            app_config.set_wrap(&wrap)?;
+        }
+        app_config.setup_document_loaders();
+        app_config.setup_user_agent();
+        app_config.resolve_model()?;
+        Ok(app_config)
+    }
+
+    #[allow(dead_code)]
+    pub fn resolve_model(&mut self) -> Result<()> {
+        if self.model_id.is_empty() {
+            let models = list_models(self, crate::client::ModelType::Chat);
+            if models.is_empty() {
+                anyhow::bail!("No available model");
+            }
+            self.model_id = models[0].id();
+        }
+        Ok(())
+    }
+
     pub fn vault_password_file(&self) -> PathBuf {
         match &self.vault_password_file {
             Some(path) => match path.exists() {
@@ -232,7 +257,6 @@ impl AppConfig {
 }
 
 impl AppConfig {
-    #[allow(dead_code)]
     pub fn set_wrap(&mut self, value: &str) -> Result<()> {
         if value == "no" {
             self.wrap = None;
@@ -247,7 +271,6 @@ impl AppConfig {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn setup_document_loaders(&mut self) {
         [("pdf", "pdftotext $1 -"), ("docx", "pandoc --to plain $1")]
             .into_iter()
@@ -257,7 +280,6 @@ impl AppConfig {
             });
     }
 
-    #[allow(dead_code)]
     pub fn setup_user_agent(&mut self) {
         if let Some("auto") = self.user_agent.as_deref() {
             self.user_agent = Some(format!(
@@ -268,7 +290,6 @@ impl AppConfig {
         }
     }
 
-    #[allow(dead_code)]
     pub fn load_envs(&mut self) {
         if let Ok(v) = env::var(get_env_name("model")) {
             self.model_id = v;
@@ -460,18 +481,6 @@ impl AppConfig {
     pub fn set_model_id_default(&mut self, model_id: String) {
         self.model_id = model_id;
     }
-
-    #[allow(dead_code)]
-    pub fn ensure_default_model_id(&mut self) -> Result<String> {
-        if self.model_id.is_empty() {
-            let models = crate::client::list_models(self, crate::client::ModelType::Chat);
-            if models.is_empty() {
-                anyhow::bail!("No available model");
-            }
-            self.model_id = models[0].id();
-        }
-        Ok(self.model_id.clone())
-    }
 }
 
 #[cfg(test)]
@@ -582,5 +591,114 @@ mod tests {
         let app = AppConfig::default();
         let url = app.sync_models_url();
         assert!(!url.is_empty());
+    }
+
+    #[test]
+    fn from_config_copies_serde_fields() {
+        let cfg = Config {
+            model_id: "provider:model-x".to_string(),
+            temperature: Some(0.42),
+            compression_threshold: 1234,
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        assert_eq!(app.model_id, "provider:model-x");
+        assert_eq!(app.temperature, Some(0.42));
+        assert_eq!(app.compression_threshold, 1234);
+    }
+
+    #[test]
+    fn from_config_installs_default_document_loaders() {
+        let cfg = Config {
+            model_id: "provider:test".to_string(),
+            ..Config::default()
+        };
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        assert_eq!(
+            app.document_loaders.get("pdf"),
+            Some(&"pdftotext $1 -".to_string())
+        );
+        assert_eq!(
+            app.document_loaders.get("docx"),
+            Some(&"pandoc --to plain $1".to_string())
+        );
+    }
+
+    #[test]
+    fn from_config_resolves_auto_user_agent() {
+        let cfg = Config {
+            model_id: "provider:test".to_string(),
+            user_agent: Some("auto".to_string()),
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        let ua = app.user_agent.as_deref().unwrap();
+        assert!(ua != "auto", "user_agent should have been resolved");
+        assert!(ua.contains('/'), "user_agent should be '<name>/<version>'");
+    }
+
+    #[test]
+    fn from_config_preserves_explicit_user_agent() {
+        let cfg = Config {
+            model_id: "provider:test".to_string(),
+            user_agent: Some("custom/1.0".to_string()),
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        assert_eq!(app.user_agent.as_deref(), Some("custom/1.0"));
+    }
+
+    #[test]
+    fn from_config_validates_wrap_value() {
+        let cfg = Config {
+            model_id: "provider:test".to_string(),
+            wrap: Some("invalid".to_string()),
+            ..Config::default()
+        };
+
+        let result = AppConfig::from_config(cfg);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_config_accepts_wrap_auto() {
+        let cfg = Config {
+            model_id: "provider:test".to_string(),
+            wrap: Some("auto".to_string()),
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+        assert_eq!(app.wrap.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn resolve_model_errors_when_no_models_available() {
+        let mut app = AppConfig {
+            model_id: String::new(),
+            clients: vec![],
+            ..AppConfig::default()
+        };
+
+        let result = app.resolve_model();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_model_keeps_explicit_model_id() {
+        let mut app = AppConfig {
+            model_id: "provider:explicit".to_string(),
+            ..AppConfig::default()
+        };
+
+        app.resolve_model().unwrap();
+        assert_eq!(app.model_id, "provider:explicit");
     }
 }
