@@ -17,6 +17,7 @@ use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::{ffi::OsStr, path::Path};
+use super::rag_cache::RagKey;
 
 const DEFAULT_AGENT_NAME: &str = "rag";
 
@@ -119,7 +120,16 @@ impl Agent {
         };
 
         let rag = if rag_path.exists() {
-            Some(Arc::new(Rag::load(app, DEFAULT_AGENT_NAME, &rag_path)?))
+            let key = RagKey::Agent(name.to_string());
+            let app_clone = app.clone();
+            let rag_path_clone = rag_path.clone();
+            let rag = app_state
+                .rag_cache
+                .load_with(key, || async move {
+                    Rag::load(&app_clone, DEFAULT_AGENT_NAME, &rag_path_clone)
+                })
+                .await?;
+            Some(rag)
         } else if !agent_config.documents.is_empty() && !info_flag {
             let mut ans = false;
             if *IS_STDOUT_TERMINAL {
@@ -152,8 +162,23 @@ impl Agent {
                         document_paths.push(path.to_string())
                     }
                 }
-                let rag = Rag::init(app, "rag", &rag_path, &document_paths, abort_signal).await?;
-                Some(Arc::new(rag))
+                let key = RagKey::Agent(name.to_string());
+                let app_clone = app.clone();
+                let rag_path_clone = rag_path.clone();
+                let rag = app_state
+                    .rag_cache
+                    .load_with(key, || async move {
+                        Rag::init(
+                            &app_clone,
+                            "rag",
+                            &rag_path_clone,
+                            &document_paths,
+                            abort_signal,
+                        )
+                        .await
+                    })
+                    .await?;
+                Some(rag)
             } else {
                 None
             }
