@@ -191,9 +191,6 @@ pub struct Config {
 }
 
 impl Config {
-    pub async fn search_rag(...) -> Result<String> { ... }
-    pub fn load_macro(name: &str) -> Result<Macro> { ... }
-    pub async fn sync_models(url: &str, ...) -> Result<()> { ... }
     pub async fn load_with_interpolation(info_flag: bool) -> Result<Self> { ... }
     pub fn load_from_file(config_path: &Path) -> Result<(Self, String)> { ... }
     pub fn load_from_str(content: &str) -> Result<Self> { ... }
@@ -201,10 +198,11 @@ impl Config {
 }
 ```
 
-Just shape + loaders + a few helpers that don't touch runtime
-state. `search_rag`/`load_macro`/`sync_models` are associated
-functions (no `&self`) that could be free functions someday, but
-that's cosmetic and out of scope for 16f.
+Just shape + four loaders. The three associated functions that
+used to live here (`search_rag`, `load_macro`, `sync_models`)
+were relocated in the 16f cleanup pass below — none of them
+touched Config state, they were squatters from the god-object
+era.
 
 ## Assumptions made
 
@@ -301,3 +299,57 @@ per-request `RequestContext`.
 ## Files deleted (16f)
 
 - `src/config/bridge.rs`
+
+## 16f cleanup pass — Config straggler relocation
+
+After the main 16f deletions landed, three associated functions
+remained on `impl Config` that took no `&self` and didn't touch
+any Config field — they were holdovers from the god-object era,
+attached to `Config` only because Config used to be the
+namespace for everything. Relocated each to its rightful owner:
+
+| Method | New home | Why |
+|--------|----------|-----|
+| `Config::load_macro(name)` | `Macro::load(name)` in `src/config/macros.rs` | Sibling of `Macro::install_macros` already there. The function loads a macro from disk and parses it into a `Macro` — pure macro concern. |
+| `Config::search_rag(app, rag, text, signal)` | `Rag::search_with_template(&self, app, text, signal)` in `src/rag/mod.rs` | Operates on a `Rag` instance and one field of `AppConfig`. Pulled `RAG_TEMPLATE` constant along with it. |
+| `Config::sync_models(url, signal)` | Free function `config::sync_models(url, signal)` in `src/config/mod.rs` | Fetches a URL, parses YAML, writes to `paths::models_override_file()`. No Config state involved. Sibling pattern to `install_builtins`, `default_sessions_dir`, `list_sessions`. |
+
+### Caller updates
+
+- `src/config/macros.rs:23` — `Config::load_macro(name)` → `Macro::load(name)`
+- `src/config/input.rs:214` — `Config::search_rag(&self.app_config, rag, &self.text, abort_signal)` → `rag.search_with_template(&self.app_config, &self.text, abort_signal)`
+- `src/main.rs:149` — `Config::sync_models(&url, abort_signal.clone())` → `sync_models(&url, abort_signal.clone())` (added `sync_models` to the `crate::config::{...}` import list)
+
+### Constants relocated
+
+- `RAG_TEMPLATE` moved from `src/config/mod.rs` to `src/rag/mod.rs` alongside the new `search_with_template` method that uses it.
+
+### Final shape of `impl Config`
+
+```rust
+impl Config {
+    pub async fn load_with_interpolation(info_flag: bool) -> Result<Self> { ... }
+    pub fn load_from_file(config_path: &Path) -> Result<(Self, String)> { ... }
+    pub fn load_from_str(content: &str) -> Result<Self> { ... }
+    pub fn load_dynamic(model_id: &str) -> Result<Self> { ... }
+}
+```
+
+Four loaders, all returning `Self` or `(Self, String)`. Nothing
+else. The `Config` type is now genuinely what its docstring
+claims: a serde POJO with constructors. No squatters.
+
+### Verification (cleanup pass)
+
+- `cargo check` — clean
+- `cargo clippy --all-targets` — clean
+- `cargo test` — 122 passing, zero failures
+- `Config::sync_models` / `Config::load_macro` / `Config::search_rag` — zero hits in `src/`
+
+### Files modified (cleanup pass)
+
+- `src/config/mod.rs` — deleted `Config::load_macro`, `Config::search_rag`, `Config::sync_models`, and `RAG_TEMPLATE` const; added free `sync_models` function
+- `src/config/macros.rs` — added `Macro::load`, updated import (added `Context`, `read_to_string`; removed `Config`)
+- `src/rag/mod.rs` — added `RAG_TEMPLATE` const and `Rag::search_with_template` method
+- `src/config/input.rs` — updated caller to `rag.search_with_template`
+- `src/main.rs` — added `sync_models` to import list, updated caller

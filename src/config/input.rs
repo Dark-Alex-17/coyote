@@ -210,8 +210,9 @@ impl Input {
             return Ok(());
         }
         if let Some(rag) = &self.rag {
-            let result =
-                Config::search_rag(&self.app_config, rag, &self.text, abort_signal).await?;
+            let result = rag
+                .search_with_template(&self.app_config, &self.text, abort_signal)
+                .await?;
             self.patched_text = Some(result);
             self.rag_name = Some(rag.name().to_string());
         }
