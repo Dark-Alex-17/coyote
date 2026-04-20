@@ -22,8 +22,8 @@ use crate::client::{
 use crate::config::paths;
 use crate::config::{
     Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, RequestContext,
-    SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, load_env_file,
-    macro_execute,
+    SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, install_builtins,
+    list_agents, load_env_file, macro_execute, sync_models,
 };
 use crate::render::{prompt_theme, render_error};
 use crate::repl::Repl;
@@ -82,45 +82,38 @@ async fn main() -> Result<()> {
 
     let log_path = setup_logger()?;
 
+    install_builtins()?;
+
     if let Some(client_arg) = &cli.authenticate {
-        let config = Config::init_bare()?;
-        let (client_name, provider) = resolve_oauth_client(client_arg.as_deref(), &config.clients)?;
+        let cfg = Config::load_with_interpolation(true).await?;
+        let app_config = AppConfig::from_config(cfg)?;
+        let (client_name, provider) =
+            resolve_oauth_client(client_arg.as_deref(), &app_config.clients)?;
         oauth::run_oauth_flow(&*provider, &client_name).await?;
         return Ok(());
     }
 
     if vault_flags {
-        return Vault::handle_vault_flags(cli, Config::init_bare()?);
+        let cfg = Config::load_with_interpolation(true).await?;
+        let app_config = AppConfig::from_config(cfg)?;
+        let vault = Vault::init(&app_config);
+        return Vault::handle_vault_flags(cli, &vault);
     }
 
     let abort_signal = create_abort_signal();
     let start_mcp_servers = cli.agent.is_none() && cli.role.is_none();
-    let cfg = Config::init(
-        working_mode,
-        info_flag,
-        start_mcp_servers,
-        log_path,
-        abort_signal.clone(),
-    )
-    .await?;
-    let app_config: Arc<AppConfig> = Arc::new(cfg.to_app_config());
-    let (mcp_config, mcp_log_path) = match &cfg.mcp_registry {
-        Some(reg) => (reg.mcp_config().cloned(), reg.log_path().cloned()),
-        None => (None, None),
-    };
-    let app_state: Arc<AppState> = Arc::new(AppState {
-        config: app_config,
-        vault: cfg.vault.clone(),
-        mcp_factory: Default::default(),
-        rag_cache: Default::default(),
-        mcp_config,
-        mcp_log_path,
-    });
-    let ctx = cfg.to_request_context(app_state);
-    log::debug!(
-        "ctx.tool_scope.mcp_runtime servers after sync: {:?}",
-        ctx.tool_scope.mcp_runtime.server_names()
+    let cfg = Config::load_with_interpolation(info_flag).await?;
+    let app_config: Arc<AppConfig> = Arc::new(AppConfig::from_config(cfg)?);
+    let app_state: Arc<AppState> = Arc::new(
+        AppState::init(
+            app_config,
+            log_path,
+            start_mcp_servers,
+            abort_signal.clone(),
+        )
+        .await?,
     );
+    let ctx = RequestContext::bootstrap(app_state, working_mode, info_flag)?;
 
     {
         let app = &*ctx.app.config;
@@ -153,7 +146,7 @@ async fn run(
 ) -> Result<()> {
     if cli.sync_models {
         let url = ctx.app.config.sync_models_url();
-        return Config::sync_models(&url, abort_signal.clone()).await;
+        return sync_models(&url, abort_signal.clone()).await;
     }
 
     if cli.list_models {

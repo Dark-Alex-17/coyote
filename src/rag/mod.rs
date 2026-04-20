@@ -20,6 +20,30 @@ use std::{
 };
 use tokio::time::sleep;
 
+const RAG_TEMPLATE: &str = r#"Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
+
+<context>
+__CONTEXT__
+</context>
+
+<sources>
+__SOURCES__
+</sources>
+
+<rules>
+- If you don't know, just say so.
+- If you are not sure, ask for clarification.
+- Answer in the same language as the user query.
+- If the context appears unreadable or of poor quality, tell the user then answer as best as you can.
+- If the answer is not in the context but you think you know the answer, explain that to the user then answer with your own knowledge.
+- Answer directly and without using xml tags.
+- When using information from the context, cite the relevant source from the <sources> section.
+</rules>
+
+<user_query>
+__INPUT__
+</user_query>"#;
+
 pub struct Rag {
     app_config: Arc<AppConfig>,
     name: String,
@@ -64,7 +88,6 @@ impl Rag {
 
     pub async fn init(
         app: &AppConfig,
-        clients: &[ClientConfig],
         name: &str,
         save_path: &Path,
         doc_paths: &[String],
@@ -85,7 +108,7 @@ impl Rag {
             top_k,
             embedding_model.max_batch_size(),
         );
-        let mut rag = Self::create(app, clients, name, save_path, data)?;
+        let mut rag = Self::create(app, name, save_path, data)?;
         let mut paths = doc_paths.to_vec();
         if paths.is_empty() {
             paths = add_documents()?;
@@ -104,25 +127,14 @@ impl Rag {
         Ok(rag)
     }
 
-    pub fn load(
-        app: &AppConfig,
-        clients: &[ClientConfig],
-        name: &str,
-        path: &Path,
-    ) -> Result<Self> {
+    pub fn load(app: &AppConfig, name: &str, path: &Path) -> Result<Self> {
         let err = || format!("Failed to load rag '{name}' at '{}'", path.display());
         let content = fs::read_to_string(path).with_context(err)?;
         let data: RagData = serde_yaml::from_str(&content).with_context(err)?;
-        Self::create(app, clients, name, path, data)
+        Self::create(app, name, path, data)
     }
 
-    pub fn create(
-        app: &AppConfig,
-        _clients: &[ClientConfig],
-        name: &str,
-        path: &Path,
-        data: RagData,
-    ) -> Result<Self> {
+    pub fn create(app: &AppConfig, name: &str, path: &Path, data: RagData) -> Result<Self> {
         let hnsw = data.build_hnsw();
         let bm25 = data.build_bm25();
         let embedding_model =
@@ -328,6 +340,29 @@ impl Rag {
             .join("\n\n");
         let sources = self.format_sources(&ids);
         Ok((embeddings, sources, ids))
+    }
+
+    pub async fn search_with_template(
+        &self,
+        app: &AppConfig,
+        text: &str,
+        abort_signal: AbortSignal,
+    ) -> Result<String> {
+        let (reranker_model, top_k) = self.get_config();
+        let (embeddings, sources, ids) = self
+            .search(text, top_k, reranker_model.as_deref(), abort_signal)
+            .await?;
+        let rag_template = app.rag_template.as_deref().unwrap_or(RAG_TEMPLATE);
+        let text = if embeddings.is_empty() {
+            text.to_string()
+        } else {
+            rag_template
+                .replace("__CONTEXT__", &embeddings)
+                .replace("__SOURCES__", &sources)
+                .replace("__INPUT__", text)
+        };
+        self.set_last_sources(&ids);
+        Ok(text)
     }
 
     fn resolve_source(&self, id: &DocumentId) -> String {

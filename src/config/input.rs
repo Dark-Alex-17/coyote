@@ -20,7 +20,7 @@ pub struct Input {
     app_config: Arc<AppConfig>,
     stream_enabled: bool,
     session: Option<Session>,
-    rag: Option<Arc<crate::rag::Rag>>,
+    rag: Option<Arc<Rag>>,
     functions: Option<Vec<FunctionDeclaration>>,
     text: String,
     raw: (String, Vec<String>),
@@ -210,8 +210,9 @@ impl Input {
             return Ok(());
         }
         if let Some(rag) = &self.rag {
-            let result =
-                Config::search_rag(&self.app_config, rag, &self.text, abort_signal).await?;
+            let result = rag
+                .search_with_template(&self.app_config, &self.text, abort_signal)
+                .await?;
             self.patched_text = Some(result);
             self.rag_name = Some(rag.name().to_string());
         }
@@ -411,7 +412,7 @@ fn resolve_role(ctx: &RequestContext, role: Option<Role>) -> (Role, bool, bool) 
 struct CapturedInputConfig {
     stream_enabled: bool,
     session: Option<Session>,
-    rag: Option<Arc<crate::rag::Rag>>,
+    rag: Option<Arc<Rag>>,
     functions: Option<Vec<FunctionDeclaration>>,
 }
 

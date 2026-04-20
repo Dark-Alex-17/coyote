@@ -231,6 +231,7 @@ impl Repl {
         })
     }
 
+    #[allow(clippy::await_holding_lock)]
     pub async fn run(&mut self) -> Result<()> {
         if AssertState::False(StateFlags::AGENT | StateFlags::RAG).assert(self.ctx.read().state()) {
             print!(
@@ -770,11 +771,11 @@ pub async fn run_repl_command(
                                     "The todo system is not enabled for this agent. Set 'auto_continue: true' in the agent's config.yaml to enable it."
                                 );
                             }
-                            if agent.todo_list().is_empty() {
+                            if ctx.todo_list.is_empty() {
                                 println!("Todo list is already empty.");
                                 false
                             } else {
-                                agent.clear_todo_list();
+                                ctx.clear_todo_list();
                                 println!("Todo list cleared.");
                                 true
                             }
@@ -824,7 +825,7 @@ pub async fn run_repl_command(
             _ => unknown_command()?,
         },
         None => {
-            reset_agent_continuation(ctx);
+            reset_continuation(ctx);
             let input = Input::from_str(ctx, line, None);
             ask(ctx, abort_signal.clone(), input, true).await?;
         }
@@ -884,14 +885,14 @@ async fn ask(
 
         if should_continue {
             let full_prompt = {
+                let todo_state = ctx.todo_list.render_for_model();
+                let remaining = ctx.todo_list.incomplete_count();
+                ctx.set_last_continuation_response(output.clone());
+                ctx.increment_auto_continue_count();
                 let agent = ctx.agent.as_mut().expect("agent checked above");
-                agent.set_last_continuation_response(output.clone());
-                agent.increment_continuation();
-                let count = agent.continuation_count();
+                let count = ctx.auto_continue_count;
                 let max = agent.max_auto_continues();
 
-                let todo_state = agent.todo_list().render_for_model();
-                let remaining = agent.todo_list().incomplete_count();
                 let prompt = agent.continuation_prompt();
 
                 let color = if app.light_theme() {
@@ -911,7 +912,7 @@ async fn ask(
             let continuation_input = Input::from_str(ctx, &full_prompt, None);
             ask(ctx, abort_signal, continuation_input, false).await
         } else {
-            reset_agent_continuation(ctx);
+            reset_continuation(ctx);
             if ctx.maybe_autoname_session() {
                 let color = if app.light_theme() {
                     nu_ansi_term::Color::LightGray
@@ -955,13 +956,13 @@ async fn ask(
 
                 if agent_can_continue_after_compress {
                     let full_prompt = {
+                        let todo_state = ctx.todo_list.render_for_model();
+                        let remaining = ctx.todo_list.incomplete_count();
+                        ctx.increment_auto_continue_count();
                         let agent = ctx.agent.as_mut().expect("agent checked above");
-                        agent.increment_continuation();
-                        let count = agent.continuation_count();
+                        let count = ctx.auto_continue_count;
                         let max = agent.max_auto_continues();
 
-                        let todo_state = agent.todo_list().render_for_model();
-                        let remaining = agent.todo_list().incomplete_count();
                         let prompt = agent.continuation_prompt();
 
                         let color = if app.light_theme() {
@@ -990,20 +991,12 @@ async fn ask(
 
 fn agent_should_continue(ctx: &RequestContext) -> bool {
     ctx.agent.as_ref().is_some_and(|agent| {
-        agent.auto_continue_enabled()
-            && agent.continuation_count() < agent.max_auto_continues()
-            && agent.todo_list().has_incomplete()
-    })
+        agent.auto_continue_enabled() && ctx.auto_continue_count < agent.max_auto_continues()
+    }) && ctx.todo_list.has_incomplete()
 }
 
-fn reset_agent_continuation(ctx: &mut RequestContext) {
-    if ctx
-        .agent
-        .as_ref()
-        .is_some_and(|agent| agent.continuation_count() > 0)
-    {
-        ctx.agent.as_mut().unwrap().reset_continuation();
-    }
+fn reset_continuation(ctx: &mut RequestContext) {
+    ctx.reset_continuation_count();
 }
 
 fn unknown_command() -> Result<()> {

@@ -94,31 +94,23 @@ pub fn handle_todo_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) 
         .strip_prefix(TODO_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
 
+    if ctx.agent.is_none() {
+        bail!("No active agent");
+    }
+
     match action {
         "init" => {
             let goal = args.get("goal").and_then(Value::as_str).unwrap_or_default();
-            let agent = ctx.agent.as_mut();
-            match agent {
-                Some(agent) => {
-                    agent.init_todo_list(goal);
-                    Ok(json!({"status": "ok", "message": "Initialized new todo list"}))
-                }
-                None => bail!("No active agent"),
-            }
+            ctx.init_todo_list(goal);
+            Ok(json!({"status": "ok", "message": "Initialized new todo list"}))
         }
         "add" => {
             let task = args.get("task").and_then(Value::as_str).unwrap_or_default();
             if task.is_empty() {
                 return Ok(json!({"error": "task description is required"}));
             }
-            let agent = ctx.agent.as_mut();
-            match agent {
-                Some(agent) => {
-                    let id = agent.add_todo(task);
-                    Ok(json!({"status": "ok", "id": id}))
-                }
-                None => bail!("No active agent"),
-            }
+            let id = ctx.add_todo(task);
+            Ok(json!({"status": "ok", "id": id}))
         }
         "done" => {
             let id = args
@@ -130,47 +122,26 @@ pub fn handle_todo_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) 
                 .map(|v| v as usize);
             match id {
                 Some(id) => {
-                    let agent = ctx.agent.as_mut();
-                    match agent {
-                        Some(agent) => {
-                            if agent.mark_todo_done(id) {
-                                Ok(
-                                    json!({"status": "ok", "message": format!("Marked todo {id} as done")}),
-                                )
-                            } else {
-                                Ok(json!({"error": format!("Todo {id} not found")}))
-                            }
-                        }
-                        None => bail!("No active agent"),
+                    if ctx.mark_todo_done(id) {
+                        Ok(json!({"status": "ok", "message": format!("Marked todo {id} as done")}))
+                    } else {
+                        Ok(json!({"error": format!("Todo {id} not found")}))
                     }
                 }
                 None => Ok(json!({"error": "id is required and must be a number"})),
             }
         }
         "list" => {
-            let agent = ctx.agent.as_ref();
-            match agent {
-                Some(agent) => {
-                    let list = agent.todo_list();
-                    if list.is_empty() {
-                        Ok(json!({"goal": "", "todos": []}))
-                    } else {
-                        Ok(serde_json::to_value(list)
-                            .unwrap_or(json!({"error": "serialization failed"})))
-                    }
-                }
-                None => bail!("No active agent"),
+            let list = &ctx.todo_list;
+            if list.is_empty() {
+                Ok(json!({"goal": "", "todos": []}))
+            } else {
+                Ok(serde_json::to_value(list).unwrap_or(json!({"error": "serialization failed"})))
             }
         }
         "clear" => {
-            let agent = ctx.agent.as_mut();
-            match agent {
-                Some(agent) => {
-                    agent.clear_todo_list();
-                    Ok(json!({"status": "ok", "message": "Todo list cleared"}))
-                }
-                None => bail!("No active agent"),
-            }
+            ctx.clear_todo_list();
+            Ok(json!({"status": "ok", "message": "Todo list cleared"}))
         }
         _ => bail!("Unknown todo action: {action}"),
     }

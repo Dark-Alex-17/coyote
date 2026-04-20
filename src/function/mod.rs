@@ -148,7 +148,7 @@ pub async fn eval_tool_calls(
     }
 
     if !output.is_empty() {
-        let (has_escalations, summary) = if ctx.current_depth() == 0
+        let (has_escalations, summary) = if ctx.current_depth == 0
             && let Some(queue) = ctx.root_escalation_queue()
             && queue.has_pending()
         {
@@ -192,7 +192,7 @@ pub struct Functions {
 }
 
 impl Functions {
-    fn install_global_tools() -> Result<()> {
+    pub fn install_builtin_global_tools() -> Result<()> {
         info!(
             "Installing global built-in functions in {}",
             paths::functions_dir().display()
@@ -241,7 +241,6 @@ impl Functions {
     }
 
     pub fn init(visible_tools: &[String]) -> Result<Self> {
-        Self::install_global_tools()?;
         Self::clear_global_functions_bin_dir()?;
 
         let declarations = Self {
@@ -258,7 +257,6 @@ impl Functions {
     }
 
     pub fn init_agent(name: &str, global_tools: &[String]) -> Result<Self> {
-        Self::install_global_tools()?;
         Self::clear_agent_bin_dir(name)?;
 
         let global_tools_declarations = if !global_tools.is_empty() {
@@ -943,7 +941,7 @@ impl ToolCall {
     pub async fn eval(&self, ctx: &mut RequestContext) -> Result<Value> {
         let agent = ctx.agent.clone();
         let functions = ctx.tool_scope.functions.clone();
-        let current_depth = ctx.current_depth();
+        let current_depth = ctx.current_depth;
         let agent_name = agent.as_ref().map(|agent| agent.name().to_owned());
         let (call_name, cmd_name, mut cmd_args, envs) = match agent.as_ref() {
             Some(agent) => self.extract_call_config_from_agent(&functions, agent)?,

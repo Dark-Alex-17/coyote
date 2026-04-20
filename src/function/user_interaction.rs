@@ -128,7 +128,7 @@ pub async fn handle_user_tool(
         .strip_prefix(USER_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
 
-    let depth = ctx.current_depth();
+    let depth = ctx.current_depth;
 
     if depth == 0 {
         handle_direct(action, args)
@@ -213,8 +213,8 @@ async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> R
     });
 
     let from_agent_id = ctx
-        .self_agent_id()
-        .map(ToOwned::to_owned)
+        .self_agent_id
+        .clone()
         .unwrap_or_else(|| "unknown".to_string());
     let from_agent_name = ctx
         .agent
