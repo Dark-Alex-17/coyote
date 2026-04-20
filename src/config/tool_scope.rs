@@ -12,19 +12,11 @@
 //! * `tool_tracker` — per-scope tool call history for auto-continuation
 //!   and looping detection
 //!
-//! # Phase 1 Step 6.5 scope
-//!
-//! This file introduces the type scaffolding. Scope transitions
-//! (`use_role`, `use_session`, `use_agent`, `exit_*`) that actually
-//! build and swap `ToolScope` instances are deferred to Step 8 when
-//! the entry points (`main.rs`, `repl/mod.rs`) get rewritten to thread
-//! `RequestContext` through the pipeline. During the bridge window,
-//! `Config.functions` / `Config.mcp_registry` keep serving today's
-//! callers and `ToolScope` sits alongside them on `RequestContext` as
-//! an unused (but compiling and tested) parallel structure.
-//!
-//! The fields mirror the plan in `docs/REST-API-ARCHITECTURE.md`
-//! section 5 and `docs/PHASE-1-IMPLEMENTATION-PLAN.md` Step 6.5.
+//! `ToolScope` lives on [`RequestContext`](super::request_context::RequestContext)
+//! and is built/replaced as the active scope changes (role swap,
+//! session swap, agent enter/exit). The base `functions` are seeded
+//! from [`AppState`](super::app_state::AppState) and per-scope filters
+//! narrow the visible set.
 
 use crate::function::{Functions, ToolCallTracker};
 use crate::mcp::{CatalogItem, ConnectedServer, McpRegistry};

@@ -1,9 +1,11 @@
 //! Per-request mutable state for a single Loki interaction.
 //!
-//! `RequestContext` holds everything that was formerly the runtime
-//! (`#[serde(skip)]`) half of [`Config`](super::Config): the active role,
-//! session, agent, RAG, supervisor state, inbox/escalation queues, and
-//! the conversation's "last message" cursor.
+//! `RequestContext` owns the runtime state that was previously stored
+//! on `Config` as `#[serde(skip)]` fields: the active role, session,
+//! agent, RAG, supervisor state, inbox/escalation queues, the
+//! conversation's "last message" cursor, and the per-scope
+//! [`ToolScope`](super::tool_scope::ToolScope) carrying functions and
+//! live MCP handles.
 //!
 //! Each frontend constructs and owns a `RequestContext`:
 //!
@@ -12,43 +14,11 @@
 //! * **API** — one `RequestContext` per HTTP request, hydrated from a
 //!   persisted session and written back at the end.
 //!
-//! # Tool scope and agent runtime (planned)
-//!
-//! # Flat fields and sub-struct fields coexist during the bridge
-//!
-//! The flat fields (`functions`, `tool_call_tracker`, `supervisor`,
-//! `inbox`, `root_escalation_queue`, `self_agent_id`, `current_depth`,
-//! `parent_supervisor`) mirror the runtime half of today's `Config`
-//! and are populated by
-//! [`Config::to_request_context`](super::Config::to_request_context)
-//! during the bridge.
-//!
-//! Step 6.5 added two **sub-struct fields** alongside the flat ones:
-//!
-//! * [`tool_scope: ToolScope`](super::tool_scope::ToolScope) — the
-//!   planned home for `functions`, `mcp_runtime`, and `tool_tracker`
-//! * [`agent_runtime: Option<AgentRuntime>`](super::agent_runtime::AgentRuntime) —
-//!   the planned home for `supervisor`, `inbox`, `escalation_queue`,
-//!   `todo_list`, `self_agent_id`, `parent_supervisor`, and `depth`
-//!
-//! During the bridge window the sub-struct fields are **additive
-//! scaffolding**: they're initialized to defaults in
-//! [`RequestContext::new`] and stay empty until Step 8 rewrites the
-//! entry points to build them explicitly. The flat fields continue
-//! to carry the actual state from `Config` during the bridge.
-//!
-//! # Phase 1 refactor history
-//!
-//! * **Step 0** — struct introduced alongside `Config`
-//! * **Step 5** — added 13 request-read methods
-//! * **Step 6** — added 12 request-write methods
-//! * **Step 6.5** — added `tool_scope` and `agent_runtime` sub-struct
-//!   fields as additive scaffolding
-//! * **Step 7** — added 14 mixed-method splits that take `&AppConfig`
-//!   as a parameter for the serialized half
-//!
-//! See `docs/PHASE-1-IMPLEMENTATION-PLAN.md` for the full migration
-//! plan.
+//! `RequestContext` is built via [`RequestContext::bootstrap`] (CLI/REPL
+//! entry point) or [`RequestContext::new`] (test/child-agent helper).
+//! It holds an `Arc<AppState>` for shared, immutable services
+//! (config, vault, MCP factory, RAG cache, MCP registry, base
+//! functions).
 
 use super::MessageContentToolCalls;
 use super::rag_cache::{RagCache, RagKey};
@@ -2396,7 +2366,7 @@ impl RequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppState, Config};
+    use crate::config::AppState;
     use crate::utils::get_env_name;
     use std::env;
     use std::fs::{create_dir_all, remove_dir_all, write};
@@ -2446,31 +2416,26 @@ mod tests {
         }
     }
 
-    fn app_state_from_config(cfg: &Config) -> Arc<AppState> {
+    fn default_app_state() -> Arc<AppState> {
         Arc::new(AppState {
-            config: Arc::new(cfg.to_app_config()),
-            vault: cfg.vault.clone(),
+            config: Arc::new(AppConfig::default()),
+            vault: Arc::new(crate::vault::Vault::default()),
             mcp_factory: Arc::new(super::super::mcp_factory::McpFactory::default()),
             rag_cache: Arc::new(RagCache::default()),
             mcp_config: None,
             mcp_log_path: None,
             mcp_registry: None,
-            functions: cfg.functions.clone(),
+            functions: Functions::default(),
         })
     }
 
     fn create_test_ctx() -> RequestContext {
-        let cfg = Config::default();
-        let app_state = app_state_from_config(&cfg);
-        cfg.to_request_context(app_state)
+        RequestContext::new(default_app_state(), WorkingMode::Cmd)
     }
 
     #[test]
-    fn to_request_context_creates_clean_state() {
-        let cfg = Config::default();
-        let app_state = app_state_from_config(&cfg);
-
-        let ctx = cfg.to_request_context(app_state);
+    fn new_creates_clean_state() {
+        let ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
 
         assert!(ctx.role.is_none());
         assert!(ctx.session.is_none());
@@ -2483,9 +2448,7 @@ mod tests {
 
     #[test]
     fn update_app_config_persists_changes() {
-        let cfg = Config::default();
-        let app_state = app_state_from_config(&cfg);
-        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
         let previous = Arc::clone(&ctx.app.config);
 
         ctx.update_app_config(|app| {
