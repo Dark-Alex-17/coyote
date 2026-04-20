@@ -697,6 +697,8 @@ mod tests {
             rag_cache: Arc::new(rag_cache::RagCache::default()),
             mcp_config: None,
             mcp_log_path: None,
+            mcp_registry: None,
+            functions: cfg.functions.clone(),
         });
         let ctx = cfg.to_request_context(app_state);
         let session = Session::new_from_ctx(&ctx, &app_config, "test-session");

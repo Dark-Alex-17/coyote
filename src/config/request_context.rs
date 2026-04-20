@@ -2408,6 +2408,8 @@ mod tests {
             rag_cache: Arc::new(RagCache::default()),
             mcp_config: None,
             mcp_log_path: None,
+            mcp_registry: None,
+            functions: cfg.functions.clone(),
         })
     }
 

@@ -729,12 +729,14 @@ impl Config {
         start_mcp_servers: bool,
         abort_signal: AbortSignal,
     ) -> Result<()> {
+        let app_config = self.to_app_config();
         let mcp_registry = McpRegistry::init(
             log_path,
             start_mcp_servers,
             self.enabled_mcp_servers.clone(),
             abort_signal.clone(),
-            self,
+            &app_config,
+            &self.vault,
         )
         .await?;
         match mcp_registry.is_empty() {
