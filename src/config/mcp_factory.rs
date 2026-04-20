@@ -24,13 +24,14 @@
 //! construction / test round-trips.
 //!
 //! The key type `McpServerKey` hashes the server name plus its full
-//! command/args/env so that two scopes requesting an identically-
-//! configured server share an `Arc`, while two scopes requesting
-//! differently-configured servers (e.g., different API tokens) get
-//! independent subprocesses. This is the sharing-vs-isolation property
-//! described in `docs/REST-API-ARCHITECTURE.md` section 5.
+//! transport config (command/args/env for stdio; url/headers for
+//! http/sse) so that two scopes requesting an identically-configured
+//! server share an `Arc`, while two scopes requesting differently-
+//! configured servers (e.g., different API tokens) get independent
+//! connections. This is the sharing-vs-isolation property described
+//! in `docs/REST-API-ARCHITECTURE.md` section 5.
 
-use crate::mcp::{ConnectedServer, JsonField, McpServer, spawn_mcp_server};
+use crate::mcp::{ConnectedServer, JsonField, McpServer, McpTransportType, spawn_mcp_server};
 
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -41,49 +42,65 @@ use std::sync::{Arc, Weak};
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct McpServerKey {
     pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
+    pub transport: McpTransportKey,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum McpTransportKey {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    Remote {
+        transport_type: McpTransportType,
+        url: String,
+        headers: Vec<(String, String)>,
+    },
 }
 
 impl McpServerKey {
-    pub fn new(
-        name: impl Into<String>,
-        command: impl Into<String>,
-        args: impl IntoIterator<Item = String>,
-        env: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
-        let mut args: Vec<String> = args.into_iter().collect();
-        args.sort();
-        let mut env: Vec<(String, String)> = env.into_iter().collect();
-        env.sort();
+    pub fn from_spec(name: &str, spec: &McpServer) -> Self {
+        let transport = if spec.is_remote() {
+            let url = spec.url.clone().unwrap_or_default();
+            let mut headers: Vec<(String, String)> = spec
+                .headers
+                .as_ref()
+                .map(|h| h.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default();
+            headers.sort();
+            McpTransportKey::Remote {
+                transport_type: spec.transport_type.clone(),
+                url,
+                headers,
+            }
+        } else {
+            let command = spec.command.clone().unwrap_or_default();
+            let mut args = spec.args.clone().unwrap_or_default();
+            args.sort();
+            let mut env: Vec<(String, String)> = spec
+                .env
+                .as_ref()
+                .map(|e| {
+                    e.iter()
+                        .map(|(k, v)| {
+                            let v_str = match v {
+                                JsonField::Str(s) => s.clone(),
+                                JsonField::Bool(b) => b.to_string(),
+                                JsonField::Int(i) => i.to_string(),
+                            };
+                            (k.clone(), v_str)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            env.sort();
+            McpTransportKey::Stdio { command, args, env }
+        };
         Self {
             name: name.into(),
-            command: command.into(),
-            args,
-            env,
+            transport,
         }
-    }
-
-    pub fn from_spec(name: &str, spec: &McpServer) -> Self {
-        let args = spec.args.clone().unwrap_or_default();
-        let env: Vec<(String, String)> = spec
-            .env
-            .as_ref()
-            .map(|e| {
-                e.iter()
-                    .map(|(k, v)| {
-                        let v_str = match v {
-                            JsonField::Str(s) => s.clone(),
-                            JsonField::Bool(b) => b.to_string(),
-                            JsonField::Int(i) => i.to_string(),
-                        };
-                        (k.clone(), v_str)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self::new(name, &spec.command, args, env)
     }
 }
 
