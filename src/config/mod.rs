@@ -89,30 +89,6 @@ const SUMMARIZATION_PROMPT: &str =
     "Summarize the discussion briefly in 200 words or less to use as a prompt for future context.";
 const SUMMARY_CONTEXT_PROMPT: &str = "This is a summary of the chat history as a recap: ";
 
-const RAG_TEMPLATE: &str = r#"Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
-
-<context>
-__CONTEXT__
-</context>
-
-<sources>
-__SOURCES__
-</sources>
-
-<rules>
-- If you don't know, just say so.
-- If you are not sure, ask for clarification.
-- Answer in the same language as the user query.
-- If the context appears unreadable or of poor quality, tell the user then answer as best as you can.
-- If the answer is not in the context but you think you know the answer, explain that to the user then answer with your own knowledge.
-- Answer directly and without using xml tags.
-- When using information from the context, cite the relevant source from the <sources> section.
-</rules>
-
-<user_query>
-__INPUT__
-</user_query>"#;
-
 const LEFT_PROMPT: &str = "{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} ";
 const RIGHT_PROMPT: &str = "{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}";
 
@@ -251,60 +227,29 @@ pub fn list_sessions() -> Vec<String> {
     list_file_names(default_sessions_dir(), ".yaml")
 }
 
+pub async fn sync_models(url: &str, abort_signal: AbortSignal) -> Result<()> {
+    let content = abortable_run_with_spinner(fetch(url), "Fetching models.yaml", abort_signal)
+        .await
+        .with_context(|| format!("Failed to fetch '{url}'"))?;
+    println!("✓ Fetched '{url}'");
+    let list = serde_yaml::from_str::<Vec<ProviderModels>>(&content)
+        .with_context(|| "Failed to parse models.yaml")?;
+    let models_override = ModelsOverride {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        list,
+    };
+    let models_override_data =
+        serde_yaml::to_string(&models_override).with_context(|| "Failed to serde {}")?;
+
+    let model_override_path = paths::models_override_file();
+    ensure_parent_exists(&model_override_path)?;
+    std::fs::write(&model_override_path, models_override_data)
+        .with_context(|| format!("Failed to write to '{}'", model_override_path.display()))?;
+    println!("✓ Updated '{}'", model_override_path.display());
+    Ok(())
+}
+
 impl Config {
-    pub async fn search_rag(
-        app: &AppConfig,
-        rag: &Rag,
-        text: &str,
-        abort_signal: AbortSignal,
-    ) -> Result<String> {
-        let (reranker_model, top_k) = rag.get_config();
-        let (embeddings, sources, ids) = rag
-            .search(text, top_k, reranker_model.as_deref(), abort_signal)
-            .await?;
-        let rag_template = app.rag_template.as_deref().unwrap_or(RAG_TEMPLATE);
-        let text = if embeddings.is_empty() {
-            text.to_string()
-        } else {
-            rag_template
-                .replace("__CONTEXT__", &embeddings)
-                .replace("__SOURCES__", &sources)
-                .replace("__INPUT__", text)
-        };
-        rag.set_last_sources(&ids);
-        Ok(text)
-    }
-
-    pub fn load_macro(name: &str) -> Result<Macro> {
-        let path = paths::macro_file(name);
-        let err = || format!("Failed to load macro '{name}' at '{}'", path.display());
-        let content = read_to_string(&path).with_context(err)?;
-        let value: Macro = serde_yaml::from_str(&content).with_context(err)?;
-        Ok(value)
-    }
-
-    pub async fn sync_models(url: &str, abort_signal: AbortSignal) -> Result<()> {
-        let content = abortable_run_with_spinner(fetch(url), "Fetching models.yaml", abort_signal)
-            .await
-            .with_context(|| format!("Failed to fetch '{url}'"))?;
-        println!("✓ Fetched '{url}'");
-        let list = serde_yaml::from_str::<Vec<ProviderModels>>(&content)
-            .with_context(|| "Failed to parse models.yaml")?;
-        let models_override = ModelsOverride {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            list,
-        };
-        let models_override_data =
-            serde_yaml::to_string(&models_override).with_context(|| "Failed to serde {}")?;
-
-        let model_override_path = paths::models_override_file();
-        ensure_parent_exists(&model_override_path)?;
-        std::fs::write(&model_override_path, models_override_data)
-            .with_context(|| format!("Failed to write to '{}'", model_override_path.display()))?;
-        println!("✓ Updated '{}'", model_override_path.display());
-        Ok(())
-    }
-
     pub async fn load_with_interpolation(info_flag: bool) -> Result<Self> {
         let config_path = paths::config_file();
         let (mut config, content) = if !config_path.exists() {

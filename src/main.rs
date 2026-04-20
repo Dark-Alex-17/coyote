@@ -23,7 +23,7 @@ use crate::config::paths;
 use crate::config::{
     Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, RequestContext,
     SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, install_builtins,
-    list_agents, load_env_file, macro_execute,
+    list_agents, load_env_file, macro_execute, sync_models,
 };
 use crate::render::{prompt_theme, render_error};
 use crate::repl::Repl;
@@ -146,7 +146,7 @@ async fn run(
 ) -> Result<()> {
     if cli.sync_models {
         let url = ctx.app.config.sync_models_url();
-        return Config::sync_models(&url, abort_signal.clone()).await;
+        return sync_models(&url, abort_signal.clone()).await;
     }
 
     if cli.list_models {
