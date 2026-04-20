@@ -1,6 +1,7 @@
-use crate::config::Config;
+use crate::config::AppConfig;
 use crate::config::paths;
 use crate::utils::{AbortSignal, abortable_run_with_spinner};
+use crate::vault::Vault;
 use crate::vault::interpolate_secrets;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{StreamExt, TryStreamExt, stream};
@@ -78,7 +79,8 @@ impl McpRegistry {
         start_mcp_servers: bool,
         enabled_mcp_servers: Option<String>,
         abort_signal: AbortSignal,
-        config: &Config,
+        app_config: &AppConfig,
+        vault: &Vault,
     ) -> Result<Self> {
         let mut registry = Self {
             log_path,
@@ -111,7 +113,7 @@ impl McpRegistry {
             return Ok(registry);
         }
 
-        let (parsed_content, missing_secrets) = interpolate_secrets(&content, &config.vault);
+        let (parsed_content, missing_secrets) = interpolate_secrets(&content, vault);
 
         if !missing_secrets.is_empty() {
             return Err(anyhow!(formatdoc!(
@@ -126,7 +128,7 @@ impl McpRegistry {
             serde_json::from_str(&parsed_content).with_context(err)?;
         registry.config = Some(mcp_servers_config);
 
-        if start_mcp_servers && config.mcp_server_support {
+        if start_mcp_servers && app_config.mcp_server_support {
             abortable_run_with_spinner(
                 registry.start_select_mcp_servers(enabled_mcp_servers),
                 "Loading MCP servers",

@@ -486,6 +486,8 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         rag_cache: ctx.app.rag_cache.clone(),
         mcp_config: ctx.app.mcp_config.clone(),
         mcp_log_path: ctx.app.mcp_log_path.clone(),
+        mcp_registry: ctx.app.mcp_registry.clone(),
+        functions: ctx.app.functions.clone(),
     });
     let agent = Agent::init(
         app_config.as_ref(),

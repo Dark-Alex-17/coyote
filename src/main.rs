@@ -111,6 +111,8 @@ async fn main() -> Result<()> {
         Some(reg) => (reg.mcp_config().cloned(), reg.log_path().cloned()),
         None => (None, None),
     };
+    let mcp_registry = cfg.mcp_registry.clone().map(Arc::new);
+    let functions = cfg.functions.clone();
     let app_state: Arc<AppState> = Arc::new(AppState {
         config: app_config,
         vault: cfg.vault.clone(),
@@ -118,6 +120,8 @@ async fn main() -> Result<()> {
         rag_cache: Default::default(),
         mcp_config,
         mcp_log_path,
+        mcp_registry,
+        functions,
     });
     let ctx = cfg.to_request_context(app_state);
 
