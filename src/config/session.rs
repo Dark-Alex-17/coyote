@@ -674,7 +674,8 @@ impl AutoName {
 mod tests {
     use super::*;
     use crate::client::{Message, MessageContent, MessageRole, Model};
-    use crate::config::{AppState, Config};
+    use crate::config::{AppConfig, AppState, RequestContext, WorkingMode};
+    use crate::function::Functions;
     use std::sync::Arc;
 
     #[test]
@@ -688,19 +689,18 @@ mod tests {
 
     #[test]
     fn session_new_from_ctx_captures_save_session() {
-        let cfg = Config::default();
-        let app_config = Arc::new(cfg.to_app_config());
+        let app_config = Arc::new(AppConfig::default());
         let app_state = Arc::new(AppState {
             config: app_config.clone(),
-            vault: cfg.vault.clone(),
+            vault: Arc::new(crate::vault::Vault::default()),
             mcp_factory: Arc::new(mcp_factory::McpFactory::default()),
             rag_cache: Arc::new(rag_cache::RagCache::default()),
             mcp_config: None,
             mcp_log_path: None,
             mcp_registry: None,
-            functions: cfg.functions.clone(),
+            functions: Functions::default(),
         });
-        let ctx = cfg.to_request_context(app_state);
+        let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let session = Session::new_from_ctx(&ctx, &app_config, "test-session");
 
         assert_eq!(session.name(), "test-session");

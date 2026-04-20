@@ -1,23 +1,19 @@
-//! Immutable, server-wide application configuration.
+//! Immutable, process-wide application configuration.
 //!
 //! `AppConfig` contains the settings loaded from `config.yaml` that are
-//! global to the Loki process: LLM provider configs, UI preferences, tool
-//! and MCP settings, RAG defaults, etc.
+//! global to the Loki process: LLM provider configs, UI preferences,
+//! tool and MCP settings, RAG defaults, etc.
 //!
-//! This is Phase 1, Step 0 of the REST API refactor: the struct is
-//! introduced alongside the existing [`Config`](super::Config) and is not
-//! yet wired into the runtime. See `docs/PHASE-1-IMPLEMENTATION-PLAN.md`
-//! for the full migration plan.
-//!
-//! # Relationship to `Config`
-//!
-//! `AppConfig` mirrors the **serialized** fields of [`Config`] — that is,
-//! every field that is NOT marked `#[serde(skip)]`. The deserialization
-//! shape is identical so an existing `config.yaml` can be loaded into
-//! either type without modification.
+//! `AppConfig` mirrors the field shape of [`Config`](super::Config) (the
+//! serde POJO loaded from YAML) but is the runtime-resolved form: env
+//! var overrides applied, wrap validated, default document loaders
+//! installed, user agent resolved, default model picked. Build it via
+//! [`AppConfig::from_config`].
 //!
 //! Runtime-only state (current role, session, agent, supervisor, etc.)
 //! lives on [`RequestContext`](super::request_context::RequestContext).
+//! Process-wide services (vault, MCP registry, function registry) live
+//! on [`AppState`](super::app_state::AppState).
 
 use crate::client::{ClientConfig, list_models};
 use crate::render::{MarkdownRender, RenderOptions};
@@ -38,7 +34,6 @@ use terminal_colorsaurus::{ColorScheme, QueryOptions, color_scheme};
 pub struct AppConfig {
     #[serde(rename(serialize = "model", deserialize = "model"))]
     #[serde(default)]
-    #[allow(dead_code)]
     pub model_id: String,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
@@ -151,7 +146,58 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn from_config(config: super::Config) -> Result<Self> {
-        let mut app_config = config.to_app_config();
+        let mut app_config = Self {
+            model_id: config.model_id,
+            temperature: config.temperature,
+            top_p: config.top_p,
+
+            dry_run: config.dry_run,
+            stream: config.stream,
+            save: config.save,
+            keybindings: config.keybindings,
+            editor: config.editor,
+            wrap: config.wrap,
+            wrap_code: config.wrap_code,
+            vault_password_file: config.vault_password_file,
+
+            function_calling_support: config.function_calling_support,
+            mapping_tools: config.mapping_tools,
+            enabled_tools: config.enabled_tools,
+            visible_tools: config.visible_tools,
+
+            mcp_server_support: config.mcp_server_support,
+            mapping_mcp_servers: config.mapping_mcp_servers,
+            enabled_mcp_servers: config.enabled_mcp_servers,
+
+            repl_prelude: config.repl_prelude,
+            cmd_prelude: config.cmd_prelude,
+            agent_session: config.agent_session,
+
+            save_session: config.save_session,
+            compression_threshold: config.compression_threshold,
+            summarization_prompt: config.summarization_prompt,
+            summary_context_prompt: config.summary_context_prompt,
+
+            rag_embedding_model: config.rag_embedding_model,
+            rag_reranker_model: config.rag_reranker_model,
+            rag_top_k: config.rag_top_k,
+            rag_chunk_size: config.rag_chunk_size,
+            rag_chunk_overlap: config.rag_chunk_overlap,
+            rag_template: config.rag_template,
+
+            document_loaders: config.document_loaders,
+
+            highlight: config.highlight,
+            theme: config.theme,
+            left_prompt: config.left_prompt,
+            right_prompt: config.right_prompt,
+
+            user_agent: config.user_agent,
+            save_shell_history: config.save_shell_history,
+            sync_models_url: config.sync_models_url,
+
+            clients: config.clients,
+        };
         app_config.load_envs();
         if let Some(wrap) = app_config.wrap.clone() {
             app_config.set_wrap(&wrap)?;
@@ -491,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn to_app_config_copies_serialized_fields() {
+    fn from_config_copies_serialized_fields() {
         let cfg = Config {
             model_id: "test-model".to_string(),
             temperature: Some(0.7),
@@ -502,10 +548,11 @@ mod tests {
             highlight: false,
             compression_threshold: 2000,
             rag_top_k: 10,
+            clients: vec![ClientConfig::default()],
             ..Config::default()
         };
 
-        let app = cfg.to_app_config();
+        let app = AppConfig::from_config(cfg).unwrap();
 
         assert_eq!(app.model_id, "test-model");
         assert_eq!(app.temperature, Some(0.7));
@@ -519,22 +566,30 @@ mod tests {
     }
 
     #[test]
-    fn to_app_config_copies_clients() {
-        let cfg = Config::default();
-        let app = cfg.to_app_config();
+    fn from_config_copies_clients() {
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            clients: vec![ClientConfig::default()],
+            ..Config::default()
+        };
+        let app = AppConfig::from_config(cfg).unwrap();
 
-        assert!(app.clients.is_empty());
+        assert_eq!(app.clients.len(), 1);
     }
 
     #[test]
-    fn to_app_config_copies_mapping_fields() {
-        let mut cfg = Config::default();
+    fn from_config_copies_mapping_fields() {
+        let mut cfg = Config {
+            model_id: "test-model".to_string(),
+            clients: vec![ClientConfig::default()],
+            ..Config::default()
+        };
         cfg.mapping_tools
             .insert("alias".to_string(), "real_tool".to_string());
         cfg.mapping_mcp_servers
             .insert("gh".to_string(), "github-mcp".to_string());
 
-        let app = cfg.to_app_config();
+        let app = AppConfig::from_config(cfg).unwrap();
 
         assert_eq!(
             app.mapping_tools.get("alias"),

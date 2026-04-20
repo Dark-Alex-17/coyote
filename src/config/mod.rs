@@ -1,7 +1,6 @@
 mod agent;
 mod app_config;
 mod app_state;
-mod bridge;
 mod input;
 mod macros;
 mod mcp_factory;
@@ -28,25 +27,20 @@ pub use self::role::{
 use self::session::Session;
 use crate::client::{
     ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
-    ProviderModels, create_client_config, list_client_types, list_models,
+    ProviderModels, create_client_config, list_client_types,
 };
-use crate::function::{FunctionDeclaration, Functions, ToolCallTracker};
+use crate::function::{FunctionDeclaration, Functions};
 use crate::rag::Rag;
 use crate::utils::*;
 pub use macros::macro_execute;
 
 use crate::config::macros::Macro;
-use crate::mcp::McpRegistry;
-use crate::supervisor::Supervisor;
-use crate::supervisor::escalation::EscalationQueue;
-use crate::supervisor::mailbox::Inbox;
 use crate::vault::{GlobalVault, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, Select};
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -59,8 +53,6 @@ use std::{
     process,
     sync::{Arc, OnceLock},
 };
-use terminal_colorsaurus::{ColorScheme, QueryOptions, color_scheme};
-use tokio::runtime::Handle;
 
 pub const TEMP_ROLE_NAME: &str = "temp";
 pub const TEMP_RAG_NAME: &str = "temp";
@@ -142,7 +134,7 @@ pub struct Config {
     pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
-    vault_password_file: Option<PathBuf>,
+    pub(super) vault_password_file: Option<PathBuf>,
 
     pub function_calling_support: bool,
     pub mapping_tools: IndexMap<String, String>,
@@ -182,50 +174,6 @@ pub struct Config {
     pub sync_models_url: Option<String>,
 
     pub clients: Vec<ClientConfig>,
-
-    #[serde(skip)]
-    pub vault: GlobalVault,
-
-    #[serde(skip)]
-    pub macro_flag: bool,
-    #[serde(skip)]
-    pub info_flag: bool,
-    #[serde(skip)]
-    pub agent_variables: Option<AgentVariables>,
-
-    #[serde(skip)]
-    pub model: Model,
-    #[serde(skip)]
-    pub functions: Functions,
-    #[serde(skip)]
-    pub mcp_registry: Option<McpRegistry>,
-    #[serde(skip)]
-    pub working_mode: WorkingMode,
-    #[serde(skip)]
-    pub last_message: Option<LastMessage>,
-
-    #[serde(skip)]
-    pub role: Option<Role>,
-    #[serde(skip)]
-    pub session: Option<Session>,
-    #[serde(skip)]
-    pub rag: Option<Arc<Rag>>,
-    #[serde(skip)]
-    pub agent: Option<Agent>,
-    #[serde(skip)]
-    pub(crate) tool_call_tracker: Option<ToolCallTracker>,
-    #[serde(skip)]
-    pub supervisor: Option<Arc<RwLock<Supervisor>>>,
-    #[serde(skip)]
-    pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
-    #[serde(skip)]
-    pub self_agent_id: Option<String>,
-    #[serde(skip)]
-    pub current_depth: usize,
-    #[serde(skip)]
-    pub inbox: Option<Arc<Inbox>>,
-    #[serde(skip)]
-    pub root_escalation_queue: Option<Arc<EscalationQueue>>,
 }
 
 impl Default for Config {
@@ -281,30 +229,6 @@ impl Default for Config {
             sync_models_url: None,
 
             clients: vec![],
-
-            vault: Default::default(),
-
-            macro_flag: false,
-            info_flag: false,
-            agent_variables: None,
-
-            model: Default::default(),
-            functions: Default::default(),
-            mcp_registry: Default::default(),
-            working_mode: WorkingMode::Cmd,
-            last_message: None,
-
-            role: None,
-            session: None,
-            rag: None,
-            agent: None,
-            tool_call_tracker: Some(ToolCallTracker::default()),
-            supervisor: None,
-            parent_supervisor: None,
-            self_agent_id: None,
-            current_depth: 0,
-            inbox: None,
-            root_escalation_queue: None,
         }
     }
 }
@@ -328,154 +252,6 @@ pub fn list_sessions() -> Vec<String> {
 }
 
 impl Config {
-    #[allow(dead_code)]
-    pub fn init_bare() -> Result<Self> {
-        let h = Handle::current();
-        tokio::task::block_in_place(|| {
-            h.block_on(Self::init(
-                WorkingMode::Cmd,
-                true,
-                false,
-                None,
-                create_abort_signal(),
-            ))
-        })
-    }
-
-    pub async fn init(
-        working_mode: WorkingMode,
-        info_flag: bool,
-        start_mcp_servers: bool,
-        log_path: Option<PathBuf>,
-        abort_signal: AbortSignal,
-    ) -> Result<Self> {
-        let config_path = paths::config_file();
-        let (mut config, content) = if !config_path.exists() {
-            match env::var(get_env_name("provider"))
-                .ok()
-                .or_else(|| env::var(get_env_name("platform")).ok())
-            {
-                Some(v) => (Self::load_dynamic(&v)?, String::new()),
-                None => {
-                    if *IS_STDOUT_TERMINAL {
-                        create_config_file(&config_path).await?;
-                    }
-                    Self::load_from_file(&config_path)?
-                }
-            }
-        } else {
-            Self::load_from_file(&config_path)?
-        };
-
-        let setup = async |config: &mut Self| -> Result<()> {
-            let vault = Vault::init(&config.to_app_config());
-
-            let (parsed_config, missing_secrets) = interpolate_secrets(&content, &vault);
-            if !missing_secrets.is_empty() && !info_flag {
-                debug!(
-                    "Global config references secrets that are missing from the vault: {missing_secrets:?}"
-                );
-                return Err(anyhow!(formatdoc!(
-                    "
-										Global config file references secrets that are missing from the vault: {:?}
-										Please add these secrets to the vault and try again.",
-                    missing_secrets
-                )));
-            }
-
-            if !parsed_config.is_empty() && !info_flag {
-                debug!("Global config is invalid once secrets are injected: {parsed_config}");
-                let new_config = Self::load_from_str(&parsed_config).with_context(|| {
-                    formatdoc!(
-                        "
-												Global config is invalid once secrets are injected.
-												Double check the secret values and file syntax, then try again.
-												"
-                    )
-                })?;
-                *config = new_config.clone();
-            }
-
-            config.working_mode = working_mode;
-            config.info_flag = info_flag;
-            config.vault = Arc::new(vault);
-
-            config.load_envs();
-
-            if let Some(wrap) = config.wrap.clone() {
-                config.set_wrap(&wrap)?;
-            }
-
-            config.load_functions()?;
-            config
-                .load_mcp_servers(log_path, start_mcp_servers, abort_signal)
-                .await?;
-
-            config.setup_model()?;
-            config.setup_document_loaders();
-            config.setup_user_agent();
-            Ok(())
-        };
-        let ret = setup(&mut config).await;
-        if !info_flag {
-            ret?;
-        }
-        Ok(config)
-    }
-
-    #[allow(dead_code)]
-    pub fn sessions_dir(&self) -> PathBuf {
-        match &self.agent {
-            None => match env::var(get_env_name("sessions_dir")) {
-                Ok(value) => PathBuf::from(value),
-                Err(_) => paths::local_path(SESSIONS_DIR_NAME),
-            },
-            Some(agent) => paths::agent_data_dir(agent.name()).join(SESSIONS_DIR_NAME),
-        }
-    }
-
-    pub fn role_like_mut(&mut self) -> Option<&mut dyn RoleLike> {
-        if let Some(session) = self.session.as_mut() {
-            Some(session)
-        } else if let Some(agent) = self.agent.as_mut() {
-            Some(agent)
-        } else if let Some(role) = self.role.as_mut() {
-            Some(role)
-        } else {
-            None
-        }
-    }
-
-    pub fn set_wrap(&mut self, value: &str) -> Result<()> {
-        if value == "no" {
-            self.wrap = None;
-        } else if value == "auto" {
-            self.wrap = Some(value.into());
-        } else {
-            value
-                .parse::<u16>()
-                .map_err(|_| anyhow!("Invalid wrap value"))?;
-            self.wrap = Some(value.into())
-        }
-        Ok(())
-    }
-
-    pub fn set_model(&mut self, model_id: &str) -> Result<()> {
-        let model = Model::retrieve_model(&self.to_app_config(), model_id, ModelType::Chat)?;
-        match self.role_like_mut() {
-            Some(role_like) => role_like.set_model(model),
-            None => {
-                self.model = model;
-            }
-        }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn list_sessions(&self) -> Vec<String> {
-        list_file_names(self.sessions_dir(), ".yaml")
-    }
-
     pub async fn search_rag(
         app: &AppConfig,
         rag: &Rag,
@@ -548,7 +324,11 @@ impl Config {
             Self::load_from_file(&config_path)?
         };
 
-        let vault = Vault::init(&config.to_app_config());
+        let bootstrap_app = AppConfig {
+            vault_password_file: config.vault_password_file.clone(),
+            ..AppConfig::default()
+        };
+        let vault = Vault::init(&bootstrap_app);
         let (parsed_config, missing_secrets) = interpolate_secrets(&content, &vault);
         if !missing_secrets.is_empty() && !info_flag {
             debug!(
@@ -573,7 +353,6 @@ impl Config {
             })?;
             config = new_config;
         }
-        config.vault = Arc::new(vault);
         Ok(config)
     }
 
@@ -632,227 +411,6 @@ impl Config {
         let config =
             serde_json::from_value(config).with_context(|| "Failed to load config from env")?;
         Ok(config)
-    }
-
-    fn load_envs(&mut self) {
-        if let Ok(v) = env::var(get_env_name("model")) {
-            self.model_id = v;
-        }
-        if let Some(v) = read_env_value::<f64>(&get_env_name("temperature")) {
-            self.temperature = v;
-        }
-        if let Some(v) = read_env_value::<f64>(&get_env_name("top_p")) {
-            self.top_p = v;
-        }
-
-        if let Some(Some(v)) = read_env_bool(&get_env_name("dry_run")) {
-            self.dry_run = v;
-        }
-        if let Some(Some(v)) = read_env_bool(&get_env_name("stream")) {
-            self.stream = v;
-        }
-        if let Some(Some(v)) = read_env_bool(&get_env_name("save")) {
-            self.save = v;
-        }
-        if let Ok(v) = env::var(get_env_name("keybindings"))
-            && v == "vi"
-        {
-            self.keybindings = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("editor")) {
-            self.editor = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("wrap")) {
-            self.wrap = v;
-        }
-        if let Some(Some(v)) = read_env_bool(&get_env_name("wrap_code")) {
-            self.wrap_code = v;
-        }
-
-        if let Some(Some(v)) = read_env_bool(&get_env_name("function_calling_support")) {
-            self.function_calling_support = v;
-        }
-        if let Ok(v) = env::var(get_env_name("mapping_tools"))
-            && let Ok(v) = serde_json::from_str(&v)
-        {
-            self.mapping_tools = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("enabled_tools")) {
-            self.enabled_tools = v;
-        }
-
-        if let Some(Some(v)) = read_env_bool(&get_env_name("mcp_server_support")) {
-            self.mcp_server_support = v;
-        }
-        if let Ok(v) = env::var(get_env_name("mapping_mcp_servers"))
-            && let Ok(v) = serde_json::from_str(&v)
-        {
-            self.mapping_mcp_servers = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("enabled_mcp_servers")) {
-            self.enabled_mcp_servers = v;
-        }
-
-        if let Some(v) = read_env_value::<String>(&get_env_name("repl_prelude")) {
-            self.repl_prelude = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("cmd_prelude")) {
-            self.cmd_prelude = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("agent_session")) {
-            self.agent_session = v;
-        }
-
-        if let Some(v) = read_env_bool(&get_env_name("save_session")) {
-            self.save_session = v;
-        }
-        if let Some(Some(v)) = read_env_value::<usize>(&get_env_name("compression_threshold")) {
-            self.compression_threshold = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("summarization_prompt")) {
-            self.summarization_prompt = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("summary_context_prompt")) {
-            self.summary_context_prompt = v;
-        }
-
-        if let Some(v) = read_env_value::<String>(&get_env_name("rag_embedding_model")) {
-            self.rag_embedding_model = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("rag_reranker_model")) {
-            self.rag_reranker_model = v;
-        }
-        if let Some(Some(v)) = read_env_value::<usize>(&get_env_name("rag_top_k")) {
-            self.rag_top_k = v;
-        }
-        if let Some(v) = read_env_value::<usize>(&get_env_name("rag_chunk_size")) {
-            self.rag_chunk_size = v;
-        }
-        if let Some(v) = read_env_value::<usize>(&get_env_name("rag_chunk_overlap")) {
-            self.rag_chunk_overlap = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("rag_template")) {
-            self.rag_template = v;
-        }
-
-        if let Ok(v) = env::var(get_env_name("document_loaders"))
-            && let Ok(v) = serde_json::from_str(&v)
-        {
-            self.document_loaders = v;
-        }
-
-        if let Some(Some(v)) = read_env_bool(&get_env_name("highlight")) {
-            self.highlight = v;
-        }
-        if *NO_COLOR {
-            self.highlight = false;
-        }
-        if self.highlight && self.theme.is_none() {
-            if let Some(v) = read_env_value::<String>(&get_env_name("theme")) {
-                self.theme = v;
-            } else if *IS_STDOUT_TERMINAL
-                && let Ok(color_scheme) = color_scheme(QueryOptions::default())
-            {
-                let theme = match color_scheme {
-                    ColorScheme::Dark => "dark",
-                    ColorScheme::Light => "light",
-                };
-                self.theme = Some(theme.into());
-            }
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("left_prompt")) {
-            self.left_prompt = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("right_prompt")) {
-            self.right_prompt = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("user_agent")) {
-            self.user_agent = v;
-        }
-        if let Some(Some(v)) = read_env_bool(&get_env_name("save_shell_history")) {
-            self.save_shell_history = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("sync_models_url")) {
-            self.sync_models_url = v;
-        }
-    }
-
-    fn load_functions(&mut self) -> Result<()> {
-        self.functions = Functions::init(self.visible_tools.as_ref().unwrap_or(&Vec::new()))?;
-        if self.working_mode.is_repl() {
-            self.functions.append_user_interaction_functions();
-        }
-        Ok(())
-    }
-
-    async fn load_mcp_servers(
-        &mut self,
-        log_path: Option<PathBuf>,
-        start_mcp_servers: bool,
-        abort_signal: AbortSignal,
-    ) -> Result<()> {
-        let app_config = self.to_app_config();
-        let mcp_registry = McpRegistry::init(
-            log_path,
-            start_mcp_servers,
-            self.enabled_mcp_servers.clone(),
-            abort_signal.clone(),
-            &app_config,
-            &self.vault,
-        )
-        .await?;
-        match mcp_registry.is_empty() {
-            false => {
-                if self.mcp_server_support {
-                    self.functions
-                        .append_mcp_meta_functions(mcp_registry.list_started_servers());
-                } else {
-                    debug!(
-                        "Skipping global MCP functions registration since 'mcp_server_support' was 'false'"
-                    );
-                }
-            }
-            _ => debug!(
-                "Skipping global MCP functions registration since 'start_mcp_servers' was 'false'"
-            ),
-        }
-        self.mcp_registry = Some(mcp_registry);
-
-        Ok(())
-    }
-
-    fn setup_model(&mut self) -> Result<()> {
-        let mut model_id = self.model_id.clone();
-        if model_id.is_empty() {
-            let models = list_models(&self.to_app_config(), ModelType::Chat);
-            if models.is_empty() {
-                bail!("No available model");
-            }
-            model_id = models[0].id()
-        }
-        self.set_model(&model_id)?;
-        self.model_id = model_id;
-
-        Ok(())
-    }
-
-    fn setup_document_loaders(&mut self) {
-        [("pdf", "pdftotext $1 -"), ("docx", "pandoc --to plain $1")]
-            .into_iter()
-            .for_each(|(k, v)| {
-                let (k, v) = (k.to_string(), v.to_string());
-                self.document_loaders.entry(k).or_insert(v);
-            });
-    }
-
-    fn setup_user_agent(&mut self) {
-        if let Some("auto") = self.user_agent.as_deref() {
-            self.user_agent = Some(format!(
-                "{}/{}",
-                env!("CARGO_CRATE_NAME"),
-                env!("CARGO_PKG_VERSION")
-            ));
-        }
     }
 }
 
@@ -1089,10 +647,6 @@ mod tests {
         assert!(cfg.save_shell_history);
         assert_eq!(cfg.keybindings, "emacs");
         assert!(cfg.clients.is_empty());
-        assert!(cfg.role.is_none());
-        assert!(cfg.session.is_none());
-        assert!(cfg.agent.is_none());
-        assert!(cfg.rag.is_none());
         assert!(cfg.save_session.is_none());
         assert!(cfg.enabled_tools.is_none());
         assert!(cfg.enabled_mcp_servers.is_none());
