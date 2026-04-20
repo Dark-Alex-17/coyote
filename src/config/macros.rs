@@ -1,12 +1,12 @@
 use crate::config::paths;
-use crate::config::{Config, RequestContext, RoleLike, ensure_parent_exists};
+use crate::config::{RequestContext, RoleLike, ensure_parent_exists};
 use crate::repl::{run_repl_command, split_args_text};
 use crate::utils::{AbortSignal, multiline_text};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use indexmap::IndexMap;
 use rust_embed::Embed;
 use serde::Deserialize;
-use std::fs::File;
+use std::fs::{File, read_to_string};
 use std::io::Write;
 
 #[derive(Embed)]
@@ -20,7 +20,7 @@ pub async fn macro_execute(
     args: Option<&str>,
     abort_signal: AbortSignal,
 ) -> Result<()> {
-    let macro_value = Config::load_macro(name)?;
+    let macro_value = Macro::load(name)?;
     let (mut new_args, text) = split_args_text(args.unwrap_or_default(), cfg!(windows));
     if !text.is_empty() {
         new_args.push(text.to_string());
@@ -44,7 +44,14 @@ pub async fn macro_execute(
     macro_ctx.model = role.model().clone();
     macro_ctx.agent_variables = ctx.agent_variables.clone();
     macro_ctx.last_message = ctx.last_message.clone();
-    macro_ctx.agent_runtime = ctx.agent_runtime.clone();
+    macro_ctx.supervisor = ctx.supervisor.clone();
+    macro_ctx.parent_supervisor = ctx.parent_supervisor.clone();
+    macro_ctx.self_agent_id = ctx.self_agent_id.clone();
+    macro_ctx.inbox = ctx.inbox.clone();
+    macro_ctx.escalation_queue = ctx.escalation_queue.clone();
+    macro_ctx.current_depth = ctx.current_depth;
+    macro_ctx.auto_continue_count = ctx.auto_continue_count;
+    macro_ctx.todo_list = ctx.todo_list.clone();
     macro_ctx.tool_scope.tool_tracker = ctx.tool_scope.tool_tracker.clone();
     macro_ctx.discontinuous_last_message();
 
@@ -69,6 +76,14 @@ pub struct Macro {
 }
 
 impl Macro {
+    pub fn load(name: &str) -> Result<Macro> {
+        let path = paths::macro_file(name);
+        let err = || format!("Failed to load macro '{name}' at '{}'", path.display());
+        let content = read_to_string(&path).with_context(err)?;
+        let value: Macro = serde_yaml::from_str(&content).with_context(err)?;
+        Ok(value)
+    }
+
     pub fn install_macros() -> Result<()> {
         info!(
             "Installing built-in macros in {}",

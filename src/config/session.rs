@@ -67,12 +67,7 @@ pub struct Session {
 }
 
 impl Session {
-    #[allow(dead_code)]
-    pub fn new_from_ctx(
-        ctx: &request_context::RequestContext,
-        app: &AppConfig,
-        name: &str,
-    ) -> Self {
+    pub fn new_from_ctx(ctx: &RequestContext, app: &AppConfig, name: &str) -> Self {
         let role = ctx.extract_role(app);
         let mut session = Self {
             name: name.to_string(),
@@ -84,9 +79,8 @@ impl Session {
         session
     }
 
-    #[allow(dead_code)]
     pub fn load_from_ctx(
-        ctx: &request_context::RequestContext,
+        ctx: &RequestContext,
         app: &AppConfig,
         name: &str,
         path: &Path,
@@ -680,7 +674,8 @@ impl AutoName {
 mod tests {
     use super::*;
     use crate::client::{Message, MessageContent, MessageRole, Model};
-    use crate::config::{AppState, Config};
+    use crate::config::{AppConfig, AppState, RequestContext, WorkingMode};
+    use crate::function::Functions;
     use std::sync::Arc;
 
     #[test]
@@ -694,17 +689,18 @@ mod tests {
 
     #[test]
     fn session_new_from_ctx_captures_save_session() {
-        let cfg = Config::default();
-        let app_config = Arc::new(cfg.to_app_config());
+        let app_config = Arc::new(AppConfig::default());
         let app_state = Arc::new(AppState {
             config: app_config.clone(),
-            vault: cfg.vault.clone(),
-            mcp_factory: Arc::new(crate::config::mcp_factory::McpFactory::new()),
-            rag_cache: Arc::new(crate::config::rag_cache::RagCache::new()),
+            vault: Arc::new(crate::vault::Vault::default()),
+            mcp_factory: Arc::new(mcp_factory::McpFactory::default()),
+            rag_cache: Arc::new(rag_cache::RagCache::default()),
             mcp_config: None,
             mcp_log_path: None,
+            mcp_registry: None,
+            functions: Functions::default(),
         });
-        let ctx = cfg.to_request_context(app_state);
+        let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let session = Session::new_from_ctx(&ctx, &app_config, "test-session");
 
         assert_eq!(session.name(), "test-session");

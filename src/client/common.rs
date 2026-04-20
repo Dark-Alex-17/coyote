@@ -417,7 +417,7 @@ pub async fn call_chat_completions(
     ctx: &mut RequestContext,
     abort_signal: AbortSignal,
 ) -> Result<(String, Vec<ToolResult>)> {
-    let is_child_agent = ctx.current_depth() > 0;
+    let is_child_agent = ctx.current_depth > 0;
     let spinner_message = if is_child_agent { "" } else { "Generating" };
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),

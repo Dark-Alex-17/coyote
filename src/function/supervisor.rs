@@ -364,7 +364,7 @@ fn run_child_agent(
             input = input.merge_tool_results(output, tool_results);
         }
 
-        if let Some(supervisor) = child_ctx.supervisor().cloned() {
+        if let Some(supervisor) = child_ctx.supervisor.clone() {
             supervisor.read().cancel_all();
         }
 
@@ -441,7 +441,8 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
 
     let (max_depth, current_depth) = {
         let supervisor = ctx
-            .supervisor()
+            .supervisor
+            .as_ref()
             .cloned()
             .ok_or_else(|| anyhow!("No supervisor active; Agent spawning not enabled"))?;
         let sup = supervisor.read();
@@ -455,7 +456,7 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
                 ),
             }));
         }
-        (sup.max_depth(), ctx.current_depth() + 1)
+        (sup.max_depth(), ctx.current_depth + 1)
     };
 
     if current_depth > max_depth {
@@ -481,10 +482,12 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let child_app_state = Arc::new(AppState {
         config: Arc::new(app_config.as_ref().clone()),
         vault: ctx.app.vault.clone(),
-        mcp_factory: Default::default(),
-        rag_cache: Default::default(),
+        mcp_factory: ctx.app.mcp_factory.clone(),
+        rag_cache: ctx.app.rag_cache.clone(),
         mcp_config: ctx.app.mcp_config.clone(),
         mcp_log_path: ctx.app.mcp_log_path.clone(),
+        mcp_registry: ctx.app.mcp_registry.clone(),
+        functions: ctx.app.functions.clone(),
     });
     let agent = Agent::init(
         app_config.as_ref(),
@@ -509,18 +512,9 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         agent_id.clone(),
     );
     child_ctx.rag = agent.rag();
-    child_ctx
-        .agent_runtime
-        .as_mut()
-        .expect("child agent runtime should be initialized")
-        .rag = child_ctx.rag.clone();
     child_ctx.agent = Some(agent);
     if should_init_supervisor {
-        child_ctx
-            .agent_runtime
-            .as_mut()
-            .expect("child agent runtime should be initialized")
-            .supervisor = Some(Arc::new(RwLock::new(Supervisor::new(
+        child_ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(
             max_concurrent,
             max_depth,
         ))));
@@ -574,7 +568,8 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     };
 
     let supervisor = ctx
-        .supervisor()
+        .supervisor
+        .as_ref()
         .cloned()
         .ok_or_else(|| anyhow!("No supervisor active"))?;
     let mut sup = supervisor.write();
@@ -596,7 +591,8 @@ async fn handle_check(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
 
     let is_finished = {
         let supervisor = ctx
-            .supervisor()
+            .supervisor
+            .as_ref()
             .cloned()
             .ok_or_else(|| anyhow!("No supervisor active"))?;
         let sup = supervisor.read();
@@ -625,7 +621,8 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
 
     let handle = {
         let supervisor = ctx
-            .supervisor()
+            .supervisor
+            .as_ref()
             .cloned()
             .ok_or_else(|| anyhow!("No supervisor active"))?;
         let mut sup = supervisor.write();
@@ -659,7 +656,8 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
 
 fn handle_list(ctx: &mut RequestContext) -> Result<Value> {
     let supervisor = ctx
-        .supervisor()
+        .supervisor
+        .as_ref()
         .cloned()
         .ok_or_else(|| anyhow!("No supervisor active"))?;
     let sup = supervisor.read();
@@ -691,7 +689,8 @@ fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("'id' is required"))?;
 
     let supervisor = ctx
-        .supervisor()
+        .supervisor
+        .as_ref()
         .cloned()
         .ok_or_else(|| anyhow!("No supervisor active"))?;
     let mut sup = supervisor.write();
@@ -722,17 +721,19 @@ fn handle_send_message(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
         .ok_or_else(|| anyhow!("'message' is required"))?;
 
     let sender = ctx
-        .self_agent_id()
-        .map(str::to_owned)
+        .self_agent_id
+        .clone()
         .or_else(|| ctx.agent.as_ref().map(|a| a.name().to_string()))
         .unwrap_or_else(|| "parent".to_string());
 
     let inbox = ctx
-        .supervisor()
+        .supervisor
+        .as_ref()
         .and_then(|sup| sup.read().inbox(id).cloned());
 
     let inbox = inbox.or_else(|| {
-        ctx.parent_supervisor()
+        ctx.parent_supervisor
+            .as_ref()
             .and_then(|sup| sup.read().inbox(id).cloned())
     });
 
@@ -760,7 +761,7 @@ fn handle_send_message(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
 }
 
 fn handle_check_inbox(ctx: &mut RequestContext) -> Result<Value> {
-    match ctx.inbox() {
+    match ctx.inbox.as_ref() {
         Some(inbox) => {
             let messages: Vec<Value> = inbox
                 .drain()
@@ -797,8 +798,8 @@ fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Val
         .ok_or_else(|| anyhow!("'reply' is required"))?;
 
     let queue = ctx
-        .root_escalation_queue()
-        .cloned()
+        .escalation_queue
+        .clone()
         .ok_or_else(|| anyhow!("No escalation queue available"))?;
 
     match queue.take(escalation_id) {
@@ -846,7 +847,8 @@ fn handle_task_create(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     }
 
     let supervisor = ctx
-        .supervisor()
+        .supervisor
+        .as_ref()
         .cloned()
         .ok_or_else(|| anyhow!("No supervisor active"))?;
     let mut sup = supervisor.write();
@@ -883,7 +885,8 @@ fn handle_task_create(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
 
 fn handle_task_list(ctx: &mut RequestContext) -> Result<Value> {
     let supervisor = ctx
-        .supervisor()
+        .supervisor
+        .as_ref()
         .cloned()
         .ok_or_else(|| anyhow!("No supervisor active"))?;
     let sup = supervisor.read();
@@ -917,7 +920,8 @@ async fn handle_task_complete(ctx: &mut RequestContext, args: &Value) -> Result<
 
     let (newly_runnable, dispatchable) = {
         let supervisor = ctx
-            .supervisor()
+            .supervisor
+            .as_ref()
             .cloned()
             .ok_or_else(|| anyhow!("No supervisor active"))?;
         let mut sup = supervisor.write();
@@ -997,7 +1001,8 @@ fn handle_task_fail(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("'task_id' is required"))?;
 
     let supervisor = ctx
-        .supervisor()
+        .supervisor
+        .as_ref()
         .cloned()
         .ok_or_else(|| anyhow!("No supervisor active"))?;
     let mut sup = supervisor.write();

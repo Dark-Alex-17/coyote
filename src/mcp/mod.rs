@@ -1,21 +1,18 @@
-use crate::config::Config;
+use crate::config::AppConfig;
 use crate::config::paths;
 use crate::utils::{AbortSignal, abortable_run_with_spinner};
+use crate::vault::Vault;
 use crate::vault::interpolate_secrets;
 use anyhow::{Context, Result, anyhow};
-use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use indoc::formatdoc;
-use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -82,7 +79,8 @@ impl McpRegistry {
         start_mcp_servers: bool,
         enabled_mcp_servers: Option<String>,
         abort_signal: AbortSignal,
-        config: &Config,
+        app_config: &AppConfig,
+        vault: &Vault,
     ) -> Result<Self> {
         let mut registry = Self {
             log_path,
@@ -115,7 +113,7 @@ impl McpRegistry {
             return Ok(registry);
         }
 
-        let (parsed_content, missing_secrets) = interpolate_secrets(&content, &config.vault);
+        let (parsed_content, missing_secrets) = interpolate_secrets(&content, vault);
 
         if !missing_secrets.is_empty() {
             return Err(anyhow!(formatdoc!(
@@ -130,7 +128,7 @@ impl McpRegistry {
             serde_json::from_str(&parsed_content).with_context(err)?;
         registry.config = Some(mcp_servers_config);
 
-        if start_mcp_servers && config.mcp_server_support {
+        if start_mcp_servers && app_config.mcp_server_support {
             abortable_run_with_spinner(
                 registry.start_select_mcp_servers(enabled_mcp_servers),
                 "Loading MCP servers",
@@ -249,65 +247,6 @@ impl McpRegistry {
         self.servers.keys().cloned().collect()
     }
 
-    #[allow(dead_code)]
-    pub async fn describe(&self, server_id: &str, tool: &str) -> Result<Value> {
-        let server = self
-            .servers
-            .iter()
-            .filter(|(id, _)| &server_id == id)
-            .map(|(_, s)| s.clone())
-            .next()
-            .ok_or(anyhow!("{server_id} MCP server not found in config"))?;
-
-        let tool_schema = server
-            .list_tools(None)
-            .await?
-            .tools
-            .into_iter()
-            .find(|it| it.name == tool)
-            .ok_or(anyhow!(
-                "{tool} not found in {server_id} MCP server catalog"
-            ))?
-            .input_schema;
-        Ok(json!({
-            "type": "object",
-            "properties": {
-                "tool": {
-                    "type": "string",
-                },
-                "arguments": tool_schema
-            }
-        }))
-    }
-
-    #[allow(dead_code)]
-    pub fn invoke(
-        &self,
-        server: &str,
-        tool: &str,
-        arguments: Value,
-    ) -> BoxFuture<'static, Result<CallToolResult>> {
-        let server = self
-            .servers
-            .get(server)
-            .cloned()
-            .with_context(|| format!("Invoked MCP server does not exist: {server}"));
-
-        let tool = tool.to_owned();
-        Box::pin(async move {
-            let server = server?;
-            let call_tool_request = CallToolRequestParams {
-                name: Cow::Owned(tool.to_owned()),
-                arguments: arguments.as_object().cloned(),
-                meta: None,
-                task: None,
-            };
-
-            let result = server.call_tool(call_tool_request).await?;
-            Ok(result)
-        })
-    }
-
     pub fn is_empty(&self) -> bool {
         self.servers.is_empty()
     }
@@ -323,7 +262,7 @@ impl McpRegistry {
 
 pub(crate) async fn spawn_mcp_server(
     spec: &McpServer,
-    log_path: Option<&std::path::Path>,
+    log_path: Option<&Path>,
 ) -> Result<Arc<ConnectedServer>> {
     let mut cmd = Command::new(&spec.command);
     if let Some(args) = &spec.args {

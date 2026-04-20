@@ -1058,6 +1058,45 @@ At this point no code references `GlobalConfig`.
 
 **Blocked by:** Step 14.
 
+---
+
+### Step 16: Complete Config → AppConfig Migration (Post-QA)
+
+**Status:** PENDING — to be completed after QA testing phase
+
+The current bridge has a bug: `Config::init` mutates Config during startup (env vars, model resolution, etc.), but `to_app_config()` only copies serialized fields, losing those mutations.
+
+Current startup flow (broken):
+```
+YAML → Config (serde deserialize)
+    → config.load_envs()        ← mutates Config
+    → config.setup_model()      ← resolves model
+    → config.load_mcp_servers() ← starts MCP
+    → cfg.to_app_config()       ← COPIES ONLY serialized fields!
+    → AppConfig loses mutations
+```
+
+**Problem:** Mutations in Config are lost when building AppConfig.
+
+**Solution:** Move mutations AFTER the bridge:
+
+1. Move `load_envs()`, `set_wrap()`, `setup_model()`, `load_mcp_servers()`, `setup_document_loaders()`, `setup_user_agent()` from Config to AppConfig
+2. In `main.rs`, apply these mutations AFTER `to_app_config()` 
+3. Delete duplicated methods from AppConfig (they become reachable)
+4. Simplify Config to pure serde deserialization only
+5. Remove bridge if Config becomes just a deserialization target (or keep for backwards compat)
+
+**Files to modify:**
+- `src/config/mod.rs` — remove init mutations, keep only serde + deserialization
+- `src/config/app_config.rs` — enable mutations, remove duplication
+- `src/main.rs` — reorder bridge + mutations
+
+**Goal:** Config becomes a simple POJO. All runtime configuration lives in AppConfig/AppState.
+
+**Blocked by:** QA testing (Step 16 can begin after tests pass)
+
+---
+
 Phase 1 complete.
 
 ---

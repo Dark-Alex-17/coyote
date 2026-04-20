@@ -1,4 +1,3 @@
-use super::todo::TodoList;
 use super::*;
 
 use crate::{
@@ -6,6 +5,7 @@ use crate::{
     function::{Functions, run_llm_function},
 };
 
+use super::rag_cache::RagKey;
 use crate::config::paths;
 use crate::config::prompts::{
     DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS, DEFAULT_TODO_INSTRUCTIONS,
@@ -39,9 +39,6 @@ pub struct Agent {
     rag: Option<Arc<Rag>>,
     model: Model,
     vault: GlobalVault,
-    todo_list: TodoList,
-    continuation_count: usize,
-    last_continuation_response: Option<String>,
 }
 
 impl Agent {
@@ -123,12 +120,16 @@ impl Agent {
         };
 
         let rag = if rag_path.exists() {
-            Some(Arc::new(Rag::load(
-                app,
-                &app.clients,
-                DEFAULT_AGENT_NAME,
-                &rag_path,
-            )?))
+            let key = RagKey::Agent(name.to_string());
+            let app_clone = app.clone();
+            let rag_path_clone = rag_path.clone();
+            let rag = app_state
+                .rag_cache
+                .load_with(key, || async move {
+                    Rag::load(&app_clone, DEFAULT_AGENT_NAME, &rag_path_clone)
+                })
+                .await?;
+            Some(rag)
         } else if !agent_config.documents.is_empty() && !info_flag {
             let mut ans = false;
             if *IS_STDOUT_TERMINAL {
@@ -161,16 +162,23 @@ impl Agent {
                         document_paths.push(path.to_string())
                     }
                 }
-                let rag = Rag::init(
-                    app,
-                    &app.clients,
-                    "rag",
-                    &rag_path,
-                    &document_paths,
-                    abort_signal,
-                )
-                .await?;
-                Some(Arc::new(rag))
+                let key = RagKey::Agent(name.to_string());
+                let app_clone = app.clone();
+                let rag_path_clone = rag_path.clone();
+                let rag = app_state
+                    .rag_cache
+                    .load_with(key, || async move {
+                        Rag::init(
+                            &app_clone,
+                            "rag",
+                            &rag_path_clone,
+                            &document_paths,
+                            abort_signal,
+                        )
+                        .await
+                    })
+                    .await?;
+                Some(rag)
             } else {
                 None
             }
@@ -202,9 +210,6 @@ impl Agent {
             rag,
             model,
             vault: app_state.vault.clone(),
-            todo_list: TodoList::default(),
-            continuation_count: 0,
-            last_continuation_response: None,
         })
     }
 
@@ -432,44 +437,6 @@ impl Agent {
 
     pub fn escalation_timeout(&self) -> u64 {
         self.config.escalation_timeout
-    }
-
-    pub fn continuation_count(&self) -> usize {
-        self.continuation_count
-    }
-
-    pub fn increment_continuation(&mut self) {
-        self.continuation_count += 1;
-    }
-
-    pub fn reset_continuation(&mut self) {
-        self.continuation_count = 0;
-        self.last_continuation_response = None;
-    }
-
-    pub fn set_last_continuation_response(&mut self, response: String) {
-        self.last_continuation_response = Some(response);
-    }
-
-    pub fn todo_list(&self) -> &TodoList {
-        &self.todo_list
-    }
-
-    pub fn init_todo_list(&mut self, goal: &str) {
-        self.todo_list = TodoList::new(goal);
-    }
-
-    pub fn add_todo(&mut self, task: &str) -> usize {
-        self.todo_list.add(task)
-    }
-
-    pub fn mark_todo_done(&mut self, id: usize) -> bool {
-        self.todo_list.mark_done(id)
-    }
-
-    pub fn clear_todo_list(&mut self) {
-        self.todo_list.clear();
-        self.reset_continuation();
     }
 
     pub fn continuation_prompt(&self) -> String {
