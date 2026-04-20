@@ -37,9 +37,98 @@ this directory using the following command:
 loki --info | grep functions_dir | awk '{print $2}'
 ```
 
-The syntax for the `functions/mcp.json` file is identical to the syntax for MCP server configurations for Claude Desktop.
+The syntax for the `functions/mcp.json` file is compatible with MCP server configurations for Claude Desktop.
 So any time you're looking to add a new server, look at the docs for it and find the configuration example for
-Claude desktop. You should be able to use the exact same configuration in your `functions/mcp.json` file.
+Claude Desktop. You should be able to use the exact same configuration in your `functions/mcp.json` file.
+
+Every server entry **must** include a `"type"` field set to one of: `"stdio"`, `"http"`, or `"sse"`.
+
+### Transport Types
+
+Loki supports three MCP transport types:
+
+| Type    | Use Case                                                                                                                                                        |
+|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `stdio` | Spawns a local subprocess and communicates over stdin/stdout                                                                                                    |
+| `http`  | Connects to a remote server via [Streamable HTTP](https://modelcontextprotocol.io/docs/concepts/transports#streamable-http)                                     |
+| `sse`   | Connects to a remote server via the legacy [HTTP+SSE](https://modelcontextprotocol.io/docs/concepts/transports#http-with-sse) transport (Claude Desktop format) |
+
+### Stdio Servers
+
+Stdio is the standard transport for locally-installed MCP servers. Loki spawns the process and communicates
+over stdin/stdout:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "type": "stdio",
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "ghcr.io/github/github-mcp-server"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "YOUR_GITHUB_TOKEN"
+      }
+    }
+  }
+}
+```
+
+| Field     | Required | Description                              |
+|-----------|----------|------------------------------------------|
+| `type`    | yes      | Must be `"stdio"`                        |
+| `command` | yes      | The executable to spawn                  |
+| `args`    | no       | Arguments passed to the command          |
+| `env`     | no       | Environment variables for the subprocess |
+| `cwd`     | no       | Working directory for the subprocess     |
+
+### HTTP (Streamable HTTP) Servers
+
+For remote MCP servers that support the Streamable HTTP transport:
+
+```json
+{
+  "mcpServers": {
+    "datadog": {
+      "type": "http",
+      "url": "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"
+    }
+  }
+}
+```
+
+| Field     | Required | Description                                            |
+|-----------|----------|--------------------------------------------------------|
+| `type`    | yes      | Must be `"http"`                                       |
+| `url`     | yes      | The server endpoint URL                                |
+| `headers` | no       | Custom HTTP headers to include with every request      |
+
+### SSE Servers
+
+For remote MCP servers that use the legacy HTTP+SSE transport (the format used by Claude Desktop):
+
+```json
+{
+  "mcpServers": {
+    "my-sse-server": {
+      "type": "sse",
+      "url": "http://127.0.0.1:64342/sse",
+      "headers": {
+        "Authorization": "Bearer my-token"
+      }
+    }
+  }
+}
+```
+
+| Field     | Required | Description                                            |
+|-----------|----------|--------------------------------------------------------|
+| `type`    | yes      | Must be `"sse"`                                        |
+| `url`     | yes      | The server SSE endpoint URL                            |
+| `headers` | no       | Custom HTTP headers to include with every request      |
+
+**Note:** Both `http` and `sse` types use the same underlying transport, which auto-negotiates the
+protocol with the server. The `type` field primarily serves as documentation of which protocol the
+server speaks. Neither type supports `command`, `args`, or `cwd` fields.
 
 ### Secret Injection
 As mentioned in the [Loki Vault documentation](../VAULT.md), you can use Loki Vault to inject secrets into your MCP configuration file.
