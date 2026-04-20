@@ -85,45 +85,35 @@ async fn main() -> Result<()> {
     install_builtins()?;
 
     if let Some(client_arg) = &cli.authenticate {
-        let config = Config::init_bare()?;
-        let (client_name, provider) = resolve_oauth_client(client_arg.as_deref(), &config.clients)?;
+        let cfg = Config::load_with_interpolation(true).await?;
+        let app_config = AppConfig::from_config(cfg)?;
+        let (client_name, provider) =
+            resolve_oauth_client(client_arg.as_deref(), &app_config.clients)?;
         oauth::run_oauth_flow(&*provider, &client_name).await?;
         return Ok(());
     }
 
     if vault_flags {
-        let cfg = Config::init_bare()?;
-        return Vault::handle_vault_flags(cli, &cfg.vault);
+        let cfg = Config::load_with_interpolation(true).await?;
+        let app_config = AppConfig::from_config(cfg)?;
+        let vault = Vault::init(&app_config);
+        return Vault::handle_vault_flags(cli, &vault);
     }
 
     let abort_signal = create_abort_signal();
     let start_mcp_servers = cli.agent.is_none() && cli.role.is_none();
-    let cfg = Config::init(
-        working_mode,
-        info_flag,
-        start_mcp_servers,
-        log_path,
-        abort_signal.clone(),
-    )
-    .await?;
-    let app_config: Arc<AppConfig> = Arc::new(cfg.to_app_config());
-    let (mcp_config, mcp_log_path) = match &cfg.mcp_registry {
-        Some(reg) => (reg.mcp_config().cloned(), reg.log_path().cloned()),
-        None => (None, None),
-    };
-    let mcp_registry = cfg.mcp_registry.clone().map(Arc::new);
-    let functions = cfg.functions.clone();
-    let app_state: Arc<AppState> = Arc::new(AppState {
-        config: app_config,
-        vault: cfg.vault.clone(),
-        mcp_factory: Default::default(),
-        rag_cache: Default::default(),
-        mcp_config,
-        mcp_log_path,
-        mcp_registry,
-        functions,
-    });
-    let ctx = cfg.to_request_context(app_state);
+    let cfg = Config::load_with_interpolation(info_flag).await?;
+    let app_config: Arc<AppConfig> = Arc::new(AppConfig::from_config(cfg)?);
+    let app_state: Arc<AppState> = Arc::new(
+        AppState::init(
+            app_config,
+            log_path,
+            start_mcp_servers,
+            abort_signal.clone(),
+        )
+        .await?,
+    );
+    let ctx = RequestContext::bootstrap(app_state, working_mode, info_flag)?;
 
     {
         let app = &*ctx.app.config;
