@@ -63,6 +63,7 @@ impl Config {
         }
     }
 
+    #[allow(dead_code)]
     pub fn to_request_context(&self, app: Arc<AppState>) -> RequestContext {
         let mut mcp_runtime = super::tool_scope::McpRuntime::default();
         if let Some(registry) = &self.mcp_registry {

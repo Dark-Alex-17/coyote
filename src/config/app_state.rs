@@ -45,7 +45,6 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub vault: GlobalVault,
     pub mcp_factory: Arc<McpFactory>,
-    #[allow(dead_code)]
     pub rag_cache: Arc<RagCache>,
     pub mcp_config: Option<McpServersConfig>,
     pub mcp_log_path: Option<PathBuf>,
@@ -54,7 +53,6 @@ pub struct AppState {
 }
 
 impl AppState {
-    #[allow(dead_code)]
     pub async fn init(
         config: Arc<AppConfig>,
         log_path: Option<PathBuf>,

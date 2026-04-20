@@ -310,13 +310,25 @@ impl Default for Config {
 }
 
 pub fn install_builtins() -> Result<()> {
+    Functions::install_builtin_global_tools()?;
     Agent::install_builtin_agents()?;
     Macro::install_macros()?;
-    Functions::install_builtin_global_tools()?;
     Ok(())
 }
 
+pub fn default_sessions_dir() -> PathBuf {
+    match env::var(get_env_name("sessions_dir")) {
+        Ok(value) => PathBuf::from(value),
+        Err(_) => paths::local_path(SESSIONS_DIR_NAME),
+    }
+}
+
+pub fn list_sessions() -> Vec<String> {
+    list_file_names(default_sessions_dir(), ".yaml")
+}
+
 impl Config {
+    #[allow(dead_code)]
     pub fn init_bare() -> Result<Self> {
         let h = Handle::current();
         tokio::task::block_in_place(|| {
@@ -411,6 +423,7 @@ impl Config {
         Ok(config)
     }
 
+    #[allow(dead_code)]
     pub fn sessions_dir(&self) -> PathBuf {
         match &self.agent {
             None => match env::var(get_env_name("sessions_dir")) {
@@ -458,6 +471,7 @@ impl Config {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn list_sessions(&self) -> Vec<String> {
         list_file_names(self.sessions_dir(), ".yaml")
     }
@@ -515,7 +529,55 @@ impl Config {
         Ok(())
     }
 
-    fn load_from_file(config_path: &Path) -> Result<(Self, String)> {
+    pub async fn load_with_interpolation(info_flag: bool) -> Result<Self> {
+        let config_path = paths::config_file();
+        let (mut config, content) = if !config_path.exists() {
+            match env::var(get_env_name("provider"))
+                .ok()
+                .or_else(|| env::var(get_env_name("platform")).ok())
+            {
+                Some(v) => (Self::load_dynamic(&v)?, String::new()),
+                None => {
+                    if *IS_STDOUT_TERMINAL {
+                        create_config_file(&config_path).await?;
+                    }
+                    Self::load_from_file(&config_path)?
+                }
+            }
+        } else {
+            Self::load_from_file(&config_path)?
+        };
+
+        let vault = Vault::init(&config.to_app_config());
+        let (parsed_config, missing_secrets) = interpolate_secrets(&content, &vault);
+        if !missing_secrets.is_empty() && !info_flag {
+            debug!(
+                "Global config references secrets that are missing from the vault: {missing_secrets:?}"
+            );
+            return Err(anyhow!(formatdoc!(
+                "
+								Global config file references secrets that are missing from the vault: {:?}
+								Please add these secrets to the vault and try again.",
+                missing_secrets
+            )));
+        }
+        if !parsed_config.is_empty() && !info_flag {
+            debug!("Global config is invalid once secrets are injected: {parsed_config}");
+            let new_config = Self::load_from_str(&parsed_config).with_context(|| {
+                formatdoc!(
+                    "
+										Global config is invalid once secrets are injected.
+										Double check the secret values and file syntax, then try again.
+										"
+                )
+            })?;
+            config = new_config;
+        }
+        config.vault = Arc::new(vault);
+        Ok(config)
+    }
+
+    pub fn load_from_file(config_path: &Path) -> Result<(Self, String)> {
         let err = || format!("Failed to load config at '{}'", config_path.display());
         let content = read_to_string(config_path).with_context(err)?;
         let config = Self::load_from_str(&content).with_context(err)?;
@@ -523,7 +585,7 @@ impl Config {
         Ok((config, content))
     }
 
-    fn load_from_str(content: &str) -> Result<Self> {
+    pub fn load_from_str(content: &str) -> Result<Self> {
         if PASSWORD_FILE_SECRET_RE.is_match(content)? {
             bail!("secret injection cannot be done on the vault_password_file property");
         }
@@ -549,7 +611,7 @@ impl Config {
         Ok(config)
     }
 
-    fn load_dynamic(model_id: &str) -> Result<Self> {
+    pub fn load_dynamic(model_id: &str) -> Result<Self> {
         let provider = match model_id.split_once(':') {
             Some((v, _)) => v,
             _ => model_id,
@@ -892,7 +954,7 @@ impl AssertState {
     }
 }
 
-async fn create_config_file(config_path: &Path) -> Result<()> {
+pub async fn create_config_file(config_path: &Path) -> Result<()> {
     let ans = Confirm::new("No config file, create a new one?")
         .with_default(true)
         .prompt()?;

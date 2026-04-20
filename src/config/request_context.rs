@@ -147,6 +147,52 @@ impl RequestContext {
         }
     }
 
+    pub fn bootstrap(
+        app: Arc<AppState>,
+        working_mode: WorkingMode,
+        info_flag: bool,
+    ) -> Result<Self> {
+        let model = Model::retrieve_model(&app.config, &app.config.model_id, ModelType::Chat)?;
+
+        let mut functions = app.functions.clone();
+        if working_mode.is_repl() {
+            functions.append_user_interaction_functions();
+        }
+
+        let mut mcp_runtime = McpRuntime::default();
+        if let Some(registry) = &app.mcp_registry {
+            mcp_runtime.sync_from_registry(registry);
+        }
+
+        Ok(Self {
+            app,
+            macro_flag: false,
+            info_flag,
+            working_mode,
+            model,
+            agent_variables: None,
+            role: None,
+            session: None,
+            rag: None,
+            agent: None,
+            last_message: None,
+            tool_scope: ToolScope {
+                functions,
+                mcp_runtime,
+                tool_tracker: ToolCallTracker::default(),
+            },
+            supervisor: None,
+            parent_supervisor: None,
+            self_agent_id: None,
+            inbox: None,
+            escalation_queue: None,
+            current_depth: 0,
+            auto_continue_count: 0,
+            todo_list: TodoList::default(),
+            last_continuation_response: None,
+        })
+    }
+
     pub fn new_for_child(
         app: Arc<AppState>,
         parent: &Self,

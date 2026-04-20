@@ -150,7 +150,6 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    #[allow(dead_code)]
     pub fn from_config(config: super::Config) -> Result<Self> {
         let mut app_config = config.to_app_config();
         app_config.load_envs();
@@ -163,7 +162,6 @@ impl AppConfig {
         Ok(app_config)
     }
 
-    #[allow(dead_code)]
     pub fn resolve_model(&mut self) -> Result<()> {
         if self.model_id.is_empty() {
             let models = list_models(self, crate::client::ModelType::Chat);
