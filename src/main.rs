@@ -92,7 +92,8 @@ async fn main() -> Result<()> {
     }
 
     if vault_flags {
-        return Vault::handle_vault_flags(cli, Config::init_bare()?);
+        let cfg = Config::init_bare()?;
+        return Vault::handle_vault_flags(cli, &cfg.vault);
     }
 
     let abort_signal = create_abort_signal();

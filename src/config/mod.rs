@@ -356,7 +356,7 @@ impl Config {
         };
 
         let setup = async |config: &mut Self| -> Result<()> {
-            let vault = Vault::init(config);
+            let vault = Vault::init(&config.to_app_config());
 
             let (parsed_config, missing_secrets) = interpolate_secrets(&content, &vault);
             if !missing_secrets.is_empty() && !info_flag {
@@ -409,16 +409,6 @@ impl Config {
             ret?;
         }
         Ok(config)
-    }
-
-    pub fn vault_password_file(&self) -> PathBuf {
-        match &self.vault_password_file {
-            Some(path) => match path.exists() {
-                true => path.clone(),
-                false => gman::config::Config::local_provider_password_file(),
-            },
-            None => gman::config::Config::local_provider_password_file(),
-        }
     }
 
     pub fn sessions_dir(&self) -> PathBuf {
