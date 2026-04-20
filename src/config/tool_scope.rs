@@ -25,7 +25,6 @@ use anyhow::{Context, Result, anyhow};
 use bm25::{Document, Language, SearchEngineBuilder};
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use serde_json::{Value, json};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -160,12 +159,8 @@ impl McpRuntime {
             .cloned()
             .with_context(|| format!("Invoked MCP server does not exist: {server}"))?;
 
-        let request = CallToolRequestParams {
-            name: Cow::Owned(tool.to_owned()),
-            arguments: arguments.as_object().cloned(),
-            meta: None,
-            task: None,
-        };
+        let mut request = CallToolRequestParams::new(tool.to_owned());
+        request.arguments = arguments.as_object().cloned();
 
         server_handle.call_tool(request).await.map_err(Into::into)
     }
