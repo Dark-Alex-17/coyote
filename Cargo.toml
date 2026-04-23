@@ -89,7 +89,12 @@ duct = "1.0.0"
 argc = "1.23.0"
 strum_macros = "0.27.2"
 indoc = "2.0.6"
-rmcp = { version = "1.5.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-native-tls"] }
+rmcp = { version = "1.5.0", features = [
+  "client",
+  "transport-child-process",
+  "transport-streamable-http-client-reqwest",
+  "reqwest-native-tls",
+] }
 num_cpus = "1.17.0"
 tree-sitter = "0.26.8"
 tree-sitter-language = "0.1"
@@ -120,7 +125,7 @@ default-features = false
 features = ["parsing", "regex-onig", "plist-load"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
-crossterm = { version = "0.28.1", features = ["use-dev-tty"] }
+crossterm = { version = "0.29.0", features = ["use-dev-tty"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3.3.0", default-features = false, features = [
