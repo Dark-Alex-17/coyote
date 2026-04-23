@@ -2,7 +2,7 @@ use super::{MarkdownRender, SseEvent};
 
 use crate::utils::{AbortSignal, poll_abort_signal, spawn_spinner};
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use crossterm::{
     cursor, queue, style,
     terminal::{self, disable_raw_mode, enable_raw_mode},
@@ -96,7 +96,7 @@ async fn markdown_stream_inner(
                         match cursor::position() {
                             Ok(pos) => break pos,
                             Err(_) if attempts < 3 => attempts += 1,
-                            Err(e) => return Err(e.into()),
+                            Err(e) => return Err(Error::from(e)),
                         }
                     };
 
