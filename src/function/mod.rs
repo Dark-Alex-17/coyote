@@ -1177,8 +1177,8 @@ pub fn run_llm_function(
         .join("");
     envs.insert("PATH".into(), format!("{prepend_path}{current_path}"));
 
-    let temp_file = temp_file("-eval-", "");
-    envs.insert("LLM_OUTPUT".into(), temp_file.display().to_string());
+    let tmp_file = temp_file("-eval-", "");
+    envs.insert("LLM_OUTPUT".into(), tmp_file.display().to_string());
 
     #[cfg(windows)]
     let cmd_name = polyfill_cmd_name(&cmd_name, &bin_dirs);
@@ -1263,9 +1263,9 @@ pub fn run_llm_function(
         return Ok(Some(error_json.to_string()));
     }
     let mut output = None;
-    if temp_file.exists() {
+    if tmp_file.exists() {
         let contents =
-            fs::read_to_string(temp_file).context("Failed to retrieve tool call output")?;
+            fs::read_to_string(tmp_file).context("Failed to retrieve tool call output")?;
         if !contents.is_empty() {
             debug!("Tool {command_name} output: {}", contents);
             output = Some(contents);
