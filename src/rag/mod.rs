@@ -1066,10 +1066,7 @@ fn reciprocal_rank_fusion(
 ) -> Vec<DocumentId> {
     let rrf_k = top_k * 2;
     let mut map: IndexMap<DocumentId, f32> = IndexMap::new();
-    for (document_ids, weight) in list_of_document_ids
-        .into_iter()
-        .zip(list_of_weights.into_iter())
-    {
+    for (document_ids, weight) in list_of_document_ids.into_iter().zip(list_of_weights) {
         for (index, &item) in document_ids.iter().enumerate() {
             *map.entry(item).or_default() += (1.0 / ((rrf_k + index + 1) as f32)) * weight;
         }
