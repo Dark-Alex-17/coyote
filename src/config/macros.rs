@@ -168,3 +168,205 @@ pub struct MacroVariable {
     pub rest: bool,
     pub default: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn var(name: &str, rest: bool, default: Option<&str>) -> MacroVariable {
+        MacroVariable {
+            name: name.to_string(),
+            rest,
+            default: default.map(String::from),
+        }
+    }
+
+    fn macro_with_vars(vars: Vec<MacroVariable>) -> Macro {
+        Macro {
+            variables: vars,
+            steps: vec![],
+        }
+    }
+
+    #[test]
+    fn resolve_no_variables() {
+        let m = macro_with_vars(vec![]);
+        let result = m.resolve_variables(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_required_variable_provided() {
+        let m = macro_with_vars(vec![var("name", false, None)]);
+        let result = m.resolve_variables(&["Alice".into()]).unwrap();
+        assert_eq!(result["name"], "Alice");
+    }
+
+    #[test]
+    fn resolve_required_variable_missing_errors() {
+        let m = macro_with_vars(vec![var("name", false, None)]);
+        let result = m.resolve_variables(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("name"));
+    }
+
+    #[test]
+    fn resolve_default_variable_uses_default() {
+        let m = macro_with_vars(vec![var("color", false, Some("blue"))]);
+        let result = m.resolve_variables(&[]).unwrap();
+        assert_eq!(result["color"], "blue");
+    }
+
+    #[test]
+    fn resolve_default_variable_overridden() {
+        let m = macro_with_vars(vec![var("color", false, Some("blue"))]);
+        let result = m.resolve_variables(&["red".into()]).unwrap();
+        assert_eq!(result["color"], "red");
+    }
+
+    #[test]
+    fn resolve_rest_variable_captures_all_remaining() {
+        let m = macro_with_vars(vec![var("first", false, None), var("rest", true, None)]);
+        let result = m
+            .resolve_variables(&["a".into(), "b".into(), "c".into()])
+            .unwrap();
+        assert_eq!(result["first"], "a");
+        assert_eq!(result["rest"], "b c");
+    }
+
+    #[test]
+    fn resolve_rest_variable_with_default() {
+        let m = macro_with_vars(vec![var("args", true, Some("default text"))]);
+        let result = m.resolve_variables(&[]).unwrap();
+        assert_eq!(result["args"], "default text");
+    }
+
+    #[test]
+    fn resolve_multiple_variables() {
+        let m = macro_with_vars(vec![
+            var("a", false, None),
+            var("b", false, None),
+            var("c", false, Some("default_c")),
+        ]);
+        let result = m.resolve_variables(&["x".into(), "y".into()]).unwrap();
+        assert_eq!(result["a"], "x");
+        assert_eq!(result["b"], "y");
+        assert_eq!(result["c"], "default_c");
+    }
+
+    #[test]
+    fn usage_no_variables() {
+        let m = macro_with_vars(vec![]);
+        assert_eq!(m.usage("my-macro"), "my-macro");
+    }
+
+    #[test]
+    fn usage_required_variable() {
+        let m = macro_with_vars(vec![var("name", false, None)]);
+        assert_eq!(m.usage("greet"), "greet <name>");
+    }
+
+    #[test]
+    fn usage_optional_variable() {
+        let m = macro_with_vars(vec![var("color", false, Some("blue"))]);
+        assert_eq!(m.usage("paint"), "paint [color]");
+    }
+
+    #[test]
+    fn usage_rest_variable() {
+        let m = macro_with_vars(vec![var("args", true, None)]);
+        assert_eq!(m.usage("run"), "run <args>...");
+    }
+
+    #[test]
+    fn usage_rest_with_default() {
+        let m = macro_with_vars(vec![var("args", true, Some("default"))]);
+        assert_eq!(m.usage("run"), "run [args]...");
+    }
+
+    #[test]
+    fn usage_mixed_variables() {
+        let m = macro_with_vars(vec![
+            var("target", false, None),
+            var("flags", true, Some("")),
+        ]);
+        assert_eq!(m.usage("build"), "build <target> [flags]...");
+    }
+
+    #[test]
+    fn interpolate_replaces_variables() {
+        let vars = IndexMap::from([("name".to_string(), "world".to_string())]);
+        let result = Macro::interpolate_command("hello {{name}}", &vars);
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn interpolate_multiple_variables() {
+        let vars = IndexMap::from([
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]);
+        let result = Macro::interpolate_command("{{a}} + {{b}}", &vars);
+        assert_eq!(result, "1 + 2");
+    }
+
+    #[test]
+    fn interpolate_no_variables_passthrough() {
+        let vars = IndexMap::new();
+        let result = Macro::interpolate_command("no vars here", &vars);
+        assert_eq!(result, "no vars here");
+    }
+
+    #[test]
+    fn interpolate_variable_not_found_left_as_is() {
+        let vars = IndexMap::new();
+        let result = Macro::interpolate_command("hello {{missing}}", &vars);
+        assert_eq!(result, "hello {{missing}}");
+    }
+
+    #[test]
+    fn deserialize_macro_from_yaml() {
+        let yaml = r#"
+steps:
+  - ".role coder"
+  - "write code for {{task}}"
+variables:
+  - name: task
+"#;
+        let m: Macro = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(m.steps.len(), 2);
+        assert_eq!(m.variables.len(), 1);
+        assert_eq!(m.variables[0].name, "task");
+        assert!(!m.variables[0].rest);
+        assert!(m.variables[0].default.is_none());
+    }
+
+    #[test]
+    fn deserialize_macro_with_defaults() {
+        let yaml = r#"
+steps:
+  - "test"
+variables:
+  - name: mode
+    default: "fast"
+  - name: args
+    rest: true
+    default: "none"
+"#;
+        let m: Macro = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(m.variables[0].default, Some("fast".to_string()));
+        assert!(m.variables[1].rest);
+        assert_eq!(m.variables[1].default, Some("none".to_string()));
+    }
+
+    #[test]
+    fn deserialize_macro_no_variables() {
+        let yaml = r#"
+steps:
+  - ".help"
+"#;
+        let m: Macro = serde_yaml::from_str(yaml).unwrap();
+        assert!(m.variables.is_empty());
+        assert_eq!(m.steps.len(), 1);
+    }
+}

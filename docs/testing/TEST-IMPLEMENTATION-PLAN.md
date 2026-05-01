@@ -52,24 +52,24 @@ depending on what's being tested:
 Each feature area has a plan file in `docs/testing/plans/`. The
 files are numbered for execution order (dependencies first):
 
-| # | File | Feature area | Priority |
-|---|---|---|---|
-| 01 | `01-config-and-appconfig.md` | Config loading, AppConfig fields, defaults | High |
-| 02 | `02-roles.md` | Role loading, retrieval, role-likes, temp roles | High |
-| 03 | `03-sessions.md` | Session create/load/save, compression, autoname | High |
-| 04 | `04-agents.md` | Agent init, tool compilation, variables, lifecycle | Critical |
-| 05 | `05-mcp-lifecycle.md` | MCP server start/stop, factory, runtime, scope transitions | Critical |
-| 06 | `06-tool-evaluation.md` | eval_tool_calls, ToolCall dispatch, tool handlers | Critical |
-| 07 | `07-input-construction.md` | Input::from_str, from_files, field capturing, function selection | High |
-| 08 | `08-request-context.md` | RequestContext methods, scope transitions, state management | Critical |
-| 09 | `09-repl-commands.md` | REPL command handlers, state assertions, argument parsing | High |
-| 10 | `10-cli-flags.md` | CLI argument handling, mode switching, early exits | High |
-| 11 | `11-sub-agent-spawning.md` | Supervisor, child agents, escalation, messaging | Critical |
-| 12 | `12-rag.md` | RAG init/load/search, embeddings, document management | Medium |
-| 13 | `13-completions-and-prompt.md` | Tab completion, prompt rendering, highlighter | Medium |
-| 14 | `14-macros.md` | Macro loading, execution, variable interpolation | Medium |
-| 15 | `15-vault.md` | Secret management, interpolation in MCP config | Medium |
-| 16 | `16-functions-and-tools.md` | Function declarations, tool compilation, binaries | High |
+| # | File | Feature area | Priority | Status |
+|---|---|---|---|---|
+| 01 | `01-config-and-appconfig.md` | Config loading, AppConfig fields, defaults | High | ✅ Iter 1-4 |
+| 02 | `02-roles.md` | Role loading, retrieval, role-likes, temp roles | High | ✅ Iter 1-4 |
+| 03 | `03-sessions.md` | Session create/load/save, compression, autoname | High | ✅ Iter 1-4 |
+| 04 | `04-agents.md` | Agent init, tool compilation, variables, lifecycle | Critical | ✅ Iter 1-4 |
+| 05 | `05-mcp-lifecycle.md` | MCP server start/stop, factory, runtime, scope transitions | Critical | ✅ Iter 5 |
+| 06 | `06-tool-evaluation.md` | eval_tool_calls, ToolCall dispatch, tool handlers | Critical | ✅ Iter 6 |
+| 07 | `07-input-construction.md` | Input::from_str, from_files, field capturing, function selection | High | ✅ Iter 7 |
+| 08 | `08-request-context.md` | RequestContext methods, scope transitions, state management | Critical | ✅ Iter 8 |
+| 09 | `09-repl-commands.md` | REPL command handlers, state assertions, argument parsing | High | ✅ Iter 9 |
+| 10 | `10-cli-flags.md` | CLI argument handling, mode switching, early exits | High | ✅ Iter 10 |
+| 11 | `11-sub-agent-spawning.md` | Supervisor, child agents, escalation, messaging | Critical | ✅ Iter 11 |
+| 12 | `12-rag.md` | RAG init/load/search, embeddings, document management | Medium | ✅ Iter 12 |
+| 13 | `13-completions-and-prompt.md` | Tab completion, prompt rendering, highlighter | Medium | ✅ Iter 13 |
+| 14 | `14-macros.md` | Macro loading, execution, variable interpolation | Medium | ✅ Iter 13 |
+| 15 | `15-vault.md` | Secret management, interpolation in MCP config | Medium | ✅ Iter 13 |
+| 16 | `16-functions-and-tools.md` | Function declarations, tool compilation, binaries | High | ✅ Iter 13 |
 
 ## Iteration tracking
 
