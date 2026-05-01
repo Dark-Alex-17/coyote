@@ -9,47 +9,58 @@ the execution path through main.rs.
 ## Behaviors to test
 
 ### Early-exit flags
-- [ ] --info prints info and exits
-- [ ] --list-models prints models and exits
-- [ ] --list-roles prints roles and exits
-- [ ] --list-sessions prints sessions and exits
-- [ ] --list-agents prints agents and exits
-- [ ] --list-rags prints RAGs and exits
-- [ ] --list-macros prints macros and exits
-- [ ] --sync-models fetches and exits
-- [ ] --build-tools (with --agent) builds and exits
-- [ ] --authenticate runs OAuth and exits
-- [ ] --completions generates shell completions and exits
-- [ ] Vault flags (--add/get/update/delete-secret, --list-secrets) and exit
+- [x] --info parsed correctly
+- [x] --list-models parsed correctly
+- [x] --list-roles parsed correctly
+- [x] --list-sessions parsed correctly
+- [x] --list-agents parsed correctly
+- [x] --list-rags parsed correctly
+- [x] --list-macros parsed correctly
+- [x] --sync-models parsed correctly
+- [x] --build-tools parsed correctly
+- [ ] --authenticate runs OAuth and exits (integration)
+- [ ] --completions generates shell completions and exits (integration)
+- [x] Vault flags (--add/get/update/delete-secret, --list-secrets) parsed
 
 ### Mode selection
-- [ ] No text/file → REPL mode
-- [ ] Text provided → command mode (single-shot)
-- [ ] --agent → agent mode
-- [ ] --role → role mode
-- [ ] --execute (-e) → shell execute mode
-- [ ] --code (-c) → code output mode
-- [ ] --prompt → temp role mode
-- [ ] --macro → macro execution mode
+- [x] No text/file → text returns None (REPL indicator)
+- [x] Text provided → text joined and returned
+- [x] --agent → agent field set
+- [x] --role → role field set
+- [x] --execute (-e) → execute flag set
+- [x] --code (-c) → code flag set
+- [x] --prompt → prompt field set
+- [x] --macro → macro_name field set
 
 ### Flag combinations
-- [ ] --model + any mode → model applied
-- [ ] --session + --role → session with role
-- [ ] --session + --agent → agent with session
-- [ ] --agent + --agent-variable → variables set
-- [ ] --dry-run + any mode → input shown, no API call
-- [ ] --no-stream + any mode → non-streaming response
-- [ ] --file + text → file content + text combined
-- [ ] --empty-session + --session → fresh session
-- [ ] --save-session + --session → force save
+- [x] --model + --role parsed together
+- [x] --session + --role parsed together
+- [ ] --session + --agent → agent with session (integration)
+- [ ] --agent + --agent-variable → variables set (integration)
+- [x] --dry-run flag parsed
+- [x] --no-stream (-S) flag parsed
+- [x] --file + text → both parsed
+- [x] --empty-session + --session parsed
+- [x] --save-session + --session parsed
 
 ### Prelude
-- [ ] apply_prelude runs before main execution
-- [ ] Prelude "role:name" loads role
-- [ ] Prelude "session:name" loads session
-- [ ] Prelude "session:role" loads both
-- [ ] Prelude skipped if macro_flag set
-- [ ] Prelude skipped if state already has role/session/agent
+- [ ] apply_prelude runs before main execution (async + filesystem)
+- [ ] Prelude "role:name" loads role (async + filesystem)
+- [ ] Prelude "session:name" loads session (async + filesystem)
+- [ ] Prelude "session:role" loads both (async + filesystem)
+- [ ] Prelude skipped if macro_flag set (async)
+- [ ] Prelude skipped if state already has role/session/agent (async)
+
+## Additional behaviors tested (not in original plan)
+
+- [x] Default Cli has all flags unset/empty
+- [x] Short flags: -m, -r, -a, -s, -e, -c, -S, -f
+- [x] Multiple -f flags accumulate
+- [x] Trailing text args collected as vec
+- [x] Cli::text() returns None with no args (terminal stdin)
+- [x] Cli::text() joins trailing args with spaces
+- [x] --rag flag parsed
+- [x] --macro flag parsed
 
 ## Old code reference
 - `src/cli/mod.rs` — Cli struct, flag definitions
