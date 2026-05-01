@@ -1,13 +1,13 @@
 use super::*;
 
 use crate::client::{
-    ChatCompletionsData, Client, ImageUrl, Message, MessageContent, MessageContentPart,
-    MessageContentToolCalls, MessageRole, Model, init_client, patch_messages,
+    init_client, patch_messages, ChatCompletionsData, Client, ImageUrl, Message,
+    MessageContent, MessageContentPart, MessageContentToolCalls, MessageRole, Model,
 };
 use crate::function::ToolResult;
-use crate::utils::{AbortSignal, base64_encode, is_loader_protocol, sha256};
+use crate::utils::{base64_encode, is_loader_protocol, sha256, AbortSignal};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use indexmap::IndexSet;
 use std::{collections::HashMap, fs::File, io::Read, sync::Arc};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -582,24 +582,12 @@ fn read_media_to_data_url(image_path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::mcp_factory::McpFactory;
-    use crate::config::rag_cache::RagCache;
     use crate::config::request_context::RequestContext;
-    use crate::config::{AppConfig, AppState, WorkingMode};
-    use crate::function::Functions;
+    use crate::config::{AppState, WorkingMode};
     use std::sync::Arc;
 
     fn default_app_state() -> Arc<AppState> {
-        Arc::new(AppState {
-            config: Arc::new(AppConfig::default()),
-            vault: Arc::new(Vault::default()),
-            mcp_factory: Arc::new(McpFactory::default()),
-            rag_cache: Arc::new(RagCache::default()),
-            mcp_config: None,
-            mcp_log_path: None,
-            mcp_registry: None,
-            functions: Functions::default(),
-        })
+        Arc::new(AppState::test_default())
     }
 
     fn create_test_ctx() -> RequestContext {
@@ -720,21 +708,11 @@ mod tests {
 
     #[test]
     fn input_from_str_captures_stream_from_config() {
-        let app_state = {
-            let mut config = AppConfig::default();
-            config.stream = false;
-            Arc::new(AppState {
-                config: Arc::new(config),
-                vault: Arc::new(crate::vault::Vault::default()),
-                mcp_factory: Arc::new(McpFactory::default()),
-                rag_cache: Arc::new(RagCache::default()),
-                mcp_config: None,
-                mcp_log_path: None,
-                mcp_registry: None,
-                functions: Functions::default(),
-            })
-        };
-        let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let mut state = AppState::test_default();
+        let mut config = (*state.config).clone();
+        config.stream = false;
+        state.config = Arc::new(config);
+        let ctx = RequestContext::new(Arc::new(state), WorkingMode::Cmd);
         let input = Input::from_str(&ctx, "test", None);
         assert!(!input.stream_enabled);
     }

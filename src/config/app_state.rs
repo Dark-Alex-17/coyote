@@ -39,6 +39,20 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(test)]
+    pub fn test_default() -> Self {
+        Self {
+            config: Arc::new(AppConfig::default()),
+            vault: Arc::new(Vault::default()),
+            mcp_factory: Arc::new(McpFactory::default()),
+            rag_cache: Arc::new(RagCache::default()),
+            mcp_config: None,
+            mcp_log_path: None,
+            mcp_registry: None,
+            functions: Functions::default(),
+        }
+    }
+
     pub async fn init(
         config: Arc<AppConfig>,
         log_path: Option<PathBuf>,
