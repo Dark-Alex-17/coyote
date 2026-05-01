@@ -2373,6 +2373,11 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::function::ToolCall;
+    use crate::mcp::{McpServer, McpServersConfig, McpTransportType};
+    use crate::utils;
+    use crate::vault::Vault;
+    use super::super::mcp_factory::McpFactory;
 
     struct TestConfigDirGuard {
         key: String,
@@ -2419,8 +2424,8 @@ mod tests {
     fn default_app_state() -> Arc<AppState> {
         Arc::new(AppState {
             config: Arc::new(AppConfig::default()),
-            vault: Arc::new(crate::vault::Vault::default()),
-            mcp_factory: Arc::new(super::super::mcp_factory::McpFactory::default()),
+            vault: Arc::new(Vault::default()),
+            mcp_factory: Arc::new(McpFactory::default()),
             rag_cache: Arc::new(RagCache::default()),
             mcp_config: None,
             mcp_log_path: None,
@@ -2563,7 +2568,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                ctx.use_agent(&app, &agent_name, None, crate::utils::create_abort_signal())
+                ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())
                     .await
                     .unwrap();
             });
@@ -2605,5 +2610,158 @@ mod tests {
     fn escalation_queue_defaults_to_none() {
         let ctx = create_test_ctx();
         assert!(ctx.root_escalation_queue().is_none());
+    }
+
+    fn app_state_with_mcp_config(mcp_server_support: bool, server_names: &[&str]) -> Arc<AppState> {
+        let mut app_config = AppConfig::default();
+        app_config.mcp_server_support = mcp_server_support;
+
+        let mcp_config = if server_names.is_empty() {
+            None
+        } else {
+            let mut servers = HashMap::new();
+            for name in server_names {
+                servers.insert(
+                    name.to_string(),
+                    McpServer {
+                        transport_type: McpTransportType::Stdio,
+                        command: Some("echo".to_string()),
+                        args: None,
+                        env: None,
+                        cwd: None,
+                        url: None,
+                        headers: None,
+                    },
+                );
+            }
+            Some(McpServersConfig {
+                mcp_servers: servers,
+            })
+        };
+
+        Arc::new(AppState {
+            config: Arc::new(app_config),
+            vault: Arc::new(Vault::default()),
+            mcp_factory: Arc::new(McpFactory::default()),
+            rag_cache: Arc::new(RagCache::default()),
+            mcp_config,
+            mcp_log_path: None,
+            mcp_registry: None,
+            functions: Functions::default(),
+        })
+    }
+
+    fn run_async<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn rebuild_tool_scope_mcp_disabled_skips_servers() {
+        let app_state = app_state_with_mcp_config(false, &["github", "slack"]);
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        run_async(ctx.rebuild_tool_scope(&app, Some("all".to_string()), abort)).unwrap();
+
+        assert!(ctx.tool_scope.mcp_runtime.is_empty());
+    }
+
+    #[test]
+    fn rebuild_tool_scope_no_enabled_servers_yields_empty_runtime() {
+        let app_state = app_state_with_mcp_config(true, &["github"]);
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        run_async(ctx.rebuild_tool_scope(&app, None, abort)).unwrap();
+
+        assert!(ctx.tool_scope.mcp_runtime.is_empty());
+    }
+
+    #[test]
+    fn rebuild_tool_scope_no_mcp_config_yields_empty_runtime() {
+        let app_state = app_state_with_mcp_config(true, &[]);
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        run_async(ctx.rebuild_tool_scope(&app, Some("all".to_string()), abort)).unwrap();
+
+        assert!(ctx.tool_scope.mcp_runtime.is_empty());
+    }
+
+    #[test]
+    fn rebuild_tool_scope_preserves_tool_tracker() {
+        let app_state = app_state_with_mcp_config(false, &[]);
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let dummy = ToolCall {
+            name: "test_tool".to_string(),
+            ..Default::default()
+        };
+        ctx.tool_scope.tool_tracker.record_call(dummy);
+
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.rebuild_tool_scope(&app, None, abort)).unwrap();
+
+        let check_call = ToolCall {
+            name: "test_tool".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            ctx.tool_scope
+                .tool_tracker
+                .check_loop(&check_call)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rebuild_tool_scope_repl_mode_appends_user_interaction_functions() {
+        let app_state = app_state_with_mcp_config(false, &[]);
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Repl);
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        run_async(ctx.rebuild_tool_scope(&app, None, abort)).unwrap();
+
+        let names: Vec<String> = ctx
+            .tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.starts_with("user__")),
+            "REPL mode should include user interaction functions, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn rebuild_tool_scope_cmd_mode_no_user_interaction_functions() {
+        let app_state = app_state_with_mcp_config(false, &[]);
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        run_async(ctx.rebuild_tool_scope(&app, None, abort)).unwrap();
+
+        let names: Vec<String> = ctx
+            .tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("user__")),
+            "CMD mode should NOT include user interaction functions, got: {names:?}"
+        );
     }
 }
