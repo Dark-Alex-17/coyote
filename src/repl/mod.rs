@@ -1186,4 +1186,248 @@ mod tests {
             (vec![".\\file.txt".into(), "C:\\dir\\file.txt".into()], "")
         );
     }
+
+    #[test]
+    fn repl_commands_has_39_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 39);
+    }
+
+    #[test]
+    fn repl_commands_all_start_with_dot() {
+        for cmd in REPL_COMMANDS.iter() {
+            assert!(
+                cmd.name.starts_with('.'),
+                "Command '{}' should start with '.'",
+                cmd.name
+            );
+        }
+    }
+
+    #[test]
+    fn repl_commands_no_empty_descriptions() {
+        for cmd in REPL_COMMANDS.iter() {
+            assert!(
+                !cmd.description.is_empty(),
+                "Command '{}' has empty description",
+                cmd.name
+            );
+        }
+    }
+
+    #[test]
+    fn repl_commands_help_is_always_available() {
+        let help = REPL_COMMANDS.iter().find(|c| c.name == ".help").unwrap();
+        assert!(help.is_valid(StateFlags::empty()));
+        assert!(help.is_valid(StateFlags::ROLE));
+        assert!(help.is_valid(StateFlags::AGENT));
+    }
+
+    #[test]
+    fn repl_commands_exit_is_always_available() {
+        let exit = REPL_COMMANDS.iter().find(|c| c.name == ".exit").unwrap();
+        assert!(exit.is_valid(StateFlags::empty()));
+        assert!(exit.is_valid(StateFlags::all()));
+    }
+
+    #[test]
+    fn repl_commands_info_role_requires_role() {
+        let cmd = REPL_COMMANDS
+            .iter()
+            .find(|c| c.name == ".info role")
+            .unwrap();
+        assert!(cmd.is_valid(StateFlags::ROLE));
+        assert!(!cmd.is_valid(StateFlags::empty()));
+        assert!(!cmd.is_valid(StateFlags::SESSION_EMPTY));
+    }
+
+    #[test]
+    fn repl_commands_session_blocked_when_already_in_session() {
+        let cmd = REPL_COMMANDS.iter().find(|c| c.name == ".session").unwrap();
+        assert!(cmd.is_valid(StateFlags::empty()));
+        assert!(!cmd.is_valid(StateFlags::SESSION));
+        assert!(!cmd.is_valid(StateFlags::SESSION_EMPTY));
+    }
+
+    #[test]
+    fn repl_commands_exit_session_requires_session() {
+        let cmd = REPL_COMMANDS
+            .iter()
+            .find(|c| c.name == ".exit session")
+            .unwrap();
+        assert!(cmd.is_valid(StateFlags::SESSION));
+        assert!(cmd.is_valid(StateFlags::SESSION_EMPTY));
+        assert!(!cmd.is_valid(StateFlags::empty()));
+    }
+
+    #[test]
+    fn repl_commands_exit_agent_requires_agent() {
+        let cmd = REPL_COMMANDS
+            .iter()
+            .find(|c| c.name == ".exit agent")
+            .unwrap();
+        assert!(cmd.is_valid(StateFlags::AGENT));
+        assert!(!cmd.is_valid(StateFlags::empty()));
+    }
+
+    #[test]
+    fn repl_commands_agent_only_when_bare() {
+        let cmd = REPL_COMMANDS.iter().find(|c| c.name == ".agent").unwrap();
+        assert!(cmd.is_valid(StateFlags::empty()));
+        assert!(!cmd.is_valid(StateFlags::ROLE));
+        assert!(!cmd.is_valid(StateFlags::SESSION));
+        assert!(!cmd.is_valid(StateFlags::AGENT));
+    }
+
+    #[test]
+    fn repl_commands_role_blocked_in_session_or_agent() {
+        let cmd = REPL_COMMANDS.iter().find(|c| c.name == ".role").unwrap();
+        assert!(cmd.is_valid(StateFlags::empty()));
+        assert!(!cmd.is_valid(StateFlags::SESSION));
+        assert!(!cmd.is_valid(StateFlags::AGENT));
+    }
+
+    #[test]
+    fn repl_commands_prompt_blocked_in_session_or_agent() {
+        let cmd = REPL_COMMANDS.iter().find(|c| c.name == ".prompt").unwrap();
+        assert!(cmd.is_valid(StateFlags::empty()));
+        assert!(cmd.is_valid(StateFlags::ROLE));
+        assert!(!cmd.is_valid(StateFlags::SESSION));
+        assert!(!cmd.is_valid(StateFlags::AGENT));
+    }
+
+    #[test]
+    fn repl_commands_rag_blocked_in_agent() {
+        let cmd = REPL_COMMANDS.iter().find(|c| c.name == ".rag").unwrap();
+        assert!(cmd.is_valid(StateFlags::empty()));
+        assert!(cmd.is_valid(StateFlags::ROLE));
+        assert!(!cmd.is_valid(StateFlags::AGENT));
+    }
+
+    #[test]
+    fn repl_commands_starter_requires_agent() {
+        let cmd = REPL_COMMANDS.iter().find(|c| c.name == ".starter").unwrap();
+        assert!(cmd.is_valid(StateFlags::AGENT));
+        assert!(!cmd.is_valid(StateFlags::empty()));
+    }
+
+    #[test]
+    fn repl_commands_clear_todo_requires_agent() {
+        let cmd = REPL_COMMANDS
+            .iter()
+            .find(|c| c.name == ".clear todo")
+            .unwrap();
+        assert!(cmd.is_valid(StateFlags::AGENT));
+        assert!(!cmd.is_valid(StateFlags::empty()));
+    }
+
+    #[test]
+    fn repl_commands_edit_role_requires_role_not_session() {
+        let cmd = REPL_COMMANDS
+            .iter()
+            .find(|c| c.name == ".edit role")
+            .unwrap();
+        assert!(cmd.is_valid(StateFlags::ROLE));
+        assert!(!cmd.is_valid(StateFlags::empty()));
+        assert!(!cmd.is_valid(StateFlags::ROLE | StateFlags::SESSION));
+    }
+
+    #[test]
+    fn repl_commands_exit_rag_requires_rag_not_agent() {
+        let cmd = REPL_COMMANDS
+            .iter()
+            .find(|c| c.name == ".exit rag")
+            .unwrap();
+        assert!(cmd.is_valid(StateFlags::RAG));
+        assert!(!cmd.is_valid(StateFlags::empty()));
+        assert!(!cmd.is_valid(StateFlags::RAG | StateFlags::AGENT));
+    }
+
+    #[test]
+    fn parse_command_plain_text_returns_none() {
+        assert!(parse_command("hello world").is_none());
+    }
+
+    #[test]
+    fn parse_command_empty_returns_none() {
+        assert!(parse_command("").is_none());
+    }
+
+    #[test]
+    fn parse_command_whitespace_only_returns_none() {
+        assert!(parse_command("   ").is_none());
+    }
+
+    #[test]
+    fn parse_command_dot_only() {
+        assert_eq!(parse_command("."), Some((".", None)));
+    }
+
+    #[test]
+    fn split_first_arg_none_input() {
+        assert!(split_first_arg(None).is_none());
+    }
+
+    #[test]
+    fn split_first_arg_single_word() {
+        assert_eq!(split_first_arg(Some("role")), Some(("role", None)));
+    }
+
+    #[test]
+    fn split_first_arg_two_words() {
+        assert_eq!(
+            split_first_arg(Some("role test-role")),
+            Some(("role", Some("test-role")))
+        );
+    }
+
+    #[test]
+    fn split_first_arg_with_extra_spaces() {
+        assert_eq!(
+            split_first_arg(Some("session  my-session")),
+            Some(("session", Some("my-session")))
+        );
+    }
+
+    #[test]
+    fn repl_command_is_valid_pass_always_true() {
+        let cmd = ReplCommand::new(".test", "desc", AssertState::pass());
+        assert!(cmd.is_valid(StateFlags::empty()));
+        assert!(cmd.is_valid(StateFlags::all()));
+    }
+
+    #[test]
+    fn repl_command_is_valid_respects_true() {
+        let cmd = ReplCommand::new(".test", "desc", AssertState::True(StateFlags::ROLE));
+        assert!(cmd.is_valid(StateFlags::ROLE));
+        assert!(!cmd.is_valid(StateFlags::empty()));
+    }
+
+    #[test]
+    fn repl_command_is_valid_respects_false() {
+        let cmd = ReplCommand::new(".test", "desc", AssertState::False(StateFlags::AGENT));
+        assert!(cmd.is_valid(StateFlags::empty()));
+        assert!(!cmd.is_valid(StateFlags::AGENT));
+    }
+
+    #[test]
+    fn multiline_regex_captures_content_between_markers() {
+        let input = ":::\nhello world\n:::";
+        let captures = MULTILINE_RE.captures(input).unwrap().unwrap();
+        let content = captures.get(1).unwrap().as_str();
+        assert_eq!(content.trim(), "hello world");
+    }
+
+    #[test]
+    fn multiline_regex_does_not_match_single_marker() {
+        let input = ":::\nhello world";
+        let result = MULTILINE_RE.captures(input).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn multiline_regex_does_not_match_plain_text() {
+        let input = "hello world";
+        let result = MULTILINE_RE.captures(input).unwrap();
+        assert!(result.is_none());
+    }
 }

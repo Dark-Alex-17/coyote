@@ -596,4 +596,78 @@ mod tests {
         assert!(cfg.enabled_tools.is_none());
         assert!(cfg.enabled_mcp_servers.is_none());
     }
+
+    #[test]
+    fn assert_state_pass_always_true() {
+        let pass = AssertState::pass();
+        assert!(pass.assert(StateFlags::empty()));
+        assert!(pass.assert(StateFlags::ROLE));
+        assert!(pass.assert(StateFlags::SESSION | StateFlags::AGENT));
+        assert!(pass.assert(StateFlags::all()));
+    }
+
+    #[test]
+    fn assert_state_bare_only_empty() {
+        let bare = AssertState::bare();
+        assert!(bare.assert(StateFlags::empty()));
+        assert!(!bare.assert(StateFlags::ROLE));
+        assert!(!bare.assert(StateFlags::SESSION));
+    }
+
+    #[test]
+    fn assert_state_true_requires_flag_present() {
+        let state = AssertState::True(StateFlags::ROLE);
+        assert!(state.assert(StateFlags::ROLE));
+        assert!(state.assert(StateFlags::ROLE | StateFlags::SESSION));
+        assert!(!state.assert(StateFlags::empty()));
+        assert!(!state.assert(StateFlags::SESSION));
+    }
+
+    #[test]
+    fn assert_state_true_with_multiple_flags_any_match() {
+        let state = AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION);
+        assert!(state.assert(StateFlags::SESSION_EMPTY));
+        assert!(state.assert(StateFlags::SESSION));
+        assert!(state.assert(StateFlags::SESSION | StateFlags::ROLE));
+        assert!(!state.assert(StateFlags::ROLE));
+        assert!(!state.assert(StateFlags::empty()));
+    }
+
+    #[test]
+    fn assert_state_false_requires_flag_absent() {
+        let state = AssertState::False(StateFlags::AGENT);
+        assert!(state.assert(StateFlags::empty()));
+        assert!(state.assert(StateFlags::ROLE));
+        assert!(!state.assert(StateFlags::AGENT));
+        assert!(!state.assert(StateFlags::AGENT | StateFlags::ROLE));
+    }
+
+    #[test]
+    fn assert_state_false_with_multiple_flags() {
+        let state = AssertState::False(StateFlags::SESSION | StateFlags::AGENT);
+        assert!(state.assert(StateFlags::empty()));
+        assert!(state.assert(StateFlags::ROLE));
+        assert!(!state.assert(StateFlags::SESSION));
+        assert!(!state.assert(StateFlags::AGENT));
+        assert!(!state.assert(StateFlags::SESSION | StateFlags::AGENT));
+    }
+
+    #[test]
+    fn assert_state_truefalse_requires_true_present_and_false_absent() {
+        let state = AssertState::TrueFalse(StateFlags::ROLE, StateFlags::SESSION);
+        assert!(state.assert(StateFlags::ROLE));
+        assert!(state.assert(StateFlags::ROLE | StateFlags::RAG));
+        assert!(!state.assert(StateFlags::empty()));
+        assert!(!state.assert(StateFlags::SESSION));
+        assert!(!state.assert(StateFlags::ROLE | StateFlags::SESSION));
+    }
+
+    #[test]
+    fn assert_state_equal_exact_match() {
+        let state = AssertState::Equal(StateFlags::ROLE | StateFlags::SESSION);
+        assert!(state.assert(StateFlags::ROLE | StateFlags::SESSION));
+        assert!(!state.assert(StateFlags::ROLE));
+        assert!(!state.assert(StateFlags::SESSION));
+        assert!(!state.assert(StateFlags::empty()));
+    }
 }

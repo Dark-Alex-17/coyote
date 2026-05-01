@@ -168,8 +168,8 @@ impl McpRuntime {
 
 #[cfg(test)]
 mod tests {
-    use crate::function::ToolCall;
     use super::*;
+    use crate::function::ToolCall;
 
     #[test]
     fn mcp_runtime_new_is_empty() {
