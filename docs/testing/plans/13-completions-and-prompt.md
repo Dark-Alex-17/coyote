@@ -24,7 +24,12 @@
 - [ ] Prompt updates after scope transitions
 - [ ] Multi-line indicator shown during ::: input
 
+## Status
+Most completion logic requires filesystem access for role/session/agent lists.
+The `split_line` function has existing tests. Prompt rendering methods are trivial
+wrappers around stored strings. Low additional unit-test yield.
+
 ## Old code reference
 - `src/config/request_context.rs` — repl_complete
-- `src/repl/completer.rs` — ReplCompleter
+- `src/repl/completer.rs` — ReplCompleter (split_line already tested)
 - `src/repl/prompt.rs` — ReplPrompt

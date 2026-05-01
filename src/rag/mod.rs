@@ -1080,3 +1080,237 @@ fn reciprocal_rank_fusion(
         .map(|(v, _)| v)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn document_id_round_trip() {
+        let id = DocumentId::new(5, 17);
+        let (file, doc) = id.split();
+        assert_eq!(file, 5);
+        assert_eq!(doc, 17);
+    }
+
+    #[test]
+    fn document_id_zero_zero() {
+        let id = DocumentId::new(0, 0);
+        let (file, doc) = id.split();
+        assert_eq!(file, 0);
+        assert_eq!(doc, 0);
+    }
+
+    #[test]
+    fn document_id_large_values() {
+        let id = DocumentId::new(1000, 9999);
+        let (file, doc) = id.split();
+        assert_eq!(file, 1000);
+        assert_eq!(doc, 9999);
+    }
+
+    #[test]
+    fn document_id_debug_format() {
+        let id = DocumentId::new(3, 7);
+        let formatted = format!("{id:?}");
+        assert_eq!(formatted, "3-7");
+    }
+
+    #[test]
+    fn document_id_equality() {
+        let a = DocumentId::new(1, 2);
+        let b = DocumentId::new(1, 2);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn document_id_inequality() {
+        let a = DocumentId::new(1, 2);
+        let b = DocumentId::new(1, 3);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn document_id_ordering() {
+        let a = DocumentId::new(0, 1);
+        let b = DocumentId::new(1, 0);
+        assert!(a < b);
+    }
+
+    #[test]
+    fn rag_document_new() {
+        let doc = RagDocument::new("hello world");
+        assert_eq!(doc.page_content, "hello world");
+        assert!(doc.metadata.is_empty());
+    }
+
+    #[test]
+    fn rag_document_default() {
+        let doc = RagDocument::default();
+        assert_eq!(doc.page_content, "");
+        assert!(doc.metadata.is_empty());
+    }
+
+    #[test]
+    fn rag_data_new_defaults() {
+        let data = RagData::new("model".into(), 1000, 20, None, 5, None);
+        assert_eq!(data.embedding_model, "model");
+        assert_eq!(data.chunk_size, 1000);
+        assert_eq!(data.chunk_overlap, 20);
+        assert_eq!(data.top_k, 5);
+        assert!(data.reranker_model.is_none());
+        assert!(data.files.is_empty());
+        assert!(data.vectors.is_empty());
+        assert!(data.document_paths.is_empty());
+        assert_eq!(data.next_file_id, 0);
+    }
+
+    #[test]
+    fn rag_data_get_returns_document() {
+        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let file = RagFile {
+            hash: "abc".into(),
+            path: "test.txt".into(),
+            documents: vec![RagDocument::new("first"), RagDocument::new("second")],
+        };
+        data.files.insert(0, file);
+
+        let doc = data.get(DocumentId::new(0, 0)).unwrap();
+        assert_eq!(doc.page_content, "first");
+
+        let doc = data.get(DocumentId::new(0, 1)).unwrap();
+        assert_eq!(doc.page_content, "second");
+    }
+
+    #[test]
+    fn rag_data_get_returns_none_for_missing_file() {
+        let data = RagData::new("m".into(), 100, 10, None, 5, None);
+        assert!(data.get(DocumentId::new(99, 0)).is_none());
+    }
+
+    #[test]
+    fn rag_data_get_returns_none_for_missing_document() {
+        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let file = RagFile {
+            hash: "abc".into(),
+            path: "test.txt".into(),
+            documents: vec![RagDocument::new("only one")],
+        };
+        data.files.insert(0, file);
+        assert!(data.get(DocumentId::new(0, 5)).is_none());
+    }
+
+    #[test]
+    fn rag_data_del_removes_files_and_vectors() {
+        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let file = RagFile {
+            hash: "abc".into(),
+            path: "test.txt".into(),
+            documents: vec![RagDocument::new("doc")],
+        };
+        data.files.insert(0, file);
+        let doc_id = DocumentId::new(0, 0);
+        data.vectors.insert(doc_id, vec![0.1, 0.2, 0.3]);
+
+        assert!(data.files.contains_key(&0));
+        assert!(data.vectors.contains_key(&doc_id));
+
+        data.del(vec![0]);
+
+        assert!(!data.files.contains_key(&0));
+        assert!(!data.vectors.contains_key(&doc_id));
+    }
+
+    #[test]
+    fn rag_data_del_nonexistent_is_noop() {
+        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        data.del(vec![99]);
+        assert!(data.files.is_empty());
+    }
+
+    #[test]
+    fn rag_data_add_inserts_files_and_vectors() {
+        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let file = RagFile {
+            hash: "xyz".into(),
+            path: "new.txt".into(),
+            documents: vec![RagDocument::new("content")],
+        };
+        let doc_id = DocumentId::new(0, 0);
+        let embeddings = vec![vec![0.5, 0.6, 0.7]];
+
+        data.add(1, vec![(0, file)], vec![doc_id], embeddings);
+
+        assert_eq!(data.next_file_id, 1);
+        assert!(data.files.contains_key(&0));
+        assert!(data.vectors.contains_key(&doc_id));
+        assert_eq!(data.vectors[&doc_id], vec![0.5, 0.6, 0.7]);
+    }
+
+    #[test]
+    fn rag_template_contains_placeholders() {
+        assert!(RAG_TEMPLATE.contains("__CONTEXT__"));
+        assert!(RAG_TEMPLATE.contains("__SOURCES__"));
+        assert!(RAG_TEMPLATE.contains("__INPUT__"));
+    }
+
+    #[test]
+    fn get_separators_returns_language_specific() {
+        let rs_seps = splitter::get_separators("rs");
+        assert!(rs_seps.iter().any(|s| s.contains("fn ")));
+
+        let py_seps = splitter::get_separators("py");
+        assert!(py_seps.iter().any(|s| s.contains("def ")));
+
+        let md_seps = splitter::get_separators("md");
+        assert!(md_seps.iter().any(|s| s.contains("# ")));
+    }
+
+    #[test]
+    fn get_separators_unknown_returns_defaults() {
+        let seps = get_separators("xyz");
+        assert_eq!(seps, DEFAULT_SEPARATORS.to_vec());
+    }
+
+    #[test]
+    fn get_separators_all_known_extensions() {
+        let known = [
+            "c", "cc", "cpp", "go", "java", "js", "mjs", "cjs", "php", "proto", "py", "rst", "rb",
+            "rs", "scala", "swift", "md", "mkd", "tex", "htm", "html", "sol",
+        ];
+        for ext in known {
+            let seps = get_separators(ext);
+            assert_ne!(seps, DEFAULT_SEPARATORS.to_vec(), "Extension '{ext}' should have language-specific separators");
+        }
+    }
+
+    #[test]
+    fn rag_data_build_bm25_empty() {
+        let data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let engine = data.build_bm25();
+        let results = engine.search("anything", 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn rag_data_build_bm25_finds_documents() {
+        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let file = RagFile {
+            hash: "h".into(),
+            path: "test.txt".into(),
+            documents: vec![
+                RagDocument::new("rust programming language"),
+                RagDocument::new("python scripting language"),
+            ],
+        };
+        data.files.insert(0, file);
+
+        let engine = data.build_bm25();
+        let results = engine.search("rust", 5);
+        assert!(!results.is_empty());
+        let top = &results[0];
+        let (file_idx, doc_idx) = top.document.id.split();
+        assert_eq!(file_idx, 0);
+        assert_eq!(doc_idx, 0);
+    }
+}

@@ -154,3 +154,45 @@ impl Vault {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_re_matches_double_braces() {
+        let captures = SECRET_RE.captures("{{MY_SECRET}}").unwrap().unwrap();
+        assert_eq!(&captures[1], "MY_SECRET");
+    }
+
+    #[test]
+    fn secret_re_matches_with_surrounding_text() {
+        let text = "key={{API_KEY}} here";
+        let captures = SECRET_RE.captures(text).unwrap().unwrap();
+        assert_eq!(&captures[1], "API_KEY");
+    }
+
+    #[test]
+    fn secret_re_no_match_single_braces() {
+        let result = SECRET_RE.captures("{NOT_SECRET}").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn secret_re_no_match_plain_text() {
+        let result = SECRET_RE.captures("just plain text").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn secret_re_matches_with_spaces() {
+        let captures = SECRET_RE.captures("{{ SPACED }}").unwrap().unwrap();
+        assert_eq!(&captures[1], " SPACED ");
+    }
+
+    #[test]
+    fn vault_default_creates_instance() {
+        let vault = Vault::default();
+        assert!(vault.password_file().is_err());
+    }
+}

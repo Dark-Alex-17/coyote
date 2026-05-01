@@ -37,6 +37,20 @@
 - [ ] Agent functions included when agent active
 - [ ] MCP meta functions included when servers active
 
+## Status
+- Function declarations, append methods, find/contains tested in iteration 6
+- MCP meta functions tested in iterations 5-7
+- Function selection tested in iteration 7
+- User interaction functions tested in iterations 6-7
+- Python parser: extensive existing tests (400+ lines)
+- TypeScript parser: extensive existing tests (400+ lines)
+- parsers::common::underscore tested in iteration 13
+- Functions::init and tool compilation require filesystem
+
+## Additional behaviors tested
+
+- [x] parsers::common::underscore: simple, dashes, spaces, special chars, consecutive, leading/trailing, uppercase, mixed
+
 ## Old code reference
 - `src/function/mod.rs` — Functions struct, init, init_agent
 - `src/config/paths.rs` — agent_functions_file (priority)
