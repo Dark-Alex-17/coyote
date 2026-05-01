@@ -1,36 +1,3 @@
-//! Per-process factory for MCP subprocess handles.
-//!
-//! `McpFactory` lives on [`AppState`](super::AppState) and is the
-//! single entrypoint that scopes use to obtain `Arc<ConnectedServer>`
-//! handles for MCP tool servers. Multiple scopes requesting the same
-//! server can (eventually) share a single subprocess via `Arc`
-//! reference counting.
-//!
-//! # Phase 1 Step 6.5 scope
-//!
-//! This file introduces the factory scaffolding with a trivial
-//! implementation:
-//!
-//! * `active` — `Mutex<HashMap<McpServerKey, Weak<ConnectedServer>>>`
-//!   for future Arc-based sharing across scopes
-//! * `acquire` — unimplemented stub for now; will be filled in when
-//!   Step 8 rewrites `use_role` / `use_session` / `use_agent` to
-//!   actually build `ToolScope`s
-//!
-//! The full design (idle pool, reaper task, per-server TTL, health
-//! checks, graceful shutdown) lands in **Phase 5** per
-//! `docs/PHASE-5-IMPLEMENTATION-PLAN.md`. Phase 1 Step 6.5 ships just
-//! enough for the type to exist on `AppState` and participate in
-//! construction / test round-trips.
-//!
-//! The key type `McpServerKey` hashes the server name plus its full
-//! transport config (command/args/env for stdio; url/headers for
-//! http/sse) so that two scopes requesting an identically-configured
-//! server share an `Arc`, while two scopes requesting differently-
-//! configured servers (e.g., different API tokens) get independent
-//! connections. This is the sharing-vs-isolation property described
-//! in `docs/REST-API-ARCHITECTURE.md` section 5.
-
 use crate::mcp::{ConnectedServer, JsonField, McpServer, McpTransportType, spawn_mcp_server};
 
 use anyhow::Result;

@@ -1,13 +1,13 @@
 use super::*;
 
 use crate::client::{
-    init_client, patch_messages, ChatCompletionsData, Client, ImageUrl, Message,
-    MessageContent, MessageContentPart, MessageContentToolCalls, MessageRole, Model,
+    ChatCompletionsData, Client, ImageUrl, Message, MessageContent, MessageContentPart,
+    MessageContentToolCalls, MessageRole, Model, init_client, patch_messages,
 };
 use crate::function::ToolResult;
-use crate::utils::{base64_encode, is_loader_protocol, sha256, AbortSignal};
+use crate::utils::{AbortSignal, base64_encode, is_loader_protocol, sha256};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use indexmap::IndexSet;
 use std::{collections::HashMap, fs::File, io::Read, sync::Arc};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -584,7 +584,9 @@ mod tests {
     use super::*;
     use crate::config::request_context::RequestContext;
     use crate::config::{AppState, WorkingMode};
+    use std::fs;
     use std::sync::Arc;
+    use std::time::SystemTime;
 
     fn default_app_state() -> Arc<AppState> {
         Arc::new(AppState::test_default())
@@ -864,5 +866,102 @@ mod tests {
         let data_urls = HashMap::new();
         let result = resolve_data_url(&data_urls, "https://example.com/image.png".to_string());
         assert_eq!(result, "https://example.com/image.png");
+    }
+
+    fn run_async<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn from_files_loads_single_text_file() {
+        let dir = env::temp_dir().join(format!(
+            "loki-input-test-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test.txt");
+        fs::write(&file_path, "file content here").unwrap();
+
+        let ctx = create_test_ctx();
+        let input = run_async(Input::from_files(
+            &ctx,
+            "question",
+            vec![file_path.to_string_lossy().to_string()],
+            None,
+        ))
+        .unwrap();
+
+        assert!(input.text().contains("file content here"));
+        assert!(input.text().contains("question"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_files_loads_multiple_files() {
+        let dir = env::temp_dir().join(format!(
+            "loki-input-test-multi-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "content A").unwrap();
+        fs::write(dir.join("b.txt"), "content B").unwrap();
+
+        let ctx = create_test_ctx();
+        let input = run_async(Input::from_files(
+            &ctx,
+            "question",
+            vec![
+                dir.join("a.txt").to_string_lossy().to_string(),
+                dir.join("b.txt").to_string_lossy().to_string(),
+            ],
+            None,
+        ))
+        .unwrap();
+
+        assert!(input.text().contains("content A"));
+        assert!(input.text().contains("content B"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_files_with_no_paths_just_text() {
+        let ctx = create_test_ctx();
+        let input = run_async(Input::from_files(&ctx, "just text", vec![], None)).unwrap();
+        assert_eq!(input.text(), "just text");
+    }
+
+    #[test]
+    fn from_files_with_external_command() {
+        let ctx = create_test_ctx();
+        let input = run_async(Input::from_files(
+            &ctx,
+            "question",
+            vec!["`echo hello from cmd`".to_string()],
+            None,
+        ))
+        .unwrap();
+        assert!(input.text().contains("hello from cmd"));
+    }
+
+    #[test]
+    fn from_files_nonexistent_file_errors() {
+        let ctx = create_test_ctx();
+        let result = run_async(Input::from_files(
+            &ctx,
+            "question",
+            vec!["/nonexistent/path/xyz.txt".to_string()],
+            None,
+        ));
+        assert!(result.is_err());
     }
 }

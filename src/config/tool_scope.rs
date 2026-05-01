@@ -1,23 +1,3 @@
-//! Per-scope tool runtime: resolved functions + live MCP handles +
-//! call tracker.
-//!
-//! `ToolScope` is the unit of tool availability for a single request.
-//! Every active `RoleLike` (role, session, agent) conceptually owns one.
-//! The contents are:
-//!
-//! * `functions` — the `Functions` declarations visible to the LLM for
-//!   this scope (global tools + role/session/agent filters applied)
-//! * `mcp_runtime` — live MCP subprocess handles for the servers this
-//!   scope has enabled, keyed by server name
-//! * `tool_tracker` — per-scope tool call history for auto-continuation
-//!   and looping detection
-//!
-//! `ToolScope` lives on [`RequestContext`](super::request_context::RequestContext)
-//! and is built/replaced as the active scope changes (role swap,
-//! session swap, agent enter/exit). The base `functions` are seeded
-//! from [`AppState`](super::app_state::AppState) and per-scope filters
-//! narrow the visible set.
-
 use crate::function::{Functions, ToolCallTracker};
 use crate::mcp::{CatalogItem, ConnectedServer, McpRegistry};
 

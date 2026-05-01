@@ -1,20 +1,3 @@
-//! Immutable, process-wide application configuration.
-//!
-//! `AppConfig` contains the settings loaded from `config.yaml` that are
-//! global to the Loki process: LLM provider configs, UI preferences,
-//! tool and MCP settings, RAG defaults, etc.
-//!
-//! `AppConfig` mirrors the field shape of [`Config`](super::Config) (the
-//! serde POJO loaded from YAML) but is the runtime-resolved form: env
-//! var overrides applied, wrap validated, default document loaders
-//! installed, user agent resolved, default model picked. Build it via
-//! [`AppConfig::from_config`].
-//!
-//! Runtime-only state (current role, session, agent, supervisor, etc.)
-//! lives on [`RequestContext`](super::request_context::RequestContext).
-//! Process-wide services (vault, MCP registry, function registry) live
-//! on [`AppState`](super::app_state::AppState).
-
 use crate::client::{ClientConfig, list_models};
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, get_env_name};

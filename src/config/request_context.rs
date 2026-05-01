@@ -1,25 +1,3 @@
-//! Per-request mutable state for a single Loki interaction.
-//!
-//! `RequestContext` owns the runtime state that was previously stored
-//! on `Config` as `#[serde(skip)]` fields: the active role, session,
-//! agent, RAG, supervisor state, inbox/escalation queues, the
-//! conversation's "last message" cursor, and the per-scope
-//! [`ToolScope`](super::tool_scope::ToolScope) carrying functions and
-//! live MCP handles.
-//!
-//! Each frontend constructs and owns a `RequestContext`:
-//!
-//! * **CLI** — one `RequestContext` per invocation, dropped at exit.
-//! * **REPL** — one long-lived `RequestContext` mutated across turns.
-//! * **API** — one `RequestContext` per HTTP request, hydrated from a
-//!   persisted session and written back at the end.
-//!
-//! `RequestContext` is built via [`RequestContext::bootstrap`] (CLI/REPL
-//! entry point) or [`RequestContext::new`] (test/child-agent helper).
-//! It holds an `Arc<AppState>` for shared, immutable services
-//! (config, vault, MCP factory, RAG cache, MCP registry, base
-//! functions).
-
 use super::MessageContentToolCalls;
 use super::rag_cache::{RagCache, RagKey};
 use super::session::Session;
@@ -2373,10 +2351,10 @@ mod tests {
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
+    use serial_test::serial;
     use std::env;
     use std::fs::{create_dir_all, remove_dir_all, write};
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestConfigDirGuard {
@@ -2535,6 +2513,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn exit_agent_clears_all_agent_state() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
@@ -2604,8 +2583,10 @@ mod tests {
     }
 
     fn app_state_with_mcp_config(mcp_server_support: bool, server_names: &[&str]) -> Arc<AppState> {
-        let mut app_config = AppConfig::default();
-        app_config.mcp_server_support = mcp_server_support;
+        let app_config = AppConfig {
+            mcp_server_support,
+            ..AppConfig::default()
+        };
 
         let mcp_config = if server_names.is_empty() {
             None
@@ -2651,6 +2632,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn rebuild_tool_scope_mcp_disabled_skips_servers() {
         let app_state = app_state_with_mcp_config(false, &["github", "slack"]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -2663,6 +2645,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn rebuild_tool_scope_no_enabled_servers_yields_empty_runtime() {
         let app_state = app_state_with_mcp_config(true, &["github"]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -2675,6 +2658,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn rebuild_tool_scope_no_mcp_config_yields_empty_runtime() {
         let app_state = app_state_with_mcp_config(true, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -2687,6 +2671,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn rebuild_tool_scope_preserves_tool_tracker() {
         let app_state = app_state_with_mcp_config(false, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -2713,6 +2698,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn rebuild_tool_scope_repl_mode_appends_user_interaction_functions() {
         let app_state = app_state_with_mcp_config(false, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Repl);
@@ -2735,6 +2721,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn rebuild_tool_scope_cmd_mode_no_user_interaction_functions() {
         let app_state = app_state_with_mcp_config(false, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -2766,8 +2753,10 @@ mod tests {
     #[test]
     fn select_functions_returns_none_when_function_calling_disabled() {
         let app_state = {
-            let mut config = AppConfig::default();
-            config.function_calling_support = false;
+            let config = AppConfig {
+                function_calling_support: false,
+                ..AppConfig::default()
+            };
             Arc::new(AppState {
                 config: Arc::new(config),
                 vault: Arc::new(Vault::default()),
@@ -2818,8 +2807,10 @@ mod tests {
     #[test]
     fn select_enabled_mcp_servers_returns_empty_when_mcp_disabled() {
         let app_state = {
-            let mut config = AppConfig::default();
-            config.mcp_server_support = false;
+            let config = AppConfig {
+                mcp_server_support: false,
+                ..AppConfig::default()
+            };
             Arc::new(AppState {
                 config: Arc::new(config),
                 vault: Arc::new(Vault::default()),
@@ -2929,6 +2920,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn use_role_obj_errors_when_agent_active() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
@@ -3064,5 +3056,237 @@ mod tests {
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
         assert!(!ctx.is_compressing_session());
+    }
+
+    #[test]
+    #[serial]
+    fn retrieve_role_from_markdown_file() {
+        let _guard = TestConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        write(
+            roles_dir.join("pirate.md"),
+            "You are a pirate. Speak only in pirate language.",
+        )
+        .unwrap();
+
+        let ctx = create_test_ctx();
+        let role = ctx.retrieve_role(&ctx.app.config, "pirate").unwrap();
+        assert_eq!(role.name(), "pirate");
+        assert!(role.prompt().contains("pirate"));
+    }
+
+    #[test]
+    #[serial]
+    fn retrieve_role_builtin_exists() {
+        let _guard = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let names = paths::list_roles(true);
+        if !names.is_empty() {
+            let role = ctx.retrieve_role(&ctx.app.config, &names[0]);
+            assert!(role.is_ok());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn retrieve_role_nonexistent_errors() {
+        let _guard = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let result = ctx.retrieve_role(&ctx.app.config, "definitely_not_a_real_role_xyz");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn retrieve_role_no_model_id_inherits_current_model() {
+        let _guard = TestConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        write(roles_dir.join("simple.md"), "You are helpful.").unwrap();
+
+        let ctx = create_test_ctx();
+        let role = ctx.retrieve_role(&ctx.app.config, "simple").unwrap();
+        assert_eq!(role.model().id(), ctx.current_model().id());
+    }
+
+    #[test]
+    #[serial]
+    fn list_roles_finds_markdown_files() {
+        let _guard = TestConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        write(roles_dir.join("alpha.md"), "Alpha role").unwrap();
+        write(roles_dir.join("beta.md"), "Beta role").unwrap();
+        write(roles_dir.join("not_a_role.txt"), "ignored").unwrap();
+
+        let names = paths::list_roles(false);
+        assert!(names.contains(&"alpha".to_string()));
+        assert!(names.contains(&"beta".to_string()));
+        assert!(!names.contains(&"not_a_role".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn list_roles_empty_dir() {
+        let _guard = TestConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        let names = paths::list_roles(false);
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn session_new_from_ctx_captures_state() {
+        let _guard = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let session = Session::new_from_ctx(&ctx, &ctx.app.config, "test-session");
+        assert_eq!(session.name(), "test-session");
+        assert!(session.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn session_save_creates_file() {
+        let _guard = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let mut session = Session::new_from_ctx(&ctx, &ctx.app.config, "save-test");
+        let session_path = ctx.session_file("save-test");
+        ensure_parent_exists(&session_path).unwrap();
+
+        session.save("save-test", &session_path, false).unwrap();
+        assert!(session_path.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_errors_when_already_in_session() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        let result = run_async(ctx.use_session(&app, Some("new"), abort));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Already in a session")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_creates_temp_session() {
+        let _guard = TestConfigDirGuard::new();
+        let sessions_dir = paths::local_path("sessions");
+        create_dir_all(&sessions_dir).unwrap();
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_session(&app, None, abort)).unwrap();
+
+        assert!(ctx.session.is_some());
+        assert_eq!(ctx.session.as_ref().unwrap().name(), TEMP_SESSION_NAME);
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_creates_named_session() {
+        let _guard = TestConfigDirGuard::new();
+        let sessions_dir = paths::local_path("sessions");
+        create_dir_all(&sessions_dir).unwrap();
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_session(&app, Some("my-session"), abort)).unwrap();
+
+        assert!(ctx.session.is_some());
+        assert_eq!(ctx.session.as_ref().unwrap().name(), "my-session");
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_roundtrip() {
+        let _guard = TestConfigDirGuard::new();
+        let sessions_dir = paths::local_path("sessions");
+        create_dir_all(&sessions_dir).unwrap();
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_session(&app, Some("roundtrip"), abort.clone())).unwrap();
+        assert!(ctx.session.is_some());
+
+        ctx.exit_session().unwrap();
+        assert!(ctx.session.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn use_role_obj_and_exit_role_full_cycle() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+
+        ctx.use_role_obj(Role::new("test-role", "test prompt"))
+            .unwrap();
+        assert!(ctx.role.is_some());
+        assert_eq!(ctx.role.as_ref().unwrap().name(), "test-role");
+
+        let _ = ctx.exit_role();
+        assert!(ctx.role.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn use_role_obj_twice_replaces_role() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+
+        ctx.use_role_obj(Role::new("first", "prompt 1")).unwrap();
+        assert_eq!(ctx.role.as_ref().unwrap().name(), "first");
+
+        ctx.use_role_obj(Role::new("second", "prompt 2")).unwrap();
+        assert_eq!(ctx.role.as_ref().unwrap().name(), "second");
+    }
+
+    #[test]
+    #[serial]
+    fn list_macros_finds_yaml_files() {
+        let _guard = TestConfigDirGuard::new();
+        let macros_dir = paths::macros_dir();
+        create_dir_all(&macros_dir).unwrap();
+        write(macros_dir.join("greet.yaml"), "steps:\n  - \".help\"").unwrap();
+        write(macros_dir.join("build.yaml"), "steps:\n  - \".help\"").unwrap();
+
+        let names = paths::list_macros();
+        assert!(names.contains(&"greet".to_string()));
+        assert!(names.contains(&"build".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn list_rags_finds_yaml_files() {
+        let _guard = TestConfigDirGuard::new();
+        let rags_dir = paths::rags_dir();
+        create_dir_all(&rags_dir).unwrap();
+        write(rags_dir.join("docs.yaml"), "embedding_model: test").unwrap();
+
+        let names = paths::list_rags();
+        assert!(names.contains(&"docs".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn list_rags_empty_dir() {
+        let _guard = TestConfigDirGuard::new();
+        let rags_dir = paths::rags_dir();
+        create_dir_all(&rags_dir).unwrap();
+        assert!(paths::list_rags().is_empty());
     }
 }

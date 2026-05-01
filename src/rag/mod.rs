@@ -1280,7 +1280,11 @@ mod tests {
         ];
         for ext in known {
             let seps = get_separators(ext);
-            assert_ne!(seps, DEFAULT_SEPARATORS.to_vec(), "Extension '{ext}' should have language-specific separators");
+            assert_ne!(
+                seps,
+                DEFAULT_SEPARATORS.to_vec(),
+                "Extension '{ext}' should have language-specific separators"
+            );
         }
     }
 

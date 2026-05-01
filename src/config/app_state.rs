@@ -1,19 +1,3 @@
-//! Shared global services for a running Loki process.
-//!
-//! `AppState` holds the services that are genuinely process-wide and
-//! immutable during request handling: the frozen [`AppConfig`], the
-//! credential [`Vault`](GlobalVault), the [`McpFactory`](super::mcp_factory::McpFactory)
-//! for MCP subprocess sharing, the [`RagCache`](super::rag_cache::RagCache)
-//! for shared RAG instances, the global MCP registry, and the base
-//! [`Functions`] declarations seeded into per-request `ToolScope`s. It
-//! is wrapped in `Arc` and shared across every [`RequestContext`] that
-//! a frontend (CLI, REPL, API) creates.
-//!
-//! Built via [`AppState::init`] from an `Arc<AppConfig>` plus
-//! startup context (log path, MCP-start flag, abort signal). The
-//! `init` call is the single place that wires the vault, MCP
-//! registry, and global functions together.
-
 use super::mcp_factory::{McpFactory, McpServerKey};
 use super::rag_cache::RagCache;
 use crate::config::AppConfig;

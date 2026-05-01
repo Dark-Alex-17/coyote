@@ -137,6 +137,7 @@ arboard = { version = "3.3.0", default-features = false }
 
 [dev-dependencies]
 pretty_assertions = "1.4.0"
+serial_test = "3"
 
 [[bin]]
 name = "loki"
