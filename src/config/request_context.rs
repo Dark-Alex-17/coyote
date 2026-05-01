@@ -2879,4 +2879,199 @@ mod tests {
         assert!(names.contains(&"mcp_invoke_github"));
         assert!(!names.contains(&"mcp_invoke_slack"));
     }
+
+    #[test]
+    fn state_empty_context() {
+        let ctx = create_test_ctx();
+        assert_eq!(ctx.state(), StateFlags::empty());
+    }
+
+    #[test]
+    fn state_with_role_only() {
+        let mut ctx = create_test_ctx();
+        ctx.role = Some(Role::new("r", "p"));
+        assert!(ctx.state().contains(StateFlags::ROLE));
+        assert!(!ctx.state().contains(StateFlags::SESSION));
+    }
+
+    #[test]
+    fn state_with_empty_session() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        assert!(ctx.state().contains(StateFlags::SESSION_EMPTY));
+        assert!(!ctx.state().contains(StateFlags::SESSION));
+    }
+
+    #[test]
+    fn state_flags_combine_role_and_session() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        ctx.role = Some(Role::new("r", "p"));
+        let state = ctx.state();
+        assert!(state.contains(StateFlags::SESSION_EMPTY));
+    }
+
+    #[test]
+    fn role_info_errors_when_no_role() {
+        let ctx = create_test_ctx();
+        assert!(ctx.role_info().is_err());
+    }
+
+    #[test]
+    fn role_info_succeeds_with_role() {
+        let mut ctx = create_test_ctx();
+        ctx.role = Some(Role::new("test", "be helpful"));
+        let info = ctx.role_info().unwrap();
+        assert!(info.contains("be helpful"));
+    }
+
+    #[test]
+    fn agent_info_errors_when_no_agent() {
+        let ctx = create_test_ctx();
+        assert!(ctx.agent_info().is_err());
+    }
+
+    #[test]
+    fn rag_info_errors_when_no_rag() {
+        let ctx = create_test_ctx();
+        assert!(ctx.rag_info().is_err());
+    }
+
+    #[test]
+    fn use_role_obj_errors_when_agent_active() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                ctx.use_agent(&app, &agent_name, None, crate::utils::create_abort_signal())
+                    .await
+                    .unwrap();
+            });
+
+        let result = ctx.use_role_obj(Role::new("r", "p"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("using a agent"));
+    }
+
+    #[test]
+    fn exit_rag_clears_rag() {
+        let mut ctx = create_test_ctx();
+        assert!(ctx.rag.is_none());
+        ctx.exit_rag().unwrap();
+        assert!(ctx.rag.is_none());
+    }
+
+    #[test]
+    fn discontinuous_last_message_sets_continuous_false() {
+        let mut ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "test", None);
+        ctx.last_message = Some(LastMessage::new(input, "reply".to_string()));
+        assert!(ctx.last_message.as_ref().unwrap().continuous);
+        ctx.discontinuous_last_message();
+        assert!(!ctx.last_message.as_ref().unwrap().continuous);
+    }
+
+    #[test]
+    fn discontinuous_last_message_noop_when_none() {
+        let mut ctx = create_test_ctx();
+        assert!(ctx.last_message.is_none());
+        ctx.discontinuous_last_message();
+        assert!(ctx.last_message.is_none());
+    }
+
+    #[test]
+    fn before_chat_completion_sets_last_message() {
+        let mut ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "hello", None);
+        ctx.before_chat_completion(&input).unwrap();
+        assert!(ctx.last_message.is_some());
+        let lm = ctx.last_message.as_ref().unwrap();
+        assert_eq!(lm.output, "");
+        assert!(lm.continuous);
+    }
+
+    #[test]
+    fn role_like_mut_returns_none_when_empty() {
+        let mut ctx = create_test_ctx();
+        assert!(ctx.role_like_mut().is_none());
+    }
+
+    #[test]
+    fn role_like_mut_returns_role_when_only_role() {
+        let mut ctx = create_test_ctx();
+        ctx.role = Some(Role::new("r", "p"));
+        assert!(ctx.role_like_mut().is_some());
+    }
+
+    #[test]
+    fn role_like_mut_prefers_session_over_role() {
+        let mut ctx = create_test_ctx();
+        ctx.role = Some(Role::new("r", "p"));
+        ctx.session = Some(Session::default());
+        let rl = ctx.role_like_mut().unwrap();
+        rl.set_temperature(Some(0.5));
+        assert_eq!(ctx.session.as_ref().unwrap().temperature(), Some(0.5));
+    }
+
+    #[test]
+    fn working_mode_cmd() {
+        let ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        assert!(ctx.working_mode.is_cmd());
+        assert!(!ctx.working_mode.is_repl());
+    }
+
+    #[test]
+    fn working_mode_repl() {
+        let ctx = RequestContext::new(default_app_state(), WorkingMode::Repl);
+        assert!(ctx.working_mode.is_repl());
+        assert!(!ctx.working_mode.is_cmd());
+    }
+
+    #[test]
+    fn session_file_returns_yaml_path() {
+        let ctx = create_test_ctx();
+        let path = ctx.session_file("my-session");
+        assert!(path.to_string_lossy().ends_with("my-session.yaml"));
+    }
+
+    #[test]
+    fn session_file_with_subdir() {
+        let ctx = create_test_ctx();
+        let path = ctx.session_file("subdir/my-session");
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("subdir"));
+        assert!(path_str.ends_with("my-session.yaml"));
+    }
+
+    #[test]
+    fn is_compressing_session_false_when_no_session() {
+        let ctx = create_test_ctx();
+        assert!(!ctx.is_compressing_session());
+    }
+
+    #[test]
+    fn is_compressing_session_false_with_default_session() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        assert!(!ctx.is_compressing_session());
+    }
 }
