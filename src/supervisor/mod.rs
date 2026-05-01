@@ -126,3 +126,130 @@ impl Debug for Supervisor {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::create_abort_signal;
+
+    fn make_handle(id: &str, agent_name: &str, depth: usize) -> AgentHandle {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let join_handle = rt.spawn(async {
+            Ok(AgentResult {
+                id: "done".into(),
+                agent_name: "test".into(),
+                output: "result".into(),
+                exit_status: AgentExitStatus::Completed,
+            })
+        });
+        std::mem::forget(rt);
+        AgentHandle {
+            id: id.to_string(),
+            agent_name: agent_name.to_string(),
+            depth,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: create_abort_signal(),
+            join_handle,
+        }
+    }
+
+    #[test]
+    fn supervisor_new_empty() {
+        let sup = Supervisor::new(4, 3);
+        assert_eq!(sup.active_count(), 0);
+        assert_eq!(sup.max_concurrent(), 4);
+        assert_eq!(sup.max_depth(), 3);
+    }
+
+    #[test]
+    fn supervisor_register_increments_count() {
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(make_handle("a1", "explore", 1)).unwrap();
+        assert_eq!(sup.active_count(), 1);
+    }
+
+    #[test]
+    fn supervisor_register_rejects_at_capacity() {
+        let mut sup = Supervisor::new(1, 3);
+        sup.register(make_handle("a1", "explore", 1)).unwrap();
+        let result = sup.register(make_handle("a2", "coder", 1));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("at capacity"));
+    }
+
+    #[test]
+    fn supervisor_register_rejects_exceeding_depth() {
+        let mut sup = Supervisor::new(4, 2);
+        let result = sup.register(make_handle("a1", "explore", 3));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max depth"));
+    }
+
+    #[test]
+    fn supervisor_register_allows_at_max_depth() {
+        let mut sup = Supervisor::new(4, 2);
+        sup.register(make_handle("a1", "explore", 2)).unwrap();
+        assert_eq!(sup.active_count(), 1);
+    }
+
+    #[test]
+    fn supervisor_take_removes_handle() {
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(make_handle("a1", "explore", 1)).unwrap();
+        let taken = sup.take("a1");
+        assert!(taken.is_some());
+        assert_eq!(sup.active_count(), 0);
+    }
+
+    #[test]
+    fn supervisor_take_nonexistent_returns_none() {
+        let mut sup = Supervisor::new(4, 3);
+        assert!(sup.take("missing").is_none());
+    }
+
+    #[test]
+    fn supervisor_list_agents() {
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(make_handle("a1", "explore", 1)).unwrap();
+        sup.register(make_handle("a2", "coder", 1)).unwrap();
+        let list = sup.list_agents();
+        assert_eq!(list.len(), 2);
+        let ids: Vec<&str> = list.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&"a1"));
+        assert!(ids.contains(&"a2"));
+    }
+
+    #[test]
+    fn supervisor_inbox_returns_handle_inbox() {
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(make_handle("a1", "explore", 1)).unwrap();
+        assert!(sup.inbox("a1").is_some());
+        assert!(sup.inbox("missing").is_none());
+    }
+
+    #[test]
+    fn supervisor_task_queue_accessible() {
+        let mut sup = Supervisor::new(4, 3);
+        let id = sup
+            .task_queue_mut()
+            .create("task".into(), "desc".into(), None, None);
+        assert!(!id.is_empty());
+        assert_eq!(sup.task_queue().list().len(), 1);
+    }
+
+    #[test]
+    fn agent_exit_status_equality() {
+        assert_eq!(AgentExitStatus::Completed, AgentExitStatus::Completed);
+        assert_ne!(
+            AgentExitStatus::Completed,
+            AgentExitStatus::Failed("err".into())
+        );
+        assert_eq!(
+            AgentExitStatus::Failed("x".into()),
+            AgentExitStatus::Failed("x".into())
+        );
+    }
+}
