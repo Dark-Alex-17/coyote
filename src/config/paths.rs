@@ -1,22 +1,3 @@
-//! Static path and filesystem-lookup helpers that used to live as
-//! associated functions on [`Config`](super::Config).
-//!
-//! None of these functions depend on any `Config` instance data — they
-//! compute paths from environment variables, XDG directories, or the
-//! crate constant for the config root. Moving them here is Phase 1
-//! Step 2 of the REST API refactor: the `Config` struct is shedding
-//! anything that doesn't actually need per-instance state so the
-//! eventual split into `AppConfig` + `RequestContext` has a clean
-//! division line.
-//!
-//! # Compatibility shim during migration
-//!
-//! The existing associated functions on `Config` (e.g.,
-//! `Config::config_dir()`) are kept as `#[deprecated]` forwarders that
-//! call into this module. Callers are migrated module-by-module; when
-//! the last caller is updated, the forwarders are deleted in a later
-//! sub-step of Step 2.
-
 use super::role::Role;
 use super::{
     AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME, ENV_FILE_NAME,
