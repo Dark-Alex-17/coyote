@@ -1383,3 +1383,337 @@ impl ToolCallTracker {
         self.last_calls.push_back(call);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(name: &str, id: Option<&str>) -> ToolCall {
+        ToolCall::new(name.to_string(), json!({}), id.map(|s| s.to_string()))
+    }
+
+    fn call_with_args(name: &str, args: Value) -> ToolCall {
+        ToolCall::new(name.to_string(), args, Some("id1".to_string()))
+    }
+
+    #[test]
+    fn toolcall_new_sets_fields() {
+        let tc = ToolCall::new("my_tool".into(), json!({"x": 1}), Some("call-1".into()));
+        assert_eq!(tc.name, "my_tool");
+        assert_eq!(tc.arguments, json!({"x": 1}));
+        assert_eq!(tc.id, Some("call-1".to_string()));
+        assert!(tc.thought_signature.is_none());
+    }
+
+    #[test]
+    fn toolcall_default_has_empty_fields() {
+        let tc = ToolCall::default();
+        assert_eq!(tc.name, "");
+        assert_eq!(tc.arguments, Value::Null);
+        assert!(tc.id.is_none());
+        assert!(tc.thought_signature.is_none());
+    }
+
+    #[test]
+    fn toolcall_with_thought_signature() {
+        let tc = ToolCall::new("t".into(), json!({}), None)
+            .with_thought_signature(Some("sig123".into()));
+        assert_eq!(tc.thought_signature, Some("sig123".to_string()));
+    }
+
+    #[test]
+    fn toolcall_with_thought_signature_none() {
+        let tc = ToolCall::new("t".into(), json!({}), None).with_thought_signature(None);
+        assert!(tc.thought_signature.is_none());
+    }
+
+    #[test]
+    fn dedup_keeps_unique_ids() {
+        let calls = vec![call("tool_a", Some("id-1")), call("tool_b", Some("id-2"))];
+        let result = ToolCall::dedup(calls);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn dedup_keeps_calls_without_ids() {
+        let calls = vec![call("tool_a", None), call("tool_b", None)];
+        let result = ToolCall::dedup(calls);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn dedup_removes_duplicate_ids_keeps_last() {
+        let calls = vec![call("tool_a", Some("id-1")), call("tool_b", Some("id-1"))];
+        let result = ToolCall::dedup(calls);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "tool_b");
+    }
+
+    #[test]
+    fn dedup_empty_input_returns_empty() {
+        let result = ToolCall::dedup(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn dedup_mixed_with_and_without_ids() {
+        let calls = vec![
+            call("a", Some("id-1")),
+            call("b", None),
+            call("c", Some("id-1")),
+            call("d", None),
+        ];
+        let result = ToolCall::dedup(calls);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].name, "b");
+        assert_eq!(result[1].name, "c");
+        assert_eq!(result[2].name, "d");
+    }
+
+    #[test]
+    fn tracker_default_values() {
+        let tracker = ToolCallTracker::default();
+        assert_eq!(tracker.max_repeats, 2);
+        assert_eq!(tracker.chain_len, 3);
+        assert!(tracker.last_calls.is_empty());
+    }
+
+    #[test]
+    fn tracker_no_loop_on_fresh_tracker() {
+        let tracker = ToolCallTracker::default();
+        assert!(tracker.check_loop(&call("tool", None)).is_none());
+    }
+
+    #[test]
+    fn tracker_no_loop_below_threshold() {
+        let mut tracker = ToolCallTracker::new(3, 5);
+        let c = call_with_args("tool", json!({"a": 1}));
+        tracker.record_call(c.clone());
+        tracker.record_call(c.clone());
+        assert!(tracker.check_loop(&c).is_none());
+    }
+
+    #[test]
+    fn tracker_detects_loop_at_max_repeats() {
+        let mut tracker = ToolCallTracker::new(2, 3);
+        let c = call_with_args("tool", json!({"a": 1}));
+        tracker.record_call(c.clone());
+        tracker.record_call(c.clone());
+        let result = tracker.check_loop(&c);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("loop"));
+    }
+
+    #[test]
+    fn tracker_different_args_no_loop() {
+        let mut tracker = ToolCallTracker::new(2, 3);
+        tracker.record_call(call_with_args("tool", json!({"a": 1})));
+        tracker.record_call(call_with_args("tool", json!({"a": 2})));
+        let new_call = call_with_args("tool", json!({"a": 3}));
+        assert!(tracker.check_loop(&new_call).is_none());
+    }
+
+    #[test]
+    fn tracker_different_names_no_loop() {
+        let mut tracker = ToolCallTracker::new(2, 3);
+        tracker.record_call(call_with_args("tool_a", json!({})));
+        tracker.record_call(call_with_args("tool_b", json!({})));
+        let new_call = call_with_args("tool_a", json!({}));
+        assert!(tracker.check_loop(&new_call).is_none());
+    }
+
+    #[test]
+    fn tracker_chain_detection() {
+        let mut tracker = ToolCallTracker::new(2, 3);
+        let c = call_with_args("tool", json!({"x": "same"}));
+        tracker.record_call(c.clone());
+        tracker.record_call(c.clone());
+        tracker.record_call(c.clone());
+        let result = tracker.check_loop(&c);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn tracker_record_call_respects_capacity() {
+        let mut tracker = ToolCallTracker::new(2, 2);
+        for i in 0..10 {
+            tracker.record_call(call_with_args(&format!("tool_{i}"), json!({})));
+        }
+        assert!(tracker.last_calls.len() <= 2 * 2);
+    }
+
+    #[test]
+    fn tracker_loop_message_contains_call_history() {
+        let mut tracker = ToolCallTracker::new(2, 3);
+        let c = call_with_args("repeat_tool", json!({"k": "v"}));
+        tracker.record_call(c.clone());
+        tracker.record_call(c.clone());
+        tracker.record_call(c.clone());
+        let msg = tracker.check_loop(&c).unwrap();
+        assert!(msg.contains("call_history"));
+        assert!(msg.contains("repeat_tool"));
+    }
+
+    #[test]
+    fn prefix_constants_are_correct() {
+        assert_eq!(TODO_FUNCTION_PREFIX, "todo__");
+        assert_eq!(SUPERVISOR_FUNCTION_PREFIX, "agent__");
+        assert_eq!(USER_FUNCTION_PREFIX, "user__");
+        assert_eq!(MCP_INVOKE_META_FUNCTION_NAME_PREFIX, "mcp_invoke");
+        assert_eq!(MCP_SEARCH_META_FUNCTION_NAME_PREFIX, "mcp_search");
+        assert_eq!(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, "mcp_describe");
+    }
+
+    #[test]
+    fn functions_default_is_empty() {
+        let f = Functions::default();
+        assert!(f.is_empty());
+        assert!(f.declarations().is_empty());
+    }
+
+    #[test]
+    fn functions_append_todo_adds_declarations() {
+        let mut f = Functions::default();
+        f.append_todo_functions();
+        assert!(!f.is_empty());
+        assert!(f.contains("todo__init"));
+        assert!(f.contains("todo__add"));
+        assert!(f.contains("todo__done"));
+        assert!(f.contains("todo__list"));
+        assert!(f.contains("todo__clear"));
+    }
+
+    #[test]
+    fn functions_append_supervisor_adds_declarations() {
+        let mut f = Functions::default();
+        f.append_supervisor_functions();
+        assert!(f.contains("agent__spawn"));
+        assert!(f.contains("agent__check"));
+        assert!(f.contains("agent__collect"));
+        assert!(f.contains("agent__list"));
+        assert!(f.contains("agent__cancel"));
+        assert!(f.contains("agent__reply_escalation"));
+    }
+
+    #[test]
+    fn functions_append_teammate_adds_declarations() {
+        let mut f = Functions::default();
+        f.append_teammate_functions();
+        assert!(f.contains("agent__send_message"));
+        assert!(f.contains("agent__check_inbox"));
+    }
+
+    #[test]
+    fn functions_append_user_interaction_adds_declarations() {
+        let mut f = Functions::default();
+        f.append_user_interaction_functions();
+        assert!(f.contains("user__ask"));
+        assert!(f.contains("user__confirm"));
+        assert!(f.contains("user__input"));
+        assert!(f.contains("user__checkbox"));
+    }
+
+    #[test]
+    fn functions_append_mcp_meta_creates_three_per_server() {
+        let mut f = Functions::default();
+        f.append_mcp_meta_functions(vec!["github".to_string()]);
+        assert_eq!(f.declarations().len(), 3);
+        assert!(f.contains("mcp_invoke_github"));
+        assert!(f.contains("mcp_search_github"));
+        assert!(f.contains("mcp_describe_github"));
+    }
+
+    #[test]
+    fn functions_append_mcp_meta_multiple_servers() {
+        let mut f = Functions::default();
+        f.append_mcp_meta_functions(vec!["github".into(), "slack".into()]);
+        assert_eq!(f.declarations().len(), 6);
+        assert!(f.contains("mcp_invoke_github"));
+        assert!(f.contains("mcp_invoke_slack"));
+    }
+
+    #[test]
+    fn functions_append_mcp_meta_empty_servers() {
+        let mut f = Functions::default();
+        f.append_mcp_meta_functions(vec![]);
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn functions_find_returns_declaration() {
+        let mut f = Functions::default();
+        f.append_todo_functions();
+        let decl = f.find("todo__init");
+        assert!(decl.is_some());
+        assert_eq!(decl.unwrap().name, "todo__init");
+    }
+
+    #[test]
+    fn functions_find_returns_none_for_missing() {
+        let f = Functions::default();
+        assert!(f.find("nonexistent").is_none());
+    }
+
+    #[test]
+    fn functions_contains_true_for_existing() {
+        let mut f = Functions::default();
+        f.append_todo_functions();
+        assert!(f.contains("todo__init"));
+    }
+
+    #[test]
+    fn functions_contains_false_for_missing() {
+        let f = Functions::default();
+        assert!(!f.contains("todo__init"));
+    }
+
+    #[test]
+    fn functions_mcp_invoke_declaration_has_tool_and_arguments_params() {
+        let mut f = Functions::default();
+        f.append_mcp_meta_functions(vec!["srv".to_string()]);
+        let decl = f.find("mcp_invoke_srv").unwrap();
+        let props = decl.parameters.properties.as_ref().unwrap();
+        assert!(props.contains_key("tool"));
+        assert!(props.contains_key("arguments"));
+        let required = decl.parameters.required.as_ref().unwrap();
+        assert!(required.contains(&"tool".to_string()));
+    }
+
+    #[test]
+    fn functions_mcp_search_declaration_has_query_and_top_k_params() {
+        let mut f = Functions::default();
+        f.append_mcp_meta_functions(vec!["srv".to_string()]);
+        let decl = f.find("mcp_search_srv").unwrap();
+        let props = decl.parameters.properties.as_ref().unwrap();
+        assert!(props.contains_key("query"));
+        assert!(props.contains_key("top_k"));
+    }
+
+    #[test]
+    fn functions_mcp_describe_declaration_has_tool_param() {
+        let mut f = Functions::default();
+        f.append_mcp_meta_functions(vec!["srv".to_string()]);
+        let decl = f.find("mcp_describe_srv").unwrap();
+        let props = decl.parameters.properties.as_ref().unwrap();
+        assert!(props.contains_key("tool"));
+    }
+
+    #[test]
+    fn functions_supervisor_includes_task_queue_tools() {
+        let mut f = Functions::default();
+        f.append_supervisor_functions();
+        assert!(f.contains("agent__task_create"));
+        assert!(f.contains("agent__task_list"));
+        assert!(f.contains("agent__task_complete"));
+        assert!(f.contains("agent__task_fail"));
+    }
+
+    #[test]
+    fn tool_result_stores_call_and_output() {
+        let tc = call("my_tool", Some("id-1"));
+        let result = ToolResult::new(tc.clone(), json!({"result": "ok"}));
+        assert_eq!(result.call.name, "my_tool");
+        assert_eq!(result.output, json!({"result": "ok"}));
+    }
+}
