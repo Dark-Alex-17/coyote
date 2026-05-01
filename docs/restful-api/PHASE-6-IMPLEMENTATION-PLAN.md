@@ -570,7 +570,7 @@ For local development with TLS via nginx:
 version: "3.9"
 services:
   loki:
-    build: .
+    build: ..
     environment:
       LOKI_CONFIG_DIR: /loki/config
     volumes:
@@ -580,7 +580,7 @@ services:
       - "127.0.0.1:3400:3400"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3400/healthz/live"]
+      test: [ "CMD", "curl", "-f", "http://localhost:3400/healthz/live" ]
       interval: 30s
       timeout: 5s
       retries: 3
