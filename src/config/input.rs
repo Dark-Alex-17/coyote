@@ -578,3 +578,313 @@ fn read_media_to_data_url(image_path: &str) -> Result<String> {
 
     Ok(data_url)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::mcp_factory::McpFactory;
+    use crate::config::rag_cache::RagCache;
+    use crate::config::request_context::RequestContext;
+    use crate::config::{AppConfig, AppState, WorkingMode};
+    use crate::function::Functions;
+    use std::sync::Arc;
+
+    fn default_app_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            config: Arc::new(AppConfig::default()),
+            vault: Arc::new(Vault::default()),
+            mcp_factory: Arc::new(McpFactory::default()),
+            rag_cache: Arc::new(RagCache::default()),
+            mcp_config: None,
+            mcp_log_path: None,
+            mcp_registry: None,
+            functions: Functions::default(),
+        })
+    }
+
+    fn create_test_ctx() -> RequestContext {
+        RequestContext::new(default_app_state(), WorkingMode::Cmd)
+    }
+
+    #[test]
+    fn resolve_role_with_explicit_role() {
+        let ctx = create_test_ctx();
+        let role = Role::new("custom", "be helpful");
+        let (resolved, with_session, with_agent) = resolve_role(&ctx, Some(role));
+        assert_eq!(resolved.name(), "custom");
+        assert!(!with_session);
+        assert!(!with_agent);
+    }
+
+    #[test]
+    fn resolve_role_without_role_no_session_no_agent() {
+        let ctx = create_test_ctx();
+        let (resolved, with_session, with_agent) = resolve_role(&ctx, None);
+        assert_eq!(resolved.name(), "");
+        assert!(!with_session);
+        assert!(!with_agent);
+    }
+
+    #[test]
+    fn resolve_role_without_role_with_session() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let (_resolved, with_session, with_agent) = resolve_role(&ctx, None);
+        assert!(with_session);
+        assert!(!with_agent);
+    }
+
+    #[test]
+    fn resolve_role_explicit_role_overrides_session_flag() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let role = Role::new("explicit", "prompt");
+        let (_resolved, with_session, _with_agent) = resolve_role(&ctx, Some(role));
+        assert!(!with_session);
+    }
+
+    #[test]
+    fn resolve_paths_detects_last_reply_syntax() {
+        let loaders = HashMap::new();
+        let (_, _, _, _, _, with_last_reply) =
+            resolve_paths(&loaders, vec!["%%".to_string()]).unwrap();
+        assert!(with_last_reply);
+    }
+
+    #[test]
+    fn resolve_paths_detects_url() {
+        let loaders = HashMap::new();
+        let (_, local, remote, _, _, _) =
+            resolve_paths(&loaders, vec!["https://example.com".to_string()]).unwrap();
+        assert!(local.is_empty());
+        assert_eq!(remote, vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn resolve_paths_detects_external_command() {
+        let loaders = HashMap::new();
+        let (_, _, _, external, _, _) =
+            resolve_paths(&loaders, vec!["`echo hello`".to_string()]).unwrap();
+        assert_eq!(external, vec!["echo hello"]);
+    }
+
+    #[test]
+    fn resolve_paths_empty_input() {
+        let loaders = HashMap::new();
+        let (raw, local, remote, external, protocol, with_last) =
+            resolve_paths(&loaders, vec![]).unwrap();
+        assert!(raw.is_empty());
+        assert!(local.is_empty());
+        assert!(remote.is_empty());
+        assert!(external.is_empty());
+        assert!(protocol.is_empty());
+        assert!(!with_last);
+    }
+
+    #[test]
+    fn resolve_paths_rejects_url_with_glob_suffix() {
+        let loaders = HashMap::new();
+        let result = resolve_paths(&loaders, vec!["https://example.com**".to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_paths_mixed_inputs() {
+        let loaders = HashMap::new();
+        let paths = vec![
+            "%%".to_string(),
+            "https://example.com".to_string(),
+            "`ls`".to_string(),
+        ];
+        let (_, _, remote, external, _, with_last) = resolve_paths(&loaders, paths).unwrap();
+        assert!(with_last);
+        assert_eq!(remote.len(), 1);
+        assert_eq!(external.len(), 1);
+    }
+
+    #[test]
+    fn input_from_str_captures_text() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "hello world", None);
+        assert_eq!(input.text(), "hello world");
+    }
+
+    #[test]
+    fn input_from_str_with_explicit_role() {
+        let ctx = create_test_ctx();
+        let role = Role::new("pirate", "you are a pirate");
+        let input = Input::from_str(&ctx, "ahoy", Some(role));
+        assert_eq!(input.role().name(), "pirate");
+        assert!(!input.with_agent());
+    }
+
+    #[test]
+    fn input_from_str_captures_stream_from_config() {
+        let app_state = {
+            let mut config = AppConfig::default();
+            config.stream = false;
+            Arc::new(AppState {
+                config: Arc::new(config),
+                vault: Arc::new(crate::vault::Vault::default()),
+                mcp_factory: Arc::new(McpFactory::default()),
+                rag_cache: Arc::new(RagCache::default()),
+                mcp_config: None,
+                mcp_log_path: None,
+                mcp_registry: None,
+                functions: Functions::default(),
+            })
+        };
+        let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let input = Input::from_str(&ctx, "test", None);
+        assert!(!input.stream_enabled);
+    }
+
+    #[test]
+    fn input_is_empty_with_no_text_and_no_medias() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "", None);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn input_is_not_empty_with_text() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "hello", None);
+        assert!(!input.is_empty());
+    }
+
+    #[test]
+    fn input_set_text_changes_text() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "original", None);
+        input.set_text("modified".to_string());
+        assert_eq!(input.text(), "modified");
+    }
+
+    #[test]
+    fn input_text_returns_patched_when_set() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "original", None);
+        input.patched_text = Some("patched".to_string());
+        assert_eq!(input.text(), "patched");
+    }
+
+    #[test]
+    fn input_clear_patch_restores_original() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "original", None);
+        input.patched_text = Some("patched".to_string());
+        input.clear_patch();
+        assert_eq!(input.text(), "original");
+    }
+
+    #[test]
+    fn input_set_continue_output_accumulates() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "test", None);
+        assert!(input.continue_output().is_none());
+        input.set_continue_output("first ");
+        assert_eq!(input.continue_output(), Some("first "));
+        input.set_continue_output("second");
+        assert_eq!(input.continue_output(), Some("first second"));
+    }
+
+    #[test]
+    fn input_set_regenerate_sets_flag_and_clears_tool_calls() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "test", None);
+        let role = input.role().clone();
+        assert!(!input.regenerate());
+        input.set_regenerate(role);
+        assert!(input.regenerate());
+        assert!(input.tool_calls().is_none());
+    }
+
+    #[test]
+    fn input_summary_truncates_long_text() {
+        let ctx = create_test_ctx();
+        let long_text = "a".repeat(200);
+        let input = Input::from_str(&ctx, &long_text, None);
+        let summary = input.summary();
+        assert!(summary.len() < 200);
+        assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn input_summary_preserves_short_text() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "short", None);
+        assert_eq!(input.summary(), "short");
+    }
+
+    #[test]
+    fn input_raw_with_no_files() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "hello", None);
+        assert_eq!(input.raw(), "hello");
+    }
+
+    #[test]
+    fn input_render_with_no_medias() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "hello", None);
+        assert_eq!(input.render(), "hello");
+    }
+
+    #[test]
+    fn input_with_agent_false_when_no_agent() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "test", None);
+        assert!(!input.with_agent());
+    }
+
+    #[test]
+    fn input_session_returns_none_when_with_session_false() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "test", Some(Role::new("r", "p")));
+        let session = Some(Session::default());
+        assert!(input.session(&session).is_none());
+    }
+
+    #[test]
+    fn input_session_returns_some_when_with_session_true() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let input = Input::from_str(&ctx, "test", None);
+        let session = Some(Session::default());
+        assert!(input.session(&session).is_some());
+    }
+
+    #[test]
+    fn is_image_recognizes_image_extensions() {
+        assert!(is_image("photo.png"));
+        assert!(is_image("photo.jpeg"));
+        assert!(is_image("photo.jpg"));
+        assert!(is_image("photo.webp"));
+        assert!(is_image("photo.gif"));
+    }
+
+    #[test]
+    fn is_image_rejects_non_image_extensions() {
+        assert!(!is_image("file.txt"));
+        assert!(!is_image("file.rs"));
+        assert!(!is_image("file.pdf"));
+    }
+
+    #[test]
+    fn resolve_data_url_returns_path_for_known_hash() {
+        let mut data_urls = HashMap::new();
+        let data_url = "data:image/png;base64,abc123";
+        let hash = sha256(data_url);
+        data_urls.insert(hash, "/path/to/image.png".to_string());
+        let result = resolve_data_url(&data_urls, data_url.to_string());
+        assert_eq!(result, "/path/to/image.png");
+    }
+
+    #[test]
+    fn resolve_data_url_returns_original_for_non_data_url() {
+        let data_urls = HashMap::new();
+        let result = resolve_data_url(&data_urls, "https://example.com/image.png".to_string());
+        assert_eq!(result, "https://example.com/image.png");
+    }
+}

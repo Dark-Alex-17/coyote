@@ -2365,19 +2365,19 @@ impl RequestContext {
 
 #[cfg(test)]
 mod tests {
+    use super::super::mcp_factory::McpFactory;
     use super::*;
     use crate::config::AppState;
+    use crate::function::ToolCall;
+    use crate::mcp::{McpServer, McpServersConfig, McpTransportType};
+    use crate::utils;
     use crate::utils::get_env_name;
+    use crate::vault::Vault;
     use std::env;
     use std::fs::{create_dir_all, remove_dir_all, write};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use crate::function::ToolCall;
-    use crate::mcp::{McpServer, McpServersConfig, McpTransportType};
-    use crate::utils;
-    use crate::vault::Vault;
-    use super::super::mcp_factory::McpFactory;
 
     struct TestConfigDirGuard {
         key: String,
@@ -2763,5 +2763,120 @@ mod tests {
             !names.iter().any(|n| n.starts_with("user__")),
             "CMD mode should NOT include user interaction functions, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn select_functions_returns_none_when_no_tools_enabled() {
+        let ctx = create_test_ctx();
+        let role = Role::default();
+        assert!(ctx.select_functions(&role).is_none());
+    }
+
+    #[test]
+    fn select_functions_returns_none_when_function_calling_disabled() {
+        let app_state = {
+            let mut config = AppConfig::default();
+            config.function_calling_support = false;
+            Arc::new(AppState {
+                config: Arc::new(config),
+                vault: Arc::new(Vault::default()),
+                mcp_factory: Arc::new(McpFactory::default()),
+                rag_cache: Arc::new(RagCache::default()),
+                mcp_config: None,
+                mcp_log_path: None,
+                mcp_registry: None,
+                functions: Functions::default(),
+            })
+        };
+        let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some("all".to_string()));
+        assert!(ctx.select_functions(&role).is_none());
+    }
+
+    #[test]
+    fn select_functions_all_enabled_tools_returns_all_non_mcp() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_todo_functions();
+        ctx.tool_scope.functions.append_user_interaction_functions();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some("all".to_string()));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"todo__init"));
+        assert!(names.contains(&"user__ask"));
+    }
+
+    #[test]
+    fn select_functions_comma_separated_filters() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_todo_functions();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some("todo__init, todo__add".to_string()));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"todo__init"));
+        assert!(names.contains(&"todo__add"));
+        assert!(!names.contains(&"todo__done"));
+    }
+
+    #[test]
+    fn select_enabled_mcp_servers_returns_empty_when_mcp_disabled() {
+        let app_state = {
+            let mut config = AppConfig::default();
+            config.mcp_server_support = false;
+            Arc::new(AppState {
+                config: Arc::new(config),
+                vault: Arc::new(Vault::default()),
+                mcp_factory: Arc::new(McpFactory::default()),
+                rag_cache: Arc::new(RagCache::default()),
+                mcp_config: None,
+                mcp_log_path: None,
+                mcp_registry: None,
+                functions: Functions::default(),
+            })
+        };
+        let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let mut role = Role::new("r", "p");
+        role.set_enabled_mcp_servers(Some("all".to_string()));
+        let result = ctx.select_enabled_mcp_servers(&role);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn select_enabled_mcp_servers_all_returns_all_mcp_functions() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope
+            .functions
+            .append_mcp_meta_functions(vec!["github".into(), "slack".into()]);
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_mcp_servers(Some("all".to_string()));
+
+        let fns = ctx.select_enabled_mcp_servers(&role);
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"mcp_invoke_github"));
+        assert!(names.contains(&"mcp_search_github"));
+        assert!(names.contains(&"mcp_invoke_slack"));
+    }
+
+    #[test]
+    fn select_enabled_mcp_servers_comma_filters() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope
+            .functions
+            .append_mcp_meta_functions(vec!["github".into(), "slack".into()]);
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_mcp_servers(Some("github".to_string()));
+
+        let fns = ctx.select_enabled_mcp_servers(&role);
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"mcp_invoke_github"));
+        assert!(!names.contains(&"mcp_invoke_slack"));
     }
 }
