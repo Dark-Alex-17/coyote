@@ -165,3 +165,47 @@ impl McpRuntime {
         server_handle.call_tool(request).await.map_err(Into::into)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::function::ToolCall;
+    use super::*;
+
+    #[test]
+    fn mcp_runtime_new_is_empty() {
+        let runtime = McpRuntime::new();
+        assert!(runtime.is_empty());
+        assert!(runtime.server_names().is_empty());
+    }
+
+    #[test]
+    fn mcp_runtime_default_is_empty() {
+        let runtime = McpRuntime::default();
+        assert!(runtime.is_empty());
+    }
+
+    #[test]
+    fn mcp_runtime_get_returns_none_for_missing_server() {
+        let runtime = McpRuntime::new();
+        assert!(runtime.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn tool_scope_default_has_empty_mcp_runtime() {
+        let scope = ToolScope::default();
+        assert!(scope.mcp_runtime.is_empty());
+    }
+
+    #[test]
+    fn tool_scope_default_has_empty_functions() {
+        let scope = ToolScope::default();
+        assert!(scope.functions.is_empty());
+    }
+
+    #[test]
+    fn tool_scope_default_tracker_has_no_loops() {
+        let scope = ToolScope::default();
+        let dummy_call = ToolCall::default();
+        assert!(scope.tool_tracker.check_loop(&dummy_call).is_none());
+    }
+}

@@ -440,3 +440,395 @@ async fn spawn_stdio_mcp_server(
     );
     Ok(service)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stdio_server(command: &str) -> McpServer {
+        McpServer {
+            transport_type: McpTransportType::Stdio,
+            command: Some(command.to_string()),
+            args: None,
+            env: None,
+            cwd: None,
+            url: None,
+            headers: None,
+        }
+    }
+
+    fn http_server(url: &str) -> McpServer {
+        McpServer {
+            transport_type: McpTransportType::Http,
+            command: None,
+            args: None,
+            env: None,
+            cwd: None,
+            url: Some(url.to_string()),
+            headers: None,
+        }
+    }
+
+    fn sse_server(url: &str) -> McpServer {
+        McpServer {
+            transport_type: McpTransportType::Sse,
+            command: None,
+            args: None,
+            env: None,
+            cwd: None,
+            url: Some(url.to_string()),
+            headers: None,
+        }
+    }
+
+    fn make_registry_with_config(server_names: &[&str]) -> McpRegistry {
+        let mut mcp_servers = HashMap::new();
+        for name in server_names {
+            mcp_servers.insert(name.to_string(), stdio_server("echo"));
+        }
+        McpRegistry {
+            config: Some(McpServersConfig { mcp_servers }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_stdio_with_command_succeeds() {
+        let spec = stdio_server("npx");
+        assert!(spec.validate("test").is_ok());
+    }
+
+    #[test]
+    fn validate_stdio_missing_command_fails() {
+        let spec = McpServer {
+            transport_type: McpTransportType::Stdio,
+            command: None,
+            args: None,
+            env: None,
+            cwd: None,
+            url: None,
+            headers: None,
+        };
+        let err = spec.validate("test").unwrap_err();
+        assert!(err.to_string().contains("missing a \"command\" field"));
+    }
+
+    #[test]
+    fn validate_stdio_with_url_fails() {
+        let spec = McpServer {
+            transport_type: McpTransportType::Stdio,
+            command: Some("cmd".into()),
+            args: None,
+            env: None,
+            cwd: None,
+            url: Some("http://localhost".into()),
+            headers: None,
+        };
+        let err = spec.validate("test").unwrap_err();
+        assert!(err.to_string().contains("remote fields"));
+    }
+
+    #[test]
+    fn validate_stdio_with_headers_fails() {
+        let mut headers = HashMap::new();
+        headers.insert("Auth".into(), "Bearer tok".into());
+        let spec = McpServer {
+            transport_type: McpTransportType::Stdio,
+            command: Some("cmd".into()),
+            args: None,
+            env: None,
+            cwd: None,
+            url: None,
+            headers: Some(headers),
+        };
+        let err = spec.validate("test").unwrap_err();
+        assert!(err.to_string().contains("remote fields"));
+    }
+
+    #[test]
+    fn validate_http_with_url_succeeds() {
+        let spec = http_server("http://localhost:8080");
+        assert!(spec.validate("test").is_ok());
+    }
+
+    #[test]
+    fn validate_http_missing_url_fails() {
+        let spec = McpServer {
+            transport_type: McpTransportType::Http,
+            command: None,
+            args: None,
+            env: None,
+            cwd: None,
+            url: None,
+            headers: None,
+        };
+        let err = spec.validate("test").unwrap_err();
+        assert!(err.to_string().contains("missing a \"url\" field"));
+    }
+
+    #[test]
+    fn validate_http_with_command_fails() {
+        let spec = McpServer {
+            transport_type: McpTransportType::Http,
+            command: Some("npx".into()),
+            args: None,
+            env: None,
+            cwd: None,
+            url: Some("http://localhost".into()),
+            headers: None,
+        };
+        let err = spec.validate("test").unwrap_err();
+        assert!(err.to_string().contains("stdio fields"));
+    }
+
+    #[test]
+    fn validate_http_with_args_fails() {
+        let spec = McpServer {
+            transport_type: McpTransportType::Http,
+            command: None,
+            args: Some(vec!["--flag".into()]),
+            env: None,
+            cwd: None,
+            url: Some("http://localhost".into()),
+            headers: None,
+        };
+        let err = spec.validate("test").unwrap_err();
+        assert!(err.to_string().contains("stdio fields"));
+    }
+
+    #[test]
+    fn validate_http_with_cwd_fails() {
+        let spec = McpServer {
+            transport_type: McpTransportType::Http,
+            command: None,
+            args: None,
+            env: None,
+            cwd: Some("/tmp".into()),
+            url: Some("http://localhost".into()),
+            headers: None,
+        };
+        let err = spec.validate("test").unwrap_err();
+        assert!(err.to_string().contains("stdio fields"));
+    }
+
+    #[test]
+    fn validate_sse_with_url_succeeds() {
+        let spec = sse_server("http://sse.example.com");
+        assert!(spec.validate("test").is_ok());
+    }
+
+    #[test]
+    fn validate_sse_missing_url_fails() {
+        let spec = McpServer {
+            transport_type: McpTransportType::Sse,
+            command: None,
+            args: None,
+            env: None,
+            cwd: None,
+            url: None,
+            headers: None,
+        };
+        let err = spec.validate("test").unwrap_err();
+        assert!(err.to_string().contains("missing a \"url\" field"));
+    }
+
+    #[test]
+    fn is_remote_true_for_http_and_sse() {
+        assert!(http_server("http://x").is_remote());
+        assert!(sse_server("http://x").is_remote());
+    }
+
+    #[test]
+    fn is_remote_false_for_stdio() {
+        assert!(!stdio_server("cmd").is_remote());
+    }
+
+    #[test]
+    fn deserialize_stdio_server_from_json() {
+        let json = r#"{
+            "mcpServers": {
+                "my-server": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server"]
+                }
+            }
+        }"#;
+        let config: McpServersConfig = serde_json::from_str(json).unwrap();
+        assert!(config.mcp_servers.contains_key("my-server"));
+        let spec = &config.mcp_servers["my-server"];
+        assert_eq!(spec.transport_type, McpTransportType::Stdio);
+        assert_eq!(spec.command.as_deref(), Some("npx"));
+        assert_eq!(
+            spec.args.as_ref().unwrap(),
+            &["-y", "@modelcontextprotocol/server"]
+        );
+    }
+
+    #[test]
+    fn deserialize_http_server_from_json() {
+        let json = r#"{
+            "mcpServers": {
+                "remote": {
+                    "type": "http",
+                    "url": "http://localhost:8080/mcp",
+                    "headers": {"Authorization": "Bearer tok"}
+                }
+            }
+        }"#;
+        let config: McpServersConfig = serde_json::from_str(json).unwrap();
+        let spec = &config.mcp_servers["remote"];
+        assert_eq!(spec.transport_type, McpTransportType::Http);
+        assert_eq!(spec.url.as_deref(), Some("http://localhost:8080/mcp"));
+        assert_eq!(
+            spec.headers.as_ref().unwrap()["Authorization"],
+            "Bearer tok"
+        );
+    }
+
+    #[test]
+    fn deserialize_env_with_mixed_types() {
+        let json = r#"{
+            "mcpServers": {
+                "s": {
+                    "type": "stdio",
+                    "command": "cmd",
+                    "env": {
+                        "STR_VAR": "hello",
+                        "BOOL_VAR": true,
+                        "INT_VAR": 42
+                    }
+                }
+            }
+        }"#;
+        let config: McpServersConfig = serde_json::from_str(json).unwrap();
+        let env = config.mcp_servers["s"].env.as_ref().unwrap();
+        assert!(matches!(env["STR_VAR"], JsonField::Str(ref s) if s == "hello"));
+        assert!(matches!(env["BOOL_VAR"], JsonField::Bool(true)));
+        assert!(matches!(env["INT_VAR"], JsonField::Int(42)));
+    }
+
+    #[test]
+    fn deserialize_multiple_servers() {
+        let json = r#"{
+            "mcpServers": {
+                "github": { "type": "stdio", "command": "gh-mcp" },
+                "remote-api": { "type": "http", "url": "http://api.example.com" }
+            }
+        }"#;
+        let config: McpServersConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.mcp_servers.len(), 2);
+        assert!(config.mcp_servers.contains_key("github"));
+        assert!(config.mcp_servers.contains_key("remote-api"));
+    }
+
+    #[test]
+    fn deserialize_empty_servers_map() {
+        let json = r#"{ "mcpServers": {} }"#;
+        let config: McpServersConfig = serde_json::from_str(json).unwrap();
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn deserialize_server_with_cwd() {
+        let json = r#"{
+            "mcpServers": {
+                "s": {
+                    "type": "stdio",
+                    "command": "cmd",
+                    "cwd": "/tmp/work"
+                }
+            }
+        }"#;
+        let config: McpServersConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.mcp_servers["s"].cwd.as_deref(), Some("/tmp/work"));
+    }
+
+    #[test]
+    fn resolve_all_returns_all_configured_servers() {
+        let registry = make_registry_with_config(&["github", "slack", "jira"]);
+        let mut ids = registry.resolve_server_ids(Some("all".to_string()));
+        ids.sort();
+        assert_eq!(ids, vec!["github", "jira", "slack"]);
+    }
+
+    #[test]
+    fn resolve_comma_separated_returns_matching_servers() {
+        let registry = make_registry_with_config(&["github", "slack", "jira"]);
+        let mut ids = registry.resolve_server_ids(Some("github, jira".to_string()));
+        ids.sort();
+        assert_eq!(ids, vec!["github", "jira"]);
+    }
+
+    #[test]
+    fn resolve_single_server_name() {
+        let registry = make_registry_with_config(&["github", "slack"]);
+        let ids = registry.resolve_server_ids(Some("slack".to_string()));
+        assert_eq!(ids, vec!["slack"]);
+    }
+
+    #[test]
+    fn resolve_none_returns_empty() {
+        let registry = make_registry_with_config(&["github"]);
+        let ids = registry.resolve_server_ids(None);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn resolve_no_config_returns_empty() {
+        let registry = McpRegistry::default();
+        let ids = registry.resolve_server_ids(Some("all".to_string()));
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn resolve_nonexistent_server_filtered_out() {
+        let registry = make_registry_with_config(&["github"]);
+        let ids = registry.resolve_server_ids(Some("github, nonexistent".to_string()));
+        assert_eq!(ids, vec!["github"]);
+    }
+
+    #[test]
+    fn resolve_all_nonexistent_returns_empty() {
+        let registry = make_registry_with_config(&["github"]);
+        let ids = registry.resolve_server_ids(Some("foo, bar".to_string()));
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn resolve_trims_whitespace() {
+        let registry = make_registry_with_config(&["github", "slack"]);
+        let mut ids = registry.resolve_server_ids(Some("  github  ,  slack  ".to_string()));
+        ids.sort();
+        assert_eq!(ids, vec!["github", "slack"]);
+    }
+
+    #[test]
+    fn registry_default_is_empty() {
+        let registry = McpRegistry::default();
+        assert!(registry.is_empty());
+        assert!(registry.list_started_servers().is_empty());
+        assert!(registry.mcp_config().is_none());
+        assert!(registry.log_path().is_none());
+    }
+
+    #[test]
+    fn registry_with_config_reports_config() {
+        let registry = make_registry_with_config(&["github"]);
+        assert!(registry.mcp_config().is_some());
+        assert!(
+            registry
+                .mcp_config()
+                .unwrap()
+                .mcp_servers
+                .contains_key("github")
+        );
+    }
+
+    #[test]
+    fn meta_function_prefixes_are_correct() {
+        assert_eq!(MCP_INVOKE_META_FUNCTION_NAME_PREFIX, "mcp_invoke");
+        assert_eq!(MCP_SEARCH_META_FUNCTION_NAME_PREFIX, "mcp_search");
+        assert_eq!(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, "mcp_describe");
+    }
+}
