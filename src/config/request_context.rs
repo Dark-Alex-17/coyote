@@ -2422,16 +2422,7 @@ mod tests {
     }
 
     fn default_app_state() -> Arc<AppState> {
-        Arc::new(AppState {
-            config: Arc::new(AppConfig::default()),
-            vault: Arc::new(Vault::default()),
-            mcp_factory: Arc::new(McpFactory::default()),
-            rag_cache: Arc::new(RagCache::default()),
-            mcp_config: None,
-            mcp_log_path: None,
-            mcp_registry: None,
-            functions: Functions::default(),
-        })
+        Arc::new(AppState::test_default())
     }
 
     fn create_test_ctx() -> RequestContext {

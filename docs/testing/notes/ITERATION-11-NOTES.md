@@ -66,7 +66,53 @@
 | `test_task_node_is_runnable` | Pending + unblocked = runnable |
 | `test_task_node_not_runnable_when_blocked` | Blocked = not runnable |
 
-**Total: 40 new tests (382 total in suite)**
+### src/function/supervisor.rs (36 new handler integration tests)
+
+| Test name | What it verifies |
+|---|---|
+| `handle_list_empty_supervisor` | Empty supervisor → 0 active, empty agents |
+| `handle_list_with_agents` | Registered agents appear in list |
+| `handle_list_no_supervisor_errors` | No supervisor → error |
+| `handle_check_unknown_agent` | Check unknown → error status |
+| `handle_check_pending_agent` | Check running agent → pending status |
+| `handle_cancel_registered_agent` | Cancel removes and signals abort |
+| `handle_cancel_unknown_agent` | Cancel unknown → error status |
+| `handle_cancel_no_supervisor_errors` | No supervisor → error |
+| `handle_send_message_to_registered_agent` | Message delivered to inbox |
+| `handle_send_message_to_unknown_agent` | Unknown agent → error status |
+| `handle_check_inbox_with_messages` | Inbox drains messages with count |
+| `handle_check_inbox_no_inbox` | No inbox → count 0 |
+| `handle_check_inbox_empty_inbox` | Empty inbox → count 0 |
+| `handle_reply_escalation_success` | Reply delivered via oneshot |
+| `handle_reply_escalation_missing_id` | Missing id → error status |
+| `handle_reply_escalation_no_queue_errors` | No queue → error |
+| `handle_task_create_simple` | Simple task created with id |
+| `handle_task_create_with_dependencies` | Task with blocked_by |
+| `handle_task_create_with_dispatch_agent` | Auto-dispatch flag set |
+| `handle_task_create_agent_without_prompt_errors` | Agent without prompt → error |
+| `handle_task_list_empty` | Empty queue → empty tasks array |
+| `handle_task_list_with_tasks` | Tasks listed |
+| `handle_task_complete_unblocks_dependents` | Complete unblocks with newly_runnable |
+| `handle_task_fail_marks_failed` | Fail sets status |
+| `handle_task_fail_reports_blocked_dependents` | Reports blocked deps |
+| `handle_task_fail_missing_task` | Missing task → error status |
+| `dispatch_unknown_action_errors` | Unknown action → error |
+| `dispatch_routes_list` | agent__list → handle_list |
+| `dispatch_routes_task_list` | agent__task_list → handle_task_list |
+| `new_for_child_inherits_escalation_queue` | Shared Arc |
+| `new_for_child_sets_depth_and_id` | Depth and self_agent_id |
+| `new_for_child_has_inbox` | Shared inbox Arc |
+| `new_for_child_inherits_parent_supervisor` | parent_supervisor set |
+| `new_for_child_starts_with_empty_scope` | Empty functions, mcp, role, session |
+| `ensure_root_escalation_queue_creates_on_first_call` | Lazy init |
+| `ensure_root_escalation_queue_returns_same_on_second_call` | Same Arc |
+
+### Infrastructure
+
+- Added `AppState::test_default()` method for cross-module test construction
+- Refactored `input.rs` and `request_context.rs` test helpers to use `test_default()`
+
+**Total: 76 new tests (418 total in suite)**
 
 ## Bugs discovered
 
@@ -92,10 +138,20 @@ None.
    pattern — not ideal but necessary since JoinHandle can't be
    mocked.
 
-5. **Most spawn/collect/check behaviors require integration tests**:
-   The actual agent__spawn handler needs a full RequestContext with
-   agent config on disk. The Supervisor struct itself is fully
-   testable in isolation.
+5. **handle_spawn requires real agent config on disk**: This is the
+   only handler that calls Agent::init. All other handlers (list,
+   check, cancel, messaging, tasks, escalation) work with just a
+   RequestContext + Supervisor, which we can construct in tests.
+
+6. **Handler integration tests cover the full dispatch chain**: The
+   tests call handler functions with real RequestContext instances
+   containing real Supervisor/EscalationQueue/Inbox instances. This
+   verifies the JSON arg parsing, supervisor interactions, and
+   response formatting all at once.
+
+7. **AppState::test_default() centralizes test construction**: Added
+   a `#[cfg(test)]` constructor that avoids importing private
+   modules (mcp_factory, rag_cache) from outside the config module.
 
 ## Next iteration
 
