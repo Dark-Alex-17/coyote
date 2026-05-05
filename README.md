@@ -1,7 +1,6 @@
 # Loki: All-in-one, batteries-included LLM CLI Tool
 
 ![Test](https://github.com/Dark-Alex-17/loki/actions/workflows/ci.yaml/badge.svg)
-![LOC](https://tokei.rs/b1/github/Dark-Alex-17/loki?category=code)
 [![crates.io link](https://img.shields.io/crates/v/loki-ai.svg)](https://crates.io/crates/loki-ai)
 ![Release](https://img.shields.io/github/v/release/Dark-Alex-17/loki?color=%23c694ff)
 ![Crate.io downloads](https://img.shields.io/crates/d/loki-ai?label=Crate%20downloads)
@@ -13,36 +12,36 @@ Agents, and More.
 It is designed to include a number of useful agents, roles, macros, and more so users can get up and running with Loki 
 in as little time as possible.
 
-![Agent example](./docs/images/agents/sql.gif)
+![Agent example](https://raw.githubusercontent.com/wiki/Dark-Alex-17/loki/docs/images/agents/sql.gif)
 
-Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration guide](./docs/AICHAT-MIGRATION.md) to get started.
+Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration guide](https://github.com/Dark-Alex-17/loki/wiki/AIChat-Migration) to get started.
 
 ## Quick Links
-* [AIChat Migration Guide](./docs/AICHAT-MIGRATION.md): Coming from AIChat? Follow the migration guide to get started.
+* [AIChat Migration Guide](https://github.com/Dark-Alex-17/loki/wiki/AIChat-Migration): Coming from AIChat? Follow the migration guide to get started.
 * [Installation](#install): Install Loki
 * [Getting Started](#getting-started): Get started with Loki by doing first-run setup steps.
-* [REPL](./docs/REPL.md): Interactive Read-Eval-Print Loop for conversational interactions with LLMs and Loki.
-  * [Custom REPL Prompt](./docs/REPL-PROMPT.md): Customize the REPL prompt to provide useful contextual information.
-* [Vault](./docs/VAULT.md): Securely store and manage sensitive information such as API keys and credentials.
-* [Shell Integrations](./docs/SHELL-INTEGRATIONS.md): Seamlessly integrate Loki with your shell environment for enhanced command-line assistance.
-* [Function Calling](./docs/function-calling/TOOLS.md#Tools): Leverage function calling capabilities to extend Loki's functionality with custom tools
-    * [Creating Custom Tools](./docs/function-calling/CUSTOM-TOOLS.md): You can create your own custom tools to enhance Loki's capabilities.
-        * [Create Custom Python Tools](./docs/function-calling/CUSTOM-TOOLS.md#custom-python-based-tools)
-        * [Create Custom TypeScript Tools](./docs/function-calling/CUSTOM-TOOLS.md#custom-typescript-based-tools)
-        * [Create Custom Bash Tools](./docs/function-calling/CUSTOM-BASH-TOOLS.md)
-            * [Bash Prompt Utilities](./docs/function-calling/BASH-PROMPT-HELPERS.md)
-* [First-Class MCP Server Support](./docs/function-calling/MCP-SERVERS.md): Easily connect and interact with MCP servers for advanced functionality.
-* [Macros](./docs/MACROS.md): Automate repetitive tasks and workflows with Loki "scripts" (macros).
-* [RAG](./docs/RAG.md): Retrieval-Augmented Generation for enhanced information retrieval and generation.
-* [Sessions](/docs/SESSIONS.md): Manage and persist conversational contexts and settings across multiple interactions.
-* [Roles](./docs/ROLES.md): Customize model behavior for specific tasks or domains.
-* [Agents](/docs/AGENTS.md): Leverage AI agents to perform complex tasks and workflows, including sub-agent spawning, teammate messaging, and user interaction tools.
-    * [Todo System](./docs/TODO-SYSTEM.md): Built-in task tracking for improved agent reliability with smaller models.
-* [Environment Variables](./docs/ENVIRONMENT-VARIABLES.md): Override and customize your Loki configuration at runtime with environment variables.
-* [Client Configurations](./docs/clients/CLIENTS.md): Configuration instructions for various LLM providers.
-    * [Authentication (API Key & OAuth)](./docs/clients/CLIENTS.md#authentication): Authenticate with API keys or OAuth for subscription-based access.
-    * [Patching API Requests](./docs/clients/PATCHES.md): Learn how to patch API requests for advanced customization.
-* [Custom Themes](./docs/THEMES.md): Change the look and feel of Loki to your preferences with custom themes.
+* [REPL](https://github.com/Dark-Alex-17/loki/wiki/REPL): Interactive Read-Eval-Print Loop for conversational interactions with LLMs and Loki.
+  * [Custom REPL Prompt](https://github.com/Dark-Alex-17/loki/wiki/REPL-Prompt): Customize the REPL prompt to provide useful contextual information.
+* [Vault](https://github.com/Dark-Alex-17/loki/wiki/Vault): Securely store and manage sensitive information such as API keys and credentials.
+* [Shell Integrations](https://github.com/Dark-Alex-17/loki/wiki/Shell-Integrations): Seamlessly integrate Loki with your shell environment for enhanced command-line assistance.
+* [Function Calling](https://github.com/Dark-Alex-17/loki/wiki/Tools): Leverage function calling capabilities to extend Loki's functionality with custom tools
+    * [Creating Custom Tools](https://github.com/Dark-Alex-17/loki/wiki/Custom-Tools): You can create your own custom tools to enhance Loki's capabilities.
+        * [Create Custom Python Tools](https://github.com/Dark-Alex-17/loki/wiki/Custom-Tools#custom-python-based-tools)
+        * [Create Custom TypeScript Tools](https://github.com/Dark-Alex-17/loki/wiki/Custom-Tools#custom-typescript-based-tools)
+        * [Create Custom Bash Tools](https://github.com/Dark-Alex-17/loki/wiki/Custom-Bash-Tools)
+            * [Bash Prompt Utilities](https://github.com/Dark-Alex-17/loki/wiki/Bash-Prompt-Helpers)
+* [First-Class MCP Server Support](https://github.com/Dark-Alex-17/loki/wiki/MCP-Servers): Easily connect and interact with MCP servers for advanced functionality.
+* [Macros](https://github.com/Dark-Alex-17/loki/wiki/Macros): Automate repetitive tasks and workflows with Loki "scripts" (macros).
+* [RAG](https://github.com/Dark-Alex-17/loki/wiki/RAG): Retrieval-Augmented Generation for enhanced information retrieval and generation.
+* [Sessions](https://github.com/Dark-Alex-17/loki/wiki/Sessions): Manage and persist conversational contexts and settings across multiple interactions.
+* [Roles](https://github.com/Dark-Alex-17/loki/wiki/Roles): Customize model behavior for specific tasks or domains.
+* [Agents](https://github.com/Dark-Alex-17/loki/wiki/Agents): Leverage AI agents to perform complex tasks and workflows, including sub-agent spawning, teammate messaging, and user interaction tools.
+    * [Todo System](https://github.com/Dark-Alex-17/loki/wiki/TODO-System): Built-in task tracking for improved agent reliability with smaller models.
+* [Environment Variables](https://github.com/Dark-Alex-17/loki/wiki/Environment-Variables): Override and customize your Loki configuration at runtime with environment variables.
+* [Client Configurations](https://github.com/Dark-Alex-17/loki/wiki/Clients): Configuration instructions for various LLM providers.
+    * [Authentication (API Key & OAuth)](https://github.com/Dark-Alex-17/loki/wiki/Clients#authentication): Authenticate with API keys or OAuth for subscription-based access.
+    * [Patching API Requests](https://github.com/Dark-Alex-17/loki/wiki/Patches): Learn how to patch API requests for advanced customization.
+* [Custom Themes](https://github.com/Dark-Alex-17/loki/wiki/Themes): Change the look and feel of Loki to your preferences with custom themes.
 * [History](#history): A history of how Loki came to be.
 
 ## Prerequisites
@@ -154,7 +153,7 @@ loki --list-secrets
 
 ### Authentication
 Each client in your configuration needs authentication (with a few exceptions; e.g. ollama). Most clients use an API key
-(set via `api_key` in the config or through the [vault](./docs/VAULT.md)). For providers that support OAuth (e.g. Claude Pro/Max 
+(set via `api_key` in the config or through the [vault](https://github.com/Dark-Alex-17/loki/wiki/Vault)). For providers that support OAuth (e.g. Claude Pro/Max 
 subscribers, Google Gemini), you can authenticate with your existing subscription instead:
 
 ```yaml
@@ -170,7 +169,7 @@ loki --authenticate my-claude-oauth
 # Or via the REPL: .authenticate
 ```
 
-For full details, see the [authentication documentation](./docs/clients/CLIENTS.md#authentication).
+For full details, see the [authentication documentation](https://github.com/Dark-Alex-17/loki/wiki/Clients#authentication).
 
 ### Tab-Completions
 You can also enable tab completions to make using Loki easier. To do so, add the following to your shell profile:
@@ -247,7 +246,7 @@ shown below:
 
 | Setting         | Description                                                                                                                                                                                                                                                                                                 |
 |-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `repl_prelude`  | This setting lets you specify a default `session` or `role` to use when starting Loki in [REPL](./docs/REPL.md) mode. <br>Values can be <ul><li>`role:<name>` to define a role</li><li>`session:<name>` to define a session</li><li>`<session>:<role>` to define both a session and a role to use</li></ul> |
+| `repl_prelude`  | This setting lets you specify a default `session` or `role` to use when starting Loki in [REPL](https://github.com/Dark-Alex-17/loki/wiki/REPL) mode. <br>Values can be <ul><li>`role:<name>` to define a role</li><li>`session:<name>` to define a session</li><li>`<session>:<role>` to define both a session and a role to use</li></ul> |
 | `cmd_prelude`   | This setting lets you specify a default `session` or `role` to use when running one-off queries in Loki via the CLI. <br>Values can be <ul><li>`role:<name>` to define a role</li><li>`session:<name>` to define a session</li><li>`<session>:<role>` to define both a session and a role to use</li></ul>  |
 | `agent_session` | This setting is used to specify a default session that all agents should start into, unless otherwise specified in the agent configuration. (e.g. `temp`, `default`)                                                                                                                                        |
 
