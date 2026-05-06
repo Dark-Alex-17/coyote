@@ -12,7 +12,7 @@ Agents, and More.
 It is designed to include a number of useful agents, roles, macros, and more so users can get up and running with Loki 
 in as little time as possible.
 
-![Agent example](https://raw.githubusercontent.com/wiki/Dark-Alex-17/loki/docs/images/agents/sql.gif)
+![Agent example](https://raw.githubusercontent.com/wiki/Dark-Alex-17/loki/images/agents/sql.gif)
 
 Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration guide](https://github.com/Dark-Alex-17/loki/wiki/AIChat-Migration) to get started.
 
