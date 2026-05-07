@@ -145,7 +145,6 @@ mod tests {
                 exit_status: AgentExitStatus::Completed,
             })
         });
-        std::mem::forget(rt);
         AgentHandle {
             id: id.to_string(),
             agent_name: agent_name.to_string(),
