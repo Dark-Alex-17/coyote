@@ -1,9 +1,11 @@
 use crate::client::{ModelType, list_models};
 use crate::config::paths;
 use crate::config::{AppConfig, Config, list_agents, list_sessions};
+use crate::utils::list_file_names;
 use crate::vault::Vault;
 use clap_complete::{CompletionCandidate, Shell, generate};
 use clap_complete_nushell::Nushell;
+use std::env;
 use std::ffi::OsStr;
 use std::io;
 
@@ -94,9 +96,36 @@ pub(super) fn macro_completer(current: &OsStr) -> Vec<CompletionCandidate> {
         .collect()
 }
 
+fn extract_agent_from_args() -> Option<String> {
+    let args: Vec<String> = env::args().collect();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        
+        if let Some(value) = arg.strip_prefix("--agent=") {
+            return Some(value.to_string());
+        }
+        
+        if (arg == "--agent" || arg == "-a") && i + 1 < args.len() {
+            return Some(args[i + 1].clone());
+        }
+        
+        i += 1;
+    }
+    None
+}
+
 pub(super) fn session_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    list_sessions()
+    
+    let sessions = if let Some(agent_name) = extract_agent_from_args() {
+        let sessions_dir = paths::agent_data_dir(&agent_name).join("sessions");
+        list_file_names(sessions_dir, ".yaml")
+    } else {
+        list_sessions()
+    };
+    
+    sessions
         .into_iter()
         .filter(|s| s.starts_with(&*cur))
         .map(CompletionCandidate::new)
