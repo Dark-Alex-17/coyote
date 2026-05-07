@@ -1,6 +1,6 @@
 use super::ClientConfig;
 use super::access_token::{is_valid_access_token, set_access_token};
-use crate::config::Config;
+use crate::config::paths;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -178,13 +178,13 @@ pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> 
 }
 
 pub fn load_oauth_tokens(client_name: &str) -> Option<OAuthTokens> {
-    let path = Config::token_file(client_name);
+    let path = paths::token_file(client_name);
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }
 
 fn save_oauth_tokens(client_name: &str, tokens: &OAuthTokens) -> Result<()> {
-    let path = Config::token_file(client_name);
+    let path = paths::token_file(client_name);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

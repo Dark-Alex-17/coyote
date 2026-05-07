@@ -234,3 +234,48 @@ pub(crate) fn generate_declarations<L: ScriptedLanguage>(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn underscore_simple() {
+        assert_eq!(underscore("hello"), "hello");
+    }
+
+    #[test]
+    fn underscore_dashes_to_underscores() {
+        assert_eq!(underscore("my-func-name"), "my_func_name");
+    }
+
+    #[test]
+    fn underscore_spaces_to_underscores() {
+        assert_eq!(underscore("my func"), "my_func");
+    }
+
+    #[test]
+    fn underscore_special_chars_removed() {
+        assert_eq!(underscore("func@name!here"), "func_name_here");
+    }
+
+    #[test]
+    fn underscore_consecutive_specials_collapsed() {
+        assert_eq!(underscore("a---b"), "a_b");
+    }
+
+    #[test]
+    fn underscore_leading_trailing_stripped() {
+        assert_eq!(underscore("-leading-"), "leading");
+    }
+
+    #[test]
+    fn underscore_uppercase_lowered() {
+        assert_eq!(underscore("MyFunc"), "myfunc");
+    }
+
+    #[test]
+    fn underscore_mixed() {
+        assert_eq!(underscore("Get-User Info"), "get_user_info");
+    }
+}

@@ -5,7 +5,7 @@ pub use utils::create_vault_password_file;
 pub use utils::interpolate_secrets;
 
 use crate::cli::Cli;
-use crate::config::Config;
+use crate::config::AppConfig;
 use crate::vault::utils::ensure_password_file_initialized;
 use anyhow::{Context, Result};
 use fancy_regex::Regex;
@@ -26,7 +26,7 @@ pub type GlobalVault = Arc<Vault>;
 
 impl Vault {
     pub fn init_bare() -> Self {
-        let vault_password_file = Config::default().vault_password_file();
+        let vault_password_file = AppConfig::default().vault_password_file();
         let local_provider = LocalProvider {
             password_file: Some(vault_password_file),
             git_branch: None,
@@ -36,7 +36,7 @@ impl Vault {
         Self { local_provider }
     }
 
-    pub fn init(config: &Config) -> Self {
+    pub fn init(config: &AppConfig) -> Self {
         let vault_password_file = config.vault_password_file();
         let mut local_provider = LocalProvider {
             password_file: Some(vault_password_file),
@@ -130,27 +130,69 @@ impl Vault {
         Ok(secrets)
     }
 
-    pub fn handle_vault_flags(cli: Cli, config: Config) -> Result<()> {
+    pub fn handle_vault_flags(cli: Cli, vault: &Vault) -> Result<()> {
         if let Some(secret_name) = cli.add_secret {
-            config.vault.add_secret(&secret_name)?;
+            vault.add_secret(&secret_name)?;
         }
 
         if let Some(secret_name) = cli.get_secret {
-            config.vault.get_secret(&secret_name, true)?;
+            vault.get_secret(&secret_name, true)?;
         }
 
         if let Some(secret_name) = cli.update_secret {
-            config.vault.update_secret(&secret_name)?;
+            vault.update_secret(&secret_name)?;
         }
 
         if let Some(secret_name) = cli.delete_secret {
-            config.vault.delete_secret(&secret_name)?;
+            vault.delete_secret(&secret_name)?;
         }
 
         if cli.list_secrets {
-            config.vault.list_secrets(true)?;
+            vault.list_secrets(true)?;
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_re_matches_double_braces() {
+        let captures = SECRET_RE.captures("{{MY_SECRET}}").unwrap().unwrap();
+        assert_eq!(&captures[1], "MY_SECRET");
+    }
+
+    #[test]
+    fn secret_re_matches_with_surrounding_text() {
+        let text = "key={{API_KEY}} here";
+        let captures = SECRET_RE.captures(text).unwrap().unwrap();
+        assert_eq!(&captures[1], "API_KEY");
+    }
+
+    #[test]
+    fn secret_re_no_match_single_braces() {
+        let result = SECRET_RE.captures("{NOT_SECRET}").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn secret_re_no_match_plain_text() {
+        let result = SECRET_RE.captures("just plain text").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn secret_re_matches_with_spaces() {
+        let captures = SECRET_RE.captures("{{ SPACED }}").unwrap().unwrap();
+        assert_eq!(&captures[1], " SPACED ");
+    }
+
+    #[test]
+    fn vault_default_creates_instance() {
+        let vault = Vault::default();
+        assert!(vault.password_file().is_err());
     }
 }

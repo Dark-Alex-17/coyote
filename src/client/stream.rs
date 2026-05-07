@@ -311,10 +311,8 @@ impl JsonStreamParser {
                     }
                     self.balances.push(ch);
                 }
-                '[' => {
-                    if self.start.is_some() {
-                        self.balances.push(ch);
-                    }
+                '[' if self.start.is_some() => {
+                    self.balances.push(ch);
                 }
                 '}' => {
                     self.balances.pop();

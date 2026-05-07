@@ -1,4 +1,3 @@
-use super::todo::TodoList;
 use super::*;
 
 use crate::{
@@ -6,6 +5,8 @@ use crate::{
     function::{Functions, run_llm_function},
 };
 
+use super::rag_cache::RagKey;
+use crate::config::paths;
 use crate::config::prompts::{
     DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS, DEFAULT_TODO_INSTRUCTIONS,
     DEFAULT_USER_INTERACTION_INSTRUCTIONS,
@@ -38,16 +39,13 @@ pub struct Agent {
     rag: Option<Arc<Rag>>,
     model: Model,
     vault: GlobalVault,
-    todo_list: TodoList,
-    continuation_count: usize,
-    last_continuation_response: Option<String>,
 }
 
 impl Agent {
     pub fn install_builtin_agents() -> Result<()> {
         info!(
             "Installing built-in agents in {}",
-            Config::agents_data_dir().display()
+            paths::agents_data_dir().display()
         );
 
         for file in AgentAssets::iter() {
@@ -56,7 +54,7 @@ impl Agent {
             let embedded_file = AgentAssets::get(&file)
                 .ok_or_else(|| anyhow!("Failed to load embedded agent file: {}", file.as_ref()))?;
             let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
-            let file_path = Config::agents_data_dir().join(file.as_ref());
+            let file_path = paths::agents_data_dir().join(file.as_ref());
             let file_extension = file_path
                 .extension()
                 .and_then(OsStr::to_str)
@@ -88,14 +86,17 @@ impl Agent {
     }
 
     pub async fn init(
-        config: &GlobalConfig,
+        app: &AppConfig,
+        app_state: &AppState,
+        current_model: &Model,
+        info_flag: bool,
         name: &str,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        let agent_data_dir = Config::agent_data_dir(name);
-        let loaders = config.read().document_loaders.clone();
-        let rag_path = Config::agent_rag_file(name, DEFAULT_AGENT_NAME);
-        let config_path = Config::agent_config_file(name);
+        let agent_data_dir = paths::agent_data_dir(name);
+        let loaders = app.document_loaders.clone();
+        let rag_path = paths::agent_rag_file(name, DEFAULT_AGENT_NAME);
+        let config_path = paths::agent_config_file(name);
         let mut agent_config = if config_path.exists() {
             AgentConfig::load(&config_path)?
         } else {
@@ -103,57 +104,33 @@ impl Agent {
         };
         let mut functions = Functions::init_agent(name, &agent_config.global_tools)?;
 
-        config.write().functions.clear_mcp_meta_functions();
-        let mcp_servers = if config.read().mcp_server_support {
-            (!agent_config.mcp_servers.is_empty()).then(|| agent_config.mcp_servers.join(","))
-        } else {
-            eprintln!(
-                "{}",
-                formatdoc!(
-                    "
-										This agent uses MCP servers, but MCP support is disabled.
-										To enable it, exit the agent and set 'mcp_server_support: true', then try again
-										"
-                )
-            );
-            None
-        };
+        agent_config.load_envs(app);
 
-        let registry = config
-            .write()
-            .mcp_registry
-            .take()
-            .with_context(|| "MCP registry should be populated")?;
-        let new_mcp_registry =
-            McpRegistry::reinit(registry, mcp_servers, abort_signal.clone()).await?;
-
-        if !new_mcp_registry.is_empty() {
-            functions.append_mcp_meta_functions(new_mcp_registry.list_started_servers());
-        }
-
-        config.write().mcp_registry = Some(new_mcp_registry);
-
-        agent_config.load_envs(&config.read());
-
-        let model = {
-            let config = config.read();
-            match agent_config.model_id.as_ref() {
-                Some(model_id) => Model::retrieve_model(&config, model_id, ModelType::Chat)?,
-                None => {
-                    if agent_config.temperature.is_none() {
-                        agent_config.temperature = config.temperature;
-                    }
-                    if agent_config.top_p.is_none() {
-                        agent_config.top_p = config.top_p;
-                    }
-                    config.current_model().clone()
+        let model = match agent_config.model_id.as_ref() {
+            Some(model_id) => Model::retrieve_model(app, model_id, ModelType::Chat)?,
+            None => {
+                if agent_config.temperature.is_none() {
+                    agent_config.temperature = app.temperature;
                 }
+                if agent_config.top_p.is_none() {
+                    agent_config.top_p = app.top_p;
+                }
+                current_model.clone()
             }
         };
 
         let rag = if rag_path.exists() {
-            Some(Arc::new(Rag::load(config, DEFAULT_AGENT_NAME, &rag_path)?))
-        } else if !agent_config.documents.is_empty() && !config.read().info_flag {
+            let key = RagKey::Agent(name.to_string());
+            let app_clone = app.clone();
+            let rag_path_clone = rag_path.clone();
+            let rag = app_state
+                .rag_cache
+                .load_with(key, || async move {
+                    Rag::load(&app_clone, DEFAULT_AGENT_NAME, &rag_path_clone)
+                })
+                .await?;
+            Some(rag)
+        } else if !agent_config.documents.is_empty() && !info_flag {
             let mut ans = false;
             if *IS_STDOUT_TERMINAL {
                 ans = Confirm::new("The agent has documents attached, init RAG?")
@@ -185,9 +162,23 @@ impl Agent {
                         document_paths.push(path.to_string())
                     }
                 }
-                let rag =
-                    Rag::init(config, "rag", &rag_path, &document_paths, abort_signal).await?;
-                Some(Arc::new(rag))
+                let key = RagKey::Agent(name.to_string());
+                let app_clone = app.clone();
+                let rag_path_clone = rag_path.clone();
+                let rag = app_state
+                    .rag_cache
+                    .load_with(key, || async move {
+                        Rag::init(
+                            &app_clone,
+                            "rag",
+                            &rag_path_clone,
+                            &document_paths,
+                            abort_signal,
+                        )
+                        .await
+                    })
+                    .await?;
+                Some(rag)
             } else {
                 None
             }
@@ -218,10 +209,7 @@ impl Agent {
             functions,
             rag,
             model,
-            vault: Arc::clone(&config.read().vault),
-            todo_list: TodoList::default(),
-            continuation_count: 0,
-            last_continuation_response: None,
+            vault: app_state.vault.clone(),
         })
     }
 
@@ -295,11 +283,11 @@ impl Agent {
         let mut config = self.config.clone();
         config.instructions = self.interpolated_instructions();
         value["definition"] = json!(config);
-        value["data_dir"] = Config::agent_data_dir(&self.name)
+        value["data_dir"] = paths::agent_data_dir(&self.name)
             .display()
             .to_string()
             .into();
-        value["config_file"] = Config::agent_config_file(&self.name)
+        value["config_file"] = paths::agent_config_file(&self.name)
             .display()
             .to_string()
             .into();
@@ -321,6 +309,14 @@ impl Agent {
 
     pub fn rag(&self) -> Option<Arc<Rag>> {
         self.rag.clone()
+    }
+
+    pub fn append_mcp_meta_functions(&mut self, mcp_servers: Vec<String>) {
+        self.functions.append_mcp_meta_functions(mcp_servers);
+    }
+
+    pub fn mcp_server_names(&self) -> &[String] {
+        &self.config.mcp_servers
     }
 
     pub fn conversation_starters(&self) -> Vec<String> {
@@ -441,44 +437,6 @@ impl Agent {
 
     pub fn escalation_timeout(&self) -> u64 {
         self.config.escalation_timeout
-    }
-
-    pub fn continuation_count(&self) -> usize {
-        self.continuation_count
-    }
-
-    pub fn increment_continuation(&mut self) {
-        self.continuation_count += 1;
-    }
-
-    pub fn reset_continuation(&mut self) {
-        self.continuation_count = 0;
-        self.last_continuation_response = None;
-    }
-
-    pub fn set_last_continuation_response(&mut self, response: String) {
-        self.last_continuation_response = Some(response);
-    }
-
-    pub fn todo_list(&self) -> &TodoList {
-        &self.todo_list
-    }
-
-    pub fn init_todo_list(&mut self, goal: &str) {
-        self.todo_list = TodoList::new(goal);
-    }
-
-    pub fn add_todo(&mut self, task: &str) -> usize {
-        self.todo_list.add(task)
-    }
-
-    pub fn mark_todo_done(&mut self, id: usize) -> bool {
-        self.todo_list.mark_done(id)
-    }
-
-    pub fn clear_todo_list(&mut self) {
-        self.todo_list.clear();
-        self.reset_continuation();
     }
 
     pub fn continuation_prompt(&self) -> String {
@@ -696,12 +654,12 @@ impl AgentConfig {
         Ok(agent_config)
     }
 
-    fn load_envs(&mut self, config: &Config) {
+    fn load_envs(&mut self, app: &AppConfig) {
         let name = &self.name;
         let with_prefix = |v: &str| normalize_env_name(&format!("{name}_{v}"));
 
         if self.agent_session.is_none() {
-            self.agent_session = config.agent_session.clone();
+            self.agent_session = app.agent_session.clone();
         }
 
         if let Some(v) = read_env_value::<String>(&with_prefix("model")) {
@@ -793,7 +751,7 @@ pub struct AgentVariable {
 }
 
 pub fn list_agents() -> Vec<String> {
-    let agents_data_dir = Config::agents_data_dir();
+    let agents_data_dir = paths::agents_data_dir();
     if !agents_data_dir.exists() {
         return vec![];
     }
@@ -803,6 +761,7 @@ pub fn list_agents() -> Vec<String> {
         for entry in entries.flatten() {
             if entry.path().is_dir()
                 && let Some(name) = entry.file_name().to_str()
+                && !name.starts_with('.')
             {
                 agents.push(name.to_string());
             }
@@ -813,7 +772,7 @@ pub fn list_agents() -> Vec<String> {
 }
 
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
-    let config_path = Config::agent_config_file(agent_name);
+    let config_path = paths::agent_config_file(agent_name);
     if !config_path.exists() {
         return vec![];
     }
@@ -831,4 +790,90 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
             (format!("{}=", v.name), Some(description))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_config_parses_from_yaml() {
+        let yaml = r#"
+name: test-agent
+description: A test agent
+instructions: You are helpful
+auto_continue: true
+max_auto_continues: 5
+can_spawn_agents: true
+max_concurrent_agents: 8
+max_agent_depth: 2
+mcp_servers:
+  - github
+  - jira
+global_tools:
+  - execute_command.sh
+  - fs_read.sh
+conversation_starters:
+  - "Hello!"
+  - "How are you?"
+variables:
+  - name: username
+    description: Your name
+"#;
+
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.name, "test-agent");
+        assert_eq!(config.description, "A test agent");
+        assert!(config.auto_continue);
+        assert_eq!(config.max_auto_continues, 5);
+        assert!(config.can_spawn_agents);
+        assert_eq!(config.max_concurrent_agents, 8);
+        assert_eq!(config.max_agent_depth, 2);
+        assert_eq!(config.mcp_servers, vec!["github", "jira"]);
+        assert_eq!(config.global_tools.len(), 2);
+        assert_eq!(config.conversation_starters.len(), 2);
+        assert_eq!(config.variables.len(), 1);
+        assert_eq!(config.variables[0].name, "username");
+    }
+
+    #[test]
+    fn agent_config_defaults() {
+        let yaml = "name: minimal\ninstructions: hi\n";
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.name, "minimal");
+        assert!(!config.auto_continue);
+        assert!(!config.can_spawn_agents);
+        assert_eq!(config.max_concurrent_agents, 4);
+        assert_eq!(config.max_agent_depth, 3);
+        assert_eq!(config.max_auto_continues, 10);
+        assert!(config.mcp_servers.is_empty());
+        assert!(config.global_tools.is_empty());
+        assert!(config.conversation_starters.is_empty());
+        assert!(config.variables.is_empty());
+        assert!(config.model_id.is_none());
+        assert!(config.temperature.is_none());
+        assert!(config.top_p.is_none());
+    }
+
+    #[test]
+    fn agent_config_with_model() {
+        let yaml =
+            "name: test\nmodel: openai:gpt-4\ntemperature: 0.7\ntop_p: 0.9\ninstructions: hi\n";
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.model_id, Some("openai:gpt-4".to_string()));
+        assert_eq!(config.temperature, Some(0.7));
+        assert_eq!(config.top_p, Some(0.9));
+    }
+
+    #[test]
+    fn agent_config_inject_defaults_true() {
+        let yaml = "name: test\ninstructions: hi\n";
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(config.inject_todo_instructions);
+        assert!(config.inject_spawn_instructions);
+    }
 }
