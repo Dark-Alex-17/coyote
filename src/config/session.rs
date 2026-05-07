@@ -692,7 +692,7 @@ mod tests {
         let app_config = Arc::new(AppConfig::default());
         let app_state = Arc::new(AppState {
             config: app_config.clone(),
-            vault: Arc::new(crate::vault::Vault::default()),
+            vault: Arc::new(Vault::default()),
             mcp_factory: Arc::new(mcp_factory::McpFactory::default()),
             rag_cache: Arc::new(rag_cache::RagCache::default()),
             mcp_config: None,
