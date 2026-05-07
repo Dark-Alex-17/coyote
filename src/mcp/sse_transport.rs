@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use fmt::{Display, Formatter};
 use futures_util::StreamExt;
-use mpsc::{Receiver, Sender, channel, OwnedPermit};
+use mpsc::error::SendError;
+use mpsc::{OwnedPermit, Receiver, Sender, channel};
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest_eventsource::{Event, EventSource};
@@ -12,7 +13,6 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
-use mpsc::error::SendError;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use url::Url;
@@ -234,8 +234,7 @@ impl Display for SseSinkError {
 
 impl Error for SseSinkError {}
 
-type ReserveOwned<T> =
-    Pin<Box<dyn Future<Output = Result<OwnedPermit<T>, SendError<()>>> + Send>>;
+type ReserveOwned<T> = Pin<Box<dyn Future<Output = Result<OwnedPermit<T>, SendError<()>>> + Send>>;
 
 struct PollSender<T> {
     tx: Sender<T>,
