@@ -8,6 +8,7 @@ use rust_embed::Embed;
 use serde::Deserialize;
 use std::fs::{File, read_to_string};
 use std::io::Write;
+use std::sync::Arc;
 
 #[derive(Embed)]
 #[folder = "assets/macros"]
@@ -36,9 +37,9 @@ pub async fn macro_execute(
     app_config.enabled_mcp_servers = role.enabled_mcp_servers().clone();
 
     let mut app_state = (*ctx.app).clone();
-    app_state.config = std::sync::Arc::new(app_config);
+    app_state.config = Arc::new(app_config);
 
-    let mut macro_ctx = RequestContext::new(std::sync::Arc::new(app_state), ctx.working_mode);
+    let mut macro_ctx = RequestContext::new(Arc::new(app_state), ctx.working_mode);
     macro_ctx.macro_flag = true;
     macro_ctx.info_flag = ctx.info_flag;
     macro_ctx.model = role.model().clone();
