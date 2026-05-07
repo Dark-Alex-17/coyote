@@ -9,7 +9,7 @@ use crate::utils::{AbortSignal, base64_encode, is_loader_protocol, sha256};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexSet;
-use std::{collections::HashMap, fs::File, io::Read};
+use std::{collections::HashMap, fs::File, io::Read, sync::Arc};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
@@ -17,7 +17,11 @@ const SUMMARY_MAX_WIDTH: usize = 80;
 
 #[derive(Debug, Clone)]
 pub struct Input {
-    config: GlobalConfig,
+    app_config: Arc<AppConfig>,
+    stream_enabled: bool,
+    session: Option<Session>,
+    rag: Option<Arc<Rag>>,
+    functions: Option<Vec<FunctionDeclaration>>,
     text: String,
     raw: (String, Vec<String>),
     patched_text: Option<String>,
@@ -34,10 +38,15 @@ pub struct Input {
 }
 
 impl Input {
-    pub fn from_str(config: &GlobalConfig, text: &str, role: Option<Role>) -> Self {
-        let (role, with_session, with_agent) = resolve_role(&config.read(), role);
+    pub fn from_str(ctx: &RequestContext, text: &str, role: Option<Role>) -> Self {
+        let (role, with_session, with_agent) = resolve_role(ctx, role);
+        let captured = capture_input_config(ctx, &role);
         Self {
-            config: config.clone(),
+            app_config: Arc::clone(&ctx.app.config),
+            stream_enabled: captured.stream_enabled,
+            session: captured.session,
+            rag: captured.rag,
+            functions: captured.functions,
             text: text.to_string(),
             raw: (text.to_string(), vec![]),
             patched_text: None,
@@ -55,12 +64,12 @@ impl Input {
     }
 
     pub async fn from_files(
-        config: &GlobalConfig,
+        ctx: &RequestContext,
         raw_text: &str,
         paths: Vec<String>,
         role: Option<Role>,
     ) -> Result<Self> {
-        let loaders = config.read().document_loaders.clone();
+        let loaders = ctx.app.config.document_loaders.clone();
         let (raw_paths, local_paths, remote_urls, external_cmds, protocol_paths, with_last_reply) =
             resolve_paths(&loaders, paths)?;
         let mut last_reply = None;
@@ -78,7 +87,7 @@ impl Input {
             texts.push(raw_text.to_string());
         };
         if with_last_reply {
-            if let Some(LastMessage { input, output, .. }) = config.read().last_message.as_ref() {
+            if let Some(LastMessage { input, output, .. }) = ctx.last_message.as_ref() {
                 if !output.is_empty() {
                     last_reply = Some(output.clone())
                 } else if let Some(v) = input.last_reply.as_ref() {
@@ -102,9 +111,14 @@ impl Input {
                 ));
             }
         }
-        let (role, with_session, with_agent) = resolve_role(&config.read(), role);
+        let (role, with_session, with_agent) = resolve_role(ctx, role);
+        let captured = capture_input_config(ctx, &role);
         Ok(Self {
-            config: config.clone(),
+            app_config: Arc::clone(&ctx.app.config),
+            stream_enabled: captured.stream_enabled,
+            session: captured.session,
+            rag: captured.rag,
+            functions: captured.functions,
             text: texts.join("\n"),
             raw: (raw_text.to_string(), raw_paths),
             patched_text: None,
@@ -122,14 +136,14 @@ impl Input {
     }
 
     pub async fn from_files_with_spinner(
-        config: &GlobalConfig,
+        ctx: &RequestContext,
         raw_text: &str,
         paths: Vec<String>,
         role: Option<Role>,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
         abortable_run_with_spinner(
-            Input::from_files(config, raw_text, paths, role),
+            Input::from_files(ctx, raw_text, paths, role),
             "Loading files",
             abort_signal,
         )
@@ -164,7 +178,7 @@ impl Input {
     }
 
     pub fn stream(&self) -> bool {
-        self.config.read().stream && !self.role().model().no_stream()
+        self.stream_enabled && !self.role().model().no_stream()
     }
 
     pub fn continue_output(&self) -> Option<&str> {
@@ -183,10 +197,9 @@ impl Input {
         self.regenerate
     }
 
-    pub fn set_regenerate(&mut self) {
-        let role = self.config.read().extract_role();
-        if role.name() == self.role().name() {
-            self.role = role;
+    pub fn set_regenerate(&mut self, current_role: Role) {
+        if current_role.name() == self.role().name() {
+            self.role = current_role;
         }
         self.regenerate = true;
         self.tool_calls = None;
@@ -196,9 +209,10 @@ impl Input {
         if self.text.is_empty() {
             return Ok(());
         }
-        let rag = self.config.read().rag.clone();
-        if let Some(rag) = rag {
-            let result = Config::search_rag(&self.config, &rag, &self.text, abort_signal).await?;
+        if let Some(rag) = &self.rag {
+            let result = rag
+                .search_with_template(&self.app_config, &self.text, abort_signal)
+                .await?;
             self.patched_text = Some(result);
             self.rag_name = Some(rag.name().to_string());
         }
@@ -220,7 +234,7 @@ impl Input {
     }
 
     pub fn create_client(&self) -> Result<Box<dyn Client>> {
-        init_client(&self.config, Some(self.role().model().clone()))
+        init_client(&self.app_config, self.role().model().clone())
     }
 
     pub async fn fetch_chat_text(&self) -> Result<String> {
@@ -240,7 +254,7 @@ impl Input {
         model.guard_max_input_tokens(&messages)?;
         let (temperature, top_p) = (self.role().temperature(), self.role().top_p());
         let functions = if model.supports_function_calling() {
-            let fns = self.config.read().select_functions(self.role());
+            let fns = self.functions.clone();
             if let Some(vec) = &fns {
                 for def in vec {
                     debug!("Function definition: {:?}", def.name);
@@ -260,7 +274,7 @@ impl Input {
     }
 
     pub fn build_messages(&self) -> Result<Vec<Message>> {
-        let mut messages = if let Some(session) = self.session(&self.config.read().session) {
+        let mut messages = if let Some(session) = self.session(&self.session) {
             session.build_messages(self)
         } else {
             self.role().build_messages(self)
@@ -275,7 +289,7 @@ impl Input {
     }
 
     pub fn echo_messages(&self) -> String {
-        if let Some(session) = self.session(&self.config.read().session) {
+        if let Some(session) = self.session(&self.session) {
             session.echo_messages(self)
         } else {
             self.role().echo_messages(self)
@@ -384,14 +398,30 @@ impl Input {
     }
 }
 
-fn resolve_role(config: &Config, role: Option<Role>) -> (Role, bool, bool) {
+fn resolve_role(ctx: &RequestContext, role: Option<Role>) -> (Role, bool, bool) {
     match role {
         Some(v) => (v, false, false),
         None => (
-            config.extract_role(),
-            config.session.is_some(),
-            config.agent.is_some(),
+            ctx.extract_role(ctx.app.config.as_ref()),
+            ctx.session.is_some(),
+            ctx.agent.is_some(),
         ),
+    }
+}
+
+struct CapturedInputConfig {
+    stream_enabled: bool,
+    session: Option<Session>,
+    rag: Option<Arc<Rag>>,
+    functions: Option<Vec<FunctionDeclaration>>,
+}
+
+fn capture_input_config(ctx: &RequestContext, role: &Role) -> CapturedInputConfig {
+    CapturedInputConfig {
+        stream_enabled: ctx.app.config.stream,
+        session: ctx.session.clone(),
+        rag: ctx.rag.clone(),
+        functions: ctx.select_functions(role),
     }
 }
 
@@ -547,4 +577,391 @@ fn read_media_to_data_url(image_path: &str) -> Result<String> {
     let data_url = format!("data:{mime_type};base64,{encoded_image}");
 
     Ok(data_url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::request_context::RequestContext;
+    use crate::config::{AppState, WorkingMode};
+    use std::fs;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    fn default_app_state() -> Arc<AppState> {
+        Arc::new(AppState::test_default())
+    }
+
+    fn create_test_ctx() -> RequestContext {
+        RequestContext::new(default_app_state(), WorkingMode::Cmd)
+    }
+
+    #[test]
+    fn resolve_role_with_explicit_role() {
+        let ctx = create_test_ctx();
+        let role = Role::new("custom", "be helpful");
+        let (resolved, with_session, with_agent) = resolve_role(&ctx, Some(role));
+        assert_eq!(resolved.name(), "custom");
+        assert!(!with_session);
+        assert!(!with_agent);
+    }
+
+    #[test]
+    fn resolve_role_without_role_no_session_no_agent() {
+        let ctx = create_test_ctx();
+        let (resolved, with_session, with_agent) = resolve_role(&ctx, None);
+        assert_eq!(resolved.name(), "");
+        assert!(!with_session);
+        assert!(!with_agent);
+    }
+
+    #[test]
+    fn resolve_role_without_role_with_session() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let (_resolved, with_session, with_agent) = resolve_role(&ctx, None);
+        assert!(with_session);
+        assert!(!with_agent);
+    }
+
+    #[test]
+    fn resolve_role_explicit_role_overrides_session_flag() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let role = Role::new("explicit", "prompt");
+        let (_resolved, with_session, _with_agent) = resolve_role(&ctx, Some(role));
+        assert!(!with_session);
+    }
+
+    #[test]
+    fn resolve_paths_detects_last_reply_syntax() {
+        let loaders = HashMap::new();
+        let (_, _, _, _, _, with_last_reply) =
+            resolve_paths(&loaders, vec!["%%".to_string()]).unwrap();
+        assert!(with_last_reply);
+    }
+
+    #[test]
+    fn resolve_paths_detects_url() {
+        let loaders = HashMap::new();
+        let (_, local, remote, _, _, _) =
+            resolve_paths(&loaders, vec!["https://example.com".to_string()]).unwrap();
+        assert!(local.is_empty());
+        assert_eq!(remote, vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn resolve_paths_detects_external_command() {
+        let loaders = HashMap::new();
+        let (_, _, _, external, _, _) =
+            resolve_paths(&loaders, vec!["`echo hello`".to_string()]).unwrap();
+        assert_eq!(external, vec!["echo hello"]);
+    }
+
+    #[test]
+    fn resolve_paths_empty_input() {
+        let loaders = HashMap::new();
+        let (raw, local, remote, external, protocol, with_last) =
+            resolve_paths(&loaders, vec![]).unwrap();
+        assert!(raw.is_empty());
+        assert!(local.is_empty());
+        assert!(remote.is_empty());
+        assert!(external.is_empty());
+        assert!(protocol.is_empty());
+        assert!(!with_last);
+    }
+
+    #[test]
+    fn resolve_paths_rejects_url_with_glob_suffix() {
+        let loaders = HashMap::new();
+        let result = resolve_paths(&loaders, vec!["https://example.com**".to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_paths_mixed_inputs() {
+        let loaders = HashMap::new();
+        let paths = vec![
+            "%%".to_string(),
+            "https://example.com".to_string(),
+            "`ls`".to_string(),
+        ];
+        let (_, _, remote, external, _, with_last) = resolve_paths(&loaders, paths).unwrap();
+        assert!(with_last);
+        assert_eq!(remote.len(), 1);
+        assert_eq!(external.len(), 1);
+    }
+
+    #[test]
+    fn input_from_str_captures_text() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "hello world", None);
+        assert_eq!(input.text(), "hello world");
+    }
+
+    #[test]
+    fn input_from_str_with_explicit_role() {
+        let ctx = create_test_ctx();
+        let role = Role::new("pirate", "you are a pirate");
+        let input = Input::from_str(&ctx, "ahoy", Some(role));
+        assert_eq!(input.role().name(), "pirate");
+        assert!(!input.with_agent());
+    }
+
+    #[test]
+    fn input_from_str_captures_stream_from_config() {
+        let mut state = AppState::test_default();
+        let mut config = (*state.config).clone();
+        config.stream = false;
+        state.config = Arc::new(config);
+        let ctx = RequestContext::new(Arc::new(state), WorkingMode::Cmd);
+        let input = Input::from_str(&ctx, "test", None);
+        assert!(!input.stream_enabled);
+    }
+
+    #[test]
+    fn input_is_empty_with_no_text_and_no_medias() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "", None);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn input_is_not_empty_with_text() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "hello", None);
+        assert!(!input.is_empty());
+    }
+
+    #[test]
+    fn input_set_text_changes_text() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "original", None);
+        input.set_text("modified".to_string());
+        assert_eq!(input.text(), "modified");
+    }
+
+    #[test]
+    fn input_text_returns_patched_when_set() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "original", None);
+        input.patched_text = Some("patched".to_string());
+        assert_eq!(input.text(), "patched");
+    }
+
+    #[test]
+    fn input_clear_patch_restores_original() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "original", None);
+        input.patched_text = Some("patched".to_string());
+        input.clear_patch();
+        assert_eq!(input.text(), "original");
+    }
+
+    #[test]
+    fn input_set_continue_output_accumulates() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "test", None);
+        assert!(input.continue_output().is_none());
+        input.set_continue_output("first ");
+        assert_eq!(input.continue_output(), Some("first "));
+        input.set_continue_output("second");
+        assert_eq!(input.continue_output(), Some("first second"));
+    }
+
+    #[test]
+    fn input_set_regenerate_sets_flag_and_clears_tool_calls() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "test", None);
+        let role = input.role().clone();
+        assert!(!input.regenerate());
+        input.set_regenerate(role);
+        assert!(input.regenerate());
+        assert!(input.tool_calls().is_none());
+    }
+
+    #[test]
+    fn input_summary_truncates_long_text() {
+        let ctx = create_test_ctx();
+        let long_text = "a".repeat(200);
+        let input = Input::from_str(&ctx, &long_text, None);
+        let summary = input.summary();
+        assert!(summary.len() < 200);
+        assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn input_summary_preserves_short_text() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "short", None);
+        assert_eq!(input.summary(), "short");
+    }
+
+    #[test]
+    fn input_raw_with_no_files() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "hello", None);
+        assert_eq!(input.raw(), "hello");
+    }
+
+    #[test]
+    fn input_render_with_no_medias() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "hello", None);
+        assert_eq!(input.render(), "hello");
+    }
+
+    #[test]
+    fn input_with_agent_false_when_no_agent() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "test", None);
+        assert!(!input.with_agent());
+    }
+
+    #[test]
+    fn input_session_returns_none_when_with_session_false() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "test", Some(Role::new("r", "p")));
+        let session = Some(Session::default());
+        assert!(input.session(&session).is_none());
+    }
+
+    #[test]
+    fn input_session_returns_some_when_with_session_true() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let input = Input::from_str(&ctx, "test", None);
+        let session = Some(Session::default());
+        assert!(input.session(&session).is_some());
+    }
+
+    #[test]
+    fn is_image_recognizes_image_extensions() {
+        assert!(is_image("photo.png"));
+        assert!(is_image("photo.jpeg"));
+        assert!(is_image("photo.jpg"));
+        assert!(is_image("photo.webp"));
+        assert!(is_image("photo.gif"));
+    }
+
+    #[test]
+    fn is_image_rejects_non_image_extensions() {
+        assert!(!is_image("file.txt"));
+        assert!(!is_image("file.rs"));
+        assert!(!is_image("file.pdf"));
+    }
+
+    #[test]
+    fn resolve_data_url_returns_path_for_known_hash() {
+        let mut data_urls = HashMap::new();
+        let data_url = "data:image/png;base64,abc123";
+        let hash = sha256(data_url);
+        data_urls.insert(hash, "/path/to/image.png".to_string());
+        let result = resolve_data_url(&data_urls, data_url.to_string());
+        assert_eq!(result, "/path/to/image.png");
+    }
+
+    #[test]
+    fn resolve_data_url_returns_original_for_non_data_url() {
+        let data_urls = HashMap::new();
+        let result = resolve_data_url(&data_urls, "https://example.com/image.png".to_string());
+        assert_eq!(result, "https://example.com/image.png");
+    }
+
+    fn run_async<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn from_files_loads_single_text_file() {
+        let dir = env::temp_dir().join(format!(
+            "loki-input-test-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test.txt");
+        fs::write(&file_path, "file content here").unwrap();
+
+        let ctx = create_test_ctx();
+        let input = run_async(Input::from_files(
+            &ctx,
+            "question",
+            vec![file_path.to_string_lossy().to_string()],
+            None,
+        ))
+        .unwrap();
+
+        assert!(input.text().contains("file content here"));
+        assert!(input.text().contains("question"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_files_loads_multiple_files() {
+        let dir = env::temp_dir().join(format!(
+            "loki-input-test-multi-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "content A").unwrap();
+        fs::write(dir.join("b.txt"), "content B").unwrap();
+
+        let ctx = create_test_ctx();
+        let input = run_async(Input::from_files(
+            &ctx,
+            "question",
+            vec![
+                dir.join("a.txt").to_string_lossy().to_string(),
+                dir.join("b.txt").to_string_lossy().to_string(),
+            ],
+            None,
+        ))
+        .unwrap();
+
+        assert!(input.text().contains("content A"));
+        assert!(input.text().contains("content B"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_files_with_no_paths_just_text() {
+        let ctx = create_test_ctx();
+        let input = run_async(Input::from_files(&ctx, "just text", vec![], None)).unwrap();
+        assert_eq!(input.text(), "just text");
+    }
+
+    #[test]
+    fn from_files_with_external_command() {
+        let ctx = create_test_ctx();
+        let input = run_async(Input::from_files(
+            &ctx,
+            "question",
+            vec!["`echo hello from cmd`".to_string()],
+            None,
+        ))
+        .unwrap();
+        assert!(input.text().contains("hello from cmd"));
+    }
+
+    #[test]
+    fn from_files_nonexistent_file_errors() {
+        let ctx = create_test_ctx();
+        let result = run_async(Input::from_files(
+            &ctx,
+            "question",
+            vec!["/nonexistent/path/xyz.txt".to_string()],
+            None,
+        ));
+        assert!(result.is_err());
+    }
 }

@@ -33,7 +33,7 @@ use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use is_terminal::IsTerminal;
 use std::borrow::Cow;
 use std::sync::LazyLock;
-use std::{env, path::PathBuf, process};
+use std::{cmp, env, path::PathBuf, process};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub static CODE_BLOCK_RE: LazyLock<Regex> =
@@ -123,7 +123,7 @@ where
             Some((v, score))
         })
         .collect();
-    list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    list.sort_unstable_by_key(|b| cmp::Reverse(b.1));
     list.into_iter().map(|(v, _)| v).collect()
 }
 

@@ -1,5 +1,7 @@
 use crate::client::{ModelType, list_models};
-use crate::config::{Config, list_agents};
+use crate::config::paths;
+use crate::config::{AppConfig, Config, list_agents, list_sessions};
+use crate::vault::Vault;
 use clap_complete::{CompletionCandidate, Shell, generate};
 use clap_complete_nushell::Nushell;
 use std::ffi::OsStr;
@@ -32,8 +34,8 @@ impl ShellCompletion {
 
 pub(super) fn model_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    match Config::init_bare() {
-        Ok(config) => list_models(&config, ModelType::Chat)
+    match load_app_config_for_completion() {
+        Ok(app_config) => list_models(&app_config, ModelType::Chat)
             .into_iter()
             .filter(|&m| m.id().starts_with(&*cur))
             .map(|m| CompletionCandidate::new(m.id()))
@@ -42,9 +44,23 @@ pub(super) fn model_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     }
 }
 
+fn load_app_config_for_completion() -> anyhow::Result<AppConfig> {
+    let h = tokio::runtime::Handle::try_current().ok();
+    let cfg = match h {
+        Some(handle) => {
+            tokio::task::block_in_place(|| handle.block_on(Config::load_with_interpolation(true)))?
+        }
+        None => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(Config::load_with_interpolation(true))?
+        }
+    };
+    AppConfig::from_config(cfg)
+}
+
 pub(super) fn role_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    Config::list_roles(true)
+    paths::list_roles(true)
         .into_iter()
         .filter(|r| r.starts_with(&*cur))
         .map(CompletionCandidate::new)
@@ -62,7 +78,7 @@ pub(super) fn agent_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
 pub(super) fn rag_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    Config::list_rags()
+    paths::list_rags()
         .into_iter()
         .filter(|r| r.starts_with(&*cur))
         .map(CompletionCandidate::new)
@@ -71,7 +87,7 @@ pub(super) fn rag_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
 pub(super) fn macro_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    Config::list_macros()
+    paths::list_macros()
         .into_iter()
         .filter(|m| m.starts_with(&*cur))
         .map(CompletionCandidate::new)
@@ -80,22 +96,17 @@ pub(super) fn macro_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
 pub(super) fn session_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    match Config::init_bare() {
-        Ok(config) => config
-            .list_sessions()
-            .into_iter()
-            .filter(|s| s.starts_with(&*cur))
-            .map(CompletionCandidate::new)
-            .collect(),
-        Err(_) => vec![],
-    }
+    list_sessions()
+        .into_iter()
+        .filter(|s| s.starts_with(&*cur))
+        .map(CompletionCandidate::new)
+        .collect()
 }
 
 pub(super) fn secrets_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    match Config::init_bare() {
-        Ok(config) => config
-            .vault
+    match load_app_config_for_completion() {
+        Ok(app_config) => Vault::init(&app_config)
             .list_secrets(false)
             .unwrap_or_default()
             .into_iter()

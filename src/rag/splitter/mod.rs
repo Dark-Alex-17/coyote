@@ -171,7 +171,6 @@ impl RecursiveCharacterTextSplitter {
             }
         }
 
-        // Now that we have the separator, split the text
         let splits = split_on_separator(text, &separator, keep_separator);
 
         // Now go merging things, recursively splitting longer texts.

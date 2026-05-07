@@ -15,19 +15,19 @@ mod vault;
 #[macro_use]
 extern crate log;
 
+use crate::cli::Cli;
 use crate::client::{
     ModelType, call_chat_completions, call_chat_completions_streaming, list_models, oauth,
 };
+use crate::config::paths;
 use crate::config::{
-    Agent, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, GlobalConfig, Input, SHELL_ROLE,
-    TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, load_env_file,
-    macro_execute,
+    Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, RequestContext,
+    SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, install_builtins,
+    list_agents, load_env_file, macro_execute, sync_models,
 };
 use crate::render::{prompt_theme, render_error};
 use crate::repl::Repl;
 use crate::utils::*;
-
-use crate::cli::Cli;
 use crate::vault::Vault;
 use anyhow::{Result, anyhow, bail};
 use clap::{CommandFactory, Parser};
@@ -40,9 +40,8 @@ use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
 use oauth::OAuthProvider;
-use parking_lot::RwLock;
 use std::path::PathBuf;
-use std::{env, mem, process, sync::Arc};
+use std::{env, process, sync::Arc};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -83,63 +82,81 @@ async fn main() -> Result<()> {
 
     let log_path = setup_logger()?;
 
+    install_builtins()?;
+
     if let Some(client_arg) = &cli.authenticate {
-        let config = Config::init_bare()?;
-        let (client_name, provider) = resolve_oauth_client(client_arg.as_deref(), &config.clients)?;
+        let cfg = Config::load_with_interpolation(true).await?;
+        let app_config = AppConfig::from_config(cfg)?;
+        let (client_name, provider) =
+            resolve_oauth_client(client_arg.as_deref(), &app_config.clients)?;
         oauth::run_oauth_flow(&*provider, &client_name).await?;
         return Ok(());
     }
 
     if vault_flags {
-        return Vault::handle_vault_flags(cli, Config::init_bare()?);
+        let cfg = Config::load_with_interpolation(true).await?;
+        let app_config = AppConfig::from_config(cfg)?;
+        let vault = Vault::init(&app_config);
+        return Vault::handle_vault_flags(cli, &vault);
     }
 
     let abort_signal = create_abort_signal();
     let start_mcp_servers = cli.agent.is_none() && cli.role.is_none();
-    let config = Arc::new(RwLock::new(
-        Config::init(
-            working_mode,
-            info_flag,
-            start_mcp_servers,
+    let cfg = Config::load_with_interpolation(info_flag).await?;
+    let app_config: Arc<AppConfig> = Arc::new(AppConfig::from_config(cfg)?);
+    let app_state: Arc<AppState> = Arc::new(
+        AppState::init(
+            app_config,
             log_path,
+            start_mcp_servers,
             abort_signal.clone(),
         )
         .await?,
-    ));
+    );
+    let ctx = RequestContext::bootstrap(app_state, working_mode, info_flag)?;
 
     {
-        let cfg = config.read();
-        if cfg.highlight {
-            set_global_render_config(prompt_theme(cfg.render_options()?)?)
+        let app = &*ctx.app.config;
+        if app.highlight {
+            set_global_render_config(prompt_theme(app.render_options()?)?)
         }
     }
 
-    if let Err(err) = run(config, cli, text, abort_signal).await {
+    if let Err(err) = run(ctx, cli, text, abort_signal).await {
         render_error(err);
         process::exit(1);
     }
     Ok(())
 }
 
+fn update_app_config(ctx: &mut RequestContext, update: impl FnOnce(&mut AppConfig)) {
+    let mut app_config = (*ctx.app.config).clone();
+    update(&mut app_config);
+
+    let mut app_state = (*ctx.app).clone();
+    app_state.config = Arc::new(app_config);
+    ctx.app = Arc::new(app_state);
+}
+
 async fn run(
-    config: GlobalConfig,
+    mut ctx: RequestContext,
     cli: Cli,
     text: Option<String>,
     abort_signal: AbortSignal,
 ) -> Result<()> {
     if cli.sync_models {
-        let url = config.read().sync_models_url();
-        return Config::sync_models(&url, abort_signal.clone()).await;
+        let url = ctx.app.config.sync_models_url();
+        return sync_models(&url, abort_signal.clone()).await;
     }
 
     if cli.list_models {
-        for model in list_models(&config.read(), ModelType::Chat) {
+        for model in list_models(ctx.app.config.as_ref(), ModelType::Chat) {
             println!("{}", model.id());
         }
         return Ok(());
     }
     if cli.list_roles {
-        let roles = Config::list_roles(true).join("\n");
+        let roles = paths::list_roles(true).join("\n");
         println!("{roles}");
         return Ok(());
     }
@@ -149,24 +166,32 @@ async fn run(
         return Ok(());
     }
     if cli.list_rags {
-        let rags = Config::list_rags().join("\n");
+        let rags = paths::list_rags().join("\n");
         println!("{rags}");
         return Ok(());
     }
     if cli.list_macros {
-        let macros = Config::list_macros().join("\n");
+        let macros = paths::list_macros().join("\n");
         println!("{macros}");
         return Ok(());
     }
 
     if cli.dry_run {
-        config.write().dry_run = true;
+        update_app_config(&mut ctx, |app| app.dry_run = true);
     }
 
     if let Some(agent) = &cli.agent {
         if cli.build_tools {
             info!("Building tools for agent '{agent}'...");
-            Agent::init(&config, agent, abort_signal.clone()).await?;
+            Agent::init(
+                &ctx.app.config,
+                &ctx.app,
+                &ctx.model,
+                ctx.info_flag,
+                agent,
+                abort_signal.clone(),
+            )
+            .await?;
             return Ok(());
         }
 
@@ -175,37 +200,40 @@ async fn run(
             None => TEMP_SESSION_NAME,
         });
         if !cli.agent_variable.is_empty() {
-            config.write().agent_variables = Some(
+            ctx.agent_variables = Some(
                 cli.agent_variable
                     .chunks(2)
                     .map(|v| (v[0].to_string(), v[1].to_string()))
                     .collect(),
             );
         }
-
-        let ret = Config::use_agent(&config, agent, session, abort_signal.clone()).await;
-        config.write().agent_variables = None;
-        ret?;
+        let app = Arc::clone(&ctx.app.config);
+        ctx.use_agent(app.as_ref(), agent, session, abort_signal.clone())
+            .await?;
     } else {
+        let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
         if let Some(prompt) = &cli.prompt {
-            config.write().use_prompt(prompt)?;
+            ctx.use_prompt(app.as_ref(), prompt)?;
         } else if let Some(name) = &cli.role {
-            Config::use_role_safely(&config, name, abort_signal.clone()).await?;
+            ctx.use_role(app.as_ref(), name, abort_signal.clone())
+                .await?;
         } else if cli.execute {
-            Config::use_role_safely(&config, SHELL_ROLE, abort_signal.clone()).await?;
+            ctx.use_role(app.as_ref(), SHELL_ROLE, abort_signal.clone())
+                .await?;
         } else if cli.code {
-            Config::use_role_safely(&config, CODE_ROLE, abort_signal.clone()).await?;
+            ctx.use_role(app.as_ref(), CODE_ROLE, abort_signal.clone())
+                .await?;
         }
         if let Some(session) = &cli.session {
-            Config::use_session_safely(
-                &config,
+            ctx.use_session(
+                app.as_ref(),
                 session.as_ref().map(|v| v.as_str()),
                 abort_signal.clone(),
             )
             .await?;
         }
         if let Some(rag) = &cli.rag {
-            Config::use_rag(&config, Some(rag), abort_signal.clone()).await?;
+            ctx.use_rag(Some(rag), abort_signal.clone()).await?;
         }
     }
 
@@ -214,106 +242,96 @@ async fn run(
     }
 
     if cli.list_sessions {
-        let sessions = config.read().list_sessions().join("\n");
+        let sessions = ctx.list_sessions().join("\n");
         println!("{sessions}");
         return Ok(());
     }
     if let Some(model_id) = &cli.model {
-        config.write().set_model(model_id)?;
+        let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
+        ctx.set_model_on_role_like(app.as_ref(), model_id)?;
     }
     if cli.no_stream {
-        config.write().stream = false;
+        update_app_config(&mut ctx, |app| app.stream = false);
     }
     if cli.empty_session {
-        config.write().empty_session()?;
+        ctx.empty_session()?;
     }
     if cli.save_session {
-        config.write().set_save_session_this_time()?;
+        ctx.set_save_session_this_time()?;
     }
     if cli.info {
-        let info = config.read().info()?;
+        let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
+        let info = ctx.info(app.as_ref())?;
         println!("{info}");
         return Ok(());
     }
-    let is_repl = config.read().working_mode.is_repl();
+    let is_repl = ctx.working_mode.is_repl();
     if cli.rebuild_rag {
-        Config::rebuild_rag(&config, abort_signal.clone()).await?;
+        ctx.rebuild_rag(abort_signal.clone()).await?;
         if is_repl {
             return Ok(());
         }
     }
     if let Some(name) = &cli.macro_name {
-        macro_execute(&config, name, text.as_deref(), abort_signal.clone()).await?;
+        macro_execute(&mut ctx, name, text.as_deref(), abort_signal.clone()).await?;
         return Ok(());
     }
     if cli.execute && !is_repl {
-        let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
-        shell_execute(&config, &SHELL, input, abort_signal.clone()).await?;
+        let input = create_input(&ctx, text, &cli.file, abort_signal.clone()).await?;
+        shell_execute(&mut ctx, &SHELL, input, abort_signal.clone()).await?;
         return Ok(());
     }
 
-    apply_prelude_safely(&config, abort_signal.clone()).await?;
+    {
+        let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
+        ctx.apply_prelude(app.as_ref(), abort_signal.clone())
+            .await?;
+    }
 
     match is_repl {
         false => {
-            let mut input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
+            let mut input = create_input(&ctx, text, &cli.file, abort_signal.clone()).await?;
             input.use_embeddings(abort_signal.clone()).await?;
-            start_directive(&config, input, cli.code, abort_signal).await
+            start_directive(&mut ctx, input, cli.code, abort_signal).await
         }
         true => {
             if !*IS_STDOUT_TERMINAL {
                 bail!("No TTY for REPL")
             }
-            start_interactive(&config).await
+            start_interactive(ctx).await
         }
     }
 }
 
-async fn apply_prelude_safely(config: &RwLock<Config>, abort_signal: AbortSignal) -> Result<()> {
-    let mut cfg = {
-        let mut guard = config.write();
-        mem::take(&mut *guard)
-    };
-
-    cfg.apply_prelude(abort_signal.clone()).await?;
-
-    {
-        let mut guard = config.write();
-        *guard = cfg;
-    }
-
-    Ok(())
-}
-
 #[async_recursion::async_recursion]
 async fn start_directive(
-    config: &GlobalConfig,
+    ctx: &mut RequestContext,
     input: Input,
     code_mode: bool,
     abort_signal: AbortSignal,
 ) -> Result<()> {
+    let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
     let client = input.create_client()?;
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
-    config.write().before_chat_completion(&input)?;
+    ctx.before_chat_completion(&input)?;
     let (output, tool_results) = if !input.stream() || extract_code {
         call_chat_completions(
             &input,
             true,
             extract_code,
             client.as_ref(),
+            ctx,
             abort_signal.clone(),
         )
         .await?
     } else {
-        call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await?
+        call_chat_completions_streaming(&input, client.as_ref(), ctx, abort_signal.clone()).await?
     };
-    config
-        .write()
-        .after_chat_completion(&input, &output, &tool_results)?;
+    ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
 
     if !tool_results.is_empty() {
         start_directive(
-            config,
+            ctx,
             input.merge_tool_results(output, tool_results),
             code_mode,
             abort_signal,
@@ -321,35 +339,41 @@ async fn start_directive(
         .await?;
     }
 
-    config.write().exit_session()?;
+    ctx.exit_session()?;
     Ok(())
 }
 
-async fn start_interactive(config: &GlobalConfig) -> Result<()> {
-    let mut repl: Repl = Repl::init(config)?;
+async fn start_interactive(ctx: RequestContext) -> Result<()> {
+    let mut repl: Repl = Repl::init(ctx)?;
     repl.run().await
 }
 
 #[async_recursion::async_recursion]
 async fn shell_execute(
-    config: &GlobalConfig,
+    ctx: &mut RequestContext,
     shell: &Shell,
     mut input: Input,
     abort_signal: AbortSignal,
 ) -> Result<()> {
+    let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
     let client = input.create_client()?;
-    config.write().before_chat_completion(&input)?;
-    let (eval_str, _) =
-        call_chat_completions(&input, false, true, client.as_ref(), abort_signal.clone()).await?;
+    ctx.before_chat_completion(&input)?;
+    let (eval_str, _) = call_chat_completions(
+        &input,
+        false,
+        true,
+        client.as_ref(),
+        ctx,
+        abort_signal.clone(),
+    )
+    .await?;
 
-    config
-        .write()
-        .after_chat_completion(&input, &eval_str, &[])?;
+    ctx.after_chat_completion(app.as_ref(), &input, &eval_str, &[])?;
     if eval_str.is_empty() {
         bail!("No command generated");
     }
-    if config.read().dry_run {
-        config.read().print_markdown(&eval_str)?;
+    if app.dry_run {
+        app.print_markdown(&eval_str)?;
         return Ok(());
     }
     if *IS_STDOUT_TERMINAL {
@@ -370,7 +394,7 @@ async fn shell_execute(
                 'e' => {
                     debug!("{} {:?}", shell.cmd, &[&shell.arg, &eval_str]);
                     let code = run_command(&shell.cmd, &[&shell.arg, &eval_str], None)?;
-                    if code == 0 && config.read().save_shell_history {
+                    if code == 0 && app.save_shell_history {
                         let _ = append_to_shell_history(&shell.name, &eval_str, code);
                     }
                     process::exit(code);
@@ -379,15 +403,16 @@ async fn shell_execute(
                     let revision = Text::new("Enter your revision:").prompt()?;
                     let text = format!("{}\n{revision}", input.text());
                     input.set_text(text);
-                    return shell_execute(config, shell, input, abort_signal.clone()).await;
+                    return shell_execute(ctx, shell, input, abort_signal.clone()).await;
                 }
                 'd' => {
-                    let role = config.read().retrieve_role(EXPLAIN_SHELL_ROLE)?;
-                    let input = Input::from_str(config, &eval_str, Some(role));
+                    let role = ctx.retrieve_role(app.as_ref(), EXPLAIN_SHELL_ROLE)?;
+                    let input = Input::from_str(ctx, &eval_str, Some(role));
                     if input.stream() {
                         call_chat_completions_streaming(
                             &input,
                             client.as_ref(),
+                            ctx,
                             abort_signal.clone(),
                         )
                         .await?;
@@ -397,6 +422,7 @@ async fn shell_execute(
                             true,
                             false,
                             client.as_ref(),
+                            ctx,
                             abort_signal.clone(),
                         )
                         .await?;
@@ -419,22 +445,16 @@ async fn shell_execute(
 }
 
 async fn create_input(
-    config: &GlobalConfig,
+    ctx: &RequestContext,
     text: Option<String>,
     file: &[String],
     abort_signal: AbortSignal,
 ) -> Result<Input> {
+    let text = text.unwrap_or_default();
     let input = if file.is_empty() {
-        Input::from_str(config, &text.unwrap_or_default(), None)
+        Input::from_str(ctx, &text, None)
     } else {
-        Input::from_files_with_spinner(
-            config,
-            &text.unwrap_or_default(),
-            file.to_vec(),
-            None,
-            abort_signal,
-        )
-        .await?
+        Input::from_files_with_spinner(ctx, &text, file.to_vec(), None, abort_signal).await?
     };
     if input.is_empty() {
         bail!("No input");
@@ -443,7 +463,7 @@ async fn create_input(
 }
 
 fn setup_logger() -> Result<Option<PathBuf>> {
-    let (log_level, log_path) = Config::log_config()?;
+    let (log_level, log_path) = paths::log_config()?;
     if log_level == LevelFilter::Off {
         return Ok(None);
     }
