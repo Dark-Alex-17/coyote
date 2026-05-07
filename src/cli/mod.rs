@@ -6,7 +6,7 @@ use crate::cli::completer::{
 };
 use anyhow::{Context, Result};
 use clap::ValueHint;
-use clap::{Parser, crate_authors, crate_description, crate_name, crate_version};
+use clap::{Parser, crate_authors, crate_description, crate_version};
 use clap_complete::ArgValueCompleter;
 use is_terminal::IsTerminal;
 use std::io::{Read, stdin};
@@ -14,7 +14,7 @@ use std::io::{Read, stdin};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 #[command(
-	name = crate_name!(),
+	name = "loki",
 	author = crate_authors!(),
 	version = crate_version!(),
 	about = crate_description!(),
