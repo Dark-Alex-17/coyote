@@ -55,6 +55,14 @@ pub struct Role {
     enabled_tools: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled_mcp_servers: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_continue: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_auto_continues: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inject_todo_instructions: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation_prompt: Option<String>,
 
     #[serde(skip)]
     model: Model,
@@ -89,6 +97,16 @@ impl Role {
                     "enabled_tools" => role.enabled_tools = value.as_str().map(|v| v.to_string()),
                     "enabled_mcp_servers" => {
                         role.enabled_mcp_servers = value.as_str().map(|v| v.to_string())
+                    }
+                    "auto_continue" => role.auto_continue = value.as_bool(),
+                    "max_auto_continues" => {
+                        role.max_auto_continues = value.as_u64().map(|v| v as usize)
+                    }
+                    "inject_todo_instructions" => {
+                        role.inject_todo_instructions = value.as_bool()
+                    }
+                    "continuation_prompt" => {
+                        role.continuation_prompt = value.as_str().map(|v| v.to_string())
                     }
                     _ => (),
                 }
@@ -130,6 +148,18 @@ impl Role {
         }
         if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
             metadata.push(format!("enabled_mcp_servers: {enabled_mcp_servers}"));
+        }
+        if let Some(auto_continue) = self.auto_continue {
+            metadata.push(format!("auto_continue: {auto_continue}"));
+        }
+        if let Some(max_auto_continues) = self.max_auto_continues {
+            metadata.push(format!("max_auto_continues: {max_auto_continues}"));
+        }
+        if let Some(inject_todo_instructions) = self.inject_todo_instructions {
+            metadata.push(format!("inject_todo_instructions: {inject_todo_instructions}"));
+        }
+        if let Some(continuation_prompt) = &self.continuation_prompt {
+            metadata.push(format!("continuation_prompt: {continuation_prompt}"));
         }
         if metadata.is_empty() {
             format!("{}\n", self.prompt)
@@ -223,6 +253,26 @@ impl Role {
 
     pub fn is_embedded_prompt(&self) -> bool {
         self.prompt.contains(INPUT_PLACEHOLDER)
+    }
+
+    pub fn auto_continue(&self) -> Option<bool> {
+        self.auto_continue
+    }
+
+    pub fn max_auto_continues(&self) -> Option<usize> {
+        self.max_auto_continues
+    }
+
+    pub fn inject_todo_instructions(&self) -> Option<bool> {
+        self.inject_todo_instructions
+    }
+
+    pub fn continuation_prompt(&self) -> Option<&str> {
+        self.continuation_prompt.as_deref()
+    }
+
+    pub fn append_to_prompt(&mut self, text: &str) {
+        self.prompt.push_str(text);
     }
 
     pub fn echo_messages(&self, input: &Input) -> String {

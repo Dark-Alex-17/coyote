@@ -39,6 +39,11 @@ pub struct AppConfig {
     pub mapping_mcp_servers: IndexMap<String, String>,
     pub enabled_mcp_servers: Option<String>,
 
+    pub auto_continue: bool,
+    pub max_auto_continues: usize,
+    pub inject_todo_instructions: bool,
+    pub continuation_prompt: Option<String>,
+
     pub repl_prelude: Option<String>,
     pub cmd_prelude: Option<String>,
     pub agent_session: Option<String>,
@@ -94,6 +99,11 @@ impl Default for AppConfig {
             mcp_server_support: true,
             mapping_mcp_servers: Default::default(),
             enabled_mcp_servers: None,
+
+            auto_continue: false,
+            max_auto_continues: 10,
+            inject_todo_instructions: true,
+            continuation_prompt: None,
 
             repl_prelude: None,
             cmd_prelude: None,
@@ -151,6 +161,11 @@ impl AppConfig {
             mcp_server_support: config.mcp_server_support,
             mapping_mcp_servers: config.mapping_mcp_servers,
             enabled_mcp_servers: config.enabled_mcp_servers,
+
+            auto_continue: config.auto_continue,
+            max_auto_continues: config.max_auto_continues,
+            inject_todo_instructions: config.inject_todo_instructions,
+            continuation_prompt: config.continuation_prompt,
 
             repl_prelude: config.repl_prelude,
             cmd_prelude: config.cmd_prelude,

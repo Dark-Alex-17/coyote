@@ -94,8 +94,14 @@ pub fn handle_todo_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) 
         .strip_prefix(TODO_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
 
-    if ctx.agent.is_none() {
-        bail!("No active agent");
+    if !ctx.app.config.function_calling_support {
+        bail!("Cannot use todo tools: function calling is disabled.");
+    }
+    let auto_config = ctx.auto_continue_config();
+    if !auto_config.enabled {
+        bail!(
+            "Auto-continue is not enabled. Set 'auto_continue: true' in your config to use todo tools."
+        );
     }
 
     match action {

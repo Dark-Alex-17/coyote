@@ -121,6 +121,11 @@ pub struct Config {
     pub mapping_mcp_servers: IndexMap<String, String>,
     pub enabled_mcp_servers: Option<String>,
 
+    pub auto_continue: bool,
+    pub max_auto_continues: usize,
+    pub inject_todo_instructions: bool,
+    pub continuation_prompt: Option<String>,
+
     pub repl_prelude: Option<String>,
     pub cmd_prelude: Option<String>,
     pub agent_session: Option<String>,
@@ -176,6 +181,11 @@ impl Default for Config {
             mcp_server_support: true,
             mapping_mcp_servers: Default::default(),
             enabled_mcp_servers: None,
+
+            auto_continue: false,
+            max_auto_continues: 10,
+            inject_todo_instructions: true,
+            continuation_prompt: None,
 
             repl_prelude: None,
             cmd_prelude: None,
