@@ -31,8 +31,18 @@ use reedline::{
 use reedline::{MenuBuilder, Signal};
 use std::sync::LazyLock;
 use std::{env, process, sync::Arc};
+use indoc::indoc;
 
 const MENU_NAME: &str = "completion_menu";
+
+pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
+    [SYSTEM REMINDER - TODO CONTINUATION]
+    You have incomplete tasks. Rules:
+    1. BEFORE marking a todo done: verify the work compiles/works. No premature completion.
+    2. If a todo is broad (e.g. \"implement X and implement Y\"): break it into specific subtasks FIRST using todo__add, then work on those.\n\
+    3. Each todo should be atomic and be \"single responsibility\" - completable in one focused action.
+    4. Continue with the next pending item now. Call tools immediately."
+};
 
 static REPL_COMMANDS: LazyLock<[ReplCommand; 39]> = LazyLock::new(|| {
     [
@@ -141,7 +151,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 39]> = LazyLock::new(|| {
         ReplCommand::new(
             ".clear todo",
             "Clear the todo list and stop auto-continuation",
-            AssertState::True(StateFlags::AGENT),
+            AssertState::pass(),
         ),
         ReplCommand::new(
             ".rag",
@@ -764,25 +774,18 @@ pub async fn run_repl_command(
                     bail!("Use '.empty session' instead");
                 }
                 Some("todo") => {
-                    let cleared = match ctx.agent.as_mut() {
-                        Some(agent) => {
-                            if !agent.auto_continue_enabled() {
-                                bail!(
-                                    "The todo system is not enabled for this agent. Set 'auto_continue: true' in the agent's config.yaml to enable it."
-                                );
-                            }
-                            if ctx.todo_list.is_empty() {
-                                println!("Todo list is already empty.");
-                                false
-                            } else {
-                                ctx.clear_todo_list();
-                                println!("Todo list cleared.");
-                                true
-                            }
-                        }
-                        None => bail!("No active agent"),
-                    };
-                    let _ = cleared;
+                    let config = ctx.auto_continue_config();
+                    if !config.enabled {
+                        bail!(
+                            "Auto-continue is not enabled. Set 'auto_continue: true' in your config to enable it."
+                        );
+                    }
+                    if ctx.todo_list.is_empty() {
+                        println!("Todo list is already empty.");
+                    } else {
+                        ctx.clear_todo_list();
+                        println!("Todo list cleared.");
+                    }
                 }
                 _ => unknown_command()?,
             },
@@ -881,19 +884,22 @@ async fn ask(
         )
         .await
     } else {
-        let should_continue = agent_should_continue(ctx);
+        let do_continue = should_continue(ctx);
 
-        if should_continue {
+        if do_continue {
             let full_prompt = {
+                let config = ctx.auto_continue_config();
                 let todo_state = ctx.todo_list.render_for_model();
                 let remaining = ctx.todo_list.incomplete_count();
                 ctx.set_last_continuation_response(output.clone());
                 ctx.increment_auto_continue_count();
-                let agent = ctx.agent.as_mut().expect("agent checked above");
                 let count = ctx.auto_continue_count;
-                let max = agent.max_auto_continues();
+                let max = config.max_continues;
 
-                let prompt = agent.continuation_prompt();
+                let prompt = config
+                    .continuation_prompt
+                    .as_deref()
+                    .unwrap_or(DEFAULT_CONTINUATION_PROMPT);
 
                 let color = if app.light_theme() {
                     nu_ansi_term::Color::LightGray
@@ -934,7 +940,7 @@ async fn ask(
                 .is_some_and(|s| s.needs_compression(app.compression_threshold));
 
             if needs_compression {
-                let agent_can_continue_after_compress = agent_should_continue(ctx);
+                let agent_can_continue_after_compress = should_continue(ctx);
 
                 if let Some(session) = ctx.session.as_mut() {
                     session.set_compressing(true);
@@ -956,14 +962,17 @@ async fn ask(
 
                 if agent_can_continue_after_compress {
                     let full_prompt = {
+                        let config = ctx.auto_continue_config();
                         let todo_state = ctx.todo_list.render_for_model();
                         let remaining = ctx.todo_list.incomplete_count();
                         ctx.increment_auto_continue_count();
-                        let agent = ctx.agent.as_mut().expect("agent checked above");
                         let count = ctx.auto_continue_count;
-                        let max = agent.max_auto_continues();
+                        let max = config.max_continues;
 
-                        let prompt = agent.continuation_prompt();
+                        let prompt = config
+                            .continuation_prompt
+                            .as_deref()
+                            .unwrap_or(DEFAULT_CONTINUATION_PROMPT);
 
                         let color = if app.light_theme() {
                             nu_ansi_term::Color::LightGray
@@ -989,10 +998,11 @@ async fn ask(
     }
 }
 
-fn agent_should_continue(ctx: &RequestContext) -> bool {
-    ctx.agent.as_ref().is_some_and(|agent| {
-        agent.auto_continue_enabled() && ctx.auto_continue_count < agent.max_auto_continues()
-    }) && ctx.todo_list.has_incomplete()
+fn should_continue(ctx: &RequestContext) -> bool {
+    let config = ctx.auto_continue_config();
+    config.enabled
+        && ctx.auto_continue_count < config.max_continues
+        && ctx.todo_list.has_incomplete()
 }
 
 fn reset_continuation(ctx: &mut RequestContext) {
@@ -1311,13 +1321,15 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_clear_todo_requires_agent() {
+    fn repl_commands_clear_todo_always_available() {
         let cmd = REPL_COMMANDS
             .iter()
             .find(|c| c.name == ".clear todo")
             .unwrap();
         assert!(cmd.is_valid(StateFlags::AGENT));
-        assert!(!cmd.is_valid(StateFlags::empty()));
+        assert!(cmd.is_valid(StateFlags::empty()));
+        assert!(cmd.is_valid(StateFlags::SESSION));
+        assert!(cmd.is_valid(StateFlags::ROLE));
     }
 
     #[test]

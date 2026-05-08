@@ -17,9 +17,11 @@ agent_session: null              # Set a session to use when starting the agent.
 name: <agent-name>               # Name of the agent, used in the UI and logs
 description: <description>       # Description of the agent, used in the UI
 version: 1                       # Version of the agent
-# Todo System & Auto-Continuation
-# These settings help smaller models handle multi-step tasks more reliably.
-# See docs/TODO-SYSTEM.md for detailed documentation.
+# Auto-Continue (Todo System)
+# The auto-continue system provides built-in task tracking for improved reliability.
+# When enabled, the model can create todo lists and the system will automatically
+# prompt it to continue when incomplete tasks remain.
+# See the [Todo System documentation](https://github.com/Dark-Alex-17/loki/wiki/TODO-System) for more information
 auto_continue: false             # Enable automatic continuation when incomplete todos remain
 max_auto_continues: 10           # Maximum number of automatic continuations before stopping
 inject_todo_instructions: true   # Inject the default todo tool usage instructions into the agent's system prompt

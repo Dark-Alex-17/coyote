@@ -1,4 +1,3 @@
-use super::MessageContentToolCalls;
 use super::rag_cache::{RagCache, RagKey};
 use super::session::Session;
 use super::todo::TodoList;
@@ -9,6 +8,7 @@ use super::{
     SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags, TEMP_ROLE_NAME, TEMP_SESSION_NAME,
     WorkingMode, ensure_parent_exists, list_agents, paths,
 };
+use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
     FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
@@ -37,6 +37,13 @@ use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remov
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+pub struct AutoContinueConfig {
+    pub enabled: bool,
+    pub max_continues: usize,
+    pub inject_instructions: bool,
+    pub continuation_prompt: Option<String>,
+}
 
 pub struct RequestContext {
     pub app: Arc<AppState>,
@@ -523,7 +530,7 @@ impl RequestContext {
     }
 
     pub fn extract_role(&self, app: &AppConfig) -> Role {
-        if let Some(session) = self.session.as_ref() {
+        let mut role = if let Some(session) = self.session.as_ref() {
             session.to_role()
         } else if let Some(agent) = self.agent.as_ref() {
             agent.to_role()
@@ -539,6 +546,65 @@ impl RequestContext {
                 app.enabled_mcp_servers.clone(),
             );
             role
+        };
+
+        if self.agent.is_none() {
+            let config = self.auto_continue_config();
+            if config.enabled && config.inject_instructions {
+                role.append_to_prompt(prompts::DEFAULT_TODO_INSTRUCTIONS);
+            }
+        }
+
+        role
+    }
+
+    pub fn auto_continue_config(&self) -> AutoContinueConfig {
+        if let Some(agent) = &self.agent {
+            return AutoContinueConfig {
+                enabled: agent.auto_continue_enabled(),
+                max_continues: agent.max_auto_continues(),
+                inject_instructions: agent.inject_todo_instructions(),
+                continuation_prompt: agent.continuation_prompt_value(),
+            };
+        }
+        let app = &self.app.config;
+        let enabled = self
+            .session
+            .as_ref()
+            .and_then(|s| s.auto_continue())
+            .or_else(|| self.role.as_ref().and_then(|r| r.auto_continue()))
+            .unwrap_or(app.auto_continue);
+        let max = self
+            .session
+            .as_ref()
+            .and_then(|s| s.max_auto_continues())
+            .or_else(|| self.role.as_ref().and_then(|r| r.max_auto_continues()))
+            .unwrap_or(app.max_auto_continues);
+        let inject = self
+            .session
+            .as_ref()
+            .and_then(|s| s.inject_todo_instructions())
+            .or_else(|| {
+                self.role
+                    .as_ref()
+                    .and_then(|r| r.inject_todo_instructions())
+            })
+            .unwrap_or(app.inject_todo_instructions);
+        let prompt = self
+            .session
+            .as_ref()
+            .and_then(|s| s.continuation_prompt().map(|v| v.to_string()))
+            .or_else(|| {
+                self.role
+                    .as_ref()
+                    .and_then(|r| r.continuation_prompt().map(|v| v.to_string()))
+            })
+            .or_else(|| app.continuation_prompt.clone());
+        AutoContinueConfig {
+            enabled,
+            max_continues: max,
+            inject_instructions: inject,
+            continuation_prompt: prompt,
         }
     }
 
@@ -747,6 +813,8 @@ impl RequestContext {
                 app.function_calling_support.to_string(),
             ),
             ("mcp_server_support", app.mcp_server_support.to_string()),
+            ("auto_continue", app.auto_continue.to_string()),
+            ("max_auto_continues", app.max_auto_continues.to_string()),
             ("stream", app.stream.to_string()),
             ("save", app.save.to_string()),
             ("keybindings", app.keybindings.clone()),
@@ -1402,12 +1470,24 @@ impl RequestContext {
     }
 
     pub async fn update(&mut self, data: &str, abort_signal: AbortSignal) -> Result<()> {
-        let parts: Vec<&str> = data.split_whitespace().collect();
-        if parts.len() != 2 {
+        let (key, raw_value) = match data.split_once(char::is_whitespace) {
+            Some((k, v)) => (k, v.trim()),
+            None => bail!("Usage: .set <key> <value>. If value is null, unset key."),
+        };
+
+        if raw_value.is_empty() {
             bail!("Usage: .set <key> <value>. If value is null, unset key.");
         }
-        let key = parts[0];
-        let value = parts[1];
+
+        let value = match key {
+            "continuation_prompt" => raw_value,
+            _ => {
+                if raw_value.contains(char::is_whitespace) {
+                    bail!("Usage: .set <key> <value>. If value is null, unset key.");
+                }
+                raw_value
+            }
+        };
         match key {
             "temperature" => {
                 let value = super::parse_value(value)?;
@@ -1522,6 +1602,49 @@ impl RequestContext {
                 let value = value.parse().with_context(|| "Invalid value")?;
                 self.update_app_config(|app| app.highlight = value);
             }
+            "auto_continue" => {
+                let value: bool = value.parse().with_context(|| "Invalid value")?;
+                if value && !self.app.config.function_calling_support {
+                    bail!(
+                        "Cannot enable auto_continue: function calling is disabled. Set 'function_calling_support: true' first."
+                    );
+                }
+                if let Some(session) = self.session.as_mut() {
+                    session.set_auto_continue(Some(value));
+                } else {
+                    self.update_app_config(|app| app.auto_continue = value);
+                }
+                if value
+                    && self.app.config.function_calling_support
+                    && !self.tool_scope.functions.contains("todo__init")
+                {
+                    self.tool_scope.functions.append_todo_functions();
+                }
+            }
+            "max_auto_continues" => {
+                let value: usize = value.parse().with_context(|| "Invalid value")?;
+                if let Some(session) = self.session.as_mut() {
+                    session.set_max_auto_continues(Some(value));
+                } else {
+                    self.update_app_config(|app| app.max_auto_continues = value);
+                }
+            }
+            "inject_todo_instructions" => {
+                let value: bool = value.parse().with_context(|| "Invalid value")?;
+                if let Some(session) = self.session.as_mut() {
+                    session.set_inject_todo_instructions(Some(value));
+                } else {
+                    self.update_app_config(|app| app.inject_todo_instructions = value);
+                }
+            }
+            "continuation_prompt" => {
+                let value: Option<String> = super::parse_value(value)?;
+                if let Some(session) = self.session.as_mut() {
+                    session.set_continuation_prompt(value);
+                } else {
+                    self.update_app_config(|app| app.continuation_prompt = value);
+                }
+            }
             _ => bail!("Unknown key '{key}'"),
         }
         Ok(())
@@ -1603,10 +1726,14 @@ impl RequestContext {
                 },
                 ".set" => {
                     let mut values = vec![
+                        "auto_continue",
+                        "continuation_prompt",
                         "temperature",
                         "top_p",
                         "enabled_tools",
                         "enabled_mcp_servers",
+                        "inject_todo_instructions",
+                        "max_auto_continues",
                         "save_session",
                         "compression_threshold",
                         "rag_reranker_model",
@@ -1721,6 +1848,19 @@ impl RequestContext {
                     .map(|v| v.id())
                     .collect(),
                 "highlight" => super::complete_bool(app.highlight),
+                "auto_continue" => {
+                    let config = self.auto_continue_config();
+                    super::complete_bool(config.enabled)
+                }
+                "max_auto_continues" => {
+                    let config = self.auto_continue_config();
+                    vec![config.max_continues.to_string()]
+                }
+                "inject_todo_instructions" => {
+                    let config = self.auto_continue_config();
+                    super::complete_bool(config.inject_instructions)
+                }
+                "continuation_prompt" => vec!["null".to_string()],
                 _ => vec![],
             };
             values = candidates.into_iter().map(|v| (v, None)).collect();
@@ -1809,6 +1949,12 @@ impl RequestContext {
         let mut functions = Functions::init(app.visible_tools.as_ref().unwrap_or(&Vec::new()))?;
         if self.working_mode.is_repl() {
             functions.append_user_interaction_functions();
+        }
+        if self.agent.is_none()
+            && app.function_calling_support
+            && self.auto_continue_config().enabled
+        {
+            functions.append_todo_functions();
         }
         if !mcp_runtime.is_empty() {
             functions.append_mcp_meta_functions(mcp_runtime.server_names());
@@ -2196,7 +2342,7 @@ impl RequestContext {
             .clone()
             .unwrap_or_else(|| SUMMARY_CONTEXT_PROMPT.into());
 
-        let todo_prefix = if self.agent.is_some() && !self.todo_list.is_empty() {
+        let todo_prefix = if self.auto_continue_config().enabled && !self.todo_list.is_empty() {
             format!(
                 "[ACTIVE TODO LIST]\n{}\n\n",
                 self.todo_list.render_for_model()

@@ -32,6 +32,14 @@ pub struct Session {
     save_session: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compression_threshold: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_continue: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_auto_continues: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inject_todo_instructions: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation_prompt: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     role_name: Option<String>,
@@ -170,6 +178,18 @@ impl Session {
         if let Some(save_session) = self.save_session() {
             data["save_session"] = save_session.into();
         }
+        if let Some(auto_continue) = self.auto_continue() {
+            data["auto_continue"] = auto_continue.into();
+        }
+        if let Some(max_auto_continues) = self.max_auto_continues() {
+            data["max_auto_continues"] = max_auto_continues.into();
+        }
+        if let Some(inject_todo_instructions) = self.inject_todo_instructions() {
+            data["inject_todo_instructions"] = inject_todo_instructions.into();
+        }
+        if let Some(continuation_prompt) = self.continuation_prompt() {
+            data["continuation_prompt"] = continuation_prompt.into();
+        }
         let (tokens, percent) = self.tokens_usage();
         data["total_tokens"] = tokens.into();
         if let Some(max_input_tokens) = self.model().max_input_tokens() {
@@ -223,6 +243,19 @@ impl Session {
 
         if let Some(compression_threshold) = self.compression_threshold {
             items.push(("compression_threshold", compression_threshold.to_string()));
+        }
+
+        if let Some(auto_continue) = self.auto_continue() {
+            items.push(("auto_continue", auto_continue.to_string()));
+        }
+        if let Some(max_auto_continues) = self.max_auto_continues() {
+            items.push(("max_auto_continues", max_auto_continues.to_string()));
+        }
+        if let Some(inject_todo_instructions) = self.inject_todo_instructions() {
+            items.push(("inject_todo_instructions", inject_todo_instructions.to_string()));
+        }
+        if let Some(continuation_prompt) = self.continuation_prompt() {
+            items.push(("continuation_prompt", continuation_prompt.to_string()));
         }
 
         if let Some(max_input_tokens) = self.model().max_input_tokens() {
@@ -331,6 +364,50 @@ impl Session {
     pub fn set_compression_threshold(&mut self, value: Option<usize>) {
         if self.compression_threshold != value {
             self.compression_threshold = value;
+            self.dirty = true;
+        }
+    }
+
+    pub fn auto_continue(&self) -> Option<bool> {
+        self.auto_continue
+    }
+
+    pub fn max_auto_continues(&self) -> Option<usize> {
+        self.max_auto_continues
+    }
+
+    pub fn set_auto_continue(&mut self, value: Option<bool>) {
+        if self.auto_continue != value {
+            self.auto_continue = value;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_max_auto_continues(&mut self, value: Option<usize>) {
+        if self.max_auto_continues != value {
+            self.max_auto_continues = value;
+            self.dirty = true;
+        }
+    }
+
+    pub fn inject_todo_instructions(&self) -> Option<bool> {
+        self.inject_todo_instructions
+    }
+
+    pub fn continuation_prompt(&self) -> Option<&str> {
+        self.continuation_prompt.as_deref()
+    }
+
+    pub fn set_inject_todo_instructions(&mut self, value: Option<bool>) {
+        if self.inject_todo_instructions != value {
+            self.inject_todo_instructions = value;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_continuation_prompt(&mut self, value: Option<String>) {
+        if self.continuation_prompt != value {
+            self.continuation_prompt = value;
             self.dirty = true;
         }
     }

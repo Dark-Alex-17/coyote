@@ -81,6 +81,16 @@ mapping_mcp_servers:             # Alias for an MCP server or set of servers
   git: github,gitmcp
 enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 'github,slack,ddg-search')
 
+# ---- Auto-Continue (Todo System) ----
+# The auto-continue system provides built-in task tracking for improved reliability.
+# When enabled, the model can create todo lists and the system will automatically
+# prompt it to continue when incomplete tasks remain.
+# See the [Todo System documentation](https://github.com/Dark-Alex-17/loki/wiki/TODO-System) for more information
+auto_continue: false              # Enable automatic continuation when incomplete todos remain (default: false)
+max_auto_continues: 10            # Maximum number of automatic continuations before stopping (default: 10)
+inject_todo_instructions: true    # Inject default todo usage instructions into the system prompt (default: true)
+continuation_prompt: null         # Custom prompt used when auto-continuing. If null, uses built-in default
+
 # ---- Session ----
 # See the [Session documentation](./docs/SESSIONS.md) for more information
 save_session: null               # Controls the persistence of the session. If true, auto save; if false, don't auto-save save; if null, ask the user what to do

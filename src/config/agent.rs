@@ -415,6 +415,14 @@ impl Agent {
         self.config.max_auto_continues
     }
 
+    pub fn inject_todo_instructions(&self) -> bool {
+        self.config.inject_todo_instructions
+    }
+
+    pub fn continuation_prompt_value(&self) -> Option<String> {
+        self.config.continuation_prompt.clone()
+    }
+
     pub fn can_spawn_agents(&self) -> bool {
         self.config.can_spawn_agents
     }
@@ -437,18 +445,6 @@ impl Agent {
 
     pub fn escalation_timeout(&self) -> u64 {
         self.config.escalation_timeout
-    }
-
-    pub fn continuation_prompt(&self) -> String {
-        self.config.continuation_prompt.clone().unwrap_or_else(|| {
-            formatdoc! {"
-                [SYSTEM REMINDER - TODO CONTINUATION]
-                You have incomplete tasks. Rules:
-                1. BEFORE marking a todo done: verify the work compiles/works. No premature completion.
-                2. If a todo is broad (e.g. \"implement X and implement Y\"): break it into specific subtasks FIRST using todo__add, then work on those.\n\
-                3. Each todo should be atomic and be \"single responsibility\" - completable in one focused action.
-                4. Continue with the next pending item now. Call tools immediately."}
-        })
     }
 
     pub fn compression_threshold(&self) -> Option<usize> {
