@@ -548,7 +548,7 @@ impl RequestContext {
             role
         };
 
-        if self.agent.is_none() {
+        if self.agent.is_none() && self.app.config.function_calling_support {
             let config = self.auto_continue_config();
             if config.enabled && config.inject_instructions {
                 role.append_to_prompt(prompts::DEFAULT_TODO_INSTRUCTIONS);
