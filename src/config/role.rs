@@ -102,9 +102,7 @@ impl Role {
                     "max_auto_continues" => {
                         role.max_auto_continues = value.as_u64().map(|v| v as usize)
                     }
-                    "inject_todo_instructions" => {
-                        role.inject_todo_instructions = value.as_bool()
-                    }
+                    "inject_todo_instructions" => role.inject_todo_instructions = value.as_bool(),
                     "continuation_prompt" => {
                         role.continuation_prompt = value.as_str().map(|v| v.to_string())
                     }
@@ -156,7 +154,9 @@ impl Role {
             metadata.push(format!("max_auto_continues: {max_auto_continues}"));
         }
         if let Some(inject_todo_instructions) = self.inject_todo_instructions {
-            metadata.push(format!("inject_todo_instructions: {inject_todo_instructions}"));
+            metadata.push(format!(
+                "inject_todo_instructions: {inject_todo_instructions}"
+            ));
         }
         if let Some(continuation_prompt) = &self.continuation_prompt {
             metadata.push(format!("continuation_prompt: {continuation_prompt}"));

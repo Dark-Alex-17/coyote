@@ -101,15 +101,15 @@ fn extract_agent_from_args() -> Option<String> {
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        
+
         if let Some(value) = arg.strip_prefix("--agent=") {
             return Some(value.to_string());
         }
-        
+
         if (arg == "--agent" || arg == "-a") && i + 1 < args.len() {
             return Some(args[i + 1].clone());
         }
-        
+
         i += 1;
     }
     None
@@ -117,14 +117,14 @@ fn extract_agent_from_args() -> Option<String> {
 
 pub(super) fn session_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    
+
     let sessions = if let Some(agent_name) = extract_agent_from_args() {
         let sessions_dir = paths::agent_data_dir(&agent_name).join("sessions");
         list_file_names(sessions_dir, ".yaml")
     } else {
         list_sessions()
     };
-    
+
     sessions
         .into_iter()
         .filter(|s| s.starts_with(&*cur))

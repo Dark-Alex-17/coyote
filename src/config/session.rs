@@ -252,7 +252,10 @@ impl Session {
             items.push(("max_auto_continues", max_auto_continues.to_string()));
         }
         if let Some(inject_todo_instructions) = self.inject_todo_instructions() {
-            items.push(("inject_todo_instructions", inject_todo_instructions.to_string()));
+            items.push((
+                "inject_todo_instructions",
+                inject_todo_instructions.to_string(),
+            ));
         }
         if let Some(continuation_prompt) = self.continuation_prompt() {
             items.push(("continuation_prompt", continuation_prompt.to_string()));
