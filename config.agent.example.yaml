@@ -28,7 +28,7 @@ inject_todo_instructions: true   # Inject the default todo tool usage instructio
 continuation_prompt: null        # Custom prompt used when auto-continuing (optional; uses default if null)
 # Sub-Agent Spawning System
 # Enable this agent to spawn and manage child agents in parallel.
-# See docs/AGENTS.md for detailed documentation.
+# See https://github.com/Dark-Alex-17/loki/wiki/Agents for detailed documentation.
 can_spawn_agents: false          # Enable the agent to spawn child agents
 max_concurrent_agents: 4         # Maximum number of agents that can run simultaneously
 max_agent_depth: 3               # Maximum nesting depth for sub-agents (prevents runaway spawning)
