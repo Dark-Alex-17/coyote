@@ -1976,6 +1976,10 @@ impl RequestContext {
         abort_signal: AbortSignal,
     ) -> Result<()> {
         let role = self.retrieve_role(app, name)?;
+        if let Some(session) = self.session.as_mut() {
+            session.guard_empty()?;
+        }
+
         let mcp_servers = if app.mcp_server_support {
             role.enabled_mcp_servers()
         } else {
