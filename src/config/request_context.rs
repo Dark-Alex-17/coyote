@@ -2131,6 +2131,12 @@ impl RequestContext {
             }
         });
 
+        if self.session.is_some() {
+            bail!(
+                "Already in a session, please run '.exit session' first to exit the current session."
+            );
+        }
+
         let should_init_supervisor = agent.can_spawn_agents();
         let max_concurrent = agent.max_concurrent_agents();
         let max_depth = agent.max_agent_depth();
@@ -3434,5 +3440,81 @@ mod tests {
         let rags_dir = paths::rags_dir();
         create_dir_all(&rags_dir).unwrap();
         assert!(paths::list_rags().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_errors_when_already_in_session() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        let result = run_async(ctx.use_agent(&app, &agent_name, Some("test_session"), abort));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Already in a session")
+        );
+        assert!(
+            ctx.agent.is_none(),
+            "Agent should not be set when session check fails"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_errors_when_already_in_session_even_without_session_name() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        let result = run_async(ctx.use_agent(&app, &agent_name, None, abort));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Already in a session")
+        );
+        assert!(
+            ctx.agent.is_none(),
+            "Agent should not be set when session check fails"
+        );
     }
 }
