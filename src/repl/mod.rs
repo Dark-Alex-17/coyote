@@ -21,6 +21,7 @@ use crate::resolve_oauth_client;
 use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
+use indoc::indoc;
 use parking_lot::RwLock;
 use reedline::CursorConfig;
 use reedline::{
@@ -31,7 +32,6 @@ use reedline::{
 use reedline::{MenuBuilder, Signal};
 use std::sync::LazyLock;
 use std::{env, process, sync::Arc};
-use indoc::indoc;
 
 const MENU_NAME: &str = "completion_menu";
 
@@ -1000,7 +1000,8 @@ async fn ask(
 
 fn should_continue(ctx: &RequestContext) -> bool {
     let config = ctx.auto_continue_config();
-    config.enabled
+    ctx.app.config.function_calling_support
+        && config.enabled
         && ctx.auto_continue_count < config.max_continues
         && ctx.todo_list.has_incomplete()
 }
