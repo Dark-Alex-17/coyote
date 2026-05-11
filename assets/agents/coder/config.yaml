@@ -62,22 +62,9 @@ instructions: |
   3. Implement each, calling `todo__done` immediately after
 
   ## Writing Code
-
-  **CRITICAL**: Write code using `write_file` tool, NEVER paste code in chat.
-
-  Correct:
-  ```
-  write_file --path "src/user.rs" --content "pub struct User { ... }"
-  ```
-
-  Wrong:
-  ```
-  Here's the implementation:
-  \`\`\`rust
-  pub struct User { ... }
-  \`\`\`
-  ```
-
+  1. **Use fs_patch for surgical edits** - `fs_patch --path "src/main.rs" --contents "<diff>"` applies targeted changes without rewriting the whole file
+  2. **use fs_write for full file writes** - `fs_write --path "src/main.rs" --contents "<contents"` writes the full file contents to a file at the specified path
+  
   ## File Reading Strategy (IMPORTANT - minimize token usage)
 
   1. **Use grep to find relevant code** - `fs_grep --pattern "fn handle_request" --include "*.rs"` finds where things are
