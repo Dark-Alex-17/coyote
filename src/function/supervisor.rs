@@ -610,8 +610,9 @@ async fn handle_check(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
                 "message": "Agent is still running"
             });
 
-            if let Some(queue) = ctx.root_escalation_queue() &&
-              queue.has_pending() {
+            if let Some(queue) = ctx.root_escalation_queue()
+                && queue.has_pending()
+            {
                 let summary = queue.pending_summary();
                 result["pending_escalations"] = json!(summary);
                 result["message"] = json!(
@@ -660,8 +661,9 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
             break;
         }
 
-        if let Some(queue) = ctx.root_escalation_queue() &&
-          queue.has_pending() {
+        if let Some(queue) = ctx.root_escalation_queue()
+            && queue.has_pending()
+        {
             let summary = queue.pending_summary();
             return Ok(json!({
                 "status": "pending",

@@ -66,6 +66,7 @@ const DARK_THEME: &[u8] = include_bytes!("../../assets/monokai-extended.theme.bi
 const LIGHT_THEME: &[u8] = include_bytes!("../../assets/monokai-extended-light.theme.bin");
 
 const CONFIG_FILE_NAME: &str = "config.yaml";
+const AGENT_GRAPH_FILE_NAME: &str = "graph.yaml";
 const ROLES_DIR_NAME: &str = "roles";
 const MACROS_DIR_NAME: &str = "macros";
 const ENV_FILE_NAME: &str = ".env";
