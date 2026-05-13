@@ -2,7 +2,7 @@
 
 use super::types::Graph;
 use crate::config::paths;
-use anyhow::{Context, Result, bail, Error, anyhow};
+use anyhow::{Context, Error, Result, anyhow, bail};
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
 

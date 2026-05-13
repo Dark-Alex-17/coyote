@@ -2,9 +2,11 @@
 //! JSON state, composed of agent/script/approval/input/end nodes.
 
 pub mod parser;
+pub mod state;
 pub mod types;
 
 pub use parser::{GraphParser, agent_has_graph, load_agent_graph};
+pub use state::{StateManager, StateRepresentation};
 pub use types::{
     AgentNode, ApprovalNode, EndNode, Graph, GraphSettings, GraphState, InputNode, Node, NodeType,
     ScriptNode,
