@@ -6,6 +6,7 @@ pub mod parser;
 pub mod script;
 pub mod state;
 pub mod types;
+pub mod user_interaction;
 pub mod validator;
 
 pub use agent::AgentNodeExecutor;
@@ -16,6 +17,7 @@ pub use types::{
     AgentNode, ApprovalNode, EndNode, Graph, GraphSettings, GraphState, InputNode, Node, NodeType,
     ScriptNode,
 };
+pub use user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 pub use validator::{GraphValidator, ValidationError, ValidationResult};
 
 pub const GRAPH_SCHEMA_VERSION: &str = "1.0";
