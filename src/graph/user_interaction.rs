@@ -11,7 +11,7 @@ use super::state::StateManager;
 use super::types::{ApprovalNode, InputNode};
 use crate::config::RequestContext;
 use crate::function::user_interaction::{USER_FUNCTION_PREFIX, handle_user_tool};
-use anyhow::{Context, Result, bail, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 

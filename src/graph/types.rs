@@ -115,9 +115,11 @@ pub enum NodeType {
     End(EndNode),
 }
 
-/// `agent`-type node: spawn an agent with a templated prompt. Agent tools
-/// come from the agent's own `config.yaml`; create agent variants for
-/// different tool sets rather than overriding here.
+/// `agent`-type node: spawn an agent with a templated prompt. The agent
+/// uses the full tool stack from its own directory (`global_tools` and
+/// `mcp_servers` in `config.yaml` plus any per-agent `tools.{sh,py,ts,js}`
+/// script). There is no per-node tool override; to use different tool
+/// sets, create agent variants. See `docs/graph-agents/agent-tools.md`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentNode {
     pub agent: String,
