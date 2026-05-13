@@ -1,12 +1,14 @@
 //! Graph-based agent orchestration. Declarative YAML workflows over a shared
 //! JSON state, composed of agent/script/approval/input/end nodes.
 
+pub mod agent;
 pub mod parser;
 pub mod script;
 pub mod state;
 pub mod types;
 pub mod validator;
 
+pub use agent::AgentNodeExecutor;
 pub use parser::{GraphParser, agent_has_graph, load_agent_graph};
 pub use script::ScriptExecutor;
 pub use state::{StateManager, StateRepresentation};
