@@ -326,7 +326,7 @@ pub async fn handle_supervisor_tool(
     }
 }
 
-fn run_child_agent(
+pub fn run_child_agent(
     mut child_ctx: RequestContext,
     initial_input: Input,
     abort_signal: AbortSignal,
@@ -372,6 +372,98 @@ fn run_child_agent(
 
         Ok(accumulated_output)
     })
+}
+
+/// Spawn an agent synchronously from a graph node and return its accumulated
+/// output. This is similar to `handle_spawn` but runs the child agent in the
+/// current task (no tokio::spawn, no supervisor handle registration) so the
+/// graph executor can sequence agent nodes directly.
+pub async fn run_agent_for_graph(
+    parent_ctx: &mut RequestContext,
+    agent_name: &str,
+    prompt: &str,
+) -> Result<String> {
+    let short_uuid = &Uuid::new_v4().to_string()[..8];
+    let agent_id = format!("graph_agent_{agent_name}_{short_uuid}");
+    let current_depth = parent_ctx.current_depth + 1;
+
+    if let Some(supervisor) = parent_ctx.supervisor.as_ref().cloned() {
+        let max_depth = supervisor.read().max_depth();
+        if current_depth > max_depth {
+            bail!("Max agent depth exceeded ({current_depth}/{max_depth})");
+        }
+    }
+
+    if !parent_ctx.app.config.function_calling_support {
+        bail!("Function calling support must be enabled to spawn agents.");
+    }
+
+    let child_inbox = Arc::new(Inbox::new());
+    parent_ctx.ensure_root_escalation_queue();
+    let child_abort = create_abort_signal();
+
+    let app_config = Arc::clone(&parent_ctx.app.config);
+    let current_model = parent_ctx.current_model().clone();
+    let info_flag = parent_ctx.info_flag;
+    let child_app_state = Arc::new(AppState {
+        config: Arc::new(app_config.as_ref().clone()),
+        vault: parent_ctx.app.vault.clone(),
+        mcp_factory: parent_ctx.app.mcp_factory.clone(),
+        rag_cache: parent_ctx.app.rag_cache.clone(),
+        mcp_config: parent_ctx.app.mcp_config.clone(),
+        mcp_log_path: parent_ctx.app.mcp_log_path.clone(),
+        mcp_registry: parent_ctx.app.mcp_registry.clone(),
+        functions: parent_ctx.app.functions.clone(),
+    });
+
+    let agent = Agent::init(
+        app_config.as_ref(),
+        child_app_state.as_ref(),
+        &current_model,
+        info_flag,
+        agent_name,
+        child_abort.clone(),
+    )
+    .await?;
+
+    let agent_mcp_servers = agent.mcp_server_names().to_vec();
+    let session = agent.agent_session().map(|v| v.to_string());
+    let should_init_supervisor = agent.can_spawn_agents();
+    let agent_max_concurrent = agent.max_concurrent_agents();
+    let agent_max_depth = agent.max_agent_depth();
+
+    let mut child_ctx = RequestContext::new_for_child(
+        Arc::clone(&child_app_state),
+        parent_ctx,
+        current_depth,
+        Arc::clone(&child_inbox),
+        agent_id.clone(),
+    );
+    child_ctx.rag = agent.rag();
+    child_ctx.agent = Some(agent);
+    if should_init_supervisor {
+        child_ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(
+            agent_max_concurrent,
+            agent_max_depth,
+        ))));
+    }
+
+    if let Some(session) = session {
+        child_ctx
+            .use_session(app_config.as_ref(), Some(&session), child_abort.clone())
+            .await?;
+        sync_agent_functions_to_ctx(&mut child_ctx)?;
+    } else {
+        populate_agent_mcp_runtime(&mut child_ctx, &agent_mcp_servers).await?;
+        sync_agent_functions_to_ctx(&mut child_ctx)?;
+        child_ctx.init_agent_shared_variables()?;
+    }
+
+    let input = Input::from_str(&child_ctx, prompt, None);
+
+    debug!("Spawning agent '{agent_name}' for graph node as '{agent_id}'");
+
+    run_child_agent(child_ctx, input, child_abort).await
 }
 
 async fn populate_agent_mcp_runtime(ctx: &mut RequestContext, server_ids: &[String]) -> Result<()> {
