@@ -50,8 +50,11 @@ enum BinaryType<'a> {
     Agent,
 }
 
+/// Canonical set of script languages that Loki can execute. This is the
+/// single source of truth for both function-tool scripts and graph script
+/// nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr)]
-enum Language {
+pub enum Language {
     Bash,
     Python,
     TypeScript,
@@ -86,6 +89,17 @@ impl Language {
             Language::Python => "py",
             Language::TypeScript => "ts",
             _ => "sh",
+        }
+    }
+}
+
+impl Language {
+    pub fn direct_invoker(self) -> Option<(&'static str, &'static [&'static str])> {
+        match self {
+            Language::Bash => Some(("bash", &[])),
+            Language::Python => Some(("python3", &[])),
+            Language::TypeScript => Some(("npx", &["tsx"])),
+            Language::Unsupported => None,
         }
     }
 }
