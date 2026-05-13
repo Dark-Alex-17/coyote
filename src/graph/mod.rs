@@ -4,6 +4,7 @@
 pub mod parser;
 pub mod state;
 pub mod types;
+pub mod validator;
 
 pub use parser::{GraphParser, agent_has_graph, load_agent_graph};
 pub use state::{StateManager, StateRepresentation};
@@ -11,6 +12,7 @@ pub use types::{
     AgentNode, ApprovalNode, EndNode, Graph, GraphSettings, GraphState, InputNode, Node, NodeType,
     ScriptNode,
 };
+pub use validator::{GraphValidator, ValidationError, ValidationResult};
 
 pub const GRAPH_SCHEMA_VERSION: &str = "1.0";
 
