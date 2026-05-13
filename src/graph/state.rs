@@ -209,12 +209,8 @@ fn value_to_string(value: &Value) -> String {
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Null => "null".to_string(),
-        Value::Array(_) => {
-            serde_json::to_string(value).unwrap_or_else(|_| String::from("[]"))
-        }
-        Value::Object(_) => {
-            serde_json::to_string(value).unwrap_or_else(|_| String::from("{}"))
-        }
+        Value::Array(_) => serde_json::to_string(value).unwrap_or_else(|_| String::from("[]")),
+        Value::Object(_) => serde_json::to_string(value).unwrap_or_else(|_| String::from("{}")),
     }
 }
 
