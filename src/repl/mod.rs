@@ -858,8 +858,18 @@ async fn ask(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    let client = input.create_client()?;
     let app = Arc::clone(&ctx.app.config);
+
+    if crate::graph::active_agent_graph_name(ctx).is_some() {
+        ctx.before_chat_completion(&input)?;
+        let output =
+            crate::graph::run_active_agent_graph(ctx, &input.text(), abort_signal.clone()).await?;
+        app.print_markdown(&output)?;
+        ctx.after_chat_completion(app.as_ref(), &input, &output, &[])?;
+        return Ok(());
+    }
+
+    let client = input.create_client()?;
     ctx.before_chat_completion(&input)?;
     let (output, tool_results) = if input.stream() {
         call_chat_completions_streaming(&input, client.as_ref(), ctx, abort_signal.clone()).await?

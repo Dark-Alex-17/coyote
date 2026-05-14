@@ -14,8 +14,8 @@ use super::types::{EndNode, Graph, Node, NodeType};
 use super::user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 use super::validator::GraphValidator;
 use crate::config::RequestContext;
-use crate::utils::AbortSignal;
-use anyhow::{Context, Result, bail, anyhow};
+use crate::utils::{AbortSignal, dimmed_text};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -74,6 +74,10 @@ impl GraphExecutor {
 
         let mut current = graph.start.clone();
         info!("[graph:{}] start at '{}'", graph.name, current);
+        eprintln!(
+            "{}",
+            dimmed_text(&format!("▸ graph: {} (start: {})", graph.name, current))
+        );
 
         let output = loop {
             if abort_signal.aborted() {
@@ -102,13 +106,17 @@ impl GraphExecutor {
                 );
             }
 
-            let node = graph.get_node(&current).ok_or_else(|| {
-                anyhow!("Node '{}' not found in graph '{}'", current, graph.name)
-            })?;
+            let node = graph
+                .get_node(&current)
+                .ok_or_else(|| anyhow!("Node '{}' not found in graph '{}'", current, graph.name))?;
 
             debug!(
                 "[graph:{}] entering '{}' (visit {})",
                 graph.name, current, visits
+            );
+            eprintln!(
+                "{}",
+                dimmed_text(&format!("▸ {} ({})", current, node_type_label(node)))
             );
 
             let next = step(
@@ -134,6 +142,13 @@ impl GraphExecutor {
                         current,
                         start.elapsed()
                     );
+                    eprintln!(
+                        "{}",
+                        dimmed_text(&format!(
+                            "▸ graph done in {:.2}s",
+                            start.elapsed().as_secs_f64()
+                        ))
+                    );
                     break out;
                 }
             }
@@ -146,6 +161,16 @@ impl GraphExecutor {
 enum StepResult {
     Continue(String),
     End(String),
+}
+
+fn node_type_label(node: &Node) -> &'static str {
+    match &node.node_type {
+        NodeType::Agent(_) => "agent",
+        NodeType::Script(_) => "script",
+        NodeType::Approval(_) => "approval",
+        NodeType::Input(_) => "input",
+        NodeType::End(_) => "end",
+    }
 }
 
 async fn step(
@@ -179,9 +204,7 @@ async fn step(
                 }
             };
             let next = dynamic.or_else(|| node.next.clone()).ok_or_else(|| {
-                anyhow!(
-                    "script node '{current}' did not emit `_next` and has no static `next`"
-                )
+                anyhow!("script node '{current}' did not emit `_next` and has no static `next`")
             })?;
             Ok(StepResult::Continue(next))
         }
