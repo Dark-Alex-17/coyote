@@ -317,25 +317,6 @@ impl Functions {
         self.declarations.iter().find(|v| v.name == name)
     }
 
-    /// Narrow the declared tool list to a caller-supplied whitelist.
-    /// Entries are matched by exact name. The shorthand `mcp:<server>`
-    /// expands to the three MCP meta-functions Loki registers per
-    /// server (`mcp_invoke_<server>`, `mcp_search_<server>`,
-    /// `mcp_describe_<server>`).
-    pub fn retain_named(&mut self, allowed: &[String]) {
-        let mut expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for entry in allowed {
-            if let Some(server) = entry.strip_prefix("mcp:") {
-                expanded.insert(format!("{MCP_INVOKE_META_FUNCTION_NAME_PREFIX}_{server}"));
-                expanded.insert(format!("{MCP_SEARCH_META_FUNCTION_NAME_PREFIX}_{server}"));
-                expanded.insert(format!("{MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX}_{server}"));
-            } else {
-                expanded.insert(entry.clone());
-            }
-        }
-        self.declarations.retain(|d| expanded.contains(&d.name));
-    }
-
     pub fn contains(&self, name: &str) -> bool {
         self.declarations.iter().any(|v| v.name == name)
     }
@@ -1748,77 +1729,5 @@ mod tests {
         let result = ToolResult::new(tc.clone(), json!({"result": "ok"}));
         assert_eq!(result.call.name, "my_tool");
         assert_eq!(result.output, json!({"result": "ok"}));
-    }
-
-    fn function_with_names(names: &[&str]) -> Functions {
-        let declarations = names
-            .iter()
-            .map(|n| FunctionDeclaration {
-                name: (*n).to_string(),
-                description: String::new(),
-                parameters: JsonSchema::default(),
-                agent: false,
-            })
-            .collect();
-        Functions { declarations }
-    }
-
-    #[test]
-    fn retain_named_keeps_only_exact_matches() {
-        let mut f = function_with_names(&["read_query", "describe_table", "web_search_loki"]);
-        f.retain_named(&["read_query".to_string()]);
-        assert!(f.contains("read_query"));
-        assert!(!f.contains("describe_table"));
-        assert!(!f.contains("web_search_loki"));
-    }
-
-    #[test]
-    fn retain_named_with_empty_list_removes_all() {
-        let mut f = function_with_names(&["a", "b", "c"]);
-        f.retain_named(&[]);
-        assert!(!f.contains("a"));
-        assert!(!f.contains("b"));
-        assert!(!f.contains("c"));
-        assert!(f.is_empty());
-    }
-
-    #[test]
-    fn retain_named_with_unknown_name_drops_everything() {
-        let mut f = function_with_names(&["a", "b"]);
-        f.retain_named(&["nonexistent".to_string()]);
-        assert!(f.is_empty());
-    }
-
-    #[test]
-    fn retain_named_with_mcp_shorthand_keeps_all_three_meta_functions() {
-        let mut f = Functions::default();
-        f.append_mcp_meta_functions(vec!["github".to_string(), "slack".to_string()]);
-        f.retain_named(&["mcp:github".to_string()]);
-        assert!(f.contains("mcp_invoke_github"));
-        assert!(f.contains("mcp_search_github"));
-        assert!(f.contains("mcp_describe_github"));
-        assert!(!f.contains("mcp_invoke_slack"));
-        assert!(!f.contains("mcp_search_slack"));
-        assert!(!f.contains("mcp_describe_slack"));
-    }
-
-    #[test]
-    fn retain_named_mixes_exact_names_and_mcp_shorthand() {
-        let mut f = function_with_names(&["read_query", "describe_table"]);
-        f.append_mcp_meta_functions(vec!["pubmed".to_string()]);
-        f.retain_named(&["read_query".to_string(), "mcp:pubmed".to_string()]);
-        assert!(f.contains("read_query"));
-        assert!(!f.contains("describe_table"));
-        assert!(f.contains("mcp_invoke_pubmed"));
-        assert!(f.contains("mcp_search_pubmed"));
-        assert!(f.contains("mcp_describe_pubmed"));
-    }
-
-    #[test]
-    fn retain_named_with_mcp_shorthand_for_unknown_server_drops_other_servers() {
-        let mut f = Functions::default();
-        f.append_mcp_meta_functions(vec!["alpha".to_string()]);
-        f.retain_named(&["mcp:beta".to_string()]);
-        assert!(!f.contains("mcp_invoke_alpha"));
     }
 }
