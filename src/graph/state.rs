@@ -13,13 +13,14 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 static TEMPLATE_VAR_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\{\{([a-zA-Z0-9_\.]+)\}\}").expect("invalid template regex"));
+    LazyLock::new(|| Regex::new(r"\{\{([a-zA-Z0-9_\.\[\]]+)\}\}").expect("invalid template regex"));
 
 /// Wraps [`GraphState`] with template interpolation, script-output merging,
 /// and a large-state temp-file fallback for use with scripts.
 ///
 /// Template syntax: `{{key}}` for top-level keys, `{{a.b.c}}` for nested
-/// JSON paths. Use [`StateManager::interpolate`] for strict interpolation
+/// JSON paths, and `{{arr[0]}}` / `{{a.b[2].c}}` / `{{matrix[0][1]}}` for
+/// array indices. Use [`StateManager::interpolate`] for strict interpolation
 /// (errors on missing keys) or [`StateManager::interpolate_lenient`] for
 /// best-effort (missing keys become empty strings).
 pub struct StateManager {
@@ -89,10 +90,20 @@ impl StateManager {
 
     fn get_nested_value(&self, key: &str) -> Option<&Value> {
         let mut parts = key.split('.');
-        let root = parts.next()?;
-        let mut current = self.state.get(root)?;
+        let first = parts.next()?;
+        let (root_key, root_indices) = split_indices(first)?;
+        let mut current = self.state.get(root_key)?;
+        for idx in root_indices {
+            current = current.get(idx)?;
+        }
         for part in parts {
-            current = current.get(part)?;
+            let (segment_key, indices) = split_indices(part)?;
+            if !segment_key.is_empty() {
+                current = current.get(segment_key)?;
+            }
+            for idx in indices {
+                current = current.get(idx)?;
+            }
         }
         Some(current)
     }
@@ -201,6 +212,26 @@ impl StateRepresentation {
     pub fn is_file(&self) -> bool {
         matches!(self, StateRepresentation::File(_))
     }
+}
+
+fn split_indices(segment: &str) -> Option<(&str, Vec<usize>)> {
+    let bracket_start = segment.find('[');
+    let key = match bracket_start {
+        Some(i) => &segment[..i],
+        None => return Some((segment, Vec::new())),
+    };
+    let mut indices = Vec::new();
+    let mut rest = &segment[bracket_start.unwrap()..];
+    while !rest.is_empty() {
+        if !rest.starts_with('[') {
+            return None;
+        }
+        let close = rest.find(']')?;
+        let idx: usize = rest[1..close].parse().ok()?;
+        indices.push(idx);
+        rest = &rest[close + 1..];
+    }
+    Some((key, indices))
 }
 
 fn value_to_string(value: &Value) -> String {
@@ -319,6 +350,45 @@ mod tests {
         let manager = manager_with(&[("data", json!({ "key": "value" }))]);
         let result = manager.interpolate("{{data}}").unwrap();
         assert_eq!(result, r#"{"key":"value"}"#);
+    }
+
+    #[test]
+    fn interpolates_array_indices() {
+        let manager = manager_with(&[("items", json!(["a", "b", "c"]))]);
+        assert_eq!(manager.interpolate("{{items[0]}}").unwrap(), "a");
+        assert_eq!(manager.interpolate("{{items[2]}}").unwrap(), "c");
+    }
+
+    #[test]
+    fn interpolates_array_indices_inside_nested_paths() {
+        let manager = manager_with(&[("outer", json!({ "inner": { "arr": ["x", "y", "z"] } }))]);
+        let result = manager
+            .interpolate("first={{outer.inner.arr[0]}} last={{outer.inner.arr[2]}}")
+            .unwrap();
+        assert_eq!(result, "first=x last=z");
+    }
+
+    #[test]
+    fn interpolates_object_fields_after_array_index() {
+        let manager = manager_with(&[("users", json!([{ "name": "Alice" }, { "name": "Bob" }]))]);
+        let result = manager
+            .interpolate("{{users[0].name}} and {{users[1].name}}")
+            .unwrap();
+        assert_eq!(result, "Alice and Bob");
+    }
+
+    #[test]
+    fn interpolates_nested_array_indices() {
+        let manager = manager_with(&[("matrix", json!([[1, 2], [3, 4]]))]);
+        assert_eq!(manager.interpolate("{{matrix[0][1]}}").unwrap(), "2");
+        assert_eq!(manager.interpolate("{{matrix[1][0]}}").unwrap(), "3");
+    }
+
+    #[test]
+    fn out_of_bounds_array_index_is_missing() {
+        let manager = manager_with(&[("items", json!(["a", "b"]))]);
+        let err = manager.interpolate("{{items[5]}}").unwrap_err().to_string();
+        assert!(err.contains("not found"), "got: {err}");
     }
 
     #[test]

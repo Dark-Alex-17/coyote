@@ -131,6 +131,13 @@ pub struct AgentNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_updates: Option<HashMap<String, String>>,
 
+    /// JSON Schema describing the expected shape of the agent's final
+    /// output. When set, the agent's raw text is post-processed through
+    /// a built-in structured-output extractor and parsed as JSON. Top-
+    /// level keys of the parsed object are auto-merged into state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 }
@@ -255,6 +262,13 @@ pub struct LlmNode {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_updates: Option<HashMap<String, String>>,
+
+    /// JSON Schema (as parsed JSON) describing the expected shape of the
+    /// node's output. When set, the raw LLM response is post-processed
+    /// through a built-in structured-output extractor and parsed as JSON.
+    /// Top-level keys of the parsed object are auto-merged into state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,

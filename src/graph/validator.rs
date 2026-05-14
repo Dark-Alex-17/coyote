@@ -411,6 +411,7 @@ mod tests {
                 agent: agent.into(),
                 prompt: "hi".into(),
                 state_updates: None,
+                output_schema: None,
                 timeout: None,
             }),
             next: next.map(String::from),
