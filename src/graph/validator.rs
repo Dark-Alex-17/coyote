@@ -248,6 +248,7 @@ fn declared_targets(node: &Node) -> Vec<(String, &'static str)> {
             for v in a.routes.values() {
                 out.push((v.clone(), "approval 'routes'"));
             }
+            out.push((a.on_other.clone(), "approval 'on_other'"));
             if let Some(t) = &a.on_timeout {
                 out.push((t.clone(), "'on_timeout'"));
             }
@@ -369,7 +370,7 @@ mod tests {
         }
     }
 
-    fn approval_node(id: &str, options: &[&str], routes: &[(&str, &str)]) -> Node {
+    fn approval_node(id: &str, options: &[&str], routes: &[(&str, &str)], on_other: &str) -> Node {
         let mut r: HashMap<String, String> = HashMap::new();
         for (k, v) in routes {
             r.insert((*k).into(), (*v).into());
@@ -381,6 +382,7 @@ mod tests {
                 question: "?".into(),
                 options: options.iter().map(|s| (*s).into()).collect(),
                 routes: r,
+                on_other: on_other.into(),
                 state_updates: None,
                 timeout: None,
                 on_timeout: None,
@@ -449,7 +451,12 @@ mod tests {
 
     #[test]
     fn flags_missing_approval_route_target() {
-        let approval = approval_node("ap", &["yes", "no"], &[("yes", "end"), ("no", "missing")]);
+        let approval = approval_node(
+            "ap",
+            &["yes", "no"],
+            &[("yes", "end"), ("no", "missing")],
+            "end",
+        );
         let graph = graph_with(vec![("ap", approval), ("end", end_node("end"))], "ap");
         let result = validator().validate(&graph);
         assert!(!result.is_valid());
@@ -458,6 +465,21 @@ mod tests {
                 .errors
                 .iter()
                 .any(|e| e.message.contains("non-existent node 'missing'"))
+        );
+    }
+
+    #[test]
+    fn flags_missing_approval_on_other_target() {
+        let approval = approval_node("ap", &["yes"], &[("yes", "end")], "missing");
+        let graph = graph_with(vec![("ap", approval), ("end", end_node("end"))], "ap");
+        let result = validator().validate(&graph);
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("non-existent node 'missing'")
+                    && e.message.contains("on_other"))
         );
     }
 
@@ -597,7 +619,7 @@ mod tests {
 
     #[test]
     fn errors_when_approval_option_has_no_route() {
-        let approval = approval_node("ap", &["yes", "no"], &[("yes", "end")]);
+        let approval = approval_node("ap", &["yes", "no"], &[("yes", "end")], "end");
         let graph = graph_with(vec![("ap", approval), ("end", end_node("end"))], "ap");
         let result = validator().validate(&graph);
         assert!(
@@ -610,7 +632,7 @@ mod tests {
 
     #[test]
     fn warns_when_approval_has_extra_route() {
-        let approval = approval_node("ap", &["yes"], &[("yes", "end"), ("maybe", "end")]);
+        let approval = approval_node("ap", &["yes"], &[("yes", "end"), ("maybe", "end")], "end");
         let graph = graph_with(vec![("ap", approval), ("end", end_node("end"))], "ap");
         let result = validator().validate(&graph);
         assert!(result.warnings.iter().any(|w| {

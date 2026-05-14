@@ -174,6 +174,13 @@ pub struct ApprovalNode {
 
     pub routes: HashMap<String, String>,
 
+    /// REQUIRED. The user_ask tool always permits a free-form "type your
+    /// own answer" response in addition to the listed `options`. When the
+    /// user supplies any answer that does NOT match a key in `routes`,
+    /// execution routes to this node. The free-form text is available to
+    /// downstream nodes via `state_updates` (e.g. `clarification: "{{choice}}"`).
+    pub on_other: String,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_updates: Option<HashMap<String, String>>,
 
@@ -427,6 +434,7 @@ nodes:
     routes:
       yes: i
       no: e
+    on_other: e
   i:
     id: i
     type: input
@@ -559,6 +567,7 @@ routes:
   approve: apply
   reject: end_reject
   edit: edit_loop
+on_other: edit_loop
 "#;
         let node: Node = serde_yaml::from_str(yaml).unwrap();
         let approval = match node.node_type {
