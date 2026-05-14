@@ -139,14 +139,10 @@ fn build_input_question(node: &InputNode, state_manager: &StateManager) -> Resul
 }
 
 fn resolve_approval_route(node: &ApprovalNode, choice: &str) -> Result<String> {
-    node.routes.get(choice).cloned().ok_or_else(|| {
-        let mut available: Vec<&str> = node.routes.keys().map(String::as_str).collect();
-        available.sort();
-        anyhow!(
-            "No route defined for choice '{choice}'. Available routes: {}",
-            available.join(", ")
-        )
-    })
+    if let Some(target) = node.routes.get(choice) {
+        return Ok(target.clone());
+    }
+    Ok(node.on_other.clone())
 }
 
 fn apply_state_updates_with_var(
@@ -234,7 +230,7 @@ mod tests {
         StateManager::new(map)
     }
 
-    fn approval(options: &[&str], routes: &[(&str, &str)]) -> ApprovalNode {
+    fn approval(options: &[&str], routes: &[(&str, &str)], on_other: &str) -> ApprovalNode {
         let mut r = HashMap::new();
         for (k, v) in routes {
             r.insert((*k).into(), (*v).into());
@@ -243,6 +239,7 @@ mod tests {
             question: "?".into(),
             options: options.iter().map(|s| (*s).into()).collect(),
             routes: r,
+            on_other: on_other.into(),
             state_updates: None,
             timeout: None,
             on_timeout: None,
@@ -289,19 +286,27 @@ mod tests {
 
     #[test]
     fn approval_route_lookup_returns_target_on_match() {
-        let node = approval(&["yes", "no"], &[("yes", "deploy"), ("no", "cancel")]);
+        let node = approval(
+            &["yes", "no"],
+            &[("yes", "deploy"), ("no", "cancel")],
+            "clarify",
+        );
         assert_eq!(resolve_approval_route(&node, "yes").unwrap(), "deploy");
         assert_eq!(resolve_approval_route(&node, "no").unwrap(), "cancel");
     }
 
     #[test]
-    fn approval_route_lookup_errors_on_unknown_choice() {
-        let node = approval(&["yes", "no"], &[("yes", "deploy"), ("no", "cancel")]);
-        let err = resolve_approval_route(&node, "maybe")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("'maybe'"), "got: {err}");
-        assert!(err.contains("yes") && err.contains("no"), "got: {err}");
+    fn approval_route_lookup_falls_back_to_on_other_for_unknown_choice() {
+        let node = approval(
+            &["yes", "no"],
+            &[("yes", "deploy"), ("no", "cancel")],
+            "clarify",
+        );
+        assert_eq!(resolve_approval_route(&node, "maybe").unwrap(), "clarify");
+        assert_eq!(
+            resolve_approval_route(&node, "free-form text").unwrap(),
+            "clarify"
+        );
     }
 
     #[test]

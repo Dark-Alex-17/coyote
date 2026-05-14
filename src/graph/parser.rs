@@ -291,6 +291,7 @@ nodes:
     routes:
       "Yes": deploy
       "No": cancel
+    on_other: cancel
   deploy:
     type: end
   cancel:
