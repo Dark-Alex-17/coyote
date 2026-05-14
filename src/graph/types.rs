@@ -118,8 +118,9 @@ pub enum NodeType {
 /// `agent`-type node: spawn an agent with a templated prompt. The agent
 /// uses the full tool stack from its own directory (`global_tools` and
 /// `mcp_servers` in `config.yaml` plus any per-agent `tools.{sh,py,ts,js}`
-/// script). There is no per-node tool override; to use different tool
-/// sets, create agent variants. See `docs/graph-agents/agent-tools.md`.
+/// script); there is no per-node tool override here. For tool-filtered
+/// one-shot LLM steps, use an `llm`-type node (future). To use different
+/// tool sets via agent variants, see `docs/graph-agents/agent-tools.md`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentNode {
     pub agent: String,

@@ -332,6 +332,15 @@ pub fn run_child_agent(
     abort_signal: AbortSignal,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
+        if crate::graph::active_agent_graph_name(&child_ctx).is_some() {
+            return crate::graph::run_active_agent_graph(
+                &mut child_ctx,
+                &initial_input.text(),
+                abort_signal,
+            )
+            .await;
+        }
+
         let mut accumulated_output = String::new();
         let mut input = initial_input;
         let app = Arc::clone(&child_ctx.app.config);

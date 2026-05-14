@@ -2,6 +2,7 @@
 //! JSON state, composed of agent/script/approval/input/end nodes.
 
 pub mod agent;
+pub mod dispatch;
 pub mod executor;
 pub mod parser;
 pub mod script;
@@ -11,6 +12,7 @@ pub mod user_interaction;
 pub mod validator;
 
 pub use agent::AgentNodeExecutor;
+pub use dispatch::{active_agent_graph_name, run_active_agent_graph};
 pub use executor::GraphExecutor;
 pub use parser::{GraphParser, agent_has_graph, load_agent_graph};
 pub use script::ScriptExecutor;

@@ -312,6 +312,17 @@ async fn start_directive(
     abort_signal: AbortSignal,
 ) -> Result<()> {
     let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
+
+    if graph::active_agent_graph_name(ctx).is_some() {
+        ctx.before_chat_completion(&input)?;
+        let output =
+            graph::run_active_agent_graph(ctx, &input.text(), abort_signal.clone()).await?;
+        app.print_markdown(&output)?;
+        ctx.after_chat_completion(app.as_ref(), &input, &output, &[])?;
+        ctx.exit_session()?;
+        return Ok(());
+    }
+
     let client = input.create_client()?;
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
     ctx.before_chat_completion(&input)?;
