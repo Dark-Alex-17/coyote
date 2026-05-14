@@ -262,6 +262,11 @@ fn declared_targets(node: &Node) -> Vec<(String, &'static str)> {
                 out.push((t.clone(), "'on_timeout'"));
             }
         }
+        NodeType::Llm(l) => {
+            if let Some(t) = &l.fallback {
+                out.push((t.clone(), "llm 'fallback'"));
+            }
+        }
         NodeType::Agent(_) | NodeType::End(_) => {}
     }
     out

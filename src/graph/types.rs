@@ -112,6 +112,7 @@ pub enum NodeType {
     Script(ScriptNode),
     Approval(ApprovalNode),
     Input(InputNode),
+    Llm(LlmNode),
     End(EndNode),
 }
 
@@ -197,6 +198,66 @@ pub struct InputNode {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_timeout: Option<String>,
+}
+
+/// `llm`-type node: a one-shot LLM call (with bounded tool-call loop)
+/// against a caller-supplied system prompt + user prompt. Unlike
+/// `agent`-type nodes, this does NOT spawn a sub-agent; it runs in a
+/// fresh isolated context. Tool access is opt-in via the `tools`
+/// whitelist (no tools when unset).
+///
+/// Routing (tolerant-fail):
+///   - success                 → `Node.next`
+///   - failure WITH fallback   → `fallback`
+///   - failure WITHOUT fallback → `Node.next`
+///
+/// `state_updates` are always applied. `{{output}}` resolves to the
+/// LLM's response on success, or to an error description on failure.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LlmNode {
+    pub instructions: String,
+
+    pub prompt: String,
+
+    /// Whitelist of tool names. Each entry is either an exact function
+    /// name or the shorthand `mcp:<server>` (expands to the three MCP
+    /// meta-functions for that server). Unset = no tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+
+    /// Number of attempts on transient errors. Default 1 = no retries.
+    #[serde(default = "default_llm_max_attempts")]
+    pub max_attempts: u32,
+
+    /// Hard cap on tool-call-loop turns within a single attempt.
+    #[serde(default = "default_llm_max_iterations")]
+    pub max_iterations: u32,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_updates: Option<HashMap<String, String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+}
+
+fn default_llm_max_attempts() -> u32 {
+    1
+}
+
+fn default_llm_max_iterations() -> u32 {
+    10
 }
 
 /// `end`-type node: terminate execution; `output` (templated) is returned
@@ -547,5 +608,94 @@ routes:
         let state = GraphState::new(initial);
         assert_eq!(state.get("user"), Some(&json!("alice")));
         assert!(state.history().is_empty());
+    }
+
+    #[test]
+    fn llm_node_with_all_fields() {
+        let yaml = r#"
+id: classify
+type: llm
+instructions: "You are a classifier."
+prompt: "Classify: {{input_text}}"
+tools:
+  - read_query
+  - "mcp:pubmed-search"
+model: anthropic:claude-3-5-haiku-20241022
+temperature: 0.0
+top_p: 0.5
+fallback: skip_classify
+max_attempts: 3
+max_iterations: 5
+state_updates:
+  category: "{{output}}"
+timeout: 30
+next: review
+"#;
+        let node: Node = serde_yaml::from_str(yaml).unwrap();
+        let llm = match node.node_type {
+            NodeType::Llm(l) => l,
+            _ => panic!("expected Llm variant"),
+        };
+        assert_eq!(llm.instructions, "You are a classifier.");
+        assert_eq!(llm.prompt, "Classify: {{input_text}}");
+        let tools = llm.tools.unwrap();
+        assert_eq!(tools, vec!["read_query", "mcp:pubmed-search"]);
+        assert_eq!(
+            llm.model.as_deref(),
+            Some("anthropic:claude-3-5-haiku-20241022")
+        );
+        assert_eq!(llm.temperature, Some(0.0));
+        assert_eq!(llm.top_p, Some(0.5));
+        assert_eq!(llm.fallback.as_deref(), Some("skip_classify"));
+        assert_eq!(llm.max_attempts, 3);
+        assert_eq!(llm.max_iterations, 5);
+        assert_eq!(llm.timeout, Some(30));
+        assert!(llm.state_updates.is_some());
+        assert_eq!(node.next.as_deref(), Some("review"));
+    }
+
+    #[test]
+    fn llm_node_minimal_fields_use_defaults() {
+        let yaml = r#"
+id: pure_text
+type: llm
+instructions: "System."
+prompt: "User."
+next: done
+"#;
+        let node: Node = serde_yaml::from_str(yaml).unwrap();
+        let llm = match node.node_type {
+            NodeType::Llm(l) => l,
+            _ => panic!("expected Llm variant"),
+        };
+        assert_eq!(llm.instructions, "System.");
+        assert_eq!(llm.prompt, "User.");
+        assert!(llm.tools.is_none());
+        assert!(llm.model.is_none());
+        assert!(llm.fallback.is_none());
+        assert_eq!(llm.max_attempts, 1);
+        assert_eq!(llm.max_iterations, 10);
+    }
+
+    #[test]
+    fn llm_node_missing_instructions_fails() {
+        let yaml = r#"
+id: bad
+type: llm
+prompt: "User only — no system prompt."
+"#;
+        let result: std::result::Result<Node, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn llm_node_missing_prompt_fails() {
+        let yaml = r#"
+id: bad
+type: llm
+instructions: "System only — no user prompt."
+"#;
+        let result: std::result::Result<Node, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
     }
 }

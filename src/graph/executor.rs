@@ -7,10 +7,11 @@
 //! template as the graph's return value.
 
 use super::agent::AgentNodeExecutor;
+use super::llm::{self, LlmNodeExecutor};
 use super::parser::GraphParser;
 use super::script::ScriptExecutor;
 use super::state::StateManager;
-use super::types::{EndNode, Graph, Node, NodeType};
+use super::types::{EndNode, Graph, LlmNode, Node, NodeType};
 use super::user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 use super::validator::GraphValidator;
 use crate::config::RequestContext;
@@ -169,6 +170,7 @@ fn node_type_label(node: &Node) -> &'static str {
         NodeType::Script(_) => "script",
         NodeType::Approval(_) => "approval",
         NodeType::Input(_) => "input",
+        NodeType::Llm(_) => "llm",
         NodeType::End(_) => "end",
     }
 }
@@ -217,8 +219,41 @@ async fn step(
                 InputNodeExecutor::execute(input_node, node.next.as_deref(), state, ctx).await?;
             Ok(StepResult::Continue(next))
         }
+        NodeType::Llm(llm_node) => {
+            let result = LlmNodeExecutor::execute(llm_node, state, ctx).await;
+            let (output, failed) = match result {
+                Ok(out) => (out, false),
+                Err(e) => {
+                    warn!("[graph:{}] llm node '{}' failed: {e}", graph_name, current);
+                    (format!("LLM node failed: {e}"), true)
+                }
+            };
+            apply_state_updates_with_llm_output(llm_node, state, &output);
+            let next = next_for_llm_node(node, failed, llm_node.fallback.as_deref())?;
+            Ok(StepResult::Continue(next))
+        }
         NodeType::End(end_node) => Ok(StepResult::End(resolve_end_output(end_node, state))),
     }
+}
+
+fn next_for_llm_node(node: &Node, failed: bool, fallback: Option<&str>) -> Result<String> {
+    if failed && let Some(fb) = fallback {
+        return Ok(fb.to_string());
+    }
+    node.next.clone().ok_or_else(|| {
+        anyhow!(
+            "llm node '{}' has no `next` set; llm nodes need static routing",
+            node.id
+        )
+    })
+}
+
+fn apply_state_updates_with_llm_output(
+    node: &super::types::LlmNode,
+    state: &mut StateManager,
+    output: &str,
+) {
+    crate::graph::llm::apply_state_updates_with_output(node, state, output);
 }
 
 /// Apply the end node's `state_updates`, then interpolate its `output`

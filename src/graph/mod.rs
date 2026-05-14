@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod dispatch;
 pub mod executor;
+pub mod llm;
 pub mod parser;
 pub mod script;
 pub mod state;
@@ -14,12 +15,13 @@ pub mod validator;
 pub use agent::AgentNodeExecutor;
 pub use dispatch::{active_agent_graph_name, run_active_agent_graph};
 pub use executor::GraphExecutor;
+pub use llm::LlmNodeExecutor;
 pub use parser::{GraphParser, agent_has_graph, load_agent_graph};
 pub use script::ScriptExecutor;
 pub use state::{StateManager, StateRepresentation};
 pub use types::{
-    AgentNode, ApprovalNode, EndNode, Graph, GraphSettings, GraphState, InputNode, Node, NodeType,
-    ScriptNode,
+    AgentNode, ApprovalNode, EndNode, Graph, GraphSettings, GraphState, InputNode, LlmNode, Node,
+    NodeType, ScriptNode,
 };
 pub use user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 pub use validator::{GraphValidator, ValidationError, ValidationResult};
