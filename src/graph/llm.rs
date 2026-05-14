@@ -13,7 +13,7 @@ use super::state::StateManager;
 use super::types::LlmNode;
 use crate::config::RequestContext;
 use crate::utils::dimmed_text;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 const OUTPUT_KEY: &str = "output";
@@ -51,9 +51,14 @@ async fn run(
     state_manager: &mut StateManager,
     _parent_ctx: &mut RequestContext,
 ) -> Result<String> {
-    let _instructions = state_manager
-        .interpolate(&node.instructions)
-        .context("Failed to interpolate llm node instructions")?;
+    let _instructions: Option<String> = match &node.instructions {
+        Some(s) => Some(
+            state_manager
+                .interpolate(s)
+                .context("Failed to interpolate llm node instructions")?,
+        ),
+        None => None,
+    };
     let _prompt = state_manager
         .interpolate(&node.prompt)
         .context("Failed to interpolate llm node prompt")?;
@@ -119,7 +124,7 @@ fn apply_state_updates_with_output(node: &LlmNode, state_manager: &mut StateMana
 
 fn describe_tools_filter(tools: Option<&[String]>) -> String {
     match tools {
-        None => "<none>".into(),
+        None => "<inherit>".into(),
         Some(t) if t.is_empty() => "<none>".into(),
         Some(t) => t.join(","),
     }
@@ -142,7 +147,7 @@ mod tests {
 
     fn node_with(updates: Option<HashMap<String, String>>) -> LlmNode {
         LlmNode {
-            instructions: "sys".into(),
+            instructions: Some("sys".into()),
             prompt: "user".into(),
             tools: None,
             model: None,
@@ -208,7 +213,7 @@ mod tests {
 
     #[test]
     fn describe_tools_filter_renders_each_case() {
-        assert_eq!(describe_tools_filter(None), "<none>");
+        assert_eq!(describe_tools_filter(None), "<inherit>");
         assert_eq!(describe_tools_filter(Some(&[])), "<none>");
         let tools = vec!["a".to_string(), "b".to_string()];
         assert_eq!(describe_tools_filter(Some(&tools)), "a,b");
