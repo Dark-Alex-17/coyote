@@ -13,7 +13,7 @@ use super::state::StateManager;
 use super::types::LlmNode;
 use crate::config::RequestContext;
 use crate::utils::dimmed_text;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 const OUTPUT_KEY: &str = "output";
@@ -21,48 +21,77 @@ const OUTPUT_KEY: &str = "output";
 pub struct LlmNodeExecutor;
 
 impl LlmNodeExecutor {
-    /// Interpolate the node's templates, run the LLM call, then return
-    /// the model's final response. State updates are applied by the
-    /// graph executor (which knows whether to use the success path or
-    /// the failure path).
+    /// Run the LLM call and resolve routing. Returns the next node ID
+    /// to visit. Handles the tolerant-fail contract internally:
+    /// success → `node_next`; failure with `fallback` → `fallback`;
+    /// failure without `fallback` → `node_next`. State updates are
+    /// applied in both success and failure paths, with `{{output}}`
+    /// resolving to the LLM's response or an error description.
     pub async fn execute(
         node: &LlmNode,
+        node_next: Option<&str>,
         state_manager: &mut StateManager,
-        _parent_ctx: &mut RequestContext,
+        parent_ctx: &mut RequestContext,
     ) -> Result<String> {
-        let _instructions = state_manager
-            .interpolate(&node.instructions)
-            .context("Failed to interpolate llm node instructions")?;
-        let _prompt = state_manager
-            .interpolate(&node.prompt)
-            .context("Failed to interpolate llm node prompt")?;
-
-        eprintln!(
-            "{}",
-            dimmed_text(&format!(
-                "▸   llm call: model={} tools={}",
-                node.model.as_deref().unwrap_or("<active>"),
-                describe_tools_filter(node.tools.as_deref())
-            ))
-        );
-
-        bail!(
-            "llm node execution body not yet implemented — see \
-             docs/implementation/graph-agents/10.5-llm-nodes.md \
-             (steps 3 & 5 of the implementation order)"
-        );
+        let result = run(node, state_manager, parent_ctx).await;
+        let (output, failed) = match result {
+            Ok(out) => (out, false),
+            Err(e) => {
+                warn!("llm node failed: {e}");
+                (format!("LLM node failed: {e}"), true)
+            }
+        };
+        apply_state_updates_with_output(node, state_manager, &output);
+        next_for_llm_node(node_next, failed, node.fallback.as_deref())
     }
+}
+
+async fn run(
+    node: &LlmNode,
+    state_manager: &mut StateManager,
+    _parent_ctx: &mut RequestContext,
+) -> Result<String> {
+    let _instructions = state_manager
+        .interpolate(&node.instructions)
+        .context("Failed to interpolate llm node instructions")?;
+    let _prompt = state_manager
+        .interpolate(&node.prompt)
+        .context("Failed to interpolate llm node prompt")?;
+
+    eprintln!(
+        "{}",
+        dimmed_text(&format!(
+            "▸   llm call: model={} tools={}",
+            node.model.as_deref().unwrap_or("<active>"),
+            describe_tools_filter(node.tools.as_deref())
+        ))
+    );
+
+    bail!(
+        "llm node execution body not yet implemented — see \
+         docs/implementation/graph-agents/10.5-llm-nodes.md \
+         (steps 3 & 5 of the implementation order)"
+    );
+}
+
+fn next_for_llm_node(
+    node_next: Option<&str>,
+    failed: bool,
+    fallback: Option<&str>,
+) -> Result<String> {
+    if failed && let Some(fb) = fallback {
+        return Ok(fb.to_string());
+    }
+    node_next
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("llm node has no `next` set; llm nodes need static routing"))
 }
 
 /// Expose the LLM call's final output as `{{output}}` for the duration
 /// of `state_updates` evaluation, then restore the prior value (or set
 /// it to `Null` if there wasn't one). Same pattern as
 /// `AgentNodeExecutor`'s `{{output}}` scoping.
-pub fn apply_state_updates_with_output(
-    node: &LlmNode,
-    state_manager: &mut StateManager,
-    output: &str,
-) {
+fn apply_state_updates_with_output(node: &LlmNode, state_manager: &mut StateManager, output: &str) {
     let Some(updates) = &node.state_updates else {
         return;
     };
