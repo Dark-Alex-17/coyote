@@ -990,9 +990,12 @@ impl RequestContext {
         let app = self.app.config.as_ref();
         let mut functions = vec![];
         if app.function_calling_support {
-            if let Some(enabled_tools) = role.enabled_tools() {
-                let mut tool_names: HashSet<String> = Default::default();
-                let declaration_names: HashSet<String> = self
+            // Compute the set of tool names enabled by the role filter, drawn
+            // from BOTH the tool_scope pool and the agent's pool so that an
+            // explicit `enabled_tools` list (e.g. from a graph LLM node) can
+            // narrow the agent's own custom tools too.
+            let role_filter: Option<HashSet<String>> = role.enabled_tools().map(|enabled_tools| {
+                let mut declaration_names: HashSet<String> = self
                     .tool_scope
                     .functions
                     .declarations()
@@ -1004,11 +1007,30 @@ impl RequestContext {
                     })
                     .map(|v| v.name.to_string())
                     .collect();
+                if let Some(agent) = &self.agent {
+                    declaration_names.extend(
+                        agent
+                            .functions()
+                            .declarations()
+                            .iter()
+                            .filter(|v| {
+                                !v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
+                                    && !v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
+                                    && !v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
+                            })
+                            .map(|v| v.name.to_string()),
+                    );
+                }
+
+                let mut tool_names: HashSet<String> = Default::default();
                 if enabled_tools == "all" {
                     tool_names.extend(declaration_names);
                 } else {
                     for item in enabled_tools.split(',') {
                         let item = item.trim();
+                        if item.is_empty() {
+                            continue;
+                        }
                         if let Some(values) = app.mapping_tools.get(item) {
                             tool_names.extend(
                                 values
@@ -1021,6 +1043,10 @@ impl RequestContext {
                         }
                     }
                 }
+                tool_names
+            });
+
+            if let Some(ref tool_names) = role_filter {
                 functions = self
                     .tool_scope
                     .functions
@@ -1063,6 +1089,9 @@ impl RequestContext {
                             && !v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
                     })
                     .collect();
+                if let Some(ref tool_names) = role_filter {
+                    agent_functions.retain(|v| tool_names.contains(&v.name));
+                }
                 let tool_names: HashSet<String> = agent_functions
                     .iter()
                     .filter_map(|v| {
@@ -1089,63 +1118,87 @@ impl RequestContext {
         let app = self.app.config.as_ref();
         let mut mcp_functions = vec![];
         if app.mcp_server_support {
-            if let Some(enabled_mcp_servers) = role.enabled_mcp_servers() {
-                let mut server_names: HashSet<String> = Default::default();
-                let mcp_declaration_names: HashSet<String> = self
-                    .tool_scope
-                    .functions
-                    .declarations()
-                    .iter()
-                    .filter(|v| {
-                        v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                            || v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                            || v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                    })
-                    .map(|v| v.name.to_string())
-                    .collect();
-                if enabled_mcp_servers == "all" {
-                    server_names.extend(mcp_declaration_names);
-                } else {
-                    for item in enabled_mcp_servers.split(',') {
-                        let item = item.trim();
-                        let item_invoke_name =
-                            format!("{}_{item}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
-                        let item_search_name =
-                            format!("{}_{item}", MCP_SEARCH_META_FUNCTION_NAME_PREFIX);
-                        let item_describe_name =
-                            format!("{}_{item}", MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX);
-                        if let Some(values) = app.mapping_mcp_servers.get(item) {
-                            server_names.extend(
-                                values
-                                    .split(',')
-                                    .flat_map(|v| {
-                                        vec![
-                                            format!(
-                                                "{}_{}",
-                                                MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
-                                                v.to_string()
-                                            ),
-                                            format!(
-                                                "{}_{}",
-                                                MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
-                                                v.to_string()
-                                            ),
-                                            format!(
-                                                "{}_{}",
-                                                MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
-                                                v.to_string()
-                                            ),
-                                        ]
-                                    })
-                                    .filter(|v| mcp_declaration_names.contains(v)),
-                            )
-                        } else if mcp_declaration_names.contains(&item_invoke_name) {
-                            server_names.insert(item_invoke_name);
-                            server_names.insert(item_search_name);
-                            server_names.insert(item_describe_name);
+            let role_filter: Option<HashSet<String>> =
+                role.enabled_mcp_servers().map(|enabled_mcp_servers| {
+                    let mut mcp_declaration_names: HashSet<String> = self
+                        .tool_scope
+                        .functions
+                        .declarations()
+                        .iter()
+                        .filter(|v| {
+                            v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
+                                || v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
+                                || v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
+                        })
+                        .map(|v| v.name.to_string())
+                        .collect();
+                    if let Some(agent) = &self.agent {
+                        mcp_declaration_names.extend(
+                            agent
+                                .functions()
+                                .declarations()
+                                .iter()
+                                .filter(|v| {
+                                    v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
+                                        || v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
+                                        || v.name
+                                            .starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
+                                })
+                                .map(|v| v.name.to_string()),
+                        );
+                    }
+
+                    let mut server_names: HashSet<String> = Default::default();
+                    if enabled_mcp_servers == "all" {
+                        server_names.extend(mcp_declaration_names);
+                    } else {
+                        for item in enabled_mcp_servers.split(',') {
+                            let item = item.trim();
+                            if item.is_empty() {
+                                continue;
+                            }
+                            let item_invoke_name =
+                                format!("{}_{item}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
+                            let item_search_name =
+                                format!("{}_{item}", MCP_SEARCH_META_FUNCTION_NAME_PREFIX);
+                            let item_describe_name =
+                                format!("{}_{item}", MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX);
+                            if let Some(values) = app.mapping_mcp_servers.get(item) {
+                                server_names.extend(
+                                    values
+                                        .split(',')
+                                        .flat_map(|v| {
+                                            vec![
+                                                format!(
+                                                    "{}_{}",
+                                                    MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
+                                                    v.to_string()
+                                                ),
+                                                format!(
+                                                    "{}_{}",
+                                                    MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+                                                    v.to_string()
+                                                ),
+                                                format!(
+                                                    "{}_{}",
+                                                    MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
+                                                    v.to_string()
+                                                ),
+                                            ]
+                                        })
+                                        .filter(|v| mcp_declaration_names.contains(v)),
+                                )
+                            } else if mcp_declaration_names.contains(&item_invoke_name) {
+                                server_names.insert(item_invoke_name);
+                                server_names.insert(item_search_name);
+                                server_names.insert(item_describe_name);
+                            }
                         }
                     }
-                }
+                    server_names
+                });
+
+            if let Some(ref server_names) = role_filter {
                 mcp_functions = self
                     .tool_scope
                     .functions
@@ -1173,6 +1226,9 @@ impl RequestContext {
                             || v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
                     })
                     .collect();
+                if let Some(ref server_names) = role_filter {
+                    agent_functions.retain(|v| server_names.contains(&v.name));
+                }
                 let tool_names: HashSet<String> = agent_functions
                     .iter()
                     .filter_map(|v| {
