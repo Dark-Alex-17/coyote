@@ -8,6 +8,7 @@ pub mod llm;
 pub mod parser;
 pub mod script;
 pub mod state;
+pub mod structured;
 pub mod types;
 pub mod user_interaction;
 pub mod validator;
