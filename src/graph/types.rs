@@ -215,13 +215,21 @@ pub struct InputNode {
 /// LLM's response on success, or to an error description on failure.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LlmNode {
-    pub instructions: String,
-
+    /// User-turn prompt. Templated against state. REQUIRED.
     pub prompt: String,
 
-    /// Whitelist of tool names. Each entry is either an exact function
-    /// name or the shorthand `mcp:<server>` (expands to the three MCP
-    /// meta-functions for that server). Unset = no tools.
+    /// Optional system prompt. When set, the LLM call uses an inline
+    /// Role with `instructions` as `Role.prompt`. Templated against
+    /// state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+
+    /// Whitelist narrowing the active agent's tool universe.
+    /// Each entry is either an exact function name (`global_tools`
+    /// entry or `tools.{sh,py,ts}` subcommand) or the shorthand
+    /// `mcp:<server>` (where `<server>` must be in the agent's
+    /// `mcp_servers`). Unset = inherit agent's full set; `[]` = no
+    /// tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
 
@@ -636,7 +644,7 @@ next: review
             NodeType::Llm(l) => l,
             _ => panic!("expected Llm variant"),
         };
-        assert_eq!(llm.instructions, "You are a classifier.");
+        assert_eq!(llm.instructions.as_deref(), Some("You are a classifier."));
         assert_eq!(llm.prompt, "Classify: {{input_text}}");
         let tools = llm.tools.unwrap();
         assert_eq!(tools, vec!["read_query", "mcp:pubmed-search"]);
@@ -668,7 +676,7 @@ next: done
             NodeType::Llm(l) => l,
             _ => panic!("expected Llm variant"),
         };
-        assert_eq!(llm.instructions, "System.");
+        assert_eq!(llm.instructions.as_deref(), Some("System."));
         assert_eq!(llm.prompt, "User.");
         assert!(llm.tools.is_none());
         assert!(llm.model.is_none());
@@ -678,14 +686,19 @@ next: done
     }
 
     #[test]
-    fn llm_node_missing_instructions_fails() {
+    fn llm_node_with_just_prompt_succeeds() {
         let yaml = r#"
-id: bad
+id: pure
 type: llm
-prompt: "User only — no system prompt."
+prompt: "User-only — no system prompt."
 "#;
-        let result: std::result::Result<Node, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err());
+        let node: Node = serde_yaml::from_str(yaml).unwrap();
+        let llm = match node.node_type {
+            NodeType::Llm(l) => l,
+            _ => panic!("expected Llm variant"),
+        };
+        assert!(llm.instructions.is_none());
+        assert_eq!(llm.prompt, "User-only — no system prompt.");
     }
 
     #[test]
