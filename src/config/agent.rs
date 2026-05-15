@@ -12,6 +12,7 @@ use crate::config::prompts::{
     DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
 use crate::graph::{Graph, GraphParser, NodeType};
+use crate::rag::RagInitConfig;
 use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
 use fancy_regex::Captures;
@@ -673,7 +674,6 @@ impl AgentConfig {
             model_id: graph.model.clone(),
             temperature: graph.temperature,
             top_p: graph.top_p,
-            agent_session: graph.agent_session.clone(),
             description: graph.description.clone(),
             global_tools: graph.global_tools.clone(),
             mcp_servers: graph.mcp_servers.clone(),
@@ -833,6 +833,9 @@ async fn init_graph_rags(
     abort_signal: AbortSignal,
 ) -> Result<HashMap<String, Arc<Rag>>> {
     let mut rags = HashMap::new();
+    if info_flag {
+        return Ok(rags);
+    }
     for (node_id, node) in &graph.nodes {
         let NodeType::Rag(rag_node) = &node.node_type else {
             continue;
@@ -852,23 +855,38 @@ async fn init_graph_rags(
                     Rag::load(&app_clone, &name_clone, &path_clone)
                 })
                 .await?
-        } else if info_flag || !*IS_STDOUT_TERMINAL {
-            bail!(
-                "Agent '{agent_name}' requires RAG for rag node '{node_id}', but its \
-                 knowledge base has not been built. Run the agent once interactively \
-                 to initialize it."
-            );
         } else {
-            let ans = Confirm::new(&format!(
-                "Initialize RAG knowledge base for rag node '{node_id}'?"
-            ))
-            .with_default(true)
-            .prompt()?;
-            if !ans {
-                bail!(
-                    "Agent '{agent_name}' has rag node '{node_id}' but its RAG was not \
-                     initialized. RAG initialization is required for this agent."
-                );
+            let config = RagInitConfig {
+                embedding_model: rag_node.embedding_model.clone(),
+                chunk_size: rag_node.chunk_size,
+                chunk_overlap: rag_node.chunk_overlap,
+                reranker_model: rag_node.reranker_model.clone(),
+                top_k: rag_node.top_k,
+                batch_size: rag_node.batch_size,
+            };
+            let fully_specified = config.embedding_model.is_some()
+                && config.chunk_size.is_some()
+                && config.chunk_overlap.is_some();
+            if !fully_specified {
+                if !*IS_STDOUT_TERMINAL {
+                    bail!(
+                        "Agent '{agent_name}' requires RAG for rag node '{node_id}', but its \
+                         knowledge base is not built and the node does not fully specify how \
+                         to build it. Set `embedding_model`, `chunk_size`, and `chunk_overlap` \
+                         on the node, or run the agent once interactively."
+                    );
+                }
+                let ans = Confirm::new(&format!(
+                    "Initialize RAG knowledge base for rag node '{node_id}'?"
+                ))
+                .with_default(true)
+                .prompt()?;
+                if !ans {
+                    bail!(
+                        "Agent '{agent_name}' has rag node '{node_id}' but its RAG was not \
+                         initialized. RAG initialization is required for this agent."
+                    );
+                }
             }
             let document_paths =
                 resolve_document_paths(&rag_node.documents, loaders, agent_data_dir)?;
@@ -879,7 +897,15 @@ async fn init_graph_rags(
             app_state
                 .rag_cache
                 .load_with(key, || async move {
-                    Rag::init(&app_clone, &name_clone, &path_clone, &document_paths, abort).await
+                    Rag::init_with_config(
+                        &app_clone,
+                        &name_clone,
+                        &path_clone,
+                        &document_paths,
+                        &config,
+                        abort,
+                    )
+                    .await
                 })
                 .await?
         };
