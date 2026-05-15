@@ -1,0 +1,270 @@
+# Graph-based agent definition (full-featured reference)
+# Location: <loki-config-dir>/agents/<agent-name>/graph.yaml
+#
+# A graph agent is defined by THIS FILE ALONE. An agent directory contains
+# EITHER a config.yaml (a normal LLM-loop agent) OR a graph.yaml (a graph
+# agent) -- never both. The presence of graph.yaml is what makes the agent
+# a graph agent.
+#
+# This file is a REFERENCE: it documents every available field. It is not a
+# runnable agent as-is -- the `agent:`, `script:`, and `documents:` values
+# point at things that would need to exist for a real agent.
+#
+# Full documentation:
+#   https://github.com/Dark-Alex-17/loki/wiki/Graph-Agents
+
+# ---------------------------------------------------------------------------
+# Identity
+# ---------------------------------------------------------------------------
+name: example-graph-agent          # Agent name (should match the directory name)
+description: |                     # Free-form prose describing the workflow
+  A reference workflow: triage a request, retrieve context, branch on a
+  script decision, run either a sub-agent or an LLM step, then gate the
+  result behind human approval.
+version: "1.0"                     # Graph SCHEMA version. Only "1.0" is accepted.
+
+# ---------------------------------------------------------------------------
+# Agent-level config (all optional)
+# The same knobs a normal agent's config.yaml carries. In a graph agent they
+# live here instead of in a config.yaml.
+# ---------------------------------------------------------------------------
+model: anthropic:claude-sonnet-4-6 # Default model for `llm` nodes that don't override it
+temperature: 0.0                   # Default sampling temperature for `llm` nodes
+top_p: null                        # Default sampling top-p for `llm` nodes
+
+global_tools:                      # Tool universe an `llm` node's `tools:` whitelist draws from
+  - web_search_loki.sh
+  - fetch_url_via_curl.sh
+
+mcp_servers:                       # MCP servers an `llm` node may reference via `mcp:<server>`
+  - pubmed-search
+
+conversation_starters:             # Suggested prompts surfaced in the UI
+  - "Research LOINC code 2160-0"
+
+# NOTE: `can_spawn_agents` is NOT a field here. It is DERIVED: a graph can
+# spawn child agents iff it contains at least one `agent` node (this graph
+# does -- see `deep_dive`).
+
+# ---------------------------------------------------------------------------
+# Execution settings (all optional)
+# ---------------------------------------------------------------------------
+settings:
+  max_loop_iterations: 100   # PER-NODE visit cap. If one node id is entered more
+                             # than this many times, execution aborts. Default 100.
+  timeout: 600               # Optional wall-clock cap (seconds) on the whole run,
+                             # checked between node transitions.
+  log_state_snapshots: true  # Log state before each node (debug/trace). Default true.
+  validate_before_run: true  # Run the graph validator at startup. Default true.
+
+# ---------------------------------------------------------------------------
+# Seed state (optional)
+# Values placed into graph state before any node runs; reference anywhere via
+# {{key}}. NOTE: `initial_prompt` is seeded automatically by Loki with the
+# caller's prompt -- do not set it here.
+# ---------------------------------------------------------------------------
+initial_state:
+  audience: "clinician"
+  # Seed an empty default for any key that a STRICT field (a node prompt /
+  # instructions / question / End output) references but that is only set on
+  # SOME paths. `refinement` is set only if the `refine` input node runs;
+  # seeding it "" keeps `finalize`'s strict prompt from failing on the
+  # approve-directly path.
+  refinement: ""
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+start: triage                # ID of the first node to run (must exist in `nodes`)
+
+# ---------------------------------------------------------------------------
+# Nodes
+# Each node is keyed by its id. The `id:` inside a node must match its key
+# (it may also be omitted -- Loki fills it in from the key).
+#
+# Node types: agent | script | approval | input | llm | rag | end
+# ---------------------------------------------------------------------------
+nodes:
+
+  # --- llm node -----------------------------------------------------------
+  # A one-shot LLM call (with an optional bounded tool-call loop). Runs in a
+  # fresh isolated context. Tools are STRICTLY opt-in (see `tools`).
+  triage:
+    id: triage
+    type: llm
+    description: Classify the request and extract its topic.
+    instructions: |            # Optional system prompt (templated against state)
+      You triage research requests for a {{audience}} audience.
+    prompt: |                  # REQUIRED user prompt (templated against state)
+      Classify this request and extract the key topic:
+      {{initial_prompt}}
+    tools: []                  # Tool whitelist. Omitted or [] = NO tools at all.
+                               # A list narrows to EXACTLY those entries.
+    output_schema:             # Optional JSON Schema. The output is parsed to JSON
+      type: object             # and its top-level object keys auto-merge into state
+      properties:              # (so `topic` / `needs_research` become {{topic}} etc).
+        topic: { type: string }
+        needs_research: { type: boolean }
+      required: [topic, needs_research]
+    state_updates:             # {{output}} = this node's result (here, the parsed object)
+      triage_result: "{{output}}"
+    next: retrieve             # REQUIRED for llm nodes: the success route
+
+  # --- rag node -----------------------------------------------------------
+  # Hybrid (vector + keyword) retrieval against a per-node knowledge base.
+  # The knowledge base is built ONCE, at agent load time, into
+  # <agent-dir>/retrieve.yaml (named after this node's id).
+  retrieve:
+    id: retrieve
+    type: rag
+    documents:                 # REQUIRED. Files, directories, URLs, loader paths.
+      - ./knowledge/           #   relative paths resolve against the agent directory
+      - https://example.com/reference
+    query: "{{topic}}"         # Retrieval query (templated). Default: {{initial_prompt}}.
+    top_k: 5                   # Chunks to retrieve. Default = the KB's own top_k.
+    timeout: 120               # Retrieval timeout in seconds. Default 120.
+    # Knowledge-base BUILD config (optional; used only when the KB is first
+    # built). When embedding_model + chunk_size + chunk_overlap are ALL set,
+    # the KB builds with no interactive prompts (works in non-interactive runs).
+    embedding_model: openai:text-embedding-3-small
+    chunk_size: 1000
+    chunk_overlap: 100
+    reranker_model: null       # Optional reranker for hybrid-search results
+    batch_size: 100            # Optional embedding-request batch size
+    state_updates:             # {{output}} = { context: <str>, sources: [<path>, ...] }
+      context: "{{output.context}}"
+      sources: "{{output.sources}}"
+    next: decide
+
+  # --- script node --------------------------------------------------------
+  # Runs a .sh / .py / .ts script. The script receives state via the
+  # GRAPH_STATE env var (inline JSON) OR GRAPH_STATE_FILE (path to a JSON
+  # file, used when state exceeds 32 KiB) -- exactly one is set. It must print
+  # a single JSON OBJECT on stdout: keys merge into state, and the reserved
+  # `_next` key (if present) overrides routing.
+  decide:
+    id: decide
+    type: script
+    script: scripts/decide.py  # Path relative to the agent directory
+    timeout: 30                # Seconds. Default 30.
+    state_updates:             # Applied after the stdout JSON is merged
+      decided_for: "{{topic}}"
+    next: summarize            # Default route if the script emits no `_next`
+    fallback: summarize        # Route taken if the script FAILS (crash / bad JSON)
+    # This script is expected to emit `_next: deep_dive` (or no `_next`, in
+    # which case `next` is used). Because `deep_dive` is reached only via the
+    # script's dynamic `_next`, the startup validator will report it as an
+    # "unreachable" WARNING -- that is expected for `_next`-routed targets.
+
+  # --- agent node ---------------------------------------------------------
+  # Spawns a full Loki sub-agent and waits for it. The child uses ITS OWN
+  # tool stack -- agent nodes have NO `tools:` field. No schema hint is
+  # injected even when `output_schema` is set (unlike llm nodes).
+  deep_dive:
+    id: deep_dive
+    type: agent
+    agent: deep-researcher     # Name of an existing Loki agent to spawn
+    prompt: |                  # User message sent to the child (templated)
+      Research {{topic}} in depth. Existing context:
+      {{context}}
+    timeout: 600               # Optional wall-clock cap, seconds. Default 300.
+    output_schema:             # Optional -- same extraction as llm nodes
+      type: object
+      properties:
+        summary: { type: string }
+        findings:
+          type: array
+          items: { type: string }
+      required: [summary, findings]
+    state_updates:
+      research: "{{output}}"
+    next: review               # REQUIRED for agent nodes
+
+  # --- llm node with a narrowed tool whitelist ----------------------------
+  summarize:
+    id: summarize
+    type: llm
+    instructions: "You write concise summaries for a {{audience}} audience."
+    prompt: "Summarize the topic {{topic}}, using your tools as needed."
+    tools:                     # Narrow whitelist: EXACTLY these entries, nothing else
+      - web_search_loki.sh     #   an exact global-tool / custom-tool name
+      - mcp:pubmed-search      #   `mcp:<server>` includes that server's functions
+    model: anthropic:claude-haiku-4-5  # Optional per-node model override
+    temperature: 0.3           # Optional per-node sampling override
+    max_attempts: 2            # Retry count on TRANSIENT errors only. Default 1.
+    max_iterations: 10         # Tool-call-loop turn cap. Default 10.
+    fallback: review           # Route here if all attempts fail
+    timeout: 300               # Optional node wall-clock cap, seconds (unset = no timeout)
+    state_updates:
+      research: "{{output}}"
+    next: review               # REQUIRED for llm nodes: the success route
+
+  # --- approval node ------------------------------------------------------
+  # Human-in-the-loop checkpoint. `user__ask` ALWAYS offers a free-form
+  # "type your own answer" option, so `on_other` is REQUIRED.
+  review:
+    id: review
+    type: approval
+    question: |
+      Proposed result for {{topic}}:
+      {{research}}
+
+      Approve?
+    options:                   # The listed choices shown to the user
+      - "yes"
+      - "no"
+    routes:                    # Map each listed option to its next node
+      "yes": finalize
+      "no": rejected_end
+    on_other: refine           # REQUIRED: route for ANY answer not in `routes`
+    state_updates:
+      decision: "{{choice}}"   # {{choice}} = the chosen option OR the free-form text
+    timeout: 300               # Optional: seconds to wait for a response
+    on_timeout: rejected_end   # Optional: route taken on interaction timeout
+
+  # --- input node ---------------------------------------------------------
+  # Collects a free-form string from the user.
+  refine:
+    id: refine
+    type: input
+    question: "What should be changed about the result?"
+    default: "minor wording only"  # Optional: used if the user submits empty input.
+                                   # NOTE: a substituted default is NOT re-validated,
+                                   # so make sure it would satisfy `validation`.
+    validation: "len(input) > 0"   # Optional length predicate: len(input) <op> N,
+                                   # <op> in > >= < <= == . Length only -- no regex.
+    state_updates:
+      refinement: "{{input}}"  # {{input}} = the user's text
+    timeout: 120               # Optional
+    on_timeout: rejected_end   # Optional: route taken on interaction timeout
+    next: finalize             # REQUIRED for input nodes: the success route
+
+  # --- llm node (final synthesis) -----------------------------------------
+  finalize:
+    id: finalize
+    type: llm
+    prompt: |
+      Produce the final answer for {{topic}}.
+      Result so far: {{research}}
+      Requested refinement (if any): {{refinement}}
+    state_updates:
+      final_answer: "{{output}}"
+    next: done
+
+  # --- end nodes ----------------------------------------------------------
+  # Terminate the graph. `output` (templated, lenient interpolation) becomes
+  # the graph's final result. A graph needs at least one `end` node.
+  done:
+    id: done
+    type: end
+    state_updates:             # Optional: applied BEFORE `output` is rendered
+      status: "completed"
+    output: |
+      [{{status}}] {{final_answer}}
+
+      Sources: {{sources}}
+
+  rejected_end:
+    id: rejected_end
+    type: end
+    output: "Request for {{topic}} was not approved."
