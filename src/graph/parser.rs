@@ -104,12 +104,14 @@ fn enhance_yaml_error(error: serde_yaml::Error) -> Error {
          Each node requires `type` plus that type's fields:\n\
          - agent:    `agent`, `prompt`\n\
          - script:   `script`\n\
-         - approval: `question`, `options`, `routes`\n\
+         - approval: `question`, `options`, `routes`, `on_other`\n\
          - input:    `question`\n\
+         - llm:      `prompt`\n\
+         - rag:      `documents`\n\
          - end:      (no required fields)"
     } else if msg.contains("unknown field") || msg.contains("unknown variant") {
         "\n\nHint: Check for typos in field names or `type:` values.\n\
-         Valid node types: agent, script, approval, input, end."
+         Valid node types: agent, script, approval, input, llm, rag, end."
     } else if msg.contains("invalid type") {
         "\n\nHint: Check that field values have the correct type.\n\
          - Strings should be quoted if they contain special characters\n\

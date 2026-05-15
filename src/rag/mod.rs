@@ -16,7 +16,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashMap, env, fmt::Debug, fs, hash::Hash, path::Path, sync::Arc, time::Duration,
+    collections::HashMap, env, fmt, fmt::Debug, fs, hash::Hash, path::Path, sync::Arc,
+    time::Duration,
 };
 use tokio::time::sleep;
 
@@ -56,7 +57,7 @@ pub struct Rag {
 }
 
 impl Debug for Rag {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Rag")
             .field("name", &self.name)
             .field("path", &self.path)
@@ -315,6 +316,14 @@ impl Rag {
         self.name == TEMP_RAG_NAME
     }
 
+    pub fn configured_top_k(&self) -> usize {
+        self.data.top_k
+    }
+
+    pub fn configured_reranker(&self) -> Option<&str> {
+        self.data.reranker_model.as_deref()
+    }
+
     pub async fn search(
         &self,
         text: &str,
@@ -323,7 +332,7 @@ impl Rag {
         abort_signal: AbortSignal,
     ) -> Result<(String, String, Vec<DocumentId>)> {
         let ret = abortable_run_with_spinner(
-            self.hybird_search(text, top_k, rerank_model),
+            self.hybrid_search(text, top_k, rerank_model),
             "Searching",
             abort_signal,
         )
@@ -583,7 +592,7 @@ impl Rag {
         Ok(())
     }
 
-    async fn hybird_search(
+    async fn hybrid_search(
         &self,
         query: &str,
         top_k: usize,
@@ -781,7 +790,7 @@ pub struct RagData {
 }
 
 impl Debug for RagData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RagData")
             .field("embedding_model", &self.embedding_model)
             .field("chunk_size", &self.chunk_size)
@@ -909,7 +918,7 @@ pub type FileId = usize;
 pub struct DocumentId(usize);
 
 impl Debug for DocumentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (file_index, document_index) = self.split();
         f.write_fmt(format_args!("{file_index}-{document_index}"))
     }
@@ -951,8 +960,8 @@ impl SelectOption {
     }
 }
 
-impl std::fmt::Display for SelectOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for SelectOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} ({})", self.value, self.description)
     }
 }

@@ -9,11 +9,11 @@
 //! The logger also accumulates per-node wall-clock timings and emits a
 //! performance summary (slowest-first) when the graph completes.
 
-use std::cmp::Reverse;
 use super::state::StateManager;
 use super::types::{Node, NodeType};
 use crate::utils::dimmed_text;
 use indexmap::IndexMap;
+use std::cmp::Reverse;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
@@ -161,6 +161,7 @@ fn node_type_label(node: &Node) -> &'static str {
         NodeType::Approval(_) => "approval",
         NodeType::Input(_) => "input",
         NodeType::Llm(_) => "llm",
+        NodeType::Rag(_) => "rag",
         NodeType::End(_) => "end",
     }
 }

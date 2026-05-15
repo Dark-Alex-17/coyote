@@ -10,6 +10,7 @@ use super::agent::AgentNodeExecutor;
 use super::llm::LlmNodeExecutor;
 use super::logging::GraphLogger;
 use super::parser::GraphParser;
+use super::rag::RagNodeExecutor;
 use super::script::ScriptExecutor;
 use super::state::StateManager;
 use super::types::{EndNode, Graph, Node, NodeType};
@@ -202,6 +203,12 @@ async fn step(
         }
         NodeType::Llm(llm_node) => {
             let next = LlmNodeExecutor::execute(llm_node, node.next.as_deref(), state, ctx).await?;
+            Ok(StepResult::Continue(next))
+        }
+        NodeType::Rag(rag_node) => {
+            let next =
+                RagNodeExecutor::execute(rag_node, current, node.next.as_deref(), state, ctx)
+                    .await?;
             Ok(StepResult::Continue(next))
         }
         NodeType::End(end_node) => Ok(StepResult::End(resolve_end_output(end_node, state))),
