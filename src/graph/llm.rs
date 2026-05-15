@@ -14,6 +14,8 @@ use anyhow::{Context, Error, Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
 
 const OUTPUT_KEY: &str = "output";
 
@@ -110,7 +112,18 @@ async fn run(
 
     let saved_role = parent_ctx.role.clone();
     parent_ctx.role = Some(role);
-    let result = run_with_retries(node, &prompt, parent_ctx).await;
+    let result = match node.timeout {
+        Some(secs) => match timeout(
+            Duration::from_secs(secs),
+            run_with_retries(node, &prompt, parent_ctx),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow!("llm node timed out after {secs}s")),
+        },
+        None => run_with_retries(node, &prompt, parent_ctx).await,
+    };
     parent_ctx.role = saved_role;
     result
 }

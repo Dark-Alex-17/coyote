@@ -36,7 +36,8 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [Sessions](https://github.com/Dark-Alex-17/loki/wiki/Sessions): Manage and persist conversational contexts and settings across multiple interactions.
 * [Roles](https://github.com/Dark-Alex-17/loki/wiki/Roles): Customize model behavior for specific tasks or domains.
 * [Agents](https://github.com/Dark-Alex-17/loki/wiki/Agents): Leverage AI agents to perform complex tasks and workflows, including sub-agent spawning, teammate messaging, and user interaction tools.
-    * [Todo System](https://github.com/Dark-Alex-17/loki/wiki/TODO-System): Built-in task tracking for improved agent reliability with smaller models.
+    * [Graph Agents](https://github.com/Dark-Alex-17/loki/wiki/Graph-Agents): Define an agent as a declarative, YAML-driven workflow — a directed graph of typed nodes (LLM calls, scripts, approvals, user input, RAG retrieval, sub-agent spawns). See [`graph.example.yaml`](graph.example.yaml) for a fully-commented reference.
+* [Todo System](https://github.com/Dark-Alex-17/loki/wiki/TODO-System): Built-in task tracking for improved LLM reliability with smaller models.
 * [Environment Variables](https://github.com/Dark-Alex-17/loki/wiki/Environment-Variables): Override and customize your Loki configuration at runtime with environment variables.
 * [Client Configurations](https://github.com/Dark-Alex-17/loki/wiki/Clients): Configuration instructions for various LLM providers.
     * [Authentication (API Key & OAuth)](https://github.com/Dark-Alex-17/loki/wiki/Clients#authentication): Authenticate with API keys or OAuth for subscription-based access.
