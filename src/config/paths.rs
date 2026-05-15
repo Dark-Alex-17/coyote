@@ -128,7 +128,7 @@ pub fn agent_data_dir(name: &str) -> PathBuf {
     }
 }
 
-pub fn agent_graph_path(agent_name: &str) -> PathBuf {
+pub fn agent_graph_file(agent_name: &str) -> PathBuf {
     agent_data_dir(agent_name).join(AGENT_GRAPH_FILE_NAME)
 }
 

@@ -34,7 +34,7 @@ pub async fn run_active_agent_graph(
     log::info!("Agent '{agent_name}' has graph.yaml; routing to graph executor");
 
     let agent_dir = paths::agent_data_dir(&agent_name);
-    let graph_path = paths::agent_graph_path(&agent_name);
+    let graph_path = paths::agent_graph_file(&agent_name);
 
     let parser = GraphParser::new(&agent_dir);
     let mut graph = parser

@@ -11,6 +11,7 @@ use crate::config::prompts::{
     DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS, DEFAULT_TODO_INSTRUCTIONS,
     DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
+use crate::graph::{Graph, GraphParser};
 use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
 use fancy_regex::Captures;
@@ -97,10 +98,25 @@ impl Agent {
         let loaders = app.document_loaders.clone();
         let rag_path = paths::agent_rag_file(name, DEFAULT_AGENT_NAME);
         let config_path = paths::agent_config_file(name);
-        let mut agent_config = if config_path.exists() {
-            AgentConfig::load(&config_path)?
-        } else {
-            bail!("Agent config file not found at '{}'", config_path.display())
+        let graph_path = paths::agent_graph_file(name);
+        let mut agent_config = match (config_path.exists(), graph_path.exists()) {
+            (true, true) => bail!(
+                "Agent '{name}' has both config.yaml and graph.yaml. A graph agent \
+                 is defined by graph.yaml alone; a normal agent by config.yaml alone. \
+                 Remove one of the two files."
+            ),
+            (true, false) => AgentConfig::load(&config_path)?,
+            (false, true) => {
+                let parser = GraphParser::new(&agent_data_dir);
+                let graph = parser
+                    .load_from_file(&graph_path)
+                    .with_context(|| format!("Failed to load graph.yaml for agent '{name}'"))?;
+                AgentConfig::from_graph(name, &graph)
+            }
+            (false, false) => bail!(
+                "Agent '{name}' has neither a config.yaml nor a graph.yaml at '{}'",
+                agent_data_dir.display()
+            ),
         };
         let mut functions = Functions::init_agent(name, &agent_config.global_tools)?;
 
@@ -287,10 +303,13 @@ impl Agent {
             .display()
             .to_string()
             .into();
-        value["config_file"] = paths::agent_config_file(&self.name)
-            .display()
-            .to_string()
-            .into();
+        let config_path = paths::agent_config_file(&self.name);
+        let definition_file = if config_path.exists() {
+            config_path
+        } else {
+            paths::agent_graph_file(&self.name)
+        };
+        value["config_file"] = definition_file.display().to_string().into();
         let data = serde_yaml::to_string(&value)?;
         Ok(data)
     }
@@ -650,6 +669,25 @@ impl AgentConfig {
         Ok(agent_config)
     }
 
+    pub fn from_graph(dir_name: &str, graph: &Graph) -> Self {
+        AgentConfig {
+            name: dir_name.to_string(),
+            model_id: graph.model.clone(),
+            temperature: graph.temperature,
+            top_p: graph.top_p,
+            agent_session: graph.agent_session.clone(),
+            description: graph.description.clone(),
+            global_tools: graph.global_tools.clone(),
+            mcp_servers: graph.mcp_servers.clone(),
+            conversation_starters: graph.conversation_starters.clone(),
+            can_spawn_agents: graph.has_agent_node(),
+            max_concurrent_agents: default_max_concurrent_agents(),
+            max_agent_depth: default_max_agent_depth(),
+            escalation_timeout: default_escalation_timeout(),
+            ..AgentConfig::default()
+        }
+    }
+
     fn load_envs(&mut self, app: &AppConfig) {
         let name = &self.name;
         let with_prefix = |v: &str| normalize_env_name(&format!("{name}_{v}"));
@@ -871,5 +909,94 @@ variables:
 
         assert!(config.inject_todo_instructions);
         assert!(config.inject_spawn_instructions);
+    }
+
+    #[test]
+    fn from_graph_maps_agent_level_fields() {
+        let yaml = r#"
+name: graph_name_ignored
+description: A graph agent
+model: anthropic:claude-sonnet-4-6
+temperature: 0.3
+top_p: 0.8
+agent_session: temp
+global_tools:
+  - fetch_pdf.sh
+mcp_servers:
+  - pubmed-search
+conversation_starters:
+  - "Start here"
+start: e
+nodes:
+  e:
+    id: e
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let config = AgentConfig::from_graph("my-agent-dir", &graph);
+
+        assert_eq!(config.name, "my-agent-dir");
+        assert_eq!(config.description, "A graph agent");
+        assert_eq!(
+            config.model_id.as_deref(),
+            Some("anthropic:claude-sonnet-4-6")
+        );
+        assert_eq!(config.temperature, Some(0.3));
+        assert_eq!(config.top_p, Some(0.8));
+        assert_eq!(config.agent_session.as_deref(), Some("temp"));
+        assert_eq!(config.global_tools, vec!["fetch_pdf.sh"]);
+        assert_eq!(config.mcp_servers, vec!["pubmed-search"]);
+        assert_eq!(config.conversation_starters, vec!["Start here"]);
+    }
+
+    #[test]
+    fn from_graph_derives_can_spawn_agents_from_agent_nodes() {
+        let with_agent = r#"
+name: g
+start: a
+nodes:
+  a:
+    id: a
+    type: agent
+    agent: helper
+    prompt: hi
+    next: e
+  e:
+    id: e
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(with_agent).unwrap();
+        assert!(AgentConfig::from_graph("d", &graph).can_spawn_agents);
+
+        let no_agent =
+            "name: g\nstart: x\nnodes:\n  x:\n    id: x\n    type: end\n    output: ok\n";
+        let graph: Graph = serde_yaml::from_str(no_agent).unwrap();
+        assert!(!AgentConfig::from_graph("d", &graph).can_spawn_agents);
+    }
+
+    #[test]
+    fn from_graph_keeps_defaults_for_llm_loop_fields() {
+        let yaml = "name: g\nstart: x\nnodes:\n  x:\n    id: x\n    type: end\n    output: ok\n";
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let config = AgentConfig::from_graph("d", &graph);
+
+        // LLM-loop concepts a graph agent does not have: left at Default.
+        assert!(!config.auto_continue);
+        assert!(config.instructions.is_empty());
+        assert!(config.documents.is_empty());
+        assert!(!config.inject_todo_instructions);
+        assert!(!config.inject_spawn_instructions);
+        assert_eq!(config.max_auto_continues, 0);
+        assert_eq!(config.summarization_threshold, 0);
+
+        // Consumed by graph execution: kept at their real defaults.
+        assert_eq!(
+            config.max_concurrent_agents,
+            default_max_concurrent_agents()
+        );
+        assert_eq!(config.max_agent_depth, default_max_agent_depth());
+        assert_eq!(config.escalation_timeout, default_escalation_timeout());
     }
 }

@@ -125,20 +125,7 @@ fn enhance_yaml_error(error: serde_yaml::Error) -> Error {
 
 /// Returns true if the named agent has a `graph.yaml` in its data directory.
 pub fn agent_has_graph(agent_name: &str) -> bool {
-    paths::agent_graph_path(agent_name).exists()
-}
-
-/// Load `graph.yaml` from the named agent's data directory. Returns `Ok(None)`
-/// if no graph file exists.
-pub fn load_agent_graph(agent_name: &str) -> Result<Option<Graph>> {
-    let graph_path = paths::agent_graph_path(agent_name);
-    if !graph_path.exists() {
-        return Ok(None);
-    }
-
-    let parser = GraphParser::new(paths::agent_data_dir(agent_name));
-    let graph = parser.load_from_file(&graph_path)?;
-    Ok(Some(graph))
+    paths::agent_graph_file(agent_name).exists()
 }
 
 #[cfg(test)]
@@ -447,11 +434,5 @@ nodes:
     #[test]
     fn agent_has_graph_false_for_unknown_agent() {
         assert!(!agent_has_graph("__nonexistent_agent_for_test__"));
-    }
-
-    #[test]
-    fn load_agent_graph_returns_none_when_absent() {
-        let result = load_agent_graph("__nonexistent_agent_for_test__").unwrap();
-        assert!(result.is_none());
     }
 }

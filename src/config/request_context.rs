@@ -1410,20 +1410,26 @@ impl RequestContext {
             Some(agent) => agent.name(),
             None => bail!("No agent"),
         };
-        let agent_config_path = paths::agent_config_file(agent_name);
-        ensure_parent_exists(&agent_config_path)?;
-        if !agent_config_path.exists() {
+        let config_path = paths::agent_config_file(agent_name);
+        let graph_path = paths::agent_graph_file(agent_name);
+        let target_path = if !config_path.exists() && graph_path.exists() {
+            graph_path
+        } else {
+            config_path
+        };
+        ensure_parent_exists(&target_path)?;
+        if !target_path.exists() {
             std::fs::write(
-                &agent_config_path,
+                &target_path,
                 "# see https://github.com/Dark-Alex-17/loki/blob/main/config.agent.example.yaml\n",
             )
-            .with_context(|| format!("Failed to write to '{}'", agent_config_path.display()))?;
+            .with_context(|| format!("Failed to write to '{}'", target_path.display()))?;
         }
         let editor = app.editor()?;
-        edit_file(&editor, &agent_config_path)?;
+        edit_file(&editor, &target_path)?;
         println!(
             "NOTE: Remember to reload the agent if there are changes made to '{}'",
-            agent_config_path.display()
+            target_path.display()
         );
         Ok(())
     }
