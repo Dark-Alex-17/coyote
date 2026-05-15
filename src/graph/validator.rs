@@ -195,16 +195,20 @@ impl GraphValidator {
         for (node_id, node) in &graph.nodes {
             if let NodeType::Agent(a) = &node.node_type {
                 let agent_dir = paths::agent_data_dir(&a.agent);
-                let config_path = paths::agent_config_file(&a.agent);
+                let has_config = paths::agent_config_file(&a.agent).exists();
+                let has_graph = paths::agent_graph_file(&a.agent).exists();
                 if !agent_dir.exists() {
                     result.error(ValidationError::with_node(
                         node_id,
                         format!("Agent '{}' not found (directory missing)", a.agent),
                     ));
-                } else if !config_path.exists() {
+                } else if !has_config && !has_graph {
                     result.error(ValidationError::with_node(
                         node_id,
-                        format!("Agent '{}' has no config.yaml", a.agent),
+                        format!(
+                            "Agent '{}' has neither a config.yaml nor a graph.yaml",
+                            a.agent
+                        ),
                     ));
                 }
             }
@@ -351,6 +355,13 @@ mod tests {
             name: "t".into(),
             description: String::new(),
             version: "1.0".into(),
+            model: None,
+            temperature: None,
+            top_p: None,
+            agent_session: None,
+            global_tools: Vec::new(),
+            mcp_servers: Vec::new(),
+            conversation_starters: Vec::new(),
             settings: GraphSettings::default(),
             initial_state: HashMap::new(),
             start: start.into(),

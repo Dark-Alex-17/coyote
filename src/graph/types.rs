@@ -17,6 +17,36 @@ pub struct Graph {
     #[serde(default = "default_schema_version")]
     pub version: String,
 
+    /// Default chat model for the agent. Used when an `llm` node does not
+    /// set its own `model`. Consulted in single-file mode (an agent with
+    /// a `graph.yaml` and no `config.yaml`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Default sampling temperature. Single-file mode only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+
+    /// Default sampling top-p. Single-file mode only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+
+    /// Session to start the agent in (e.g. `temp`). Single-file mode only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<String>,
+
+    /// Global tools available to the agent's nodes. Single-file mode only.
+    #[serde(default)]
+    pub global_tools: Vec<String>,
+
+    /// MCP servers available to the agent's nodes. Single-file mode only.
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+
+    /// Suggested prompts surfaced in the UI. Single-file mode only.
+    #[serde(default)]
+    pub conversation_starters: Vec<String>,
+
     #[serde(default)]
     pub settings: GraphSettings,
 
@@ -39,6 +69,15 @@ impl Graph {
 
     pub fn node_ids(&self) -> Vec<&str> {
         self.nodes.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Returns true if any node is an `agent`-type node. Used to derive
+    /// `can_spawn_agents` when synthesizing an agent config from a
+    /// single-file graph.
+    pub fn has_agent_node(&self) -> bool {
+        self.nodes
+            .values()
+            .any(|n| matches!(n.node_type, NodeType::Agent(_)))
     }
 }
 
@@ -733,5 +772,77 @@ instructions: "System only — no user prompt."
 "#;
         let result: std::result::Result<Node, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn graph_parses_agent_level_top_level_fields() {
+        let yaml = r#"
+name: single_file
+start: e
+model: anthropic:claude-sonnet-4-6
+temperature: 0.2
+top_p: 0.9
+agent_session: temp
+global_tools:
+  - web_search_loki.sh
+mcp_servers:
+  - pubmed-search
+conversation_starters:
+  - "Look up 2160-0"
+nodes:
+  e:
+    id: e
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(graph.model.as_deref(), Some("anthropic:claude-sonnet-4-6"));
+        assert_eq!(graph.temperature, Some(0.2));
+        assert_eq!(graph.top_p, Some(0.9));
+        assert_eq!(graph.agent_session.as_deref(), Some("temp"));
+        assert_eq!(graph.global_tools, vec!["web_search_loki.sh"]);
+        assert_eq!(graph.mcp_servers, vec!["pubmed-search"]);
+        assert_eq!(graph.conversation_starters, vec!["Look up 2160-0"]);
+    }
+
+    #[test]
+    fn graph_agent_level_fields_default_when_absent() {
+        let yaml = "name: g\nstart: x\nnodes:\n  x:\n    id: x\n    type: end\n    output: ok\n";
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        assert!(graph.model.is_none());
+        assert!(graph.temperature.is_none());
+        assert!(graph.top_p.is_none());
+        assert!(graph.agent_session.is_none());
+        assert!(graph.global_tools.is_empty());
+        assert!(graph.mcp_servers.is_empty());
+        assert!(graph.conversation_starters.is_empty());
+    }
+
+    #[test]
+    fn has_agent_node_detects_agent_nodes() {
+        let with_agent = r#"
+name: g
+start: a
+nodes:
+  a:
+    id: a
+    type: agent
+    agent: helper
+    prompt: hi
+    next: e
+  e:
+    id: e
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(with_agent).unwrap();
+        assert!(graph.has_agent_node());
+    }
+
+    #[test]
+    fn has_agent_node_false_without_agent_nodes() {
+        let yaml = "name: g\nstart: x\nnodes:\n  x:\n    id: x\n    type: end\n    output: ok\n";
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        assert!(!graph.has_agent_node());
     }
 }

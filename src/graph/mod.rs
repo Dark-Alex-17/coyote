@@ -17,7 +17,7 @@ pub use agent::AgentNodeExecutor;
 pub use dispatch::{active_agent_graph_name, run_active_agent_graph};
 pub use executor::GraphExecutor;
 pub use llm::LlmNodeExecutor;
-pub use parser::{GraphParser, agent_has_graph, load_agent_graph};
+pub use parser::{GraphParser, agent_has_graph};
 pub use script::ScriptExecutor;
 pub use state::{StateManager, StateRepresentation};
 pub use types::{
