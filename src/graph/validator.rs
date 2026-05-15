@@ -103,7 +103,29 @@ impl GraphValidator {
         self.validate_scripts(graph, &mut result);
         self.validate_agents(graph, &mut result);
         self.validate_approval_routes(graph, &mut result);
+        self.validate_rag_nodes(graph, &mut result);
         result
+    }
+
+    fn validate_rag_nodes(&self, graph: &Graph, result: &mut ValidationResult) {
+        for (node_id, node) in &graph.nodes {
+            if let NodeType::Rag(r) = &node.node_type {
+                if r.documents.is_empty() {
+                    result.error(ValidationError::with_node(
+                        node_id,
+                        "RAG node has no 'documents'; at least one knowledge source \
+                         is required",
+                    ));
+                }
+                if r.state_updates.is_none() {
+                    result.warning(ValidationError::with_node(
+                        node_id,
+                        "RAG node has no 'state_updates'; its retrieval result will \
+                         not be written to state",
+                    ));
+                }
+            }
+        }
     }
 
     fn validate_node_references(&self, graph: &Graph, result: &mut ValidationResult) {
@@ -272,7 +294,9 @@ fn declared_targets(node: &Node) -> Vec<(String, &'static str)> {
                 out.push((t.clone(), "llm 'fallback'"));
             }
         }
-        NodeType::Agent(_) | NodeType::End(_) => {}
+        // `agent`/`rag` route only via `next` (already collected above);
+        // `end` is terminal. No type-specific routing edges to add.
+        NodeType::Agent(_) | NodeType::Rag(_) | NodeType::End(_) => {}
     }
     out
 }
@@ -414,6 +438,80 @@ mod tests {
             }),
             next: None,
         }
+    }
+
+    fn rag_node(id: &str, documents: &[&str], with_state_updates: bool) -> Node {
+        let state_updates = with_state_updates.then(|| {
+            let mut m: HashMap<String, String> = HashMap::new();
+            m.insert("ctx".into(), "{{output.context}}".into());
+            m
+        });
+        Node {
+            id: id.into(),
+            description: String::new(),
+            node_type: NodeType::Rag(RagNode {
+                documents: documents.iter().map(|s| (*s).into()).collect(),
+                query: None,
+                top_k: None,
+                state_updates,
+                timeout: None,
+            }),
+            next: Some("end".into()),
+        }
+    }
+
+    #[test]
+    fn rag_node_without_documents_errors() {
+        let graph = graph_with(
+            vec![("r", rag_node("r", &[], true)), ("end", end_node("end"))],
+            "r",
+        );
+        let result = validator().validate(&graph);
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("no 'documents'") && e.node_id.as_deref() == Some("r"))
+        );
+    }
+
+    #[test]
+    fn rag_node_without_state_updates_warns() {
+        let graph = graph_with(
+            vec![
+                ("r", rag_node("r", &["./docs"], false)),
+                ("end", end_node("end")),
+            ],
+            "r",
+        );
+        let result = validator().validate(&graph);
+        assert!(result.is_valid());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("no 'state_updates'"))
+        );
+    }
+
+    #[test]
+    fn valid_rag_node_produces_no_findings() {
+        let graph = graph_with(
+            vec![
+                ("r", rag_node("r", &["./docs"], true)),
+                ("end", end_node("end")),
+            ],
+            "r",
+        );
+        let result = validator().validate(&graph);
+        assert!(result.is_valid());
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("RAG node"))
+        );
     }
 
     fn agent_node(id: &str, agent: &str, next: Option<&str>) -> Node {

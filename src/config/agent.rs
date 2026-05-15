@@ -11,7 +11,7 @@ use crate::config::prompts::{
     DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS, DEFAULT_TODO_INSTRUCTIONS,
     DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
-use crate::graph::{Graph, GraphParser};
+use crate::graph::{Graph, GraphParser, NodeType};
 use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
 use fancy_regex::Captures;
@@ -38,6 +38,7 @@ pub struct Agent {
     session_dynamic_instructions: Option<String>,
     functions: Functions,
     rag: Option<Arc<Rag>>,
+    graph_rags: HashMap<String, Arc<Rag>>,
     model: Model,
     vault: GlobalVault,
 }
@@ -99,6 +100,7 @@ impl Agent {
         let rag_path = paths::agent_rag_file(name, DEFAULT_AGENT_NAME);
         let config_path = paths::agent_config_file(name);
         let graph_path = paths::agent_graph_file(name);
+        let mut graph_for_rag: Option<Graph> = None;
         let mut agent_config = match (config_path.exists(), graph_path.exists()) {
             (true, true) => bail!(
                 "Agent '{name}' has both config.yaml and graph.yaml. A graph agent \
@@ -111,7 +113,9 @@ impl Agent {
                 let graph = parser
                     .load_from_file(&graph_path)
                     .with_context(|| format!("Failed to load graph.yaml for agent '{name}'"))?;
-                AgentConfig::from_graph(name, &graph)
+                let config = AgentConfig::from_graph(name, &graph);
+                graph_for_rag = Some(graph);
+                config
             }
             (false, false) => bail!(
                 "Agent '{name}' has neither a config.yaml nor a graph.yaml at '{}'",
@@ -154,44 +158,16 @@ impl Agent {
                     .prompt()?;
             }
             if ans {
-                let mut document_paths = vec![];
-                for path in &agent_config.documents {
-                    if is_url(path) {
-                        document_paths.push(path.to_string());
-                    } else if is_loader_protocol(&loaders, path) {
-                        let (protocol, document_path) = path
-                            .split_once(':')
-                            .with_context(|| "Invalid loader protocol path")?;
-                        let resolved_path = resolve_home_dir(document_path);
-                        let new_path = if Path::new(&resolved_path).is_relative() {
-                            safe_join_path(&agent_data_dir, resolved_path)
-                                .ok_or_else(|| anyhow!("Invalid document path: '{path}'"))?
-                        } else {
-                            PathBuf::from(&resolved_path)
-                        };
-                        document_paths.push(format!("{}:{}", protocol, new_path.display()));
-                    } else if Path::new(&resolve_home_dir(path)).is_relative() {
-                        let new_path = safe_join_path(&agent_data_dir, path)
-                            .ok_or_else(|| anyhow!("Invalid document path: '{path}'"))?;
-                        document_paths.push(new_path.display().to_string())
-                    } else {
-                        document_paths.push(path.to_string())
-                    }
-                }
+                let document_paths =
+                    resolve_document_paths(&agent_config.documents, &loaders, &agent_data_dir)?;
                 let key = RagKey::Agent(name.to_string());
                 let app_clone = app.clone();
                 let rag_path_clone = rag_path.clone();
+                let abort = abort_signal.clone();
                 let rag = app_state
                     .rag_cache
                     .load_with(key, || async move {
-                        Rag::init(
-                            &app_clone,
-                            "rag",
-                            &rag_path_clone,
-                            &document_paths,
-                            abort_signal,
-                        )
-                        .await
+                        Rag::init(&app_clone, "rag", &rag_path_clone, &document_paths, abort).await
                     })
                     .await?;
                 Some(rag)
@@ -200,6 +176,23 @@ impl Agent {
             }
         } else {
             None
+        };
+
+        let graph_rags = match &graph_for_rag {
+            Some(graph) => {
+                init_graph_rags(
+                    app,
+                    app_state,
+                    name,
+                    graph,
+                    &agent_data_dir,
+                    &loaders,
+                    info_flag,
+                    abort_signal.clone(),
+                )
+                .await?
+            }
+            None => HashMap::new(),
         };
 
         if agent_config.auto_continue {
@@ -224,6 +217,7 @@ impl Agent {
             session_dynamic_instructions: None,
             functions,
             rag,
+            graph_rags,
             model,
             vault: app_state.vault.clone(),
         })
@@ -328,6 +322,10 @@ impl Agent {
 
     pub fn rag(&self) -> Option<Arc<Rag>> {
         self.rag.clone()
+    }
+
+    pub fn graph_rag(&self, node_id: &str) -> Option<Arc<Rag>> {
+        self.graph_rags.get(node_id).cloned()
     }
 
     pub fn append_mcp_meta_functions(&mut self, mcp_servers: Vec<String>) {
@@ -782,6 +780,112 @@ pub struct AgentVariable {
     pub default: Option<String>,
     #[serde(skip_deserializing, default)]
     pub value: String,
+}
+
+/// Resolve document path specs (URLs, loader-protocol paths, relative or
+/// absolute file paths) into the concrete paths `Rag::init` expects.
+/// Relative paths are joined against the agent's data directory.
+fn resolve_document_paths(
+    documents: &[String],
+    loaders: &HashMap<String, String>,
+    agent_data_dir: &Path,
+) -> Result<Vec<String>> {
+    let mut document_paths = vec![];
+    for path in documents {
+        if is_url(path) {
+            document_paths.push(path.to_string());
+        } else if is_loader_protocol(loaders, path) {
+            let (protocol, document_path) = path
+                .split_once(':')
+                .with_context(|| "Invalid loader protocol path")?;
+            let resolved_path = resolve_home_dir(document_path);
+            let new_path = if Path::new(&resolved_path).is_relative() {
+                safe_join_path(agent_data_dir, resolved_path)
+                    .ok_or_else(|| anyhow!("Invalid document path: '{path}'"))?
+            } else {
+                PathBuf::from(&resolved_path)
+            };
+            document_paths.push(format!("{}:{}", protocol, new_path.display()));
+        } else if Path::new(&resolve_home_dir(path)).is_relative() {
+            let new_path = safe_join_path(agent_data_dir, path)
+                .ok_or_else(|| anyhow!("Invalid document path: '{path}'"))?;
+            document_paths.push(new_path.display().to_string())
+        } else {
+            document_paths.push(path.to_string())
+        }
+    }
+    Ok(document_paths)
+}
+
+/// Build or load a knowledge base for every `rag` node in the graph. Each
+/// node's RAG lives in `<agent>/<node-id>.yaml`. A missing knowledge base is
+/// a hard error (interactive: after a declined confirm; non-interactive:
+/// immediately) — a graph with an uninitialized `rag` node cannot run.
+#[allow(clippy::too_many_arguments)]
+async fn init_graph_rags(
+    app: &AppConfig,
+    app_state: &AppState,
+    agent_name: &str,
+    graph: &Graph,
+    agent_data_dir: &Path,
+    loaders: &HashMap<String, String>,
+    info_flag: bool,
+    abort_signal: AbortSignal,
+) -> Result<HashMap<String, Arc<Rag>>> {
+    let mut rags = HashMap::new();
+    for (node_id, node) in &graph.nodes {
+        let NodeType::Rag(rag_node) = &node.node_type else {
+            continue;
+        };
+        let rag_path = paths::agent_rag_file(agent_name, node_id);
+        let key = RagKey::GraphNode {
+            agent: agent_name.to_string(),
+            node: node_id.clone(),
+        };
+        let rag = if rag_path.exists() {
+            let app_clone = app.clone();
+            let path_clone = rag_path.clone();
+            let name_clone = node_id.clone();
+            app_state
+                .rag_cache
+                .load_with(key, || async move {
+                    Rag::load(&app_clone, &name_clone, &path_clone)
+                })
+                .await?
+        } else if info_flag || !*IS_STDOUT_TERMINAL {
+            bail!(
+                "Agent '{agent_name}' requires RAG for rag node '{node_id}', but its \
+                 knowledge base has not been built. Run the agent once interactively \
+                 to initialize it."
+            );
+        } else {
+            let ans = Confirm::new(&format!(
+                "Initialize RAG knowledge base for rag node '{node_id}'?"
+            ))
+            .with_default(true)
+            .prompt()?;
+            if !ans {
+                bail!(
+                    "Agent '{agent_name}' has rag node '{node_id}' but its RAG was not \
+                     initialized. RAG initialization is required for this agent."
+                );
+            }
+            let document_paths =
+                resolve_document_paths(&rag_node.documents, loaders, agent_data_dir)?;
+            let app_clone = app.clone();
+            let path_clone = rag_path.clone();
+            let name_clone = node_id.clone();
+            let abort = abort_signal.clone();
+            app_state
+                .rag_cache
+                .load_with(key, || async move {
+                    Rag::init(&app_clone, &name_clone, &path_clone, &document_paths, abort).await
+                })
+                .await?
+        };
+        rags.insert(node_id.clone(), rag);
+    }
+    Ok(rags)
 }
 
 pub fn list_agents() -> Vec<String> {

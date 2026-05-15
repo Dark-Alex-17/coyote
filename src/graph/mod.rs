@@ -7,6 +7,7 @@ pub mod executor;
 pub mod llm;
 pub mod logging;
 pub mod parser;
+pub mod rag;
 pub mod script;
 pub mod state;
 pub mod structured;
@@ -20,11 +21,12 @@ pub use executor::GraphExecutor;
 pub use llm::LlmNodeExecutor;
 pub use logging::GraphLogger;
 pub use parser::{GraphParser, agent_has_graph};
+pub use rag::RagNodeExecutor;
 pub use script::ScriptExecutor;
 pub use state::{StateManager, StateRepresentation};
 pub use types::{
     AgentNode, ApprovalNode, EndNode, Graph, GraphSettings, GraphState, InputNode, LlmNode, Node,
-    NodeType, ScriptNode,
+    NodeType, RagNode, ScriptNode,
 };
 pub use user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 pub use validator::{GraphValidator, ValidationError, ValidationResult};

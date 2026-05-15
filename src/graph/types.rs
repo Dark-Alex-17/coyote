@@ -152,6 +152,7 @@ pub enum NodeType {
     Approval(ApprovalNode),
     Input(InputNode),
     Llm(LlmNode),
+    Rag(RagNode),
     End(EndNode),
 }
 
@@ -326,6 +327,35 @@ fn default_llm_max_attempts() -> u32 {
 
 fn default_llm_max_iterations() -> u32 {
     10
+}
+
+/// `rag`-type node: run a hybrid (vector + keyword) retrieval against a
+/// per-node knowledge base and write the result into state. The retrieved
+/// context and the list of source paths are exposed to `state_updates` via
+/// `{{output.context}}` and `{{output.sources}}` (the whole result is
+/// `{{output}}`, a JSON object). The knowledge base is built once at agent
+/// load time into `<agent>/<node-id>.yaml`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RagNode {
+    /// Knowledge sources (files, directories, URLs, loader-protocol paths).
+    /// REQUIRED — this is what makes the node a RAG node.
+    pub documents: Vec<String>,
+
+    /// Retrieval query, templated against state. Defaults to
+    /// `{{initial_prompt}}` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+
+    /// Number of chunks to retrieve. Defaults to the knowledge base's own
+    /// configured `top_k` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<usize>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_updates: Option<HashMap<String, String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
 }
 
 /// `end`-type node: terminate execution; `output` (templated) is returned
