@@ -198,21 +198,19 @@ fn build_inline_role(
         role.set_top_p(Some(p));
     }
 
-    if let Some(tool_entries) = &node.tools {
-        if tool_entries.is_empty() {
-            role.set_enabled_tools(Some(String::new()));
-            role.set_enabled_mcp_servers(Some(String::new()));
+    if node.tools.as_deref().unwrap_or_default().is_empty() {
+        role.set_enabled_tools(Some(String::new()));
+        role.set_enabled_mcp_servers(Some(String::new()));
+    } else {
+        if !regular_tools.is_empty() {
+            role.set_enabled_tools(Some(regular_tools.join(",")));
         } else {
-            if !regular_tools.is_empty() {
-                role.set_enabled_tools(Some(regular_tools.join(",")));
-            } else {
-                role.set_enabled_tools(Some(String::new()));
-            }
-            if !mcp_servers.is_empty() {
-                role.set_enabled_mcp_servers(Some(mcp_servers.join(",")));
-            } else {
-                role.set_enabled_mcp_servers(Some(String::new()));
-            }
+            role.set_enabled_tools(Some(String::new()));
+        }
+        if !mcp_servers.is_empty() {
+            role.set_enabled_mcp_servers(Some(mcp_servers.join(",")));
+        } else {
+            role.set_enabled_mcp_servers(Some(String::new()));
         }
     }
 
@@ -370,9 +368,8 @@ fn format_schema_hint(schema: &Value) -> String {
 
 fn describe_tools_filter(tools: Option<&[String]>) -> String {
     match tools {
-        None => "<inherit>".into(),
-        Some(t) if t.is_empty() => "<none>".into(),
-        Some(t) => t.join(","),
+        Some(t) if !t.is_empty() => t.join(","),
+        _ => "<none>".into(),
     }
 }
 
@@ -531,7 +528,7 @@ mod tests {
 
     #[test]
     fn describe_tools_filter_renders_each_case() {
-        assert_eq!(describe_tools_filter(None), "<inherit>");
+        assert_eq!(describe_tools_filter(None), "<none>");
         assert_eq!(describe_tools_filter(Some(&[])), "<none>");
         let tools = vec!["a".to_string(), "b".to_string()];
         assert_eq!(describe_tools_filter(Some(&tools)), "a,b");

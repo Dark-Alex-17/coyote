@@ -31,10 +31,6 @@ pub struct Graph {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
 
-    /// Session to start the agent in (e.g. `temp`). Single-file mode only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_session: Option<String>,
-
     /// Global tools available to the agent's nodes. Single-file mode only.
     #[serde(default)]
     pub global_tools: Vec<String>,
@@ -282,8 +278,8 @@ pub struct LlmNode {
     /// Each entry is either an exact function name (`global_tools`
     /// entry or `tools.{sh,py,ts}` subcommand) or the shorthand
     /// `mcp:<server>` (where `<server>` must be in the agent's
-    /// `mcp_servers`). Unset = inherit agent's full set; `[]` = no
-    /// tools.
+    /// `mcp_servers`). Unset or `[]` = no tools — tools are strictly
+    /// opt-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
 
@@ -350,6 +346,28 @@ pub struct RagNode {
     /// configured `top_k` when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<usize>,
+
+    /// Embedding model for building the knowledge base. When this plus
+    /// `chunk_size` and `chunk_overlap` are all set, knowledge-base
+    /// construction runs non-interactively (no prompts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+
+    /// Chunk size for splitting documents at build time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_size: Option<usize>,
+
+    /// Chunk overlap for splitting documents at build time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_overlap: Option<usize>,
+
+    /// Reranker model applied to hybrid-search results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reranker_model: Option<String>,
+
+    /// Embedding-request batch size at build time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<usize>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_updates: Option<HashMap<String, String>>,
@@ -812,7 +830,6 @@ start: e
 model: anthropic:claude-sonnet-4-6
 temperature: 0.2
 top_p: 0.9
-agent_session: temp
 global_tools:
   - web_search_loki.sh
 mcp_servers:
@@ -829,7 +846,6 @@ nodes:
         assert_eq!(graph.model.as_deref(), Some("anthropic:claude-sonnet-4-6"));
         assert_eq!(graph.temperature, Some(0.2));
         assert_eq!(graph.top_p, Some(0.9));
-        assert_eq!(graph.agent_session.as_deref(), Some("temp"));
         assert_eq!(graph.global_tools, vec!["web_search_loki.sh"]);
         assert_eq!(graph.mcp_servers, vec!["pubmed-search"]);
         assert_eq!(graph.conversation_starters, vec!["Look up 2160-0"]);
@@ -842,7 +858,6 @@ nodes:
         assert!(graph.model.is_none());
         assert!(graph.temperature.is_none());
         assert!(graph.top_p.is_none());
-        assert!(graph.agent_session.is_none());
         assert!(graph.global_tools.is_empty());
         assert!(graph.mcp_servers.is_empty());
         assert!(graph.conversation_starters.is_empty());
