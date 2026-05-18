@@ -1,8 +1,8 @@
 //! Main execution loop for graph workflows.
 //!
 //! Dispatches each node to its type-specific executor, handles routing
-//! (static `Node.next`, script `_next` override, approval `routes`, input
-//! `on_timeout`), enforces `max_loop_iterations` and an optional
+//! (static `Node.next`, script `_next` override, approval `routes` and
+//! `on_other`), enforces `max_loop_iterations` and an optional
 //! whole-graph timeout, and resolves the final `End` node's `output`
 //! template as the graph's return value.
 

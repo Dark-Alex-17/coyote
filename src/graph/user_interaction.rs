@@ -23,8 +23,7 @@ pub struct ApprovalNodeExecutor;
 impl ApprovalNodeExecutor {
     /// Prompt the user with the (templated) question and routes the
     /// selected option through the node's `routes` map. Returns the next
-    /// node ID. On escalation timeout/error the node routes to
-    /// `on_timeout` if set, otherwise propagates the failure.
+    /// node ID. An escalation timeout/error propagates as a failure.
     pub async fn execute(
         node: &ApprovalNode,
         state_manager: &mut StateManager,
@@ -43,9 +42,6 @@ impl ApprovalNodeExecutor {
         .context("user__ask failed")?;
 
         if let Some(err) = response.get("error").and_then(Value::as_str) {
-            if let Some(on_timeout) = &node.on_timeout {
-                return Ok(on_timeout.clone());
-            }
             bail!("Approval interaction failed: {err}");
         }
 
@@ -67,8 +63,8 @@ impl InputNodeExecutor {
     /// Prompt the user for free-form text. If a `default` is configured
     /// and the user submits an empty response, the default is substituted.
     /// Optional `validation` is evaluated against the final value. Returns
-    /// `node_next` (the parent `Node.next`) on success, or `on_timeout` on
-    /// escalation timeout/error.
+    /// `node_next` (the parent `Node.next`) on success; an escalation
+    /// timeout/error propagates as a failure.
     pub async fn execute(
         node: &InputNode,
         node_next: Option<&str>,
@@ -86,9 +82,6 @@ impl InputNodeExecutor {
         .context("user__input failed")?;
 
         if let Some(err) = response.get("error").and_then(Value::as_str) {
-            if let Some(on_timeout) = &node.on_timeout {
-                return Ok(on_timeout.clone());
-            }
             bail!("Input interaction failed: {err}");
         }
 
@@ -241,8 +234,6 @@ mod tests {
             routes: r,
             on_other: on_other.into(),
             state_updates: None,
-            timeout: None,
-            on_timeout: None,
         }
     }
 
@@ -252,8 +243,6 @@ mod tests {
             default: None,
             validation: None,
             state_updates: None,
-            timeout: None,
-            on_timeout: None,
         }
     }
 

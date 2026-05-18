@@ -219,12 +219,6 @@ pub struct ApprovalNode {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_updates: Option<HashMap<String, String>>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<u64>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_timeout: Option<String>,
 }
 
 /// `input`-type node: collect free-form text from the user. Routes via the
@@ -242,12 +236,6 @@ pub struct InputNode {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_updates: Option<HashMap<String, String>>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<u64>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_timeout: Option<String>,
 }
 
 /// `llm`-type node: a one-shot LLM call (with bounded tool-call loop)
@@ -584,8 +572,6 @@ validation: "len(input) > 0"
 state_updates:
   api_key: "{{input}}"
 next: configure
-timeout: 300
-on_timeout: skip
 "#;
         let node: Node = serde_yaml::from_str(yaml).unwrap();
         let input = match node.node_type {
@@ -595,8 +581,6 @@ on_timeout: skip
         assert_eq!(input.question, "Enter your API key:");
         assert_eq!(input.default.as_deref(), Some("{{previous_api_key}}"));
         assert_eq!(input.validation.as_deref(), Some("len(input) > 0"));
-        assert_eq!(input.timeout, Some(300));
-        assert_eq!(input.on_timeout.as_deref(), Some("skip"));
         let updates = input.state_updates.unwrap();
         assert_eq!(
             updates.get("api_key").map(|s| s.as_str()),
@@ -621,8 +605,6 @@ question: "Describe the feature:"
         assert!(input.default.is_none());
         assert!(input.validation.is_none());
         assert!(input.state_updates.is_none());
-        assert!(input.timeout.is_none());
-        assert!(input.on_timeout.is_none());
         assert!(node.next.is_none());
     }
 
