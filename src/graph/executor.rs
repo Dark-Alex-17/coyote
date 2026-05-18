@@ -15,13 +15,14 @@ use super::script::ScriptExecutor;
 use super::state::StateManager;
 use super::types::{EndNode, Graph, Node, NodeType};
 use super::user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
-use super::validator::GraphValidator;
+use super::validator::{AgentValidationContext, GraphValidator};
 use crate::config::RequestContext;
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct GraphExecutor {
@@ -72,7 +73,13 @@ impl GraphExecutor {
         let GraphExecutor { graph, base_dir } = self;
 
         if graph.settings.validate_before_run {
-            let validator = GraphValidator::new(&base_dir);
+            let mut validator = GraphValidator::new(&base_dir);
+            if let Some(agent) = &ctx.agent {
+                validator = validator.with_agent_context(AgentValidationContext::from_agent(
+                    agent,
+                    Arc::clone(&ctx.app.config),
+                ));
+            }
             let result = validator.validate(&graph);
             for w in &result.warnings {
                 logger.validation_warning(w.node_id.as_deref(), &w.message);
