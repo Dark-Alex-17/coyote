@@ -37,6 +37,7 @@ use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remov
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use crate::graph;
 
 pub struct AutoContinueConfig {
     pub enabled: bool,
@@ -1007,6 +1008,7 @@ impl RequestContext {
                     })
                     .map(|v| v.name.to_string())
                     .collect();
+
                 if let Some(agent) = &self.agent {
                     declaration_names.extend(
                         agent
@@ -1031,6 +1033,7 @@ impl RequestContext {
                         if item.is_empty() {
                             continue;
                         }
+
                         if let Some(values) = app.mapping_tools.get(item) {
                             tool_names.extend(
                                 values
@@ -1089,9 +1092,11 @@ impl RequestContext {
                             && !v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
                     })
                     .collect();
+
                 if let Some(ref tool_names) = role_filter {
                     agent_functions.retain(|v| tool_names.contains(&v.name));
                 }
+
                 let tool_names: HashSet<String> = agent_functions
                     .iter()
                     .filter_map(|v| {
@@ -1157,6 +1162,7 @@ impl RequestContext {
                             if item.is_empty() {
                                 continue;
                             }
+
                             let item_invoke_name =
                                 format!("{}_{item}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
                             let item_search_name =
@@ -1226,9 +1232,11 @@ impl RequestContext {
                             || v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
                     })
                     .collect();
+
                 if let Some(ref server_names) = role_filter {
                     agent_functions.retain(|v| server_names.contains(&v.name));
                 }
+
                 let tool_names: HashSet<String> = agent_functions
                     .iter()
                     .filter_map(|v| {
@@ -2168,6 +2176,14 @@ impl RequestContext {
         )
         .await?;
 
+        let is_graph_agent = graph::agent_has_graph(agent_name);
+        if is_graph_agent && session_name.is_some() {
+            bail!(
+                "Graph-based agent '{agent_name}' does not support sessions. \
+                 The graph manages its own state; re-run without a session."
+            );
+        }
+
         let mcp_servers = if app.mcp_server_support {
             (!agent.mcp_server_names().is_empty()).then(|| agent.mcp_server_names().join(","))
         } else {
@@ -2189,8 +2205,10 @@ impl RequestContext {
             );
         }
 
+        // Graph agents manage their own state; never engage a session,
+        // not even an inherited app-level `agent_session` default.
         let session_name = session_name.map(|v| v.to_string()).or_else(|| {
-            if self.macro_flag {
+            if self.macro_flag || is_graph_agent {
                 None
             } else {
                 agent.agent_session().map(|v| v.to_string())
@@ -3581,6 +3599,81 @@ mod tests {
         assert!(
             ctx.agent.is_none(),
             "Agent should not be set when session check fails"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_errors_when_graph_agent_given_explicit_session() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_graph_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\nversion: \"1.0\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: ok\n"
+            ),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        let result = run_async(ctx.use_agent(&app, &agent_name, Some("test_session"), abort));
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not support sessions")
+        );
+        assert!(
+            ctx.agent.is_none(),
+            "Agent should not be set when the graph-agent session guard fails"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_skips_inherited_session_for_graph_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.agent_session = Some("inherited".to_string()));
+
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_graph_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\nversion: \"1.0\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: ok\n"
+            ),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        assert!(ctx.agent.is_some(), "Graph agent should load successfully");
+        assert!(
+            ctx.session.is_none(),
+            "Graph agent must not engage a session, not even an inherited default"
         );
     }
 }
