@@ -17,7 +17,7 @@ use crate::utils::{
     AbortSignal, abortable_run_with_spinner, create_abort_signal, dimmed_text, set_text, temp_file,
 };
 
-use crate::resolve_oauth_client;
+use crate::{graph, resolve_oauth_client};
 use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
@@ -32,6 +32,7 @@ use reedline::{
 use reedline::{MenuBuilder, Signal};
 use std::sync::LazyLock;
 use std::{env, process, sync::Arc};
+use log::warn;
 
 const MENU_NAME: &str = "completion_menu";
 
@@ -497,6 +498,12 @@ pub async fn run_repl_command(
                 ),
             },
             ".session" => {
+                if let Some(name) = graph::active_agent_graph_name(ctx) {
+                    bail!(
+                        "Graph-based agent '{name}' does not support sessions. \
+                         The graph manages its own state."
+                    );
+                }
                 let app = Arc::clone(&ctx.app.config);
                 ctx.use_session(app.as_ref(), args, abort_signal.clone())
                     .await?;
@@ -508,7 +515,7 @@ pub async fn run_repl_command(
                     };
                     eprintln!("\n📢 {}", color.italic().paint("Autonaming the session."),);
                     if let Err(err) = ctx.autoname_session(app.as_ref()).await {
-                        log::warn!("Failed to autonaming the session: {err}");
+                        warn!("Failed to autonaming the session: {err}");
                     }
                     if let Some(session) = ctx.session.as_mut() {
                         session.set_autonaming(false);
@@ -860,10 +867,10 @@ async fn ask(
 
     let app = Arc::clone(&ctx.app.config);
 
-    if crate::graph::active_agent_graph_name(ctx).is_some() {
+    if graph::active_agent_graph_name(ctx).is_some() {
         ctx.before_chat_completion(&input)?;
         let output =
-            crate::graph::run_active_agent_graph(ctx, &input.text(), abort_signal.clone()).await?;
+            graph::run_active_agent_graph(ctx, &input.text(), abort_signal.clone()).await?;
         app.print_markdown(&output)?;
         ctx.after_chat_completion(app.as_ref(), &input, &output, &[])?;
         return Ok(());
@@ -937,7 +944,7 @@ async fn ask(
                 };
                 eprintln!("\n📢 {}", color.italic().paint("Autonaming the session."),);
                 if let Err(err) = ctx.autoname_session(app.as_ref()).await {
-                    log::warn!("Failed to autonaming the session: {err}");
+                    warn!("Failed to autonaming the session: {err}");
                 }
                 if let Some(session) = ctx.session.as_mut() {
                     session.set_autonaming(false);
@@ -964,7 +971,7 @@ async fn ask(
                 eprintln!("\n📢 {}", color.italic().paint("Compressing the session."),);
 
                 if let Err(err) = ctx.compress_session().await {
-                    log::warn!("Failed to compress the session: {err}");
+                    warn!("Failed to compress the session: {err}");
                 }
                 if let Some(session) = ctx.session.as_mut() {
                     session.set_compressing(false);
