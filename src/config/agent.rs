@@ -1049,7 +1049,6 @@ description: A graph agent
 model: anthropic:claude-sonnet-4-6
 temperature: 0.3
 top_p: 0.8
-agent_session: temp
 global_tools:
   - fetch_pdf.sh
 mcp_servers:
@@ -1074,7 +1073,6 @@ nodes:
         );
         assert_eq!(config.temperature, Some(0.3));
         assert_eq!(config.top_p, Some(0.8));
-        assert_eq!(config.agent_session.as_deref(), Some("temp"));
         assert_eq!(config.global_tools, vec!["fetch_pdf.sh"]);
         assert_eq!(config.mcp_servers, vec!["pubmed-search"]);
         assert_eq!(config.conversation_starters, vec!["Start here"]);

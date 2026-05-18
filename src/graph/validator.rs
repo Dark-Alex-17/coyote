@@ -464,6 +464,84 @@ mod tests {
         }
     }
 
+    fn input_node(id: &str, on_timeout: Option<&str>, next: Option<&str>) -> Node {
+        Node {
+            id: id.into(),
+            description: String::new(),
+            node_type: NodeType::Input(InputNode {
+                question: "?".into(),
+                default: None,
+                validation: None,
+                state_updates: None,
+                timeout: None,
+                on_timeout: on_timeout.map(String::from),
+            }),
+            next: next.map(String::from),
+        }
+    }
+
+    fn llm_node(id: &str, fallback: Option<&str>, next: Option<&str>) -> Node {
+        Node {
+            id: id.into(),
+            description: String::new(),
+            node_type: NodeType::Llm(LlmNode {
+                instructions: None,
+                prompt: "p".into(),
+                tools: None,
+                model: None,
+                temperature: None,
+                top_p: None,
+                fallback: fallback.map(String::from),
+                max_attempts: 1,
+                max_iterations: 10,
+                state_updates: None,
+                output_schema: None,
+                timeout: None,
+            }),
+            next: next.map(String::from),
+        }
+    }
+
+    #[test]
+    fn flags_missing_approval_on_timeout_target() {
+        let mut approval = approval_node("a", &["yes"], &[("yes", "end")], "end");
+        if let NodeType::Approval(ref mut n) = approval.node_type {
+            n.on_timeout = Some("ghost".into());
+        }
+        let graph = graph_with(vec![("a", approval), ("end", end_node("end"))], "a");
+        let result = validator().validate(&graph);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.message.contains("ghost")));
+    }
+
+    #[test]
+    fn flags_missing_input_on_timeout_target() {
+        let graph = graph_with(
+            vec![
+                ("i", input_node("i", Some("ghost"), Some("end"))),
+                ("end", end_node("end")),
+            ],
+            "i",
+        );
+        let result = validator().validate(&graph);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.message.contains("ghost")));
+    }
+
+    #[test]
+    fn flags_missing_llm_fallback_target() {
+        let graph = graph_with(
+            vec![
+                ("l", llm_node("l", Some("ghost"), Some("end"))),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+        let result = validator().validate(&graph);
+        assert!(!result.is_valid());
+        assert!(result.errors.iter().any(|e| e.message.contains("ghost")));
+    }
+
     #[test]
     fn rag_node_without_documents_errors() {
         let graph = graph_with(

@@ -864,6 +864,27 @@ nodes:
     }
 
     #[test]
+    fn node_ids_lists_nodes_in_order() {
+        let yaml = r#"
+name: g
+start: first
+nodes:
+  first:
+    id: first
+    type: agent
+    agent: helper
+    prompt: hi
+    next: last
+  last:
+    id: last
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(graph.node_ids(), vec!["first", "last"]);
+    }
+
+    #[test]
     fn has_agent_node_detects_agent_nodes() {
         let with_agent = r#"
 name: g
