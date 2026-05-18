@@ -221,10 +221,81 @@ impl Default for Config {
 }
 
 pub fn install_builtins() -> Result<()> {
-    Functions::install_builtin_global_tools()?;
-    Agent::install_builtin_agents()?;
-    Macro::install_macros()?;
+    Functions::install_builtin_global_tools(false)?;
+    Agent::install_builtin_agents(false)?;
+    Macro::install_macros(false)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AssetCategory {
+    Agents,
+    Macros,
+    Functions,
+    #[value(name = "mcp_config")]
+    McpConfig,
+}
+
+impl AssetCategory {
+    pub const NAMES: [&'static str; 4] = ["agents", "macros", "functions", "mcp_config"];
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "agents" => Some(Self::Agents),
+            "macros" => Some(Self::Macros),
+            "functions" => Some(Self::Functions),
+            "mcp_config" => Some(Self::McpConfig),
+            _ => None,
+        }
+    }
+}
+
+pub fn install_assets(category: AssetCategory) -> Result<()> {
+    let (label, target) = match category {
+        AssetCategory::Agents => ("agents", paths::agents_data_dir()),
+        AssetCategory::Macros => ("macros", paths::macros_dir()),
+        AssetCategory::Functions => ("functions", paths::functions_dir()),
+        AssetCategory::McpConfig => ("MCP config", paths::mcp_config_file()),
+    };
+
+    if !confirm_asset_overwrite(category, label, &target)? {
+        println!("Aborted. No files were changed.");
+        return Ok(());
+    }
+
+    match category {
+        AssetCategory::Agents => Agent::install_builtin_agents(true)?,
+        AssetCategory::Macros => Macro::install_macros(true)?,
+        AssetCategory::Functions => Functions::install_builtin_global_tools(true)?,
+        AssetCategory::McpConfig => Functions::install_mcp_config()?,
+    }
+
+    println!("Reinstalled bundled {label} ({})", target.display());
+    Ok(())
+}
+
+fn confirm_asset_overwrite(category: AssetCategory, label: &str, target: &Path) -> Result<bool> {
+    if !*IS_STDOUT_TERMINAL {
+        return Ok(true);
+    }
+    let body = match category {
+        AssetCategory::McpConfig => format!(
+            "This replaces your MCP server configuration at {} with this \
+             build's bundled template. Your configured MCP servers (and any \
+             custom secret references they contain) will be lost.",
+            target.display()
+        ),
+        _ => format!(
+            "Reinstalling bundled {label} overwrites every bundled {label} in \
+             {} with this build's packaged versions. Local changes to bundled \
+             {label} will be lost; {label} you created yourself are left \
+             untouched.",
+            target.display()
+        ),
+    };
+    let prompt = format!("{} {body}\nContinue? [y/N] ", warning_text("WARNING:"));
+    let answer = read_single_key(&['y', 'Y', 'n', 'N'], 'n', &prompt)?;
+    Ok(matches!(answer, 'y' | 'Y'))
 }
 
 pub fn default_sessions_dir() -> PathBuf {

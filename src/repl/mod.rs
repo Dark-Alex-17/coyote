@@ -7,17 +7,17 @@ use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
 use crate::client::{call_chat_completions, call_chat_completions_streaming, init_client, oauth};
-use crate::config::paths;
 use crate::config::{
     AgentVariables, AppConfig, AssertState, Input, LastMessage, RequestContext, StateFlags,
     macro_execute,
 };
+use crate::config::{AssetCategory, paths};
 use crate::render::render_error;
 use crate::utils::{
     AbortSignal, abortable_run_with_spinner, create_abort_signal, dimmed_text, set_text, temp_file,
 };
 
-use crate::{graph, resolve_oauth_client};
+use crate::{config, graph, resolve_oauth_client};
 use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
@@ -45,7 +45,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 39]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 40]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -210,6 +210,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 39]> = LazyLock::new(|| {
         ReplCommand::new(
             ".vault",
             "View or modify the Loki vault",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".install",
+            "Reinstall bundled agents, macros, functions, or MCP config (overwrites local changes)",
             AssertState::pass(),
         ),
         ReplCommand::new(".exit", "Exit REPL", AssertState::pass()),
@@ -522,6 +527,16 @@ pub async fn run_repl_command(
                     }
                 }
             }
+            ".install" => match args.map(str::trim) {
+                Some(name) if !name.is_empty() => match AssetCategory::parse(name) {
+                    Some(category) => config::install_assets(category)?,
+                    None => println!(
+                        "Unknown asset category '{name}'. Valid categories: {}",
+                        AssetCategory::NAMES.join(", ")
+                    ),
+                },
+                _ => println!("Usage: .install <{}>", AssetCategory::NAMES.join("|")),
+            },
             ".rag" => {
                 ctx.use_rag(args, abort_signal.clone()).await?;
             }
@@ -1216,8 +1231,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_39_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 39);
+    fn repl_commands_has_40_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 40);
     }
 
     #[test]

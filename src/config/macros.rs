@@ -85,7 +85,7 @@ impl Macro {
         Ok(value)
     }
 
-    pub fn install_macros() -> Result<()> {
+    pub fn install_macros(force: bool) -> Result<()> {
         info!(
             "Installing built-in macros in {}",
             paths::macros_dir().display()
@@ -98,7 +98,7 @@ impl Macro {
             let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
             let file_path = paths::macros_dir().join(file.as_ref());
 
-            if file_path.exists() {
+            if file_path.exists() && !force {
                 debug!(
                     "Macro file already exists, skipping: {}",
                     file_path.display()

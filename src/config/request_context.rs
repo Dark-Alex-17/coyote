@@ -3,10 +3,10 @@ use super::session::Session;
 use super::todo::TodoList;
 use super::tool_scope::{McpRuntime, ToolScope};
 use super::{
-    AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, CREATE_TITLE_ROLE, Input,
-    LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, RIGHT_PROMPT, Role, RoleLike, SESSIONS_DIR_NAME,
-    SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags, TEMP_ROLE_NAME, TEMP_SESSION_NAME,
-    WorkingMode, ensure_parent_exists, list_agents, paths,
+    AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
+    Input, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, RIGHT_PROMPT, Role, RoleLike,
+    SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags, TEMP_ROLE_NAME,
+    TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, paths,
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
@@ -1784,6 +1784,9 @@ impl RequestContext {
                 }
                 ".rag" => super::map_completion_values(paths::list_rags()),
                 ".agent" => super::map_completion_values(list_agents()),
+                ".install" => super::map_completion_values(
+                    AssetCategory::NAMES.iter().map(|s| s.to_string()).collect(),
+                ),
                 ".macro" => super::map_completion_values(paths::list_macros()),
                 ".starter" => match &self.agent {
                     Some(agent) => agent
@@ -3674,6 +3677,97 @@ mod tests {
         assert!(
             ctx.session.is_none(),
             "Graph agent must not engage a session, not even an inherited default"
+        );
+    }
+
+    fn first_file(dir: &Path) -> Option<PathBuf> {
+        for entry in read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = first_file(&path) {
+                    return Some(found);
+                }
+            } else {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn asset_category_parse_maps_known_names() {
+        assert_eq!(AssetCategory::parse("agents"), Some(AssetCategory::Agents));
+        assert_eq!(AssetCategory::parse("macros"), Some(AssetCategory::Macros));
+        assert_eq!(
+            AssetCategory::parse("functions"),
+            Some(AssetCategory::Functions)
+        );
+        assert_eq!(
+            AssetCategory::parse("mcp_config"),
+            Some(AssetCategory::McpConfig)
+        );
+        assert_eq!(AssetCategory::parse("roles"), None);
+        assert_eq!(AssetCategory::parse(""), None);
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_agents_force_overwrites_only_with_force() {
+        let _guard = TestConfigDirGuard::new();
+
+        Agent::install_builtin_agents(false).unwrap();
+        let file =
+            first_file(&paths::agents_data_dir()).expect("bundled agents should be installed");
+
+        write(&file, "SENTINEL").unwrap();
+        Agent::install_builtin_agents(false).unwrap();
+        assert_eq!(
+            read_to_string(&file).unwrap(),
+            "SENTINEL",
+            "non-force install must not overwrite an existing file"
+        );
+
+        Agent::install_builtin_agents(true).unwrap();
+        assert_ne!(
+            read_to_string(&file).unwrap(),
+            "SENTINEL",
+            "force install must overwrite the existing file"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_functions_force_preserves_user_mcp_json() {
+        let _guard = TestConfigDirGuard::new();
+
+        Functions::install_builtin_global_tools(false).unwrap();
+        let mcp = paths::mcp_config_file();
+        assert!(mcp.exists(), "mcp.json should be installed on first run");
+
+        write(&mcp, "USER_MCP_CONFIG").unwrap();
+        Functions::install_builtin_global_tools(true).unwrap();
+        assert_eq!(
+            read_to_string(&mcp).unwrap(),
+            "USER_MCP_CONFIG",
+            "force install must NOT overwrite the user's mcp.json"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_mcp_config_overwrites_existing() {
+        let _guard = TestConfigDirGuard::new();
+
+        Functions::install_mcp_config().unwrap();
+        let mcp = paths::mcp_config_file();
+        assert!(mcp.exists(), "install_mcp_config should create mcp.json");
+
+        write(&mcp, "USER_MCP_CONFIG").unwrap();
+        Functions::install_mcp_config().unwrap();
+        assert_ne!(
+            read_to_string(&mcp).unwrap(),
+            "USER_MCP_CONFIG",
+            "install_mcp_config must overwrite the existing mcp.json"
         );
     }
 }
