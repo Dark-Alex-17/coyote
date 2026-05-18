@@ -45,7 +45,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 40]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 41]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -57,6 +57,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 40]> = LazyLock::new(|| {
         ReplCommand::new(
             ".edit config",
             "Modify configuration file",
+            AssertState::False(StateFlags::AGENT),
+        ),
+        ReplCommand::new(
+            ".edit mcp-config",
+            "Modify the MCP servers configuration file",
             AssertState::False(StateFlags::AGENT),
         ),
         ReplCommand::new(".model", "Switch LLM model", AssertState::pass()),
@@ -627,8 +632,13 @@ pub async fn run_repl_command(
                         let app = Arc::clone(&ctx.app.config);
                         ctx.edit_agent_config(app.as_ref())?;
                     }
+                    Some("mcp-config") => {
+                        ctx.edit_mcp_config()?;
+                    }
                     _ => {
-                        println!(r#"Usage: .edit <config|role|session|rag-docs|agent-config>"#)
+                        println!(
+                            r#"Usage: .edit <config|mcp-config|role|session|rag-docs|agent-config>"#
+                        )
                     }
                 }
             }
@@ -1231,8 +1241,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_40_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 40);
+    fn repl_commands_has_41_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 41);
     }
 
     #[test]
