@@ -3,7 +3,7 @@
 //! routes-vs-options consistency.
 //!
 //! The validator only follows **declared static edges** (`next`, approval
-//! `routes`, script `fallback`, `on_timeout`). Script nodes can also route
+//! `routes` and `on_other`, script/llm `fallback`). Script nodes can also route
 //! dynamically via `_next` in their JSON output at runtime; those edges are
 //! invisible here. As a result, unreachable-node detection and "no reachable
 //! End node" are reported as warnings (not errors) to avoid false positives
@@ -275,18 +275,10 @@ fn declared_targets(node: &Node) -> Vec<(String, &'static str)> {
                 out.push((v.clone(), "approval 'routes'"));
             }
             out.push((a.on_other.clone(), "approval 'on_other'"));
-            if let Some(t) = &a.on_timeout {
-                out.push((t.clone(), "'on_timeout'"));
-            }
         }
         NodeType::Script(s) => {
             if let Some(t) = &s.fallback {
                 out.push((t.clone(), "script 'fallback'"));
-            }
-        }
-        NodeType::Input(i) => {
-            if let Some(t) = &i.on_timeout {
-                out.push((t.clone(), "'on_timeout'"));
             }
         }
         NodeType::Llm(l) => {
@@ -294,9 +286,9 @@ fn declared_targets(node: &Node) -> Vec<(String, &'static str)> {
                 out.push((t.clone(), "llm 'fallback'"));
             }
         }
-        // `agent`/`rag` route only via `next` (already collected above);
-        // `end` is terminal. No type-specific routing edges to add.
-        NodeType::Agent(_) | NodeType::Rag(_) | NodeType::End(_) => {}
+        // `agent`/`input`/`rag` route only via `next` (already collected
+        // above); `end` is terminal. No type-specific routing edges to add.
+        NodeType::Agent(_) | NodeType::Input(_) | NodeType::Rag(_) | NodeType::End(_) => {}
     }
     out
 }
@@ -418,8 +410,6 @@ mod tests {
                 routes: r,
                 on_other: on_other.into(),
                 state_updates: None,
-                timeout: None,
-                on_timeout: None,
             }),
             next: None,
         }
@@ -464,22 +454,6 @@ mod tests {
         }
     }
 
-    fn input_node(id: &str, on_timeout: Option<&str>, next: Option<&str>) -> Node {
-        Node {
-            id: id.into(),
-            description: String::new(),
-            node_type: NodeType::Input(InputNode {
-                question: "?".into(),
-                default: None,
-                validation: None,
-                state_updates: None,
-                timeout: None,
-                on_timeout: on_timeout.map(String::from),
-            }),
-            next: next.map(String::from),
-        }
-    }
-
     fn llm_node(id: &str, fallback: Option<&str>, next: Option<&str>) -> Node {
         Node {
             id: id.into(),
@@ -500,32 +474,6 @@ mod tests {
             }),
             next: next.map(String::from),
         }
-    }
-
-    #[test]
-    fn flags_missing_approval_on_timeout_target() {
-        let mut approval = approval_node("a", &["yes"], &[("yes", "end")], "end");
-        if let NodeType::Approval(ref mut n) = approval.node_type {
-            n.on_timeout = Some("ghost".into());
-        }
-        let graph = graph_with(vec![("a", approval), ("end", end_node("end"))], "a");
-        let result = validator().validate(&graph);
-        assert!(!result.is_valid());
-        assert!(result.errors.iter().any(|e| e.message.contains("ghost")));
-    }
-
-    #[test]
-    fn flags_missing_input_on_timeout_target() {
-        let graph = graph_with(
-            vec![
-                ("i", input_node("i", Some("ghost"), Some("end"))),
-                ("end", end_node("end")),
-            ],
-            "i",
-        );
-        let result = validator().validate(&graph);
-        assert!(!result.is_valid());
-        assert!(result.errors.iter().any(|e| e.message.contains("ghost")));
     }
 
     #[test]
@@ -759,8 +707,6 @@ mod tests {
                 default: None,
                 validation: None,
                 state_updates: None,
-                timeout: None,
-                on_timeout: None,
             }),
             next: None,
         };

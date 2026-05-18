@@ -219,8 +219,6 @@ nodes:
     on_other: refine           # REQUIRED: route for ANY answer not in `routes`
     state_updates:
       decision: "{{choice}}"   # {{choice}} = the chosen option OR the free-form text
-    timeout: 300               # Optional: seconds to wait for a response
-    on_timeout: rejected_end   # Optional: route taken on interaction timeout
 
   # --- input node ---------------------------------------------------------
   # Collects a free-form string from the user.
@@ -235,8 +233,6 @@ nodes:
                                    # <op> in > >= < <= == . Length only -- no regex.
     state_updates:
       refinement: "{{input}}"  # {{input}} = the user's text
-    timeout: 120               # Optional
-    on_timeout: rejected_end   # Optional: route taken on interaction timeout
     next: finalize             # REQUIRED for input nodes: the success route
 
   # --- llm node (final synthesis) -----------------------------------------
