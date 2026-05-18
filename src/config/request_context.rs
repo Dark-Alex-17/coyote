@@ -1344,6 +1344,18 @@ impl RequestContext {
         Ok(())
     }
 
+    pub fn edit_mcp_config(&self) -> Result<()> {
+        let mcp_path = paths::mcp_config_file();
+        let editor = self.app.config.editor()?;
+        edit_file(&editor, &mcp_path)?;
+        println!(
+            "NOTE: Remember to restart {} for changes to '{}' to take effect",
+            env!("CARGO_CRATE_NAME"),
+            mcp_path.display(),
+        );
+        Ok(())
+    }
+
     pub fn new_role(&self, app: &AppConfig, name: &str) -> Result<()> {
         if self.macro_flag {
             bail!("No role");
