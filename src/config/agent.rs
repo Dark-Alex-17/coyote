@@ -45,7 +45,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn install_builtin_agents() -> Result<()> {
+    pub fn install_builtin_agents(force: bool) -> Result<()> {
         info!(
             "Installing built-in agents in {}",
             paths::agents_data_dir().display()
@@ -65,7 +65,7 @@ impl Agent {
             #[cfg_attr(not(unix), expect(unused))]
             let is_script = matches!(file_extension.as_deref(), Some("sh") | Some("py"));
 
-            if file_path.exists() {
+            if file_path.exists() && !force {
                 debug!(
                     "Agent file already exists, skipping: {}",
                     file_path.display()

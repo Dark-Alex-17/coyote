@@ -4,6 +4,7 @@ use crate::cli::completer::{
     ShellCompletion, agent_completer, macro_completer, model_completer, rag_completer,
     role_completer, secrets_completer, session_completer,
 };
+use crate::config::AssetCategory;
 use anyhow::{Context, Result};
 use clap::ValueHint;
 use clap::{Parser, crate_authors, crate_description, crate_version};
@@ -82,6 +83,9 @@ pub struct Cli {
     /// Build all configured Bash tool scripts
     #[arg(long)]
     pub build_tools: bool,
+    /// Reinstall bundled assets, overwriting any local changes
+    #[arg(long, value_name = "CATEGORY", value_enum)]
+    pub install: Option<AssetCategory>,
     /// Sync models updates
     #[arg(long)]
     pub sync_models: bool,

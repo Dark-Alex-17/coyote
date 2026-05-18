@@ -203,7 +203,7 @@ pub struct Functions {
 }
 
 impl Functions {
-    pub fn install_builtin_global_tools() -> Result<()> {
+    pub fn install_builtin_global_tools(force: bool) -> Result<()> {
         info!(
             "Installing global built-in functions in {}",
             paths::functions_dir().display()
@@ -228,7 +228,8 @@ impl Functions {
             #[cfg_attr(not(unix), expect(unused))]
             let is_script = matches!(file_extension.as_deref(), Some("sh") | Some("py"));
 
-            if file_path.exists() {
+            let force_this = force && file.as_ref() != "mcp.json";
+            if file_path.exists() && !force_this {
                 debug!(
                     "Function file already exists, skipping: {}",
                     file_path.display()
@@ -247,6 +248,22 @@ impl Functions {
                 fs::set_permissions(&file_path, fs::Permissions::from_mode(0o755))?;
             }
         }
+
+        Ok(())
+    }
+
+    pub fn install_mcp_config() -> Result<()> {
+        let file_path = paths::mcp_config_file();
+        let embedded = FunctionAssets::get("mcp.json")
+            .ok_or_else(|| anyhow!("Failed to load embedded mcp.json"))?;
+        let content = unsafe { std::str::from_utf8_unchecked(&embedded.data) };
+
+        ensure_parent_exists(&file_path)?;
+
+        info!("Reinstalling MCP config file: {}", file_path.display());
+
+        let mut config_file = File::create(&file_path)?;
+        config_file.write_all(content.as_bytes())?;
 
         Ok(())
     }
