@@ -1,14 +1,3 @@
-//! Static validation for graph definitions: reference integrity, cycles,
-//! reachability, terminal nodes, script/agent existence, and approval
-//! routes-vs-options consistency.
-//!
-//! The validator only follows **declared static edges** (`next`, approval
-//! `routes` and `on_other`, script/llm `fallback`). Script nodes can also route
-//! dynamically via `_next` in their JSON output at runtime; those edges are
-//! invisible here. As a result, unreachable-node detection and "no reachable
-//! End node" are reported as warnings (not errors) to avoid false positives
-//! against dynamically-routed graphs.
-
 use super::types::{Graph, Node, NodeType};
 use crate::client::{Model, ModelType};
 use crate::config::{Agent, AppConfig, paths};
@@ -17,7 +6,6 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// A single validation finding, optionally scoped to a node.
 #[derive(Debug, Clone)]
 pub struct ValidationError {
     pub node_id: Option<String>,
@@ -40,8 +28,6 @@ impl ValidationError {
     }
 }
 
-/// Aggregated validation findings: blocking `errors` and informational
-/// `warnings`.
 #[derive(Debug, Default)]
 pub struct ValidationResult {
     pub errors: Vec<ValidationError>,
@@ -61,8 +47,6 @@ impl ValidationResult {
         self.warnings.push(w);
     }
 
-    /// Consume into a `Result`, aggregating all errors into a single message.
-    /// Warnings are dropped.
     pub fn into_result(self) -> Result<()> {
         if self.is_valid() {
             return Ok(());
@@ -75,6 +59,7 @@ impl ValidationResult {
                 None => format!("  {}", e.message),
             })
             .collect();
+
         bail!(
             "Graph validation failed with {} error(s):\n{}",
             self.errors.len(),
@@ -83,9 +68,6 @@ impl ValidationResult {
     }
 }
 
-/// Agent-level context that `llm`-node `tools` and `model` references are
-/// validated against. Supplying it lets a typo in a node's `tools` or
-/// `model` be caught at graph load time instead of when the node runs.
 pub struct AgentValidationContext {
     pub tool_names: HashSet<String>,
     pub mcp_servers: HashSet<String>,
@@ -107,8 +89,6 @@ impl AgentValidationContext {
     }
 }
 
-/// Validator for graph structures. `base_dir` is used to resolve relative
-/// script paths (typically the owning agent's data directory).
 pub struct GraphValidator {
     base_dir: PathBuf,
     agent_ctx: Option<AgentValidationContext>,
@@ -138,6 +118,7 @@ impl GraphValidator {
         self.validate_approval_routes(graph, &mut result);
         self.validate_rag_nodes(graph, &mut result);
         self.validate_llm_nodes(graph, &mut result);
+
         result
     }
 
@@ -166,10 +147,12 @@ impl GraphValidator {
         let Some(ctx) = &self.agent_ctx else {
             return;
         };
+
         for (node_id, node) in &graph.nodes {
             let NodeType::Llm(llm) = &node.node_type else {
                 continue;
             };
+
             if let Some(tools) = &llm.tools {
                 for entry in tools {
                     if let Some(server) = entry.strip_prefix("mcp:") {
@@ -187,6 +170,7 @@ impl GraphValidator {
                     }
                 }
             }
+
             if let Some(model_id) = &llm.model
                 && Model::retrieve_model(ctx.app_config.as_ref(), model_id, ModelType::Chat)
                     .is_err()
@@ -332,14 +316,12 @@ impl GraphValidator {
     }
 }
 
-/// All declared outgoing targets from a node, paired with a human-readable
-/// label for use in error messages. Used both for cycle detection and
-/// reference validation.
 fn declared_targets(node: &Node) -> Vec<(String, &'static str)> {
     let mut out = Vec::new();
     if let Some(n) = &node.next {
         out.push((n.clone(), "'next'"));
     }
+
     match &node.node_type {
         NodeType::Approval(a) => {
             for v in a.routes.values() {
@@ -407,6 +389,7 @@ fn detect_cycle_dfs(
             if !graph.has_node(&next) {
                 continue;
             }
+
             if !visited.contains(&next) {
                 if let Some(cycle) = detect_cycle_dfs(graph, &next, visited, rec_stack, path) {
                     return Some(cycle);
@@ -438,6 +421,7 @@ mod tests {
         for (id, node) in nodes {
             map.insert(id.to_string(), node);
         }
+
         Graph {
             name: "t".into(),
             description: String::new(),
@@ -472,6 +456,7 @@ mod tests {
         for (k, v) in routes {
             r.insert((*k).into(), (*v).into());
         }
+
         Node {
             id: id.into(),
             description: String::new(),
@@ -506,6 +491,7 @@ mod tests {
             m.insert("ctx".into(), "{{output.context}}".into());
             m
         });
+
         Node {
             id: id.into(),
             description: String::new(),
@@ -556,7 +542,9 @@ mod tests {
             ],
             "l",
         );
+
         let result = validator().validate(&graph);
+
         assert!(!result.is_valid());
         assert!(result.errors.iter().any(|e| e.message.contains("ghost")));
     }
@@ -575,6 +563,7 @@ mod tests {
             n.tools = tools.map(|t| t.iter().map(|s| s.to_string()).collect());
             n.model = model.map(String::from);
         }
+
         node
     }
 
@@ -587,9 +576,11 @@ mod tests {
             ],
             "l",
         );
+
         let result = validator()
             .with_agent_context(agent_ctx(&["read_query"], &[]))
             .validate(&graph);
+
         assert!(!result.is_valid());
         assert!(
             result
@@ -608,9 +599,11 @@ mod tests {
             ],
             "l",
         );
+
         let result = validator()
             .with_agent_context(agent_ctx(&["read_query"], &[]))
             .validate(&graph);
+
         assert!(result.is_valid());
     }
 
@@ -623,9 +616,11 @@ mod tests {
             ],
             "l",
         );
+
         let result = validator()
             .with_agent_context(agent_ctx(&[], &["pubmed-search"]))
             .validate(&graph);
+
         assert!(!result.is_valid());
         assert!(
             result
@@ -647,9 +642,11 @@ mod tests {
             ],
             "l",
         );
+
         let result = validator()
             .with_agent_context(agent_ctx(&[], &["pubmed-search"]))
             .validate(&graph);
+
         assert!(result.is_valid());
     }
 
@@ -662,9 +659,11 @@ mod tests {
             ],
             "l",
         );
+
         let result = validator()
             .with_agent_context(agent_ctx(&[], &[]))
             .validate(&graph);
+
         assert!(!result.is_valid());
         assert!(
             result
@@ -683,7 +682,9 @@ mod tests {
             ],
             "l",
         );
+
         let result = validator().validate(&graph);
+
         assert!(result.is_valid());
     }
 
@@ -693,7 +694,9 @@ mod tests {
             vec![("r", rag_node("r", &[], true)), ("end", end_node("end"))],
             "r",
         );
+
         let result = validator().validate(&graph);
+
         assert!(!result.is_valid());
         assert!(
             result
@@ -712,7 +715,9 @@ mod tests {
             ],
             "r",
         );
+
         let result = validator().validate(&graph);
+
         assert!(result.is_valid());
         assert!(
             result
@@ -731,7 +736,9 @@ mod tests {
             ],
             "r",
         );
+
         let result = validator().validate(&graph);
+
         assert!(result.is_valid());
         assert!(
             !result
@@ -765,7 +772,9 @@ mod tests {
         let mut start = end_node("start");
         start.next = Some("end".into());
         let graph = graph_with(vec![("start", start), ("end", end_node("end"))], "start");
+
         let result = validator().validate(&graph);
+
         assert!(result.is_valid(), "errors: {:?}", result.errors);
     }
 
@@ -774,7 +783,9 @@ mod tests {
         let mut n = end_node("n1");
         n.next = Some("nope".into());
         let graph = graph_with(vec![("n1", n), ("end", end_node("end"))], "n1");
+
         let result = validator().validate(&graph);
+
         assert!(!result.is_valid());
         assert!(
             result
@@ -794,7 +805,9 @@ mod tests {
             "end",
         );
         let graph = graph_with(vec![("ap", approval), ("end", end_node("end"))], "ap");
+
         let result = validator().validate(&graph);
+
         assert!(!result.is_valid());
         assert!(
             result
@@ -808,7 +821,9 @@ mod tests {
     fn flags_missing_approval_on_other_target() {
         let approval = approval_node("ap", &["yes"], &[("yes", "end")], "missing");
         let graph = graph_with(vec![("ap", approval), ("end", end_node("end"))], "ap");
+
         let result = validator().validate(&graph);
+
         assert!(!result.is_valid());
         assert!(
             result
@@ -823,7 +838,9 @@ mod tests {
     fn flags_missing_script_fallback_target() {
         let scr = script_node("s", "does-not-exist.py", Some("nowhere"));
         let graph = graph_with(vec![("s", scr), ("end", end_node("end"))], "s");
+
         let result = validator().validate(&graph);
+
         assert!(
             result
                 .errors
@@ -839,7 +856,9 @@ mod tests {
         let mut b = end_node("b");
         b.next = Some("a".into());
         let graph = graph_with(vec![("a", a), ("b", b)], "a");
+
         let result = validator().validate(&graph);
+
         assert!(!result.is_valid());
         assert!(
             result
@@ -854,7 +873,9 @@ mod tests {
         let mut a = end_node("a");
         a.next = Some("a".into());
         let graph = graph_with(vec![("a", a)], "a");
+
         let result = validator().validate(&graph);
+
         assert!(
             result
                 .errors
@@ -869,7 +890,9 @@ mod tests {
             vec![("start", end_node("start")), ("orphan", end_node("orphan"))],
             "start",
         );
+
         let result = validator().validate(&graph);
+
         assert!(
             result.warnings.iter().any(
                 |w| w.node_id.as_deref() == Some("orphan") && w.message.contains("unreachable")
@@ -883,7 +906,9 @@ mod tests {
         let b = agent_node("b", "__no_such_agent__", None);
         a.next = Some("b".into());
         let graph = graph_with(vec![("a", a), ("b", b)], "a");
+
         let result = validator().validate(&graph);
+
         assert!(
             result
                 .errors
@@ -911,7 +936,9 @@ mod tests {
             vec![("start", start), ("orphan_end", end_node("orphan_end"))],
             "start",
         );
+
         let result = validator().validate(&graph);
+
         assert!(result.is_valid(), "unexpected errors: {:?}", result.errors);
         assert!(
             result
@@ -930,7 +957,9 @@ mod tests {
             vec![("start", start), ("s", scr), ("end", end_node("end"))],
             "start",
         );
+
         let result = validator().validate(&graph);
+
         assert!(
             result
                 .errors
@@ -944,7 +973,9 @@ mod tests {
     fn errors_when_referenced_agent_missing() {
         let agent = agent_node("a", "__definitely_no_such_agent__", Some("end"));
         let graph = graph_with(vec![("a", agent), ("end", end_node("end"))], "a");
+
         let result = validator().validate(&graph);
+
         assert!(result.errors.iter().any(|e| {
             e.message
                 .contains("Agent '__definitely_no_such_agent__' not found")
@@ -955,7 +986,9 @@ mod tests {
     fn errors_when_approval_option_has_no_route() {
         let approval = approval_node("ap", &["yes", "no"], &[("yes", "end")], "end");
         let graph = graph_with(vec![("ap", approval), ("end", end_node("end"))], "ap");
+
         let result = validator().validate(&graph);
+
         assert!(
             result
                 .errors
@@ -968,7 +1001,9 @@ mod tests {
     fn warns_when_approval_has_extra_route() {
         let approval = approval_node("ap", &["yes"], &[("yes", "end"), ("maybe", "end")], "end");
         let graph = graph_with(vec![("ap", approval), ("end", end_node("end"))], "ap");
+
         let result = validator().validate(&graph);
+
         assert!(result.warnings.iter().any(|w| {
             w.message
                 .contains("Route 'maybe' has no corresponding option")
@@ -982,11 +1017,13 @@ mod tests {
         let mut b = end_node("b");
         b.next = Some("missing2".into());
         let graph = graph_with(vec![("a", a), ("b", b)], "a");
+
         let err = validator()
             .validate(&graph)
             .into_result()
             .unwrap_err()
             .to_string();
+
         assert!(err.contains("missing1"), "got: {err}");
         assert!(err.contains("missing2"), "got: {err}");
         assert!(err.contains("validation failed"), "got: {err}");
@@ -996,7 +1033,9 @@ mod tests {
     fn into_result_returns_ok_when_no_errors() {
         let mut start = end_node("start");
         start.next = Some("end".into());
+
         let graph = graph_with(vec![("start", start), ("end", end_node("end"))], "start");
+
         assert!(validator().validate(&graph).into_result().is_ok());
     }
 }

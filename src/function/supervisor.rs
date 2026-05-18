@@ -5,6 +5,7 @@ use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor};
 use crate::utils::{AbortSignal, create_abort_signal};
 
+use crate::graph;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use indexmap::IndexMap;
@@ -332,8 +333,8 @@ pub fn run_child_agent(
     abort_signal: AbortSignal,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
-        if crate::graph::active_agent_graph_name(&child_ctx).is_some() {
-            return crate::graph::run_active_agent_graph(
+        if graph::active_agent_graph_name(&child_ctx).is_some() {
+            return graph::run_active_agent_graph(
                 &mut child_ctx,
                 &initial_input.text(),
                 abort_signal,

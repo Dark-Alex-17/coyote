@@ -1,12 +1,3 @@
-//! Execution of `approval` and `input` graph nodes via Loki's existing
-//! user-interaction system (`user__ask`, `user__input`).
-//!
-//! Both delegate to [`crate::function::user_interaction::handle_user_tool`],
-//! which prompts the user directly at depth 0 (via `inquire`) and escalates
-//! to the parent through the escalation queue at depth > 0. We interpret the
-//! returned JSON's `answer` field for the user's response and an `error`
-//! field for escalation timeout/cancellation.
-
 use super::state::StateManager;
 use super::types::{ApprovalNode, InputNode};
 use crate::config::RequestContext;
@@ -21,9 +12,6 @@ const INPUT_KEY: &str = "input";
 pub struct ApprovalNodeExecutor;
 
 impl ApprovalNodeExecutor {
-    /// Prompt the user with the (templated) question and routes the
-    /// selected option through the node's `routes` map. Returns the next
-    /// node ID. An escalation timeout/error propagates as a failure.
     pub async fn execute(
         node: &ApprovalNode,
         state_manager: &mut StateManager,
@@ -60,11 +48,6 @@ impl ApprovalNodeExecutor {
 pub struct InputNodeExecutor;
 
 impl InputNodeExecutor {
-    /// Prompt the user for free-form text. If a `default` is configured
-    /// and the user submits an empty response, the default is substituted.
-    /// Optional `validation` is evaluated against the final value. Returns
-    /// `node_next` (the parent `Node.next`) on success; an escalation
-    /// timeout/error propagates as a failure.
     pub async fn execute(
         node: &InputNode,
         node_next: Option<&str>,
@@ -122,12 +105,14 @@ fn build_input_question(node: &InputNode, state_manager: &StateManager) -> Resul
     let mut question = state_manager
         .interpolate(&node.question)
         .context("Failed to interpolate input question")?;
+
     if let Some(default_template) = &node.default {
         let default = state_manager.interpolate_lenient(default_template);
         if !default.is_empty() {
             question = format!("{question} [default: {default}]");
         }
     }
+
     Ok(question)
 }
 
@@ -135,6 +120,7 @@ fn resolve_approval_route(node: &ApprovalNode, choice: &str) -> Result<String> {
     if let Some(target) = node.routes.get(choice) {
         return Ok(target.clone());
     }
+
     Ok(node.on_other.clone())
 }
 
@@ -151,12 +137,14 @@ fn apply_state_updates_with_var(
     state_manager
         .state_mut()
         .set(var_name.into(), Value::String(var_value.to_string()));
+
     for (key, template) in updates {
         let value = state_manager.interpolate_lenient(template);
         state_manager
             .state_mut()
             .set(key.clone(), Value::String(value));
     }
+
     match prev {
         Some(v) => state_manager.state_mut().set(var_name.into(), v),
         None => {
@@ -220,6 +208,7 @@ mod tests {
         for (k, v) in pairs {
             map.insert((*k).into(), v.clone());
         }
+
         StateManager::new(map)
     }
 
@@ -228,6 +217,7 @@ mod tests {
         for (k, v) in routes {
             r.insert((*k).into(), (*v).into());
         }
+
         ApprovalNode {
             question: "?".into(),
             options: options.iter().map(|s| (*s).into()).collect(),
@@ -280,6 +270,7 @@ mod tests {
             &[("yes", "deploy"), ("no", "cancel")],
             "clarify",
         );
+
         assert_eq!(resolve_approval_route(&node, "yes").unwrap(), "deploy");
         assert_eq!(resolve_approval_route(&node, "no").unwrap(), "cancel");
     }
@@ -291,6 +282,7 @@ mod tests {
             &[("yes", "deploy"), ("no", "cancel")],
             "clarify",
         );
+
         assert_eq!(resolve_approval_route(&node, "maybe").unwrap(), "clarify");
         assert_eq!(
             resolve_approval_route(&node, "free-form text").unwrap(),
@@ -303,7 +295,9 @@ mod tests {
         let mut updates = HashMap::new();
         updates.insert("decision".into(), "{{choice}}".into());
         let mut state = manager_with(&[]);
+
         apply_state_updates_with_var(&Some(updates), &mut state, CHOICE_KEY, "approve");
+
         assert_eq!(state.state().get("decision"), Some(&json!("approve")));
         assert_eq!(state.state().get(CHOICE_KEY), Some(&Value::Null));
     }
@@ -313,7 +307,9 @@ mod tests {
         let mut updates = HashMap::new();
         updates.insert("decision".into(), "{{choice}}".into());
         let mut state = manager_with(&[("choice", json!("preserved"))]);
+
         apply_state_updates_with_var(&Some(updates), &mut state, CHOICE_KEY, "approve");
+
         assert_eq!(state.state().get("decision"), Some(&json!("approve")));
         assert_eq!(state.state().get(CHOICE_KEY), Some(&json!("preserved")));
     }
@@ -323,7 +319,9 @@ mod tests {
         let mut updates = HashMap::new();
         updates.insert("api_key".into(), "{{input}}".into());
         let mut state = manager_with(&[]);
+
         apply_state_updates_with_var(&Some(updates), &mut state, INPUT_KEY, "sk-12345");
+
         assert_eq!(state.state().get("api_key"), Some(&json!("sk-12345")));
         assert_eq!(state.state().get(INPUT_KEY), Some(&Value::Null));
     }
@@ -333,7 +331,9 @@ mod tests {
         let state = manager_with(&[("name", json!("alice"))]);
         let mut node = input("Hi, what's your name?");
         node.default = Some("{{name}}".into());
+
         let q = build_input_question(&node, &state).unwrap();
+
         assert_eq!(q, "Hi, what's your name? [default: alice]");
     }
 
@@ -342,7 +342,9 @@ mod tests {
         let state = manager_with(&[]);
         let mut node = input("Enter value:");
         node.default = Some("{{missing}}".into());
+
         let q = build_input_question(&node, &state).unwrap();
+
         assert_eq!(q, "Enter value:");
     }
 
@@ -350,14 +352,18 @@ mod tests {
     fn input_question_uses_no_default_when_field_absent() {
         let state = manager_with(&[]);
         let node = input("Enter value:");
+
         let q = build_input_question(&node, &state).unwrap();
+
         assert_eq!(q, "Enter value:");
     }
 
     #[test]
     fn no_state_updates_means_var_never_appears_in_state() {
         let mut state = manager_with(&[]);
+
         apply_state_updates_with_var(&None, &mut state, CHOICE_KEY, "approve");
+
         assert!(state.state().get(CHOICE_KEY).is_none());
     }
 }

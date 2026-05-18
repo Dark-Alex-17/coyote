@@ -1,15 +1,6 @@
-//! Main execution loop for graph workflows.
-//!
-//! Dispatches each node to its type-specific executor, handles routing
-//! (static `Node.next`, script `_next` override, approval `routes` and
-//! `on_other`), enforces `max_loop_iterations` and an optional
-//! whole-graph timeout, and resolves the final `End` node's `output`
-//! template as the graph's return value.
-
 use super::agent::AgentNodeExecutor;
 use super::llm::LlmNodeExecutor;
 use super::logging::GraphLogger;
-use super::parser::GraphParser;
 use super::rag::RagNodeExecutor;
 use super::script::ScriptExecutor;
 use super::state::StateManager;
@@ -21,7 +12,7 @@ use crate::utils::AbortSignal;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,18 +29,6 @@ impl GraphExecutor {
         }
     }
 
-    /// Load a graph from disk and construct the executor in one step.
-    /// `base_dir` is also used to resolve relative script paths.
-    pub fn from_path(graph_path: impl AsRef<Path>, base_dir: impl Into<PathBuf>) -> Result<Self> {
-        let base_dir = base_dir.into();
-        let parser = GraphParser::new(&base_dir);
-        let graph = parser.load_from_file(graph_path)?;
-        Ok(Self::new(graph, base_dir))
-    }
-
-    /// Run the graph to completion. Returns the resolved `output` template
-    /// of the terminal `End` node. Any failure is logged via the
-    /// `GraphLogger` before being propagated.
     pub async fn execute(
         self,
         ctx: &mut RequestContext,
@@ -222,9 +201,6 @@ async fn step(
     }
 }
 
-/// Apply the end node's `state_updates`, then interpolate its `output`
-/// template against the resulting state. Both use lenient interpolation
-/// so the graph still produces a result even when some keys are absent.
 fn resolve_end_output(end_node: &EndNode, state: &mut StateManager) -> String {
     apply_simple_state_updates(end_node.state_updates.as_ref(), state);
     state.interpolate_lenient(&end_node.output)
@@ -264,6 +240,7 @@ mod tests {
     fn resolve_end_output_interpolates_template_against_state() {
         let mut state = state_with(&[("name", json!("alice"))]);
         let node = end_node("done: {{name}}", None);
+
         assert_eq!(resolve_end_output(&node, &mut state), "done: alice");
     }
 
@@ -273,6 +250,7 @@ mod tests {
         updates.insert("summary".into(), "completed for {{user}}".into());
         let node = end_node("RESULT: {{summary}}", Some(updates));
         let mut state = state_with(&[("user", json!("bob"))]);
+
         assert_eq!(
             resolve_end_output(&node, &mut state),
             "RESULT: completed for bob"
@@ -287,6 +265,7 @@ mod tests {
     fn resolve_end_output_with_empty_template_returns_empty_string() {
         let mut state = state_with(&[]);
         let node = end_node("", None);
+
         assert_eq!(resolve_end_output(&node, &mut state), "");
     }
 
@@ -294,13 +273,16 @@ mod tests {
     fn resolve_end_output_lenient_on_missing_keys() {
         let mut state = state_with(&[]);
         let node = end_node("hello {{unknown}}!", None);
+
         assert_eq!(resolve_end_output(&node, &mut state), "hello !");
     }
 
     #[test]
     fn apply_simple_state_updates_does_nothing_when_none() {
         let mut state = state_with(&[("k", json!("v"))]);
+
         apply_simple_state_updates(None, &mut state);
+
         assert_eq!(state.state().get("k"), Some(&json!("v")));
     }
 
@@ -309,32 +291,9 @@ mod tests {
         let mut updates = HashMap::new();
         updates.insert("k".into(), "new-{{k}}".into());
         let mut state = state_with(&[("k", json!("old"))]);
+
         apply_simple_state_updates(Some(&updates), &mut state);
+
         assert_eq!(state.state().get("k"), Some(&json!("new-old")));
-    }
-
-    #[test]
-    fn from_path_loads_and_constructs_executor() {
-        use std::io::Write;
-        let path = std::env::temp_dir().join(format!(
-            "loki-graph-executor-test-{}.yaml",
-            std::process::id()
-        ));
-        let yaml = r#"
-name: test_graph
-start: only
-nodes:
-  only:
-    type: end
-    output: hello
-"#;
-        std::fs::write(&path, yaml).unwrap();
-
-        let parent = path.parent().unwrap().to_path_buf();
-        let executor = GraphExecutor::from_path(&path, &parent).unwrap();
-        assert_eq!(executor.graph.name, "test_graph");
-        assert_eq!(executor.graph.start, "only");
-
-        let _ = std::fs::remove_file(&path);
     }
 }

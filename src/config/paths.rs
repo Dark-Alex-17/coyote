@@ -3,7 +3,7 @@ use super::{
     AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME,
     ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME, GLOBAL_TOOLS_DIR_NAME,
     GLOBAL_TOOLS_UTILS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, ModelsOverride, RAGS_DIR_NAME,
-    ROLES_DIR_NAME, paths,
+    ROLES_DIR_NAME,
 };
 use crate::client::ProviderModels;
 use crate::utils::{get_env_name, list_file_names, normalize_env_name};

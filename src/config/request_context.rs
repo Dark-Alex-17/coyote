@@ -27,6 +27,7 @@ use crate::utils::{
     list_file_names, now, render_prompt, temp_file,
 };
 
+use crate::graph;
 use anyhow::{Context, Error, Result, bail};
 use indoc::formatdoc;
 use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
@@ -37,7 +38,6 @@ use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remov
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use crate::graph;
 
 pub struct AutoContinueConfig {
     pub enabled: bool,

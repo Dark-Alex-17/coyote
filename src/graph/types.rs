@@ -1,12 +1,9 @@
-//! Core data structures for graph-based agent orchestration.
-
 use anyhow::Result;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// A graph definition loaded from YAML.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Graph {
     pub name: String,
@@ -17,29 +14,21 @@ pub struct Graph {
     #[serde(default = "default_schema_version")]
     pub version: String,
 
-    /// Default chat model for the agent. Used when an `llm` node does not
-    /// set its own `model`. Consulted in single-file mode (an agent with
-    /// a `graph.yaml` and no `config.yaml`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
-    /// Default sampling temperature. Single-file mode only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
 
-    /// Default sampling top-p. Single-file mode only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
 
-    /// Global tools available to the agent's nodes. Single-file mode only.
     #[serde(default)]
     pub global_tools: Vec<String>,
 
-    /// MCP servers available to the agent's nodes. Single-file mode only.
     #[serde(default)]
     pub mcp_servers: Vec<String>,
 
-    /// Suggested prompts surfaced in the UI. Single-file mode only.
     #[serde(default)]
     pub conversation_starters: Vec<String>,
 
@@ -67,9 +56,6 @@ impl Graph {
         self.nodes.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Returns true if any node is an `agent`-type node. Used to derive
-    /// `can_spawn_agents` when synthesizing an agent config from a
-    /// single-file graph.
     pub fn has_agent_node(&self) -> bool {
         self.nodes
             .values()
@@ -81,7 +67,6 @@ fn default_schema_version() -> String {
     super::GRAPH_SCHEMA_VERSION.to_string()
 }
 
-/// Graph-level settings.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GraphSettings {
     #[serde(default = "default_max_loop_iterations")]
@@ -116,12 +101,8 @@ fn default_true() -> bool {
     true
 }
 
-/// A node in the graph. `node_type` is flattened into the YAML, so a node's
-/// variant-specific fields live alongside `id`, `description`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Node {
-    /// Unique node identifier. May be omitted in YAML; the parser fills it
-    /// in from the surrounding `nodes:` map key.
     #[serde(default)]
     pub id: String,
 
@@ -131,15 +112,10 @@ pub struct Node {
     #[serde(flatten)]
     pub node_type: NodeType,
 
-    /// Static next-node routing. Used by agent/input nodes.
-    /// Approval nodes use their `routes` map instead.
-    /// Script nodes: this is populated by `_next` in JSON output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
 }
 
-/// The supported node variants. YAML uses an internal `type` tag in lowercase
-/// (e.g. `type: agent`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum NodeType {
@@ -152,12 +128,6 @@ pub enum NodeType {
     End(EndNode),
 }
 
-/// `agent`-type node: spawn an agent with a templated prompt. The agent
-/// uses the full tool stack from its own directory (`global_tools` and
-/// `mcp_servers` in `config.yaml` plus any per-agent `tools.{sh,py,ts,js}`
-/// script); there is no per-node tool override here. For tool-filtered
-/// one-shot LLM steps, use an `llm`-type node (future). To use different
-/// tool sets via agent variants, see `docs/graph-agents/agent-tools.md`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentNode {
     pub agent: String,
@@ -167,10 +137,6 @@ pub struct AgentNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_updates: Option<HashMap<String, String>>,
 
-    /// JSON Schema describing the expected shape of the agent's final
-    /// output. When set, the agent's raw text is post-processed through
-    /// a built-in structured-output extractor and parsed as JSON. Top-
-    /// level keys of the parsed object are auto-merged into state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<Value>,
 
@@ -178,9 +144,6 @@ pub struct AgentNode {
     pub timeout: Option<u64>,
 }
 
-/// `script`-type node: run a Python/TypeScript/Bash script that prints a
-/// JSON object on stdout. Keys merge into state; the special `_next` key
-/// overrides routing and is not merged.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScriptNode {
     pub script: String,
@@ -188,7 +151,6 @@ pub struct ScriptNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_updates: Option<HashMap<String, String>>,
 
-    /// Fallback node to route to if the script fails to run or returns empty
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
 
@@ -200,8 +162,6 @@ fn default_script_timeout() -> u64 {
     30
 }
 
-/// `approval`-type node: prompt the user with `options` and route based on
-/// their choice via the `routes` map.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApprovalNode {
     pub question: String,
@@ -210,20 +170,12 @@ pub struct ApprovalNode {
 
     pub routes: HashMap<String, String>,
 
-    /// REQUIRED. The user_ask tool always permits a free-form "type your
-    /// own answer" response in addition to the listed `options`. When the
-    /// user supplies any answer that does NOT match a key in `routes`,
-    /// execution routes to this node. The free-form text is available to
-    /// downstream nodes via `state_updates` (e.g. `clarification: "{{choice}}"`).
     pub on_other: String,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_updates: Option<HashMap<String, String>>,
 }
 
-/// `input`-type node: collect free-form text from the user. Routes via the
-/// top-level `next` field; the user's text is exposed to templates as
-/// `{{input}}` in `state_updates`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InputNode {
     pub question: String,
@@ -238,36 +190,13 @@ pub struct InputNode {
     pub state_updates: Option<HashMap<String, String>>,
 }
 
-/// `llm`-type node: a one-shot LLM call (with bounded tool-call loop)
-/// against a caller-supplied system prompt + user prompt. Unlike
-/// `agent`-type nodes, this does NOT spawn a sub-agent; it runs in a
-/// fresh isolated context. Tool access is opt-in via the `tools`
-/// whitelist (no tools when unset).
-///
-/// Routing (tolerant-fail):
-///   - success                 → `Node.next`
-///   - failure WITH fallback   → `fallback`
-///   - failure WITHOUT fallback → `Node.next`
-///
-/// `state_updates` are always applied. `{{output}}` resolves to the
-/// LLM's response on success, or to an error description on failure.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LlmNode {
-    /// User-turn prompt. Templated against state. REQUIRED.
     pub prompt: String,
 
-    /// Optional system prompt. When set, the LLM call uses an inline
-    /// Role with `instructions` as `Role.prompt`. Templated against
-    /// state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
 
-    /// Whitelist narrowing the active agent's tool universe.
-    /// Each entry is either an exact function name (`global_tools`
-    /// entry or `tools.{sh,py,ts}` subcommand) or the shorthand
-    /// `mcp:<server>` (where `<server>` must be in the agent's
-    /// `mcp_servers`). Unset or `[]` = no tools — tools are strictly
-    /// opt-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
 
@@ -283,21 +212,15 @@ pub struct LlmNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
 
-    /// Number of attempts on transient errors. Default 1 = no retries.
     #[serde(default = "default_llm_max_attempts")]
     pub max_attempts: u32,
 
-    /// Hard cap on tool-call-loop turns within a single attempt.
     #[serde(default = "default_llm_max_iterations")]
     pub max_iterations: u32,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_updates: Option<HashMap<String, String>>,
 
-    /// JSON Schema (as parsed JSON) describing the expected shape of the
-    /// node's output. When set, the raw LLM response is post-processed
-    /// through a built-in structured-output extractor and parsed as JSON.
-    /// Top-level keys of the parsed object are auto-merged into state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<Value>,
 
@@ -313,47 +236,28 @@ fn default_llm_max_iterations() -> u32 {
     10
 }
 
-/// `rag`-type node: run a hybrid (vector + keyword) retrieval against a
-/// per-node knowledge base and write the result into state. The retrieved
-/// context and the list of source paths are exposed to `state_updates` via
-/// `{{output.context}}` and `{{output.sources}}` (the whole result is
-/// `{{output}}`, a JSON object). The knowledge base is built once at agent
-/// load time into `<agent>/<node-id>.yaml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RagNode {
-    /// Knowledge sources (files, directories, URLs, loader-protocol paths).
-    /// REQUIRED — this is what makes the node a RAG node.
     pub documents: Vec<String>,
 
-    /// Retrieval query, templated against state. Defaults to
-    /// `{{initial_prompt}}` when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
 
-    /// Number of chunks to retrieve. Defaults to the knowledge base's own
-    /// configured `top_k` when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<usize>,
 
-    /// Embedding model for building the knowledge base. When this plus
-    /// `chunk_size` and `chunk_overlap` are all set, knowledge-base
-    /// construction runs non-interactively (no prompts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
 
-    /// Chunk size for splitting documents at build time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_size: Option<usize>,
 
-    /// Chunk overlap for splitting documents at build time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_overlap: Option<usize>,
 
-    /// Reranker model applied to hybrid-search results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reranker_model: Option<String>,
 
-    /// Embedding-request batch size at build time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_size: Option<usize>,
 
@@ -364,8 +268,6 @@ pub struct RagNode {
     pub timeout: Option<u64>,
 }
 
-/// `end`-type node: terminate execution; `output` (templated) is returned
-/// as the graph's final result.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EndNode {
     #[serde(default)]
@@ -375,7 +277,6 @@ pub struct EndNode {
     pub state_updates: Option<HashMap<String, String>>,
 }
 
-/// Runtime state for a graph execution: KV store plus visit history.
 #[derive(Debug, Clone, Default)]
 pub struct GraphState {
     data: HashMap<String, Value>,
@@ -400,7 +301,6 @@ impl GraphState {
         self.data.insert(key, value);
     }
 
-    /// Merge a JSON object into state. Existing keys are overwritten.
     pub fn merge(&mut self, json_obj: &serde_json::Map<String, Value>) {
         for (key, value) in json_obj {
             self.data.insert(key.clone(), value.clone());
@@ -411,8 +311,6 @@ impl GraphState {
         &self.data
     }
 
-    /// Record that a node has been entered. Updates both history and loop
-    /// counts.
     pub fn visit_node(&mut self, node_id: &str) {
         self.history.push(node_id.to_string());
         *self.loop_counts.entry(node_id.to_string()).or_insert(0) += 1;
@@ -422,10 +320,7 @@ impl GraphState {
         self.loop_counts.get(node_id).copied().unwrap_or(0)
     }
 
-    pub fn history(&self) -> &[String] {
-        &self.history
-    }
-
+    #[cfg(test)]
     pub fn current_node(&self) -> Option<&str> {
         self.history.last().map(|s| s.as_str())
     }
@@ -667,7 +562,7 @@ on_other: edit_loop
         assert_eq!(state.loop_count("node1"), 2);
         assert_eq!(state.loop_count("node2"), 1);
         assert_eq!(state.loop_count("never"), 0);
-        assert_eq!(state.history().len(), 3);
+        assert_eq!(state.history.len(), 3);
         assert_eq!(state.current_node(), Some("node1"));
     }
 
@@ -707,7 +602,7 @@ on_other: edit_loop
         initial.insert("user".to_string(), json!("alice"));
         let state = GraphState::new(initial);
         assert_eq!(state.get("user"), Some(&json!("alice")));
-        assert!(state.history().is_empty());
+        assert!(state.history.is_empty());
     }
 
     #[test]

@@ -782,9 +782,6 @@ pub struct AgentVariable {
     pub value: String,
 }
 
-/// Resolve document path specs (URLs, loader-protocol paths, relative or
-/// absolute file paths) into the concrete paths `Rag::init` expects.
-/// Relative paths are joined against the agent's data directory.
 fn resolve_document_paths(
     documents: &[String],
     loaders: &HashMap<String, String>,
@@ -817,10 +814,6 @@ fn resolve_document_paths(
     Ok(document_paths)
 }
 
-/// Build or load a knowledge base for every `rag` node in the graph. Each
-/// node's RAG lives in `<agent>/<node-id>.yaml`. A missing knowledge base is
-/// a hard error (interactive: after a declined confirm; non-interactive:
-/// immediately) — a graph with an uninitialized `rag` node cannot run.
 #[allow(clippy::too_many_arguments)]
 async fn init_graph_rags(
     app: &AppConfig,
@@ -876,11 +869,13 @@ async fn init_graph_rags(
                          on the node, or run the agent once interactively."
                     );
                 }
+
                 let ans = Confirm::new(&format!(
                     "Initialize RAG knowledge base for rag node '{node_id}'?"
                 ))
                 .with_default(true)
                 .prompt()?;
+
                 if !ans {
                     bail!(
                         "Agent '{agent_name}' has rag node '{node_id}' but its RAG was not \
@@ -888,6 +883,7 @@ async fn init_graph_rags(
                     );
                 }
             }
+
             let document_paths =
                 resolve_document_paths(&rag_node.documents, loaders, agent_data_dir)?;
             let app_clone = app.clone();
@@ -1043,34 +1039,31 @@ variables:
 
     #[test]
     fn from_graph_maps_agent_level_fields() {
-        let yaml = r#"
-name: graph_name_ignored
-description: A graph agent
-model: anthropic:claude-sonnet-4-6
-temperature: 0.3
-top_p: 0.8
-global_tools:
-  - fetch_pdf.sh
-mcp_servers:
-  - pubmed-search
-conversation_starters:
-  - "Start here"
-start: e
-nodes:
-  e:
-    id: e
-    type: end
-    output: done
-"#;
-        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let yaml = formatdoc! {r#"
+            name: graph_name_ignored
+            description: A graph agent
+            model: claude:claude-sonnet-4-6
+            temperature: 0.3
+            top_p: 0.8
+            global_tools:
+              - fetch_pdf.sh
+            mcp_servers:
+              - pubmed-search
+            conversation_starters:
+              - "Start here"
+            start: e
+            nodes:
+              e:
+                id: e
+                type: end
+                output: done
+            "#};
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
         let config = AgentConfig::from_graph("my-agent-dir", &graph);
 
         assert_eq!(config.name, "my-agent-dir");
         assert_eq!(config.description, "A graph agent");
-        assert_eq!(
-            config.model_id.as_deref(),
-            Some("anthropic:claude-sonnet-4-6")
-        );
+        assert_eq!(config.model_id.as_deref(), Some("claude:claude-sonnet-4-6"));
         assert_eq!(config.temperature, Some(0.3));
         assert_eq!(config.top_p, Some(0.8));
         assert_eq!(config.global_tools, vec!["fetch_pdf.sh"]);
@@ -1080,22 +1073,22 @@ nodes:
 
     #[test]
     fn from_graph_derives_can_spawn_agents_from_agent_nodes() {
-        let with_agent = r#"
-name: g
-start: a
-nodes:
-  a:
-    id: a
-    type: agent
-    agent: helper
-    prompt: hi
-    next: e
-  e:
-    id: e
-    type: end
-    output: done
-"#;
-        let graph: Graph = serde_yaml::from_str(with_agent).unwrap();
+        let with_agent = formatdoc! {r#"
+            name: g
+            start: a
+            nodes:
+              a:
+                id: a
+                type: agent
+                agent: helper
+                prompt: hi
+                next: e
+              e:
+                id: e
+                type: end
+                output: done
+            "#};
+        let graph: Graph = serde_yaml::from_str(&with_agent).unwrap();
         assert!(AgentConfig::from_graph("d", &graph).can_spawn_agents);
 
         let no_agent =
@@ -1110,7 +1103,6 @@ nodes:
         let graph: Graph = serde_yaml::from_str(yaml).unwrap();
         let config = AgentConfig::from_graph("d", &graph);
 
-        // LLM-loop concepts a graph agent does not have: left at Default.
         assert!(!config.auto_continue);
         assert!(config.instructions.is_empty());
         assert!(config.documents.is_empty());
@@ -1119,7 +1111,6 @@ nodes:
         assert_eq!(config.max_auto_continues, 0);
         assert_eq!(config.summarization_threshold, 0);
 
-        // Consumed by graph execution: kept at their real defaults.
         assert_eq!(
             config.max_concurrent_agents,
             default_max_concurrent_agents()
