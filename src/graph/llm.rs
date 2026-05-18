@@ -468,6 +468,33 @@ mod tests {
         assert!(state.state().get(OUTPUT_KEY).is_none());
     }
 
+    #[test]
+    fn next_for_llm_node_success_routes_to_next() {
+        assert_eq!(
+            next_for_llm_node(Some("nx"), false, Some("fb")).unwrap(),
+            "nx"
+        );
+    }
+
+    #[test]
+    fn next_for_llm_node_failure_with_fallback_routes_to_fallback() {
+        assert_eq!(
+            next_for_llm_node(Some("nx"), true, Some("fb")).unwrap(),
+            "fb"
+        );
+    }
+
+    #[test]
+    fn next_for_llm_node_failure_without_fallback_routes_to_next() {
+        assert_eq!(next_for_llm_node(Some("nx"), true, None).unwrap(), "nx");
+    }
+
+    #[test]
+    fn next_for_llm_node_errors_without_next_or_fallback() {
+        assert!(next_for_llm_node(None, false, None).is_err());
+        assert!(next_for_llm_node(None, true, None).is_err());
+    }
+
     fn node_with_schema(updates: Option<HashMap<String, String>>, schema: Value) -> LlmNode {
         let mut n = node_with(updates);
         n.output_schema = Some(schema);

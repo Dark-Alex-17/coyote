@@ -1430,6 +1430,23 @@ mod tests {
     }
 
     #[test]
+    fn direct_invoker_maps_each_language() {
+        assert_eq!(
+            Language::Bash.direct_invoker(),
+            Some(("bash", &[] as &[&str]))
+        );
+        assert_eq!(
+            Language::Python.direct_invoker(),
+            Some(("python3", &[] as &[&str]))
+        );
+        assert_eq!(
+            Language::TypeScript.direct_invoker(),
+            Some(("npx", &["tsx"] as &[&str]))
+        );
+        assert_eq!(Language::Unsupported.direct_invoker(), None);
+    }
+
+    #[test]
     fn toolcall_with_thought_signature() {
         let tc = ToolCall::new("t".into(), json!({}), None)
             .with_thought_signature(Some("sig123".into()));
