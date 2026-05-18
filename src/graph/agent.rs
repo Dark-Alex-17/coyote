@@ -1,10 +1,3 @@
-//! Execution of `agent`-type graph nodes.
-//!
-//! Spawns a child agent via `function::supervisor::run_agent_for_graph`,
-//! interpolating the prompt against current graph state. After the agent
-//! finishes, applies the node's `state_updates` (templates can reference
-//! `{{output}}` for the agent's stdout).
-
 use super::state::StateManager;
 use super::structured;
 use super::types::AgentNode;
@@ -22,8 +15,6 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 pub struct AgentNodeExecutor;
 
 impl AgentNodeExecutor {
-    /// Interpolate the node's prompt, spawn the agent, wait for it to
-    /// finish, then apply `state_updates`. Returns the agent's full output.
     pub async fn execute(
         node: &AgentNode,
         state_manager: &mut StateManager,
@@ -90,14 +81,6 @@ fn indent_prompt(prompt: &str, prefix_spaces: usize) -> Vec<String> {
     out
 }
 
-/// Exposes the agent's output as `{{output}}` for template evaluation, then
-/// applies every key/template in `state_updates`. The temporary `output`
-/// state key is removed at the end so it doesn't leak into subsequent
-/// nodes' templates.
-///
-/// When `node.output_schema` is set AND the output is a JSON object, its
-/// top-level keys are also auto-merged into state permanently (before
-/// state_updates evaluation, so explicit state_updates can override).
 fn apply_state_updates(node: &AgentNode, state_manager: &mut StateManager, output: &Value) {
     if node.output_schema.is_some()
         && let Some(obj) = output.as_object()
@@ -165,7 +148,9 @@ mod tests {
             node_with("hi", Some(u))
         };
         let mut state = manager_with(&[]);
+
         apply_state_updates(&node, &mut state, &json!("agent finished its work"));
+
         assert_eq!(
             state.state().get("findings"),
             Some(&json!("agent finished its work"))
@@ -180,7 +165,9 @@ mod tests {
             node_with("hi", Some(u))
         };
         let mut state = manager_with(&[("topic", json!("auth"))]);
+
         apply_state_updates(&node, &mut state, &json!("JWT vs sessions"));
+
         assert_eq!(
             state.state().get("summary"),
             Some(&json!("auth: JWT vs sessions"))
@@ -195,7 +182,9 @@ mod tests {
             node_with("hi", Some(u))
         };
         let mut state = manager_with(&[]);
+
         apply_state_updates(&node, &mut state, &json!("anything"));
+
         assert_eq!(state.state().get("output"), Some(&Value::Null));
     }
 
@@ -207,7 +196,9 @@ mod tests {
             node_with("hi", Some(u))
         };
         let mut state = manager_with(&[("output", json!("preserved"))]);
+
         apply_state_updates(&node, &mut state, &json!("new agent output"));
+
         assert_eq!(
             state.state().get("greeting"),
             Some(&json!("new agent output"))
@@ -219,7 +210,9 @@ mod tests {
     fn no_state_updates_is_a_noop() {
         let node = node_with("hi", None);
         let mut state = manager_with(&[("k", json!("v"))]);
+
         apply_state_updates(&node, &mut state, &json!("ignored"));
+
         assert_eq!(state.state().get("k"), Some(&json!("v")));
         assert!(state.state().get("output").is_none());
     }
@@ -232,7 +225,9 @@ mod tests {
             node_with("hi", Some(u))
         };
         let mut state = manager_with(&[]);
+
         apply_state_updates(&node, &mut state, &json!("DATA"));
+
         assert_eq!(state.state().get("decorated"), Some(&json!("[] DATA")));
     }
 
@@ -251,7 +246,9 @@ mod tests {
         let node = node_with_schema("hi", None, json!({"type": "object"}));
         let mut state = manager_with(&[]);
         let output = json!({"goal": "do X", "summary": "details"});
+
         apply_state_updates(&node, &mut state, &output);
+
         assert_eq!(state.state().get("goal"), Some(&json!("do X")));
         assert_eq!(state.state().get("summary"), Some(&json!("details")));
     }
@@ -265,7 +262,9 @@ mod tests {
             "config": { "key": "value" },
             "count": 42
         });
+
         apply_state_updates(&node, &mut state, &output);
+
         assert_eq!(state.state().get("tags"), Some(&json!(["a", "b"])));
         assert_eq!(state.state().get("config"), Some(&json!({"key": "value"})));
         assert_eq!(state.state().get("count"), Some(&json!(42)));
@@ -278,7 +277,9 @@ mod tests {
         let node = node_with_schema("hi", Some(u), json!({"type": "object"}));
         let mut state = manager_with(&[]);
         let output = json!({"goal": "do X"});
+
         apply_state_updates(&node, &mut state, &output);
+
         assert_eq!(state.state().get("goal"), Some(&json!("renamed-do X")));
     }
 
@@ -287,7 +288,9 @@ mod tests {
         let node = node_with("hi", None);
         let mut state = manager_with(&[]);
         let output = json!({"goal": "do X"});
+
         apply_state_updates(&node, &mut state, &output);
+
         assert!(state.state().get("goal").is_none());
     }
 }

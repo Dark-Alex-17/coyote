@@ -22,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
 use indoc::indoc;
+use log::warn;
 use parking_lot::RwLock;
 use reedline::CursorConfig;
 use reedline::{
@@ -32,7 +33,6 @@ use reedline::{
 use reedline::{MenuBuilder, Signal};
 use std::sync::LazyLock;
 use std::{env, process, sync::Arc};
-use log::warn;
 
 const MENU_NAME: &str = "completion_menu";
 

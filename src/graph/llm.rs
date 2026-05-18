@@ -1,14 +1,8 @@
-//! Execution of `llm`-type graph nodes — one-shot LLM calls with a
-//! bounded tool-call loop, an opt-in tool whitelist (delegated to
-//! `Role.enabled_tools` / `Role.enabled_mcp_servers`), and per-node
-//! overrides for model/temperature/top_p. See
-//! `docs/implementation/graph-agents/10.5-llm-nodes.md` for the design.
-
 use super::state::StateManager;
 use super::structured;
 use super::types::LlmNode;
 use crate::client::{Model, ModelType, call_chat_completions};
-use crate::config::{RequestContext, Role, RoleLike};
+use crate::config::{Input, RequestContext, Role, RoleLike};
 use crate::utils::{create_abort_signal, dimmed_text};
 use anyhow::{Context, Error, Result, anyhow, bail};
 use serde_json::Value;
@@ -22,12 +16,6 @@ const OUTPUT_KEY: &str = "output";
 pub struct LlmNodeExecutor;
 
 impl LlmNodeExecutor {
-    /// Run the LLM call and resolve routing. Returns the next node ID
-    /// to visit. Handles the tolerant-fail contract internally:
-    /// success → `node_next`; failure with `fallback` → `fallback`;
-    /// failure without `fallback` → `node_next`. State updates are
-    /// applied in both success and failure paths, with `{{output}}`
-    /// resolving to the LLM's response or an error description.
     pub async fn execute(
         node: &LlmNode,
         node_next: Option<&str>,
@@ -54,6 +42,7 @@ impl LlmNodeExecutor {
                 (Value::String(format!("LLM node failed: {e}")), true)
             }
         };
+
         apply_state_updates_with_output(node, state_manager, &output);
         next_for_llm_node(node_next, failed, node.fallback.as_deref())
     }
@@ -151,7 +140,7 @@ async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -
     let abort = create_abort_signal();
     let app_cfg = Arc::clone(&ctx.app.config);
     let role_for_input = ctx.role.clone();
-    let mut input = crate::config::Input::from_str(ctx, prompt, role_for_input);
+    let mut input = Input::from_str(ctx, prompt, role_for_input);
     let mut accumulated = String::new();
 
     for turn in 0..node.max_iterations {
@@ -299,9 +288,6 @@ fn validate_tools_subset(
     Ok(())
 }
 
-/// Loose substring match against the transient error messages we expect
-/// from network/API failures or empty-output cases. Brittle by nature;
-/// a typed error enum would be better long-term.
 fn is_transient(err: &Error) -> bool {
     let s = format!("{err:#}");
     s.contains("timed out")
@@ -322,17 +308,9 @@ fn next_for_llm_node(
     }
     node_next
         .map(String::from)
-        .ok_or_else(|| anyhow::anyhow!("llm node has no `next` set; llm nodes need static routing"))
+        .ok_or_else(|| anyhow!("llm node has no `next` set; llm nodes need static routing"))
 }
 
-/// Expose the LLM call's final output as `{{output}}` for the duration
-/// of `state_updates` evaluation, then restore the prior value (or set
-/// it to `Null` if there wasn't one). Same pattern as
-/// `AgentNodeExecutor`'s `{{output}}` scoping.
-///
-/// When `node.output_schema` is set AND the output is a JSON object, its
-/// top-level keys are also auto-merged into state permanently (before
-/// state_updates evaluation, so explicit state_updates can override).
 fn apply_state_updates_with_output(
     node: &LlmNode,
     state_manager: &mut StateManager,
@@ -424,7 +402,9 @@ mod tests {
         u.insert("response".into(), "{{output}}".into());
         let node = node_with(Some(u));
         let mut state = manager_with(&[]);
+
         apply_state_updates_with_output(&node, &mut state, &json!("the answer"));
+
         assert_eq!(state.state().get("response"), Some(&json!("the answer")));
     }
 
@@ -434,7 +414,9 @@ mod tests {
         u.insert("summary".into(), "{{topic}}: {{output}}".into());
         let node = node_with(Some(u));
         let mut state = manager_with(&[("topic", json!("LOINC"))]);
+
         apply_state_updates_with_output(&node, &mut state, &json!("abc"));
+
         assert_eq!(state.state().get("summary"), Some(&json!("LOINC: abc")));
     }
 
@@ -444,7 +426,9 @@ mod tests {
         u.insert("k".into(), "{{output}}".into());
         let node = node_with(Some(u));
         let mut state = manager_with(&[]);
+
         apply_state_updates_with_output(&node, &mut state, &json!("anything"));
+
         assert_eq!(state.state().get(OUTPUT_KEY), Some(&json!(null)));
     }
 
@@ -454,7 +438,9 @@ mod tests {
         u.insert("greeting".into(), "{{output}}".into());
         let node = node_with(Some(u));
         let mut state = manager_with(&[("output", json!("preserved"))]);
+
         apply_state_updates_with_output(&node, &mut state, &json!("new"));
+
         assert_eq!(state.state().get("greeting"), Some(&json!("new")));
         assert_eq!(state.state().get(OUTPUT_KEY), Some(&json!("preserved")));
     }
@@ -463,7 +449,9 @@ mod tests {
     fn no_state_updates_is_a_noop() {
         let node = node_with(None);
         let mut state = manager_with(&[("k", json!("v"))]);
+
         apply_state_updates_with_output(&node, &mut state, &json!("x"));
+
         assert_eq!(state.state().get("k"), Some(&json!("v")));
         assert!(state.state().get(OUTPUT_KEY).is_none());
     }
@@ -506,7 +494,9 @@ mod tests {
         let node = node_with_schema(None, json!({"type": "object"}));
         let mut state = manager_with(&[]);
         let output = json!({"goal": "do X", "summary": "details"});
+
         apply_state_updates_with_output(&node, &mut state, &output);
+
         assert_eq!(state.state().get("goal"), Some(&json!("do X")));
         assert_eq!(state.state().get("summary"), Some(&json!("details")));
     }
@@ -520,7 +510,9 @@ mod tests {
             "config": { "key": "value" },
             "count": 42
         });
+
         apply_state_updates_with_output(&node, &mut state, &output);
+
         assert_eq!(state.state().get("tags"), Some(&json!(["a", "b"])));
         assert_eq!(state.state().get("config"), Some(&json!({"key": "value"})));
         assert_eq!(state.state().get("count"), Some(&json!(42)));
@@ -533,7 +525,9 @@ mod tests {
         let node = node_with_schema(Some(u), json!({"type": "object"}));
         let mut state = manager_with(&[]);
         let output = json!({"goal": "do X"});
+
         apply_state_updates_with_output(&node, &mut state, &output);
+
         assert_eq!(state.state().get("goal"), Some(&json!("renamed-do X")));
     }
 
@@ -542,7 +536,9 @@ mod tests {
         let node = node_with_schema(None, json!({"type": "array"}));
         let mut state = manager_with(&[]);
         let output = json!([1, 2, 3]);
+
         apply_state_updates_with_output(&node, &mut state, &output);
+
         assert!(state.state().get("0").is_none());
         assert!(state.state().get(OUTPUT_KEY).is_none());
     }
@@ -552,14 +548,18 @@ mod tests {
         let node = node_with(None);
         let mut state = manager_with(&[]);
         let output = json!({"goal": "do X"});
+
         apply_state_updates_with_output(&node, &mut state, &output);
+
         assert!(state.state().get("goal").is_none());
     }
 
     #[test]
     fn format_schema_hint_includes_schema_and_instruction() {
         let schema = json!({"type": "object", "properties": {"goal": {"type": "string"}}});
+
         let hint = format_schema_hint(&schema);
+
         assert!(hint.contains("Schema:"));
         assert!(hint.contains("\"goal\""));
         assert!(hint.contains("JSON"));
@@ -582,7 +582,9 @@ mod tests {
             "web_search_loki".to_string(),
             "mcp:github".to_string(),
         ];
+
         let (regular, mcp) = categorize_tools(Some(&entries));
+
         assert_eq!(regular, vec!["read_query", "web_search_loki"]);
         assert_eq!(mcp, vec!["pubmed-search", "github"]);
     }
@@ -590,6 +592,7 @@ mod tests {
     #[test]
     fn categorize_tools_with_none_returns_empty() {
         let (regular, mcp) = categorize_tools(None);
+
         assert!(regular.is_empty());
         assert!(mcp.is_empty());
     }
@@ -597,6 +600,7 @@ mod tests {
     #[test]
     fn categorize_tools_with_empty_returns_empty() {
         let (regular, mcp) = categorize_tools(Some(&[]));
+
         assert!(regular.is_empty());
         assert!(mcp.is_empty());
     }

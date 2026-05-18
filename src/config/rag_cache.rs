@@ -9,12 +9,7 @@ use std::sync::{Arc, Weak};
 pub enum RagKey {
     Named(String),
     Agent(String),
-    /// A `rag` node's per-node knowledge base, keyed by owning agent name
-    /// and node id.
-    GraphNode {
-        agent: String,
-        node: String,
-    },
+    GraphNode { agent: String, node: String },
 }
 
 #[derive(Default)]

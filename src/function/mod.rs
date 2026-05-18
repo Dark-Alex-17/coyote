@@ -50,9 +50,6 @@ enum BinaryType<'a> {
     Agent,
 }
 
-/// Canonical set of script languages that Loki can execute. This is the
-/// single source of truth for both function-tool scripts and graph script
-/// nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr)]
 pub enum Language {
     Bash,

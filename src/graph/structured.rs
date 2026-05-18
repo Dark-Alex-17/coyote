@@ -1,12 +1,3 @@
-//! Structured-output extraction for `llm` and `agent` nodes. Takes the
-//! raw final text of a node and a user-supplied JSON Schema, and returns
-//! a parsed [`serde_json::Value`] conforming to that schema (best-effort).
-//!
-//! Strategy: try to parse `raw` directly first (with light cleanup of
-//! markdown fences), and only invoke a follow-up LLM call against the
-//! built-in `structured-output` role if direct parsing fails. On
-//! extractor-output parse failure, perform one repair retry.
-
 use crate::client::call_chat_completions;
 use crate::config::{Input, RequestContext, Role, RoleLike};
 use crate::utils::{create_abort_signal, dimmed_text};
@@ -67,6 +58,7 @@ async fn extract_via_extractor(
                 "{}",
                 dimmed_text("▸   structured-output: extractor returned invalid JSON, retrying")
             );
+
             Box::pin(extract_via_extractor(&output, schema, parent_ctx, true)).await
         }
     }
@@ -101,11 +93,13 @@ async fn run_one_shot(prompt: &str, ctx: &mut RequestContext) -> Result<String> 
     let (output, tool_results) =
         call_chat_completions(&input, false, false, client.as_ref(), ctx, abort).await?;
     ctx.after_chat_completion(app_cfg.as_ref(), &input, &output, &tool_results)?;
+
     Ok(output)
 }
 
 fn try_parse_json(raw: &str) -> Option<Value> {
     let cleaned = strip_code_fences(raw.trim());
+
     serde_json::from_str(cleaned).ok()
 }
 
@@ -129,26 +123,32 @@ mod tests {
     #[test]
     fn try_parse_json_accepts_plain_object() {
         let v = try_parse_json(r#"{"a": 1}"#).unwrap();
+
         assert_eq!(v, json!({"a": 1}));
     }
 
     #[test]
     fn try_parse_json_strips_json_fences() {
         let raw = "```json\n{\"a\": 1}\n```";
+
         let v = try_parse_json(raw).unwrap();
+
         assert_eq!(v, json!({"a": 1}));
     }
 
     #[test]
     fn try_parse_json_strips_bare_fences() {
         let raw = "```\n{\"a\": 1}\n```";
+
         let v = try_parse_json(raw).unwrap();
+
         assert_eq!(v, json!({"a": 1}));
     }
 
     #[test]
     fn try_parse_json_tolerates_whitespace() {
         let v = try_parse_json("   \n  {\"x\": true}\n\n").unwrap();
+
         assert_eq!(v, json!({"x": true}));
     }
 
@@ -165,13 +165,16 @@ mod tests {
     #[test]
     fn try_parse_json_accepts_arrays() {
         let v = try_parse_json("[1, 2, 3]").unwrap();
+
         assert_eq!(v, json!([1, 2, 3]));
     }
 
     #[test]
     fn build_extractor_prompt_includes_schema_and_input() {
         let schema = json!({"type": "object"});
+
         let prompt = build_extractor_prompt("hello", &schema, false);
+
         assert!(prompt.contains("Schema:"));
         assert!(prompt.contains("Input:"));
         assert!(prompt.contains("hello"));
@@ -180,7 +183,9 @@ mod tests {
     #[test]
     fn build_extractor_prompt_repair_includes_repair_instruction() {
         let schema = json!({"type": "object"});
+
         let prompt = build_extractor_prompt("oops", &schema, true);
+
         assert!(prompt.contains("previous response"));
         assert!(prompt.contains("oops"));
     }
@@ -188,6 +193,7 @@ mod tests {
     #[test]
     fn build_extractor_role_disables_tools_and_mcp() {
         let role = build_extractor_role().expect("builtin role must exist");
+
         assert_eq!(role.enabled_tools().as_deref(), Some(""));
         assert_eq!(role.enabled_mcp_servers().as_deref(), Some(""));
     }

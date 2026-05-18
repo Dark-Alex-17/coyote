@@ -1,14 +1,3 @@
-//! Structured logging and per-node timing for graph execution.
-//!
-//! Two output channels, both owned by [`GraphLogger`]:
-//! - **`tracing`** (`info!`/`debug!`/`warn!`/`error!`) — respects
-//!   `RUST_LOG`; this is the developer-facing channel.
-//! - **stderr narration** — the dimmed `▸` lines the user follows along
-//!   with during execution.
-//!
-//! The logger also accumulates per-node wall-clock timings and emits a
-//! performance summary (slowest-first) when the graph completes.
-
 use super::state::StateManager;
 use super::types::{Node, NodeType};
 use crate::utils::dimmed_text;
@@ -107,10 +96,6 @@ impl GraphLogger {
         }
     }
 
-    /// Log a state snapshot before a node runs. No-op unless the graph's
-    /// `log_state_snapshots` setting is enabled. Keys + byte size go to
-    /// `debug`; the full state goes to `trace` (it may contain secrets,
-    /// so it is never logged at a more visible level).
     pub fn state_snapshot(&self, node_id: &str, state: &StateManager) {
         if !self.log_state_snapshots {
             return;
@@ -118,6 +103,7 @@ impl GraphLogger {
         let snapshot = state.snapshot();
         let mut keys: Vec<&str> = snapshot.keys().map(String::as_str).collect();
         keys.sort_unstable();
+
         debug!(
             "[graph:{}] [{node_id}] state: {} bytes, keys={:?}",
             self.graph_name,
@@ -136,10 +122,12 @@ impl GraphLogger {
         }
         let mut rows: Vec<(&String, &NodeTiming)> = self.timings.iter().collect();
         rows.sort_by_key(|b| Reverse(b.1.total));
+
         info!(
             "[graph:{}] performance summary (slowest first):",
             self.graph_name
         );
+
         for (node_id, t) in rows {
             let avg = t.total / t.count.max(1) as u32;
             info!(
@@ -190,9 +178,11 @@ mod tests {
     #[test]
     fn node_timing_max_tracks_largest() {
         let mut t = NodeTiming::default();
+
         t.record(Duration::from_millis(10));
         t.record(Duration::from_millis(80));
         t.record(Duration::from_millis(40));
+
         assert_eq!(t.max, Duration::from_millis(80));
         assert_eq!(t.count, 3);
         assert_eq!(t.total, Duration::from_millis(130));
@@ -201,6 +191,7 @@ mod tests {
     #[test]
     fn new_logger_has_no_timings() {
         let logger = GraphLogger::new("g", true);
+
         assert!(logger.timings.is_empty());
         assert!(logger.log_state_snapshots);
     }

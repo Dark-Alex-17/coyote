@@ -1,11 +1,3 @@
-//! Execution of `rag`-type graph nodes.
-//!
-//! A `rag` node runs a hybrid (vector + keyword) retrieval against the
-//! per-node knowledge base built at agent-load time, and writes the result
-//! into graph state. The result is exposed to `state_updates` as
-//! `{{output}}` — a JSON object `{ context, sources }` where `sources` is
-//! an array of source paths.
-
 use super::state::StateManager;
 use super::types::RagNode;
 use crate::config::RequestContext;
@@ -22,9 +14,6 @@ const DEFAULT_RAG_TIMEOUT_SECS: u64 = 120;
 pub struct RagNodeExecutor;
 
 impl RagNodeExecutor {
-    /// Interpolate the node's query, run the retrieval against this node's
-    /// knowledge base, expose the result as `{{output}}` for `state_updates`,
-    /// and return `node_next`.
     pub async fn execute(
         node: &RagNode,
         node_id: &str,
@@ -74,8 +63,6 @@ impl RagNodeExecutor {
 }
 
 /// Assemble the `{{output}}` value as `{ "context": <ctx>, "sources": [...] }`.
-/// `Rag::search` returns sources as a `- {path}` bullet list; it is split
-/// into a JSON array so downstream templates can index `{{output.sources[0]}}`.
 fn build_rag_output(context: String, sources_str: &str) -> Value {
     let sources: Vec<Value> = sources_str
         .lines()
@@ -84,14 +71,13 @@ fn build_rag_output(context: String, sources_str: &str) -> Value {
         .map(|s| Value::String(s.to_string()))
         .collect();
     let mut obj = Map::new();
+
     obj.insert("context".into(), Value::String(context));
     obj.insert("sources".into(), Value::Array(sources));
+
     Value::Object(obj)
 }
 
-/// Expose the retrieval result as `{{output}}` for the duration of
-/// `state_updates` evaluation, then restore the prior value. Same scoping
-/// pattern as `llm`/`agent` nodes.
 fn apply_state_updates(node: &RagNode, state_manager: &mut StateManager, output: &Value) {
     let Some(updates) = &node.state_updates else {
         return;
@@ -124,6 +110,7 @@ mod tests {
     #[test]
     fn build_rag_output_splits_bullet_sources_into_array() {
         let out = build_rag_output("ctx".into(), "- a.md\n- https://x.com/spec");
+
         assert_eq!(out["context"], json!("ctx"));
         assert_eq!(out["sources"], json!(["a.md", "https://x.com/spec"]));
     }
@@ -131,18 +118,21 @@ mod tests {
     #[test]
     fn build_rag_output_handles_empty_sources() {
         let out = build_rag_output("ctx".into(), "");
+
         assert_eq!(out["sources"], json!([]));
     }
 
     #[test]
     fn build_rag_output_ignores_blank_lines() {
         let out = build_rag_output("c".into(), "- a\n\n- b\n");
+
         assert_eq!(out["sources"], json!(["a", "b"]));
     }
 
     #[test]
     fn build_rag_output_tolerates_unprefixed_lines() {
         let out = build_rag_output("c".into(), "plain/path");
+
         assert_eq!(out["sources"], json!(["plain/path"]));
     }
 }
