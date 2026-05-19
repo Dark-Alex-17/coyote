@@ -553,8 +553,7 @@ pub async fn run_repl_command(
                     bail!("Cannot perform this operation because you are in a macro")
                 }
                 let version = args.map(|s| s.trim().to_string());
-                task::spawn_blocking(move || config::run_self_update(version, false))
-                    .await??;
+                task::spawn_blocking(move || config::run_self_update(version, false)).await??;
             }
             ".rag" => {
                 ctx.use_rag(args, abort_signal.clone()).await?;
