@@ -4,7 +4,7 @@ use crate::utils::AbortSignal;
 use anyhow::{Context, Result, anyhow, bail};
 use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
-use reqwest::{header, RequestBuilder};
+use reqwest::{RequestBuilder, header};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 

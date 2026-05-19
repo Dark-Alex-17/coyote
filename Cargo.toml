@@ -96,6 +96,14 @@ clap_complete_nushell = "4.5.9"
 open = "5"
 rand = { version = "0.10.0", features = ["default"] }
 url = "2.5.8"
+self_update = { version = "0.44", default-features = false, features = [
+  "reqwest",
+  "rustls",
+  "archive-tar",
+  "compression-flate2",
+  "archive-zip",
+  "compression-zip-deflate",
+] }
 
 [dependencies.reqwest]
 version = "0.13.3"

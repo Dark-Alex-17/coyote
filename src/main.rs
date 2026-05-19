@@ -83,6 +83,13 @@ async fn main() -> Result<()> {
 
     let log_path = setup_logger()?;
 
+    if let Some(version) = &cli.update {
+        let version = version.clone();
+        let force = cli.force;
+        return tokio::task::spawn_blocking(move || config::run_self_update(version, force))
+            .await?;
+    }
+
     install_builtins()?;
 
     if let Some(client_arg) = &cli.authenticate {

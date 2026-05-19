@@ -138,6 +138,29 @@ To use a binary from the releases page on Linux/MacOS, do the following:
 3. Extract the binary with `tar -C /usr/local/bin -xzf loki-<arch>.tar.gz` (Note: This may require `sudo`)
 4. Now you can run `loki`!
 
+## Updating
+Loki can update itself in place to the latest GitHub release. Run `loki --update`
+for the newest release, or `loki --update v0.4.0` for a specific version:
+
+```shell
+loki --update
+loki --update v0.4.0
+```
+
+The same is available from within the REPL via `.update` and `.update v0.4.0`.
+
+If Loki was installed with a package manager, prefer that package manager so its
+records stay in sync with the binary on disk; i.e. `brew upgrade loki` for Homebrew,
+or `cargo install --locked loki-ai` for Cargo.
+
+When Loki detects a package-manager install it prints a warning and asks for
+confirmation. In a non-interactive shell (no TTY), pass `--force` to update
+anyway:
+
+```shell
+loki --update --force
+```
+
 ## Getting Started
 After installation, you can generate the configuration files and directories by simply running:
 

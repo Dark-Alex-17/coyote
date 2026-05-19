@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use eventsource_stream::{EventStream, Eventsource};
 use fmt::{Display, Formatter};
 use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
 use mpsc::error::SendError;
 use mpsc::{OwnedPermit, Receiver, Sender, channel};
 use reqwest::Client;
@@ -13,13 +14,11 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
-use futures_util::stream::BoxStream;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use url::Url;
 
-type SseEventStream =
-    EventStream<BoxStream<'static, reqwest::Result<bytes::Bytes>>>;
+type SseEventStream = EventStream<BoxStream<'static, reqwest::Result<bytes::Bytes>>>;
 
 const CHANNEL_BUF: usize = 64;
 

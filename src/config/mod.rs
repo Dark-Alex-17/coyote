@@ -12,6 +12,7 @@ mod role;
 mod session;
 pub(crate) mod todo;
 mod tool_scope;
+mod update;
 
 pub use self::agent::{Agent, AgentVariables, complete_agent_variables, list_agents};
 #[allow(unused_imports)]
@@ -25,6 +26,7 @@ pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
 use self::session::Session;
+pub use self::update::run_self_update;
 use crate::client::{
     ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
     ProviderModels, create_client_config, list_client_types,

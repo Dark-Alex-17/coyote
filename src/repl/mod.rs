@@ -33,6 +33,7 @@ use reedline::{
 use reedline::{MenuBuilder, Signal};
 use std::sync::LazyLock;
 use std::{env, process, sync::Arc};
+use tokio::task;
 
 const MENU_NAME: &str = "completion_menu";
 
@@ -45,7 +46,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 41]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 42]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -220,6 +221,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 41]> = LazyLock::new(|| {
         ReplCommand::new(
             ".install",
             "Reinstall bundled agents, macros, functions, or MCP config (overwrites local changes)",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".update",
+            "Update Loki to the latest release (or a specified version)",
             AssertState::pass(),
         ),
         ReplCommand::new(".exit", "Exit REPL", AssertState::pass()),
@@ -542,6 +548,14 @@ pub async fn run_repl_command(
                 },
                 _ => println!("Usage: .install <{}>", AssetCategory::NAMES.join("|")),
             },
+            ".update" => {
+                if ctx.macro_flag {
+                    bail!("Cannot perform this operation because you are in a macro")
+                }
+                let version = args.map(|s| s.trim().to_string());
+                task::spawn_blocking(move || config::run_self_update(version, false))
+                    .await??;
+            }
             ".rag" => {
                 ctx.use_rag(args, abort_signal.clone()).await?;
             }
@@ -1241,8 +1255,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_41_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 41);
+    fn repl_commands_has_42_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 42);
     }
 
     #[test]
