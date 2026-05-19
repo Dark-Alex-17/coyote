@@ -1,13 +1,13 @@
-use std::fs::OpenOptions;
+use crate::utils::warning_text;
 use anyhow::{Context, Result, bail};
+use dunce::canonicalize;
 use inquire::Confirm;
 use is_terminal::IsTerminal;
+use self_update::Status;
+use self_update::backends::github::Update;
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::{env, fs, io, process};
-use dunce::canonicalize;
-use self_update::backends::github::Update;
-use self_update::Status;
-use crate::utils::warning_text;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstallSource {
@@ -70,11 +70,7 @@ fn normalize_version(requested: Option<String>) -> Option<String> {
 
 fn is_dir_writable(dir: &Path) -> bool {
     let probe = dir.join(format!(".loki-update-write-test-{}", process::id()));
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-    {
+    match OpenOptions::new().write(true).create_new(true).open(&probe) {
         Ok(_) => {
             let _ = fs::remove_file(&probe);
             true
