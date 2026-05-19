@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, anyhow};
+use eventsource_stream::{EventStream, Eventsource};
 use fmt::{Display, Formatter};
 use futures_util::StreamExt;
 use mpsc::error::SendError;
 use mpsc::{OwnedPermit, Receiver, Sender, channel};
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use reqwest_eventsource::{Event, EventSource};
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use std::collections::HashMap;
 use std::error::Error;
@@ -13,9 +13,13 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
+use futures_util::stream::BoxStream;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use url::Url;
+
+type SseEventStream =
+    EventStream<BoxStream<'static, reqwest::Result<bytes::Bytes>>>;
 
 const CHANNEL_BUF: usize = 64;
 
@@ -47,8 +51,15 @@ impl LegacySseTransport {
             .build()
             .context("Failed to build HTTP client")?;
 
-        let request = client.get(sse_url);
-        let mut es = EventSource::new(request).context("Failed to open SSE connection")?;
+        let response = client
+            .get(sse_url)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .send()
+            .await
+            .context("Failed to open SSE connection")?
+            .error_for_status()
+            .context("SSE server returned an error status")?;
+        let mut es: SseEventStream = response.bytes_stream().boxed().eventsource();
 
         let post_endpoint = wait_for_endpoint_event(&mut es, &base_url).await?;
 
@@ -83,18 +94,17 @@ impl LegacySseTransport {
     }
 }
 
-async fn wait_for_endpoint_event(es: &mut EventSource, base_url: &Url) -> Result<String> {
+async fn wait_for_endpoint_event(es: &mut SseEventStream, base_url: &Url) -> Result<String> {
     let timeout = Duration::from_secs(30);
     tokio::time::timeout(timeout, async {
         while let Some(event) = es.next().await {
             match event {
-                Ok(Event::Open) => {}
-                Ok(Event::Message(msg)) if msg.event == "endpoint" => {
+                Ok(msg) if msg.event == "endpoint" => {
                     let endpoint = msg.data.trim().to_string();
                     let resolved = resolve_endpoint(&endpoint, base_url)?;
                     return Ok(resolved);
                 }
-                Ok(Event::Message(_)) => {}
+                Ok(_) => {}
                 Err(e) => {
                     return Err(anyhow!(
                         "SSE connection error while waiting for endpoint event: {e}"
@@ -120,10 +130,10 @@ fn resolve_endpoint(endpoint: &str, base_url: &Url) -> Result<String> {
     }
 }
 
-async fn sse_reader_task(mut es: EventSource, tx: Sender<ServerJsonRpcMessage>) {
+async fn sse_reader_task(mut es: SseEventStream, tx: Sender<ServerJsonRpcMessage>) {
     while let Some(event) = es.next().await {
         match event {
-            Ok(Event::Message(msg)) if msg.event == "message" => {
+            Ok(msg) if msg.event == "message" => {
                 match serde_json::from_str::<ServerJsonRpcMessage>(&msg.data) {
                     Ok(rpc_msg) => {
                         if tx.send(rpc_msg).await.is_err() {
@@ -136,14 +146,12 @@ async fn sse_reader_task(mut es: EventSource, tx: Sender<ServerJsonRpcMessage>) 
                 }
             }
             Ok(_) => {}
-            Err(reqwest_eventsource::Error::StreamEnded) => break,
             Err(e) => {
                 error!("SSE stream error: {e}");
                 break;
             }
         }
     }
-    es.close();
 }
 
 async fn post_writer_task(
