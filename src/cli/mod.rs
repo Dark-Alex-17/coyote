@@ -137,6 +137,12 @@ pub struct Cli {
     /// Generate static shell completion scripts
     #[arg(long, value_name = "SHELL", value_enum)]
     pub completions: Option<ShellCompletion>,
+    /// Update Loki to the latest release, or to a specific version
+    #[arg(long, value_name = "VERSION")]
+    pub update: Option<Option<String>>,
+    /// With --update, update even if Loki was installed via a package manager
+    #[arg(long, requires = "update")]
+    pub force: bool,
 }
 
 impl Cli {
@@ -395,5 +401,29 @@ mod tests {
     fn parse_macro_flag() {
         let cli = parse(&["--macro", "my-macro"]);
         assert_eq!(cli.macro_name, Some("my-macro".to_string()));
+    }
+
+    #[test]
+    fn parse_update_flag_no_value() {
+        let cli = parse(&["--update"]);
+        assert_eq!(cli.update, Some(None));
+    }
+
+    #[test]
+    fn parse_update_flag_with_version() {
+        let cli = parse(&["--update", "v0.4.0"]);
+        assert_eq!(cli.update, Some(Some("v0.4.0".to_string())));
+    }
+
+    #[test]
+    fn parse_update_with_force() {
+        let cli = parse(&["--update", "--force"]);
+        assert_eq!(cli.update, Some(None));
+        assert!(cli.force);
+    }
+
+    #[test]
+    fn parse_force_without_update_fails() {
+        assert!(Cli::try_parse_from(["loki", "--force"]).is_err());
     }
 }
