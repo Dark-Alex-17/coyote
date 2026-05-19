@@ -227,6 +227,9 @@ pub fn patch_messages(messages: &mut Vec<Message>, model: &Model) {
 }
 
 pub fn extract_system_message(messages: &mut Vec<Message>) -> Option<String> {
+    if messages.is_empty() {
+        return None;
+    }
     if messages[0].role.is_system() {
         let system_message = messages.remove(0);
         return Some(system_message.content.to_text());
