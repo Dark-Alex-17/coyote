@@ -151,6 +151,7 @@ fn node_type_label(node: &Node) -> &'static str {
         NodeType::Llm(_) => "llm",
         NodeType::Rag(_) => "rag",
         NodeType::End(_) => "end",
+        NodeType::Map(_) => "map",
     }
 }
 

@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(graph.start, "node1");
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(
-            graph.nodes.get("node1").unwrap().next.as_deref(),
+            graph.nodes.get("node1").unwrap().next_target(),
             Some("node2")
         );
     }
