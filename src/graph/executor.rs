@@ -1,5 +1,5 @@
 use super::agent::AgentNodeExecutor;
-use super::llm::LlmNodeExecutor;
+use super::llm::{LlmExecutionOutcome, LlmNodeExecutor};
 use super::logging::GraphLogger;
 use super::map::MapNodeExecutor;
 use super::progress::{BranchProgressHandle, BranchProgressTracker};
@@ -366,17 +366,16 @@ async fn step(
             Ok(StepResult::Continue(vec![next]))
         }
         NodeType::Llm(llm_node) => {
-            let primary = first_next_target(node).map(str::to_string);
-            let llm_routing =
-                LlmNodeExecutor::execute(llm_node, primary.as_deref(), state, ctx).await?;
-            let targets = resolve_branching_next(node, &llm_routing);
+            let outcome = LlmNodeExecutor::execute(llm_node, state, ctx).await?;
+            let targets = match outcome {
+                LlmExecutionOutcome::Continue => static_next_targets(node, current, "llm")?,
+                LlmExecutionOutcome::FellBack(target) => vec![target],
+            };
             Ok(StepResult::Continue(targets))
         }
         NodeType::Rag(rag_node) => {
-            let primary = first_next_target(node).map(str::to_string);
-            let rag_routing =
-                RagNodeExecutor::execute(rag_node, current, primary.as_deref(), state, ctx).await?;
-            let targets = resolve_branching_next(node, &rag_routing);
+            RagNodeExecutor::execute(rag_node, current, state, ctx).await?;
+            let targets = static_next_targets(node, current, "rag")?;
             Ok(StepResult::Continue(targets))
         }
         NodeType::End(end_node) => Ok(StepResult::End(resolve_end_output(end_node, state))),
@@ -404,35 +403,6 @@ fn first_next_target(node: &Node) -> Option<&str> {
     node.next
         .as_ref()
         .and_then(|t| t.as_slice().first().map(|s| s.as_str()))
-}
-
-// Resolves the actual frontier-advance targets after an LLM/RAG node ran.
-//
-// LLM/RAG executors return their chosen routing as a String — either the
-// primary `next:` target (success path) or the node's `fallback:` (failure
-// path with retry exhausted). We can't tell these apart from inside step()
-// without an API refactor, so we compare strings: if the returned routing
-// matches the first declared `next` target, treat as success and (for
-// fan-out) use ALL declared targets; otherwise treat as fallback and use the
-// returned target alone.
-//
-// Known limitation: if a fan-out node's `fallback:` is set to the same node
-// id as its first `next:` target, a successful run is indistinguishable from
-// a fallback run — both look like "returned the first target". The result is
-// that the executor advances to all Many targets in the fallback case (which
-// is the OPPOSITE of the user's likely intent). Workaround: choose a
-// `fallback:` distinct from any `next:` target.
-fn resolve_branching_next(node: &Node, returned_routing: &str) -> Vec<String> {
-    let Some(targets) = &node.next else {
-        return vec![returned_routing.to_string()];
-    };
-    let slice = targets.as_slice();
-    let first_matches = slice.first().is_some_and(|s| s == returned_routing);
-    if first_matches && slice.len() > 1 {
-        slice.to_vec()
-    } else {
-        vec![returned_routing.to_string()]
-    }
 }
 
 fn resolve_end_output(end_node: &EndNode, state: &mut StateManager) -> String {

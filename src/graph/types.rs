@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -129,11 +129,11 @@ pub struct Node {
 }
 
 impl Node {
-    /// Returns the single next target as a string slice, or `None` if no next is
-    /// declared or if a multi-target fan-out is declared. Use this for read-only
-    /// inspection (e.g. tests). For execution paths that require single-target
-    /// semantics, use `next_single()` — it errors explicitly when a fan-out is
-    /// declared so the caller can surface a clear failure instead of skipping it.
+    /// Returns the single next target as a string slice for tests and other
+    /// read-only inspection. Returns `None` when no `next:` is declared at all,
+    /// OR when a real multi-target fan-out is declared (since a fan-out has no
+    /// "single" target). Execution paths use `static_next_targets` in the graph
+    /// executor instead.
     #[allow(dead_code)]
     pub fn next_target(&self) -> Option<&str> {
         match &self.next {
@@ -141,16 +141,6 @@ impl Node {
             Some(NextTargets::One(s)) => Some(s),
             Some(NextTargets::Many(v)) if v.len() == 1 => Some(&v[0]),
             Some(NextTargets::Many(_)) => None,
-        }
-    }
-
-    /// Returns the single next target as a string slice, or an explicit error if
-    /// the node declares a multi-target fan-out (which is not yet supported
-    /// pre-Phase-D). Returns `Ok(None)` when no next is declared at all.
-    pub fn next_single(&self) -> Result<Option<&str>> {
-        match &self.next {
-            None => Ok(None),
-            Some(targets) => Ok(Some(targets.single()?.as_str())),
         }
     }
 }
@@ -172,23 +162,8 @@ impl NextTargets {
     }
 
     /// True if this declares more than one parallel target (i.e., a real fan-out).
-    #[allow(dead_code)]
     pub fn is_fan_out(&self) -> bool {
         matches!(self, NextTargets::Many(v) if v.len() > 1)
-    }
-
-    /// Returns the single target if exactly one is declared, else errors with a
-    /// clear "not yet supported" message. Used by the v1 executor until parallel
-    /// branch execution lands in Phase D.
-    pub fn single(&self) -> Result<&String> {
-        match self {
-            NextTargets::One(s) => Ok(s),
-            NextTargets::Many(v) if v.len() == 1 => Ok(&v[0]),
-            NextTargets::Many(_) => bail!(
-                "Parallel fan-out (`next: [a, b, ...]`) is declared, but parallel \
-                 branch execution is not yet implemented in this build."
-            ),
-        }
     }
 }
 
@@ -971,23 +946,7 @@ next: retrieve
     }
 
     #[test]
-    fn next_single_errors_on_real_fan_out_with_clear_message() {
-        let yaml = r#"
-id: triage
-type: llm
-prompt: Classify
-next: [a, b]
-"#;
-        let node: Node = serde_yaml::from_str(yaml).unwrap();
-
-        let err = node.next_single().unwrap_err().to_string();
-
-        assert!(err.contains("Parallel fan-out"), "got: {err}");
-        assert!(err.contains("not yet implemented"), "got: {err}");
-    }
-
-    #[test]
-    fn next_single_accepts_many_containing_exactly_one_target() {
+    fn next_target_treats_many_of_one_as_single() {
         let yaml = r#"
 id: triage
 type: llm
@@ -997,7 +956,6 @@ next: [retrieve]
 
         let node: Node = serde_yaml::from_str(yaml).unwrap();
 
-        assert_eq!(node.next_single().unwrap(), Some("retrieve"));
         assert_eq!(node.next_target(), Some("retrieve"));
     }
 
