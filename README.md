@@ -49,16 +49,6 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 Loki requires the following tools to be installed on your system:
 * [jq](https://github.com/jqlang/jq)
     * `brew install jq`
-* [jira (optional)](https://github.com/ankitpokhrel/jira-cli/wiki/Installation) (For the `query_jira_issues` tool)
-    * `brew tap ankitpokhrel/jira-cli && brew install jira-cli`
-    * You'll need to [create a JIRA API token](https://id.atlassian.com/manage-profile/security/api-tokens) for authentication
-    * Then, save it as an environment variable to your shell profile:
-      ```sh
-      # ~/.bashrc or ~/.zshrc
-      export JIRA_API_TOKEN="your_jira_api_token_here"
-      ```
-    * Then run `jira init`, select installation type as `cloud`, and provide the required details to generate a config
-      file for the Jira CLI.
 * [usql](https://github.com/xo/usql) (For the `sql` agent)
     * `brew install xo/xo/usql`
 * [docker](https://docs.docker.com/engine/install/)
@@ -66,7 +56,7 @@ Loki requires the following tools to be installed on your system:
     * `curl -LsSf https://astral.sh/uv/install.sh | sh`
 
 These tools are used to provide various functionalities within Loki, such as document processing, JSON manipulation,
-interaction with Jira, and they are used within agents and tools.
+etc., and they are used within agents and tools.
 
 ## Install
 
