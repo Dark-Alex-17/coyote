@@ -353,6 +353,24 @@ fn single_reference_key(template: &str) -> Option<&str> {
     valid.then_some(inner)
 }
 
+// Returns the root state keys referenced by any `{{...}}` expressions in the
+// given template string. The "root key" is the identifier before the first
+// `.` or `[` — i.e. for `{{user.name}}` the root is `user`, for `{{items[0]}}`
+// the root is `items`. Used by the validator to compute the static read-set of
+// a node's templated fields without depending on a runtime `StateManager`.
+pub(super) fn template_root_keys(template: &str) -> Vec<String> {
+    TEMPLATE_VAR_RE
+        .captures_iter(template)
+        .flatten()
+        .filter_map(|c| c.get(1))
+        .map(|m| {
+            let inner = m.as_str();
+            let cut = inner.find(['.', '[']).unwrap_or(inner.len());
+            inner[..cut].to_string()
+        })
+        .collect()
+}
+
 fn value_to_string(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
