@@ -6,10 +6,11 @@
 # agent), never both. The presence of graph.yaml is what makes the agent
 # a graph agent.
 #
-# This file is meant to serve as a reference only: it documents every 
-# available field. It is not a runnable agent as-is. The `agent:`, 
-# `script:`, and `documents:` values point at things that would need to 
-# exist for a real agent.
+# This file is a reference: it documents every available field, themed
+# around a deep web research workflow with parallel retrieval. It is not
+# a runnable agent as-is. The `agent:`, `script:`, and `documents:` values
+# point at things that would need to exist for a real agent. For a real,
+# runnable deep-research graph agent, see assets/agents/deep-research/.
 #
 # Full documentation:
 #   https://github.com/Dark-Alex-17/loki/wiki/Graph-Agents
@@ -17,11 +18,11 @@
 # ---------------------------------------------------------------------------
 # Identity
 # ---------------------------------------------------------------------------
-name: example-graph-agent          # Agent name (should match the directory name)
+name: deep-research-example        # Agent name (should match the directory name)
 description: |                     # Free-form prose describing the workflow
-  A reference workflow: triage a request, retrieve context, branch on a
-  script decision, run either a sub-agent or an LLM step, then gate the
-  result behind human approval.
+  A reference workflow: triage a research request, retrieve local
+  context, branch on a script decision, run either a sub-agent or an
+  LLM research step, then gate the result behind human approval.
 version: "1.0"                     # Graph SCHEMA version. Only "1.0" is accepted.
 
 # ---------------------------------------------------------------------------
@@ -29,7 +30,7 @@ version: "1.0"                     # Graph SCHEMA version. Only "1.0" is accepte
 # The same knobs a normal agent's config.yaml carries. In a graph agent they
 # live here instead of in a config.yaml.
 # ---------------------------------------------------------------------------
-model: claude:claude-sonnet-4-6 # Default model for `llm` nodes that don't override it
+model: claude:claude-sonnet-4-6    # Default model for `llm` nodes that don't override it
 temperature: 0.0                   # Default sampling temperature for `llm` nodes
 top_p: null                        # Default sampling top-p for `llm` nodes
 
@@ -38,10 +39,10 @@ global_tools:                      # Tool universe an `llm` node's `tools:` whit
   - fetch_url_via_curl.sh
 
 mcp_servers:                       # MCP servers an `llm` node may reference via `mcp:<server>`
-  - pubmed-search
+  - ddg-search
 
 conversation_starters:             # Suggested prompts surfaced in the UI
-  - "Research LOINC code 2160-0"
+  - "Research the current state of WebAssembly outside the browser"
 
 # ---------------------------------------------------------------------------
 # Execution settings (all optional)
@@ -53,17 +54,44 @@ settings:
                              # checked between node transitions.
   log_state_snapshots: true  # Log state before each node (debug/trace). Default true.
   validate_before_run: true  # Run the graph validator at startup. Default true.
+  max_concurrency: 4         # Cap on simultaneously running branches in any
+                             # super-step (static fan-out OR a `map` node).
+                             # Default 4. Per-`map` overrides this. See Parallel
+                             # Execution below.
+
+# ---------------------------------------------------------------------------
+# Reducers (optional, required whenever two parallel branches write the same
+# state key in the same super-step; otherwise the validator errors at load).
+#
+# A reducer says HOW two values for the same key get merged. Built-ins:
+#   append    list += [value]              (single value appended to a list)
+#   extend    list += value (a list)       (list-of-lists flattened by one level)
+#   concat    "a\nb"                       (string join with newline separator)
+#   sum       a + b                        (numeric add; ints stay ints)
+#   max       max(a, b)
+#   min       min(a, b)
+#   merge     {**a, **b}                   (dict union, RHS wins on key collision)
+#   overwrite last-write-wins              (explicit opt-in; B's value replaces A's)
+#
+# Keys not listed here have an implicit "single writer per super-step" rule:
+# the validator rejects any graph where two parallel branches both write a
+# key with no reducer.
+# ---------------------------------------------------------------------------
+reducers:
+  sources: append             # The diamond below writes `sources` from both
+                              # branches; append accumulates them into a list.
+  context: concat             # Each branch contributes prose; concat joins them.
 
 # ---------------------------------------------------------------------------
 # Seed state (optional)
 # Values placed into graph state before any node runs; reference anywhere via
-# {{key}}. 
+# {{key}}.
 #
 # Note: `initial_prompt` is seeded automatically by Loki with the
 # caller's prompt. So there's no need to set it here.
 # ---------------------------------------------------------------------------
 initial_state:
-  audience: "clinician"
+  audience: "general reader"
   # Seed an empty default for any key that a strict field (a node prompt /
   # instructions / question / End output) references but that is only set on
   # some paths. `refinement` is set only if the `refine` input node runs;
@@ -81,7 +109,7 @@ start: triage                # ID of the first node to run (must exist in `nodes
 # Each node is keyed by its id. The `id:` inside a node must match its key
 # (it may also be omitted and thus Loki fills it in from the key).
 #
-# Node types: agent | script | approval | input | llm | rag | end
+# Node types: agent | script | approval | input | llm | rag | map | end
 # ---------------------------------------------------------------------------
 nodes:
 
@@ -91,25 +119,37 @@ nodes:
   triage:
     id: triage
     type: llm
-    description: Classify the request and extract its topic.
+    description: Classify the research request and extract its topic.
     instructions: |            # Optional system prompt (templated against state)
       You triage research requests for a {{audience}} audience.
     prompt: |                  # Required user prompt (templated against state)
-      Classify this request and extract the key topic:
+      Classify this request and extract the core research topic:
       {{initial_prompt}}
     tools: []                  # Tool whitelist. Omitted or [] = no tools at all.
                                # A list narrows to exactly those entries.
     output_schema:             # Optional JSON Schema. The output is parsed to JSON
       type: object             # and its top-level object keys auto-merge into state
-      properties:              # (so `topic` / `needs_research` become {{topic}} etc).
+      properties:              # (so `topic` / `needs_deep_dive` become {{topic}} etc).
         topic: { type: string }
-        needs_research: { type: boolean }
-      required: [topic, needs_research]
+        needs_deep_dive: { type: boolean }
+      required: [topic, needs_deep_dive]
     state_updates:             # {{output}} = this node's result (here, the parsed object)
       triage_result: "{{output}}"
-    next: retrieve             # Required for llm nodes: the success route
+    # --- POLYMORPHIC `next` -----------------------------------------------
+    # A single string runs the next node sequentially (e.g. `next: retrieve`).
+    # A list runs ALL listed nodes IN PARALLEL as one BSP super-step. Their
+    # writes are merged via `reducers:` at the join. Branches converge
+    # implicitly when they all route to the same downstream node (here,
+    # `synthesize`). See the diamond:
+    #
+    #          triage
+    #          /     \
+    #     retrieve  web_search   (run concurrently)
+    #          \     /
+    #         synthesize         (join — fires once after both finish)
+    next: [retrieve, web_search]
 
-  # --- rag node -----------------------------------------------------------
+  # --- rag node (parallel branch 1 of the diamond) ------------------------
   # Hybrid (vector + keyword) retrieval against a per-node knowledge base.
   # The knowledge base is built ONCE, at agent load time, into
   # <agent-dir>/retrieve.yaml (named after this node's id).
@@ -131,29 +171,60 @@ nodes:
     reranker_model: null       # Optional reranker for hybrid-search results
     batch_size: 100            # Optional embedding-request batch size
     state_updates:             # {{output}} = { context: <str>, sources: [<path>, ...] }
-      context: "{{output.context}}"
-      sources: "{{output.sources}}"
-    next: decide
+      context: "{{output.context}}"   # writes `context` — `reducers.context = concat`
+      sources: "{{output.sources}}"   # writes `sources` — `reducers.sources = append`
+    next: synthesize           # Joins with web_search at `synthesize`.
 
-  # --- script node --------------------------------------------------------
+  # --- llm node (parallel branch 2 of the diamond) ------------------------
+  # Runs concurrently with `retrieve`. Both branches write `context` and
+  # `sources`; the validator confirms both keys have a reducer declared, and
+  # the BSP scheduler merges them at the join.
+  web_search:
+    id: web_search
+    type: llm
+    instructions: "You are a web researcher. Cite every claim."
+    prompt: "Web research: {{topic}}. Return findings and sources."
+    tools:
+      - web_search_loki
+      - mcp:ddg-search
+    output_schema:
+      type: object
+      properties:
+        context: { type: string }
+        sources:
+          type: array
+          items: { type: string }
+      required: [context, sources]
+    # When `output_schema` is set, top-level keys auto-merge into state, so
+    # `context` and `sources` are produced without needing `state_updates`.
+    next: synthesize           # Joins with retrieve at `synthesize`.
+
+  # --- script node (the diamond's JOIN; also dispatches) -----------------
   # Runs a .sh / .py / .ts script. The script receives state via the
   # GRAPH_STATE env var (inline JSON) or GRAPH_STATE_FILE (path to a JSON
   # file, used when state exceeds 32 KiB). Exactly one is set. It must print
   # a single JSON object on stdout: keys merge into state, and the reserved
   # `_next` key (if present) overrides routing.
-  decide:
-    id: decide
+  #
+  # This node fires once: after both `retrieve` and `web_search` finish.
+  # The BSP scheduler dedups the two incoming edges into a single frontier
+  # entry, applies the staged branch writes through the reducers, then runs
+  # this node against the merged state. Inside the script, `context` is the
+  # concatenated text of both branches and `sources` is the combined list.
+  synthesize:
+    id: synthesize
     type: script
-    script: scripts/decide.py  # Path relative to the agent directory
+    script: scripts/synthesize.py  # Path relative to the agent directory
     timeout: 30                # Seconds. Default 30.
     state_updates:             # Applied after the stdout JSON is merged
       decided_for: "{{topic}}"
     next: summarize            # Default route if the script emits no `_next`
     fallback: summarize        # Route taken if the script fails (crash / bad JSON)
-    # This script is expected to emit `_next: deep_dive` (or no `_next`, in
-    # which case `next` is used). Because `deep_dive` is reached only via the
-    # script's dynamic `_next`, the startup validator will report it as an
-    # "unreachable" warning. That is expected for `_next`-routed targets.
+    # This script is expected to emit `_next: deep_dive` (or `_next: subjects_map`
+    # to demonstrate the map node below), or no `_next` (then `next` is used).
+    # Targets reached only via the script's dynamic `_next` get an
+    # "unreachable" warning from the validator — expected for `_next`-routed
+    # targets.
 
   # --- agent node ---------------------------------------------------------
   # Spawns a full Loki sub-agent and waits for it. The child uses its own
@@ -162,7 +233,7 @@ nodes:
   deep_dive:
     id: deep_dive
     type: agent
-    agent: deep-researcher     # Name of an existing Loki agent to spawn
+    agent: deep-research       # Name of an existing Loki agent to spawn
     prompt: |                  # User message sent to the child (templated)
       Research {{topic}} in depth. Existing context:
       {{context}}
@@ -179,15 +250,77 @@ nodes:
       research: "{{output}}"
     next: review               # Required for agent nodes
 
+  # --- map node (Dynamic fan-out — LangGraph's `Send` API) ----------------
+  # Spawns one parallel sub-branch per item in `over`. Each sub-branch runs
+  # the node referenced by `branch:` with the item bound to `as:`. Outputs
+  # collect into the array named by `collect_into:`, preserving input order.
+  #
+  # Reach via `synthesize`'s `_next: subjects_map`. The producer is expected
+  # to have written a list at `subjects` (e.g. an upstream LLM node with an
+  # `output_schema` returning {"subjects": ["a", "b", "c"]}).
+  subjects_map:
+    id: subjects_map
+    type: map
+    over: "{{subjects}}"        # Required. List expression resolved from state.
+                                # Empty list is allowed — no branches spawn,
+                                # `collect_into` is written as [].
+    as: subject                 # Required. Per-branch state key holding the
+                                # current item. Read with {{subject}} inside
+                                # the branch node's prompt.
+    branch: research_subject    # Required. Node id to invoke per item.
+                                # Must point to an llm | agent | rag | script
+                                # node satisfying the map branch contract:
+                                #   - no `next:` (atomic, joined at map exit)
+                                #   - no `state_updates:` other than via the
+                                #     map's `collect_into` channel
+                                #   - no `output_schema:` (top-level merge
+                                #     would clash with collect_into)
+                                # Validator (C.5) enforces all three.
+    collect_into: subject_findings  # Required. State key for the array of
+                                    # per-branch outputs, in input order
+                                    # (not spawn-finish order).
+    max_concurrency: 3          # Optional per-map cap. Defaults to
+                                # settings.max_concurrency above.
+    output_key: output          # Optional. State key the branch's output
+                                # appears under. Default "output". Useful
+                                # only if the branch reads its own bound
+                                # name back (rare).
+    next: aggregate_subjects    # Where to go after all sub-branches finish.
+
+  # Branch node for subjects_map. Each invocation receives a different
+  # `subject` in state. The branch is "atomic", meaning it cannot route on
+  # its own; the surrounding `map` joins after all invocations finish.
+  research_subject:
+    id: research_subject
+    type: llm
+    instructions: "Research one subject deeply for a {{audience}} audience."
+    prompt: "Research {{subject}}: pull the key facts and one citation."
+    tools:
+      - web_search_loki
+    # No `next:`, `state_updates:`, or `output_schema:` here — map branches
+    # have a strict contract (see `subjects_map.branch` comment).
+
+  # Aggregator that runs after the map joins. Reads the collected list.
+  aggregate_subjects:
+    id: aggregate_subjects
+    type: llm
+    instructions: "Combine N per-subject reports into one cohesive summary."
+    prompt: |
+      Per-subject reports (in original input order):
+      {{subject_findings}}
+    state_updates:
+      research: "{{output}}"
+    next: review
+
   # --- llm node with a narrowed tool whitelist ----------------------------
   summarize:
     id: summarize
     type: llm
-    instructions: "You write concise summaries for a {{audience}} audience."
+    instructions: "You write concise research summaries for a {{audience}} audience."
     prompt: "Summarize the topic {{topic}}, using your tools as needed."
-    tools:                     # Narrow whitelist: Exactly these entries, nothing else
-      - web_search_loki.sh     #   an exact global-tool / custom-tool name
-      - mcp:pubmed-search      #   `mcp:<server>` includes that server's functions
+    tools:                     # Narrow whitelist: exactly these entries, nothing else
+      - web_search_loki        #   an exact global-tool / custom-tool name
+      - mcp:ddg-search         #   `mcp:<server>` includes that server's functions
     model: claude:claude-haiku-4-5  # Optional per-node model override
     temperature: 0.3           # Optional per-node sampling override
     max_attempts: 2            # Retry count on transient errors only. Default 1.
@@ -205,7 +338,7 @@ nodes:
     id: review
     type: approval
     question: |
-      Proposed result for {{topic}}:
+      Proposed research result for {{topic}}:
       {{research}}
 
       Approve?
@@ -224,10 +357,10 @@ nodes:
   refine:
     id: refine
     type: input
-    question: "What should be changed about the result?"
-    default: "minor wording only"  # Optional: used if the user submits empty input.
-                                   # Note: a substituted default is not re-validated,
-                                   # so make sure it would satisfy `validation`.
+    question: "What should be changed about the research result?"
+    default: "tighten the summary"  # Optional: used if the user submits empty input.
+                                    # Note: a substituted default is not re-validated,
+                                    # so make sure it would satisfy `validation`.
     validation: "len(input) > 0"   # Optional length predicate: len(input) <op> N,
                                    # <op> in > >= < <= == . Length only -- no regex.
     state_updates:
@@ -239,11 +372,11 @@ nodes:
     id: finalize
     type: llm
     prompt: |
-      Produce the final answer for {{topic}}.
+      Produce the final research report for {{topic}}.
       Result so far: {{research}}
       Requested refinement (if any): {{refinement}}
     state_updates:
-      final_answer: "{{output}}"
+      final_report: "{{output}}"
     next: done
 
   # --- end nodes ----------------------------------------------------------
@@ -255,11 +388,11 @@ nodes:
     state_updates:             # Optional: applied before `output` is rendered
       status: "completed"
     output: |
-      [{{status}}] {{final_answer}}
+      [{{status}}] {{final_report}}
 
       Sources: {{sources}}
 
   rejected_end:
     id: rejected_end
     type: end
-    output: "Request for {{topic}} was not approved."
+    output: "Research on {{topic}} was not approved."
