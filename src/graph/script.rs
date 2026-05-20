@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+#[derive(Clone)]
 pub struct ScriptExecutor {
     base_dir: PathBuf,
 }
