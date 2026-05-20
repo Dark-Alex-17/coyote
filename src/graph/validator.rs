@@ -318,8 +318,10 @@ impl GraphValidator {
 
 fn declared_targets(node: &Node) -> Vec<(String, &'static str)> {
     let mut out = Vec::new();
-    if let Some(n) = &node.next {
-        out.push((n.clone(), "'next'"));
+    if let Some(targets) = &node.next {
+        for target in targets.as_slice() {
+            out.push((target.clone(), "'next'"));
+        }
     }
 
     match &node.node_type {
@@ -342,6 +344,12 @@ fn declared_targets(node: &Node) -> Vec<(String, &'static str)> {
         // `agent`/`input`/`rag` route only via `next` (already collected
         // above); `end` is terminal. No type-specific routing edges to add.
         NodeType::Agent(_) | NodeType::Input(_) | NodeType::Rag(_) | NodeType::End(_) => {}
+        // A `map` node invokes its `branch:` target once per item from the
+        // resolved `over` list. The branch is statically referenced, so it
+        // is a real declared edge for cycle/reachability purposes.
+        NodeType::Map(m) => {
+            out.push((m.branch.clone(), "map 'branch'"));
+        }
     }
     out
 }
@@ -434,6 +442,7 @@ mod tests {
             conversation_starters: Vec::new(),
             settings: GraphSettings::default(),
             initial_state: HashMap::new(),
+            reducers: HashMap::new(),
             start: start.into(),
             nodes: map,
         }
@@ -529,7 +538,7 @@ mod tests {
                 output_schema: None,
                 timeout: None,
             }),
-            next: next.map(String::from),
+            next: next.map(NextTargets::from),
         }
     }
 
@@ -759,7 +768,7 @@ mod tests {
                 output_schema: None,
                 timeout: None,
             }),
-            next: next.map(String::from),
+            next: next.map(NextTargets::from),
         }
     }
 
@@ -1037,5 +1046,115 @@ mod tests {
         let graph = graph_with(vec![("start", start), ("end", end_node("end"))], "start");
 
         assert!(validator().validate(&graph).into_result().is_ok());
+    }
+
+    #[test]
+    fn cycle_detector_treats_fan_out_diamond_as_a_valid_dag() {
+        let mut start = end_node("start");
+        start.next = Some(NextTargets::Many(vec!["a".into(), "b".into()]));
+        let mut a = end_node("a");
+        a.next = Some("join".into());
+        let mut b = end_node("b");
+        b.next = Some("join".into());
+        let mut join = end_node("join");
+        join.next = Some("end".into());
+
+        let graph = graph_with(
+            vec![
+                ("start", start),
+                ("a", a),
+                ("b", b),
+                ("join", join),
+                ("end", end_node("end")),
+            ],
+            "start",
+        );
+
+        let result = validator().validate(&graph);
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("Cycle detected")),
+            "fan-out diamond incorrectly reported as cycle: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn reachability_visits_every_member_of_many_next_targets() {
+        let mut start = end_node("start");
+        start.next = Some(NextTargets::Many(vec!["a".into(), "b".into(), "c".into()]));
+        let graph = graph_with(
+            vec![
+                ("start", start),
+                ("a", end_node("a")),
+                ("b", end_node("b")),
+                ("c", end_node("c")),
+            ],
+            "start",
+        );
+
+        let result = validator().validate(&graph);
+
+        for orphan in ["a", "b", "c"] {
+            assert!(
+                !result
+                    .warnings
+                    .iter()
+                    .any(|w| w.node_id.as_deref() == Some(orphan)
+                        && w.message.contains("unreachable")),
+                "fan-out target '{orphan}' incorrectly marked unreachable: {:?}",
+                result.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn node_reference_check_catches_missing_member_inside_many() {
+        let mut start = end_node("start");
+        start.next = Some(NextTargets::Many(vec!["a".into(), "ghost".into()]));
+        let graph = graph_with(vec![("start", start), ("a", end_node("a"))], "start");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("non-existent node 'ghost'")
+                    && e.node_id.as_deref() == Some("start")),
+            "expected error for missing 'ghost' target in Many: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn node_reference_check_catches_missing_map_branch_target() {
+        let map = Node {
+            id: "fan".into(),
+            description: String::new(),
+            node_type: NodeType::Map(MapNode {
+                over: "{{items}}".into(),
+                as_name: "item".into(),
+                branch: "no_such_node".into(),
+                output_key: "output".into(),
+                collect_into: "results".into(),
+                max_concurrency: None,
+            }),
+            next: Some("end".into()),
+        };
+        let graph = graph_with(vec![("fan", map), ("end", end_node("end"))], "fan");
+
+        let result = validator().validate(&graph);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("non-existent node 'no_such_node'")
+                    && e.message.contains("map 'branch'")),
+            "expected error for missing map branch: {:?}",
+            result.errors
+        );
     }
 }
