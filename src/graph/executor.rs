@@ -9,7 +9,7 @@ use super::state::StateManager;
 use super::types::{EndNode, Graph, Node, NodeType};
 use super::user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 use super::validator::{AgentValidationContext, GraphValidator};
-use crate::config::RequestContext;
+use crate::config::{RenderMode, RequestContext};
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::join_all;
@@ -144,7 +144,8 @@ impl GraphExecutor {
             let snapshot = state.read_snapshot();
             let semaphore = Arc::new(Semaphore::new(max_concurrency));
 
-            let mut branch_tasks = Vec::with_capacity(frontier.len());
+            let frontier_size = frontier.len();
+            let mut branch_tasks = Vec::with_capacity(frontier_size);
             for node_id in &frontier {
                 let node = graph
                     .get_node(node_id)
@@ -153,7 +154,10 @@ impl GraphExecutor {
                     })?
                     .clone();
                 let branch_state = state.fork_for_branch_state();
-                let branch_ctx = ctx.fork_for_branch();
+                let mut branch_ctx = ctx.fork_for_branch();
+                if frontier_size > 1 {
+                    branch_ctx.render_mode = RenderMode::Silent;
+                }
                 let script_exec_clone = script_executor.clone();
                 let graph_clone = Arc::clone(&graph);
                 let current = node_id.clone();

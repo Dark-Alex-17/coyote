@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::config::paths;
+use crate::config::{paths, RenderMode};
 use crate::{
     config::{AppConfig, Input, RequestContext},
     function::{FunctionDeclaration, ToolCall, ToolResult, eval_tool_calls},
@@ -459,6 +459,9 @@ pub async fn call_chat_completions_streaming(
 ) -> Result<(String, Vec<ToolResult>)> {
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
+    if ctx.render_mode == RenderMode::Silent {
+        handler.set_silent(true);
+    }
 
     let (send_ret, render_ret) = tokio::join!(
         client.chat_completions_streaming(input, &mut handler),

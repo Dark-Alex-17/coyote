@@ -16,6 +16,7 @@ pub struct SseHandler {
     last_tool_calls: Vec<ToolCall>,
     max_call_repeats: usize,
     call_repeat_chain_len: usize,
+    silent: bool,
 }
 
 impl SseHandler {
@@ -28,7 +29,17 @@ impl SseHandler {
             last_tool_calls: Vec::new(),
             max_call_repeats: 2,
             call_repeat_chain_len: 3,
+            silent: false,
         }
+    }
+
+    /// Suppresses stdout streaming of incoming tokens. Tokens are still buffered
+    /// internally (so the caller's `.take()` still returns the full response) —
+    /// only the per-token send to the SSE renderer is skipped. Used by parallel
+    /// graph super-step branches so concurrent LLM calls don't interleave on
+    /// stdout.
+    pub fn set_silent(&mut self, silent: bool) {
+        self.silent = silent;
     }
 
     pub fn text(&mut self, text: &str) -> Result<()> {
@@ -36,6 +47,10 @@ impl SseHandler {
             return Ok(());
         }
         self.buffer.push_str(text);
+        if self.silent {
+            return Ok(());
+        }
+        
         let ret = self
             .sender
             .send(SseEvent::Text(text.to_string()))

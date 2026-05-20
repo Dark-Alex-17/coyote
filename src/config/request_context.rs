@@ -46,6 +46,17 @@ pub struct AutoContinueConfig {
     pub continuation_prompt: Option<String>,
 }
 
+/// Controls how LLM token streams are presented to the user. `Silent` is set
+/// on branch contexts during parallel graph super-steps so concurrent LLM
+/// calls don't interleave token-by-token on stdout — the full response still
+/// lands in graph state via the normal output_schema / state_updates pathway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderMode {
+    #[default]
+    Streaming,
+    Silent,
+}
+
 pub struct RequestContext {
     pub app: Arc<AppState>,
 
@@ -74,6 +85,8 @@ pub struct RequestContext {
     pub auto_continue_count: usize,
     pub todo_list: TodoList,
     pub last_continuation_response: Option<String>,
+
+    pub render_mode: RenderMode,
 }
 
 impl RequestContext {
@@ -100,6 +113,7 @@ impl RequestContext {
             auto_continue_count: 0,
             todo_list: TodoList::default(),
             last_continuation_response: None,
+            render_mode: RenderMode::default(),
         }
     }
 
@@ -146,6 +160,7 @@ impl RequestContext {
             auto_continue_count: 0,
             todo_list: TodoList::default(),
             last_continuation_response: None,
+            render_mode: RenderMode::default(),
         })
     }
 
@@ -195,6 +210,7 @@ impl RequestContext {
             auto_continue_count: 0,
             todo_list: self.todo_list.clone(),
             last_continuation_response: None,
+            render_mode: self.render_mode,
         }
     }
 
@@ -233,6 +249,7 @@ impl RequestContext {
             auto_continue_count: 0,
             todo_list: TodoList::default(),
             last_continuation_response: None,
+            render_mode: parent.render_mode,
         }
     }
 
