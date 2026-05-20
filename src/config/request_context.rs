@@ -172,7 +172,6 @@ impl RequestContext {
     /// - `auto_continue_count` reset to 0 (each branch starts a fresh
     ///   continuation budget)
     /// - `last_continuation_response` reset to None
-    #[allow(dead_code)]
     pub fn fork_for_branch(&self) -> Self {
         Self {
             app: Arc::clone(&self.app),

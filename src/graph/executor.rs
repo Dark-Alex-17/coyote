@@ -1,6 +1,7 @@
 use super::agent::AgentNodeExecutor;
 use super::llm::LlmNodeExecutor;
 use super::logging::GraphLogger;
+use super::map::MapNodeExecutor;
 use super::rag::RagNodeExecutor;
 use super::script::ScriptExecutor;
 use super::staging::BranchWrites;
@@ -74,6 +75,10 @@ impl GraphExecutor {
         let max_iterations = graph.settings.max_loop_iterations;
         let graph_timeout = graph.settings.timeout.map(Duration::from_secs);
         let max_concurrency = graph.settings.max_concurrency;
+        // Wrap in Arc so spawned branch tasks can cheaply share the Graph for
+        // node lookup (especially the map executor, which needs to resolve its
+        // `branch:` target from inside a spawned task).
+        let graph = Arc::new(graph);
         let start = Instant::now();
 
         let mut frontier: HashSet<String> = HashSet::from([graph.start.clone()]);
@@ -150,7 +155,7 @@ impl GraphExecutor {
                 let branch_state = state.fork_for_branch_state();
                 let branch_ctx = ctx.fork_for_branch();
                 let script_exec_clone = script_executor.clone();
-                let graph_name = graph.name.clone();
+                let graph_clone = Arc::clone(&graph);
                 let current = node_id.clone();
                 let sem_clone = semaphore.clone();
                 let abort_clone = abort_signal.clone();
@@ -171,15 +176,13 @@ impl GraphExecutor {
                     let node_start = Instant::now();
                     let mut state = branch_state;
                     let mut ctx = branch_ctx;
-                    let result = step(
-                        &node,
-                        &mut state,
-                        &mut ctx,
-                        &script_exec_clone,
-                        &graph_name,
-                        &current,
-                    )
-                    .await;
+                    let step_ctx = StepContext {
+                        graph: graph_clone.as_ref(),
+                        script_executor: &script_exec_clone,
+                        max_concurrency,
+                        abort_signal: &abort_clone,
+                    };
+                    let result = step(&node, &mut state, &mut ctx, &step_ctx, &current).await;
                     let elapsed = node_start.elapsed();
                     (current, state, result, elapsed)
                 });
@@ -263,6 +266,23 @@ fn sorted_frontier(frontier: &HashSet<String>) -> Vec<String> {
     v
 }
 
+// Bundles the engine-config refs that every `step()` call needs to thread
+// through. Constructed once per spawned branch task (or once at the call site
+// for sequential paths) so step() and downstream executors (MapNodeExecutor)
+// take one parameter instead of five.
+pub(super) struct StepContext<'a> {
+    pub graph: &'a Graph,
+    pub script_executor: &'a ScriptExecutor,
+    pub max_concurrency: usize,
+    pub abort_signal: &'a AbortSignal,
+}
+
+impl StepContext<'_> {
+    pub fn graph_name(&self) -> &str {
+        &self.graph.name
+    }
+}
+
 enum StepResult {
     Continue(String),
     End(String),
@@ -272,8 +292,7 @@ async fn step(
     node: &Node,
     state: &mut StateManager,
     ctx: &mut RequestContext,
-    script_executor: &ScriptExecutor,
-    graph_name: &str,
+    step_ctx: &StepContext<'_>,
     current: &str,
 ) -> Result<StepResult> {
     match &node.node_type {
@@ -288,13 +307,16 @@ async fn step(
             Ok(StepResult::Continue(next))
         }
         NodeType::Script(script_node) => {
-            let dynamic = match script_executor.execute(script_node, state).await {
+            let dynamic = match step_ctx.script_executor.execute(script_node, state).await {
                 Ok(n) => n,
                 Err(e) => {
                     if let Some(fallback) = &script_node.fallback {
                         warn!(
                             "[graph:{}] script '{}' failed, routing to fallback '{}': {}",
-                            graph_name, current, fallback, e
+                            step_ctx.graph_name(),
+                            current,
+                            fallback,
+                            e
                         );
                         return Ok(StepResult::Continue(fallback.clone()));
                     }
@@ -334,10 +356,16 @@ async fn step(
             Ok(StepResult::Continue(next))
         }
         NodeType::End(end_node) => Ok(StepResult::End(resolve_end_output(end_node, state))),
-        NodeType::Map(_) => bail!(
-            "Map nodes are not yet supported in this build \
-             (parallel branch execution lands in Phase D/E)."
-        ),
+        NodeType::Map(map_node) => {
+            let next = node
+                .next_single()?
+                .ok_or_else(|| {
+                    anyhow!("map node '{current}' has no `next` and is not an end node")
+                })?
+                .to_string();
+            MapNodeExecutor::execute(map_node, state, ctx, step_ctx, current).await?;
+            Ok(StepResult::Continue(next))
+        }
     }
 }
 
