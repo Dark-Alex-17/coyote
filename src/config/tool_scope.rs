@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct ToolScope {
     pub functions: Functions,
     pub mcp_runtime: McpRuntime,
@@ -24,7 +25,7 @@ impl Default for ToolScope {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct McpRuntime {
     pub servers: HashMap<String, Arc<ConnectedServer>>,
 }

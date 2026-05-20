@@ -149,6 +149,56 @@ impl RequestContext {
         })
     }
 
+    /// Forks the context for one parallel branch of a graph super-step.
+    ///
+    /// Each branch gets a fresh, owned clone — mutations (role swap,
+    /// `before/after_chat_completion`, tool tracker, last_message, etc.) are
+    /// scoped to the branch and discarded when the branch finishes. The
+    /// user-visible state communication happens through the graph's
+    /// `StateManager` (via `fork_for_branch_state` + `diff_against` +
+    /// `apply_branch_writes` reducers), NOT through `RequestContext`.
+    ///
+    /// Distinction from `new_for_child`: `new_for_child` builds a fresh context
+    /// for a SPAWNED SUB-AGENT (different agent identity, different supervisor
+    /// hierarchy, depth+1, fresh tool tracker). `fork_for_branch` keeps the
+    /// caller's identity and supervisor hierarchy — it's a sibling clone of the
+    /// SAME logical agent, running one of N parallel work items.
+    ///
+    /// Behavior of per-field cloning:
+    /// - `Arc`-wrapped fields (`app`, `rag`, `supervisor`, `parent_supervisor`,
+    ///   `inbox`, `escalation_queue`) — shared via Arc::clone
+    /// - Owned heap fields (`model`, `role`, `session`, `agent`, `tool_scope`,
+    ///   `todo_list`, etc.) — deep `.clone()` so the branch can mutate freely
+    /// - `auto_continue_count` reset to 0 (each branch starts a fresh
+    ///   continuation budget)
+    /// - `last_continuation_response` reset to None
+    #[allow(dead_code)]
+    pub fn fork_for_branch(&self) -> Self {
+        Self {
+            app: Arc::clone(&self.app),
+            macro_flag: self.macro_flag,
+            info_flag: self.info_flag,
+            working_mode: self.working_mode,
+            model: self.model.clone(),
+            agent_variables: self.agent_variables.clone(),
+            role: self.role.clone(),
+            session: self.session.clone(),
+            rag: self.rag.clone(),
+            agent: self.agent.clone(),
+            last_message: self.last_message.clone(),
+            tool_scope: self.tool_scope.clone(),
+            supervisor: self.supervisor.clone(),
+            parent_supervisor: self.parent_supervisor.clone(),
+            self_agent_id: self.self_agent_id.clone(),
+            inbox: self.inbox.clone(),
+            escalation_queue: self.escalation_queue.clone(),
+            current_depth: self.current_depth,
+            auto_continue_count: 0,
+            todo_list: self.todo_list.clone(),
+            last_continuation_response: None,
+        }
+    }
+
     pub fn new_for_child(
         app: Arc<AppState>,
         parent: &Self,
