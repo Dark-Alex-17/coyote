@@ -1,6 +1,7 @@
 use super::types::Reducer;
 use anyhow::{Result, bail};
 use serde_json::{Number, Value};
+use crate::graph::type_name;
 
 /// Combines a branch's incoming write with the current state value (if any)
 /// via the specified reducer. The result is what gets written back to live
@@ -144,17 +145,6 @@ fn number_or_error(value: &Value, reducer_name: &str, position: &str) -> Result<
             "reducer '{reducer_name}' requires a number for the {position} value, got {}",
             type_name(value)
         ),
-    }
-}
-
-fn type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
     }
 }
 
