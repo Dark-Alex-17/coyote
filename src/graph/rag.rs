@@ -14,13 +14,12 @@ const DEFAULT_RAG_TIMEOUT_SECS: u64 = 120;
 pub struct RagNodeExecutor;
 
 impl RagNodeExecutor {
-    pub async fn execute(
+    pub(super) async fn execute(
         node: &RagNode,
         node_id: &str,
-        node_next: Option<&str>,
         state_manager: &mut StateManager,
         ctx: &mut RequestContext,
-    ) -> Result<String> {
+    ) -> Result<()> {
         let query_template = node.query.as_deref().unwrap_or(DEFAULT_QUERY);
         let query = state_manager
             .interpolate(query_template)
@@ -55,10 +54,7 @@ impl RagNodeExecutor {
 
         let output = build_rag_output(context, &sources_str);
         apply_state_updates(node, state_manager, &output);
-
-        node_next
-            .map(String::from)
-            .ok_or_else(|| anyhow!("rag node '{node_id}' has no `next` set"))
+        Ok(())
     }
 }
 

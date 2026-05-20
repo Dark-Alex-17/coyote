@@ -13,15 +13,26 @@ use tokio::time::timeout;
 
 const OUTPUT_KEY: &str = "output";
 
+/// What happened during an LLM node's execution, from the caller's routing
+/// perspective. `Continue` means the caller should advance via the node's
+/// declared `next:` targets (whether the LLM actually succeeded or failed
+/// without a fallback — either way, the executor uses node.next). `FellBack`
+/// means the LLM failed after retries and the node had a `fallback:` declared,
+/// so routing should go to that fallback target only.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LlmExecutionOutcome {
+    Continue,
+    FellBack(String),
+}
+
 pub struct LlmNodeExecutor;
 
 impl LlmNodeExecutor {
-    pub async fn execute(
+    pub(super) async fn execute(
         node: &LlmNode,
-        node_next: Option<&str>,
         state_manager: &mut StateManager,
         parent_ctx: &mut RequestContext,
-    ) -> Result<String> {
+    ) -> Result<LlmExecutionOutcome> {
         let result = run(node, state_manager, parent_ctx).await;
         let (output, failed) = match result {
             Ok(raw) => match &node.output_schema {
@@ -44,7 +55,15 @@ impl LlmNodeExecutor {
         };
 
         apply_state_updates_with_output(node, state_manager, &output);
-        next_for_llm_node(node_next, failed, node.fallback.as_deref())
+        Ok(outcome_from(failed, node.fallback.as_deref()))
+    }
+}
+
+fn outcome_from(failed: bool, fallback: Option<&str>) -> LlmExecutionOutcome {
+    if failed && let Some(fb) = fallback {
+        LlmExecutionOutcome::FellBack(fb.to_string())
+    } else {
+        LlmExecutionOutcome::Continue
     }
 }
 
@@ -298,19 +317,6 @@ fn is_transient(err: &Error) -> bool {
         || s.contains("produced no output")
 }
 
-fn next_for_llm_node(
-    node_next: Option<&str>,
-    failed: bool,
-    fallback: Option<&str>,
-) -> Result<String> {
-    if failed && let Some(fb) = fallback {
-        return Ok(fb.to_string());
-    }
-    node_next
-        .map(String::from)
-        .ok_or_else(|| anyhow!("llm node has no `next` set; llm nodes need static routing"))
-}
-
 fn apply_state_updates_with_output(
     node: &LlmNode,
     state_manager: &mut StateManager,
@@ -457,30 +463,29 @@ mod tests {
     }
 
     #[test]
-    fn next_for_llm_node_success_routes_to_next() {
+    fn outcome_from_success_is_continue() {
         assert_eq!(
-            next_for_llm_node(Some("nx"), false, Some("fb")).unwrap(),
-            "nx"
+            outcome_from(false, Some("fb")),
+            LlmExecutionOutcome::Continue
+        );
+        assert_eq!(outcome_from(false, None), LlmExecutionOutcome::Continue);
+    }
+
+    #[test]
+    fn outcome_from_failure_with_fallback_is_fell_back() {
+        assert_eq!(
+            outcome_from(true, Some("fb")),
+            LlmExecutionOutcome::FellBack("fb".to_string())
         );
     }
 
     #[test]
-    fn next_for_llm_node_failure_with_fallback_routes_to_fallback() {
-        assert_eq!(
-            next_for_llm_node(Some("nx"), true, Some("fb")).unwrap(),
-            "fb"
-        );
-    }
-
-    #[test]
-    fn next_for_llm_node_failure_without_fallback_routes_to_next() {
-        assert_eq!(next_for_llm_node(Some("nx"), true, None).unwrap(), "nx");
-    }
-
-    #[test]
-    fn next_for_llm_node_errors_without_next_or_fallback() {
-        assert!(next_for_llm_node(None, false, None).is_err());
-        assert!(next_for_llm_node(None, true, None).is_err());
+    fn outcome_from_failure_without_fallback_is_continue() {
+        // Failed but no fallback: caller routes via node.next as if successful.
+        // The error has already been recorded to state via the OUTPUT_KEY by
+        // execute(); the caller's `static_next_targets` will error if node.next
+        // is also missing.
+        assert_eq!(outcome_from(true, None), LlmExecutionOutcome::Continue);
     }
 
     fn node_with_schema(updates: Option<HashMap<String, String>>, schema: Value) -> LlmNode {

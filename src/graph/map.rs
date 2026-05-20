@@ -14,12 +14,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-// Map sub-branches are atomic — the branch node has no `next` (enforced by
-// validator rule C.5). But LLM/RAG node executors require an `Option<&str>` for
-// their routing argument and error if it's `None`. Passing this sentinel
-// satisfies their contract; the map executor discards the returned routing.
-const MAP_BRANCH_SENTINEL_NEXT: &str = "__map_branch_continuation__";
-
 pub(super) struct MapNodeExecutor;
 
 impl MapNodeExecutor {
@@ -99,26 +93,15 @@ impl MapNodeExecutor {
                 let mut ctx = sub_ctx;
 
                 let exec_result: Result<()> = match &branch_clone.node_type {
-                    NodeType::Llm(n) => LlmNodeExecutor::execute(
-                        n,
-                        Some(MAP_BRANCH_SENTINEL_NEXT),
-                        &mut state,
-                        &mut ctx,
-                    )
-                    .await
-                    .map(|_| ()),
+                    NodeType::Llm(n) => LlmNodeExecutor::execute(n, &mut state, &mut ctx)
+                        .await
+                        .map(|_| ()),
                     NodeType::Agent(n) => AgentNodeExecutor::execute(n, &mut state, &mut ctx)
                         .await
                         .map(|_| ()),
-                    NodeType::Rag(n) => RagNodeExecutor::execute(
-                        n,
-                        &sub_branch_id,
-                        Some(MAP_BRANCH_SENTINEL_NEXT),
-                        &mut state,
-                        &mut ctx,
-                    )
-                    .await
-                    .map(|_| ()),
+                    NodeType::Rag(n) => {
+                        RagNodeExecutor::execute(n, &sub_branch_id, &mut state, &mut ctx).await
+                    }
                     NodeType::Script(n) => script_clone.execute(n, &mut state).await.map(|_| ()),
                     _ => Err(anyhow!(
                         "map branch '{}' has type that cannot run inside a map \
