@@ -4,14 +4,14 @@ use super::llm::LlmNodeExecutor;
 use super::rag::RagNodeExecutor;
 use super::state::StateManager;
 use super::types::{MapNode, NodeType};
-use crate::config::RequestContext;
+use crate::config::{RenderMode, RequestContext};
+use crate::graph::type_name;
 use anyhow::{Context, Result, anyhow};
 use futures_util::future::join_all;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use crate::graph::type_name;
 
 // Map sub-branches are atomic — the branch node has no `next` (enforced by
 // validator rule C.5). But LLM/RAG node executors require an `Option<&str>` for
@@ -66,7 +66,8 @@ impl MapNodeExecutor {
             let as_name = node.as_name.clone();
             let branch_clone = branch_node.clone();
             let mut sub_state = state.fork_for_branch_state();
-            let sub_ctx = ctx.fork_for_branch();
+            let mut sub_ctx = ctx.fork_for_branch();
+            sub_ctx.render_mode = RenderMode::Silent;
             let script_clone = step_ctx.script_executor.clone();
             let sub_branch_id = node.branch.clone();
             let sem = semaphore.clone();

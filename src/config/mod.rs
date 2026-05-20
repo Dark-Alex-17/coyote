@@ -21,7 +21,7 @@ pub use self::app_config::AppConfig;
 pub use self::app_state::AppState;
 pub use self::input::Input;
 #[allow(unused_imports)]
-pub use self::request_context::RequestContext;
+pub use self::request_context::{RenderMode, RequestContext};
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
