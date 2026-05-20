@@ -1,7 +1,7 @@
 use super::types::Reducer;
+use crate::graph::type_name;
 use anyhow::{Result, bail};
 use serde_json::{Number, Value};
-use crate::graph::type_name;
 
 /// Combines a branch's incoming write with the current state value (if any)
 /// via the specified reducer. The result is what gets written back to live

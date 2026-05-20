@@ -1,6 +1,7 @@
 use super::agent::AgentNodeExecutor;
 use super::executor::StepContext;
 use super::llm::LlmNodeExecutor;
+use super::progress::{BranchProgressHandle, BranchProgressTracker};
 use super::rag::RagNodeExecutor;
 use super::state::StateManager;
 use super::types::{MapNode, NodeType};
@@ -59,6 +60,7 @@ impl MapNodeExecutor {
             .unwrap_or(step_ctx.max_concurrency)
             .max(1);
         let semaphore = Arc::new(Semaphore::new(max_conc));
+        let progress_tracker = BranchProgressTracker::new();
         let mut sub_tasks = Vec::with_capacity(items.len());
 
         for (idx, item) in items.iter().enumerate() {
@@ -72,15 +74,21 @@ impl MapNodeExecutor {
             let sub_branch_id = node.branch.clone();
             let sem = semaphore.clone();
             let abort = step_ctx.abort_signal.clone();
+            let progress_handle: BranchProgressHandle =
+                progress_tracker.add_branch(&format!("{}[{idx}]", node.branch));
 
             sub_state.state_mut().set(as_name, item);
 
             let task = tokio::spawn(async move {
+                let mut progress_handle = Some(progress_handle);
                 let _permit = sem
                     .acquire()
                     .await
                     .expect("map semaphore should not be closed");
                 if abort.aborted() {
+                    if let Some(h) = progress_handle.take() {
+                        h.fail("aborted");
+                    }
                     return (
                         idx,
                         sub_state,
@@ -119,12 +127,20 @@ impl MapNodeExecutor {
                     )),
                 };
 
+                if let Some(h) = progress_handle.take() {
+                    match &exec_result {
+                        Ok(_) => h.complete(),
+                        Err(e) => h.fail(&e.to_string()),
+                    }
+                }
+
                 (idx, state, exec_result)
             });
             sub_tasks.push(task);
         }
 
         let joined = join_all(sub_tasks).await;
+        progress_tracker.clear();
 
         // Collect outputs keyed by input index so order is preserved regardless
         // of finish order. This is the user-facing contract from plan E.2.
