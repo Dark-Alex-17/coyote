@@ -940,9 +940,9 @@ prompt: Classify
 next: [retrieve_local, retrieve_web, retrieve_docs]
 "#;
         let node: Node = serde_yaml::from_str(yaml).unwrap();
-        
+
         let targets = node.next.as_ref().expect("next should be present");
-        
+
         assert!(targets.is_fan_out());
         assert_eq!(
             targets.as_slice(),
@@ -963,9 +963,9 @@ prompt: Classify
 next: retrieve
 "#;
         let node: Node = serde_yaml::from_str(yaml).unwrap();
-        
+
         let targets = node.next.as_ref().expect("next should be present");
-        
+
         assert!(!targets.is_fan_out());
         assert_eq!(node.next_target(), Some("retrieve"));
     }
@@ -979,9 +979,9 @@ prompt: Classify
 next: [a, b]
 "#;
         let node: Node = serde_yaml::from_str(yaml).unwrap();
-        
+
         let err = node.next_single().unwrap_err().to_string();
-        
+
         assert!(err.contains("Parallel fan-out"), "got: {err}");
         assert!(err.contains("not yet implemented"), "got: {err}");
     }
@@ -994,9 +994,9 @@ type: llm
 prompt: Classify
 next: [retrieve]
 "#;
-        
+
         let node: Node = serde_yaml::from_str(yaml).unwrap();
-        
+
         assert_eq!(node.next_single().unwrap(), Some("retrieve"));
         assert_eq!(node.next_target(), Some("retrieve"));
     }
@@ -1036,9 +1036,9 @@ nodes:
     type: end
     output: ok
 "#;
-        
+
         let graph: Graph = serde_yaml::from_str(yaml).unwrap();
-        
+
         assert_eq!(graph.reducers.len(), 8);
         assert_eq!(graph.reducers.get("sources"), Some(&Reducer::Append));
         assert_eq!(graph.reducers.get("findings"), Some(&Reducer::Extend));
@@ -1053,18 +1053,18 @@ nodes:
     #[test]
     fn reducers_default_to_empty_when_block_absent() {
         let yaml = "name: g\nstart: x\nnodes:\n  x:\n    type: end\n";
-        
+
         let graph: Graph = serde_yaml::from_str(yaml).unwrap();
-        
+
         assert!(graph.reducers.is_empty());
     }
 
     #[test]
     fn max_concurrency_defaults_to_eight() {
         let yaml = "name: g\nstart: x\nnodes:\n  x:\n    type: end\n";
-        
+
         let graph: Graph = serde_yaml::from_str(yaml).unwrap();
-        
+
         assert_eq!(graph.settings.max_concurrency, 8);
     }
 
@@ -1079,9 +1079,9 @@ nodes:
   x:
     type: end
 "#;
-        
+
         let graph: Graph = serde_yaml::from_str(yaml).unwrap();
-        
+
         assert_eq!(graph.settings.max_concurrency, 16);
     }
 
@@ -1099,12 +1099,12 @@ max_concurrency: 5
 next: rank
 "#;
         let node: Node = serde_yaml::from_str(yaml).unwrap();
-        
+
         let map = match node.node_type {
             NodeType::Map(m) => m,
             _ => panic!("expected Map variant"),
         };
-        
+
         assert_eq!(map.over, "{{subjects}}");
         assert_eq!(map.as_name, "subject");
         assert_eq!(map.branch, "research_subject");
@@ -1124,12 +1124,12 @@ branch: process
 collect_into: results
 "#;
         let node: Node = serde_yaml::from_str(yaml).unwrap();
-        
+
         let map = match node.node_type {
             NodeType::Map(m) => m,
             _ => panic!("expected Map variant"),
         };
-        
+
         assert_eq!(map.output_key, "output");
         assert!(map.max_concurrency.is_none());
     }
