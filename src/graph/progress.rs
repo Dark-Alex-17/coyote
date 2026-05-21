@@ -1,10 +1,14 @@
 use crate::utils::IS_STDOUT_TERMINAL;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
 
 static SPINNER_STYLE: LazyLock<ProgressStyle> = LazyLock::new(|| {
-    ProgressStyle::with_template("{spinner} [{prefix}] {msg}")
+    ProgressStyle::with_template("{spinner} [{prefix}] {msg} ({elapsed})")
         .expect("valid template")
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""])
 });
@@ -33,36 +37,27 @@ impl BranchProgressTracker {
         bar.set_prefix(label.to_string());
         bar.set_message("running…");
         bar.enable_steady_tick(Duration::from_millis(80));
-        BranchProgressHandle {
-            bar: Some(bar),
-            started: Instant::now(),
-        }
+        BranchProgressHandle { bar: Some(bar) }
     }
 }
 
 pub(super) struct BranchProgressHandle {
     bar: Option<ProgressBar>,
-    started: Instant,
 }
 
 impl BranchProgressHandle {
     pub fn disabled() -> Self {
-        Self {
-            bar: None,
-            started: Instant::now(),
-        }
+        Self { bar: None }
     }
 
     pub fn complete(self) {
         if let Some(bar) = self.bar {
-            let elapsed = self.started.elapsed();
-            bar.finish_with_message(format!("✓ done ({:.1}s)", elapsed.as_secs_f64()));
+            bar.finish_with_message(format!("{GREEN}✓ done{RESET}"));
         }
     }
 
     pub fn fail(self, err: &str) {
         if let Some(bar) = self.bar {
-            let elapsed = self.started.elapsed();
             let truncated = if err.len() > 80 {
                 let mut s = err[..80].to_string();
                 s.push('…');
@@ -70,11 +65,7 @@ impl BranchProgressHandle {
             } else {
                 err.to_string()
             };
-            bar.finish_with_message(format!(
-                "✗ failed ({:.1}s) — {}",
-                elapsed.as_secs_f64(),
-                truncated
-            ));
+            bar.finish_with_message(format!("{RED}✗ failed {RESET} — {truncated}"));
         }
     }
 }
