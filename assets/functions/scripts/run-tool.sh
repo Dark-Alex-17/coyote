@@ -70,11 +70,11 @@ def to_args:
     to_entries | .[] |
     (.key | split("_") | join("-")) as $key |
     if .value | type == "array" then
-        .value | .[] | "--\($key) \(. | escape_shell_word)"
+        .value | .[] | "--\($key)=\(. | escape_shell_word)"
     elif .value | type == "boolean" then
         if .value then "--\($key)" else "" end
     else
-        "--\($key) \(.value | escape_shell_word)"
+        "--\($key)=\(.value | escape_shell_word)"
     end;
 [ to_args ] | join(" ")
 EOF
