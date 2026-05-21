@@ -45,6 +45,22 @@ conversation_starters:             # Suggested prompts surfaced in the UI
   - "Research the current state of WebAssembly outside the browser"
 
 # ---------------------------------------------------------------------------
+# Agent variables (optional)
+# Declared the same way as a normal agent's config.yaml `variables:` block.
+# Each variable becomes available to:
+#   - LLM nodes via the template form `{{name}}` once seeded into state
+#     (see initial_state below).
+#   - Script nodes via the env var `LLM_AGENT_VAR_<UPPER_NAME>`.
+# Values may be overridden at runtime with
+#   `loki -a <agent> --agent-variable <name> <value> "..."`.
+# ---------------------------------------------------------------------------
+variables:
+  - name: project_dir
+    description: |
+      Absolute path to the project directory.
+    default: "."
+
+# ---------------------------------------------------------------------------
 # Execution settings (all optional)
 # ---------------------------------------------------------------------------
 settings:
@@ -206,6 +222,18 @@ nodes:
   # file, used when state exceeds 32 KiB). Exactly one is set. It must print
   # a single JSON object on stdout: keys merge into state, and the reserved
   # `_next` key (if present) overrides routing.
+  #
+  # The script also receives these env vars (parity with bash tools called
+  # from normal agents):
+  #   GRAPH_STATE / GRAPH_STATE_FILE  state payload (one of the two is set)
+  #   LLM_ROOT_DIR                    loki config dir
+  #   LLM_PROMPT_UTILS_FILE           path to .shared/prompt-utils.sh
+  #   LLM_AGENT_DATA_DIR              this agent's data directory
+  #   LLM_AGENT_VAR_<NAME>            one per declared `variables:` entry
+  #   PATH                            with loki's functions bin dir prepended
+  #   CLICOLOR_FORCE / FORCE_COLOR    so child tools emit ANSI colors
+  # The script's working directory is loki's invocation CWD (not the agent
+  # directory), matching the behavior of bash tools.
   #
   # This node fires once: after both `retrieve` and `web_search` finish.
   # The BSP scheduler dedups the two incoming edges into a single frontier
