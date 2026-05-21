@@ -39,8 +39,12 @@ impl GraphExecutor {
         ctx: &mut RequestContext,
         abort_signal: AbortSignal,
     ) -> Result<String> {
-        let mut logger =
-            GraphLogger::new(&self.graph.name, self.graph.settings.log_state_snapshots);
+        let is_nested = ctx.current_depth > 0;
+        let mut logger = GraphLogger::with_visibility(
+            &self.graph.name,
+            self.graph.settings.log_state_snapshots,
+            is_nested,
+        );
         let result = self.run(&mut logger, ctx, abort_signal).await;
         if let Err(e) = &result {
             logger.graph_error(e);
@@ -143,12 +147,14 @@ impl GraphExecutor {
             let semaphore = Arc::new(Semaphore::new(max_concurrency));
 
             let frontier_size = frontier.len();
+            let is_nested = ctx.current_depth > 0;
             let has_progress_nodes = frontier.iter().any(|nid| {
                 graph.get_node(nid).is_some_and(|n| {
                     !matches!(n.node_type, NodeType::Approval(_) | NodeType::Input(_))
                 })
             });
-            let progress_tracker = has_progress_nodes.then(BranchProgressTracker::new);
+            let progress_tracker =
+                (has_progress_nodes && !is_nested).then(BranchProgressTracker::new);
             let mut branch_tasks = Vec::with_capacity(frontier_size);
             for node_id in &frontier {
                 let node = graph

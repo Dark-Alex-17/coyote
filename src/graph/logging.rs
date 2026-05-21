@@ -25,14 +25,16 @@ impl NodeTiming {
 pub struct GraphLogger {
     graph_name: String,
     log_state_snapshots: bool,
+    silent: bool,
     timings: IndexMap<String, NodeTiming>,
 }
 
 impl GraphLogger {
-    pub fn new(graph_name: &str, log_state_snapshots: bool) -> Self {
+    pub fn with_visibility(graph_name: &str, log_state_snapshots: bool, silent: bool) -> Self {
         Self {
             graph_name: graph_name.to_string(),
             log_state_snapshots,
+            silent,
             timings: IndexMap::new(),
         }
     }
@@ -42,13 +44,15 @@ impl GraphLogger {
             "[graph:{}] start at '{}' ({} nodes)",
             self.graph_name, start_node, node_count
         );
-        eprintln!(
-            "{}",
-            dimmed_text(&format!(
-                "▸ graph: {} (start: {start_node})",
-                self.graph_name
-            ))
-        );
+        if !self.silent {
+            eprintln!(
+                "{}",
+                dimmed_text(&format!(
+                    "▸ graph: {} (start: {start_node})",
+                    self.graph_name
+                ))
+            );
+        }
     }
 
     pub fn graph_complete(&self, end_node: &str, elapsed: Duration) {
@@ -56,10 +60,12 @@ impl GraphLogger {
             "[graph:{}] end '{}' (elapsed {:?})",
             self.graph_name, end_node, elapsed
         );
-        eprintln!(
-            "{}",
-            dimmed_text(&format!("▸ graph done in {:.2}s", elapsed.as_secs_f64()))
-        );
+        if !self.silent {
+            eprintln!(
+                "{}",
+                dimmed_text(&format!("▸ graph done in {:.2}s", elapsed.as_secs_f64()))
+            );
+        }
         self.log_performance_summary();
     }
 
@@ -157,7 +163,7 @@ mod tests {
 
     #[test]
     fn records_and_aggregates_node_timings() {
-        let mut logger = GraphLogger::new("g", false);
+        let mut logger = GraphLogger::with_visibility("g", false, false);
         logger.record_timing("a", Duration::from_millis(100));
         logger.record_timing("a", Duration::from_millis(300));
         logger.record_timing("b", Duration::from_millis(50));
@@ -187,7 +193,7 @@ mod tests {
 
     #[test]
     fn new_logger_has_no_timings() {
-        let logger = GraphLogger::new("g", true);
+        let logger = GraphLogger::with_visibility("g", true, false);
 
         assert!(logger.timings.is_empty());
         assert!(logger.log_state_snapshots);
