@@ -76,7 +76,12 @@ impl GraphExecutor {
         }
 
         let mut state = StateManager::new(graph.initial_state.clone());
-        let script_executor = ScriptExecutor::new(&base_dir);
+        let agent_envs = ctx
+            .agent
+            .as_ref()
+            .map(|a| a.variable_envs())
+            .unwrap_or_default();
+        let script_executor = ScriptExecutor::new(&base_dir).with_envs(agent_envs);
         let max_iterations = graph.settings.max_loop_iterations;
         let graph_timeout = graph.settings.timeout.map(Duration::from_secs);
         let max_concurrency = graph.settings.max_concurrency;
