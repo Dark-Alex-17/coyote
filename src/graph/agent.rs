@@ -3,7 +3,6 @@ use super::structured;
 use super::types::AgentNode;
 use crate::config::RequestContext;
 use crate::function::supervisor::run_agent_for_graph;
-use crate::utils::dimmed_text;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::time::Duration;
@@ -23,14 +22,6 @@ impl AgentNodeExecutor {
         let prompt = state_manager
             .interpolate(&node.prompt)
             .with_context(|| format!("Failed to interpolate prompt for agent '{}'", node.agent))?;
-
-        eprintln!(
-            "{}",
-            dimmed_text(&format!("▸   spawning agent '{}' with prompt:", node.agent))
-        );
-        for line in indent_prompt(&prompt, 6) {
-            eprintln!("{}", dimmed_text(&line));
-        }
 
         let timeout_dur = Duration::from_secs(node.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
@@ -64,21 +55,6 @@ impl AgentNodeExecutor {
 
         Ok(raw)
     }
-}
-
-fn indent_prompt(prompt: &str, prefix_spaces: usize) -> Vec<String> {
-    const MAX_LINES: usize = 12;
-    let pad = " ".repeat(prefix_spaces);
-    let mut out: Vec<String> = prompt
-        .lines()
-        .take(MAX_LINES)
-        .map(|line| format!("{pad}{line}"))
-        .collect();
-    let total = prompt.lines().count();
-    if total > MAX_LINES {
-        out.push(format!("{pad}... ({} more lines)", total - MAX_LINES));
-    }
-    out
 }
 
 fn apply_state_updates(node: &AgentNode, state_manager: &mut StateManager, output: &Value) {

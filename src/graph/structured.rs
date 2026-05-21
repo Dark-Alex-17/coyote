@@ -1,6 +1,6 @@
 use crate::client::call_chat_completions;
 use crate::config::{Input, RequestContext, Role, RoleLike};
-use crate::utils::{create_abort_signal, dimmed_text};
+use crate::utils::create_abort_signal;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::sync::Arc;
@@ -24,10 +24,6 @@ pub async fn extract(raw: &str, schema: &Value, parent_ctx: &mut RequestContext)
         return Ok(parsed);
     }
 
-    eprintln!(
-        "{}",
-        dimmed_text("▸   structured-output: parsing raw output failed, invoking extractor")
-    );
     extract_via_extractor(raw, schema, parent_ctx, false).await
 }
 
@@ -53,14 +49,7 @@ async fn extract_via_extractor(
             "Structured-output extractor failed to produce valid JSON after repair retry. \
              Last response:\n{output}"
         ),
-        None => {
-            eprintln!(
-                "{}",
-                dimmed_text("▸   structured-output: extractor returned invalid JSON, retrying")
-            );
-
-            Box::pin(extract_via_extractor(&output, schema, parent_ctx, true)).await
-        }
+        None => Box::pin(extract_via_extractor(&output, schema, parent_ctx, true)).await,
     }
 }
 

@@ -1,7 +1,7 @@
 use super::state::StateManager;
 use super::types::RagNode;
 use crate::config::RequestContext;
-use crate::utils::{create_abort_signal, dimmed_text};
+use crate::utils::create_abort_signal;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value};
 use std::time::Duration;
@@ -33,11 +33,6 @@ impl RagNodeExecutor {
 
         let top_k = node.top_k.unwrap_or_else(|| rag.configured_top_k());
         let rerank = rag.configured_reranker();
-
-        eprintln!(
-            "{}",
-            dimmed_text(&format!("▸   rag lookup: node={node_id} top_k={top_k}"))
-        );
 
         let timeout_dur = Duration::from_secs(node.timeout.unwrap_or(DEFAULT_RAG_TIMEOUT_SECS));
         let abort = create_abort_signal();

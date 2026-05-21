@@ -3,7 +3,7 @@ use super::structured;
 use super::types::LlmNode;
 use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::{Input, RequestContext, Role, RoleLike};
-use crate::utils::{create_abort_signal, dimmed_text};
+use crate::utils::create_abort_signal;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -100,15 +100,6 @@ async fn run(
 
     let (regular_tools, mcp_servers) = categorize_tools(node.tools.as_deref());
     validate_tools_subset(&regular_tools, &mcp_servers, parent_ctx)?;
-
-    eprintln!(
-        "{}",
-        dimmed_text(&format!(
-            "▸   llm call: model={} tools={}",
-            node.model.as_deref().unwrap_or("<active>"),
-            describe_tools_filter(node.tools.as_deref())
-        ))
-    );
 
     let role = build_inline_role(
         node,
@@ -363,13 +354,6 @@ fn format_schema_hint(schema: &Value) -> String {
     )
 }
 
-fn describe_tools_filter(tools: Option<&[String]>) -> String {
-    match tools {
-        Some(t) if !t.is_empty() => t.join(","),
-        _ => "<none>".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::types::*;
@@ -569,14 +553,6 @@ mod tests {
         assert!(hint.contains("\"goal\""));
         assert!(hint.contains("JSON"));
         assert!(hint.contains("ONLY"));
-    }
-
-    #[test]
-    fn describe_tools_filter_renders_each_case() {
-        assert_eq!(describe_tools_filter(None), "<none>");
-        assert_eq!(describe_tools_filter(Some(&[])), "<none>");
-        let tools = vec!["a".to_string(), "b".to_string()];
-        assert_eq!(describe_tools_filter(Some(&tools)), "a,b");
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use super::state::{StateManager, StateRepresentation};
 use super::types::ScriptNode;
 use crate::function::Language;
-use crate::utils::dimmed_text;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -31,11 +30,6 @@ impl ScriptExecutor {
         if !script_path.exists() {
             bail!("Script file not found: '{}'", script_path.display());
         }
-
-        eprintln!(
-            "{}",
-            dimmed_text(&format!("▸   running script '{}'", node.script))
-        );
 
         let language = detect_language(&script_path)?;
         let state_repr = state_manager.serialize_state()?;
@@ -97,23 +91,6 @@ impl ScriptExecutor {
                     script_path.display()
                 )
             })?;
-
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(json_output) {
-            let keys: Vec<&str> = parsed
-                .keys()
-                .filter(|k| k.as_str() != "_next")
-                .map(|s| s.as_str())
-                .collect();
-            if !keys.is_empty() {
-                eprintln!(
-                    "{}",
-                    dimmed_text(&format!("▸   merged: {}", keys.join(", ")))
-                );
-            }
-            if let Some(n) = &next {
-                eprintln!("{}", dimmed_text(&format!("▸   script set _next = '{n}'")));
-            }
-        }
 
         apply_state_updates(node, state_manager);
 

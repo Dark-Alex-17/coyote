@@ -123,7 +123,7 @@ impl MapNodeExecutor {
         }
 
         let joined = join_all(sub_tasks).await;
-        progress_tracker.clear();
+        drop(progress_tracker);
 
         // Collect outputs keyed by input index so order is preserved regardless
         // of finish order. This is the user-facing contract from plan E.2.
