@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::config::{paths, RenderMode};
+use crate::config::{RenderMode, paths};
 use crate::{
     config::{AppConfig, Input, RequestContext},
     function::{FunctionDeclaration, ToolCall, ToolResult, eval_tool_calls},
@@ -418,7 +418,8 @@ pub async fn call_chat_completions(
     abort_signal: AbortSignal,
 ) -> Result<(String, Vec<ToolResult>)> {
     let is_child_agent = ctx.current_depth > 0;
-    let spinner_message = if is_child_agent { "" } else { "Generating" };
+    let suppress_spinner = is_child_agent || ctx.render_mode == RenderMode::Silent;
+    let spinner_message = if suppress_spinner { "" } else { "Generating" };
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
         spinner_message,
@@ -459,13 +460,14 @@ pub async fn call_chat_completions_streaming(
 ) -> Result<(String, Vec<ToolResult>)> {
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
-    if ctx.render_mode == RenderMode::Silent {
+    let silent = ctx.render_mode == RenderMode::Silent;
+    if silent {
         handler.set_silent(true);
     }
 
     let (send_ret, render_ret) = tokio::join!(
         client.chat_completions_streaming(input, &mut handler),
-        render_stream(rx, client.app_config(), abort_signal.clone()),
+        render_stream(rx, client.app_config(), abort_signal.clone(), silent),
     );
 
     if handler.abort().aborted() {

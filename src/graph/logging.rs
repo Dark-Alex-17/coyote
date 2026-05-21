@@ -72,10 +72,6 @@ impl GraphLogger {
             "[graph:{}] entering '{}' (visit {visit})",
             self.graph_name, node.id
         );
-        eprintln!(
-            "{}",
-            dimmed_text(&format!("▸ {} ({})", node.id, node_type_label(node)))
-        );
     }
 
     pub fn record_timing(&mut self, node_id: &str, elapsed: Duration) {
@@ -142,7 +138,7 @@ impl GraphLogger {
     }
 }
 
-fn node_type_label(node: &Node) -> &'static str {
+pub(super) fn node_type_label(node: &Node) -> &'static str {
     match &node.node_type {
         NodeType::Agent(_) => "agent",
         NodeType::Script(_) => "script",

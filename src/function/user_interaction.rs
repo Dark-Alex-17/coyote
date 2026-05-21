@@ -2,7 +2,7 @@ use super::{FunctionDeclaration, JsonSchema};
 use crate::config::RequestContext;
 use crate::supervisor::escalation::{EscalationRequest, new_escalation_id};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
 use inquire::{Confirm, MultiSelect, Select, Text};
 use serde_json::{Value, json};
@@ -155,7 +155,10 @@ fn handle_direct_ask(args: &Value) -> Result<Value> {
     let mut options = parse_options(args)?;
     options.push(CUSTOM_MULTI_CHOICE_ANSWER_OPTION.to_string());
 
-    let mut answer = Select::new(question, options).prompt()?;
+    let mut answer = Select::new(question, options)
+        .without_filtering()
+        .with_help_message("↑↓ to move, enter to select")
+        .prompt()?;
 
     if answer == CUSTOM_MULTI_CHOICE_ANSWER_OPTION {
         answer = Text::new("Custom response:").prompt()?
@@ -205,12 +208,11 @@ async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> R
         .ok_or_else(|| anyhow!("'question' is required"))?
         .to_string();
 
-    let options: Option<Vec<String>> = args.get("options").and_then(Value::as_array).map(|arr| {
-        arr.iter()
-            .filter_map(Value::as_str)
-            .map(String::from)
-            .collect()
-    });
+    let options: Option<Vec<String>> = if args.get("options").is_some() {
+        Some(parse_options(args)?)
+    } else {
+        None
+    };
 
     let from_agent_id = ctx
         .self_agent_id
@@ -262,13 +264,24 @@ async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> R
 }
 
 fn parse_options(args: &Value) -> Result<Vec<String>> {
-    args.get("options")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .ok_or_else(|| anyhow!("'options' is required and must be an array of strings"))
+    let raw = args
+        .get("options")
+        .ok_or_else(|| anyhow!("'options' is required and must be an array of strings"))?;
+
+    let arr: Vec<Value> = match raw {
+        Value::Array(arr) => arr.clone(),
+        Value::String(s) => serde_json::from_str::<Vec<Value>>(s).map_err(|_| {
+            anyhow!(
+                "'options' was a string but did not parse as a JSON array. \
+                 Pass options as a native JSON array, e.g. [\"yes\", \"no\"]."
+            )
+        })?,
+        _ => bail!("'options' is required and must be an array of strings"),
+    };
+
+    Ok(arr
+        .iter()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect())
 }

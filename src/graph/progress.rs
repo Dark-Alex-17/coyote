@@ -46,12 +46,6 @@ impl BranchProgressTracker {
             started: Instant::now(),
         }
     }
-
-    pub fn clear(&self) {
-        if let Some(multi) = &self.multi {
-            let _ = multi.clear();
-        }
-    }
 }
 
 pub(super) struct BranchProgressHandle {
@@ -60,7 +54,7 @@ pub(super) struct BranchProgressHandle {
 }
 
 impl BranchProgressHandle {
-    fn disabled() -> Self {
+    pub fn disabled() -> Self {
         Self {
             bar: None,
             started: Instant::now(),
