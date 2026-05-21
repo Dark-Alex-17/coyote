@@ -1,24 +1,41 @@
 use super::state::{StateManager, StateRepresentation};
 use super::types::ScriptNode;
+use crate::config::paths;
 use crate::function::Language;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+#[cfg(windows)]
+const PATH_SEP: &str = ";";
+#[cfg(not(windows))]
+const PATH_SEP: &str = ":";
+
 #[derive(Clone)]
 pub struct ScriptExecutor {
     base_dir: PathBuf,
+    extra_envs: HashMap<String, String>,
 }
 
 impl ScriptExecutor {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        let base_dir = base_dir.into();
+        let extra_envs = build_default_envs(&base_dir);
         Self {
-            base_dir: base_dir.into(),
+            base_dir,
+            extra_envs,
         }
+    }
+
+    pub fn with_envs(mut self, envs: HashMap<String, String>) -> Self {
+        self.extra_envs.extend(envs);
+        self
     }
 
     pub async fn execute(
@@ -35,9 +52,9 @@ impl ScriptExecutor {
         let state_repr = state_manager.serialize_state()?;
 
         let mut cmd = build_command(language, &script_path)?;
-        cmd.current_dir(&self.base_dir);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        cmd.envs(&self.extra_envs);
         match &state_repr {
             StateRepresentation::Inline(json) => {
                 cmd.env("GRAPH_STATE", json);
@@ -109,6 +126,36 @@ fn apply_state_updates(node: &ScriptNode, state_manager: &mut StateManager) {
             .state_mut()
             .set(key.clone(), Value::String(value));
     }
+}
+
+fn build_default_envs(agent_data_dir: &Path) -> HashMap<String, String> {
+    let mut envs = HashMap::new();
+    envs.insert(
+        "LLM_ROOT_DIR".to_string(),
+        paths::config_dir().to_string_lossy().into_owned(),
+    );
+    envs.insert(
+        "LLM_PROMPT_UTILS_FILE".to_string(),
+        paths::bash_prompt_utils_file()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    envs.insert(
+        "LLM_AGENT_DATA_DIR".to_string(),
+        agent_data_dir.to_string_lossy().into_owned(),
+    );
+    envs.insert("CLICOLOR_FORCE".to_string(), "1".to_string());
+    envs.insert("FORCE_COLOR".to_string(), "1".to_string());
+
+    if let Ok(current_path) = env::var("PATH") {
+        let bin_dir = paths::functions_bin_dir();
+        envs.insert(
+            "PATH".to_string(),
+            format!("{}{}{}", bin_dir.display(), PATH_SEP, current_path),
+        );
+    }
+
+    envs
 }
 
 fn detect_language(script_path: &Path) -> Result<Language> {

@@ -1,3 +1,4 @@
+use crate::config::AgentVariable;
 use anyhow::Result;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,9 @@ pub struct Graph {
 
     #[serde(default)]
     pub conversation_starters: Vec<String>,
+
+    #[serde(default)]
+    pub variables: Vec<AgentVariable>,
 
     #[serde(default)]
     pub settings: GraphSettings,

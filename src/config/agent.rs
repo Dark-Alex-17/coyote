@@ -678,6 +678,7 @@ impl AgentConfig {
             global_tools: graph.global_tools.clone(),
             mcp_servers: graph.mcp_servers.clone(),
             conversation_starters: graph.conversation_starters.clone(),
+            variables: graph.variables.clone(),
             can_spawn_agents: graph.has_agent_node(),
             max_concurrent_agents: default_max_concurrent_agents(),
             max_agent_depth: default_max_agent_depth(),

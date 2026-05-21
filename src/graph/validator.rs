@@ -848,6 +848,7 @@ mod tests {
             global_tools: Vec::new(),
             mcp_servers: Vec::new(),
             conversation_starters: Vec::new(),
+            variables: Vec::new(),
             settings: GraphSettings::default(),
             initial_state: HashMap::new(),
             reducers: HashMap::new(),

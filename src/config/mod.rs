@@ -14,7 +14,9 @@ pub(crate) mod todo;
 mod tool_scope;
 mod update;
 
-pub use self::agent::{Agent, AgentVariables, complete_agent_variables, list_agents};
+pub use self::agent::{
+    Agent, AgentVariable, AgentVariables, complete_agent_variables, list_agents,
+};
 #[allow(unused_imports)]
 pub use self::app_config::AppConfig;
 #[allow(unused_imports)]
