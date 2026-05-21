@@ -321,17 +321,13 @@ impl GraphValidator {
         }
     }
 
-    // Phase C — Parallel-execution validation.
+    // Parallel-execution validation.
     //
-    // The v1 algorithm uses immediate-successor analysis only: a parallel
-    // group is the set of `next:` targets of a single fan-out node. Map nodes
-    // are checked separately by `validate_map_branches` (the branch is
-    // self-parallel, but enforcement comes from strict-mode rules on the
-    // branch node, not from group membership). Transitive parallel groups
-    // (deeper fan-out chains) are a v2 enhancement; v1 over-reports rather
-    // than under-reports — a false positive forces an unneeded reducer
-    // (mild annoyance); a false negative allows silent data races (catastrophic).
-
+    // The v1 algorithm uses immediate-successor analysis only: a parallel group is the set of `next:` targets of a
+    // single fan-out node. Map nodes are checked separately by `validate_map_branches` (the branch is self-parallel,
+    // but enforcement comes from strict-mode rules on the branch node, not from group membership). Transitive parallel
+    // groups (deeper fan-out chains) are a v2 enhancement; v1 over-reports rather than under-reports. A false positive
+    // forces an unneeded reducer (mild annoyance); a false negative allows silent data races (catastrophic).
     fn validate_max_concurrency(&self, graph: &Graph, result: &mut ValidationResult) {
         if graph.settings.max_concurrency == 0 {
             result.error(ValidationError::new(
@@ -613,15 +609,12 @@ fn declared_targets(node: &Node) -> Vec<(String, &'static str)> {
                 out.push((t.clone(), "llm 'fallback'"));
             }
         }
-        // `agent`/`input`/`rag` route only via `next` (already collected
-        // above); `end` is terminal. No type-specific routing edges to add.
-        NodeType::Agent(_) | NodeType::Input(_) | NodeType::Rag(_) | NodeType::End(_) => {}
-        // A `map` node invokes its `branch:` target once per item from the
-        // resolved `over` list. The branch is statically referenced, so it
-        // is a real declared edge for cycle/reachability purposes.
         NodeType::Map(m) => {
             out.push((m.branch.clone(), "map 'branch'"));
         }
+        // `agent`/`input`/`rag` route only via `next` (already collected
+        // above); `end` is terminal. No type-specific routing edges to add.
+        NodeType::Agent(_) | NodeType::Input(_) | NodeType::Rag(_) | NodeType::End(_) => {}
     }
     out
 }
@@ -653,13 +646,11 @@ fn find_reachable_nodes(graph: &Graph) -> HashSet<String> {
     reachable
 }
 
-// v1 parallel-group detection: only the immediate `next` targets of a fan-out
-// node count as a parallel group. Map branches are handled separately by
-// `validate_map_branches` (the branch's self-parallelism is checked via
-// strict-mode rules on the branch node itself, not via group membership).
+// v1 parallel-group detection: only the immediate `next` targets of a fan-out node count as a parallel group. Map
+// branches are handled separately by `validate_map_branches` (the branch's self-parallelism is checked via strict-mode
+// rules on the branch node itself, not via group membership).
 //
-// Returns one HashSet per fan-out source; deeper transitive parallelism is
-// intentionally out of scope for v1.
+// Returns one HashSet per fan-out source; deeper transitive parallelism is intentionally out of scope for v1.
 fn compute_parallel_groups(graph: &Graph) -> Vec<HashSet<String>> {
     let mut groups = Vec::new();
     for node in graph.nodes.values() {
@@ -677,19 +668,18 @@ fn compute_parallel_groups(graph: &Graph) -> Vec<HashSet<String>> {
 // Sources considered:
 //   - `state_updates` keys (every node type that has them)
 //   - `output_schema` top-level `properties` for `llm` and `agent` (auto-merge)
-//
-// Returns `None` only for script nodes with no declared `state_updates` — their
-// emitted JSON is opaque to static analysis. The validator treats `None` as a
-// load-time error when the script appears in a parallel group (C.6).
 fn write_set_of(node: &Node) -> Option<HashSet<String>> {
     if matches!(node.node_type, NodeType::Script(_)) && node_state_updates_keys(node).is_none() {
         return None;
     }
+
     let mut writes = HashSet::new();
     if let Some(keys) = node_state_updates_keys(node) {
         writes.extend(keys);
     }
+
     writes.extend(output_schema_top_level_keys(node));
+
     Some(writes)
 }
 
@@ -698,26 +688,6 @@ fn write_set_of(node: &Node) -> Option<HashSet<String>> {
 // "Root key" follows the same definition as `template_root_keys`: for a
 // reference like `{{user.name}}` or `{{items[0]}}`, the root is the bare
 // identifier before the first `.` or `[`.
-//
-// Templated fields scanned per node type:
-//   - llm:      instructions, prompt, state_updates values
-//   - agent:    prompt, state_updates values
-//   - rag:      query (defaulting to "{{initial_prompt}}"), state_updates values
-//   - approval: question, state_updates values
-//   - input:    question, default, state_updates values
-//   - end:      output, state_updates values
-//   - map:      over (its `{{...}}` IS the dynamic read of the list to fan out over)
-//   - script:   state_updates values only (the script body is opaque to static
-//               analysis; its reads via GRAPH_STATE / GRAPH_STATE_FILE can't be
-//               inferred at load time)
-//
-// Scoped variables produced by THIS node's own execution are excluded from
-// state_updates value scanning:
-//   - llm/agent/rag → "output" (the node's body output)
-//   - approval      → "choice" (the user's selected option)
-//   - input         → "input"  (the user's typed text)
-// These are bindings created inside the node, not reads from prior state, so
-// they cannot race with a sibling's writes.
 fn read_set_of(node: &Node) -> HashSet<String> {
     let mut reads: HashSet<String> = HashSet::new();
     let scoped: &[&str] = match &node.node_type {

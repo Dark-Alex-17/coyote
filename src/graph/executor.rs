@@ -76,9 +76,6 @@ impl GraphExecutor {
         let max_iterations = graph.settings.max_loop_iterations;
         let graph_timeout = graph.settings.timeout.map(Duration::from_secs);
         let max_concurrency = graph.settings.max_concurrency;
-        // Wrap in Arc so spawned branch tasks can cheaply share the Graph for
-        // node lookup (especially the map executor, which needs to resolve its
-        // `branch:` target from inside a spawned task).
         let graph = Arc::new(graph);
         let start = Instant::now();
 
@@ -297,10 +294,6 @@ fn sorted_frontier(frontier: &HashSet<String>) -> Vec<String> {
     v
 }
 
-// Bundles the engine-config refs that every `step()` call needs to thread
-// through. Constructed once per spawned branch task (or once at the call site
-// for sequential paths) so step() and downstream executors (MapNodeExecutor)
-// take one parameter instead of five.
 pub(super) struct StepContext<'a> {
     pub graph: &'a Graph,
     pub script_executor: &'a ScriptExecutor,
@@ -391,8 +384,6 @@ async fn step(
     }
 }
 
-// Returns all `next:` targets from the node (handles both `One` and `Many`),
-// erroring if no `next` is set.
 fn static_next_targets(node: &Node, current: &str, kind: &str) -> Result<Vec<String>> {
     node.next
         .as_ref()
@@ -400,9 +391,6 @@ fn static_next_targets(node: &Node, current: &str, kind: &str) -> Result<Vec<Str
         .ok_or_else(|| anyhow!("{kind} node '{current}' has no `next` and is not an end node"))
 }
 
-// Returns the first declared `next:` target as a borrowed `&str`, or `None` if
-// no `next` is set. Used by node executors that take `Option<&str>` for their
-// primary routing argument (LLM, RAG, Input).
 fn first_next_target(node: &Node) -> Option<&str> {
     node.next
         .as_ref()
@@ -447,6 +435,7 @@ mod tests {
     #[test]
     fn resolve_end_output_interpolates_template_against_state() {
         let mut state = state_with(&[("name", json!("alice"))]);
+
         let node = end_node("done: {{name}}", None);
 
         assert_eq!(resolve_end_output(&node, &mut state), "done: alice");
@@ -457,6 +446,7 @@ mod tests {
         let mut updates = HashMap::new();
         updates.insert("summary".into(), "completed for {{user}}".into());
         let node = end_node("RESULT: {{summary}}", Some(updates));
+
         let mut state = state_with(&[("user", json!("bob"))]);
 
         assert_eq!(
@@ -472,6 +462,7 @@ mod tests {
     #[test]
     fn resolve_end_output_with_empty_template_returns_empty_string() {
         let mut state = state_with(&[]);
+
         let node = end_node("", None);
 
         assert_eq!(resolve_end_output(&node, &mut state), "");
@@ -480,6 +471,7 @@ mod tests {
     #[test]
     fn resolve_end_output_lenient_on_missing_keys() {
         let mut state = state_with(&[]);
+
         let node = end_node("hello {{unknown}}!", None);
 
         assert_eq!(resolve_end_output(&node, &mut state), "hello !");

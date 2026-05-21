@@ -102,6 +102,7 @@ fn apply_state_updates(node: &ScriptNode, state_manager: &mut StateManager) {
     let Some(updates) = &node.state_updates else {
         return;
     };
+
     for (key, template) in updates {
         let value = state_manager.interpolate_lenient(template);
         state_manager

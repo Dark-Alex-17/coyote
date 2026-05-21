@@ -33,11 +33,6 @@ impl SseHandler {
         }
     }
 
-    /// Suppresses stdout streaming of incoming tokens. Tokens are still buffered
-    /// internally (so the caller's `.take()` still returns the full response) —
-    /// only the per-token send to the SSE renderer is skipped. Used by parallel
-    /// graph super-step branches so concurrent LLM calls don't interleave on
-    /// stdout.
     pub fn set_silent(&mut self, silent: bool) {
         self.silent = silent;
     }
@@ -47,10 +42,11 @@ impl SseHandler {
             return Ok(());
         }
         self.buffer.push_str(text);
+
         if self.silent {
             return Ok(());
         }
-        
+
         let ret = self
             .sender
             .send(SseEvent::Text(text.to_string()))

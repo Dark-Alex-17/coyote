@@ -33,11 +33,11 @@ use indoc::formatdoc;
 use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{env, fs};
 
 pub struct AutoContinueConfig {
     pub enabled: bool,
@@ -46,10 +46,6 @@ pub struct AutoContinueConfig {
     pub continuation_prompt: Option<String>,
 }
 
-/// Controls how LLM token streams are presented to the user. `Silent` is set
-/// on branch contexts during parallel graph super-steps so concurrent LLM
-/// calls don't interleave token-by-token on stdout — the full response still
-/// lands in graph state via the normal output_schema / state_updates pathway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RenderMode {
     #[default]
@@ -166,27 +162,18 @@ impl RequestContext {
 
     /// Forks the context for one parallel branch of a graph super-step.
     ///
-    /// Each branch gets a fresh, owned clone — mutations (role swap,
+    /// Each branch gets a fresh, owned clone. Mutations (role swap,
     /// `before/after_chat_completion`, tool tracker, last_message, etc.) are
     /// scoped to the branch and discarded when the branch finishes. The
     /// user-visible state communication happens through the graph's
     /// `StateManager` (via `fork_for_branch_state` + `diff_against` +
-    /// `apply_branch_writes` reducers), NOT through `RequestContext`.
+    /// `apply_branch_writes` reducers), and not through `RequestContext`.
     ///
     /// Distinction from `new_for_child`: `new_for_child` builds a fresh context
-    /// for a SPAWNED SUB-AGENT (different agent identity, different supervisor
+    /// for a spawned sub-agent (different agent identity, different supervisor
     /// hierarchy, depth+1, fresh tool tracker). `fork_for_branch` keeps the
-    /// caller's identity and supervisor hierarchy — it's a sibling clone of the
-    /// SAME logical agent, running one of N parallel work items.
-    ///
-    /// Behavior of per-field cloning:
-    /// - `Arc`-wrapped fields (`app`, `rag`, `supervisor`, `parent_supervisor`,
-    ///   `inbox`, `escalation_queue`) — shared via Arc::clone
-    /// - Owned heap fields (`model`, `role`, `session`, `agent`, `tool_scope`,
-    ///   `todo_list`, etc.) — deep `.clone()` so the branch can mutate freely
-    /// - `auto_continue_count` reset to 0 (each branch starts a fresh
-    ///   continuation budget)
-    /// - `last_continuation_response` reset to None
+    /// caller's identity and supervisor hierarchy; it's a sibling clone of the
+    /// same logical agent, running one of N parallel work items.
     pub fn fork_for_branch(&self) -> Self {
         Self {
             app: Arc::clone(&self.app),
@@ -1419,6 +1406,7 @@ impl RequestContext {
             env!("CARGO_CRATE_NAME"),
             mcp_path.display(),
         );
+
         Ok(())
     }
 
@@ -1503,20 +1491,23 @@ impl RequestContext {
         } else {
             config_path
         };
+
         ensure_parent_exists(&target_path)?;
         if !target_path.exists() {
-            std::fs::write(
+            fs::write(
                 &target_path,
                 "# see https://github.com/Dark-Alex-17/loki/blob/main/config.agent.example.yaml\n",
             )
             .with_context(|| format!("Failed to write to '{}'", target_path.display()))?;
         }
+
         let editor = app.editor()?;
         edit_file(&editor, &target_path)?;
         println!(
             "NOTE: Remember to reload the agent if there are changes made to '{}'",
             target_path.display()
         );
+
         Ok(())
     }
 
@@ -2026,7 +2017,7 @@ impl RequestContext {
                 .collect();
         } else if cmd == ".agent" {
             if args.len() == 2 {
-                let dir = paths::agent_data_dir(args[0]).join(super::SESSIONS_DIR_NAME);
+                let dir = paths::agent_data_dir(args[0]).join(SESSIONS_DIR_NAME);
                 values = list_file_names(dir, ".yaml")
                     .into_iter()
                     .map(|v| (v, None))

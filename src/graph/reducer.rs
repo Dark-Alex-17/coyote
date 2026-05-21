@@ -3,17 +3,6 @@ use crate::graph::type_name;
 use anyhow::{Result, bail};
 use serde_json::{Number, Value};
 
-/// Combines a branch's incoming write with the current state value (if any)
-/// via the specified reducer. The result is what gets written back to live
-/// state during the super-step merge phase.
-///
-/// `current = None` means the key has no prior value in this super-step or in
-/// live state. Most reducers treat absent as their identity (empty array,
-/// empty string, no prior value). `Overwrite` ignores `current` entirely.
-///
-/// Errors clearly when types are incompatible with the reducer (e.g.
-/// `Sum` on a string), naming the reducer and which side (`current` / `incoming`)
-/// has the wrong type.
 pub fn apply(reducer: Reducer, current: Option<&Value>, incoming: Value) -> Result<Value> {
     match reducer {
         Reducer::Append => apply_append(current, incoming),
@@ -37,6 +26,7 @@ fn apply_append(current: Option<&Value>, incoming: Value) -> Result<Value> {
         ),
     };
     arr.push(incoming);
+
     Ok(Value::Array(arr))
 }
 
@@ -56,6 +46,7 @@ fn apply_extend(current: Option<&Value>, incoming: Value) -> Result<Value> {
             type_name(&other)
         ),
     }
+
     Ok(Value::Array(arr))
 }
 
@@ -81,6 +72,7 @@ fn apply_concat(current: Option<&Value>, incoming: Value) -> Result<Value> {
             type_name(other)
         ),
     };
+
     Ok(Value::String(result))
 }
 
@@ -90,6 +82,7 @@ fn apply_sum(current: Option<&Value>, incoming: Value) -> Result<Value> {
         None => 0.0,
         Some(value) => number_or_error(value, "sum", "current")?,
     };
+
     Ok(json_number(c + i))
 }
 
@@ -135,6 +128,7 @@ fn apply_merge(current: Option<&Value>, incoming: Value) -> Result<Value> {
             type_name(&other)
         ),
     }
+
     Ok(Value::Object(map))
 }
 
@@ -148,10 +142,8 @@ fn number_or_error(value: &Value, reducer_name: &str, position: &str) -> Result<
     }
 }
 
-// Numeric reducers compute in f64 for simplicity. We preserve integer typing
-// when the result is losslessly representable as i64 so `count: sum` stays an
-// integer rather than degrading to a float. Non-finite values (NaN, Inf) can't
-// arise from finite inputs to +/max/min, so the fallback never fires in practice.
+// Numeric reducers compute in f64 for simplicity. Integer typing is preserved when the result is losslessly
+// representable as i64.
 fn json_number(n: f64) -> Value {
     if n.fract() == 0.0 && n.is_finite() && n.abs() <= (i64::MAX as f64) {
         Value::Number(Number::from(n as i64))

@@ -159,13 +159,6 @@ impl StateManager {
         }
     }
 
-    /// Forks state for a parallel branch: returns a fully-owned `StateManager`
-    /// seeded from the current state's data. The branch mutates its fork
-    /// freely; callers extract its writes via `diff_against` after the branch
-    /// completes, then merge them via `apply_branch_writes`.
-    ///
-    /// Distinct from `read_snapshot` (returns a shared `Arc<GraphState>` for
-    /// reads) — `fork_for_branch_state` returns a writable owned clone.
     pub fn fork_for_branch_state(&self) -> Self {
         Self {
             state: self.state.clone(),
@@ -173,11 +166,6 @@ impl StateManager {
         }
     }
 
-    /// Returns the keys whose values differ from `snapshot`. Use this after a
-    /// branch finishes to extract its writes (input to `apply_branch_writes`).
-    /// Keys present in `self` but absent from `snapshot`, or with different
-    /// values, count as writes. Deletions are not represented (no current node
-    /// executor deletes state).
     pub fn diff_against(&self, snapshot: &GraphState) -> HashMap<String, Value> {
         let mut diff = HashMap::new();
         for (k, v) in self.state.data() {
@@ -188,30 +176,10 @@ impl StateManager {
         diff
     }
 
-    /// Returns an `Arc`-wrapped snapshot of the current graph state. Each
-    /// branch in a parallel super-step uses this snapshot as the baseline for
-    /// its `diff_against` call at branch end. The executor extracts each
-    /// branch's writes (the diff) and merges them via `apply_branch_writes` at
-    /// the super-step boundary.
-    ///
-    /// Distinct from the older `snapshot()` method (returns a `HashMap` clone
-    /// of the data only — used by `script_executor` to ship state to child
-    /// processes).
-    #[allow(dead_code)]
     pub fn read_snapshot(&self) -> Arc<GraphState> {
         Arc::new(self.state.clone())
     }
 
-    /// Commits a deterministically-ordered set of per-branch writes back into
-    /// live state, applying declared reducers where they exist.
-    ///
-    /// Caller must pre-sort `writes` by `(node_id, invocation_index)` so that
-    /// non-commutative reducers (`Concat`, `Merge`) produce reproducible output.
-    ///
-    /// Errors when a key has writers from ≥2 branches but no reducer declared.
-    /// The validator (Phase C) catches this at load time; this runtime check is
-    /// defense-in-depth against a malformed or out-of-date validator missing it.
-    #[allow(dead_code)]
     pub fn apply_branch_writes(
         &mut self,
         writes: Vec<BranchWrites>,
@@ -252,22 +220,6 @@ impl StateManager {
         Ok(())
     }
 
-    /// Interpolates a template and returns a typed JSON `Value`.
-    ///
-    /// Two paths depending on the template shape:
-    /// - **Pure single reference** (the entire trimmed template is a single
-    ///   `{{key}}` expression, e.g. `"{{subjects}}"`, `"{{user.name}}"`,
-    ///   `"{{items[0]}}"`) — returns the typed `Value` at that key, preserving
-    ///   numbers, bools, arrays, and objects. Errors if the key is missing.
-    /// - **Mixed template** (multiple refs, surrounding text, or no refs) —
-    ///   falls back to string interpolation via `interpolate()` and returns
-    ///   `Value::String(...)`. Strict on missing keys.
-    ///
-    /// Required by:
-    /// - `map.over: "{{subjects}}"` — must resolve to a JSON array, not its string form
-    /// - `state_updates` writes that should preserve the source type (a `cost_usd: "{{api_cost}}"`
-    ///   write should land as a Number, not a String)
-    #[allow(dead_code)]
     pub fn interpolate_raw(&self, template: &str) -> Result<Value> {
         let trimmed = template.trim();
         if let Some(key) = single_reference_key(trimmed) {
@@ -338,9 +290,7 @@ fn split_indices(segment: &str) -> Option<(&str, Vec<usize>)> {
 }
 
 // Returns the inner key when `template` is exactly a single `{{key}}` reference
-// (no surrounding text, no other braces). Mirrors the character set the
-// TEMPLATE_VAR_RE regex accepts so `interpolate_raw` and `interpolate` stay
-// consistent about what counts as a valid key.
+// (no surrounding text, no other braces).
 fn single_reference_key(template: &str) -> Option<&str> {
     let inner = template.strip_prefix("{{")?.strip_suffix("}}")?;
     if inner.contains("{{") || inner.contains("}}") {
@@ -353,11 +303,10 @@ fn single_reference_key(template: &str) -> Option<&str> {
     valid.then_some(inner)
 }
 
-// Returns the root state keys referenced by any `{{...}}` expressions in the
-// given template string. The "root key" is the identifier before the first
-// `.` or `[` — i.e. for `{{user.name}}` the root is `user`, for `{{items[0]}}`
-// the root is `items`. Used by the validator to compute the static read-set of
-// a node's templated fields without depending on a runtime `StateManager`.
+// Returns the root state keys referenced by any `{{...}}` expressions in the given template string. The "root key" is
+// the identifier before the first `.` or `[`; e.g., for `{{user.name}}` the root is `user`, for `{{items[0]}}` the
+// root is `items`. Used by the validator to compute the static read-set of a node's templated fields without
+// depending on a runtime `StateManager`.
 pub(super) fn template_root_keys(template: &str) -> Vec<String> {
     TEMPLATE_VAR_RE
         .captures_iter(template)
@@ -985,9 +934,6 @@ mod tests {
     #[test]
     fn interpolate_raw_inner_spaces_treated_as_mixed() {
         let manager = manager_with(&[("k", json!("v"))]);
-        // `{{ k }}` is not a valid pure reference (spaces inside braces are
-        // outside the allowed character set). Fall back to string interpolation
-        // -- which doesn't match the regex either, so the literal passes through.
         let result = manager.interpolate_raw("{{ k }}").unwrap();
         assert_eq!(result, json!("{{ k }}"));
     }

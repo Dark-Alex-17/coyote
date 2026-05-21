@@ -273,6 +273,7 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
     }
 
     println!("Reinstalled bundled {label} ({})", target.display());
+
     Ok(())
 }
 
@@ -297,6 +298,7 @@ fn confirm_asset_overwrite(category: AssetCategory, label: &str, target: &Path) 
     };
     let prompt = format!("{} {body}\nContinue? [y/N] ", warning_text("WARNING:"));
     let answer = read_single_key(&['y', 'Y', 'n', 'N'], 'n', &prompt)?;
+
     Ok(matches!(answer, 'y' | 'Y'))
 }
 

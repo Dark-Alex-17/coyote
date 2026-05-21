@@ -155,6 +155,7 @@ async fn run(
     if let Some(category) = cli.install {
         return config::install_assets(category);
     }
+
     if cli.sync_models {
         let url = ctx.app.config.sync_models_url();
         return sync_models(&url, abort_signal.clone()).await;

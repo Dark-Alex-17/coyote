@@ -406,18 +406,21 @@ mod tests {
     #[test]
     fn parse_update_flag_no_value() {
         let cli = parse(&["--update"]);
+
         assert_eq!(cli.update, Some(None));
     }
 
     #[test]
     fn parse_update_flag_with_version() {
         let cli = parse(&["--update", "v0.4.0"]);
+
         assert_eq!(cli.update, Some(Some("v0.4.0".to_string())));
     }
 
     #[test]
     fn parse_update_with_force() {
         let cli = parse(&["--update", "--force"]);
+
         assert_eq!(cli.update, Some(None));
         assert!(cli.force);
     }

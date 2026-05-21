@@ -5,8 +5,8 @@ use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use mpsc::error::SendError;
 use mpsc::{OwnedPermit, Receiver, Sender, channel};
-use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Client, header};
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use std::collections::HashMap;
 use std::error::Error;
@@ -52,7 +52,7 @@ impl LegacySseTransport {
 
         let response = client
             .get(sse_url)
-            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .header(header::ACCEPT, "text/event-stream")
             .send()
             .await
             .context("Failed to open SSE connection")?

@@ -1,8 +1,8 @@
 # Graph-based agent definition (full-featured reference)
 # Location: <loki-config-dir>/agents/<agent-name>/graph.yaml
 #
-# A graph agent is defined by THIS FILE ALONE. An agent directory contains
-# EITHER a config.yaml (a normal LLM-loop agent) or a graph.yaml (a graph
+# A graph agent is defined by this file alone. An agent directory contains
+# either a config.yaml (a normal LLM-loop agent) or a graph.yaml (a graph
 # agent), never both. The presence of graph.yaml is what makes the agent
 # a graph agent.
 #
@@ -23,7 +23,7 @@ description: |                     # Free-form prose describing the workflow
   A reference workflow: triage a research request, retrieve local
   context, branch on a script decision, run either a sub-agent or an
   LLM research step, then gate the result behind human approval.
-version: "1.0"                     # Graph SCHEMA version. Only "1.0" is accepted.
+version: "1.0"                     # Graph schema version. Only "1.0" is accepted.
 
 # ---------------------------------------------------------------------------
 # Agent-level config (all optional)
@@ -63,7 +63,7 @@ settings:
 # Reducers (optional, required whenever two parallel branches write the same
 # state key in the same super-step; otherwise the validator errors at load).
 #
-# A reducer says HOW two values for the same key get merged. Built-ins:
+# A reducer says how two values for the same key get merged. Built-ins:
 #   append    list += [value]              (single value appended to a list)
 #   extend    list += value (a list)       (list-of-lists flattened by one level)
 #   concat    "a\nb"                       (string join with newline separator)
@@ -135,10 +135,11 @@ nodes:
       required: [topic, needs_deep_dive]
     state_updates:             # {{output}} = this node's result (here, the parsed object)
       triage_result: "{{output}}"
-    # --- POLYMORPHIC `next` -----------------------------------------------
+    # --- Polymorphic `next` -----------------------------------------------
     # A single string runs the next node sequentially (e.g. `next: retrieve`).
-    # A list runs ALL listed nodes IN PARALLEL as one BSP super-step. Their
-    # writes are merged via `reducers:` at the join. Branches converge
+    # A list runs all listed nodes in parallel as one BSP super-step
+    # (for more info on BSP, see https://en.wikipedia.org/wiki/Bulk_synchronous_parallel).
+    # Their writes are merged via `reducers:` at the join. Branches converge
     # implicitly when they all route to the same downstream node (here,
     # `synthesize`). See the diamond:
     #
@@ -146,12 +147,12 @@ nodes:
     #          /     \
     #     retrieve  web_search   (run concurrently)
     #          \     /
-    #         synthesize         (join — fires once after both finish)
+    #         synthesize         (join; fires once after both finish)
     next: [retrieve, web_search]
 
   # --- rag node (parallel branch 1 of the diamond) ------------------------
   # Hybrid (vector + keyword) retrieval against a per-node knowledge base.
-  # The knowledge base is built ONCE, at agent load time, into
+  # The knowledge base is built once, at agent load time, into
   # <agent-dir>/retrieve.yaml (named after this node's id).
   retrieve:
     id: retrieve
@@ -162,7 +163,7 @@ nodes:
     query: "{{topic}}"         # Retrieval query (templated). Default: {{initial_prompt}}.
     top_k: 5                   # Chunks to retrieve. Default = the KB's own top_k.
     timeout: 120               # Retrieval timeout in seconds. Default 120.
-    # Knowledge-base BUILD config (optional; used only when the KB is first
+    # Knowledge-base build config (optional; used only when the KB is first
     # built). When embedding_model + chunk_size + chunk_overlap are all set,
     # the KB builds with no interactive prompts (works in non-interactive runs).
     embedding_model: openai:text-embedding-3-small
@@ -171,8 +172,8 @@ nodes:
     reranker_model: null       # Optional reranker for hybrid-search results
     batch_size: 100            # Optional embedding-request batch size
     state_updates:             # {{output}} = { context: <str>, sources: [<path>, ...] }
-      context: "{{output.context}}"   # writes `context` — `reducers.context = concat`
-      sources: "{{output.sources}}"   # writes `sources` — `reducers.sources = append`
+      context: "{{output.context}}"   # writes `context` -> `reducers.context = concat`
+      sources: "{{output.sources}}"   # writes `sources` -> `reducers.sources = append`
     next: synthesize           # Joins with web_search at `synthesize`.
 
   # --- llm node (parallel branch 2 of the diamond) ------------------------
@@ -199,7 +200,7 @@ nodes:
     # `context` and `sources` are produced without needing `state_updates`.
     next: synthesize           # Joins with retrieve at `synthesize`.
 
-  # --- script node (the diamond's JOIN; also dispatches) -----------------
+  # --- script node (the diamond's join; also dispatches) -----------------
   # Runs a .sh / .py / .ts script. The script receives state via the
   # GRAPH_STATE env var (inline JSON) or GRAPH_STATE_FILE (path to a JSON
   # file, used when state exceeds 32 KiB). Exactly one is set. It must print
@@ -223,12 +224,12 @@ nodes:
     # This script is expected to emit `_next: deep_dive` (or `_next: subjects_map`
     # to demonstrate the map node below), or no `_next` (then `next` is used).
     # Targets reached only via the script's dynamic `_next` get an
-    # "unreachable" warning from the validator — expected for `_next`-routed
+    # "unreachable" warning from the validator. This is expected for `_next`-routed
     # targets.
 
   # --- agent node ---------------------------------------------------------
   # Spawns a full Loki sub-agent and waits for it. The child uses its own
-  # tool stack. Agent nodes have NO `tools:` field. No schema hint is
+  # tool stack. Agent nodes have no `tools:` field. No schema hint is
   # injected even when `output_schema` is set (unlike llm nodes).
   deep_dive:
     id: deep_dive
@@ -250,7 +251,7 @@ nodes:
       research: "{{output}}"
     next: review               # Required for agent nodes
 
-  # --- map node (Dynamic fan-out — LangGraph's `Send` API) ----------------
+  # --- map node (Dynamic fan-out. Think: LangGraph's `Send` API) ----------------
   # Spawns one parallel sub-branch per item in `over`. Each sub-branch runs
   # the node referenced by `branch:` with the item bound to `as:`. Outputs
   # collect into the array named by `collect_into:`, preserving input order.
@@ -262,8 +263,8 @@ nodes:
     id: subjects_map
     type: map
     over: "{{subjects}}"        # Required. List expression resolved from state.
-                                # Empty list is allowed — no branches spawn,
-                                # `collect_into` is written as [].
+                                # Empty list is allowed. It means no branches spawn,
+                                # and thus `collect_into` is written as [].
     as: subject                 # Required. Per-branch state key holding the
                                 # current item. Read with {{subject}} inside
                                 # the branch node's prompt.
@@ -275,7 +276,7 @@ nodes:
                                 #     map's `collect_into` channel
                                 #   - no `output_schema:` (top-level merge
                                 #     would clash with collect_into)
-                                # Validator (C.5) enforces all three.
+                                # Validator enforces all three.
     collect_into: subject_findings  # Required. State key for the array of
                                     # per-branch outputs, in input order
                                     # (not spawn-finish order).
@@ -297,7 +298,7 @@ nodes:
     prompt: "Research {{subject}}: pull the key facts and one citation."
     tools:
       - web_search_loki
-    # No `next:`, `state_updates:`, or `output_schema:` here — map branches
+    # No `next:`, `state_updates:`, or `output_schema:` here. Map branches
     # have a strict contract (see `subjects_map.branch` comment).
 
   # Aggregator that runs after the map joins. Reads the collected list.

@@ -82,9 +82,6 @@ impl Clone for Rag {
     }
 }
 
-/// Caller-supplied overrides for building a RAG knowledge base. Each field
-/// takes precedence over the app-level `rag_*` config; a field left `None`
-/// falls back to app config and then, if still unset, an interactive prompt.
 #[derive(Debug, Clone, Default)]
 pub struct RagInitConfig {
     pub embedding_model: Option<String>,
@@ -100,12 +97,6 @@ impl Rag {
         init_client(&self.app_config, model)
     }
 
-    /// Build a RAG knowledge base using caller-supplied config overrides.
-    /// Unlike [`Rag::init`], this does not bail outright in non-interactive
-    /// mode: it only requires a terminal when a needed value is missing
-    /// from both `config` and app config. When `config` fully specifies
-    /// `embedding_model`, `chunk_size`, and `chunk_overlap`, the build runs
-    /// with no prompts.
     pub async fn init_with_config(
         app: &AppConfig,
         name: &str,
@@ -1389,13 +1380,13 @@ mod tests {
 
     #[test]
     fn get_separators_returns_language_specific() {
-        let rs_seps = splitter::get_separators("rs");
+        let rs_seps = get_separators("rs");
         assert!(rs_seps.iter().any(|s| s.contains("fn ")));
 
-        let py_seps = splitter::get_separators("py");
+        let py_seps = get_separators("py");
         assert!(py_seps.iter().any(|s| s.contains("def ")));
 
-        let md_seps = splitter::get_separators("md");
+        let md_seps = get_separators("md");
         assert!(md_seps.iter().any(|s| s.contains("# ")));
     }
 
