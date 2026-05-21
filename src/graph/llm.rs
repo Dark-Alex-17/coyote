@@ -13,12 +13,6 @@ use tokio::time::timeout;
 
 const OUTPUT_KEY: &str = "output";
 
-/// What happened during an LLM node's execution, from the caller's routing
-/// perspective. `Continue` means the caller should advance via the node's
-/// declared `next:` targets (whether the LLM actually succeeded or failed
-/// without a fallback — either way, the executor uses node.next). `FellBack`
-/// means the LLM failed after retries and the node had a `fallback:` declared,
-/// so routing should go to that fallback target only.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum LlmExecutionOutcome {
     Continue,
@@ -235,6 +229,7 @@ fn categorize_tools(entries: Option<&[String]>) -> (Vec<String>, Vec<String>) {
     let Some(entries) = entries else {
         return (regular, mcp);
     };
+
     for e in entries {
         if let Some(server) = e.strip_prefix("mcp:") {
             mcp.push(server.to_string());
@@ -242,6 +237,7 @@ fn categorize_tools(entries: Option<&[String]>) -> (Vec<String>, Vec<String>) {
             regular.push(e.clone());
         }
     }
+
     (regular, mcp)
 }
 
@@ -465,10 +461,6 @@ mod tests {
 
     #[test]
     fn outcome_from_failure_without_fallback_is_continue() {
-        // Failed but no fallback: caller routes via node.next as if successful.
-        // The error has already been recorded to state via the OUTPUT_KEY by
-        // execute(); the caller's `static_next_targets` will error if node.next
-        // is also missing.
         assert_eq!(outcome_from(true, None), LlmExecutionOutcome::Continue);
     }
 

@@ -802,6 +802,7 @@ fn resolve_document_paths(
             } else {
                 PathBuf::from(&resolved_path)
             };
+
             document_paths.push(format!("{}:{}", protocol, new_path.display()));
         } else if Path::new(&resolve_home_dir(path)).is_relative() {
             let new_path = safe_join_path(agent_data_dir, path)
@@ -829,6 +830,7 @@ async fn init_graph_rags(
     if info_flag {
         return Ok(rags);
     }
+
     for (node_id, node) in &graph.nodes {
         let NodeType::Rag(rag_node) = &node.node_type else {
             continue;
@@ -1059,6 +1061,7 @@ variables:
                 output: done
             "#};
         let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+
         let config = AgentConfig::from_graph("my-agent-dir", &graph);
 
         assert_eq!(config.name, "my-agent-dir");
@@ -1101,6 +1104,7 @@ variables:
     fn from_graph_keeps_defaults_for_llm_loop_fields() {
         let yaml = "name: g\nstart: x\nnodes:\n  x:\n    id: x\n    type: end\n    output: ok\n";
         let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
         let config = AgentConfig::from_graph("d", &graph);
 
         assert!(!config.auto_continue);

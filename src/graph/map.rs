@@ -125,8 +125,7 @@ impl MapNodeExecutor {
         let joined = join_all(sub_tasks).await;
         drop(progress_tracker);
 
-        // Collect outputs keyed by input index so order is preserved regardless
-        // of finish order. This is the user-facing contract from plan E.2.
+        // Collect outputs keyed by input index so order is preserved regardless of finish order.
         let mut outputs: HashMap<usize, Value> = HashMap::new();
         for join_result in joined {
             let (idx, sub_state, exec_result) =

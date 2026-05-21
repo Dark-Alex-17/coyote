@@ -9,14 +9,6 @@ static SPINNER_STYLE: LazyLock<ProgressStyle> = LazyLock::new(|| {
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""])
 });
 
-// Manages a set of per-branch spinners drawn side-by-side via indicatif's
-// `MultiProgress`. Created at the start of a multi-branch graph super-step
-// (or map sub-branch fan-out) and torn down at the join.
-//
-// When stdout isn't a terminal (CI, piped output), the tracker becomes a
-// no-op — `add_branch` returns a disabled handle whose methods do nothing.
-// This keeps machine-piped graph runs free of spinner garbage in their
-// captured output.
 pub(super) struct BranchProgressTracker {
     multi: Option<MultiProgress>,
 }

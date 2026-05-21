@@ -128,13 +128,8 @@ pub struct Node {
     pub next: Option<NextTargets>,
 }
 
+#[cfg(test)]
 impl Node {
-    /// Returns the single next target as a string slice for tests and other
-    /// read-only inspection. Returns `None` when no `next:` is declared at all,
-    /// OR when a real multi-target fan-out is declared (since a fan-out has no
-    /// "single" target). Execution paths use `static_next_targets` in the graph
-    /// executor instead.
-    #[allow(dead_code)]
     pub fn next_target(&self) -> Option<&str> {
         match &self.next {
             None => None,
@@ -153,7 +148,6 @@ pub enum NextTargets {
 }
 
 impl NextTargets {
-    /// View as a slice of node ids. `One(s)` returns a single-element slice.
     pub fn as_slice(&self) -> &[String] {
         match self {
             NextTargets::One(s) => slice::from_ref(s),
@@ -161,7 +155,6 @@ impl NextTargets {
         }
     }
 
-    /// True if this declares more than one parallel target (i.e., a real fan-out).
     pub fn is_fan_out(&self) -> bool {
         matches!(self, NextTargets::Many(v) if v.len() > 1)
     }
@@ -349,28 +342,18 @@ pub struct EndNode {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MapNode {
-    /// Template expression that must resolve (via `interpolate_raw`, added in
-    /// Phase B) to a JSON array. Each item in the array is one branch invocation.
     pub over: String,
 
-    /// The name to bind each item under, accessible as `{{<as_name>}}` inside
-    /// the branch node's templates. YAML field is `as:`.
     #[serde(rename = "as")]
     pub as_name: String,
 
-    /// Node id to invoke once per item in the resolved list.
     pub branch: String,
 
-    /// State key that the branch node writes; the map collects this key's value
-    /// across invocations. Defaults to "output".
     #[serde(default = "default_map_output_key")]
     pub output_key: String,
 
-    /// State key to receive the array of per-branch outputs, in input-list order.
     pub collect_into: String,
 
-    /// Optional cap on simultaneously-running sub-branches. Falls back to
-    /// `settings.max_concurrency` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<usize>,
 }
@@ -707,7 +690,7 @@ on_other: edit_loop
         initial.insert("k".to_string(), json!("v"));
         let state = GraphState::new(initial);
         let serialized = state.to_json().unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        let parsed: Value = serde_json::from_str(&serialized).unwrap();
         assert_eq!(parsed.get("k"), Some(&json!("v")));
         assert!(state.size_bytes() > 0);
     }
