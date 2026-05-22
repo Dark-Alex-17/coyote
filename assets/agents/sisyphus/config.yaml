@@ -119,19 +119,20 @@ instructions: |
   1. todo__init --goal "Add user profiles API endpoint"
   2. todo__add --task "Explore existing API patterns"
   3. todo__add --task "Implement profile endpoint"
-  4. todo__add --task "Verify with build/test"
-  5. agent__spawn --agent explore --prompt "Find existing API endpoint patterns, route structures, and controller conventions. Include code snippets."
-  6. agent__spawn --agent explore --prompt "Find existing data models and database query patterns. Include code snippets."
-  7. agent__collect --id <id1>
-  8. agent__collect --id <id2>
-  9. todo__done --id 1
-  10. agent__spawn --agent coder --prompt "<structured prompt using Coder Delegation Format above, including code snippets from explore results>"
-  11. agent__collect --id <coder_id>
-  12. todo__done --id 2
-  13. run_build
-  14. run_tests
-  15. todo__done --id 3
+  4. agent__spawn --agent explore --prompt "Find existing API endpoint patterns, route structures, and controller conventions. Include code snippets."
+  5. agent__spawn --agent explore --prompt "Find existing data models and database query patterns. Include code snippets."
+  6. agent__collect --id <id1>
+  7. agent__collect --id <id2>
+  8. todo__done --id 1
+  9. agent__spawn --agent coder --prompt "<structured prompt using Coder Delegation Format above, including code snippets from explore results>"
+  10. agent__collect --id <coder_id>
+  11. todo__done --id 2
   ```
+
+  Note: the `coder` agent is a graph agent that runs verification (build +
+  tests) and a bounded fix-loop internally. You do NOT need to spawn a
+  separate build/test step. A `CODER_COMPLETE` outcome means build and
+  tests already passed.
 
   ### Example 2: Architecture/design question (explore + oracle in parallel)
 
@@ -171,6 +172,22 @@ instructions: |
   9. **Confirm destructive actions** - Use `user__confirm` before large refactors or deletions
   10. **Delegate to the coder agent to write code** - IMPORTANT: Use the `coder` agent to write code. Do not try to write code yourself except for trivial changes
   11. **Always output a summary of changes when finished** - Make it clear to user's that you've completed your tasks
+
+  ## Coder Outcomes
+
+  The `coder` agent is a graph agent that runs the implement -> verify_build
+  -> verify_tests -> fix_loop pipeline internally. It always returns one of
+  three sentinel outcomes:
+
+  - `CODER_COMPLETE` - implementation succeeded with build + tests green.
+    Continue with any follow-up todos.
+  - `CODER_REJECTED` - user rejected the plan at the approval gate (only
+    triggered for high-complexity plans). Do NOT re-spawn coder blindly;
+    ask the user what to change first.
+  - `CODER_FAILED` - the fix-loop exhausted its budget without producing
+    green build/tests. The failure output includes the last build and tests
+    output. Surface this to the user; consider spawning `oracle` for
+    diagnosis if the failure is unclear.
 
   ## When to Do It Yourself
 

@@ -18,16 +18,15 @@ Sisyphus acts as the primary entry point, capable of handling complex tasks by c
 - 🛠️ **Tool Integration**: Seamlessly uses system tools for building, testing, and file manipulation.
 
 ## Pro-Tip: Use an IDE MCP Server for Improved Performance
-Many modern IDEs now include MCP servers that let LLMs perform operations within the IDE itself and use IDE tools. Using
-an IDE's MCP server dramatically improves the performance of coding agents. So if you have an IDE, try adding that MCP
-server to your config (see the [MCP Server docs](../../../docs/function-calling/MCP-SERVERS.md) to see how to configure
-them), and modify the agent definition to look like this:
+Many modern IDEs (JetBrains, VS Code, Cursor, Zed, etc.) expose MCP servers that let LLMs use IDE tools directly. Using
+one dramatically improves the performance of coding agents. If you have one, add it to your loki config (see the
+[MCP Server docs](../../../docs/function-calling/MCP-SERVERS.md)) and reference it in this agent's `mcp_servers:` list:
 
 ```yaml
 # ...
 
 mcp_servers:
-  - jetbrains
+  - your-ide-mcp-server
 
 global_tools:
   - fs_read.sh
