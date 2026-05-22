@@ -60,7 +60,13 @@ pub enum Language {
 
 impl From<&String> for Language {
     fn from(s: &String) -> Self {
-        match s.to_lowercase().as_str() {
+        Language::from_extension(s)
+    }
+}
+
+impl Language {
+    pub fn from_extension(ext: &str) -> Self {
+        match ext.to_lowercase().as_str() {
             "sh" => Language::Bash,
             "py" => Language::Python,
             "ts" => Language::TypeScript,
