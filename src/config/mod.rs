@@ -2,6 +2,7 @@ mod agent;
 mod app_config;
 mod app_state;
 mod input;
+mod install_remote;
 mod macros;
 mod mcp_factory;
 pub(crate) mod paths;
@@ -22,6 +23,7 @@ pub use self::app_config::AppConfig;
 #[allow(unused_imports)]
 pub use self::app_state::AppState;
 pub use self::input::Input;
+pub use self::install_remote::{install_remote, install_remote_from_repl_args};
 #[allow(unused_imports)]
 pub use self::request_context::{RenderMode, RequestContext};
 pub use self::role::{
@@ -266,6 +268,31 @@ impl AssetCategory {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "agents" => Some(Self::Agents),
+            "macros" => Some(Self::Macros),
+            "functions" => Some(Self::Functions),
+            "mcp_config" => Some(Self::McpConfig),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InstallFilter {
+    Agents,
+    Roles,
+    Macros,
+    Functions,
+    #[value(name = "mcp_config")]
+    McpConfig,
+}
+
+impl InstallFilter {
+    pub const NAMES: [&'static str; 5] = ["agents", "roles", "macros", "functions", "mcp_config"];
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "agents" => Some(Self::Agents),
+            "roles" => Some(Self::Roles),
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
             "mcp_config" => Some(Self::McpConfig),

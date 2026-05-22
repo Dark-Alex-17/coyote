@@ -4,7 +4,7 @@ use crate::cli::completer::{
     ShellCompletion, agent_completer, macro_completer, model_completer, rag_completer,
     role_completer, secrets_completer, session_completer,
 };
-use crate::config::AssetCategory;
+use crate::config::{AssetCategory, InstallFilter};
 use anyhow::{Context, Result};
 use clap::ValueHint;
 use clap::{Parser, crate_authors, crate_description, crate_version};
@@ -86,6 +86,15 @@ pub struct Cli {
     /// Reinstall bundled assets, overwriting any local changes
     #[arg(long, value_name = "CATEGORY", value_enum)]
     pub install: Option<AssetCategory>,
+    /// Install assets from a remote git repository (URL may be suffixed with #<ref>)
+    #[arg(long, value_name = "GIT_URL")]
+    pub install_from: Option<String>,
+    /// Restrict --install-from to a single asset category
+    #[arg(long, value_name = "CATEGORY", value_enum, requires = "install_from")]
+    pub filter: Option<InstallFilter>,
+    /// Overwrite all conflicts without prompting (used with --install-from)
+    #[arg(long, requires = "install_from")]
+    pub install_force: bool,
     /// Sync models updates
     #[arg(long)]
     pub sync_models: bool,
