@@ -117,33 +117,38 @@ async fn prepare_chat_completions(
 /// So this function injects the Claude Code system prompt into the request
 /// body to make it a valid request.
 fn inject_oauth_system_prompt(body: &mut Value) {
-    let prefix_block = json!({
-        "type": "text",
-        "text": CLAUDE_CODE_PREFIX,
-    });
-
-    match body.get("system") {
-        Some(Value::String(existing)) => {
-            let existing_block = json!({
-                "type": "text",
-                "text": existing,
-            });
-            body["system"] = json!([prefix_block, existing_block]);
-        }
-        Some(Value::Array(_)) => {
-            if let Some(arr) = body["system"].as_array_mut() {
-                let already_injected = arr
-                    .iter()
-                    .any(|block| block["text"].as_str() == Some(CLAUDE_CODE_PREFIX));
-                if !already_injected {
-                    arr.insert(0, prefix_block);
-                }
+    let existing_text = match body.get("system") {
+        Some(Value::String(s)) => {
+            if s.starts_with(CLAUDE_CODE_PREFIX) {
+                return;
             }
+            (!s.is_empty()).then(|| s.clone())
         }
-        _ => {
-            body["system"] = json!([prefix_block]);
+        Some(Value::Array(blocks)) => {
+            let already_injected = blocks.iter().any(|b| {
+                b.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t.starts_with(CLAUDE_CODE_PREFIX))
+                    .unwrap_or(false)
+            });
+            if already_injected {
+                return;
+            }
+            let joined: Vec<String> = blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()).map(String::from))
+                .collect();
+            (!joined.is_empty()).then(|| joined.join("\n\n"))
         }
-    }
+        _ => None,
+    };
+
+    let merged = match existing_text {
+        Some(rest) => format!("{}\n\n{}", CLAUDE_CODE_PREFIX, rest),
+        None => CLAUDE_CODE_PREFIX.to_string(),
+    };
+
+    body["system"] = json!([{ "type": "text", "text": merged }]);
 }
 
 pub async fn claude_chat_completions(
