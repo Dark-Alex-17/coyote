@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
-use inquire::Select;
+use inquire::{Confirm, Select};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use crate::function::Language;
 use crate::mcp::{McpServer, McpServersConfig};
 use crate::utils;
 use crate::utils::IS_STDOUT_TERMINAL;
-use crate::vault::{Vault, interpolate_secrets};
+use crate::vault::{Vault, create_vault_password_file, interpolate_secrets};
 
 pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool) -> Result<()> {
     let (url, reference) = parse_url_with_ref(git_url)?;
@@ -39,6 +39,7 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
         let local = local_mcp.exists().then_some(local_mcp.as_path());
         let report = merge_mcp_json(local, remote_mcp, local_mcp, force)?;
         print_mcp_merge_report(&report);
+        handle_missing_secrets(&report.missing_secrets)?;
     }
 
     Ok(())
@@ -809,15 +810,75 @@ fn print_mcp_merge_report(report: &McpMergeReport) {
             .collect();
         println!("  > renamed:     {}", pairs.join(", "));
     }
-    if !report.missing_secrets.is_empty() {
-        println!("\nMissing vault secrets referenced by the merged mcp.json:");
-        for name in &report.missing_secrets {
+}
+
+fn handle_missing_secrets(missing: &[String]) -> Result<()> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let (added, deferred) = if *IS_STDOUT_TERMINAL {
+        println!(
+            "\nThe merged mcp.json references {} secret(s) not yet in the vault.",
+            missing.len()
+        );
+        prompt_for_each_secret(missing)?
+    } else {
+        (Vec::new(), missing.to_vec())
+    };
+
+    print_secret_summary(&added, &deferred);
+    Ok(())
+}
+
+fn prompt_for_each_secret(missing: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    let mut vault = Vault::init_bare();
+    let mut password_file_ensured = false;
+    let mut added = Vec::new();
+    let mut deferred = Vec::new();
+
+    for name in missing {
+        let proceed = Confirm::new(&format!("Add {{{{ {name} }}}} to vault now?"))
+            .with_default(false)
+            .prompt()
+            .with_context(|| format!("failed to read confirmation for secret '{name}'"))?;
+        if !proceed {
+            deferred.push(name.clone());
+            continue;
+        }
+        if !password_file_ensured {
+            create_vault_password_file(&mut vault)
+                .context("Failed to initialize the vault password file")?;
+            password_file_ensured = true;
+        }
+
+        match vault.add_secret(name) {
+            Ok(()) => added.push(name.clone()),
+            Err(e) => {
+                eprintln!("Failed to add '{name}' to vault: {e:#}");
+                deferred.push(name.clone());
+            }
+        }
+    }
+
+    Ok((added, deferred))
+}
+
+fn print_secret_summary(added: &[String], deferred: &[String]) {
+    if !added.is_empty() {
+        println!(
+            "\nAdded {} secret(s) to the vault: {}",
+            added.len(),
+            added.join(", ")
+        );
+    }
+    if !deferred.is_empty() {
+        println!(
+            "\nThe following secrets are still required by your MCP servers. \
+             Add them with `loki --add-secret <NAME>` or `.vault add <NAME>` in the REPL:"
+        );
+        for name in deferred {
             println!("  {{{{ {name} }}}}");
         }
-        println!(
-            "\nAdd each missing secret to the vault before starting these MCP servers. \
-             For example: `loki --add-secret <NAME>` or `.vault add <NAME>` in the REPL."
-        );
     }
 }
 
@@ -911,6 +972,7 @@ mod tests {
             agents: Some(PathBuf::from("/x")),
             ..RemoteLayout::default()
         };
+
         assert!(!l.is_empty());
     }
 
@@ -923,7 +985,9 @@ mod tests {
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
         };
+
         let out = apply_filter(l, None);
+
         assert!(out.agents.is_some() && out.roles.is_some() && out.macros.is_some());
         assert!(out.functions_tools.is_some() && out.mcp_json.is_some());
     }
@@ -937,7 +1001,9 @@ mod tests {
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
         };
+
         let out = apply_filter(l, Some(InstallFilter::Functions));
+
         assert!(out.agents.is_none());
         assert_eq!(out.functions_tools, Some(PathBuf::from("f")));
         assert!(out.mcp_json.is_none());
@@ -952,7 +1018,9 @@ mod tests {
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
         };
+
         let out = apply_filter(l, Some(InstallFilter::McpConfig));
+
         assert!(out.agents.is_none() && out.functions_tools.is_none());
         assert_eq!(out.mcp_json, Some(PathBuf::from("j")));
     }
@@ -966,7 +1034,9 @@ mod tests {
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
         };
+
         let out = apply_filter(l, Some(InstallFilter::Roles));
+
         assert_eq!(out.roles, Some(PathBuf::from("r")));
         assert!(out.agents.is_none() && out.macros.is_none());
         assert!(out.functions_tools.is_none() && out.mcp_json.is_none());
@@ -1002,6 +1072,7 @@ mod tests {
         std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
 
         let err = walk_files(&root).unwrap_err();
+
         assert!(
             err.to_string().contains("Symlink not allowed"),
             "got error: {err}"
@@ -1036,6 +1107,7 @@ mod tests {
         touch(&root.join("README.md"));
 
         let layout = scan_remote_layout(&root).unwrap();
+
         assert!(layout.is_empty());
         let _ = fs::remove_dir_all(&root);
     }
@@ -1045,7 +1117,9 @@ mod tests {
         let dir = fresh_temp_dir("classify-new-");
         let src = dir.join("src");
         fs::write(&src, b"hello").unwrap();
+
         let dst = dir.join("dst");
+
         assert_eq!(classify_file(&src, &dst).unwrap(), PlannedKind::New);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1055,8 +1129,10 @@ mod tests {
         let dir = fresh_temp_dir("classify-identical-");
         let src = dir.join("src");
         let dst = dir.join("dst");
+
         fs::write(&src, b"same bytes").unwrap();
         fs::write(&dst, b"same bytes").unwrap();
+
         assert_eq!(classify_file(&src, &dst).unwrap(), PlannedKind::Identical);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1066,8 +1142,10 @@ mod tests {
         let dir = fresh_temp_dir("classify-conflict-");
         let src = dir.join("src");
         let dst = dir.join("dst");
+
         fs::write(&src, b"version A").unwrap();
         fs::write(&dst, b"version B").unwrap();
+
         assert_eq!(classify_file(&src, &dst).unwrap(), PlannedKind::Conflict);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1136,6 +1214,7 @@ mod tests {
         assert_eq!(report.replaced, vec!["alpha"]);
 
         let written = fs::read_to_string(&target).unwrap();
+
         assert!(written.contains("\"command\": \"echo\""), "got: {written}");
         assert!(!written.contains("OLD"));
         let _ = fs::remove_dir_all(&dir);
@@ -1153,6 +1232,7 @@ mod tests {
         write_mcp(&remote, FIXTURE_REMOTE);
 
         let err = merge_mcp_json(Some(&target), &remote, &target, false).unwrap_err();
+
         assert!(
             err.to_string()
                 .contains("Refusing to merge non-interactively"),
@@ -1169,6 +1249,7 @@ mod tests {
         write_mcp(&remote, r#"{"mcpServers": {"broken": {"type": "stdio"}}}"#);
 
         let err = merge_mcp_json(None, &remote, &target, false).unwrap_err();
+
         assert!(
             format!("{err:#}").contains("missing a \"command\" field"),
             "got: {err:#}"
@@ -1187,6 +1268,7 @@ mod tests {
         );
 
         let report = merge_mcp_json(None, &remote, &target, false).unwrap();
+
         assert_eq!(report.missing_secrets, vec!["LOKI_TEST_MERGE_SECRET"]);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1207,5 +1289,20 @@ mod tests {
 
         assert_eq!(after_first, after_second);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_missing_secrets_noop_on_empty_input() {
+        assert!(handle_missing_secrets(&[]).is_ok());
+    }
+
+    #[test]
+    fn handle_missing_secrets_defers_all_in_non_tty() {
+        let missing = vec![
+            "LOKI_TEST_STEP4_A".to_string(),
+            "LOKI_TEST_STEP4_B".to_string(),
+        ];
+
+        assert!(handle_missing_secrets(&missing).is_ok());
     }
 }
