@@ -156,6 +156,10 @@ async fn run(
         return config::install_assets(category);
     }
 
+    if let Some(url) = cli.install_from.as_deref() {
+        return config::install_remote(url, cli.filter, cli.install_force);
+    }
+
     if cli.sync_models {
         let url = ctx.app.config.sync_models_url();
         return sync_models(&url, abort_signal.clone()).await;

@@ -538,16 +538,27 @@ pub async fn run_repl_command(
                     }
                 }
             }
-            ".install" => match args.map(str::trim) {
-                Some(name) if !name.is_empty() => match AssetCategory::parse(name) {
-                    Some(category) => config::install_assets(category)?,
-                    None => println!(
-                        "Unknown asset category '{name}'. Valid categories: {}",
-                        AssetCategory::NAMES.join(", ")
+            ".install" => {
+                let trimmed = args.map(str::trim).unwrap_or("");
+                let mut parts = trimmed.splitn(2, char::is_whitespace);
+                match parts.next() {
+                    Some("remote") => {
+                        let rest = parts.next().unwrap_or("").trim();
+                        config::install_remote_from_repl_args(rest)?;
+                    }
+                    Some(name) if !name.is_empty() => match AssetCategory::parse(name) {
+                        Some(category) => config::install_assets(category)?,
+                        None => println!(
+                            "Unknown asset category '{name}'. Valid categories: {}",
+                            AssetCategory::NAMES.join(", ")
+                        ),
+                    },
+                    _ => println!(
+                        "Usage: .install <{}> | .install remote <git-url>",
+                        AssetCategory::NAMES.join("|")
                     ),
-                },
-                _ => println!("Usage: .install <{}>", AssetCategory::NAMES.join("|")),
-            },
+                }
+            }
             ".update" => {
                 if ctx.macro_flag {
                     bail!("Cannot perform this operation because you are in a macro")
