@@ -10,7 +10,8 @@ Loki is an all-in-one, batteries-included, LLM CLI tool featuring Shell Assistan
 Agents, and More.
 
 It is designed to include a number of useful agents, roles, macros, and more so users can get up and running with Loki 
-in as little time as possible.
+in as little time as possible. You can also install entire bundles of agents, roles, macros, tools, and MCP servers from 
+any git repository — see [Sharing Configurations](#sharing-configurations).
 
 ![Agent example](https://raw.githubusercontent.com/wiki/Dark-Alex-17/loki/images/agents/sql.gif)
 
@@ -20,6 +21,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [AIChat Migration Guide](https://github.com/Dark-Alex-17/loki/wiki/AIChat-Migration): Coming from AIChat? Follow the migration guide to get started.
 * [Installation](#install): Install Loki
 * [Getting Started](#getting-started): Get started with Loki by doing first-run setup steps.
+* [Sharing Configurations](https://github.com/Dark-Alex-17/loki/wiki/Sharing-Configurations): Install bundles of agents, roles, macros, tools, and MCP servers from any git repo, and share your own.
 * [REPL](https://github.com/Dark-Alex-17/loki/wiki/REPL): Interactive Read-Eval-Print Loop for conversational interactions with LLMs and Loki.
   * [Custom REPL Prompt](https://github.com/Dark-Alex-17/loki/wiki/REPL-Prompt): Customize the REPL prompt to provide useful contextual information.
 * [Vault](https://github.com/Dark-Alex-17/loki/wiki/Vault): Securely store and manage sensitive information such as API keys and credentials.
