@@ -4,9 +4,9 @@ use super::todo::TodoList;
 use super::tool_scope::{McpRuntime, ToolScope};
 use super::{
     AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
-    Input, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, RIGHT_PROMPT, Role, RoleLike,
-    SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags, TEMP_ROLE_NAME,
-    TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, paths,
+    Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, RIGHT_PROMPT, Role,
+    RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
+    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, paths,
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
@@ -1855,9 +1855,12 @@ impl RequestContext {
                 }
                 ".rag" => super::map_completion_values(paths::list_rags()),
                 ".agent" => super::map_completion_values(list_agents()),
-                ".install" => super::map_completion_values(
-                    AssetCategory::NAMES.iter().map(|s| s.to_string()).collect(),
-                ),
+                ".install" => {
+                    let mut values: Vec<String> =
+                        AssetCategory::NAMES.iter().map(|s| s.to_string()).collect();
+                    values.push("remote".to_string());
+                    super::map_completion_values(values)
+                }
                 ".macro" => super::map_completion_values(paths::list_macros()),
                 ".starter" => match &self.agent {
                     Some(agent) => agent
@@ -1913,6 +1916,28 @@ impl RequestContext {
                 }
                 _ => vec![],
             };
+        } else if cmd == ".install" && args.first() == Some(&"remote") && args.len() >= 2 {
+            let prev = args.get(args.len() - 2).copied().unwrap_or("");
+            if prev == "--filter" {
+                values = super::map_completion_values(
+                    InstallFilter::NAMES.iter().map(|s| s.to_string()).collect(),
+                );
+            } else {
+                let has_filter = args.iter().enumerate().any(|(i, a)| {
+                    a.starts_with("--filter=") || (*a == "--filter" && i < args.len() - 1)
+                });
+                let has_force = args.contains(&"--force");
+                let mut available: Vec<&str> = vec![];
+
+                if !has_filter {
+                    available.push("--filter");
+                }
+                if !has_force {
+                    available.push("--force");
+                }
+
+                values = super::map_completion_values(available);
+            }
         } else if cmd == ".set" && args.len() == 2 {
             let candidates = match args[0] {
                 "max_output_tokens" => match self.current_model().max_output_tokens() {
