@@ -487,14 +487,6 @@
           thinking:
             type: enabled
             budget_tokens: 16000
-    - name: claude-3-5-haiku-20241022
-      max_input_tokens: 200000
-      max_output_tokens: 8192
-      require_max_tokens: true
-      input_price: 0.8
-      output_price: 4
-      supports_vision: true
-      supports_function_calling: true
 
 # Links:
 #  - https://docs.mistral.ai/getting-started/models/models_overview/
