@@ -220,7 +220,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 42]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".install",
-            "Reinstall bundled agents, macros, functions, or MCP config (overwrites local changes)",
+            "Reinstall bundled assets, or install assets from a remote git repo (.install remote <url>)",
             AssertState::pass(),
         ),
         ReplCommand::new(

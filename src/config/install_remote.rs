@@ -575,7 +575,7 @@ fn resolve_conflict(planned: &PlannedFile, sticky: &mut StickyMode) -> Result<Co
             *sticky = StickyMode::ReplaceAll;
             Ok(ConflictAction::Replace)
         }
-        "abort" => bail!("Aborted by user."),
+        "abort" => bail!("Install aborted by user at conflict resolution."),
         _ => unreachable!("inquire::Select returned an unexpected option"),
     }
 }
