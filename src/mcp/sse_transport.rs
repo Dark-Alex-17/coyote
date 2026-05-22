@@ -3,12 +3,12 @@ use eventsource_stream::{EventStream, Eventsource};
 use fmt::{Display, Formatter};
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
+use indexmap::IndexMap;
 use mpsc::error::SendError;
 use mpsc::{OwnedPermit, Receiver, Sender, channel};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, header};
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -28,7 +28,10 @@ pub struct LegacySseTransport {
 }
 
 impl LegacySseTransport {
-    pub async fn connect(sse_url: &str, headers: Option<&HashMap<String, String>>) -> Result<Self> {
+    pub async fn connect(
+        sse_url: &str,
+        headers: Option<&IndexMap<String, String>>,
+    ) -> Result<Self> {
         let base_url =
             Url::parse(sse_url).with_context(|| format!("Invalid SSE URL: {sse_url}"))?;
 

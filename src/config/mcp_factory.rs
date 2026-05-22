@@ -109,12 +109,13 @@ impl McpFactory {
 mod tests {
     use super::*;
     use crate::mcp::{JsonField, McpServer, McpTransportType};
+    use indexmap::IndexMap;
     use std::collections::HashMap;
 
     fn stdio_spec(
         command: &str,
         args: Option<Vec<String>>,
-        env: Option<HashMap<String, JsonField>>,
+        env: Option<IndexMap<String, JsonField>>,
     ) -> McpServer {
         McpServer {
             transport_type: McpTransportType::Stdio,
@@ -130,7 +131,7 @@ mod tests {
     fn remote_spec(
         transport: McpTransportType,
         url: &str,
-        headers: Option<HashMap<String, String>>,
+        headers: Option<IndexMap<String, String>>,
     ) -> McpServer {
         McpServer {
             transport_type: transport,
@@ -145,7 +146,7 @@ mod tests {
 
     #[test]
     fn key_from_stdio_spec_captures_command_args_env() {
-        let mut env = HashMap::new();
+        let mut env = IndexMap::new();
         env.insert("TOKEN".into(), JsonField::Str("abc".into()));
         let spec = stdio_spec("npx", Some(vec!["-y".into(), "server".into()]), Some(env));
         let key = McpServerKey::from_spec("my-server", &spec);
@@ -163,7 +164,7 @@ mod tests {
 
     #[test]
     fn key_from_stdio_spec_sorts_args_and_env() {
-        let mut env = HashMap::new();
+        let mut env = IndexMap::new();
         env.insert("Z_VAR".into(), JsonField::Str("z".into()));
         env.insert("A_VAR".into(), JsonField::Int(42));
         let spec = stdio_spec(
@@ -222,7 +223,7 @@ mod tests {
 
     #[test]
     fn key_from_remote_sse_spec_with_sorted_headers() {
-        let mut hdrs = HashMap::new();
+        let mut hdrs = IndexMap::new();
         hdrs.insert("Z-Key".into(), "z-val".into());
         hdrs.insert("A-Key".into(), "a-val".into());
         let spec = remote_spec(McpTransportType::Sse, "http://sse.example.com", Some(hdrs));
@@ -264,7 +265,7 @@ mod tests {
 
     #[test]
     fn key_env_bool_and_int_coerce_to_string() {
-        let mut env = HashMap::new();
+        let mut env = IndexMap::new();
         env.insert("FLAG".into(), JsonField::Bool(true));
         env.insert("PORT".into(), JsonField::Int(3000));
         let spec = stdio_spec("cmd", None, Some(env));

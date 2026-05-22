@@ -29,6 +29,8 @@ use crate::utils::{
 
 use crate::graph;
 use anyhow::{Context, Error, Result, bail};
+#[cfg(test)]
+use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
 use parking_lot::RwLock;
@@ -2899,7 +2901,7 @@ mod tests {
         let mcp_config = if server_names.is_empty() {
             None
         } else {
-            let mut servers = HashMap::new();
+            let mut servers = IndexMap::new();
             for name in server_names {
                 servers.insert(
                     name.to_string(),

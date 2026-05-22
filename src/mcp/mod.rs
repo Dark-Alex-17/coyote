@@ -8,6 +8,7 @@ use crate::vault::interpolate_secrets;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use http::{HeaderName, HeaderValue};
+use indexmap::IndexMap;
 use indoc::formatdoc;
 use rmcp::service::RunningService;
 use rmcp::transport::StreamableHttpClientTransport;
@@ -49,23 +50,29 @@ impl Clone for ServerCatalog {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct McpServersConfig {
     #[serde(rename = "mcpServers")]
-    pub mcp_servers: HashMap<String, McpServer>,
+    pub mcp_servers: IndexMap<String, McpServer>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpServer {
     #[serde(rename = "type")]
     pub transport_type: McpTransportType,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<Vec<String>>,
-    pub env: Option<HashMap<String, JsonField>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<IndexMap<String, JsonField>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    pub headers: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<IndexMap<String, String>>,
 }
 
 impl McpServer {
@@ -111,7 +118,7 @@ impl McpServer {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum McpTransportType {
     Stdio,
@@ -119,7 +126,7 @@ pub(crate) enum McpTransportType {
     Sse,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum JsonField {
     Str(String),
@@ -352,7 +359,7 @@ pub(crate) async fn spawn_mcp_server(
 
 async fn spawn_http_mcp_server(
     url: &str,
-    headers: Option<&HashMap<String, String>>,
+    headers: Option<&IndexMap<String, String>>,
 ) -> Result<Arc<ConnectedServer>> {
     let transport = if let Some(hdrs) = headers
         && !hdrs.is_empty()
@@ -382,7 +389,7 @@ async fn spawn_http_mcp_server(
 
 async fn spawn_sse_mcp_server(
     url: &str,
-    headers: Option<&HashMap<String, String>>,
+    headers: Option<&IndexMap<String, String>>,
 ) -> Result<Arc<ConnectedServer>> {
     let sse = LegacySseTransport::connect(url, headers)
         .await
@@ -482,7 +489,7 @@ mod tests {
     }
 
     fn make_registry_with_config(server_names: &[&str]) -> McpRegistry {
-        let mut mcp_servers = HashMap::new();
+        let mut mcp_servers = IndexMap::new();
         for name in server_names {
             mcp_servers.insert(name.to_string(), stdio_server("echo"));
         }
@@ -530,7 +537,7 @@ mod tests {
 
     #[test]
     fn validate_stdio_with_headers_fails() {
-        let mut headers = HashMap::new();
+        let mut headers = IndexMap::new();
         headers.insert("Auth".into(), "Bearer tok".into());
         let spec = McpServer {
             transport_type: McpTransportType::Stdio,
