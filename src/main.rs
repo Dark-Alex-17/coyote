@@ -92,6 +92,14 @@ async fn main() -> Result<()> {
 
     install_builtins()?;
 
+    if let Some(category) = cli.install {
+        return config::install_assets(category);
+    }
+
+    if let Some(url) = cli.install_from.as_deref() {
+        return config::install_remote(url, cli.filter, cli.install_force);
+    }
+
     if let Some(client_arg) = &cli.authenticate {
         let cfg = Config::load_with_interpolation(true).await?;
         let app_config = AppConfig::from_config(cfg)?;
@@ -152,14 +160,6 @@ async fn run(
     text: Option<String>,
     abort_signal: AbortSignal,
 ) -> Result<()> {
-    if let Some(category) = cli.install {
-        return config::install_assets(category);
-    }
-
-    if let Some(url) = cli.install_from.as_deref() {
-        return config::install_remote(url, cli.filter, cli.install_force);
-    }
-
     if cli.sync_models {
         let url = ctx.app.config.sync_models_url();
         return sync_models(&url, abort_signal.clone()).await;
