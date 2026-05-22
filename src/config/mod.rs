@@ -84,6 +84,26 @@ const GLOBAL_TOOLS_DIR_NAME: &str = "tools";
 const GLOBAL_TOOLS_UTILS_DIR_NAME: &str = "utils";
 const BASH_PROMPT_UTILS_FILE_NAME: &str = "prompt-utils.sh";
 const MCP_FILE_NAME: &str = "mcp.json";
+const DEFAULT_VISIBLE_TOOLS: [&str; 18] = [
+    "execute_command.sh",
+    "execute_py_code.py",
+    "execute_sql_code.sh",
+    "fetch_url_via_curl.sh",
+    "fs_cat.sh",
+    "fs_glob.sh",
+    "fs_grep.sh",
+    "fs_ls.sh",
+    "fs_mkdir.sh",
+    "fs_patch.sh",
+    "fs_read.sh",
+    "fs_rm.sh",
+    "fs_write.sh",
+    "get_current_time.sh",
+    "get_current_weather.sh",
+    "search_wikipedia.sh",
+    "search_arxiv.sh",
+    "web_search_loki.sh",
+];
 
 const CLIENTS_FIELD: &str = "clients";
 
@@ -562,6 +582,18 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
     let (model, clients_config) = create_client_config(client, &vault).await?;
     config["model"] = model.into();
     config["vault_password_file"] = vault.password_file()?.display().to_string().into();
+    config["stream"] = json!(true);
+    config["save"] = json!(true);
+    config["keybindings"] = json!("vi");
+    config["wrap"] = json!("auto");
+    config["wrap_code"] = json!(false);
+    config["function_calling_support"] = json!(true);
+    config["enabled_tools"] = json!(null);
+    config["visible_tools"] = json!(DEFAULT_VISIBLE_TOOLS);
+    config["mcp_server_support"] = json!(true);
+    config["enabled_mcp_servers"] = json!(null);
+    config["highlight"] = json!(true);
+    config["light_theme"] = json!(false);
     config[CLIENTS_FIELD] = clients_config;
 
     let config_data = serde_yaml::to_string(&config).with_context(|| "Failed to create config")?;
