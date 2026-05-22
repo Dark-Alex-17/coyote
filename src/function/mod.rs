@@ -227,12 +227,11 @@ impl Functions {
             })?;
             let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
             let file_path = paths::functions_dir().join(file.as_ref());
-            let file_extension = file_path
+            #[cfg_attr(not(unix), expect(unused))]
+            let is_script = file_path
                 .extension()
                 .and_then(OsStr::to_str)
-                .map(|s| s.to_lowercase());
-            #[cfg_attr(not(unix), expect(unused))]
-            let is_script = matches!(file_extension.as_deref(), Some("sh") | Some("py"));
+                .is_some_and(|ext| Language::from_extension(ext) != Language::Unsupported);
 
             let force_this = force && file.as_ref() != "mcp.json";
             if file_path.exists() && !force_this {
