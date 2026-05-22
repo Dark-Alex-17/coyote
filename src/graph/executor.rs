@@ -1,8 +1,7 @@
 use super::agent::AgentNodeExecutor;
 use super::llm::{LlmExecutionOutcome, LlmNodeExecutor};
-use super::logging::{GraphLogger, node_type_label};
+use super::logging::{GraphLogger, narrate_node_complete, narrate_node_failed};
 use super::map::MapNodeExecutor;
-use super::progress::{BranchProgressHandle, BranchProgressTracker};
 use super::rag::RagNodeExecutor;
 use super::script::ScriptExecutor;
 use super::staging::BranchWrites;
@@ -152,14 +151,15 @@ impl GraphExecutor {
             let semaphore = Arc::new(Semaphore::new(max_concurrency));
 
             let frontier_size = frontier.len();
-            let is_nested = ctx.current_depth > 0;
-            let has_progress_nodes = frontier.iter().any(|nid| {
-                graph.get_node(nid).is_some_and(|n| {
-                    !matches!(n.node_type, NodeType::Approval(_) | NodeType::Input(_))
-                })
-            });
-            let progress_tracker =
-                (has_progress_nodes && !is_nested).then(BranchProgressTracker::new);
+            let in_super_step = frontier_size > 1;
+            let silent = logger.silent();
+
+            if in_super_step {
+                let mut branches = sorted_frontier(&frontier);
+                branches.sort();
+                logger.super_step_start(&branches);
+            }
+
             let mut branch_tasks = Vec::with_capacity(frontier_size);
             for node_id in &frontier {
                 let node = graph
@@ -168,34 +168,31 @@ impl GraphExecutor {
                         anyhow!("Node '{}' not found in graph '{}'", node_id, graph.name)
                     })?
                     .clone();
+                logger.node_start(&node, in_super_step);
                 let branch_state = state.fork_for_branch_state();
                 let mut branch_ctx = ctx.fork_for_branch();
-                branch_ctx.render_mode = RenderMode::Silent;
+                if in_super_step {
+                    branch_ctx.render_mode = RenderMode::Silent;
+                }
                 let script_exec_clone = script_executor.clone();
                 let graph_clone = Arc::clone(&graph);
                 let current = node_id.clone();
                 let sem_clone = semaphore.clone();
                 let abort_clone = abort_signal.clone();
-                let progress_handle = match (
-                    matches!(node.node_type, NodeType::Approval(_) | NodeType::Input(_)),
-                    &progress_tracker,
-                ) {
-                    (false, Some(tracker)) => {
-                        tracker.add_branch(&format!("{} ({})", node_id, node_type_label(&node)))
-                    }
-                    _ => BranchProgressHandle::disabled(),
-                };
 
                 let task = tokio::spawn(async move {
-                    let mut progress_handle = Some(progress_handle);
                     let _permit = sem_clone
                         .acquire()
                         .await
                         .expect("semaphore should not be closed");
                     if abort_clone.aborted() {
-                        if let Some(h) = progress_handle.take() {
-                            h.fail("aborted");
-                        }
+                        narrate_node_failed(
+                            silent,
+                            &node,
+                            Duration::default(),
+                            "aborted",
+                            in_super_step,
+                        );
                         return (
                             current.clone(),
                             branch_state,
@@ -214,10 +211,38 @@ impl GraphExecutor {
                     };
                     let result = step(&node, &mut state, &mut ctx, &step_ctx, &current).await;
                     let elapsed = node_start.elapsed();
-                    if let Some(h) = progress_handle.take() {
-                        match &result {
-                            Ok(_) => h.complete(),
-                            Err(e) => h.fail(&e.to_string()),
+                    match &result {
+                        Ok(StepResult::Continue(targets)) => {
+                            let route = if targets.is_empty() {
+                                None
+                            } else {
+                                Some(targets.join(", "))
+                            };
+                            narrate_node_complete(
+                                silent,
+                                &node,
+                                elapsed,
+                                route.as_deref(),
+                                in_super_step,
+                            );
+                        }
+                        Ok(StepResult::End(_)) => {
+                            narrate_node_complete(
+                                silent,
+                                &node,
+                                elapsed,
+                                Some("END"),
+                                in_super_step,
+                            );
+                        }
+                        Err(e) => {
+                            narrate_node_failed(
+                                silent,
+                                &node,
+                                elapsed,
+                                &e.to_string(),
+                                in_super_step,
+                            );
                         }
                     }
                     (current, state, result, elapsed)
@@ -226,7 +251,6 @@ impl GraphExecutor {
             }
 
             let joined = join_all(branch_tasks).await;
-            drop(progress_tracker);
 
             let mut branch_writes: Vec<BranchWrites> = Vec::new();
             let mut next_frontier: HashSet<String> = HashSet::new();
@@ -294,6 +318,9 @@ impl GraphExecutor {
                 return Ok(output);
             }
 
+            if in_super_step {
+                logger.super_step_end(&sorted_frontier(&next_frontier));
+            }
             frontier = next_frontier;
         }
     }

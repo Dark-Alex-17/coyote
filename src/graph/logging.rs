@@ -1,9 +1,23 @@
 use super::state::StateManager;
 use super::types::{Node, NodeType};
 use crate::utils::dimmed_text;
+use chrono::Local;
 use indexmap::IndexMap;
 use std::cmp::Reverse;
 use std::time::Duration;
+
+fn ts() -> String {
+    Local::now().format("%H:%M:%S").to_string()
+}
+
+fn fmt_secs(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 1.0 {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{secs:.2}s")
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct NodeTiming {
@@ -80,6 +94,43 @@ impl GraphLogger {
         );
     }
 
+    pub fn silent(&self) -> bool {
+        self.silent
+    }
+
+    pub fn node_start(&self, node: &Node, in_super_step: bool) {
+        narrate_node_start(self.silent, node, in_super_step);
+    }
+
+    pub fn super_step_start(&self, branches: &[String]) {
+        if self.silent {
+            return;
+        }
+        eprintln!(
+            "{}",
+            dimmed_text(&format!(
+                "▸ {} super-step start: {}",
+                ts(),
+                branches.join(", ")
+            ))
+        );
+    }
+
+    pub fn super_step_end(&self, targets: &[String]) {
+        if self.silent {
+            return;
+        }
+        let route = if targets.is_empty() {
+            String::new()
+        } else {
+            format!(" -> {}", targets.join(", "))
+        };
+        eprintln!(
+            "{}",
+            dimmed_text(&format!("▸ {} super-step end{route}", ts()))
+        );
+    }
+
     pub fn record_timing(&mut self, node_id: &str, elapsed: Duration) {
         self.timings
             .entry(node_id.to_string())
@@ -142,6 +193,66 @@ impl GraphLogger {
             );
         }
     }
+}
+
+pub fn narrate_node_start(silent: bool, node: &Node, in_super_step: bool) {
+    if silent {
+        return;
+    }
+    let indent = if in_super_step { "  " } else { "" };
+    let label = node_type_label(node);
+    eprintln!(
+        "{}",
+        dimmed_text(&format!("▸ {} {indent}{} ({label}) start", ts(), node.id))
+    );
+}
+
+pub fn narrate_node_complete(
+    silent: bool,
+    node: &Node,
+    elapsed: Duration,
+    next_target: Option<&str>,
+    in_super_step: bool,
+) {
+    if silent {
+        return;
+    }
+    let indent = if in_super_step { "  " } else { "" };
+    let label = node_type_label(node);
+    let dur = fmt_secs(elapsed);
+    let route = next_target.map(|t| format!(" -> {t}")).unwrap_or_default();
+    eprintln!(
+        "{}",
+        dimmed_text(&format!(
+            "▸ {} {indent}{} ({label}) done in {dur}{route}",
+            ts(),
+            node.id
+        ))
+    );
+}
+
+pub fn narrate_node_failed(
+    silent: bool,
+    node: &Node,
+    elapsed: Duration,
+    err: &str,
+    in_super_step: bool,
+) {
+    if silent {
+        return;
+    }
+    let indent = if in_super_step { "  " } else { "" };
+    let label = node_type_label(node);
+    let dur = fmt_secs(elapsed);
+    let excerpt: String = err.chars().take(120).collect();
+    eprintln!(
+        "{}",
+        dimmed_text(&format!(
+            "▸ {} {indent}{} ({label}) FAILED in {dur} -- {excerpt}",
+            ts(),
+            node.id
+        ))
+    );
 }
 
 pub(super) fn node_type_label(node: &Node) -> &'static str {
