@@ -5,7 +5,6 @@ pub mod llm;
 pub mod logging;
 pub mod map;
 pub mod parser;
-pub mod progress;
 pub mod rag;
 pub mod reducer;
 pub mod script;
