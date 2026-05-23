@@ -176,11 +176,12 @@ subscribers, Google Gemini), you can authenticate with your existing subscriptio
 # In your config.yaml
 clients:
   - type: claude
+    name: my-claude-oauth
     auth: oauth # Indicate you want to authenticate with OAuth instead of an API key
 ```
 
 ```sh
-loki --authenticate claude
+loki --authenticate my-claude-oauth
 # Or via the REPL: .authenticate
 ```
 
