@@ -2969,6 +2969,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_mcp_disabled_skips_servers() {
+        let _guard = TestConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(false, &["github", "slack"]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let app = ctx.app.config.clone();
@@ -2982,6 +2983,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_no_enabled_servers_yields_empty_runtime() {
+        let _guard = TestConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(true, &["github"]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let app = ctx.app.config.clone();
@@ -2995,6 +2997,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_no_mcp_config_yields_empty_runtime() {
+        let _guard = TestConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(true, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let app = ctx.app.config.clone();
@@ -3008,6 +3011,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_preserves_tool_tracker() {
+        let _guard = TestConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(false, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let dummy = ToolCall {
@@ -3035,6 +3039,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_repl_mode_appends_user_interaction_functions() {
+        let _guard = TestConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(false, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Repl);
         let app = ctx.app.config.clone();
@@ -3058,6 +3063,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_cmd_mode_no_user_interaction_functions() {
+        let _guard = TestConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(false, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let app = ctx.app.config.clone();
