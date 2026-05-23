@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::{InstallFilter, paths};
+#[cfg(not(windows))]
 use crate::function::Language;
 use crate::mcp::{McpServer, McpServersConfig};
 use crate::utils;
