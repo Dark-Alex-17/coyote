@@ -49,6 +49,11 @@ def parse_raw_data(data):
 
 
 def parse_argv():
+    tool_data_file = os.environ.get("LLM_TOOL_DATA_FILE")
+    if tool_data_file and os.path.isfile(tool_data_file):
+        with open(tool_data_file, "r", encoding="utf-8") as f:
+            return f.read()
+
     argv = sys.argv[:] + [None] * max(0, 2 - len(sys.argv))
 
     tool_data = argv[1]

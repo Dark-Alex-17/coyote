@@ -3,7 +3,7 @@ use super::{
     message::{Message, MessageContent, MessageContentPart},
 };
 
-use crate::config::Config;
+use crate::config::AppConfig;
 use crate::utils::{estimate_token_length, strip_think_tag};
 
 use anyhow::{Result, bail};
@@ -44,7 +44,11 @@ impl Model {
             .collect()
     }
 
-    pub fn retrieve_model(config: &Config, model_id: &str, model_type: ModelType) -> Result<Self> {
+    pub fn retrieve_model(
+        config: &AppConfig,
+        model_id: &str,
+        model_type: ModelType,
+    ) -> Result<Self> {
         let models = list_all_models(config);
         let (client_name, model_name) = match model_id.split_once(':') {
             Some((client_name, model_name)) => {

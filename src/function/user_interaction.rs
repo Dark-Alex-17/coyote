@@ -1,8 +1,8 @@
 use super::{FunctionDeclaration, JsonSchema};
-use crate::config::GlobalConfig;
+use crate::config::RequestContext;
 use crate::supervisor::escalation::{EscalationRequest, new_escalation_id};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
 use inquire::{Confirm, MultiSelect, Select, Text};
 use serde_json::{Value, json};
@@ -120,7 +120,7 @@ pub fn user_interaction_function_declarations() -> Vec<FunctionDeclaration> {
 }
 
 pub async fn handle_user_tool(
-    config: &GlobalConfig,
+    ctx: &mut RequestContext,
     cmd_name: &str,
     args: &Value,
 ) -> Result<Value> {
@@ -128,12 +128,12 @@ pub async fn handle_user_tool(
         .strip_prefix(USER_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
 
-    let depth = config.read().current_depth;
+    let depth = ctx.current_depth;
 
     if depth == 0 {
         handle_direct(action, args)
     } else {
-        handle_escalated(config, action, args).await
+        handle_escalated(ctx, action, args).await
     }
 }
 
@@ -155,7 +155,10 @@ fn handle_direct_ask(args: &Value) -> Result<Value> {
     let mut options = parse_options(args)?;
     options.push(CUSTOM_MULTI_CHOICE_ANSWER_OPTION.to_string());
 
-    let mut answer = Select::new(question, options).prompt()?;
+    let mut answer = Select::new(question, options)
+        .without_filtering()
+        .with_help_message("↑↓ to move, enter to select")
+        .prompt()?;
 
     if answer == CUSTOM_MULTI_CHOICE_ANSWER_OPTION {
         answer = Text::new("Custom response:").prompt()?
@@ -198,42 +201,37 @@ fn handle_direct_checkbox(args: &Value) -> Result<Value> {
     Ok(json!({ "answers": answers }))
 }
 
-async fn handle_escalated(config: &GlobalConfig, action: &str, args: &Value) -> Result<Value> {
+async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> Result<Value> {
     let question = args
         .get("question")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'question' is required"))?
         .to_string();
 
-    let options: Option<Vec<String>> = args.get("options").and_then(Value::as_array).map(|arr| {
-        arr.iter()
-            .filter_map(Value::as_str)
-            .map(String::from)
-            .collect()
-    });
-
-    let (from_agent_id, from_agent_name, root_queue, timeout_secs) = {
-        let cfg = config.read();
-        let agent_id = cfg
-            .self_agent_id
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        let agent_name = cfg
-            .agent
-            .as_ref()
-            .map(|a| a.name().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let queue = cfg
-            .root_escalation_queue
-            .clone()
-            .ok_or_else(|| anyhow!("No escalation queue available; cannot reach parent agent"))?;
-        let timeout = cfg
-            .agent
-            .as_ref()
-            .map(|a| a.escalation_timeout())
-            .unwrap_or(DEFAULT_ESCALATION_TIMEOUT_SECS);
-        (agent_id, agent_name, queue, timeout)
+    let options: Option<Vec<String>> = if args.get("options").is_some() {
+        Some(parse_options(args)?)
+    } else {
+        None
     };
+
+    let from_agent_id = ctx
+        .self_agent_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let from_agent_name = ctx
+        .agent
+        .as_ref()
+        .map(|a| a.name().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let root_queue = ctx
+        .root_escalation_queue()
+        .cloned()
+        .ok_or_else(|| anyhow!("No escalation queue available; cannot reach parent agent"))?;
+    let timeout_secs = ctx
+        .agent
+        .as_ref()
+        .map(|a| a.escalation_timeout())
+        .unwrap_or(DEFAULT_ESCALATION_TIMEOUT_SECS);
 
     let escalation_id = new_escalation_id();
     let (tx, rx) = oneshot::channel();
@@ -266,13 +264,24 @@ async fn handle_escalated(config: &GlobalConfig, action: &str, args: &Value) -> 
 }
 
 fn parse_options(args: &Value) -> Result<Vec<String>> {
-    args.get("options")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .ok_or_else(|| anyhow!("'options' is required and must be an array of strings"))
+    let raw = args
+        .get("options")
+        .ok_or_else(|| anyhow!("'options' is required and must be an array of strings"))?;
+
+    let arr: Vec<Value> = match raw {
+        Value::Array(arr) => arr.clone(),
+        Value::String(s) => serde_json::from_str::<Vec<Value>>(s).map_err(|_| {
+            anyhow!(
+                "'options' was a string but did not parse as a JSON array. \
+                 Pass options as a native JSON array, e.g. [\"yes\", \"no\"]."
+            )
+        })?,
+        _ => bail!("'options' is required and must be an array of strings"),
+    };
+
+    Ok(arr
+        .iter()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect())
 }

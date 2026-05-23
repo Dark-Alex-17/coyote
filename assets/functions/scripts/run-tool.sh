@@ -13,7 +13,11 @@ main() {
 }
 
 parse_argv() {
-		tool_data="$1"
+    if [[ -n "$LLM_TOOL_DATA_FILE" ]] && [[ -f "$LLM_TOOL_DATA_FILE" ]]; then
+        tool_data="$(cat "$LLM_TOOL_DATA_FILE")"
+    else
+				tool_data="$1"
+    fi
     if [[ -z "$tool_data" ]]; then
         die "usage: ./{function_name}.sh <tool-data>"
     fi
@@ -54,7 +58,6 @@ run() {
     if [[ "$OS" == "Windows_NT" ]]; then
         set -o igncr
         tool_path="$(cygpath -w "$tool_path")"
-        tool_data="$(echo "$tool_data" | sed 's/\\/\\\\/g')"
     fi
 
     jq_script="$(cat <<-'EOF'
@@ -67,11 +70,11 @@ def to_args:
     to_entries | .[] |
     (.key | split("_") | join("-")) as $key |
     if .value | type == "array" then
-        .value | .[] | "--\($key) \(. | escape_shell_word)"
+        .value | .[] | "--\($key)=\(. | escape_shell_word)"
     elif .value | type == "boolean" then
         if .value then "--\($key)" else "" end
     else
-        "--\($key) \(.value | escape_shell_word)"
+        "--\($key)=\(.value | escape_shell_word)"
     end;
 [ to_args ] | join(" ")
 EOF

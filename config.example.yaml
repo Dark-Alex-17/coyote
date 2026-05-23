@@ -27,18 +27,18 @@ sync_models_url: >               # URL to sync model changes from
   https://raw.githubusercontent.com/Dark-Alex-17/loki/refs/heads/main/models.yaml
 
 # ---- REPL Prompt ----
-# Custom REPL left/right prompts; see the [REPL Prompt Documentation](./docs/REPL-PROMPT.md) for more information
+# Custom REPL left/right prompts; see the [REPL Prompt Documentation](https://github.com/Dark-Alex-17/loki/wiki/REPL-Prompt) for more information
 left_prompt:
   '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
 right_prompt:
   '{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
 
 # ---- Vault ----
-# See the [Vault documentation](./docs/VAULT.md) for more information on the Loki vault
+# See the [Vault documentation](https://github.com/Dark-Alex-17/loki/wiki/Vault) for more information on the Loki vault
 vault_password_file: null        # Path to a file containing the password for the Loki vault (cannot be a secret template)
 
 # ---- Function Calling ----
-# See the [Tools documentation](./docs/function-calling/TOOLS.md) for more details
+# See the [Tools documentation](https://github.com/Dark-Alex-17/loki/wiki/Tools) for more details
 function_calling: true           # Enables or disables function calling (Globally).
 mapping_tools:                   # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write,fs_read,fs_glob,fs_grep'
@@ -46,6 +46,7 @@ enabled_tools: null              # Which tools to enable by default. (e.g. 'fs,w
 visible_tools:                   # Which tools are visible to be compiled (and are thus able to be defined in 'enabled_tools')
 #  - demo_py.py
 #  - demo_sh.sh
+#  - demo_ts.ts
   - execute_command.sh
 #  - execute_py_code.py
 #  - execute_sql_code.sh
@@ -61,8 +62,8 @@ visible_tools:                   # Which tools are visible to be compiled (and a
 #  - fs_write.sh
   - get_current_time.sh
 #  - get_current_weather.py
+#  - get_current_weather.ts
   - get_current_weather.sh
-  - query_jira_issues.sh
 #  - search_arxiv.sh
 #  - search_wikipedia.sh
 #  - search_wolframalpha.sh
@@ -73,14 +74,24 @@ visible_tools:                   # Which tools are visible to be compiled (and a
 #  - web_search_tavily.sh
 
 # ---- MCP Servers ----
-# See the [MCP Servers documentation](./docs/MCP-SERVERS.md) for more details
+# See the [MCP Servers documentation](https://github.com/Dark-Alex-17/loki/wiki/MCP-Servers) for more details
 mcp_server_support: true         # Enables or disables MCP servers (globally).
 mapping_mcp_servers:             # Alias for an MCP server or set of servers
   git: github,gitmcp
 enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 'github,slack,ddg-search')
 
+# ---- Auto-Continue (Todo System) ----
+# The auto-continue system provides built-in task tracking for improved reliability.
+# When enabled, the model can create todo lists and the system will automatically
+# prompt it to continue when incomplete tasks remain.
+# See the [Todo System documentation](https://github.com/Dark-Alex-17/loki/wiki/TODO-System) for more information
+auto_continue: false              # Enable automatic continuation when incomplete todos remain (default: false)
+max_auto_continues: 10            # Maximum number of automatic continuations before stopping (default: 10)
+inject_todo_instructions: true    # Inject default todo usage instructions into the system prompt (default: true)
+continuation_prompt: null         # Custom prompt used when auto-continuing. If null, uses built-in default
+
 # ---- Session ----
-# See the [Session documentation](./docs/SESSIONS.md) for more information
+# See the [Session documentation](https://github.com/Dark-Alex-17/loki/wiki/Sessions) for more information
 save_session: null               # Controls the persistence of the session. If true, auto save; if false, don't auto-save save; if null, ask the user what to do
 compression_threshold: 4000      # Compress the session when the token count reaches or exceeds this threshold
 summarization_prompt: >          # The text prompt used for creating a concise summary of session message
@@ -89,7 +100,7 @@ summary_context_prompt: >        # The text prompt used for including the summar
   'This is a summary of the chat history as a recap: '
 
 # ---- RAG ----
-# See the [RAG Docs](./docs/RAG.md) for more details.
+# See the [RAG Docs](https://github.com/Dark-Alex-17/loki/wiki/RAG) for more details.
 rag_embedding_model: null        # Specifies the embedding model used for context retrieval
 rag_reranker_model: null         # Specifies the reranker model used for sorting retrieved documents; Loki uses Reciprocal Rank Fusion by default
 rag_top_k: 5                     # Specifies the number of documents to retrieve for answering queries
@@ -135,7 +146,7 @@ document_loaders:
     sh -c "yek $1 --json | jq 'map({ path: .filename, contents: .content })'"
 
 # ---- Clients ----
-# See the [Clients documentation](./docs/clients/CLIENTS.md) for more details
+# See the [Clients documentation](https://github.com/Dark-Alex-17/loki/wiki/Clients) for more details
 clients:
   # All clients have the following configuration:
   # - type: xxxx

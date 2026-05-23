@@ -2,9 +2,9 @@ use super::{ToolCall, catch_error};
 use crate::utils::AbortSignal;
 
 use anyhow::{Context, Result, anyhow, bail};
+use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
-use reqwest::RequestBuilder;
-use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
+use reqwest::{RequestBuilder, header};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -16,6 +16,7 @@ pub struct SseHandler {
     last_tool_calls: Vec<ToolCall>,
     max_call_repeats: usize,
     call_repeat_chain_len: usize,
+    silent: bool,
 }
 
 impl SseHandler {
@@ -28,7 +29,12 @@ impl SseHandler {
             last_tool_calls: Vec::new(),
             max_call_repeats: 2,
             call_repeat_chain_len: 3,
+            silent: false,
         }
+    }
+
+    pub fn set_silent(&mut self, silent: bool) {
+        self.silent = silent;
     }
 
     pub fn text(&mut self, text: &str) -> Result<()> {
@@ -36,6 +42,11 @@ impl SseHandler {
             return Ok(());
         }
         self.buffer.push_str(text);
+
+        if self.silent {
+            return Ok(());
+        }
+
         let ret = self
             .sender
             .send(SseEvent::Text(text.to_string()))
@@ -193,11 +204,46 @@ pub async fn sse_stream<F>(builder: RequestBuilder, mut handle: F) -> Result<()>
 where
     F: FnMut(SseMessage) -> Result<bool>,
 {
-    let mut es = builder.eventsource()?;
+    let res = builder
+        .header(header::ACCEPT, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-store")
+        .send()
+        .await?;
+    let status = res.status();
+    if !status.is_success() {
+        let text = res.text().await?;
+        let data: Value = match text.parse() {
+            Ok(data) => data,
+            Err(_) => {
+                bail!(
+                    "Invalid response data: {text} (status: {})",
+                    status.as_u16()
+                );
+            }
+        };
+        catch_error(&data, status.as_u16())?;
+        return Ok(());
+    }
+
+    let content_type = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let is_event_stream = content_type
+        .as_deref()
+        .map(|ct| ct.starts_with("text/event-stream"))
+        .unwrap_or(false);
+    if !is_event_stream {
+        let header_value = content_type.unwrap_or_default();
+        let text = res.text().await?;
+        bail!("Invalid response event-stream. content-type: {header_value}, data: {text}");
+    }
+
+    let mut es = res.bytes_stream().boxed().eventsource();
     while let Some(event) = es.next().await {
         match event {
-            Ok(Event::Open) => {}
-            Ok(Event::Message(message)) => {
+            Ok(message) => {
                 let message = SseMessage {
                     event: message.event,
                     data: message.data,
@@ -207,33 +253,7 @@ where
                 }
             }
             Err(err) => {
-                match err {
-                    EventSourceError::StreamEnded => {}
-                    EventSourceError::InvalidStatusCode(status, res) => {
-                        let text = res.text().await?;
-                        let data: Value = match text.parse() {
-                            Ok(data) => data,
-                            Err(_) => {
-                                bail!(
-                                    "Invalid response data: {text} (status: {})",
-                                    status.as_u16()
-                                );
-                            }
-                        };
-                        catch_error(&data, status.as_u16())?;
-                    }
-                    EventSourceError::InvalidContentType(header_value, res) => {
-                        let text = res.text().await?;
-                        bail!(
-                            "Invalid response event-stream. content-type: {}, data: {text}",
-                            header_value.to_str().unwrap_or_default()
-                        );
-                    }
-                    _ => {
-                        bail!("{}", err);
-                    }
-                }
-                es.close();
+                bail!("{err}");
             }
         }
     }
@@ -311,10 +331,8 @@ impl JsonStreamParser {
                     }
                     self.balances.push(ch);
                 }
-                '[' => {
-                    if self.start.is_some() {
-                        self.balances.push(ch);
-                    }
+                '[' if self.start.is_some() => {
+                    self.balances.push(ch);
                 }
                 '}' => {
                     self.balances.pop();
@@ -342,7 +360,7 @@ mod tests {
 
     use bytes::Bytes;
     use futures_util::stream;
-    use rand::Rng;
+    use rand::random_range;
     use serde_json::json;
 
     #[test]
@@ -392,10 +410,9 @@ mod tests {
     }
 
     fn split_chunks(text: &str) -> Vec<Vec<u8>> {
-        let mut rng = rand::rng();
         let len = text.len();
-        let cut1 = rng.random_range(1..len - 1);
-        let cut2 = rng.random_range(cut1 + 1..len);
+        let cut1 = random_range(1..len - 1);
+        let cut2 = random_range(cut1 + 1..len);
         let chunk1 = text.as_bytes()[..cut1].to_vec();
         let chunk2 = text.as_bytes()[cut1..cut2].to_vec();
         let chunk3 = text.as_bytes()[cut2..].to_vec();

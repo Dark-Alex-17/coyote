@@ -268,4 +268,87 @@ mod tests {
         assert!(!queue.claim(&id1, "worker-2"));
         assert_eq!(queue.get(&id1).unwrap().status, TaskStatus::InProgress);
     }
+
+    #[test]
+    fn test_fail_sets_status() {
+        let mut queue = TaskQueue::new();
+        let id = queue.create("Task".into(), "".into(), None, None);
+        queue.fail(&id);
+        assert_eq!(queue.get(&id).unwrap().status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn test_get_returns_none_for_missing() {
+        let queue = TaskQueue::new();
+        assert!(queue.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_dispatch_agent_stored() {
+        let mut queue = TaskQueue::new();
+        let id = queue.create(
+            "Auto task".into(),
+            "desc".into(),
+            Some("coder".into()),
+            Some("implement feature".into()),
+        );
+        let task = queue.get(&id).unwrap();
+        assert_eq!(task.dispatch_agent.as_deref(), Some("coder"));
+        assert_eq!(task.prompt.as_deref(), Some("implement feature"));
+    }
+
+    #[test]
+    fn test_claim_blocked_task_fails() {
+        let mut queue = TaskQueue::new();
+        let id1 = queue.create("A".into(), "".into(), None, None);
+        let id2 = queue.create("B".into(), "".into(), None, None);
+        queue.add_dependency(&id2, &id1).unwrap();
+        assert!(!queue.claim(&id2, "worker"));
+    }
+
+    #[test]
+    fn test_list_sorted_by_id() {
+        let mut queue = TaskQueue::new();
+        queue.create("Third".into(), "".into(), None, None);
+        queue.create("First".into(), "".into(), None, None);
+        queue.create("Second".into(), "".into(), None, None);
+        let tasks = queue.list();
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn test_default_is_empty() {
+        let queue = TaskQueue::default();
+        assert!(queue.list().is_empty());
+    }
+
+    #[test]
+    fn test_dependency_on_nonexistent_task_errors() {
+        let mut queue = TaskQueue::new();
+        let id1 = queue.create("A".into(), "".into(), None, None);
+        let result = queue.add_dependency(&id1, "nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_complete_nonexistent_returns_empty() {
+        let mut queue = TaskQueue::new();
+        let unblocked = queue.complete("nonexistent");
+        assert!(unblocked.is_empty());
+    }
+
+    #[test]
+    fn test_task_node_is_runnable() {
+        let node = TaskNode::new("1".into(), "t".into(), "d".into(), None, None);
+        assert!(node.is_runnable());
+    }
+
+    #[test]
+    fn test_task_node_not_runnable_when_blocked() {
+        let mut node = TaskNode::new("1".into(), "t".into(), "d".into(), None, None);
+        node.blocked_by.insert("2".into());
+        node.status = TaskStatus::Blocked;
+        assert!(!node.is_runnable());
+    }
 }

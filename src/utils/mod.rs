@@ -33,8 +33,7 @@ use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use is_terminal::IsTerminal;
 use std::borrow::Cow;
 use std::sync::LazyLock;
-use std::{env, path::PathBuf, process};
-use unicode_segmentation::UnicodeSegmentation;
+use std::{cmp, env, path::PathBuf, process};
 
 pub static CODE_BLOCK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?ms)```\w*(.*)```").unwrap());
@@ -74,21 +73,8 @@ pub fn parse_bool(value: &str) -> Option<bool> {
 }
 
 pub fn estimate_token_length(text: &str) -> usize {
-    let words: Vec<&str> = text.unicode_words().collect();
-    let mut output: f32 = 0.0;
-    for word in words {
-        if word.is_ascii() {
-            output += 1.3;
-        } else {
-            let count = word.chars().count();
-            if count == 1 {
-                output += 1.0
-            } else {
-                output += (count as f32) * 0.5;
-            }
-        }
-    }
-    output.ceil() as usize
+    let weighted: usize = text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+    weighted.div_ceil(4)
 }
 
 pub fn strip_think_tag(text: &str) -> Cow<'_, str> {
@@ -123,7 +109,7 @@ where
             Some((v, score))
         })
         .collect();
-    list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    list.sort_unstable_by_key(|b| cmp::Reverse(b.1));
     list.into_iter().map(|(v, _)| v).collect()
 }
 

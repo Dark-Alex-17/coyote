@@ -1,5 +1,5 @@
 use super::{FunctionDeclaration, JsonSchema};
-use crate::config::GlobalConfig;
+use crate::config::RequestContext;
 
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
@@ -89,38 +89,34 @@ pub fn todo_function_declarations() -> Vec<FunctionDeclaration> {
     ]
 }
 
-pub fn handle_todo_tool(config: &GlobalConfig, cmd_name: &str, args: &Value) -> Result<Value> {
+pub fn handle_todo_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) -> Result<Value> {
     let action = cmd_name
         .strip_prefix(TODO_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
 
+    if !ctx.app.config.function_calling_support {
+        bail!("Cannot use todo tools: function calling is disabled.");
+    }
+    let auto_config = ctx.auto_continue_config();
+    if !auto_config.enabled {
+        bail!(
+            "Auto-continue is not enabled. Set 'auto_continue: true' in your config to use todo tools."
+        );
+    }
+
     match action {
         "init" => {
             let goal = args.get("goal").and_then(Value::as_str).unwrap_or_default();
-            let mut cfg = config.write();
-            let agent = cfg.agent.as_mut();
-            match agent {
-                Some(agent) => {
-                    agent.init_todo_list(goal);
-                    Ok(json!({"status": "ok", "message": "Initialized new todo list"}))
-                }
-                None => bail!("No active agent"),
-            }
+            ctx.init_todo_list(goal);
+            Ok(json!({"status": "ok", "message": "Initialized new todo list"}))
         }
         "add" => {
             let task = args.get("task").and_then(Value::as_str).unwrap_or_default();
             if task.is_empty() {
                 return Ok(json!({"error": "task description is required"}));
             }
-            let mut cfg = config.write();
-            let agent = cfg.agent.as_mut();
-            match agent {
-                Some(agent) => {
-                    let id = agent.add_todo(task);
-                    Ok(json!({"status": "ok", "id": id}))
-                }
-                None => bail!("No active agent"),
-            }
+            let id = ctx.add_todo(task);
+            Ok(json!({"status": "ok", "id": id}))
         }
         "done" => {
             let id = args
@@ -132,50 +128,26 @@ pub fn handle_todo_tool(config: &GlobalConfig, cmd_name: &str, args: &Value) -> 
                 .map(|v| v as usize);
             match id {
                 Some(id) => {
-                    let mut cfg = config.write();
-                    let agent = cfg.agent.as_mut();
-                    match agent {
-                        Some(agent) => {
-                            if agent.mark_todo_done(id) {
-                                Ok(
-                                    json!({"status": "ok", "message": format!("Marked todo {id} as done")}),
-                                )
-                            } else {
-                                Ok(json!({"error": format!("Todo {id} not found")}))
-                            }
-                        }
-                        None => bail!("No active agent"),
+                    if ctx.mark_todo_done(id) {
+                        Ok(json!({"status": "ok", "message": format!("Marked todo {id} as done")}))
+                    } else {
+                        Ok(json!({"error": format!("Todo {id} not found")}))
                     }
                 }
                 None => Ok(json!({"error": "id is required and must be a number"})),
             }
         }
         "list" => {
-            let cfg = config.read();
-            let agent = cfg.agent.as_ref();
-            match agent {
-                Some(agent) => {
-                    let list = agent.todo_list();
-                    if list.is_empty() {
-                        Ok(json!({"goal": "", "todos": []}))
-                    } else {
-                        Ok(serde_json::to_value(list)
-                            .unwrap_or(json!({"error": "serialization failed"})))
-                    }
-                }
-                None => bail!("No active agent"),
+            let list = &ctx.todo_list;
+            if list.is_empty() {
+                Ok(json!({"goal": "", "todos": []}))
+            } else {
+                Ok(serde_json::to_value(list).unwrap_or(json!({"error": "serialization failed"})))
             }
         }
         "clear" => {
-            let mut cfg = config.write();
-            let agent = cfg.agent.as_mut();
-            match agent {
-                Some(agent) => {
-                    agent.clear_todo_list();
-                    Ok(json!({"status": "ok", "message": "Todo list cleared"}))
-                }
-                None => bail!("No active agent"),
-            }
+            ctx.clear_todo_list();
+            Ok(json!({"status": "ok", "message": "Todo list cleared"}))
         }
         _ => bail!("Unknown todo action: {action}"),
     }

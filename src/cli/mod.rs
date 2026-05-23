@@ -4,9 +4,10 @@ use crate::cli::completer::{
     ShellCompletion, agent_completer, macro_completer, model_completer, rag_completer,
     role_completer, secrets_completer, session_completer,
 };
+use crate::config::{AssetCategory, InstallFilter};
 use anyhow::{Context, Result};
 use clap::ValueHint;
-use clap::{Parser, crate_authors, crate_description, crate_name, crate_version};
+use clap::{Parser, crate_authors, crate_description, crate_version};
 use clap_complete::ArgValueCompleter;
 use is_terminal::IsTerminal;
 use std::io::{Read, stdin};
@@ -14,7 +15,7 @@ use std::io::{Read, stdin};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 #[command(
-	name = crate_name!(),
+	name = "loki",
 	author = crate_authors!(),
 	version = crate_version!(),
 	about = crate_description!(),
@@ -82,6 +83,18 @@ pub struct Cli {
     /// Build all configured Bash tool scripts
     #[arg(long)]
     pub build_tools: bool,
+    /// Reinstall bundled assets, overwriting any local changes
+    #[arg(long, value_name = "CATEGORY", value_enum)]
+    pub install: Option<AssetCategory>,
+    /// Install assets from a remote git repository (URL may be suffixed with #<ref>)
+    #[arg(long, value_name = "GIT_URL")]
+    pub install_from: Option<String>,
+    /// Restrict --install-from to a single asset category
+    #[arg(long, value_name = "CATEGORY", value_enum, requires = "install_from")]
+    pub filter: Option<InstallFilter>,
+    /// Overwrite all conflicts without prompting (used with --install-from)
+    #[arg(long, requires = "install_from")]
+    pub install_force: bool,
     /// Sync models updates
     #[arg(long)]
     pub sync_models: bool,
@@ -133,6 +146,12 @@ pub struct Cli {
     /// Generate static shell completion scripts
     #[arg(long, value_name = "SHELL", value_enum)]
     pub completions: Option<ShellCompletion>,
+    /// Update Loki to the latest release, or to a specific version
+    #[arg(long, value_name = "VERSION")]
+    pub update: Option<Option<String>>,
+    /// With --update, update even if Loki was installed via a package manager
+    #[arg(long, requires = "update")]
+    pub force: bool,
 }
 
 impl Cli {
@@ -174,5 +193,249 @@ impl Cli {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        let mut full_args = vec!["loki"];
+        full_args.extend_from_slice(args);
+        Cli::try_parse_from(full_args).unwrap()
+    }
+
+    #[test]
+    fn parse_no_args_defaults() {
+        let cli = parse(&[]);
+        assert!(cli.model.is_none());
+        assert!(cli.role.is_none());
+        assert!(cli.session.is_none());
+        assert!(cli.agent.is_none());
+        assert!(!cli.execute);
+        assert!(!cli.code);
+        assert!(!cli.no_stream);
+        assert!(!cli.dry_run);
+        assert!(!cli.info);
+        assert!(!cli.build_tools);
+        assert!(cli.file.is_empty());
+        assert!(cli.text.is_empty());
+    }
+
+    #[test]
+    fn parse_model_flag() {
+        let cli = parse(&["--model", "gpt-4o"]);
+        assert_eq!(cli.model, Some("gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn parse_model_short_flag() {
+        let cli = parse(&["-m", "gpt-4o"]);
+        assert_eq!(cli.model, Some("gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn parse_role_flag() {
+        let cli = parse(&["--role", "coder"]);
+        assert_eq!(cli.role, Some("coder".to_string()));
+    }
+
+    #[test]
+    fn parse_session_with_name() {
+        let cli = parse(&["--session", "my-session"]);
+        assert_eq!(cli.session, Some(Some("my-session".to_string())));
+    }
+
+    #[test]
+    fn parse_agent_flag() {
+        let cli = parse(&["--agent", "sisyphus"]);
+        assert_eq!(cli.agent, Some("sisyphus".to_string()));
+    }
+
+    #[test]
+    fn parse_agent_short_flag() {
+        let cli = parse(&["-a", "sisyphus"]);
+        assert_eq!(cli.agent, Some("sisyphus".to_string()));
+    }
+
+    #[test]
+    fn parse_execute_flag() {
+        let cli = parse(&["-e", "list files"]);
+        assert!(cli.execute);
+    }
+
+    #[test]
+    fn parse_code_flag() {
+        let cli = parse(&["-c", "hello world"]);
+        assert!(cli.code);
+    }
+
+    #[test]
+    fn parse_no_stream_flag() {
+        let cli = parse(&["-S", "test"]);
+        assert!(cli.no_stream);
+    }
+
+    #[test]
+    fn parse_dry_run_flag() {
+        let cli = parse(&["--dry-run", "test"]);
+        assert!(cli.dry_run);
+    }
+
+    #[test]
+    fn parse_info_flag() {
+        let cli = parse(&["--info"]);
+        assert!(cli.info);
+    }
+
+    #[test]
+    fn parse_list_flags() {
+        assert!(parse(&["--list-models"]).list_models);
+        assert!(parse(&["--list-roles"]).list_roles);
+        assert!(parse(&["--list-sessions"]).list_sessions);
+        assert!(parse(&["--list-agents"]).list_agents);
+        assert!(parse(&["--list-rags"]).list_rags);
+        assert!(parse(&["--list-macros"]).list_macros);
+    }
+
+    #[test]
+    fn parse_file_flag_single() {
+        let cli = parse(&["-f", "file.txt", "question"]);
+        assert_eq!(cli.file, vec!["file.txt"]);
+    }
+
+    #[test]
+    fn parse_file_flag_multiple() {
+        let cli = parse(&["-f", "a.txt", "-f", "b.txt", "question"]);
+        assert_eq!(cli.file, vec!["a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn parse_trailing_text() {
+        let cli = parse(&["hello", "world"]);
+        assert_eq!(cli.text, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn parse_prompt_flag() {
+        let cli = parse(&["--prompt", "be a pirate"]);
+        assert_eq!(cli.prompt, Some("be a pirate".to_string()));
+    }
+
+    #[test]
+    fn parse_empty_session_flag() {
+        let cli = parse(&["--session", "s", "--empty-session"]);
+        assert!(cli.empty_session);
+    }
+
+    #[test]
+    fn parse_save_session_flag() {
+        let cli = parse(&["--session", "s", "--save-session"]);
+        assert!(cli.save_session);
+    }
+
+    #[test]
+    fn parse_build_tools_flag() {
+        let cli = parse(&["--build-tools"]);
+        assert!(cli.build_tools);
+    }
+
+    #[test]
+    fn parse_sync_models_flag() {
+        let cli = parse(&["--sync-models"]);
+        assert!(cli.sync_models);
+    }
+
+    #[test]
+    fn parse_model_with_role() {
+        let cli = parse(&["-m", "gpt-4o", "-r", "coder"]);
+        assert_eq!(cli.model, Some("gpt-4o".to_string()));
+        assert_eq!(cli.role, Some("coder".to_string()));
+    }
+
+    #[test]
+    fn parse_agent_with_file_and_text() {
+        let cli = parse(&["-a", "sisyphus", "-f", "code.rs", "explain", "this"]);
+        assert_eq!(cli.agent, Some("sisyphus".to_string()));
+        assert_eq!(cli.file, vec!["code.rs"]);
+        assert_eq!(cli.text, vec!["explain", "this"]);
+    }
+
+    #[test]
+    fn parse_role_with_session() {
+        let cli = parse(&["-r", "coder", "-s", "dev-session"]);
+        assert_eq!(cli.role, Some("coder".to_string()));
+        assert_eq!(cli.session, Some(Some("dev-session".to_string())));
+    }
+
+    #[test]
+    fn cli_text_returns_none_when_no_text_no_stdin() {
+        let cli = parse(&[]);
+        assert!(cli.text().unwrap().is_none());
+    }
+
+    #[test]
+    fn cli_text_joins_trailing_args() {
+        let cli = parse(&["hello", "world"]);
+        assert_eq!(cli.text().unwrap(), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn parse_add_secret_flag() {
+        let cli = parse(&["--add-secret", "MY_KEY"]);
+        assert_eq!(cli.add_secret, Some("MY_KEY".to_string()));
+    }
+
+    #[test]
+    fn parse_get_secret_flag() {
+        let cli = parse(&["--get-secret", "MY_KEY"]);
+        assert_eq!(cli.get_secret, Some("MY_KEY".to_string()));
+    }
+
+    #[test]
+    fn parse_list_secrets_flag() {
+        let cli = parse(&["--list-secrets"]);
+        assert!(cli.list_secrets);
+    }
+
+    #[test]
+    fn parse_rag_flag() {
+        let cli = parse(&["--rag", "my-rag"]);
+        assert_eq!(cli.rag, Some("my-rag".to_string()));
+    }
+
+    #[test]
+    fn parse_macro_flag() {
+        let cli = parse(&["--macro", "my-macro"]);
+        assert_eq!(cli.macro_name, Some("my-macro".to_string()));
+    }
+
+    #[test]
+    fn parse_update_flag_no_value() {
+        let cli = parse(&["--update"]);
+
+        assert_eq!(cli.update, Some(None));
+    }
+
+    #[test]
+    fn parse_update_flag_with_version() {
+        let cli = parse(&["--update", "v0.4.0"]);
+
+        assert_eq!(cli.update, Some(Some("v0.4.0".to_string())));
+    }
+
+    #[test]
+    fn parse_update_with_force() {
+        let cli = parse(&["--update", "--force"]);
+
+        assert_eq!(cli.update, Some(None));
+        assert!(cli.force);
+    }
+
+    #[test]
+    fn parse_force_without_update_fails() {
+        assert!(Cli::try_parse_from(["loki", "--force"]).is_err());
     }
 }

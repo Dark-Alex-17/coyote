@@ -55,6 +55,14 @@ pub struct Role {
     enabled_tools: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled_mcp_servers: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_continue: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_auto_continues: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inject_todo_instructions: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation_prompt: Option<String>,
 
     #[serde(skip)]
     model: Model,
@@ -89,6 +97,14 @@ impl Role {
                     "enabled_tools" => role.enabled_tools = value.as_str().map(|v| v.to_string()),
                     "enabled_mcp_servers" => {
                         role.enabled_mcp_servers = value.as_str().map(|v| v.to_string())
+                    }
+                    "auto_continue" => role.auto_continue = value.as_bool(),
+                    "max_auto_continues" => {
+                        role.max_auto_continues = value.as_u64().map(|v| v as usize)
+                    }
+                    "inject_todo_instructions" => role.inject_todo_instructions = value.as_bool(),
+                    "continuation_prompt" => {
+                        role.continuation_prompt = value.as_str().map(|v| v.to_string())
                     }
                     _ => (),
                 }
@@ -130,6 +146,20 @@ impl Role {
         }
         if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
             metadata.push(format!("enabled_mcp_servers: {enabled_mcp_servers}"));
+        }
+        if let Some(auto_continue) = self.auto_continue {
+            metadata.push(format!("auto_continue: {auto_continue}"));
+        }
+        if let Some(max_auto_continues) = self.max_auto_continues {
+            metadata.push(format!("max_auto_continues: {max_auto_continues}"));
+        }
+        if let Some(inject_todo_instructions) = self.inject_todo_instructions {
+            metadata.push(format!(
+                "inject_todo_instructions: {inject_todo_instructions}"
+            ));
+        }
+        if let Some(continuation_prompt) = &self.continuation_prompt {
+            metadata.push(format!("continuation_prompt: {continuation_prompt}"));
         }
         if metadata.is_empty() {
             format!("{}\n", self.prompt)
@@ -223,6 +253,26 @@ impl Role {
 
     pub fn is_embedded_prompt(&self) -> bool {
         self.prompt.contains(INPUT_PLACEHOLDER)
+    }
+
+    pub fn auto_continue(&self) -> Option<bool> {
+        self.auto_continue
+    }
+
+    pub fn max_auto_continues(&self) -> Option<usize> {
+        self.max_auto_continues
+    }
+
+    pub fn inject_todo_instructions(&self) -> Option<bool> {
+        self.inject_todo_instructions
+    }
+
+    pub fn continuation_prompt(&self) -> Option<&str> {
+        self.continuation_prompt.as_deref()
+    }
+
+    pub fn append_to_prompt(&mut self, text: &str) {
+        self.prompt.push_str(text);
     }
 
     pub fn echo_messages(&self, input: &Input) -> String {
@@ -373,6 +423,100 @@ fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_new_parses_prompt() {
+        let role = Role::new("test", "You are a helpful assistant");
+        assert_eq!(role.name(), "test");
+        assert_eq!(role.prompt(), "You are a helpful assistant");
+    }
+
+    #[test]
+    fn role_new_parses_metadata() {
+        let content =
+            "---\nmodel: openai:gpt-4\ntemperature: 0.7\ntop_p: 0.9\n---\nYou are helpful";
+        let role = Role::new("test", content);
+        assert_eq!(role.model_id(), Some("openai:gpt-4"));
+        assert_eq!(role.temperature(), Some(0.7));
+        assert_eq!(role.top_p(), Some(0.9));
+        assert_eq!(role.prompt(), "You are helpful");
+    }
+
+    #[test]
+    fn role_new_parses_enabled_tools() {
+        let content = "---\nenabled_tools: tool1,tool2\n---\nPrompt";
+        let role = Role::new("test", content);
+        assert_eq!(role.enabled_tools(), Some("tool1,tool2".to_string()));
+    }
+
+    #[test]
+    fn role_new_parses_enabled_mcp_servers() {
+        let content = "---\nenabled_mcp_servers: github,jira\n---\nPrompt";
+        let role = Role::new("test", content);
+        assert_eq!(role.enabled_mcp_servers(), Some("github,jira".to_string()));
+    }
+
+    #[test]
+    fn role_new_no_metadata_has_none_fields() {
+        let role = Role::new("test", "Just a prompt");
+        assert_eq!(role.model_id(), None);
+        assert_eq!(role.temperature(), None);
+        assert_eq!(role.top_p(), None);
+        assert_eq!(role.enabled_tools(), None);
+        assert_eq!(role.enabled_mcp_servers(), None);
+    }
+
+    #[test]
+    fn role_builtin_shell_loads() {
+        let role = Role::builtin("shell").unwrap();
+        assert_eq!(role.name(), "shell");
+        assert!(!role.prompt().is_empty());
+    }
+
+    #[test]
+    fn role_builtin_code_loads() {
+        let role = Role::builtin("code").unwrap();
+        assert_eq!(role.name(), "code");
+        assert!(!role.prompt().is_empty());
+    }
+
+    #[test]
+    fn role_builtin_nonexistent_errors() {
+        let result = Role::builtin("nonexistent_role_xyz");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn role_default_has_empty_fields() {
+        let role = Role::default();
+        assert_eq!(role.name(), "");
+        assert_eq!(role.prompt(), "");
+        assert_eq!(role.model_id(), None);
+    }
+
+    #[test]
+    fn role_set_model_updates_model() {
+        let mut role = Role::new("test", "prompt");
+        let model = Model::default();
+        role.set_model(model.clone());
+        assert_eq!(role.model().id(), model.id());
+    }
+
+    #[test]
+    fn role_set_temperature_works() {
+        let mut role = Role::new("test", "prompt");
+        role.set_temperature(Some(0.5));
+        assert_eq!(role.temperature(), Some(0.5));
+    }
+
+    #[test]
+    fn role_export_includes_metadata() {
+        let content = "---\ntemperature: 0.8\n---\nMy prompt";
+        let role = Role::new("test", content);
+        let exported = role.export();
+        assert!(exported.contains("temperature"));
+        assert!(exported.contains("My prompt"));
+    }
 
     #[test]
     fn test_parse_structure_prompt1() {
