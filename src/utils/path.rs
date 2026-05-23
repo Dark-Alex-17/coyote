@@ -241,23 +241,23 @@ fn add_file(files: &mut IndexSet<String>, suffixes: Option<&Vec<String>>, path: 
 }
 
 fn is_valid_extension(suffixes: Option<&Vec<String>>, path: &Path) -> bool {
-    let filename_regex = Regex::new(r"^.+\.*").unwrap();
-    if let Some(suffixes) = suffixes
-        && !suffixes.is_empty()
-    {
-        if let Ok(Some(_)) = filename_regex.find(&suffixes.join(",")) {
-            let file_name = path
-                .file_name()
-                .and_then(|v| v.to_str())
-                .expect("invalid filename")
-                .to_string();
-            return suffixes.contains(&file_name);
-        } else if let Some(extension) = path.extension().map(|v| v.to_string_lossy().to_string()) {
-            return suffixes.contains(&extension);
-        }
-        return false;
+    let Some(suffixes) = suffixes else {
+        return true;
+    };
+    if suffixes.is_empty() {
+        return true;
     }
-    true
+
+    let file_name = path.file_name().and_then(|v| v.to_str());
+    let extension = path.extension().and_then(|v| v.to_str());
+
+    suffixes.iter().any(|suffix| {
+        if suffix.contains('.') {
+            Some(suffix.as_str()) == file_name
+        } else {
+            Some(suffix.as_str()) == extension
+        }
+    })
 }
 
 #[cfg(test)]
@@ -351,5 +351,44 @@ mod tests {
                 None
             )
         );
+    }
+
+    #[test]
+    fn test_is_valid_extension() {
+        let md_ext = vec!["md".to_string()];
+        let md_txt_ext = vec!["md".to_string(), "txt".to_string()];
+        let test_md_filename = vec!["test.md".to_string()];
+        let mixed = vec!["md".to_string(), "test.txt".to_string()];
+
+        assert!(is_valid_extension(None, Path::new("Agents.md")));
+        assert!(is_valid_extension(Some(&vec![]), Path::new("Agents.md")));
+
+        assert!(is_valid_extension(Some(&md_ext), Path::new("Agents.md")));
+        assert!(is_valid_extension(
+            Some(&md_ext),
+            Path::new("/home/atusa/code/loki.wiki/Agents.md")
+        ));
+        assert!(!is_valid_extension(Some(&md_ext), Path::new("notes.txt")));
+        assert!(!is_valid_extension(Some(&md_ext), Path::new("README")));
+
+        assert!(is_valid_extension(Some(&md_txt_ext), Path::new("a.md")));
+        assert!(is_valid_extension(Some(&md_txt_ext), Path::new("a.txt")));
+        assert!(!is_valid_extension(Some(&md_txt_ext), Path::new("a.rs")));
+
+        assert!(is_valid_extension(
+            Some(&test_md_filename),
+            Path::new("dir/test.md")
+        ));
+        assert!(!is_valid_extension(
+            Some(&test_md_filename),
+            Path::new("dir/Agents.md")
+        ));
+
+        assert!(is_valid_extension(Some(&mixed), Path::new("Agents.md")));
+        assert!(is_valid_extension(Some(&mixed), Path::new("dir/test.txt")));
+        assert!(!is_valid_extension(
+            Some(&mixed),
+            Path::new("dir/other.txt")
+        ));
     }
 }

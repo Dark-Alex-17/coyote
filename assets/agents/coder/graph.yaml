@@ -1,0 +1,278 @@
+name: coder
+description: |
+  Implementation agent. Plans, implements, and runs build + tests in a
+  bounded fix-loop until verified. Designed to be delegated to by sisyphus.
+version: "1.0"
+
+temperature: 0.1
+
+global_tools:
+  - fs_cat.sh
+  - fs_ls.sh
+  - fs_write.sh
+  - fs_patch.sh
+  - execute_command.sh
+
+variables:
+  - name: project_dir
+    description: |
+      Absolute path to the project directory. Defaults to "." which is the
+      directory you invoked `loki` from. Override at runtime with
+      `loki -a coder --agent-variable project_dir /abs/path "..."`.
+    default: "."
+
+settings:
+  max_loop_iterations: 20
+  log_state_snapshots: true
+  validate_before_run: true
+  timeout: 1800
+
+initial_state:
+  project_dir: ""
+  fix_attempts: 0
+  max_fix_attempts: 3
+  fix_instructions: ""
+  build_output: ""
+  tests_output: ""
+  last_node_output: ""
+  plan_summary: ""
+  files_to_modify: []
+  files_to_create: []
+  risks: []
+  complexity_score: 0
+
+start: resolve_paths
+
+nodes:
+  resolve_paths:
+    id: resolve_paths
+    type: script
+    description: Resolve project_dir to an absolute path from the agent variable
+    script: scripts/resolve_paths.sh
+    timeout: 5
+    fallback: end_failure
+
+  analyze_request:
+    id: analyze_request
+    type: llm
+    description: Extract a structured plan and complexity score from the orchestrator's prompt
+    instructions: |
+      You are a senior engineer's planning assistant. Read the orchestrator's
+      request and emit a structured plan. You only plan. You never edit files.
+
+      Score complexity from 1 to 10:
+        1-3: trivial - single file, <=20 lines changed, obvious approach
+        4-6: moderate - 2-5 files, clear approach, some pattern matching
+        7-10: complex - multi-component, ambiguous tradeoffs, refactoring,
+              or wide blast radius
+
+      Be specific in `files_to_modify` and `files_to_create`. All paths
+      MUST be absolute. The project root is {{project_dir}}. Prefer paths
+      like "{{project_dir}}/src/foo.rs" over "src/foo.rs". The implementer
+      uses these paths directly with fs_write and fs_patch tools, which
+      resolve relative paths against the loki invocation directory (NOT
+      the project dir). Empty arrays are fine if no files in that category.
+
+      `risks` is a list of short strings. Anything that could derail the
+      implementation: unknown dependencies, brittle tests, blast radius,
+      etc. Empty list is fine.
+
+      Project directory: {{project_dir}}
+    prompt: "{{initial_prompt}}"
+    tools: []
+    output_schema:
+      type: object
+      properties:
+        plan_summary:
+          type: string
+          description: 1-3 sentences summarizing what will be done
+        files_to_modify:
+          type: array
+          items: {type: string}
+        files_to_create:
+          type: array
+          items: {type: string}
+        complexity_score:
+          type: integer
+          minimum: 1
+          maximum: 10
+        risks:
+          type: array
+          items: {type: string}
+      required: [plan_summary, files_to_modify, files_to_create, complexity_score, risks]
+    state_updates:
+      last_node_output: "{{output}}"
+    fallback: end_failure
+    next: route_complexity
+
+  route_complexity:
+    id: route_complexity
+    type: script
+    description: Route to approval gate for complex plans; skip otherwise
+    script: scripts/route_complexity.sh
+    timeout: 5
+    fallback: implement
+
+  gate_approval:
+    id: gate_approval
+    type: approval
+    description: Optional human checkpoint for high-complexity plans
+    question: |
+      ## Plan
+      {{plan_summary}}
+
+      ## Files to modify
+      {{files_to_modify}}
+
+      ## Files to create
+      {{files_to_create}}
+
+      ## Risks
+      {{risks}}
+
+      Complexity: {{complexity_score}}/10
+
+      Approve this plan?
+    options:
+      - "yes"
+      - "no"
+    routes:
+      "yes": implement
+      "no": end_rejected
+    on_other: end_rejected
+
+  implement:
+    id: implement
+    type: llm
+    description: Write code via fs tools. Bounded tool-call loop.
+    instructions: |
+      You are a senior engineer. Implement the plan by writing code via
+      tools. Follow existing patterns in the codebase.
+
+      ## Writing code
+
+      1. Use `fs_patch` for surgical edits to existing files.
+      2. Use `fs_write` for new files or full rewrites.
+      3. NEVER output code to chat. Always use tools.
+      4. ALWAYS pass ABSOLUTE paths to fs_write and fs_patch. Relative
+         paths resolve against the loki invocation directory (not the
+         project dir), which is rarely what you want. The project root
+         is {{project_dir}}.
+
+      ## File reading
+
+      1. Use `execute_command` to grep/find:
+         `execute_command --command "grep -rn 'fn handle_request' --include='*.rs' ."`
+         `execute_command --command "find . -name '*.rs' -not -path '*/target/*'"`
+      2. Read only what you need:
+         `fs_cat --path "src/main.rs" --offset 50 --limit 30`
+      3. Never read entire large files. Use offset/limit.
+      4. Use `fs_ls` to list directory contents.
+
+      ## Pattern matching
+
+      Before writing ANY file:
+      1. Find a similar existing file (grep, then read).
+      2. Match its style: imports, naming, structure, error handling.
+      3. Follow the same patterns exactly. Do not invent new ones.
+
+      ## Fix loop
+
+      If the "Fix loop status" section in your user prompt is non-empty,
+      the previous attempt failed verification. Read the error, identify
+      the minimal fix, apply it. Do not refactor while fixing.
+
+      ## Rules
+
+      1. Match existing patterns - read examples first.
+      2. Minimal changes - implement only what's asked.
+      3. Never suppress errors (`as any`, `@ts-ignore`, `#[allow(...)]`
+         on unfamiliar lints, etc.).
+      4. No dead code, no commented-out blocks, no premature abstractions.
+      5. End your turn when editing is done. The graph runs verification next.
+
+      Project directory: {{project_dir}}
+    prompt: |
+      ## Plan summary
+      {{plan_summary}}
+
+      ## Files involved
+      - Modify: {{files_to_modify}}
+      - Create: {{files_to_create}}
+
+      ## Original request from the orchestrator
+      {{initial_prompt}}
+
+      ## Fix loop status
+      {{fix_instructions}}
+    tools:
+      - fs_cat
+      - fs_ls
+      - fs_write
+      - fs_patch
+      - execute_command
+    max_iterations: 30
+    state_updates:
+      last_node_output: "{{output}}"
+    fallback: end_failure
+    next: verify_build
+
+  verify_build:
+    id: verify_build
+    type: script
+    description: Run the project's check/build command. Routes to verify_tests on success, fix_loop_gate on failure.
+    script: scripts/verify_build.sh
+    timeout: 300
+    fallback: fix_loop_gate
+
+  verify_tests:
+    id: verify_tests
+    type: script
+    description: Run the project's test command. Routes to end_success on pass, fix_loop_gate on failure.
+    script: scripts/verify_tests.sh
+    timeout: 600
+    fallback: fix_loop_gate
+
+  fix_loop_gate:
+    id: fix_loop_gate
+    type: script
+    description: Budget gate. Loops back to implement with fix_instructions populated, or terminates as end_failure.
+    script: scripts/fix_loop_gate.sh
+    timeout: 5
+    fallback: end_failure
+
+  end_success:
+    id: end_success
+    type: end
+    output: |
+      CODER_COMPLETE
+      Plan: {{plan_summary}}
+      Files modified: {{files_to_modify}}
+      Files created: {{files_to_create}}
+      Build: passed
+      Tests: passed
+
+  end_rejected:
+    id: end_rejected
+    type: end
+    output: |
+      CODER_REJECTED
+      Plan was rejected at the approval gate.
+      Plan: {{plan_summary}}
+
+  end_failure:
+    id: end_failure
+    type: end
+    output: |
+      CODER_FAILED
+      Plan: {{plan_summary}}
+      Attempts: {{fix_attempts}}/{{max_fix_attempts}}
+
+      Last node output:
+      {{last_node_output}}
+
+      Last build output:
+      {{build_output}}
+
+      Last tests output:
+      {{tests_output}}

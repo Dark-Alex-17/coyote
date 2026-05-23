@@ -15,11 +15,38 @@ use inquire::{Confirm, Select, Text, required, validator::Validation};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{collections::HashMap, env, fmt::Debug, fs, hash::Hash, path::Path, time::Duration};
+use std::{
+    collections::HashMap, env, fmt, fmt::Debug, fs, hash::Hash, path::Path, sync::Arc,
+    time::Duration,
+};
 use tokio::time::sleep;
 
+const RAG_TEMPLATE: &str = r#"Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
+
+<context>
+__CONTEXT__
+</context>
+
+<sources>
+__SOURCES__
+</sources>
+
+<rules>
+- If you don't know, just say so.
+- If you are not sure, ask for clarification.
+- Answer in the same language as the user query.
+- If the context appears unreadable or of poor quality, tell the user then answer as best as you can.
+- If the answer is not in the context but you think you know the answer, explain that to the user then answer with your own knowledge.
+- Answer directly and without using xml tags.
+- When using information from the context, cite the relevant source from the <sources> section.
+</rules>
+
+<user_query>
+__INPUT__
+</user_query>"#;
+
 pub struct Rag {
-    config: GlobalConfig,
+    app_config: Arc<AppConfig>,
     name: String,
     path: String,
     embedding_model: Model,
@@ -30,7 +57,7 @@ pub struct Rag {
 }
 
 impl Debug for Rag {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Rag")
             .field("name", &self.name)
             .field("path", &self.path)
@@ -43,7 +70,7 @@ impl Debug for Rag {
 impl Clone for Rag {
     fn clone(&self) -> Self {
         Self {
-            config: self.config.clone(),
+            app_config: self.app_config.clone(),
             name: self.name.clone(),
             path: self.path.clone(),
             embedding_model: self.embedding_model.clone(),
@@ -55,9 +82,128 @@ impl Clone for Rag {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RagInitConfig {
+    pub embedding_model: Option<String>,
+    pub chunk_size: Option<usize>,
+    pub chunk_overlap: Option<usize>,
+    pub reranker_model: Option<String>,
+    pub top_k: Option<usize>,
+    pub batch_size: Option<usize>,
+}
+
 impl Rag {
+    fn create_embeddings_client(&self, model: Model) -> Result<Box<dyn Client>> {
+        init_client(&self.app_config, model)
+    }
+
+    pub async fn init_with_config(
+        app: &AppConfig,
+        name: &str,
+        save_path: &Path,
+        doc_paths: &[String],
+        config: &RagInitConfig,
+        abort_signal: AbortSignal,
+    ) -> Result<Self> {
+        if doc_paths.is_empty() {
+            bail!("Cannot build RAG knowledge base '{name}' with no documents");
+        }
+        println!("⚙ Initializing RAG...");
+        let data = Self::resolve_init_data(app, config)?;
+        let mut rag = Self::create(app, name, save_path, data)?;
+        let loaders = app.document_loaders.clone();
+        let (spinner, spinner_rx) = Spinner::create("");
+        abortable_run_with_spinner_rx(
+            rag.sync_documents(doc_paths, true, loaders, Some(spinner)),
+            spinner_rx,
+            abort_signal,
+        )
+        .await?;
+        if rag.save()? {
+            println!("✓ Saved RAG to '{}'.", save_path.display());
+        }
+        Ok(rag)
+    }
+
+    fn resolve_init_data(app: &AppConfig, config: &RagInitConfig) -> Result<RagData> {
+        let embedding_model_id = config
+            .embedding_model
+            .clone()
+            .or_else(|| app.rag_embedding_model.clone());
+        let embedding_model_id = match embedding_model_id {
+            Some(value) => {
+                println!("Embedding model: {value}");
+                value
+            }
+            None => {
+                if !*IS_STDOUT_TERMINAL {
+                    bail!(
+                        "RAG knowledge base needs an embedding model. Set `embedding_model` \
+                         on the rag node, or run the agent interactively once."
+                    );
+                }
+                let models = list_models(app, ModelType::Embedding);
+                if models.is_empty() {
+                    bail!("No available embedding model");
+                }
+                select_embedding_model(&models)?
+            }
+        };
+        let embedding_model =
+            Model::retrieve_model(app, &embedding_model_id, ModelType::Embedding)?;
+
+        let chunk_size = match config.chunk_size.or(app.rag_chunk_size) {
+            Some(value) => {
+                println!("Chunk size: {value}");
+                value
+            }
+            None => {
+                if !*IS_STDOUT_TERMINAL {
+                    bail!(
+                        "RAG knowledge base needs a chunk_size. Set `chunk_size` on the \
+                         rag node, or run the agent interactively once."
+                    );
+                }
+                set_chunk_size(&embedding_model)?
+            }
+        };
+        let chunk_overlap = match config.chunk_overlap.or(app.rag_chunk_overlap) {
+            Some(value) => {
+                println!("Chunk overlap: {value}");
+                value
+            }
+            None => {
+                if !*IS_STDOUT_TERMINAL {
+                    bail!(
+                        "RAG knowledge base needs a chunk_overlap. Set `chunk_overlap` on \
+                         the rag node, or run the agent interactively once."
+                    );
+                }
+                set_chunk_overlay(chunk_size / 20)?
+            }
+        };
+
+        let reranker_model = config
+            .reranker_model
+            .clone()
+            .or_else(|| app.rag_reranker_model.clone());
+        let top_k = config.top_k.unwrap_or(app.rag_top_k);
+        let batch_size = config
+            .batch_size
+            .or_else(|| embedding_model.max_batch_size());
+
+        Ok(RagData::new(
+            embedding_model.id(),
+            chunk_size,
+            chunk_overlap,
+            reranker_model,
+            top_k,
+            batch_size,
+        ))
+    }
+
     pub async fn init(
-        config: &GlobalConfig,
+        app: &AppConfig,
         name: &str,
         save_path: &Path,
         doc_paths: &[String],
@@ -67,11 +213,9 @@ impl Rag {
             bail!("Failed to init rag in non-interactive mode");
         }
         println!("⚙ Initializing RAG...");
-        let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(config)?;
-        let (reranker_model, top_k) = {
-            let config = config.read();
-            (config.rag_reranker_model.clone(), config.rag_top_k)
-        };
+        let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(app)?;
+        let reranker_model = app.rag_reranker_model.clone();
+        let top_k = app.rag_top_k;
         let data = RagData::new(
             embedding_model.id(),
             chunk_size,
@@ -80,12 +224,12 @@ impl Rag {
             top_k,
             embedding_model.max_batch_size(),
         );
-        let mut rag = Self::create(config, name, save_path, data)?;
+        let mut rag = Self::create(app, name, save_path, data)?;
         let mut paths = doc_paths.to_vec();
         if paths.is_empty() {
             paths = add_documents()?;
         };
-        let loaders = config.read().document_loaders.clone();
+        let loaders = app.document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
         abortable_run_with_spinner_rx(
             rag.sync_documents(&paths, true, loaders, Some(spinner)),
@@ -99,20 +243,20 @@ impl Rag {
         Ok(rag)
     }
 
-    pub fn load(config: &GlobalConfig, name: &str, path: &Path) -> Result<Self> {
+    pub fn load(app: &AppConfig, name: &str, path: &Path) -> Result<Self> {
         let err = || format!("Failed to load rag '{name}' at '{}'", path.display());
         let content = fs::read_to_string(path).with_context(err)?;
         let data: RagData = serde_yaml::from_str(&content).with_context(err)?;
-        Self::create(config, name, path, data)
+        Self::create(app, name, path, data)
     }
 
-    pub fn create(config: &GlobalConfig, name: &str, path: &Path, data: RagData) -> Result<Self> {
+    pub fn create(app: &AppConfig, name: &str, path: &Path, data: RagData) -> Result<Self> {
         let hnsw = data.build_hnsw();
         let bm25 = data.build_bm25();
         let embedding_model =
-            Model::retrieve_model(&config.read(), &data.embedding_model, ModelType::Embedding)?;
+            Model::retrieve_model(app, &data.embedding_model, ModelType::Embedding)?;
         let rag = Rag {
-            config: config.clone(),
+            app_config: Arc::new(app.clone()),
             name: name.to_string(),
             path: path.display().to_string(),
             data,
@@ -132,10 +276,10 @@ impl Rag {
         &mut self,
         document_paths: &[String],
         refresh: bool,
-        config: &GlobalConfig,
+        app: &AppConfig,
         abort_signal: AbortSignal,
     ) -> Result<()> {
-        let loaders = config.read().document_loaders.clone();
+        let loaders = app.document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
         abortable_run_with_spinner_rx(
             self.sync_documents(document_paths, refresh, loaders, Some(spinner)),
@@ -149,22 +293,17 @@ impl Rag {
         Ok(())
     }
 
-    pub fn create_config(config: &GlobalConfig) -> Result<(Model, usize, usize)> {
-        let (embedding_model_id, chunk_size, chunk_overlap) = {
-            let config = config.read();
-            (
-                config.rag_embedding_model.clone(),
-                config.rag_chunk_size,
-                config.rag_chunk_overlap,
-            )
-        };
+    pub fn create_config(app: &AppConfig) -> Result<(Model, usize, usize)> {
+        let embedding_model_id = app.rag_embedding_model.clone();
+        let chunk_size = app.rag_chunk_size;
+        let chunk_overlap = app.rag_chunk_overlap;
         let embedding_model_id = match embedding_model_id {
             Some(value) => {
                 println!("Select embedding model: {value}");
                 value
             }
             None => {
-                let models = list_models(&config.read(), ModelType::Embedding);
+                let models = list_models(app, ModelType::Embedding);
                 if models.is_empty() {
                     bail!("No available embedding model");
                 }
@@ -172,7 +311,7 @@ impl Rag {
             }
         };
         let embedding_model =
-            Model::retrieve_model(&config.read(), &embedding_model_id, ModelType::Embedding)?;
+            Model::retrieve_model(app, &embedding_model_id, ModelType::Embedding)?;
 
         let chunk_size = match chunk_size {
             Some(value) => {
@@ -292,6 +431,14 @@ impl Rag {
         self.name == TEMP_RAG_NAME
     }
 
+    pub fn configured_top_k(&self) -> usize {
+        self.data.top_k
+    }
+
+    pub fn configured_reranker(&self) -> Option<&str> {
+        self.data.reranker_model.as_deref()
+    }
+
     pub async fn search(
         &self,
         text: &str,
@@ -300,7 +447,7 @@ impl Rag {
         abort_signal: AbortSignal,
     ) -> Result<(String, String, Vec<DocumentId>)> {
         let ret = abortable_run_with_spinner(
-            self.hybird_search(text, top_k, rerank_model),
+            self.hybrid_search(text, top_k, rerank_model),
             "Searching",
             abort_signal,
         )
@@ -317,6 +464,29 @@ impl Rag {
             .join("\n\n");
         let sources = self.format_sources(&ids);
         Ok((embeddings, sources, ids))
+    }
+
+    pub async fn search_with_template(
+        &self,
+        app: &AppConfig,
+        text: &str,
+        abort_signal: AbortSignal,
+    ) -> Result<String> {
+        let (reranker_model, top_k) = self.get_config();
+        let (embeddings, sources, ids) = self
+            .search(text, top_k, reranker_model.as_deref(), abort_signal)
+            .await?;
+        let rag_template = app.rag_template.as_deref().unwrap_or(RAG_TEMPLATE);
+        let text = if embeddings.is_empty() {
+            text.to_string()
+        } else {
+            rag_template
+                .replace("__CONTEXT__", &embeddings)
+                .replace("__SOURCES__", &sources)
+                .replace("__INPUT__", text)
+        };
+        self.set_last_sources(&ids);
+        Ok(text)
     }
 
     fn resolve_source(&self, id: &DocumentId) -> String {
@@ -537,7 +707,7 @@ impl Rag {
         Ok(())
     }
 
-    async fn hybird_search(
+    async fn hybrid_search(
         &self,
         query: &str,
         top_k: usize,
@@ -560,9 +730,8 @@ impl Rag {
 
         let ids = match rerank_model {
             Some(model_id) => {
-                let model =
-                    Model::retrieve_model(&self.config.read(), model_id, ModelType::Reranker)?;
-                let client = init_client(&self.config, Some(model))?;
+                let model = Model::retrieve_model(&self.app_config, model_id, ModelType::Reranker)?;
+                let client = self.create_embeddings_client(model)?;
                 let ids: IndexSet<DocumentId> = [vector_search_ids, keyword_search_ids]
                     .concat()
                     .into_iter()
@@ -665,7 +834,7 @@ impl Rag {
         data: EmbeddingsData,
         spinner: Option<Spinner>,
     ) -> Result<EmbeddingsOutput> {
-        let embedding_client = init_client(&self.config, Some(self.embedding_model.clone()))?;
+        let embedding_client = self.create_embeddings_client(self.embedding_model.clone())?;
         let EmbeddingsData { texts, query } = data;
         let batch_size = self
             .data
@@ -736,7 +905,7 @@ pub struct RagData {
 }
 
 impl Debug for RagData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RagData")
             .field("embedding_model", &self.embedding_model)
             .field("chunk_size", &self.chunk_size)
@@ -864,7 +1033,7 @@ pub type FileId = usize;
 pub struct DocumentId(usize);
 
 impl Debug for DocumentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (file_index, document_index) = self.split();
         f.write_fmt(format_args!("{file_index}-{document_index}"))
     }
@@ -906,8 +1075,8 @@ impl SelectOption {
     }
 }
 
-impl std::fmt::Display for SelectOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for SelectOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} ({})", self.value, self.description)
     }
 }
@@ -1021,10 +1190,7 @@ fn reciprocal_rank_fusion(
 ) -> Vec<DocumentId> {
     let rrf_k = top_k * 2;
     let mut map: IndexMap<DocumentId, f32> = IndexMap::new();
-    for (document_ids, weight) in list_of_document_ids
-        .into_iter()
-        .zip(list_of_weights.into_iter())
-    {
+    for (document_ids, weight) in list_of_document_ids.into_iter().zip(list_of_weights) {
         for (index, &item) in document_ids.iter().enumerate() {
             *map.entry(item).or_default() += (1.0 / ((rrf_k + index + 1) as f32)) * weight;
         }
@@ -1037,4 +1203,242 @@ fn reciprocal_rank_fusion(
         .take(top_k)
         .map(|(v, _)| v)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn document_id_round_trip() {
+        let id = DocumentId::new(5, 17);
+        let (file, doc) = id.split();
+        assert_eq!(file, 5);
+        assert_eq!(doc, 17);
+    }
+
+    #[test]
+    fn document_id_zero_zero() {
+        let id = DocumentId::new(0, 0);
+        let (file, doc) = id.split();
+        assert_eq!(file, 0);
+        assert_eq!(doc, 0);
+    }
+
+    #[test]
+    fn document_id_large_values() {
+        let id = DocumentId::new(1000, 9999);
+        let (file, doc) = id.split();
+        assert_eq!(file, 1000);
+        assert_eq!(doc, 9999);
+    }
+
+    #[test]
+    fn document_id_debug_format() {
+        let id = DocumentId::new(3, 7);
+        let formatted = format!("{id:?}");
+        assert_eq!(formatted, "3-7");
+    }
+
+    #[test]
+    fn document_id_equality() {
+        let a = DocumentId::new(1, 2);
+        let b = DocumentId::new(1, 2);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn document_id_inequality() {
+        let a = DocumentId::new(1, 2);
+        let b = DocumentId::new(1, 3);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn document_id_ordering() {
+        let a = DocumentId::new(0, 1);
+        let b = DocumentId::new(1, 0);
+        assert!(a < b);
+    }
+
+    #[test]
+    fn rag_document_new() {
+        let doc = RagDocument::new("hello world");
+        assert_eq!(doc.page_content, "hello world");
+        assert!(doc.metadata.is_empty());
+    }
+
+    #[test]
+    fn rag_document_default() {
+        let doc = RagDocument::default();
+        assert_eq!(doc.page_content, "");
+        assert!(doc.metadata.is_empty());
+    }
+
+    #[test]
+    fn rag_data_new_defaults() {
+        let data = RagData::new("model".into(), 1000, 20, None, 5, None);
+        assert_eq!(data.embedding_model, "model");
+        assert_eq!(data.chunk_size, 1000);
+        assert_eq!(data.chunk_overlap, 20);
+        assert_eq!(data.top_k, 5);
+        assert!(data.reranker_model.is_none());
+        assert!(data.files.is_empty());
+        assert!(data.vectors.is_empty());
+        assert!(data.document_paths.is_empty());
+        assert_eq!(data.next_file_id, 0);
+    }
+
+    #[test]
+    fn rag_data_get_returns_document() {
+        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let file = RagFile {
+            hash: "abc".into(),
+            path: "test.txt".into(),
+            documents: vec![RagDocument::new("first"), RagDocument::new("second")],
+        };
+        data.files.insert(0, file);
+
+        let doc = data.get(DocumentId::new(0, 0)).unwrap();
+        assert_eq!(doc.page_content, "first");
+
+        let doc = data.get(DocumentId::new(0, 1)).unwrap();
+        assert_eq!(doc.page_content, "second");
+    }
+
+    #[test]
+    fn rag_data_get_returns_none_for_missing_file() {
+        let data = RagData::new("m".into(), 100, 10, None, 5, None);
+        assert!(data.get(DocumentId::new(99, 0)).is_none());
+    }
+
+    #[test]
+    fn rag_data_get_returns_none_for_missing_document() {
+        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let file = RagFile {
+            hash: "abc".into(),
+            path: "test.txt".into(),
+            documents: vec![RagDocument::new("only one")],
+        };
+        data.files.insert(0, file);
+        assert!(data.get(DocumentId::new(0, 5)).is_none());
+    }
+
+    #[test]
+    fn rag_data_del_removes_files_and_vectors() {
+        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let file = RagFile {
+            hash: "abc".into(),
+            path: "test.txt".into(),
+            documents: vec![RagDocument::new("doc")],
+        };
+        data.files.insert(0, file);
+        let doc_id = DocumentId::new(0, 0);
+        data.vectors.insert(doc_id, vec![0.1, 0.2, 0.3]);
+
+        assert!(data.files.contains_key(&0));
+        assert!(data.vectors.contains_key(&doc_id));
+
+        data.del(vec![0]);
+
+        assert!(!data.files.contains_key(&0));
+        assert!(!data.vectors.contains_key(&doc_id));
+    }
+
+    #[test]
+    fn rag_data_del_nonexistent_is_noop() {
+        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        data.del(vec![99]);
+        assert!(data.files.is_empty());
+    }
+
+    #[test]
+    fn rag_data_add_inserts_files_and_vectors() {
+        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let file = RagFile {
+            hash: "xyz".into(),
+            path: "new.txt".into(),
+            documents: vec![RagDocument::new("content")],
+        };
+        let doc_id = DocumentId::new(0, 0);
+        let embeddings = vec![vec![0.5, 0.6, 0.7]];
+
+        data.add(1, vec![(0, file)], vec![doc_id], embeddings);
+
+        assert_eq!(data.next_file_id, 1);
+        assert!(data.files.contains_key(&0));
+        assert!(data.vectors.contains_key(&doc_id));
+        assert_eq!(data.vectors[&doc_id], vec![0.5, 0.6, 0.7]);
+    }
+
+    #[test]
+    fn rag_template_contains_placeholders() {
+        assert!(RAG_TEMPLATE.contains("__CONTEXT__"));
+        assert!(RAG_TEMPLATE.contains("__SOURCES__"));
+        assert!(RAG_TEMPLATE.contains("__INPUT__"));
+    }
+
+    #[test]
+    fn get_separators_returns_language_specific() {
+        let rs_seps = get_separators("rs");
+        assert!(rs_seps.iter().any(|s| s.contains("fn ")));
+
+        let py_seps = get_separators("py");
+        assert!(py_seps.iter().any(|s| s.contains("def ")));
+
+        let md_seps = get_separators("md");
+        assert!(md_seps.iter().any(|s| s.contains("# ")));
+    }
+
+    #[test]
+    fn get_separators_unknown_returns_defaults() {
+        let seps = get_separators("xyz");
+        assert_eq!(seps, DEFAULT_SEPARATORS.to_vec());
+    }
+
+    #[test]
+    fn get_separators_all_known_extensions() {
+        let known = [
+            "c", "cc", "cpp", "go", "java", "js", "mjs", "cjs", "php", "proto", "py", "rst", "rb",
+            "rs", "scala", "swift", "md", "mkd", "tex", "htm", "html", "sol",
+        ];
+        for ext in known {
+            let seps = get_separators(ext);
+            assert_ne!(
+                seps,
+                DEFAULT_SEPARATORS.to_vec(),
+                "Extension '{ext}' should have language-specific separators"
+            );
+        }
+    }
+
+    #[test]
+    fn rag_data_build_bm25_empty() {
+        let data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let engine = data.build_bm25();
+        let results = engine.search("anything", 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn rag_data_build_bm25_finds_documents() {
+        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let file = RagFile {
+            hash: "h".into(),
+            path: "test.txt".into(),
+            documents: vec![
+                RagDocument::new("rust programming language"),
+                RagDocument::new("python scripting language"),
+            ],
+        };
+        data.files.insert(0, file);
+
+        let engine = data.build_bm25();
+        let results = engine.search("rust", 5);
+        assert!(!results.is_empty());
+        let top = &results[0];
+        let (file_idx, doc_idx) = top.document.id.split();
+        assert_eq!(file_idx, 0);
+        assert_eq!(doc_idx, 0);
+    }
 }

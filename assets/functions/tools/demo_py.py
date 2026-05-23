@@ -1,6 +1,7 @@
 import os
 from typing import List, Literal, Optional
 
+
 def run(
     string: str,
     string_enum: Literal["foo", "bar"],
@@ -9,26 +10,38 @@ def run(
     number: float,
     array: List[str],
     string_optional: Optional[str] = None,
+    integer_with_default: int = 42,
+    boolean_with_default: bool = True,
+    number_with_default: float = 3.14,
+    string_with_default: str = "hello",
     array_optional: Optional[List[str]] = None,
 ):
-    """Demonstrates how to create a tool using Python and how to use comments.
+    """Demonstrates all supported Python parameter types and variations.
     Args:
-        string: Define a required string property
-        string_enum: Define a required string property with enum
-        boolean: Define a required boolean property
-        integer: Define a required integer property
-        number: Define a required number property
-        array: Define a required string array property
-        string_optional: Define an optional string property
-        array_optional: Define an optional string array property
+        string: A required string property
+        string_enum: A required string property constrained to specific values
+        boolean: A required boolean property
+        integer: A required integer property
+        number: A required number (float) property
+        array: A required string array property
+        string_optional: An optional string property (Optional[str] with None default)
+        integer_with_default: An optional integer with a non-None default value
+        boolean_with_default: An optional boolean with a default value
+        number_with_default: An optional number with a default value
+        string_with_default: An optional string with a default value
+        array_optional: An optional string array property
     """
     output = f"""string: {string}
 string_enum: {string_enum}
-string_optional: {string_optional}
 boolean: {boolean}
 integer: {integer}
 number: {number}
 array: {array}
+string_optional: {string_optional}
+integer_with_default: {integer_with_default}
+boolean_with_default: {boolean_with_default}
+number_with_default: {number_with_default}
+string_with_default: {string_with_default}
 array_optional: {array_optional}"""
 
     for key, value in os.environ.items():

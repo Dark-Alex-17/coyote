@@ -20,11 +20,9 @@ pub fn read_single_key(valid_chars: &[char], default: char, prompt: &str) -> Res
                 KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                     break Err(anyhow::anyhow!("Interrupted"));
                 }
-                KeyCode::Char(c) => {
-                    if valid_chars.contains(&c) {
-                        break Ok(c);
-                    }
+                KeyCode::Char(c) if valid_chars.contains(&c) => {
                     // Invalid character, continue loop
+                    break Ok(c);
                 }
                 KeyCode::Enter => {
                     break Ok(default);

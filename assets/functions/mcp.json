@@ -1,6 +1,7 @@
 {
   "mcpServers": {
     "github": {
+      "type": "stdio",
       "command": "docker",
       "args": [
         "run",
@@ -15,14 +16,17 @@
       }
     },
     "atlassian": {
+      "type": "stdio",
       "command": "npx",
       "args": ["-y", "mcp-remote@0.1.13", "https://mcp.atlassian.com/v1/mcp"]
     },
     "docker": {
+      "type": "stdio",
       "command": "uvx",
       "args": ["mcp-server-docker"]
     },
     "ddg-search": {
+      "type": "stdio",
       "command": "uvx",
       "args": ["duckduckgo-mcp-server"]
     }

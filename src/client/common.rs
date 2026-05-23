@@ -1,7 +1,8 @@
 use super::*;
 
+use crate::config::{RenderMode, paths};
 use crate::{
-    config::{Config, GlobalConfig, Input},
+    config::{AppConfig, Input, RequestContext},
     function::{FunctionDeclaration, ToolCall, ToolResult, eval_tool_calls},
     render::render_stream,
     utils::*,
@@ -24,7 +25,7 @@ use tokio::sync::mpsc::unbounded_channel;
 pub const MODELS_YAML: &str = include_str!("../../models.yaml");
 
 pub static ALL_PROVIDER_MODELS: LazyLock<Vec<ProviderModels>> = LazyLock::new(|| {
-    Config::local_models_override()
+    paths::local_models_override()
         .ok()
         .unwrap_or_else(|| serde_yaml::from_str(MODELS_YAML).unwrap())
 });
@@ -37,7 +38,7 @@ static ESCAPE_SLASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?<!\\)/
 
 #[async_trait::async_trait]
 pub trait Client: Sync + Send {
-    fn global_config(&self) -> &GlobalConfig;
+    fn app_config(&self) -> &AppConfig;
 
     fn extra_config(&self) -> Option<&ExtraConfig>;
 
@@ -58,7 +59,7 @@ pub trait Client: Sync + Send {
         if let Some(proxy) = extra.and_then(|v| v.proxy.as_deref()) {
             builder = set_proxy(builder, proxy)?;
         }
-        if let Some(user_agent) = self.global_config().read().user_agent.as_ref() {
+        if let Some(user_agent) = self.app_config().user_agent.as_ref() {
             builder = builder.user_agent(user_agent);
         }
         let client = builder
@@ -69,7 +70,7 @@ pub trait Client: Sync + Send {
     }
 
     async fn chat_completions(&self, input: Input) -> Result<ChatCompletionsOutput> {
-        if self.global_config().read().dry_run {
+        if self.app_config().dry_run {
             let content = input.echo_messages();
             return Ok(ChatCompletionsOutput::new(&content));
         }
@@ -89,7 +90,7 @@ pub trait Client: Sync + Send {
         let input = input.clone();
         tokio::select! {
             ret = async {
-                if self.global_config().read().dry_run {
+                if self.app_config().dry_run {
                     let content = input.echo_messages();
                     handler.text(&content)?;
                     return Ok(());
@@ -413,10 +414,12 @@ pub async fn call_chat_completions(
     print: bool,
     extract_code: bool,
     client: &dyn Client,
+    ctx: &mut RequestContext,
     abort_signal: AbortSignal,
 ) -> Result<(String, Vec<ToolResult>)> {
-    let is_child_agent = client.global_config().read().current_depth > 0;
-    let spinner_message = if is_child_agent { "" } else { "Generating" };
+    let is_child_agent = ctx.current_depth > 0;
+    let suppress_spinner = is_child_agent || ctx.render_mode == RenderMode::Silent;
+    let spinner_message = if suppress_spinner { "" } else { "Generating" };
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
         spinner_message,
@@ -436,15 +439,13 @@ pub async fn call_chat_completions(
                     text = extract_code_block(&strip_think_tag(&text)).to_string();
                 }
                 if print {
-                    client.global_config().read().print_markdown(&text)?;
+                    ctx.app.config.print_markdown(&text)?;
                 }
             }
-            let tool_results = eval_tool_calls(client.global_config(), tool_calls).await?;
-            if let Some(tracker) = client.global_config().write().tool_call_tracker.as_mut() {
-                tool_results
-                    .iter()
-                    .for_each(|res| tracker.record_call(res.call.clone()));
-            }
+            let tool_results = eval_tool_calls(ctx, tool_calls).await?;
+            tool_results
+                .iter()
+                .for_each(|res| ctx.tool_scope.tool_tracker.record_call(res.call.clone()));
             Ok((text, tool_results))
         }
         Err(err) => Err(err),
@@ -454,14 +455,19 @@ pub async fn call_chat_completions(
 pub async fn call_chat_completions_streaming(
     input: &Input,
     client: &dyn Client,
+    ctx: &mut RequestContext,
     abort_signal: AbortSignal,
 ) -> Result<(String, Vec<ToolResult>)> {
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
+    let silent = ctx.render_mode == RenderMode::Silent;
+    if silent {
+        handler.set_silent(true);
+    }
 
     let (send_ret, render_ret) = tokio::join!(
         client.chat_completions_streaming(input, &mut handler),
-        render_stream(rx, client.global_config(), abort_signal.clone()),
+        render_stream(rx, client.app_config(), abort_signal.clone(), silent),
     );
 
     if handler.abort().aborted() {
@@ -476,12 +482,10 @@ pub async fn call_chat_completions_streaming(
             if !text.is_empty() && !text.ends_with('\n') {
                 println!();
             }
-            let tool_results = eval_tool_calls(client.global_config(), tool_calls).await?;
-            if let Some(tracker) = client.global_config().write().tool_call_tracker.as_mut() {
-                tool_results
-                    .iter()
-                    .for_each(|res| tracker.record_call(res.call.clone()));
-            }
+            let tool_results = eval_tool_calls(ctx, tool_calls).await?;
+            tool_results
+                .iter()
+                .for_each(|res| ctx.tool_scope.tool_tracker.record_call(res.call.clone()));
             Ok((text, tool_results))
         }
         Err(err) => {

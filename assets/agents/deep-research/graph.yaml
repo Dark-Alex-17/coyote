@@ -1,0 +1,293 @@
+name: deep-research
+description: |
+  Deep web research workflow. Plans an investigation, decomposes it
+  into sub-questions researched in parallel, grounds the work in a
+  local knowledge corpus, vets the credibility of cited sources, runs
+  a reflexion self-critique loop to revise weak or incomplete findings,
+  delegates the final write-up to a focused sub-agent, checks that the
+  cited sources are reachable, and gates the result behind human
+  approval. A reviewer's free-form feedback at the approval step feeds
+  back into another research pass.
+
+  This is the canonical Loki graph-agent reference: it exercises every
+  node type (script, llm, rag, map, agent, input, approval, end) and
+  both static fan-out and dynamic map fan-out.
+
+version: "1.0"
+
+temperature: 0.0
+
+global_tools:
+  - web_search_loki.sh
+  - fetch_url_via_curl.sh
+  - search_arxiv.sh
+
+mcp_servers:
+  - ddg-search
+
+conversation_starters:
+  - "How does HTTP/3 differ from HTTP/2?"
+  - "Summarize recent advances in solid-state battery chemistry"
+
+settings:
+  max_loop_iterations: 40
+  log_state_snapshots: false
+  validate_before_run: true
+  max_concurrency: 4
+
+initial_state:
+  research_feedback: ""
+  research_attempts: 0
+  local_context: ""
+  local_sources: ""
+
+start: parse_request
+
+nodes:
+
+  parse_request:
+    id: parse_request
+    type: script
+    script: scripts/parse_request.py
+    next: bootstrap_research
+
+  ask_topic:
+    id: ask_topic
+    type: input
+    question: "What would you like me to research?"
+    validation: "len(input) > 0"
+    state_updates:
+      topic: "{{input}}"
+    next: bootstrap_research
+
+  bootstrap_research:
+    id: bootstrap_research
+    type: script
+    script: scripts/bootstrap_research.py
+    next: [plan, knowledge_lookup]
+
+  plan:
+    id: plan
+    type: llm
+    instructions: |
+      You are a research planner. Given a topic, produce a focused
+      research plan and decompose it into 3-5 specific sub-questions
+      that can each be researched independently in parallel.
+
+      The plan is a short narrative naming the key questions and the
+      kinds of sources that would be authoritative. The sub-questions
+      are precise, self-contained queries (each one is sent on its own
+      to a separate research worker, so they must be answerable
+      without each other's context).
+    prompt: "Research topic: {{topic}}"
+    tools: []
+    output_schema:
+      type: object
+      properties:
+        research_plan:
+          type: string
+          description: A short plan narrative.
+        questions:
+          type: array
+          items: { type: string }
+          minItems: 1
+          maxItems: 6
+          description: 3-5 specific, self-contained sub-questions.
+      required: [research_plan, questions]
+    next: research_each_question
+
+  knowledge_lookup:
+    id: knowledge_lookup
+    type: rag
+    documents:
+      - ./knowledge/
+    query: "{{topic}}"
+    top_k: 6
+    chunk_size: 1000
+    chunk_overlap: 100
+    state_updates:
+      local_context: "{{output.context}}"
+      local_sources: "{{output.sources}}"
+    next: research_each_question
+
+  research_each_question:
+    id: research_each_question
+    type: map
+    over: "{{questions}}"
+    as: question
+    branch: research_one_question
+    collect_into: question_findings
+    max_concurrency: 3
+    next: combine_findings
+
+  research_one_question:
+    id: research_one_question
+    type: llm
+    instructions: |
+      You are a web research assistant. Investigate the SINGLE question
+      given to you using your tools: search the web, fetch and read
+      pages, and search arXiv for academic sources.
+
+      Rules:
+        - Every factual claim must be backed by a real source you
+          actually retrieved. Never fabricate URLs, page titles,
+          authors, or DOIs.
+        - Prefer primary and authoritative sources over aggregators.
+        - Where sources disagree, report the disagreement rather than
+          papering over it.
+        - Put the URL (or DOI) inline next to each claim it supports.
+
+      Return organized findings in plain text. Do not include
+      meta-commentary about the process.
+    prompt: |
+      Research question: {{question}}
+
+      Local context that may help:
+      {{local_context}}
+
+      {{research_feedback}}
+    tools:
+      - web_search_loki
+      - fetch_url_via_curl
+      - search_arxiv
+      - mcp:ddg-search
+    max_iterations: 10
+    max_attempts: 2
+    temperature: 0.1
+
+  combine_findings:
+    id: combine_findings
+    type: script
+    script: scripts/combine_findings.py
+    next: vet_sources
+
+  vet_sources:
+    id: vet_sources
+    type: llm
+    instructions: |
+      You assess the credibility of the sources cited in a set of
+      research findings. For every distinct source URL in the findings,
+      call the `classify_source` tool to get its credibility tier. Then
+      summarize: which claims rest on HIGH-credibility sources, and
+      which rest on PREPRINT or UNVERIFIED sources and so need
+      corroboration. Do NOT do any new research -- assess only what is
+      already cited.
+    prompt: |
+      Findings to assess:
+      {{findings}}
+    tools:
+      - classify_source
+    max_iterations: 15
+    state_updates:
+      source_assessment: "{{output}}"
+    next: critique
+
+  critique:
+    id: critique
+    type: llm
+    instructions: |
+      You are a meticulous research reviewer. Judge whether the
+      findings below are good enough to synthesize a complete,
+      well-supported report that answers the research plan.
+
+      Mark the findings REVISE if ANY of these hold:
+        - A research-plan question is unanswered or only weakly
+          addressed.
+        - A factual claim has no source, or cites a source that looks
+          fabricated.
+        - The findings lean on a single source where corroboration is
+          needed.
+        - A key claim rests only on a PREPRINT or UNVERIFIED source,
+          per the source credibility assessment below.
+        - An obvious counter-perspective or recent development is
+          missing.
+      Otherwise mark them PASS.
+
+      Respond in EXACTLY this format, nothing else:
+
+      VERDICT: <PASS or REVISE>
+      FEEDBACK: <if REVISE, be specific and actionable -- name the gaps
+      and what kind of source would close them; if PASS, write "none">
+    prompt: |
+      Research plan:
+      {{research_plan}}
+
+      Findings under review:
+      {{findings}}
+
+      Source credibility assessment:
+      {{source_assessment}}
+    tools: []
+    state_updates:
+      critique: "{{output}}"
+    next: reflexion_gate
+
+  reflexion_gate:
+    id: reflexion_gate
+    type: script
+    script: scripts/reflexion_gate.py
+    next: synthesize
+
+  synthesize:
+    id: synthesize
+    type: agent
+    agent: report-writer
+    prompt: |
+      Research topic: {{topic}}
+
+      Findings (organized by sub-question, with inline citations):
+      {{findings}}
+
+      Source credibility assessment:
+      {{source_assessment}}
+
+      Produce the final report following your instructions.
+    timeout: 300
+    state_updates:
+      report: "{{output}}"
+    next: verify_sources
+
+  verify_sources:
+    id: verify_sources
+    type: script
+    script: scripts/verify_sources.py
+    next: approve
+
+  approve:
+    id: approve
+    type: approval
+    question: |
+      Research report on: {{topic}}
+
+      {{report}}
+
+      ----
+      {{source_check}}
+      ----
+
+      Accept this report? Pick "accept" or "reject", or type specific
+      feedback to send the research back for another pass.
+    options:
+      - "accept"
+      - "reject"
+    routes:
+      "accept": end_accepted
+      "reject": end_rejected
+    on_other: incorporate_feedback
+    state_updates:
+      decision: "{{choice}}"
+
+  incorporate_feedback:
+    id: incorporate_feedback
+    type: script
+    script: scripts/incorporate_feedback.py
+
+  end_accepted:
+    id: end_accepted
+    type: end
+    output: "{{report}}"
+
+  end_rejected:
+    id: end_rejected
+    type: end
+    output: "Research on '{{topic}}' was rejected and discarded."
