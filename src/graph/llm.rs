@@ -28,36 +28,46 @@ impl LlmNodeExecutor {
         parent_ctx: &mut RequestContext,
     ) -> Result<LlmExecutionOutcome> {
         let result = run(node, state_manager, parent_ctx).await;
-        let (output, failed) = match result {
+        let (output, failure_reason) = match result {
             Ok(raw) => match &node.output_schema {
                 Some(schema) => match structured::extract(&raw, schema, parent_ctx).await {
-                    Ok(value) => (value, false),
+                    Ok(value) => (value, None),
                     Err(e) => {
                         warn!("llm node structured extraction failed: {e}");
                         (
                             Value::String(format!("LLM node structured-extraction failed: {e}")),
-                            true,
+                            Some(format!("structured-extraction failed: {e}")),
                         )
                     }
                 },
-                None => (Value::String(raw), false),
+                None => (Value::String(raw), None),
             },
             Err(e) => {
                 warn!("llm node failed: {e}");
-                (Value::String(format!("LLM node failed: {e}")), true)
+                (
+                    Value::String(format!("LLM node failed: {e}")),
+                    Some(format!("LLM call failed: {e:#}")),
+                )
             }
         };
 
         apply_state_updates_with_output(node, state_manager, &output);
-        Ok(outcome_from(failed, node.fallback.as_deref()))
+        outcome_from(failure_reason.as_deref(), node.fallback.as_deref())
     }
 }
 
-fn outcome_from(failed: bool, fallback: Option<&str>) -> LlmExecutionOutcome {
-    if failed && let Some(fb) = fallback {
-        LlmExecutionOutcome::FellBack(fb.to_string())
-    } else {
-        LlmExecutionOutcome::Continue
+fn outcome_from(
+    failure_reason: Option<&str>,
+    fallback: Option<&str>,
+) -> Result<LlmExecutionOutcome> {
+    match (failure_reason, fallback) {
+        (None, _) => Ok(LlmExecutionOutcome::Continue),
+        (Some(_), Some(fb)) => Ok(LlmExecutionOutcome::FellBack(fb.to_string())),
+        (Some(reason), None) => bail!(
+            "LLM node failed and no fallback declared: {reason}. \
+             Add a `fallback:` route on the node to route on failure, \
+             or fix the underlying error."
+        ),
     }
 }
 
@@ -445,23 +455,29 @@ mod tests {
     #[test]
     fn outcome_from_success_is_continue() {
         assert_eq!(
-            outcome_from(false, Some("fb")),
+            outcome_from(None, Some("fb")).unwrap(),
             LlmExecutionOutcome::Continue
         );
-        assert_eq!(outcome_from(false, None), LlmExecutionOutcome::Continue);
+        assert_eq!(
+            outcome_from(None, None).unwrap(),
+            LlmExecutionOutcome::Continue
+        );
     }
 
     #[test]
     fn outcome_from_failure_with_fallback_is_fell_back() {
         assert_eq!(
-            outcome_from(true, Some("fb")),
+            outcome_from(Some("HTTP 404"), Some("fb")).unwrap(),
             LlmExecutionOutcome::FellBack("fb".to_string())
         );
     }
 
     #[test]
-    fn outcome_from_failure_without_fallback_is_continue() {
-        assert_eq!(outcome_from(true, None), LlmExecutionOutcome::Continue);
+    fn outcome_from_failure_without_fallback_propagates_error() {
+        let err = outcome_from(Some("HTTP 404"), None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no fallback declared"), "got: {msg}");
+        assert!(msg.contains("HTTP 404"), "got: {msg}");
     }
 
     fn node_with_schema(updates: Option<HashMap<String, String>>, schema: Value) -> LlmNode {
