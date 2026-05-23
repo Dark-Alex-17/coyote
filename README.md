@@ -11,7 +11,7 @@ Agents, and More.
 
 It is designed to include a number of useful agents, roles, macros, and more so users can get up and running with Loki 
 in as little time as possible. You can also install entire bundles of agents, roles, macros, tools, and MCP servers from 
-any git repository — see [Sharing Configurations](#sharing-configurations).
+any git repository — see [Sharing Configurations](https://github.com/Dark-Alex-17/loki/wiki/Sharing-Configurations).
 
 ![Agent example](https://raw.githubusercontent.com/wiki/Dark-Alex-17/loki/images/agents/sql.gif)
 
