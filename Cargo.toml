@@ -10,7 +10,7 @@ repository = "https://github.com/Dark-Alex-17/loki"
 categories = ["command-line-utilities"]
 readme = "README.md"
 license = "MIT"
-rust-version = "1.89.0"
+rust-version = "1.95.0"
 exclude = [".github", "CONTRIBUTING.md"]
 
 [dependencies]
