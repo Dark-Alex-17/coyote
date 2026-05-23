@@ -1,3 +1,102 @@
+## v0.4.0 (2026-05-23)
+
+### Feat
+
+- LLM node failures propgate up
+- Added .install remote tab completions to the REPL
+- feature complete install remote with category selection
+- Support to interactively add secrets to Loki that are missing from MCP configs when merging
+- Added MCP config merging support for remote asset installations
+- install remote now writes files to disk
+- Created basic install_remote functions
+- Created a more comprehensive and immediately useful default config for first runs
+- Created an example graph-based agent called deep-research
+- Improved coder agent that is now a graph-based agent
+- Removed indicatif spinners. The UX just won't stop clobbering for parallel graph nodes
+- Added agent variables support for graph agents and improved script executor to use the same environment variables as normal agent tool calling for further flexibility
+- Improved UX with colored spinners for parallel graph agents and no clobbering outputs for sub-agents
+- created new graph-based deep-research agent
+- improved UX for parallel graph execution
+- added branch progress tracker for better visualization of parallel graph super-steps
+- Removed the jira-helper agent and replaced it with the atlassian role
+- created the RenderMode enum to suppress stdout streaming during parallel graph super-steps
+- Full support for map node types
+- implemented the frontier-based scheduling for the graph executor with simplified state management (gotta love .clone)
+- validation support for parallel graph execution; restricted map nodes to only run for nodes without next targets and not supporting chained map nodes
+- created the staging area for state merges per super-step and created the built-in reducers (and their application) for the state merge phase of a super step
+- scaffolding work for fan-out nodes for parallel branch execution support and stubbed out Map node types
+- Loki can now update itself via .update and --update commands
+- added a .edit command for editing the MCP configuration file
+- Created a new .install command to install bundled assets on-demand
+- migrated llm node validation to graph loading time instead of graph runtime
+- ripped out user input timeout scaffolding for approval and input node types; implementation can't be done cleanly
+- added additional support for all RAG-configuration fields in RAG nodes
+- initial support for RAG nodes in the graph execution system
+- implemented structured logging for graph execution
+- merged normal agent config and graph agent configs into one file (either/or)
+- added structured-output extraction for llm and agent nodes
+- created full llm node runtime implementation
+- scaffolded together the initial llm node type and its executor
+- wired together graph execution and agent graph dispatch
+- implemented support for the graph executor
+- created the approval node executor and the input node executor for user interaction
+- Added initial support for native Loki agent nodes in the graph-based agent system
+- Added direct script invocation support for graph-based agents
+- Added graph validation
+- Implemented state management for agent graphs
+- initial agent graph scaffolding
+- add auto-continue support to all contexts
+- dynamic tab completions now show the sessions for a given agent instead of only listing global sessions
+- legacy SSE support for MCP server configurations
+- support http/sse transport types for MCP server configurations so it fully supports claude desktop-style MCP configs
+- 99% complete migration to new state structs to get away from God-Config struct; i.e. AppConfig, AppState, and RequestContext
+- Automatic runtime customization using shebangs
+- Created a demo TypeScript tool and a get_current_weather function in TypeScript
+- Updated the Python demo tool to show all possible parameter types and variations
+- Added TypeScript tool support using the refactored common ScriptedLanguage trait
+
+### Fix
+
+- Generified the functions usage of script detection for an executable bit on unix systems
+- merge required claude code system prompt into instructions
+- updated argc argument passing in run-tool and run-agent scripts
+- Added additional graph validation for parallel reads and writes with dependencies between nodes states
+- bug in next_single method and improved outcome handling for LLM node execution
+- inline RAG bug when globbing files by extension without subdirectory globbing
+- update the estimate_token_length function to use the standard word count method
+- removed unnecessary regenerate logic for sessions and use the same logic for all contexts; prevents a panic on empty message list
+- error when users try to start a session on a graph agent
+- added on_other field for approval nodes so users can specify an alternative free-text target when none of the options match what they want
+- accidentally added back in full agent tools on LLM nodes
+- Improve the coder agent's usage of tools
+- make the agent__collect escalation-aware so it doesn't freeze on sub-agent escalations
+- check for an existing session before starting up MCP servers when switching to a role
+- do not switch to agent if a session is active.
+- Do not append todo instructions when function calling is disabled
+- a bug in the dynamic completions because the crate name is loki-ai but the binary is named loki
+- bug found by copilot that would create a lock on the PollSender for sse-based MCP servers
+- Accidental shadow of temp_file function for Windows function calling
+- upgraded to newer rmcp version to get native-tls support
+- RagCache was not being used for agent and sub-agent instantiation
+- TypeScript function args were being passed as objects rather than direct parameters
+- Added in forgotten wrapper scripts for TypeScript tools
+- don't shadow variables in binary path handling for Windows
+- Tool call improvements for Windows systems
+
+### Refactor
+
+- migrated llm nodes to use Roles to simplify instructions handling and to function like inline roles
+- migrated the next_node and apply_state_updates logic for LLM nodes into the LlmExecutor
+- fully complete state re-architecting
+- Fully ripped out the god Config struct
+- Deprecated old Config struct initialization logic
+- migrate functions and MCP servers to AppConfig
+- Migrate the vault/bare_init logic
+- created a single install_builtins free function to remove from Config::init
+- partial migration to init in AppConfig
+- Extracted common Python parser logic into a common.rs module
+- python tools now use tree-sitter queries instead of AST
+
 ## v0.3.0 (2026-04-02)
 
 ### Feat
