@@ -4,6 +4,7 @@ pub(crate) mod user_interaction;
 
 use crate::{
     config::{Agent, RequestContext},
+    graph,
     utils::*,
 };
 
@@ -1199,6 +1200,9 @@ pub fn run_llm_function(
         if dir.exists() {
             bin_dirs.push(dir);
         }
+        if graph::agent_has_graph(&agent_name) {
+            envs.insert("AUTO_CONFIRM".into(), "true".into());
+        }
     } else {
         bin_dirs.push(paths::functions_bin_dir());
     }
@@ -1242,7 +1246,7 @@ pub fn run_llm_function(
         .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
 
     let stdout = child.stdout.take().expect("Failed to capture stdout");
-    let mut stderr = child.stderr.take().expect("Failed to capture stderr");
+    let stderr = child.stderr.take().expect("Failed to capture stderr");
 
     let stdout_thread = std::thread::spawn(move || {
         let mut buffer = [0; 1024];
@@ -1269,8 +1273,29 @@ pub fn run_llm_function(
     });
 
     let stderr_thread = std::thread::spawn(move || {
+        let mut buffer = [0; 1024];
+        let mut reader = stderr;
+        let mut err = io::stderr();
         let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
+        while let Ok(n) = reader.read(&mut buffer) {
+            if n == 0 {
+                break;
+            }
+            let chunk = &buffer[0..n];
+            buf.extend_from_slice(chunk);
+            let mut last_pos = 0;
+            for (i, &byte) in chunk.iter().enumerate() {
+                if byte == b'\n' {
+                    let _ = err.write_all(&chunk[last_pos..i]);
+                    let _ = err.write_all(b"\r\n");
+                    last_pos = i + 1;
+                }
+            }
+            if last_pos < n {
+                let _ = err.write_all(&chunk[last_pos..n]);
+            }
+            let _ = err.flush();
+        }
         buf
     });
 
@@ -1283,9 +1308,6 @@ pub fn run_llm_function(
     let exit_code = status.code().unwrap_or_default();
     if exit_code != 0 {
         let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
-        if !stderr.is_empty() {
-            eprintln!("{stderr}");
-        }
         let tool_error_message = format!("Tool call '{command_name}' exited with code {exit_code}");
         eprintln!("{}", warning_text(&format!("⚠️ {tool_error_message} ⚠️")));
         let mut error_json = json!({"tool_call_error": tool_error_message});
