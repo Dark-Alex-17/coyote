@@ -526,7 +526,7 @@ impl RoleLike for Agent {
     }
 
     fn enabled_tools(&self) -> Option<String> {
-        self.config.global_tools.clone().join(",").into()
+        None
     }
 
     fn enabled_mcp_servers(&self) -> Option<String> {
