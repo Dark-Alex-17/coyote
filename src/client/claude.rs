@@ -114,41 +114,35 @@ async fn prepare_chat_completions(
 ///
 /// This behavior was discovered 2026-03-17.
 ///
-/// So this function injects the Claude Code system prompt into the request
-/// body to make it a valid request.
+/// The prefix must be in its **own** top-level system block. Concatenating it
+/// with role / session content into a single block causes Anthropic to reject
+/// the request with `rate_limit_error`. Any pre-existing system content is
+/// preserved as additional blocks after the prefix.
 fn inject_oauth_system_prompt(body: &mut Value) {
-    let existing_text = match body.get("system") {
+    let existing_blocks: Vec<Value> = match body.get("system") {
         Some(Value::String(s)) => {
-            if s.starts_with(CLAUDE_CODE_PREFIX) {
-                return;
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({ "type": "text", "text": s })]
             }
-            (!s.is_empty()).then(|| s.clone())
         }
-        Some(Value::Array(blocks)) => {
-            let already_injected = blocks.iter().any(|b| {
-                b.get("text")
-                    .and_then(|t| t.as_str())
-                    .map(|t| t.starts_with(CLAUDE_CODE_PREFIX))
-                    .unwrap_or(false)
-            });
-            if already_injected {
-                return;
-            }
-            let joined: Vec<String> = blocks
-                .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()).map(String::from))
-                .collect();
-            (!joined.is_empty()).then(|| joined.join("\n\n"))
-        }
-        _ => None,
+        Some(Value::Array(blocks)) => blocks.clone(),
+        _ => Vec::new(),
     };
 
-    let merged = match existing_text {
-        Some(rest) => format!("{}\n\n{}", CLAUDE_CODE_PREFIX, rest),
-        None => CLAUDE_CODE_PREFIX.to_string(),
-    };
+    let already_injected = existing_blocks
+        .first()
+        .and_then(|b| b.get("text").and_then(|t| t.as_str()))
+        .map(|t| t == CLAUDE_CODE_PREFIX)
+        .unwrap_or(false);
+    if already_injected {
+        return;
+    }
 
-    body["system"] = json!([{ "type": "text", "text": merged }]);
+    let mut system = vec![json!({ "type": "text", "text": CLAUDE_CODE_PREFIX })];
+    system.extend(existing_blocks);
+    body["system"] = Value::Array(system);
 }
 
 pub async fn claude_chat_completions(
