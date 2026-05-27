@@ -55,6 +55,7 @@ impl ScriptExecutor {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.envs(&self.extra_envs);
+        cmd.env("AUTO_CONFIRM", "true");
         match &state_repr {
             StateRepresentation::Inline(json) => {
                 cmd.env("GRAPH_STATE", json);

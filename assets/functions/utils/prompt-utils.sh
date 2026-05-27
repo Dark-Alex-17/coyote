@@ -506,16 +506,14 @@ open_link() {
 }
 
 guard_operation() {
-  if [[ -t 1 ]]; then
-  	if [[ -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
-			ans="$(confirm "${1:-Are you sure you want to continue?}")"
+	if [[ -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
+		ans="$(confirm "${1:-Are you sure you want to continue?}")"
 
-			if [[ "$ans" == 0 ]]; then
-				error "Operation aborted!" 2>&1
-				exit 1
-			fi
+		if [[ "$ans" == 0 ]]; then
+			error "Operation aborted!" 2>&1
+			exit 1
 		fi
-  fi
+	fi
 }
 
 # Here is an example of a patch block that can be applied to modify the file to request the user's name:
@@ -655,19 +653,17 @@ guard_path() {
     exit 1
   fi
 
-  if [[ -t 1 ]]; then
-    path="$(_to_real_path "$1")"
-    confirmation_prompt="$2"
+	path="$(_to_real_path "$1")"
+	confirmation_prompt="$2"
 
-    if [[ ! "$path" == "$(pwd)"* && -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
-			ans="$(confirm "$confirmation_prompt")"
+	if [[ ! "$path" == "$(pwd)"* && -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
+		ans="$(confirm "$confirmation_prompt")"
 
-			if [[ "$ans" == 0 ]]; then
-				error "Operation aborted!" >&2
-				exit 1
-			fi
-    fi
-  fi
+		if [[ "$ans" == 0 ]]; then
+			error "Operation aborted!" >&2
+			exit 1
+		fi
+	fi
 }
 
 _to_real_path() {
