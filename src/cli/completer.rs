@@ -27,7 +27,9 @@ impl ShellCompletion {
             Self::Bash => generate(Shell::Bash, cmd, COYOTE_CLI_NAME, &mut io::stdout()),
             Self::Elvish => generate(Shell::Elvish, cmd, COYOTE_CLI_NAME, &mut io::stdout()),
             Self::Fish => generate(Shell::Fish, cmd, COYOTE_CLI_NAME, &mut io::stdout()),
-            Self::PowerShell => generate(Shell::PowerShell, cmd, COYOTE_CLI_NAME, &mut io::stdout()),
+            Self::PowerShell => {
+                generate(Shell::PowerShell, cmd, COYOTE_CLI_NAME, &mut io::stdout())
+            }
             Self::Zsh => generate(Shell::Zsh, cmd, COYOTE_CLI_NAME, &mut io::stdout()),
             Self::Nushell => generate(Nushell, cmd, COYOTE_CLI_NAME, &mut io::stdout()),
         }
