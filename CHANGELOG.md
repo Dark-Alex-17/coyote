@@ -1,3 +1,15 @@
+## v0.5.0 (2026-05-27)
+
+### Feat
+
+- rename Loki to Coyote
+
+### Fix
+
+- bash-based user interactions in agents accidentally regressed in graph implementation
+- Claude function calling in agent contexts
+- Claude code rate limit error per new Claude changes
+
 ## v0.4.0 (2026-05-23)
 
 ### Feat
