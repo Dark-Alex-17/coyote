@@ -1,9 +1,9 @@
-function _loki_fish
+function _coyote_fish
     set -l _old (commandline)
     if test -n $_old
         echo -n "⌛"
         commandline -f repaint
-        commandline (loki -e $_old)
+        commandline (coyote -e $_old)
     end
 end
-bind \ee _loki_fish
+bind \ee _coyote_fish

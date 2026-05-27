@@ -1,7 +1,7 @@
-_loki_bash() {
+_coyote_bash() {
     if [[ -n "$READLINE_LINE" ]]; then
-        READLINE_LINE=$(loki -e "$READLINE_LINE")
+        READLINE_LINE=$(coyote -e "$READLINE_LINE")
         READLINE_POINT=${#READLINE_LINE}
     fi
 }
-bind -x '"\ee": _loki_bash'
+bind -x '"\ee": _coyote_bash'

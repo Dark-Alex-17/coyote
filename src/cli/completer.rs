@@ -9,7 +9,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::io;
 
-const LOKI_CLI_NAME: &str = "loki";
+const COYOTE_CLI_NAME: &str = "coyote";
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum ShellCompletion {
@@ -24,12 +24,12 @@ pub enum ShellCompletion {
 impl ShellCompletion {
     pub fn generate_completions(self, cmd: &mut clap::Command) {
         match self {
-            Self::Bash => generate(Shell::Bash, cmd, LOKI_CLI_NAME, &mut io::stdout()),
-            Self::Elvish => generate(Shell::Elvish, cmd, LOKI_CLI_NAME, &mut io::stdout()),
-            Self::Fish => generate(Shell::Fish, cmd, LOKI_CLI_NAME, &mut io::stdout()),
-            Self::PowerShell => generate(Shell::PowerShell, cmd, LOKI_CLI_NAME, &mut io::stdout()),
-            Self::Zsh => generate(Shell::Zsh, cmd, LOKI_CLI_NAME, &mut io::stdout()),
-            Self::Nushell => generate(Nushell, cmd, LOKI_CLI_NAME, &mut io::stdout()),
+            Self::Bash => generate(Shell::Bash, cmd, COYOTE_CLI_NAME, &mut io::stdout()),
+            Self::Elvish => generate(Shell::Elvish, cmd, COYOTE_CLI_NAME, &mut io::stdout()),
+            Self::Fish => generate(Shell::Fish, cmd, COYOTE_CLI_NAME, &mut io::stdout()),
+            Self::PowerShell => generate(Shell::PowerShell, cmd, COYOTE_CLI_NAME, &mut io::stdout()),
+            Self::Zsh => generate(Shell::Zsh, cmd, COYOTE_CLI_NAME, &mut io::stdout()),
+            Self::Nushell => generate(Nushell, cmd, COYOTE_CLI_NAME, &mut io::stdout()),
         }
     }
 }

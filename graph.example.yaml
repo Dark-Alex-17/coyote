@@ -1,5 +1,5 @@
 # Graph-based agent definition (full-featured reference)
-# Location: <loki-config-dir>/agents/<agent-name>/graph.yaml
+# Location: <coyote-config-dir>/agents/<agent-name>/graph.yaml
 #
 # A graph agent is defined by this file alone. An agent directory contains
 # either a config.yaml (a normal LLM-loop agent) or a graph.yaml (a graph
@@ -13,7 +13,7 @@
 # runnable deep-research graph agent, see assets/agents/deep-research/.
 #
 # Full documentation:
-#   https://github.com/Dark-Alex-17/loki/wiki/Graph-Agents
+#   https://github.com/Dark-Alex-17/coyote/wiki/Graph-Agents
 
 # ---------------------------------------------------------------------------
 # Identity
@@ -35,7 +35,7 @@ temperature: 0.0                   # Default sampling temperature for `llm` node
 top_p: null                        # Default sampling top-p for `llm` nodes
 
 global_tools:                      # Tool universe an `llm` node's `tools:` whitelist draws from
-  - web_search_loki.sh
+  - web_search_coyote.sh
   - fetch_url_via_curl.sh
 
 mcp_servers:                       # MCP servers an `llm` node may reference via `mcp:<server>`
@@ -52,7 +52,7 @@ conversation_starters:             # Suggested prompts surfaced in the UI
 #     (see initial_state below).
 #   - Script nodes via the env var `LLM_AGENT_VAR_<UPPER_NAME>`.
 # Values may be overridden at runtime with
-#   `loki -a <agent> --agent-variable <name> <value> "..."`.
+#   `coyote -a <agent> --agent-variable <name> <value> "..."`.
 # ---------------------------------------------------------------------------
 variables:
   - name: project_dir
@@ -103,7 +103,7 @@ reducers:
 # Values placed into graph state before any node runs; reference anywhere via
 # {{key}}.
 #
-# Note: `initial_prompt` is seeded automatically by Loki with the
+# Note: `initial_prompt` is seeded automatically by Coyote with the
 # caller's prompt. So there's no need to set it here.
 # ---------------------------------------------------------------------------
 initial_state:
@@ -123,7 +123,7 @@ start: triage                # ID of the first node to run (must exist in `nodes
 # ---------------------------------------------------------------------------
 # Nodes
 # Each node is keyed by its id. The `id:` inside a node must match its key
-# (it may also be omitted and thus Loki fills it in from the key).
+# (it may also be omitted and thus Coyote fills it in from the key).
 #
 # Node types: agent | script | approval | input | llm | rag | map | end
 # ---------------------------------------------------------------------------
@@ -202,7 +202,7 @@ nodes:
     instructions: "You are a web researcher. Cite every claim."
     prompt: "Web research: {{topic}}. Return findings and sources."
     tools:
-      - web_search_loki
+      - web_search_coyote
       - mcp:ddg-search
     output_schema:
       type: object
@@ -226,13 +226,13 @@ nodes:
   # The script also receives these env vars (parity with bash tools called
   # from normal agents):
   #   GRAPH_STATE / GRAPH_STATE_FILE  state payload (one of the two is set)
-  #   LLM_ROOT_DIR                    loki config dir
+  #   LLM_ROOT_DIR                    coyote config dir
   #   LLM_PROMPT_UTILS_FILE           path to .shared/prompt-utils.sh
   #   LLM_AGENT_DATA_DIR              this agent's data directory
   #   LLM_AGENT_VAR_<NAME>            one per declared `variables:` entry
-  #   PATH                            with loki's functions bin dir prepended
+  #   PATH                            with coyote's functions bin dir prepended
   #   CLICOLOR_FORCE / FORCE_COLOR    so child tools emit ANSI colors
-  # The script's working directory is loki's invocation CWD (not the agent
+  # The script's working directory is coyote's invocation CWD (not the agent
   # directory), matching the behavior of bash tools.
   #
   # This node fires once: after both `retrieve` and `web_search` finish.
@@ -256,13 +256,13 @@ nodes:
     # targets.
 
   # --- agent node ---------------------------------------------------------
-  # Spawns a full Loki sub-agent and waits for it. The child uses its own
+  # Spawns a full Coyote sub-agent and waits for it. The child uses its own
   # tool stack. Agent nodes have no `tools:` field. No schema hint is
   # injected even when `output_schema` is set (unlike llm nodes).
   deep_dive:
     id: deep_dive
     type: agent
-    agent: deep-research       # Name of an existing Loki agent to spawn
+    agent: deep-research       # Name of an existing Coyote agent to spawn
     prompt: |                  # User message sent to the child (templated)
       Research {{topic}} in depth. Existing context:
       {{context}}
@@ -325,7 +325,7 @@ nodes:
     instructions: "Research one subject deeply for a {{audience}} audience."
     prompt: "Research {{subject}}: pull the key facts and one citation."
     tools:
-      - web_search_loki
+      - web_search_coyote
     # No `next:`, `state_updates:`, or `output_schema:` here. Map branches
     # have a strict contract (see `subjects_map.branch` comment).
 
@@ -348,7 +348,7 @@ nodes:
     instructions: "You write concise research summaries for a {{audience}} audience."
     prompt: "Summarize the topic {{topic}}, using your tools as needed."
     tools:                     # Narrow whitelist: exactly these entries, nothing else
-      - web_search_loki        #   an exact global-tool / custom-tool name
+      - web_search_coyote        #   an exact global-tool / custom-tool name
       - mcp:ddg-search         #   `mcp:<server>` includes that server's functions
     model: claude:claude-haiku-4-5  # Optional per-node model override
     temperature: 0.3           # Optional per-node sampling override

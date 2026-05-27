@@ -28,7 +28,7 @@ pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> R
         }
     } else {
         Err(anyhow!(
-            "A password file is required to utilize the Loki vault. Please configure a password file in your config file and try again."
+            "A password file is required to utilize the Coyote vault. Please configure a password file in your config file and try again."
         ))
     }
 }
@@ -95,7 +95,7 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
 
         if !ans {
             return Err(anyhow!(
-                "A password file is required to utilize the Loki vault. Please configure a password file in your config file and try again."
+                "A password file is required to utilize the Coyote vault. Please configure a password file in your config file and try again."
             ));
         }
 

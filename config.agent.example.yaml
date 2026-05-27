@@ -1,5 +1,5 @@
 # Agent-specific configuration
-# Location `<loki-config-dir>/agents/<agent-name>/config.yaml`
+# Location `<coyote-config-dir>/agents/<agent-name>/config.yaml`
 #
 # Available Environment Variables:
 #   - <agent-name>_MODEL
@@ -21,14 +21,14 @@ version: 1                       # Version of the agent
 # The auto-continue system provides built-in task tracking for improved reliability.
 # When enabled, the model can create todo lists and the system will automatically
 # prompt it to continue when incomplete tasks remain.
-# See the [Todo System documentation](https://github.com/Dark-Alex-17/loki/wiki/TODO-System) for more information
+# See the [Todo System documentation](https://github.com/Dark-Alex-17/coyote/wiki/TODO-System) for more information
 auto_continue: false             # Enable automatic continuation when incomplete todos remain
 max_auto_continues: 10           # Maximum number of automatic continuations before stopping
 inject_todo_instructions: true   # Inject the default todo tool usage instructions into the agent's system prompt
 continuation_prompt: null        # Custom prompt used when auto-continuing (optional; uses default if null)
 # Sub-Agent Spawning System
 # Enable this agent to spawn and manage child agents in parallel.
-# See https://github.com/Dark-Alex-17/loki/wiki/Agents for detailed documentation.
+# See https://github.com/Dark-Alex-17/coyote/wiki/Agents for detailed documentation.
 can_spawn_agents: false          # Enable the agent to spawn child agents
 max_concurrent_agents: 4         # Maximum number of agents that can run simultaneously
 max_agent_depth: 3               # Maximum nesting depth for sub-agents (prevents runaway spawning)
@@ -37,7 +37,7 @@ summarization_model: null        # Model to use for summarizing sub-agent output
 summarization_threshold: 4000    # Character threshold above which sub-agent output is summarized before returning to parent
 escalation_timeout: 300          # Seconds a sub-agent waits for a user interaction response before timing out (default: 5 minutes)
 mcp_servers:                     # Optional list of MCP servers that the agent utilizes
-  - github                       # Corresponds to the name of an MCP server in the `<loki-config-dir>/functions/mcp.json` file
+  - github                       # Corresponds to the name of an MCP server in the `<coyote-config-dir>/functions/mcp.json` file
 global_tools:                    # Optional list of additional global tools to enable for the agent; i.e. not tools specific to the agent
   - web_search
   - fs
@@ -80,10 +80,10 @@ conversation_starters:          # Optional conversation starters for the agent
   - What is the best way to exercise?
   - How do I manage my time effectively?
 documents:                     # Optional documents to load for the agent
-  - git:/some/repo             # Explicitly tell Loki to use the 'git' document loader using an absolute path
-  - pdf:some-pdf-file.pdf      # Explicitly tell Loki to use the 'pdf' document loader using a relative path
+  - git:/some/repo             # Explicitly tell Coyote to use the 'git' document loader using an absolute path
+  - pdf:some-pdf-file.pdf      # Explicitly tell Coyote to use the 'pdf' document loader using a relative path
   - https://some-website.com/some-page
-  - some-file.pdf              # File with relative path to the <loki-config-dir>/agents/<agent-name> directory; i.e. file in the same directory as this config file
+  - some-file.pdf              # File with relative path to the <coyote-config-dir>/agents/<agent-name> directory; i.e. file in the same directory as this config file
   - ~/some-file.txt            # File in the user's home directory
   - /absolute/path/to/some-file.md  # File with absolute path
   - /absolute/path/**/NAME.txt    # Find all NAME.txt files in the specified directory and all its subdirectories

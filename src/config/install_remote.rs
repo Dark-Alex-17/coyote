@@ -136,7 +136,7 @@ impl Drop for TempRepoDir {
 }
 
 fn clone_to_temp(url: &str, reference: Option<&str>) -> Result<TempRepoDir> {
-    let dest = utils::temp_file("loki-remote-install-", "");
+    let dest = utils::temp_file("coyote-remote-install-", "");
     let dest_arg: OsString = dest.as_os_str().into();
 
     let is_sha = reference
@@ -875,7 +875,7 @@ fn print_secret_summary(added: &[String], deferred: &[String]) {
     if !deferred.is_empty() {
         println!(
             "\nThe following secrets are still required by your MCP servers. \
-             Add them with `loki --add-secret <NAME>` or `.vault add <NAME>` in the REPL:"
+             Add them with `coyote --add-secret <NAME>` or `.vault add <NAME>` in the REPL:"
         );
         for name in deferred {
             println!("  {{{{ {name} }}}}");
@@ -1265,12 +1265,12 @@ mod tests {
         let target = dir.join("target.json");
         write_mcp(
             &remote,
-            r#"{"mcpServers": {"x": {"type":"stdio","command":"echo","env":{"K":"{{LOKI_TEST_MERGE_SECRET}}"}}}}"#,
+            r#"{"mcpServers": {"x": {"type":"stdio","command":"echo","env":{"K":"{{COYOTE_TEST_MERGE_SECRET}}"}}}}"#,
         );
 
         let report = merge_mcp_json(None, &remote, &target, false).unwrap();
 
-        assert_eq!(report.missing_secrets, vec!["LOKI_TEST_MERGE_SECRET"]);
+        assert_eq!(report.missing_secrets, vec!["COYOTE_TEST_MERGE_SECRET"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1300,8 +1300,8 @@ mod tests {
     #[test]
     fn handle_missing_secrets_defers_all_in_non_tty() {
         let missing = vec![
-            "LOKI_TEST_STEP4_A".to_string(),
-            "LOKI_TEST_STEP4_B".to_string(),
+            "COYOTE_TEST_STEP4_A".to_string(),
+            "COYOTE_TEST_STEP4_B".to_string(),
         ];
 
         assert!(handle_missing_secrets(&missing).is_ok());

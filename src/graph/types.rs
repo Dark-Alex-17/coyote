@@ -812,7 +812,7 @@ model: anthropic:claude-sonnet-4-6
 temperature: 0.2
 top_p: 0.9
 global_tools:
-  - web_search_loki.sh
+  - web_search_coyote.sh
 mcp_servers:
   - pubmed-search
 conversation_starters:
@@ -827,7 +827,7 @@ nodes:
         assert_eq!(graph.model.as_deref(), Some("anthropic:claude-sonnet-4-6"));
         assert_eq!(graph.temperature, Some(0.2));
         assert_eq!(graph.top_p, Some(0.9));
-        assert_eq!(graph.global_tools, vec!["web_search_loki.sh"]);
+        assert_eq!(graph.global_tools, vec!["web_search_coyote.sh"]);
         assert_eq!(graph.mcp_servers, vec!["pubmed-search"]);
         assert_eq!(graph.conversation_starters, vec!["Look up 2160-0"]);
     }

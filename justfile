@@ -18,7 +18,7 @@ fmt:
 	cargo fmt --all
 
 # Build the project for the current system architecture
-# (Gets stored at ./target/[debug|release]/loki)
+# (Gets stored at ./target/[debug|release]/coyote)
 [group: 'build']
 [arg('build_type', pattern="debug|release")]
 build build_type='debug':

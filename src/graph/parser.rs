@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn load_from_file_reads_disk() {
         let dir = env::temp_dir();
-        let path = dir.join(format!("loki_graph_parser_test_{}.yaml", process::id()));
+        let path = dir.join(format!("coyote_graph_parser_test_{}.yaml", process::id()));
         let yaml = formatdoc! {r#"
             name: disk_graph
             version: "1.0"

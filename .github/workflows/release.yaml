@@ -98,9 +98,9 @@ jobs:
           # Ignore Act's local artifact dir noise
           echo artifacts/ >> .git/info/exclude || true
 
-          # Edit the version line right after name="loki"
+          # Edit the version line right after name="coyote"
           sed -E -i '
-            /^[[:space:]]*name[[:space:]]*=[[:space:]]*"loki"[[:space:]]*$/ {
+            /^[[:space:]]*name[[:space:]]*=[[:space:]]*"coyote"[[:space:]]*$/ {
               n
               s|^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]*"|version = "'"$VERSION"'"|
             }
@@ -278,7 +278,7 @@ jobs:
       - name: Verify file
         shell: bash
         run: |
-          file target/${{ matrix.target }}/release/loki
+          file target/${{ matrix.target }}/release/coyote
 
       - name: Test
         if: matrix.target != 'aarch64-apple-darwin' && matrix.target != 'aarch64-pc-windows-msvc'
@@ -382,11 +382,11 @@ jobs:
         shell: bash
         run: |
           # Set environment variables
-          macos_sha="$(cat ./artifacts/loki-x86_64-apple-darwin.sha256 | awk '{print $1}')"
+          macos_sha="$(cat ./artifacts/coyote-x86_64-apple-darwin.sha256 | awk '{print $1}')"
           echo "MACOS_SHA=$macos_sha" >> $GITHUB_ENV
-          macos_sha_arm="$(cat ./artifacts/loki-aarch64-apple-darwin.sha256 | awk '{print $1}')"
+          macos_sha_arm="$(cat ./artifacts/coyote-aarch64-apple-darwin.sha256 | awk '{print $1}')"
           echo "MACOS_SHA_ARM=$macos_sha_arm" >> $GITHUB_ENV
-          linux_sha="$(cat ./artifacts/loki-x86_64-unknown-linux-musl.sha256 | awk '{print $1}')"
+          linux_sha="$(cat ./artifacts/coyote-x86_64-unknown-linux-musl.sha256 | awk '{print $1}')"
           echo "LINUX_SHA=$linux_sha" >> $GITHUB_ENV
           release_version="$(cat ./artifacts/release-version)"
           echo "RELEASE_VERSION=$release_version" >> $GITHUB_ENV
@@ -402,23 +402,23 @@ jobs:
         if: env.ACT != 'true'
         run: |
           # run packaging script
-          python "./deployment/homebrew/packager.py" ${{ env.RELEASE_VERSION }} "./deployment/homebrew/loki.rb.template" "./loki.rb" ${{ env.MACOS_SHA }} ${{ env.MACOS_SHA_ARM }} ${{ env.LINUX_SHA }}
+          python "./deployment/homebrew/packager.py" ${{ env.RELEASE_VERSION }} "./deployment/homebrew/coyote.rb.template" "./coyote.rb" ${{ env.MACOS_SHA }} ${{ env.MACOS_SHA_ARM }} ${{ env.LINUX_SHA }}
 
       - name: Push changes to Homebrew tap
         if: env.ACT != 'true'
         env:
-          TOKEN: ${{ secrets.LOKI_GITHUB_TOKEN }}
+          TOKEN: ${{ secrets.COYOTE_GITHUB_TOKEN }}
         run: |
           # push to Git
           git config --global user.name "Dark-Alex-17"
           git config --global user.email "alex.j.tusa@gmail.com"
-          git clone https://Dark-Alex-17:${{ secrets.LOKI_GITHUB_TOKEN }}@github.com/Dark-Alex-17/homebrew-loki.git
-          rm homebrew-loki/Formula/loki.rb
-          cp loki.rb homebrew-loki/Formula
-          cd homebrew-loki
+          git clone https://Dark-Alex-17:${{ secrets.COYOTE_GITHUB_TOKEN }}@github.com/Dark-Alex-17/homebrew-coyote.git
+          rm homebrew-coyote/Formula/coyote.rb
+          cp coyote.rb homebrew-coyote/Formula
+          cd homebrew-coyote
           git add .
-          git diff-index --quiet HEAD || git commit -am "Update formula for Loki release ${{ env.RELEASE_VERSION }}"
-          git push https://$TOKEN@github.com/Dark-Alex-17/homebrew-loki.git
+          git diff-index --quiet HEAD || git commit -am "Update formula for Coyote release ${{ env.RELEASE_VERSION }}"
+          git push https://$TOKEN@github.com/Dark-Alex-17/homebrew-coyote.git
 
   publish-crate:
     needs: publish-github-release

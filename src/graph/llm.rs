@@ -568,13 +568,13 @@ mod tests {
         let entries = vec![
             "read_query".to_string(),
             "mcp:pubmed-search".to_string(),
-            "web_search_loki".to_string(),
+            "web_search_coyote".to_string(),
             "mcp:github".to_string(),
         ];
 
         let (regular, mcp) = categorize_tools(Some(&entries));
 
-        assert_eq!(regular, vec!["read_query", "web_search_loki"]);
+        assert_eq!(regular, vec!["read_query", "web_search_coyote"]);
         assert_eq!(mcp, vec!["pubmed-search", "github"]);
     }
 

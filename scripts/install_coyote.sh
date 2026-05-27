@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# loki installer (Linux/macOS)
+# coyote installer (Linux/macOS)
 #
 # Usage examples:
-#   curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/loki/main/scripts/install_loki.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/loki/main/scripts/install_loki.sh | bash -s -- --version vX.Y.Z
-#   BIN_DIR="$HOME/.local/bin" bash scripts/install_loki.sh
+#   curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/main/scripts/install_coyote.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/main/scripts/install_coyote.sh | bash -s -- --version vX.Y.Z
+#   BIN_DIR="$HOME/.local/bin" bash scripts/install_coyote.sh
 #
 # Flags / Env:
-#   --version <tag>   Release tag (default: latest). Or set LOKI_VERSION.
+#   --version <tag>   Release tag (default: latest). Or set COYOTE_VERSION.
 #   --bin-dir <dir>   Install directory (default: /usr/local/bin or ~/.local/bin). Or set BIN_DIR.
 
-REPO="Dark-Alex-17/loki"
-VERSION="${LOKI_VERSION:-}"
+REPO="Dark-Alex-17/coyote"
+VERSION="${COYOTE_VERSION:-}"
 BIN_DIR="${BIN_DIR:-}"
 
 usage() {
-  echo "loki installer (Linux/macOS)"
+  echo "coyote installer (Linux/macOS)"
   echo
   echo "Options:"
   echo "  --version <tag>         Release tag (default: latest)"
@@ -44,7 +44,7 @@ fi
 mkdir -p "${BIN_DIR}"
 
 log() {
-	echo "[loki-install] $*"
+	echo "[coyote-install] $*"
 }
 
 need_cmd() {
@@ -92,9 +92,9 @@ fi
 
 http_get() {
   if [[ "$DL" == "curl" ]]; then
-    curl -fsSL -H 'User-Agent: loki-installer' "$1"
+    curl -fsSL -H 'User-Agent: coyote-installer' "$1"
   else
-    wget -qO- --header='User-Agent: loki-installer' "$1"
+    wget -qO- --header='User-Agent: coyote-installer' "$1"
   fi
 }
 
@@ -111,9 +111,9 @@ fi
 ASSET_CANDIDATES=()
 if [[ "$OS" == "darwin" ]]; then
   if [[ "$ARCH" == "x86_64" ]]; then
-    ASSET_CANDIDATES+=("loki-x86_64-apple-darwin.tar.gz")
+    ASSET_CANDIDATES+=("coyote-x86_64-apple-darwin.tar.gz")
   else
-    ASSET_CANDIDATES+=("loki-aarch64-apple-darwin.tar.gz")
+    ASSET_CANDIDATES+=("coyote-aarch64-apple-darwin.tar.gz")
   fi
 elif [[ "$OS" == "linux" ]]; then
   if [[ "$ARCH" == "x86_64" ]]; then
@@ -122,12 +122,12 @@ elif [[ "$OS" == "linux" ]]; then
     if ldd --version 2>&1 | grep -qi glibc; then LIBC="gnu"; fi
 
     if [[ "$LIBC" == "gnu" ]]; then
-      ASSET_CANDIDATES+=("loki-x86_64-unknown-linux-gnu.tar.gz")
+      ASSET_CANDIDATES+=("coyote-x86_64-unknown-linux-gnu.tar.gz")
     fi
 
-    ASSET_CANDIDATES+=("loki-x86_64-unknown-linux-musl.tar.gz")
+    ASSET_CANDIDATES+=("coyote-x86_64-unknown-linux-musl.tar.gz")
   else
-    ASSET_CANDIDATES+=("loki-aarch64-unknown-linux-musl.tar.gz")
+    ASSET_CANDIDATES+=("coyote-aarch64-unknown-linux-musl.tar.gz")
   fi
 else
   echo "Error: unsupported OS for this installer: $OS" >&2; exit 1
@@ -170,9 +170,9 @@ log "Download URL: $ASSET_URL"
 
 ARCHIVE="$TMPDIR/asset"
 if [[ "$DL" == "curl" ]]; then
-  curl -fL -H 'User-Agent: loki-installer' "$ASSET_URL" -o "$ARCHIVE"
+  curl -fL -H 'User-Agent: coyote-installer' "$ASSET_URL" -o "$ARCHIVE"
 else
-  wget -q --header='User-Agent: loki-installer' "$ASSET_URL" -O "$ARCHIVE"
+  wget -q --header='User-Agent: coyote-installer' "$ASSET_URL" -O "$ARCHIVE"
 fi
 
 WORK="$TMPDIR/work"; mkdir -p "$WORK"
@@ -192,21 +192,21 @@ fi
 BIN_PATH=""
 while IFS= read -r -d '' f; do
   base=$(basename "$f")
-  if [[ "$base" == "loki" ]]; then
+  if [[ "$base" == "coyote" ]]; then
   	BIN_PATH="$f"
   	break
   fi
 done < <(find "$EXTRACTED_DIR" -type f -print0)
 
 if [[ -z "$BIN_PATH" ]]; then
-	echo "Error: could not find 'loki' binary in the archive" >&2
+	echo "Error: could not find 'coyote' binary in the archive" >&2
 	exit 1
 fi
 
 chmod +x "$BIN_PATH"
-install -m 0755 "$BIN_PATH" "${BIN_DIR}/loki"
+install -m 0755 "$BIN_PATH" "${BIN_DIR}/coyote"
 
-log "Installed: ${BIN_DIR}/loki"
+log "Installed: ${BIN_DIR}/coyote"
 
 case ":$PATH:" in
   *":${BIN_DIR}:"*) ;;
@@ -216,5 +216,5 @@ case ":$PATH:" in
     ;;
 esac
 
-log "Done. Try: loki --help"
+log "Done. Try: coyote --help"
 

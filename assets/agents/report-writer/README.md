@@ -27,7 +27,7 @@ You can also use this agent directly if you have a set of findings you
 want polished:
 
 ```sh
-loki -a report-writer "Topic: X. Findings: <paste findings here>"
+coyote -a report-writer "Topic: X. Findings: <paste findings here>"
 ```
 
 It will produce a single Markdown report following the rules in its

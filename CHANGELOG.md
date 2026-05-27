@@ -5,7 +5,7 @@
 - LLM node failures propgate up
 - Added .install remote tab completions to the REPL
 - feature complete install remote with category selection
-- Support to interactively add secrets to Loki that are missing from MCP configs when merging
+- Support to interactively add secrets to Coyote that are missing from MCP configs when merging
 - Added MCP config merging support for remote asset installations
 - install remote now writes files to disk
 - Created basic install_remote functions
@@ -25,7 +25,7 @@
 - validation support for parallel graph execution; restricted map nodes to only run for nodes without next targets and not supporting chained map nodes
 - created the staging area for state merges per super-step and created the built-in reducers (and their application) for the state merge phase of a super step
 - scaffolding work for fan-out nodes for parallel branch execution support and stubbed out Map node types
-- Loki can now update itself via .update and --update commands
+- Coyote can now update itself via .update and --update commands
 - added a .edit command for editing the MCP configuration file
 - Created a new .install command to install bundled assets on-demand
 - migrated llm node validation to graph loading time instead of graph runtime
@@ -40,7 +40,7 @@
 - wired together graph execution and agent graph dispatch
 - implemented support for the graph executor
 - created the approval node executor and the input node executor for user interaction
-- Added initial support for native Loki agent nodes in the graph-based agent system
+- Added initial support for native Coyote agent nodes in the graph-based agent system
 - Added direct script invocation support for graph-based agents
 - Added graph validation
 - Implemented state management for agent graphs
@@ -73,7 +73,7 @@
 - check for an existing session before starting up MCP servers when switching to a role
 - do not switch to agent if a session is active.
 - Do not append todo instructions when function calling is disabled
-- a bug in the dynamic completions because the crate name is loki-ai but the binary is named loki
+- a bug in the dynamic completions because the crate name is coyote-ai but the binary is named coyote
 - bug found by copilot that would create a lock on the PollSender for sse-based MCP servers
 - Accidental shadow of temp_file function for Windows function calling
 - upgraded to newer rmcp version to get native-tls support
@@ -120,7 +120,7 @@
 - Created a CodeRabbit-style code-reviewer agent
 - Added configuration option in agents to indicate the timeout for user input before proceeding (defaults to 5 minutes)
 - Added support for sub-agents to escalate user interaction requests from any depth to the parent agents for user interactions
-- built-in user interaction tools to remove the need for the list/confirm/etc prompts in prompt tools and to enhance user interactions in Loki
+- built-in user interaction tools to remove the need for the list/confirm/etc prompts in prompt tools and to enhance user interactions in Coyote
 - Experimental update to sisyphus to use the new parallel agent spawning system
 - Added an agent configuration property that allows auto-injecting sub-agent spawning instructions (when using the built-in sub-agent spawning system)
 - Auto-dispatch support of sub-agents and support for the teammate pattern between subagents
@@ -174,7 +174,7 @@
 
 - Simplified sisyphus prompt to improve functionality
 - Supported the injection of RAG sources into the prompt, not just via the `.sources rag` command in the REPL so models can directly reference the documents that supported their responses
-- Created the Sisyphus agent to make Loki function like Claude Code, Gemini, Codex, etc.
+- Created the Sisyphus agent to make Coyote function like Claude Code, Gemini, Codex, etc.
 - Created the Oracle agent to handle high-level architectural decisions and design questions about a given codebase
 - Updated the coder agent to be much more task-focused and to be delegated to by Sisyphus
 - Created the explore agent for exploring codebases to help answer questions
@@ -234,8 +234,8 @@
 - Support for secret injection into the global config file (API keys, for example)
 - Improved MCP handling toggle handling
 - Secret injection into the MCP configuration
-- added REPL support for interacting with the Loki vault
-- Integrated gman with Loki to create a vault and added flags to configure the Loki vault
+- added REPL support for interacting with the Coyote vault
+- Integrated gman with Coyote to create a vault and added flags to configure the Coyote vault
 - Added a default session to the jira helper to make interaction more natural
 - Created the repo-analyzer role
 - Created the coder and sql agents

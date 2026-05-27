@@ -1,0 +1,23 @@
+# Documentation: https://docs.brew.sh/Formula-Cookbook
+#                https://rubydoc.brew.sh/Formula
+class Coyote < Formula
+  desc "All-in-one, batteries included LLM CLI tool"
+  homepage "https://github.com/Dark-Alex-17/coyote"
+  if OS.mac? and Hardware::CPU.arm?
+    url "https://github.com/Dark-Alex-17/coyote/releases/download/v$version/coyote-aarch64-apple-darwin.tar.gz"
+    sha256 "$hash_mac_arm"
+  elsif OS.mac? and Hardware::CPU.intel?
+    url "https://github.com/Dark-Alex-17/coyote/releases/download/v$version/coyote-x86_64-apple-darwin.tar.gz"
+    sha256 "$hash_mac"
+  else
+    url "https://github.com/Dark-Alex-17/coyote/releases/download/v$version/coyote-x86_64-unknown-linux-musl.tar.gz"
+    sha256 "$hash_linux"
+  end
+  version "$version"
+  license "MIT"
+
+  def install
+    bin.install "coyote"
+    ohai "You're done! Get started with \"coyote --help\""
+  end
+end
