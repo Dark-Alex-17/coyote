@@ -1,6 +1,6 @@
 # Sisyphus
 
-The main coordinator agent for the Loki coding ecosystem, providing a powerful CLI interface for code generation and
+The main coordinator agent for the Coyote coding ecosystem, providing a powerful CLI interface for code generation and
 project management similar to OpenCode, ClaudeCode, Codex, or Gemini CLI.
 
 _Inspired by the Sisyphus and Oracle agents of OpenCode._
@@ -19,8 +19,8 @@ Sisyphus acts as the primary entry point, capable of handling complex tasks by c
 
 ## Pro-Tip: Use an IDE MCP Server for Improved Performance
 Many modern IDEs (JetBrains, VS Code, Cursor, Zed, etc.) expose MCP servers that let LLMs use IDE tools directly. Using
-one dramatically improves the performance of coding agents. If you have one, add it to your loki config (see the
-[MCP Server docs](../../../docs/function-calling/MCP-SERVERS.md)) and reference it in this agent's `mcp_servers:` list:
+one dramatically improves the performance of coding agents. If you have one, add it to your coyote config (see the
+[MCP Server docs](https://github.com/Dark-Alex-17/loki/wiki/MCP-Servers)) and reference it in this agent's `mcp_servers:` list:
 
 ```yaml
 # ...
@@ -33,7 +33,7 @@ global_tools:
   - fs_grep.sh
   - fs_glob.sh
   - fs_ls.sh
-  - web_search_loki.sh
+  - web_search_coyote.sh
   - execute_command.sh
 
 # ...

@@ -1,6 +1,6 @@
 # deep-research
 
-A deep web research agent, built as a Loki graph agent. It plans an
+A deep web research agent, built as a Coyote graph agent. It plans an
 investigation, decomposes it into sub-questions researched in
 parallel, grounds the work in a local knowledge corpus, vets the
 credibility of cited sources, runs a reflexion self-critique loop to
@@ -13,12 +13,12 @@ this agent runs a fixed graph: every request goes through the same
 `plan -> parallel research -> vet -> critique -> synthesize -> verify -> approve`
 pipeline.
 
-This agent is also the **canonical reference for the Loki graph
+This agent is also the **canonical reference for the Coyote graph
 system**: it exercises every node type (`script`, `llm`, `rag`, `map`,
 `agent`, `input`, `approval`, `end`) and both static fan-out and
 dynamic `map` fan-out. If you are learning how to build a graph
 agent, this is the file to read alongside the
-[Graph-Agents wiki](https://github.com/Dark-Alex-17/loki/wiki/Graph-Agents).
+[Graph-Agents wiki](https://github.com/Dark-Alex-17/coyote/wiki/Graph-Agents).
 
 ## Workflow
 
@@ -48,21 +48,21 @@ incorporate_feedback (script)       -> research_each_question (the human-feedbac
 
 ### Node-type breakdown
 
-| Type | Nodes |
-|---|---|
-| `script` (Python) | `parse_request`, `bootstrap_research`, `combine_findings`, `reflexion_gate`, `verify_sources`, `incorporate_feedback` |
-| `llm` (tools: `[]`) | `plan`, `critique` |
-| `llm` (with tool whitelist) | `research_one_question`, `vet_sources` |
-| `rag` | `knowledge_lookup` — local corpus retrieval |
-| `map` | `research_each_question` — dynamic fan-out per sub-question |
-| `agent` | `synthesize` — spawns the `report-writer` sub-agent |
-| `input` | `ask_topic` |
-| `approval` | `approve` |
-| `end` | `end_accepted`, `end_rejected` |
+| Type                        | Nodes                                                                                                                 |
+|-----------------------------|-----------------------------------------------------------------------------------------------------------------------|
+| `script` (Python)           | `parse_request`, `bootstrap_research`, `combine_findings`, `reflexion_gate`, `verify_sources`, `incorporate_feedback` |
+| `llm` (tools: `[]`)         | `plan`, `critique`                                                                                                    |
+| `llm` (with tool whitelist) | `research_one_question`, `vet_sources`                                                                                |
+| `rag`                       | `knowledge_lookup` — local corpus retrieval                                                                           |
+| `map`                       | `research_each_question` — dynamic fan-out per sub-question                                                           |
+| `agent`                     | `synthesize` — spawns the `report-writer` sub-agent                                                                   |
+| `input`                     | `ask_topic`                                                                                                           |
+| `approval`                  | `approve`                                                                                                             |
+| `end`                       | `end_accepted`, `end_rejected`                                                                                        |
 
 ## Parallel execution
 
-The graph has two parallel super-steps where Loki's BSP scheduler runs
+The graph has two parallel super-steps where Coyote's BSP scheduler runs
 branches concurrently.
 
 **1. Context loading (`plan` ‖ `knowledge_lookup`)** — after
@@ -96,7 +96,7 @@ PDFs, or text files into `knowledge/` to bias the research toward
 your local context.
 
 The knowledge base is built once, at agent-load time, into
-`~/.config/loki/agents/deep-research/knowledge_lookup.yaml`. Because
+`~/.config/coyote/agents/deep-research/knowledge_lookup.yaml`. Because
 the node fully specifies its build config (`embedding_model`,
 `chunk_size`, `chunk_overlap`), the build is non-interactive. Delete
 that cached file after adding or changing knowledge to force a
@@ -119,13 +119,13 @@ for details.
 
 ## Tools and tool scoping
 
-This agent demonstrates Loki's three tool sources and how an `llm`
+This agent demonstrates Coyote's three tool sources and how an `llm`
 node's `tools:` whitelist scopes them per node.
 
 The agent's full tool universe, declared in `graph.yaml`:
 
-- **Global tools** (`global_tools`): `web_search_loki`,
-  `fetch_url_via_curl`, `search_arxiv` - Loki's built-in tool scripts.
+- **Global tools** (`global_tools`): `web_search_coyote`,
+  `fetch_url_via_curl`, `search_arxiv` - Coyote's built-in tool scripts.
 - **MCP server** (`mcp_servers`): `ddg-search` - a DuckDuckGo web
   search MCP server. Referenced in a whitelist as `mcp:ddg-search`.
 - **Custom agent tool** (`tools.sh`): `classify_source` - a
@@ -134,11 +134,11 @@ The agent's full tool universe, declared in `graph.yaml`:
 No node receives all of these. Each `llm` node's `tools:` whitelist
 narrows the universe to exactly what that step needs:
 
-| Node | `tools:` whitelist | Draws from |
-|---|---|---|
-| `plan`, `critique` | `[]` | nothing - pure reasoning |
-| `research_one_question` | `web_search_loki`, `fetch_url_via_curl`, `search_arxiv`, `mcp:ddg-search` | global tools + MCP |
-| `vet_sources` | `classify_source` | the custom tool only |
+| Node                    | `tools:` whitelist                                                          | Draws from               |
+|-------------------------|-----------------------------------------------------------------------------|--------------------------|
+| `plan`, `critique`      | `[]`                                                                        | nothing - pure reasoning |
+| `research_one_question` | `web_search_coyote`, `fetch_url_via_curl`, `search_arxiv`, `mcp:ddg-search` | global tools + MCP       |
+| `vet_sources`           | `classify_source`                                                           | the custom tool only     |
 
 `research_one_question` (each parallel branch of the map) can search
 and fetch but cannot classify sources; `vet_sources` can classify
@@ -153,21 +153,21 @@ deterministic - exactly the kind of logic a tool should own rather than
 the LLM guessing.
 
 Web search may require API-key configuration; see the
-[Tools](https://github.com/Dark-Alex-17/loki/wiki/Tools) docs.
+[Tools](https://github.com/Dark-Alex-17/coyote/wiki/Tools) docs.
 `fetch_url_via_curl`, `search_arxiv`, and `classify_source` work
 without a key.
 
 ## Setup
 
 `research_one_question` (each parallel branch of the `map`) uses the
-`ddg-search` MCP server via `mcp:ddg-search`. It is one of Loki's
+`ddg-search` MCP server via `mcp:ddg-search`. It is one of Coyote's
 default MCP servers; make sure it is registered in
-`~/.config/loki/mcp.json` (run `loki --install mcp_config` to restore
+`~/.config/coyote/mcp.json` (run `coyote --install mcp_config` to restore
 the default template if it is missing). If `ddg-search` is unavailable,
 the branches still have their global web-search tools to fall back on.
 
 The `synthesize` node spawns the `report-writer` sub-agent. Both
-agents ship with `loki agents install`; if you install one manually,
+agents ship with `coyote agents install`; if you install one manually,
 install both so the agent reference resolves.
 
 ## Reflexion
@@ -205,10 +205,10 @@ backstop: it caps the total visits to any single node.
 ## Running
 
 ```sh
-loki agents install                  # ships deep-research
-loki -a deep-research "How does HTTP/3 differ from HTTP/2?"
-loki -a deep-research "Recent advances in solid-state batteries"
-loki -a deep-research                # no prompt -> triggers ask_topic
+coyote agents install                  # ships deep-research
+coyote -a deep-research "How does HTTP/3 differ from HTTP/2?"
+coyote -a deep-research "Recent advances in solid-state batteries"
+coyote -a deep-research                # no prompt -> triggers ask_topic
 ```
 
 ## Anti-hallucination
@@ -240,7 +240,7 @@ loki -a deep-research                # no prompt -> triggers ask_topic
   `report-writer` sub-agent.
 - **Tool scope.** Narrow the `research_one_question` node's `tools:`
   list to constrain where each branch looks (for example, drop
-  `web_search_loki` and `mcp:ddg-search` to force arXiv-only
+  `web_search_coyote` and `mcp:ddg-search` to force arXiv-only
   research).
 - **Local knowledge.** Drop files into `knowledge/` to bias every
   research branch toward your local context (see the *Local

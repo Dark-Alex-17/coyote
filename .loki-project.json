@@ -1,1 +1,0 @@
-{"type":"rust","build":"cargo build","test":"cargo test","check":"cargo check","_detected_by":"heuristic","_cached_at":"2026-04-13T13:36:33-06:00"}

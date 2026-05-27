@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn from_files_loads_single_text_file() {
         let dir = env::temp_dir().join(format!(
-            "loki-input-test-{}",
+            "coyote-input-test-{}",
             SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -906,7 +906,7 @@ mod tests {
     #[test]
     fn from_files_loads_multiple_files() {
         let dir = env::temp_dir().join(format!(
-            "loki-input-test-multi-{}",
+            "coyote-input-test-multi-{}",
             SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

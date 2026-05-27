@@ -15,7 +15,7 @@ use std::io::{Read, stdin};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 #[command(
-	name = "loki",
+	name = "coyote",
 	author = crate_authors!(),
 	version = crate_version!(),
 	about = crate_description!(),
@@ -125,19 +125,19 @@ pub struct Cli {
     /// Disable colored log output
     #[arg(long, requires = "tail_logs")]
     pub disable_log_colors: bool,
-    /// Add a secret to the Loki vault
+    /// Add a secret to the Coyote vault
     #[arg(long, value_name = "SECRET_NAME", exclusive = true)]
     pub add_secret: Option<String>,
-    /// Decrypt a secret from the Loki vault and print the plaintext
+    /// Decrypt a secret from the Coyote vault and print the plaintext
     #[arg(long, value_name = "SECRET_NAME", exclusive = true, add = ArgValueCompleter::new(secrets_completer))]
     pub get_secret: Option<String>,
-    /// Update an existing secret in the Loki vault
+    /// Update an existing secret in the Coyote vault
     #[arg(long, value_name = "SECRET_NAME", exclusive = true, add = ArgValueCompleter::new(secrets_completer))]
     pub update_secret: Option<String>,
-    /// Delete a secret from the Loki vault
+    /// Delete a secret from the Coyote vault
     #[arg(long, value_name = "SECRET_NAME", exclusive = true, add = ArgValueCompleter::new(secrets_completer))]
     pub delete_secret: Option<String>,
-    /// List all secrets stored in the Loki vault
+    /// List all secrets stored in the Coyote vault
     #[arg(long, exclusive = true)]
     pub list_secrets: bool,
     /// Authenticate with an LLM provider using OAuth (e.g., --authenticate client_name)
@@ -146,10 +146,10 @@ pub struct Cli {
     /// Generate static shell completion scripts
     #[arg(long, value_name = "SHELL", value_enum)]
     pub completions: Option<ShellCompletion>,
-    /// Update Loki to the latest release, or to a specific version
+    /// Update Coyote to the latest release, or to a specific version
     #[arg(long, value_name = "VERSION")]
     pub update: Option<Option<String>>,
-    /// With --update, update even if Loki was installed via a package manager
+    /// With --update, update even if Coyote was installed via a package manager
     #[arg(long, requires = "update")]
     pub force: bool,
 }
@@ -202,7 +202,7 @@ mod tests {
     use clap::Parser;
 
     fn parse(args: &[&str]) -> Cli {
-        let mut full_args = vec!["loki"];
+        let mut full_args = vec!["coyote"];
         full_args.extend_from_slice(args);
         Cli::try_parse_from(full_args).unwrap()
     }
@@ -436,6 +436,6 @@ mod tests {
 
     #[test]
     fn parse_force_without_update_fails() {
-        assert!(Cli::try_parse_from(["loki", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["coyote", "--force"]).is_err());
     }
 }

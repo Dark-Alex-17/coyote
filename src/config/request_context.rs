@@ -1498,7 +1498,7 @@ impl RequestContext {
         if !target_path.exists() {
             fs::write(
                 &target_path,
-                "# see https://github.com/Dark-Alex-17/loki/blob/main/config.agent.example.yaml\n",
+                "# see https://github.com/Dark-Alex-17/coyote/blob/main/config.agent.example.yaml\n",
             )
             .with_context(|| format!("Failed to write to '{}'", target_path.display()))?;
         }
@@ -2706,7 +2706,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = env::temp_dir().join(format!("loki-request-context-tests-{unique}"));
+            let path = env::temp_dir().join(format!("coyote-request-context-tests-{unique}"));
             create_dir_all(&path).unwrap();
             unsafe {
                 env::set_var(&key, &path);

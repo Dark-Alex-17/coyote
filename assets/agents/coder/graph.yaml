@@ -17,8 +17,8 @@ variables:
   - name: project_dir
     description: |
       Absolute path to the project directory. Defaults to "." which is the
-      directory you invoked `loki` from. Override at runtime with
-      `loki -a coder --agent-variable project_dir /abs/path "..."`.
+      directory you invoked `coyote` from. Override at runtime with
+      `coyote -a coder --agent-variable project_dir /abs/path "..."`.
     default: "."
 
 settings:
@@ -70,7 +70,7 @@ nodes:
       MUST be absolute. The project root is {{project_dir}}. Prefer paths
       like "{{project_dir}}/src/foo.rs" over "src/foo.rs". The implementer
       uses these paths directly with fs_write and fs_patch tools, which
-      resolve relative paths against the loki invocation directory (NOT
+      resolve relative paths against the coyote invocation directory (NOT
       the project dir). Empty arrays are fine if no files in that category.
 
       `risks` is a list of short strings. Anything that could derail the
@@ -155,7 +155,7 @@ nodes:
       2. Use `fs_write` for new files or full rewrites.
       3. NEVER output code to chat. Always use tools.
       4. ALWAYS pass ABSOLUTE paths to fs_write and fs_patch. Relative
-         paths resolve against the loki invocation directory (not the
+         paths resolve against the coyote invocation directory (not the
          project dir), which is rarely what you want. The project root
          is {{project_dir}}.
 

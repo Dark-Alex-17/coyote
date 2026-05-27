@@ -1,12 +1,12 @@
 [package]
-name = "loki-ai"
+name = "coyote-ai"
 version = "0.4.0"
 edition = "2024"
 authors = ["Alex Clarke <alex.j.tusa@gmail.com>"]
 description = "An all-in-one, batteries included LLM CLI Tool"
 keywords = ["chatgpt", "llm", "cli", "ai", "repl"]
-homepage = "https://github.com/Dark-Alex-17/loki"
-repository = "https://github.com/Dark-Alex-17/loki"
+homepage = "https://github.com/Dark-Alex-17/coyote"
+repository = "https://github.com/Dark-Alex-17/coyote"
 categories = ["command-line-utilities"]
 readme = "README.md"
 license = "MIT"
@@ -138,7 +138,7 @@ pretty_assertions = "1.4.0"
 serial_test = "3"
 
 [[bin]]
-name = "loki"
+name = "coyote"
 path = "src/main.rs"
 
 [profile.release]

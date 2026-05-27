@@ -3,5 +3,5 @@
 /.env
 !cli/**
 .idea/
-/loki.iml
+/coyote.iml
 /.idea/

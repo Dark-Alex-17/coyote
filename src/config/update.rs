@@ -69,7 +69,7 @@ fn normalize_version(requested: Option<String>) -> Option<String> {
 }
 
 fn is_dir_writable(dir: &Path) -> bool {
-    let probe = dir.join(format!(".loki-update-write-test-{}", process::id()));
+    let probe = dir.join(format!(".coyote-update-write-test-{}", process::id()));
     match OpenOptions::new().write(true).create_new(true).open(&probe) {
         Ok(_) => {
             let _ = fs::remove_file(&probe);
@@ -83,24 +83,24 @@ pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
     let target_tag = normalize_version(requested);
 
     let exe_path = env::current_exe()
-        .context("Could not determine the path of the running loki executable")?;
+        .context("Could not determine the path of the running coyote executable")?;
     let resolved = canonicalize(&exe_path).unwrap_or_else(|_| exe_path.clone());
     let source = classify_install_path(&resolved);
 
     if source.is_package_managed() {
         let body = match source {
             InstallSource::Homebrew => format!(
-                "Loki appears to be installed via Homebrew ({}).\n\
+                "Coyote appears to be installed via Homebrew ({}).\n\
                  Updating in place replaces the binary inside Homebrew's Cellar; `brew` will\n\
                  then report a version that no longer matches the file on disk, and a later\n\
                  `brew upgrade`/`brew reinstall` may overwrite it or fail.\n\
-                 The clean way to update is:  brew upgrade loki",
+                 The clean way to update is:  brew upgrade coyote",
                 exe_path.display()
             ),
             InstallSource::Cargo => format!(
-                "Loki appears to be installed via `cargo install` ({}).\n\
+                "Coyote appears to be installed via `cargo install` ({}).\n\
                  Updating in place leaves Cargo's records out of sync with the binary on disk.\n\
-                 The clean way to update is:  cargo install --locked loki-ai",
+                 The clean way to update is:  cargo install --locked coyote-ai",
                 exe_path.display()
             ),
             InstallSource::Manual => unreachable!("Manual installs are not package-managed"),
@@ -130,7 +130,7 @@ pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
     {
         bail!(
             "No write permission for '{}'. Re-run with elevated permissions (e.g. sudo), \
-             or update Loki through your package manager.",
+             or update Coyote through your package manager.",
             parent.display()
         );
     }
@@ -139,8 +139,8 @@ pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
     let mut builder = Update::configure();
     builder
         .repo_owner("Dark-Alex-17")
-        .repo_name("loki")
-        .bin_name("loki")
+        .repo_name("coyote")
+        .bin_name("coyote")
         .current_version(env!("CARGO_PKG_VERSION"))
         .no_confirm(true)
         .show_download_progress(interactive);
@@ -155,10 +155,10 @@ pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
 
     match status {
         Status::UpToDate(version) => {
-            println!("Loki is already up to date (v{version}).");
+            println!("Coyote is already up to date (v{version}).");
         }
         Status::Updated(version) => {
-            println!("Loki updated to v{version}. Restart loki to use the new version.");
+            println!("Coyote updated to v{version}. Restart coyote to use the new version.");
         }
     }
     Ok(())
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn classify_cargo_install() {
         assert_eq!(
-            classify_install_path(&PathBuf::from("/home/u/.cargo/bin/loki")),
+            classify_install_path(&PathBuf::from("/home/u/.cargo/bin/coyote")),
             InstallSource::Cargo
         );
     }
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn classify_homebrew_opt_prefix() {
         assert_eq!(
-            classify_install_path(&PathBuf::from("/opt/homebrew/bin/loki")),
+            classify_install_path(&PathBuf::from("/opt/homebrew/bin/coyote")),
             InstallSource::Homebrew
         );
     }
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn classify_homebrew_cellar() {
         assert_eq!(
-            classify_install_path(&PathBuf::from("/usr/local/Cellar/loki/0.3.0/bin/loki")),
+            classify_install_path(&PathBuf::from("/usr/local/Cellar/coyote/0.3.0/bin/coyote")),
             InstallSource::Homebrew
         );
     }
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn classify_homebrew_linuxbrew() {
         assert_eq!(
-            classify_install_path(&PathBuf::from("/home/linuxbrew/.linuxbrew/bin/loki")),
+            classify_install_path(&PathBuf::from("/home/linuxbrew/.linuxbrew/bin/coyote")),
             InstallSource::Homebrew
         );
     }
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn classify_manual_usr_local_bin() {
         assert_eq!(
-            classify_install_path(&PathBuf::from("/usr/local/bin/loki")),
+            classify_install_path(&PathBuf::from("/usr/local/bin/coyote")),
             InstallSource::Manual
         );
     }
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn classify_manual_local_bin() {
         assert_eq!(
-            classify_install_path(&PathBuf::from("/home/u/.local/bin/loki")),
+            classify_install_path(&PathBuf::from("/home/u/.local/bin/coyote")),
             InstallSource::Manual
         );
     }

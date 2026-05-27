@@ -85,7 +85,7 @@ async fn prepare_chat_completions(
         let ready = oauth::prepare_oauth_access_token(client, &provider, self_.name()).await?;
         if !ready {
             bail!(
-                "OAuth configured but no tokens found for '{}'. Run: 'loki --authenticate {}' or '.authenticate' in the REPL",
+                "OAuth configured but no tokens found for '{}'. Run: 'coyote --authenticate {}' or '.authenticate' in the REPL",
                 self_.name(),
                 self_.name()
             );
@@ -100,7 +100,7 @@ async fn prepare_chat_completions(
         request_data.header("x-api-key", api_key);
     } else {
         bail!(
-            "No authentication configured for '{}'. Set `api_key` or use `auth: oauth` with `loki --authenticate {}`.",
+            "No authentication configured for '{}'. Set `api_key` or use `auth: oauth` with `coyote --authenticate {}`.",
             self_.name(),
             self_.name()
         );

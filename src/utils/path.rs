@@ -366,7 +366,7 @@ mod tests {
         assert!(is_valid_extension(Some(&md_ext), Path::new("Agents.md")));
         assert!(is_valid_extension(
             Some(&md_ext),
-            Path::new("/home/atusa/code/loki.wiki/Agents.md")
+            Path::new("/home/atusa/code/coyote.wiki/Agents.md")
         ));
         assert!(!is_valid_extension(Some(&md_ext), Path::new("notes.txt")));
         assert!(!is_valid_extension(Some(&md_ext), Path::new("README")));

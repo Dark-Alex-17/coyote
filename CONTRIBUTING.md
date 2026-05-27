@@ -2,7 +2,7 @@
 Contributors are very welcome! **No contribution is too small and all contributions are valued.**
 
 ## Rust
-You'll need to have the stable Rust toolchain installed in order to develop Loki.
+You'll need to have the stable Rust toolchain installed in order to develop Coyote.
 
 The Rust toolchain (stable) can be installed via rustup using the following command:
 
@@ -84,5 +84,5 @@ Claude, etc.) is not permitted unless explicitly disclosed and approved.
 Submissions must certify that the contributor understands and can maintain the code they submit.
 
 ## Questions? Reach out to me!
-If you encounter any questions while developing Loki, please don't hesitate to reach out to me at 
+If you encounter any questions while developing Coyote, please don't hesitate to reach out to me at 
 alex.j.tusa@gmail.com. I'm happy to help contributors in any way I can, regardless of if they're new or experienced!

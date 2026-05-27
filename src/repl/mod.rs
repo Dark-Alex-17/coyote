@@ -215,7 +215,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 42]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".vault",
-            "View or modify the Loki vault",
+            "View or modify the Coyote vault",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -225,7 +225,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 42]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".update",
-            "Update Loki to the latest release (or a specified version)",
+            "Update Coyote to the latest release (or a specified version)",
             AssertState::pass(),
         ),
         ReplCommand::new(".exit", "Exit REPL", AssertState::pass()),

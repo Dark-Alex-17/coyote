@@ -16,7 +16,7 @@ prompt: null                          # A custom prompt to use for this role tha
 # The auto-continue system provides built-in task tracking for improved reliability.
 # When enabled, the model can create todo lists and the system will automatically
 # prompt it to continue when incomplete tasks remain.
-# See the [Todo System documentation](https://github.com/Dark-Alex-17/loki/wiki/TODO-System) for more information
+# See the [Todo System documentation](https://github.com/Dark-Alex-17/coyote/wiki/TODO-System) for more information
 auto_continue: false                  # Enable automatic continuation when incomplete todos remain (default: false)
 max_auto_continues: 10                # Maximum number of automatic continuations before stopping (default: 10)
 inject_todo_instructions: true        # Inject default todo tool usage instructions into the system prompt (default: true)

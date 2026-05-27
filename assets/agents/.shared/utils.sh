@@ -7,14 +7,14 @@ set -euo pipefail
 #######################
 
 # Cache file name for detected project info
-_LOKI_PROJECT_CACHE=".loki-project.json"
+_COYOTE_PROJECT_CACHE=".coyote-project.json"
 
 # Read cached project detection if valid
 # Usage: _read_project_cache "/path/to/project"
 # Returns: cached JSON on stdout (exit 0) or nothing (exit 1)
 _read_project_cache() {
   local dir="$1"
-  local cache_file="${dir}/${_LOKI_PROJECT_CACHE}"
+  local cache_file="${dir}/${_COYOTE_PROJECT_CACHE}"
 
   if [[ -f "${cache_file}" ]]; then
     local cached
@@ -32,7 +32,7 @@ _read_project_cache() {
 _write_project_cache() {
   local dir="$1"
   local json="$2"
-  local cache_file="${dir}/${_LOKI_PROJECT_CACHE}"
+  local cache_file="${dir}/${_COYOTE_PROJECT_CACHE}"
 
   echo "${json}" > "${cache_file}" 2>/dev/null || true
 }
@@ -238,7 +238,7 @@ _detect_with_llm() {
 	)
 
   local llm_response
-  llm_response=$(loki --no-stream "${prompt}" 2>/dev/null) || return 1
+  llm_response=$(coyote --no-stream "${prompt}" 2>/dev/null) || return 1
 
   llm_response=$(echo "${llm_response}" | sed 's/^```json//;s/^```//;s/```$//' | tr -d '\n' | sed 's/^[[:space:]]*//')
   llm_response=$(echo "${llm_response}" | grep -o '{[^}]*}' | head -1)

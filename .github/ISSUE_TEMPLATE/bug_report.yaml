@@ -21,25 +21,25 @@ body:
       value: |
         I tried this:
 
-        1. `loki`
+        1. `coyote`
 
         I expected this to happen:
 
         Instead, this happened:
   - type: textarea
-    id: loki-log
+    id: coyote-log
     attributes:
-      label: Loki log
-      description: Include the Loki log file to help diagnose the issue. (`loki --info` to see the log_path)
+      label: Coyote log
+      description: Include the Coyote log file to help diagnose the issue. (`coyote --info` to see the log_path)
       value: |
         | OS      | Log file location                                     |
         | ------- | ----------------------------------------------------- |
-        | Linux   | `~/.cache/loki/loki.log`                      |
-        | Mac     | `~/Library/Logs/loki/loki.log`                |
-        | Windows | `C:\Users\<User>\AppData\Local\loki\loki.log` |
+        | Linux   | `~/.cache/coyote/coyote.log`                      |
+        | Mac     | `~/Library/Logs/coyote/coyote.log`                |
+        | Windows | `C:\Users\<User>\AppData\Local\coyote\coyote.log` |
 
         ```
-        please provide a copy of your loki log file here if possible; you may need to redact some of the lines
+        please provide a copy of your coyote log file here if possible; you may need to redact some of the lines
         ```
 
   - type: input
@@ -57,13 +57,13 @@ body:
     validations:
       required: true
   - type: input
-    id: loki-version
+    id: coyote-version
     attributes:
-      label: Loki Version
+      label: Coyote Version
       description: >
-        Loki version (`loki --version` if using a release, `git describe` if building
+        Coyote version (`coyote --version` if using a release, `git describe` if building
         from main).
-        **Make sure that you are using the [latest loki release](https://github.com/Dark-Alex-17/loki/releases) or a newer main build**
-      placeholder: "loki 0.1.0"
+        **Make sure that you are using the [latest coyote release](https://github.com/Dark-Alex-17/coyote/releases) or a newer main build**
+      placeholder: "coyote 0.1.0"
     validations:
       required: true

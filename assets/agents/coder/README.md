@@ -4,7 +4,7 @@ A graph-based implementation agent. Plans, implements, and runs build +
 tests in a bounded fix-loop until verified. Designed to be delegated to by
 the **[Sisyphus](../sisyphus/README.md)** agent.
 
-Coder is a [graph agent](https://github.com/Dark-Alex-17/loki/wiki/Graph-Agents): its workflow is
+Coder is a [graph agent](https://github.com/Dark-Alex-17/coyote/wiki/Graph-Agents): its workflow is
 defined declaratively in `graph.yaml`, with verification and the
 implement-fix loop enforced as graph edges rather than prose.
 
@@ -42,10 +42,10 @@ so it accepts the runtime override flag:
 ```sh
 # Invoke from inside the project (project_dir defaults to ".")
 cd /path/to/your/project
-loki -a coder "Add a foo() function..."
+coyote -a coder "Add a foo() function..."
 
 # Or invoke from anywhere with an explicit override
-loki -a coder --agent-variable project_dir /path/to/your/project "Add..."
+coyote -a coder --agent-variable project_dir /path/to/your/project "Add..."
 ```
 
 `graph.yaml` `initial_state` exposes:

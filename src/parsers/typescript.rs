@@ -425,7 +425,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("loki_ts_parser_{file_name}_{unique}.ts"));
+        let path = std::env::temp_dir().join(format!("coyote_ts_parser_{file_name}_{unique}.ts"));
         fs::write(&path, source).expect("write");
         let file = File::open(&path).expect("open");
         let result = generate_typescript_declarations(file, file_name, Some(parent));

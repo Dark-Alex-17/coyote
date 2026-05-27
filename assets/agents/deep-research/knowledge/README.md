@@ -5,7 +5,7 @@ hybrid (vector + keyword) retrieval over every file in this directory.
 Drop your own notes, papers (PDFs), Markdown docs, or text files here
 and they will be indexed into a per-agent knowledge base on first run.
 
-Loki supports common file types out of the box: `.md`, `.txt`, `.pdf`,
+Coyote supports common file types out of the box: `.md`, `.txt`, `.pdf`,
 `.html`, and others. Subdirectories are walked recursively.
 
 A small starter file (`research-style-notes.md`) ships so the RAG
@@ -17,7 +17,7 @@ To force the knowledge base to rebuild after you add or change files,
 delete the cached index:
 
 ```sh
-rm ~/.config/loki/agents/deep-research/knowledge_lookup.yaml
+rm ~/.config/coyote/agents/deep-research/knowledge_lookup.yaml
 ```
 
 The next run will rebuild from the current contents of this directory.

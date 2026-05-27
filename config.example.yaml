@@ -18,31 +18,31 @@ agent_session: null              # Set a session to use when starting an agent (
 
 # ---- Appearance ----
 highlight: true                  # Controls syntax highlighting
-light_theme: false               # Activates a light color theme when true. env: LOKI_LIGHT_THEME
+light_theme: false               # Activates a light color theme when true. env: COYOTE_LIGHT_THEME
 
 # ---- Miscellaneous ----
-user_agent: null                 # Set User-Agent HTTP header, use `auto` for loki/<current-version>
+user_agent: null                 # Set User-Agent HTTP header, use `auto` for coyote/<current-version>
 save_shell_history: true         # Whether to save shell execution command to the history file
 sync_models_url: >               # URL to sync model changes from
-  https://raw.githubusercontent.com/Dark-Alex-17/loki/refs/heads/main/models.yaml
+  https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/models.yaml
 
 # ---- REPL Prompt ----
-# Custom REPL left/right prompts; see the [REPL Prompt Documentation](https://github.com/Dark-Alex-17/loki/wiki/REPL-Prompt) for more information
+# Custom REPL left/right prompts; see the [REPL Prompt Documentation](https://github.com/Dark-Alex-17/coyote/wiki/REPL-Prompt) for more information
 left_prompt:
   '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
 right_prompt:
   '{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
 
 # ---- Vault ----
-# See the [Vault documentation](https://github.com/Dark-Alex-17/loki/wiki/Vault) for more information on the Loki vault
-vault_password_file: null        # Path to a file containing the password for the Loki vault (cannot be a secret template)
+# See the [Vault documentation](https://github.com/Dark-Alex-17/coyote/wiki/Vault) for more information on the Coyote vault
+vault_password_file: null        # Path to a file containing the password for the Coyote vault (cannot be a secret template)
 
 # ---- Function Calling ----
-# See the [Tools documentation](https://github.com/Dark-Alex-17/loki/wiki/Tools) for more details
+# See the [Tools documentation](https://github.com/Dark-Alex-17/coyote/wiki/Tools) for more details
 function_calling: true           # Enables or disables function calling (Globally).
 mapping_tools:                   # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write,fs_read,fs_glob,fs_grep'
-enabled_tools: null              # Which tools to enable by default. (e.g. 'fs,web_search_loki')
+enabled_tools: null              # Which tools to enable by default. (e.g. 'fs,web_search_coyote')
 visible_tools:                   # Which tools are visible to be compiled (and are thus able to be defined in 'enabled_tools')
 #  - demo_py.py
 #  - demo_sh.sh
@@ -69,12 +69,12 @@ visible_tools:                   # Which tools are visible to be compiled (and a
 #  - search_wolframalpha.sh
 #  - send_mail.sh
 #  - send_twilio.sh
-#  - web_search_loki.sh
+#  - web_search_coyote.sh
 #  - web_search_perplexity.sh
 #  - web_search_tavily.sh
 
 # ---- MCP Servers ----
-# See the [MCP Servers documentation](https://github.com/Dark-Alex-17/loki/wiki/MCP-Servers) for more details
+# See the [MCP Servers documentation](https://github.com/Dark-Alex-17/coyote/wiki/MCP-Servers) for more details
 mcp_server_support: true         # Enables or disables MCP servers (globally).
 mapping_mcp_servers:             # Alias for an MCP server or set of servers
   git: github,gitmcp
@@ -84,14 +84,14 @@ enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 
 # The auto-continue system provides built-in task tracking for improved reliability.
 # When enabled, the model can create todo lists and the system will automatically
 # prompt it to continue when incomplete tasks remain.
-# See the [Todo System documentation](https://github.com/Dark-Alex-17/loki/wiki/TODO-System) for more information
+# See the [Todo System documentation](https://github.com/Dark-Alex-17/coyote/wiki/TODO-System) for more information
 auto_continue: false              # Enable automatic continuation when incomplete todos remain (default: false)
 max_auto_continues: 10            # Maximum number of automatic continuations before stopping (default: 10)
 inject_todo_instructions: true    # Inject default todo usage instructions into the system prompt (default: true)
 continuation_prompt: null         # Custom prompt used when auto-continuing. If null, uses built-in default
 
 # ---- Session ----
-# See the [Session documentation](https://github.com/Dark-Alex-17/loki/wiki/Sessions) for more information
+# See the [Session documentation](https://github.com/Dark-Alex-17/coyote/wiki/Sessions) for more information
 save_session: null               # Controls the persistence of the session. If true, auto save; if false, don't auto-save save; if null, ask the user what to do
 compression_threshold: 4000      # Compress the session when the token count reaches or exceeds this threshold
 summarization_prompt: >          # The text prompt used for creating a concise summary of session message
@@ -100,9 +100,9 @@ summary_context_prompt: >        # The text prompt used for including the summar
   'This is a summary of the chat history as a recap: '
 
 # ---- RAG ----
-# See the [RAG Docs](https://github.com/Dark-Alex-17/loki/wiki/RAG) for more details.
+# See the [RAG Docs](https://github.com/Dark-Alex-17/coyote/wiki/RAG) for more details.
 rag_embedding_model: null        # Specifies the embedding model used for context retrieval
-rag_reranker_model: null         # Specifies the reranker model used for sorting retrieved documents; Loki uses Reciprocal Rank Fusion by default
+rag_reranker_model: null         # Specifies the reranker model used for sorting retrieved documents; Coyote uses Reciprocal Rank Fusion by default
 rag_top_k: 5                     # Specifies the number of documents to retrieve for answering queries
 rag_chunk_size: null             # Defines the size of chunks for document processing in characters
 rag_chunk_overlap: null          # Defines the overlap between chunks
@@ -141,12 +141,12 @@ document_loaders:
   docx: 'pandoc --to plain $1'                                                          # Use pandoc to convert a .docx file to text
   # (see https://pandoc.org for details on how to install pandoc)
   jina: 'curl -fsSL https://r.jina.ai/$1 -H "Authorization: Bearer {{JINA_API_KEY}}'    # Use Jina to translate a website into text;
-  # Requires a Jina API key to be added to the Loki vault
+  # Requires a Jina API key to be added to the Coyote vault
   git: >                                                                                # Use yek to load a git repository into the knowledgebase (https://github.com/bodo-run/yek)
     sh -c "yek $1 --json | jq 'map({ path: .filename, contents: .content })'"
 
 # ---- Clients ----
-# See the [Clients documentation](https://github.com/Dark-Alex-17/loki/wiki/Clients) for more details
+# See the [Clients documentation](https://github.com/Dark-Alex-17/coyote/wiki/Clients) for more details
 clients:
   # All clients have the following configuration:
   # - type: xxxx
@@ -177,14 +177,14 @@ clients:
   # See https://platform.openai.com/docs/quickstart
   - type: openai
     api_base: https://api.openai.com/v1               # Optional
-    api_key: '{{OPENAI_API_KEY}}'                     # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{OPENAI_API_KEY}}'                     # You can either hard-code or inject secrets from the Coyote vault
     organization_id: org-xxx                          # Optional
 
   # For any platform compatible with OpenAI's API
   - type: openai-compatible
     name: ollama
     api_base: http://localhost:11434/v1
-    api_key: '{{OLLAMA_API_KEY}}'                     # Optional; You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{OLLAMA_API_KEY}}'                     # Optional; You can either hard-code or inject secrets from the Coyote vault
     models:
       - name: deepseek-r1
         max_input_tokens: 131072
@@ -202,9 +202,9 @@ clients:
   # See https://ai.google.dev/docs
   - type: gemini
     api_base: https://generativelanguage.googleapis.com/v1beta
-    api_key: '{{GEMINI_API_KEY}}'                       # You can either hard-code or inject secrets from the Loki vault
-    auth: null                                          # When set to 'oauth', Loki will use OAuth instead of an API key
-                                                        # Authenticate with `loki --authenticate` or `.authenticate` in the REPL
+    api_key: '{{GEMINI_API_KEY}}'                       # You can either hard-code or inject secrets from the Coyote vault
+    auth: null                                          # When set to 'oauth', Coyote will use OAuth instead of an API key
+                                                        # Authenticate with `coyote --authenticate` or `.authenticate` in the REPL
     patch:
       chat_completions:
         '.*':
@@ -222,49 +222,49 @@ clients:
   # See https://docs.anthropic.com/claude/reference/getting-started-with-the-api
   - type: claude
     api_base: https://api.anthropic.com/v1              # Optional
-    api_key: '{{ANTHROPIC_API_KEY}}'                    # You can either hard-code or inject secrets from the Loki vault
-    auth: null                                          # When set to 'oauth', Loki will use OAuth instead of an API key
-                                                        # Authenticate with `loki --authenticate` or `.authenticate` in the REPL
+    api_key: '{{ANTHROPIC_API_KEY}}'                    # You can either hard-code or inject secrets from the Coyote vault
+    auth: null                                          # When set to 'oauth', Coyote will use OAuth instead of an API key
+                                                        # Authenticate with `coyote --authenticate` or `.authenticate` in the REPL
 
   # See https://docs.mistral.ai/
   - type: openai-compatible
     name: mistral
     api_base: https://api.mistral.ai/v1
-    api_key: '{{MISTRAL_API_KEY}}'                      # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{MISTRAL_API_KEY}}'                      # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://docs.x.ai/docs
   - type: openai-compatible
     name: xai
     api_base: https://api.x.ai/v1
-    api_key: '{{XAI_API_KEY}}'                          # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{XAI_API_KEY}}'                          # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://docs.ai21.com/docs/overview
   - type: openai-compatible
     name: ai12
     api_base: https://api.ai21.com/studio/v1
-    api_key: '{{AI21_API_KEY}}'                         # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{AI21_API_KEY}}'                         # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://docs.cohere.com/docs/the-cohere-platform
   - type: cohere
     api_base: https://api.cohere.ai/v2                  # Optional
-    api_key: '{{COHERE_API_KEY}}'                       # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{COHERE_API_KEY}}'                       # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://docs.perplexity.ai/getting-started/overview
   - type: openai-compatible
     name: perplexity
     api_base: https://api.perplexity.ai
-    api_key: '{{PERPLEXITY_API_KEY}}'                   # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{PERPLEXITY_API_KEY}}'                   # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://console.groq.com/docs/quickstart
   - type: openai-compatible
     name: groq
     api_base: https://api.groq.com/openai/v1
-    api_key: '{{GROQ_API_KEY}}'                         # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{GROQ_API_KEY}}'                         # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://learn.microsoft.com/en-us/azure/ai-services/openai/chatgpt-quickstart
   - type: azure-openai
     api_base: https://{RESOURCE}.openai.azure.com
-    api_key: '{{AZURE_OPENAI_API_KEY}}'                 # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{AZURE_OPENAI_API_KEY}}'                 # You can either hard-code or inject secrets from the Coyote vault
     models:
       - name: gpt-4o                                    # Model deployment name
         max_input_tokens: 128000
@@ -295,8 +295,8 @@ clients:
 
   # See https://docs.aws.amazon.com/bedrock/latest/userguide/
   - type: bedrock
-    access_key_id: '{{AWS_ACCESS_KEY_ID}}'              # You can either hard-code or inject secrets from the Loki vault
-    secret_access_key: '{{AWS_SECRET_ACCESS_KEY}}'      # You can either hard-code or inject secrets from the Loki vault
+    access_key_id: '{{AWS_ACCESS_KEY_ID}}'              # You can either hard-code or inject secrets from the Coyote vault
+    secret_access_key: '{{AWS_SECRET_ACCESS_KEY}}'      # You can either hard-code or inject secrets from the Coyote vault
     region: xxx
     session_token: xxx                                  # Optional, only needed for temporary credentials
 
@@ -304,67 +304,67 @@ clients:
   - type: openai-compatible
     name: cloudflare
     api_base: https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1
-    api_key: '{{CLOUDFLARE_API_KEY}}'                    # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{CLOUDFLARE_API_KEY}}'                    # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://cloud.baidu.com/doc/WENXINWORKSHOP/index.html
   - type: openai-compatible
     name: ernie
     api_base: https://qianfan.baidubce.com/v2
-    api_key: '{{BAIDU_API_KEY}}'                        # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{BAIDU_API_KEY}}'                        # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://dashscope.aliyun.com/
   - type: openai-compatible
     name: qianwen
     api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
-    api_key: '{{ALIYUN_API_KEY}}'                       # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{ALIYUN_API_KEY}}'                       # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://cloud.tencent.com/product/hunyuan
   - type: openai-compatible
     name: hunyuan
     api_base: https://api.hunyuan.cloud.tencent.com/v1
-    api_key: '{{TENCENT_API_KEY}}'                      # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{TENCENT_API_KEY}}'                      # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://platform.moonshot.cn/docs/intro
   - type: openai-compatible
     name: moonshot
     api_base: https://api.moonshot.cn/v1
-    api_key: '{{MOONSHOT_API_KEY}}'                     # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{MOONSHOT_API_KEY}}'                     # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://platform.deepseek.com/api-docs/
   - type: openai-compatible
     name: deepseek
     api_base: https://api.deepseek.com
-    api_key: '{{DEEPSEEK_API_KEY}}'                     # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{DEEPSEEK_API_KEY}}'                     # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://open.bigmodel.cn/dev/howuse/introduction
   - type: openai-compatible
     name: zhipuai
     api_base: https://open.bigmodel.cn/api/paas/v4
-    api_key: '{{ZHIPUAI_API_KEY}}'                      # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{ZHIPUAI_API_KEY}}'                      # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://platform.minimaxi.com/document/Fast%20access
   - type: openai-compatible
     name: minimax
     api_base: https://api.minimax.chat/v1
-    api_key: '{{MINIMAX_API_KEY}}'                      # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{MINIMAX_API_KEY}}'                      # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://openrouter.ai/docs#quick-start
   - type: openai-compatible
     name: openrouter
     api_base: https://openrouter.ai/api/v1
-    api_key: '{{OPENROUTER_API_KEY}}'                   # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{OPENROUTER_API_KEY}}'                   # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://github.com/marketplace/models
   - type: openai-compatible
     name: github
     api_base: https://models.inference.ai.azure.com
-    api_key: '{{GITHUB_API_KEY}}'                       # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{GITHUB_API_KEY}}'                       # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://deepinfra.com/docs
   - type: openai-compatible
     name: deepinfra
     api_base: https://api.deepinfra.com/v1/openai
-    api_key: '{{DEEPINFRA_API_KEY}}'                    # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{DEEPINFRA_API_KEY}}'                    # You can either hard-code or inject secrets from the Coyote vault
 
 
   # ----- RAG dedicated -----
@@ -373,10 +373,10 @@ clients:
   - type: openai-compatible
     name: jina
     api_base: https://api.jina.ai/v1
-    api_key: '{{JINA_API_KEY}}'                         # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{JINA_API_KEY}}'                         # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://docs.voyageai.com/docs/introduction
   - type: openai-compatible
     name: voyageai
     api_base: https://api.voyageai.com/v1
-    api_key: '{{VOYAGEAI_API_KEY}}'                     # You can either hard-code or inject secrets from the Loki vault
+    api_key: '{{VOYAGEAI_API_KEY}}'                     # You can either hard-code or inject secrets from the Coyote vault

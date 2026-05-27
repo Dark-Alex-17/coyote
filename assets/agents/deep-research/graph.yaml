@@ -9,7 +9,7 @@ description: |
   approval. A reviewer's free-form feedback at the approval step feeds
   back into another research pass.
 
-  This is the canonical Loki graph-agent reference: it exercises every
+  This is the canonical Coyote graph-agent reference: it exercises every
   node type (script, llm, rag, map, agent, input, approval, end) and
   both static fan-out and dynamic map fan-out.
 
@@ -18,7 +18,7 @@ version: "1.0"
 temperature: 0.0
 
 global_tools:
-  - web_search_loki.sh
+  - web_search_coyote.sh
   - fetch_url_via_curl.sh
   - search_arxiv.sh
 
@@ -147,7 +147,7 @@ nodes:
 
       {{research_feedback}}
     tools:
-      - web_search_loki
+      - web_search_coyote
       - fetch_url_via_curl
       - search_arxiv
       - mcp:ddg-search

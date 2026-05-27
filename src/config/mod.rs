@@ -104,13 +104,13 @@ const DEFAULT_VISIBLE_TOOLS: [&str; 18] = [
     "get_current_weather.sh",
     "search_wikipedia.sh",
     "search_arxiv.sh",
-    "web_search_loki.sh",
+    "web_search_coyote.sh",
 ];
 
 const CLIENTS_FIELD: &str = "clients";
 
 const SYNC_MODELS_URL: &str =
-    "https://raw.githubusercontent.com/Dark-Alex-17/loki/refs/heads/main/models.yaml";
+    "https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/models.yaml";
 
 const SUMMARIZATION_PROMPT: &str =
     "Summarize the discussion briefly in 200 words or less to use as a prompt for future context.";
@@ -625,7 +625,7 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
 
     let config_data = serde_yaml::to_string(&config).with_context(|| "Failed to create config")?;
     let config_data = format!(
-        "# see https://github.com/Dark-Alex-17/loki/blob/main/config.example.yaml\n\n{config_data}"
+        "# see https://github.com/Dark-Alex-17/coyote/blob/main/config.example.yaml\n\n{config_data}"
     );
 
     ensure_parent_exists(config_path)?;

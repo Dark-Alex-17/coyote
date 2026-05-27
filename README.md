@@ -1,54 +1,54 @@
-# Loki: All-in-one, batteries-included LLM CLI Tool
+# Coyote: All-in-one, batteries-included LLM CLI Tool
 
-![Test](https://github.com/Dark-Alex-17/loki/actions/workflows/ci.yaml/badge.svg)
-[![crates.io link](https://img.shields.io/crates/v/loki-ai.svg)](https://crates.io/crates/loki-ai)
-![Release](https://img.shields.io/github/v/release/Dark-Alex-17/loki?color=%23c694ff)
-![Crate.io downloads](https://img.shields.io/crates/d/loki-ai?label=Crate%20downloads)
-[![GitHub Downloads](https://img.shields.io/github/downloads/Dark-Alex-17/loki/total.svg?label=GitHub%20downloads)](https://github.com/Dark-Alex-17/loki/releases)
+![Test](https://github.com/Dark-Alex-17/coyote/actions/workflows/ci.yaml/badge.svg)
+[![crates.io link](https://img.shields.io/crates/v/coyote-ai.svg)](https://crates.io/crates/coyote-ai)
+![Release](https://img.shields.io/github/v/release/Dark-Alex-17/coyote?color=%23c694ff)
+![Crate.io downloads](https://img.shields.io/crates/d/coyote-ai?label=Crate%20downloads)
+[![GitHub Downloads](https://img.shields.io/github/downloads/Dark-Alex-17/coyote/total.svg?label=GitHub%20downloads)](https://github.com/Dark-Alex-17/coyote/releases)
 
-Loki is an all-in-one, batteries-included, LLM CLI tool featuring Shell Assistant, CLI & REPL Mode, RAG, AI Tools & 
+Coyote is an all-in-one, batteries-included, LLM CLI tool featuring Shell Assistant, CLI & REPL Mode, RAG, AI Tools & 
 Agents, and More.
 
-It is designed to include a number of useful agents, roles, macros, and more so users can get up and running with Loki 
+It is designed to include a number of useful agents, roles, macros, and more so users can get up and running with Coyote 
 in as little time as possible. You can also install entire bundles of agents, roles, macros, tools, and MCP servers from 
-any git repository. See [Sharing Configurations](https://github.com/Dark-Alex-17/loki/wiki/Sharing-Configurations) for more information.
+any git repository. See [Sharing Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Sharing-Configurations) for more information.
 
-![Agent example](https://raw.githubusercontent.com/wiki/Dark-Alex-17/loki/images/agents/sql.gif)
+![Agent example](https://raw.githubusercontent.com/wiki/Dark-Alex-17/coyote/images/agents/sql.gif)
 
-Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration guide](https://github.com/Dark-Alex-17/loki/wiki/AIChat-Migration) to get started.
+Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration guide](https://github.com/Dark-Alex-17/coyote/wiki/AIChat-Migration) to get started.
 
 ## Quick Links
-* [AIChat Migration Guide](https://github.com/Dark-Alex-17/loki/wiki/AIChat-Migration): Coming from AIChat? Follow the migration guide to get started.
-* [Installation](#install): Install Loki
-* [Getting Started](#getting-started): Get started with Loki by doing first-run setup steps.
-* [Sharing Configurations](https://github.com/Dark-Alex-17/loki/wiki/Sharing-Configurations): Install bundles of agents, roles, macros, tools, and MCP servers from any git repo, and share your own.
-* [REPL](https://github.com/Dark-Alex-17/loki/wiki/REPL): Interactive Read-Eval-Print Loop for conversational interactions with LLMs and Loki.
-  * [Custom REPL Prompt](https://github.com/Dark-Alex-17/loki/wiki/REPL-Prompt): Customize the REPL prompt to provide useful contextual information.
-* [Vault](https://github.com/Dark-Alex-17/loki/wiki/Vault): Securely store and manage sensitive information such as API keys and credentials.
-* [Shell Integrations](https://github.com/Dark-Alex-17/loki/wiki/Shell-Integrations): Seamlessly integrate Loki with your shell environment for enhanced command-line assistance.
-* [Function Calling](https://github.com/Dark-Alex-17/loki/wiki/Tools): Leverage function calling capabilities to extend Loki's functionality with custom tools
-    * [Creating Custom Tools](https://github.com/Dark-Alex-17/loki/wiki/Custom-Tools): You can create your own custom tools to enhance Loki's capabilities.
-        * [Create Custom Python Tools](https://github.com/Dark-Alex-17/loki/wiki/Custom-Tools#custom-python-based-tools)
-        * [Create Custom TypeScript Tools](https://github.com/Dark-Alex-17/loki/wiki/Custom-Tools#custom-typescript-based-tools)
-        * [Create Custom Bash Tools](https://github.com/Dark-Alex-17/loki/wiki/Custom-Bash-Tools)
-            * [Bash Prompt Utilities](https://github.com/Dark-Alex-17/loki/wiki/Bash-Prompt-Helpers)
-* [First-Class MCP Server Support](https://github.com/Dark-Alex-17/loki/wiki/MCP-Servers): Easily connect and interact with MCP servers for advanced functionality.
-* [Macros](https://github.com/Dark-Alex-17/loki/wiki/Macros): Automate repetitive tasks and workflows with Loki "scripts" (macros).
-* [RAG](https://github.com/Dark-Alex-17/loki/wiki/RAG): Retrieval-Augmented Generation for enhanced information retrieval and generation.
-* [Sessions](https://github.com/Dark-Alex-17/loki/wiki/Sessions): Manage and persist conversational contexts and settings across multiple interactions.
-* [Roles](https://github.com/Dark-Alex-17/loki/wiki/Roles): Customize model behavior for specific tasks or domains.
-* [Agents](https://github.com/Dark-Alex-17/loki/wiki/Agents): Leverage AI agents to perform complex tasks and workflows, including sub-agent spawning, teammate messaging, and user interaction tools.
-    * [Graph Agents](https://github.com/Dark-Alex-17/loki/wiki/Graph-Agents): Define an agent as a declarative, YAML-driven workflow. A directed graph of typed nodes (LLM calls, scripts, approvals, user input, RAG retrieval, sub-agent spawns).
-* [Todo System](https://github.com/Dark-Alex-17/loki/wiki/TODO-System): Built-in task tracking for improved LLM reliability with smaller models.
-* [Environment Variables](https://github.com/Dark-Alex-17/loki/wiki/Environment-Variables): Override and customize your Loki configuration at runtime with environment variables.
-* [Client Configurations](https://github.com/Dark-Alex-17/loki/wiki/Clients): Configuration instructions for various LLM providers.
-    * [Authentication (API Key & OAuth)](https://github.com/Dark-Alex-17/loki/wiki/Clients#authentication): Authenticate with API keys or OAuth for subscription-based access.
-    * [Patching API Requests](https://github.com/Dark-Alex-17/loki/wiki/Patches): Learn how to patch API requests for advanced customization.
-* [Custom Themes](https://github.com/Dark-Alex-17/loki/wiki/Themes): Change the look and feel of Loki to your preferences with custom themes.
-* [History](#history): A history of how Loki came to be.
+* [AIChat Migration Guide](https://github.com/Dark-Alex-17/coyote/wiki/AIChat-Migration): Coming from AIChat? Follow the migration guide to get started.
+* [Installation](#install): Install Coyote
+* [Getting Started](#getting-started): Get started with Coyote by doing first-run setup steps.
+* [Sharing Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Sharing-Configurations): Install bundles of agents, roles, macros, tools, and MCP servers from any git repo, and share your own.
+* [REPL](https://github.com/Dark-Alex-17/coyote/wiki/REPL): Interactive Read-Eval-Print Loop for conversational interactions with LLMs and Coyote.
+  * [Custom REPL Prompt](https://github.com/Dark-Alex-17/coyote/wiki/REPL-Prompt): Customize the REPL prompt to provide useful contextual information.
+* [Vault](https://github.com/Dark-Alex-17/coyote/wiki/Vault): Securely store and manage sensitive information such as API keys and credentials.
+* [Shell Integrations](https://github.com/Dark-Alex-17/coyote/wiki/Shell-Integrations): Seamlessly integrate Coyote with your shell environment for enhanced command-line assistance.
+* [Function Calling](https://github.com/Dark-Alex-17/coyote/wiki/Tools): Leverage function calling capabilities to extend Coyote's functionality with custom tools
+    * [Creating Custom Tools](https://github.com/Dark-Alex-17/coyote/wiki/Custom-Tools): You can create your own custom tools to enhance Coyote's capabilities.
+        * [Create Custom Python Tools](https://github.com/Dark-Alex-17/coyote/wiki/Custom-Tools#custom-python-based-tools)
+        * [Create Custom TypeScript Tools](https://github.com/Dark-Alex-17/coyote/wiki/Custom-Tools#custom-typescript-based-tools)
+        * [Create Custom Bash Tools](https://github.com/Dark-Alex-17/coyote/wiki/Custom-Bash-Tools)
+            * [Bash Prompt Utilities](https://github.com/Dark-Alex-17/coyote/wiki/Bash-Prompt-Helpers)
+* [First-Class MCP Server Support](https://github.com/Dark-Alex-17/coyote/wiki/MCP-Servers): Easily connect and interact with MCP servers for advanced functionality.
+* [Macros](https://github.com/Dark-Alex-17/coyote/wiki/Macros): Automate repetitive tasks and workflows with Coyote "scripts" (macros).
+* [RAG](https://github.com/Dark-Alex-17/coyote/wiki/RAG): Retrieval-Augmented Generation for enhanced information retrieval and generation.
+* [Sessions](https://github.com/Dark-Alex-17/coyote/wiki/Sessions): Manage and persist conversational contexts and settings across multiple interactions.
+* [Roles](https://github.com/Dark-Alex-17/coyote/wiki/Roles): Customize model behavior for specific tasks or domains.
+* [Agents](https://github.com/Dark-Alex-17/coyote/wiki/Agents): Leverage AI agents to perform complex tasks and workflows, including sub-agent spawning, teammate messaging, and user interaction tools.
+    * [Graph Agents](https://github.com/Dark-Alex-17/coyote/wiki/Graph-Agents): Define an agent as a declarative, YAML-driven workflow. A directed graph of typed nodes (LLM calls, scripts, approvals, user input, RAG retrieval, sub-agent spawns).
+* [Todo System](https://github.com/Dark-Alex-17/coyote/wiki/TODO-System): Built-in task tracking for improved LLM reliability with smaller models.
+* [Environment Variables](https://github.com/Dark-Alex-17/coyote/wiki/Environment-Variables): Override and customize your Coyote configuration at runtime with environment variables.
+* [Client Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Clients): Configuration instructions for various LLM providers.
+    * [Authentication (API Key & OAuth)](https://github.com/Dark-Alex-17/coyote/wiki/Clients#authentication): Authenticate with API keys or OAuth for subscription-based access.
+    * [Patching API Requests](https://github.com/Dark-Alex-17/coyote/wiki/Patches): Learn how to patch API requests for advanced customization.
+* [Custom Themes](https://github.com/Dark-Alex-17/coyote/wiki/Themes): Change the look and feel of Coyote to your preferences with custom themes.
+* [History](#history): A history of how Coyote came to be.
 
 ## Prerequisites
-Loki requires the following tools to be installed on your system:
+Coyote requires the following tools to be installed on your system:
 * [jq](https://github.com/jqlang/jq)
     * `brew install jq`
 * [usql](https://github.com/xo/usql) (For the `sql` agent)
@@ -57,57 +57,57 @@ Loki requires the following tools to be installed on your system:
 * [uv](https://docs.astral.sh/uv/getting-started/installation/)
     * `curl -LsSf https://astral.sh/uv/install.sh | sh`
 
-These tools are used to provide various functionalities within Loki, such as document processing, JSON manipulation,
+These tools are used to provide various functionalities within Coyote, such as document processing, JSON manipulation,
 etc., and they are used within agents and tools.
 
 ## Install
 
 ### Cargo
-If you have Cargo installed, then you can install `loki` from Crates.io:
+If you have Cargo installed, then you can install `coyote` from Crates.io:
 
 ```shell
-cargo install loki-ai # Binary name is `loki`
+cargo install coyote-ai # Binary name is `coyote`
 
 # If you encounter issues installing, try installing with '--locked'
-cargo install --locked loki-ai
+cargo install --locked coyote-ai
 ```
 
 ### Homebrew (Mac/Linux)
-To install Loki from Homebrew, install the `loki` tap. Then you'll be able to install `loki`:
+To install Coyote from Homebrew, install the `coyote` tap. Then you'll be able to install `coyote`:
 
 ```shell
-brew tap Dark-Alex-17/loki
-brew install loki
+brew tap Dark-Alex-17/coyote
+brew install coyote
 
 # If you need to be more specific, use:
-brew install Dark-Alex-17/loki/loki
+brew install Dark-Alex-17/coyote/coyote
 ```
 
-To upgrade `loki` using Homebrew:
+To upgrade `coyote` using Homebrew:
 
 ```shell
-brew upgrade loki
+brew upgrade coyote
 ```
 
 ### Scripts
 #### Linux/MacOS (`bash`)
-You can use the following command to run a bash script that downloads and installs the latest version of `loki` for your
+You can use the following command to run a bash script that downloads and installs the latest version of `coyote` for your
 OS (Linux/MacOS) and architecture (x86_64/arm64):
 
 ```shell
-curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/loki/main/install_loki.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/main/install_coyote.sh | bash
 ```
 
 #### Windows/Linux/MacOS (`PowerShell`)
-You can use the following command to run a PowerShell script that downloads and installs the latest version of `loki`
+You can use the following command to run a PowerShell script that downloads and installs the latest version of `coyote`
 for your OS (Windows/Linux/MacOS) and architecture (x86_64/arm64):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/loki/main/scripts/install_loki.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/main/scripts/install_coyote.ps1 | iex"
 ```
 
 ### Manual
-Binaries are available on the [releases](https://github.com/Dark-Alex-17/loki/releases) page for the following platforms:
+Binaries are available on the [releases](https://github.com/Dark-Alex-17/coyote/releases) page for the following platforms:
 
 | Platform       | Architecture(s) |
 |----------------|-----------------|
@@ -118,58 +118,58 @@ Binaries are available on the [releases](https://github.com/Dark-Alex-17/loki/re
 #### Windows Instructions
 To use a binary from the releases page on Windows, do the following:
 
-1. Download the latest [binary](https://github.com/Dark-Alex-17/loki/releases) for your OS.
+1. Download the latest [binary](https://github.com/Dark-Alex-17/coyote/releases) for your OS.
 2. Use 7-Zip or TarTool to unpack the Tar file.
-3. Run the executable `loki.exe`!
+3. Run the executable `coyote.exe`!
 
 #### Linux/MacOS Instructions
 To use a binary from the releases page on Linux/MacOS, do the following:
 
-1. Download the latest [binary](https://github.com/Dark-Alex-17/loki/releases) for your OS.
+1. Download the latest [binary](https://github.com/Dark-Alex-17/coyote/releases) for your OS.
 2. `cd` to the directory where you downloaded the binary.
-3. Extract the binary with `tar -C /usr/local/bin -xzf loki-<arch>.tar.gz` (Note: This may require `sudo`)
-4. Now you can run `loki`!
+3. Extract the binary with `tar -C /usr/local/bin -xzf coyote-<arch>.tar.gz` (Note: This may require `sudo`)
+4. Now you can run `coyote`!
 
 ## Updating
-Loki can update itself in place to the latest GitHub release. Run `loki --update`
-for the newest release, or `loki --update v0.4.0` for a specific version:
+Coyote can update itself in place to the latest GitHub release. Run `coyote --update`
+for the newest release, or `coyote --update v0.4.0` for a specific version:
 
 ```shell
-loki --update
-loki --update v0.4.0
+coyote --update
+coyote --update v0.4.0
 ```
 
 The same is available from within the REPL via `.update` and `.update v0.4.0`.
 
-If Loki was installed with a package manager, prefer that package manager so its
-records stay in sync with the binary on disk; i.e. `brew upgrade loki` for Homebrew,
-or `cargo install --locked loki-ai` for Cargo.
+If Coyote was installed with a package manager, prefer that package manager so its
+records stay in sync with the binary on disk; i.e. `brew upgrade coyote` for Homebrew,
+or `cargo install --locked coyote-ai` for Cargo.
 
-When Loki detects a package-manager install it prints a warning and asks for
+When Coyote detects a package-manager install it prints a warning and asks for
 confirmation. In a non-interactive shell (no TTY), pass `--force` to update
 anyway:
 
 ```shell
-loki --update --force
+coyote --update --force
 ```
 
 ## Getting Started
 After installation, you can generate the configuration files and directories by simply running:
 
 ```sh
-loki --info
+coyote --info
 ```
 
-Then, you need to set up the Loki vault by creating a vault password file. Loki will do this for you automatically and
+Then, you need to set up the Coyote vault by creating a vault password file. Coyote will do this for you automatically and
 guide you through the process when you first attempt to access the vault. So, to get started, you can run:
 
 ```sh
-loki --list-secrets
+coyote --list-secrets
 ```
 
 ### Authentication
 Each client in your configuration needs authentication (with a few exceptions; e.g. ollama). Most clients use an API key
-(set via `api_key` in the config or through the [vault](https://github.com/Dark-Alex-17/loki/wiki/Vault)). For providers that support OAuth (e.g. Claude Pro/Max 
+(set via `api_key` in the config or through the [vault](https://github.com/Dark-Alex-17/coyote/wiki/Vault)). For providers that support OAuth (e.g. Claude Pro/Max 
 subscribers, Google Gemini), you can authenticate with your existing subscription instead:
 
 ```yaml
@@ -181,40 +181,40 @@ clients:
 ```
 
 ```sh
-loki --authenticate my-claude-oauth
+coyote --authenticate my-claude-oauth
 # Or via the REPL: .authenticate
 ```
 
-For full details, see the [authentication documentation](https://github.com/Dark-Alex-17/loki/wiki/Clients#authentication).
+For full details, see the [authentication documentation](https://github.com/Dark-Alex-17/coyote/wiki/Clients#authentication).
 
 ### Tab-Completions
-You can also enable tab completions to make using Loki easier. To do so, add the following to your shell profile:
+You can also enable tab completions to make using Coyote easier. To do so, add the following to your shell profile:
 ```shell
 # Bash
 # (add to: `~/.bashrc`)
-source <(COMPLETE=bash loki) 
+source <(COMPLETE=bash coyote) 
 
 # Zsh
 # (add to: `~/.zshrc`)
-source <(COMPLETE=zsh loki)
+source <(COMPLETE=zsh coyote)
 
 # Fish
 # (add to: `~/.config/fish/config.fish`)
-source <(COMPLETE=fish loki | psub)
+source <(COMPLETE=fish coyote | psub)
 
 # Elvish
 # (add to: `~/.elvish/rc.elv`)
-eval (E:COMPLETE=elvish loki | slurp)
+eval (E:COMPLETE=elvish coyote | slurp)
 
 # PowerShell
 # (add to: `$PROFILE`)
 $env:COMPLETE = "powershell"
-loki | Out-String | Invoke-Expression
+coyote | Out-String | Invoke-Expression
 ```
 
 ### Shell Integration
-You can integrate Loki's Shell Assistant into your shell for enhanced command-line assistance. Add the code in the
-corresponding [shell integration script](./scripts/shell-integration) to your shell. Then, you can invoke Loki to convert natural language to 
+You can integrate Coyote's Shell Assistant into your shell for enhanced command-line assistance. Add the code in the
+corresponding [shell integration script](./scripts/shell-integration) to your shell. Then, you can invoke Coyote to convert natural language to 
 shell commands by pressing `Alt-e`. For example:
 
 ```shell
@@ -224,18 +224,18 @@ find . -name "*.md"
 ```
 
 ## Configuration
-The location of the global Loki configuration varies between systems, so you can use the following command to find your
+The location of the global Coyote configuration varies between systems, so you can use the following command to find your
 `config.yaml` file:
 
 ```shell
-loki --info | grep 'config_file' | awk '{print $2}'
+coyote --info | grep 'config_file' | awk '{print $2}'
 ```
 
 The configuration file consists of a number of settings. To see a full example configuration file with every setting
 defined, refer to the [example configuration file](./config.example.yaml).
 
 ### Default LLM
-The following settings are available to configure the default LLM that is used when you start Loki, and its
+The following settings are available to configure the default LLM that is used when you start Coyote, and its
 hyperparameters:
 
 | Setting       | Description                                                                                                                                             |
@@ -245,34 +245,34 @@ hyperparameters:
 | `top_p`       | The default `top_p` hyperparameter value to use for all models, with a range of (0,1) (or (0,2) for some models); <br>Used unless explicitly overridden |
 
 ### CLI Behavior
-You can use the following settings to modify the behavior of Loki:
+You can use the following settings to modify the behavior of Coyote:
 
 | Setting       | Default Value | Description                                                                                                                         |
 |---------------|---------------|-------------------------------------------------------------------------------------------------------------------------------------|
 | `stream`      | `true`        | Controls whether to use stream-style APIs when querying for completions from LLM providers                                          |
 | `save`        | `true`        | Controls whether to save each query/response to every model to `messages.md` for posterity; Useful for debugging                    |
 | `keybindings` | `emacs`       | Specifies which keybinding schema to use; can either be `emacs` or `vi`                                                             |
-| `editor`      | `null`        | What text editor Loki should use to edit the input buffer or session (e.g. `vim`, `emacs`, `nano`, `hx`); <br>Defaults to `$EDITOR` |
+| `editor`      | `null`        | What text editor Coyote should use to edit the input buffer or session (e.g. `vim`, `emacs`, `nano`, `hx`); <br>Defaults to `$EDITOR` |
 | `wrap`        | `no`          | Controls whether text is wrapped (can be `no`, `auto`, or some `<max_width>`                                                        |
 | `wrap_code`   | `false`       | Enables or disables the wrapping of code blocks                                                                                     |
 
 ### Preludes
-Preludes let you define the default behavior for the different operating modes of Loki. The available settings are
+Preludes let you define the default behavior for the different operating modes of Coyote. The available settings are
 shown below:
 
 | Setting         | Description                                                                                                                                                                                                                                                                                                 |
 |-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `repl_prelude`  | This setting lets you specify a default `session` or `role` to use when starting Loki in [REPL](https://github.com/Dark-Alex-17/loki/wiki/REPL) mode. <br>Values can be <ul><li>`role:<name>` to define a role</li><li>`session:<name>` to define a session</li><li>`<session>:<role>` to define both a session and a role to use</li></ul> |
-| `cmd_prelude`   | This setting lets you specify a default `session` or `role` to use when running one-off queries in Loki via the CLI. <br>Values can be <ul><li>`role:<name>` to define a role</li><li>`session:<name>` to define a session</li><li>`<session>:<role>` to define both a session and a role to use</li></ul>  |
+| `repl_prelude`  | This setting lets you specify a default `session` or `role` to use when starting Coyote in [REPL](https://github.com/Dark-Alex-17/coyote/wiki/REPL) mode. <br>Values can be <ul><li>`role:<name>` to define a role</li><li>`session:<name>` to define a session</li><li>`<session>:<role>` to define both a session and a role to use</li></ul> |
+| `cmd_prelude`   | This setting lets you specify a default `session` or `role` to use when running one-off queries in Coyote via the CLI. <br>Values can be <ul><li>`role:<name>` to define a role</li><li>`session:<name>` to define a session</li><li>`<session>:<role>` to define both a session and a role to use</li></ul>  |
 | `agent_session` | This setting is used to specify a default session that all agents should start into, unless otherwise specified in the agent configuration. (e.g. `temp`, `default`)                                                                                                                                        |
 
 ### Appearance
-The appearance of Loki can be modified using the following settings:
+The appearance of Coyote can be modified using the following settings:
 
 | Setting       | Default Value | Description                                          |
 |---------------|---------------|------------------------------------------------------|
 | `highlight`   | `true`        | This setting enables or disables syntax highlighting |
-| `light_theme` | `false`       | This setting toggles light mode in Loki              |
+| `light_theme` | `false`       | This setting toggles light mode in Coyote              |
 
 ### Miscellaneous Settings
 | Setting              | Default Value | Description                                                                                                      |
@@ -284,7 +284,7 @@ The appearance of Loki can be modified using the following settings:
 
 ## History
 
-Loki began as a fork of [AIChat CLI](https://github.com/sigoden/aichat) and has since evolved into an independent project.
+Coyote began as a fork of [AIChat CLI](https://github.com/sigoden/aichat) and has since evolved into an independent project.
 
 See [CREDITS.md](./CREDITS.md) for full attribution and background.
 
