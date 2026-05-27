@@ -369,7 +369,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time went backwards")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("coyote_python_parser_{file_name}_{unique}.py"));
+        let path =
+            std::env::temp_dir().join(format!("coyote_python_parser_{file_name}_{unique}.py"));
         fs::write(&path, source).expect("failed to write temp python source");
         let file = File::open(&path).expect("failed to open temp python source");
         let result = generate_python_declarations(file, file_name, Some(parent));
