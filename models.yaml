@@ -202,6 +202,24 @@
 #  - https://ai.google.dev/api/rest/v1beta/models/streamGenerateContent
 - provider: gemini
   models:
+    - name: gemini-3.5-flash
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.2
+      output_price: 1.5
+      supports_function_calling: true
+    - name: gemini-3-flash-preview
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.2
+      output_price: 1.5
+      supports_function_calling: true
+    - name: gemini-3.1-flash-lite
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.2
+      output_price: 1.5
+      supports_function_calling: true
     - name: gemini-3.1-pro-preview
       max_input_tokens: 1048576
       max_output_tokens: 65535
@@ -238,20 +256,6 @@
       max_input_tokens: 1048576
       supports_vision: true
       supports_function_calling: true
-    - name: gemini-2.0-flash
-      max_input_tokens: 1048576
-      max_output_tokens: 8192
-      input_price: 0
-      output_price: 0
-      supports_vision: true
-      supports_function_calling: true
-    - name: gemini-2.0-flash-lite
-      max_input_tokens: 1048576
-      max_output_tokens: 8192
-      input_price: 0
-      output_price: 0
-      supports_vision: true
-      supports_function_calling: true
     - name: gemma-3-27b-it
       max_input_tokens: 131072
       max_output_tokens: 8192
@@ -269,6 +273,20 @@
 #  - https://docs.anthropic.com/en/api/messages
 - provider: claude
   models:
+    - name: claude-opus-4-8
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+    - name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
     - name: claude-opus-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -737,6 +755,24 @@
 #  - https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/gemini
 - provider: vertexai
   models:
+    - name: gemini-3.5-flash
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.2
+      output_price: 1.5
+      supports_function_calling: true
+    - name: gemini-3-flash-preview
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.2
+      output_price: 1.5
+      supports_function_calling: true
+    - name: gemini-3.1-flash-lite
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.2
+      output_price: 1.5
+      supports_function_calling: true
     - name: gemini-3.1-pro-preview
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -773,18 +809,18 @@
       max_input_tokens: 1048576
       supports_vision: true
       supports_function_calling: true
-    - name: gemini-2.0-flash-001
-      max_input_tokens: 1048576
-      max_output_tokens: 8192
-      input_price: 0.15
-      output_price: 0.6
+    - name: claude-opus-4-8
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 25
       supports_vision: true
       supports_function_calling: true
-    - name: gemini-2.0-flash-lite-001
-      max_input_tokens: 1048576
-      max_output_tokens: 8192
-      input_price: 0.075
-      output_price: 0.3
+    - name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 25
       supports_vision: true
       supports_function_calling: true
     - name: claude-opus-4-6
@@ -942,6 +978,20 @@
 #  - https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-call.html
 - provider: bedrock
   models:
+    - name: us.anthropic.claude-opus-4-8
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+    - name: us.anthropic.claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
     - name: us.anthropic.claude-opus-4-6-v1
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -1568,6 +1618,20 @@
       max_input_tokens: 131072
       input_price: 0.1
       output_price: 0.2
+    - name: anthropic/claude-opus-4-8
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+    - name: anthropic/claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
     - name: anthropic/claude-opus-4.6
       max_input_tokens: 200000
       max_output_tokens: 8192
