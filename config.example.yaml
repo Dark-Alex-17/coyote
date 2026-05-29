@@ -39,7 +39,7 @@ vault_password_file: null        # Path to a file containing the password for th
 
 # ---- Function Calling ----
 # See the [Tools documentation](https://github.com/Dark-Alex-17/coyote/wiki/Tools) for more details
-function_calling: true           # Enables or disables function calling (Globally).
+function_calling_support: true           # Enables or disables function calling (Globally).
 mapping_tools:                   # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write,fs_read,fs_glob,fs_grep'
 enabled_tools: null              # Which tools to enable by default. (e.g. 'fs,web_search_coyote')
