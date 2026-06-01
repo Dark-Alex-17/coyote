@@ -14,6 +14,16 @@ struct SkillsAsset;
 static RE_METADATA: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)-{3,}\s*(.*?)\s*-{3,}\s*(.*)").unwrap());
 
+pub const SKILL_SCAFFOLD: &str = "\
+---
+description: One-line description shown to the model when listing skills.
+enabled_tools:
+enabled_mcp_servers:
+auto_unload: false
+---
+Replace this body with the knowledge or methodology this skill teaches.
+";
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Skill {
     name: String,
