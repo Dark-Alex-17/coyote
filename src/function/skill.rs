@@ -1,5 +1,6 @@
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::{RequestContext, Skill, SkillPolicy, paths};
+use crate::utils::create_abort_signal;
 
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
@@ -71,7 +72,7 @@ pub fn skill_function_declarations() -> Vec<FunctionDeclaration> {
     ]
 }
 
-pub fn handle_skill_tool(
+pub async fn handle_skill_tool(
     ctx: &mut RequestContext,
     cmd_name: &str,
     args: &Value,
@@ -95,8 +96,8 @@ pub fn handle_skill_tool(
 
     match action {
         "list" => handle_list(ctx, &policy),
-        "load" => handle_load(ctx, args, &policy),
-        "unload" => handle_unload(ctx, args),
+        "load" => handle_load(ctx, args, &policy).await,
+        "unload" => handle_unload(ctx, args).await,
         _ => bail!("Unknown skill action: {action}"),
     }
 }
@@ -137,7 +138,7 @@ fn handle_list(ctx: &RequestContext, policy: &SkillPolicy) -> Result<Value> {
     Ok(json!({"skills": entries}))
 }
 
-fn handle_load(
+async fn handle_load(
     ctx: &mut RequestContext,
     args: &Value,
     policy: &SkillPolicy,
@@ -189,29 +190,42 @@ fn handle_load(
         }));
     }
 
-    match ctx.skill_registry.insert(skill) {
-        Ok(()) => Ok(json!({
-            "status": "ok",
-            "loaded": name,
-            "message": format!("Skill '{name}' loaded")
-        })),
-        Err(e) => Ok(json!({"error": e.to_string()})),
+    if let Err(e) = ctx.skill_registry.insert(skill) {
+        return Ok(json!({"error": e.to_string()}));
     }
+
+    if let Err(e) = ctx.refresh_tool_scope(create_abort_signal()).await {
+        let _ = ctx.skill_registry.unload(name);
+        return Ok(json!({
+            "error": format!("Loaded skill '{name}' but failed to refresh tool scope: {e}")
+        }));
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "loaded": name,
+        "message": format!("Skill '{name}' loaded")
+    }))
 }
 
-fn handle_unload(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
+async fn handle_unload(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let name = match args.get("name").and_then(Value::as_str) {
         Some(n) if !n.is_empty() => n,
         _ => return Ok(json!({"error": "name is required"})),
     };
 
-    match ctx.skill_registry.unload(name) {
-        Ok(()) => Ok(json!({
-            "status": "ok",
-            "unloaded": name
-        })),
-        Err(e) => Ok(json!({"error": e.to_string()})),
+    if let Err(e) = ctx.skill_registry.unload(name) {
+        return Ok(json!({"error": e.to_string()}));
     }
+
+    if let Err(e) = ctx.refresh_tool_scope(create_abort_signal()).await {
+        warn!("Unloaded skill '{name}' but failed to refresh tool scope: {e}");
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "unloaded": name
+    }))
 }
 
 fn csv_to_vec(csv: Option<&str>) -> Vec<String> {

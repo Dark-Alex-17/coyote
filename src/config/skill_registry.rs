@@ -53,6 +53,21 @@ impl SkillRegistry {
         self.loaded.keys().cloned().collect()
     }
 
+    pub fn loaded_mcp_servers(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for skill in self.loaded.values() {
+            if let Some(csv) = skill.enabled_mcp_servers() {
+                for token in csv.split(',') {
+                    let t = token.trim();
+                    if !t.is_empty() {
+                        out.insert(t.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn is_loaded(&self, name: &str) -> bool {
         self.loaded.contains_key(name)
     }
