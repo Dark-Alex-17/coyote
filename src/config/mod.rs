@@ -287,6 +287,7 @@ impl AssetCategory {
 pub enum InstallFilter {
     Agents,
     Roles,
+    Skills,
     Macros,
     Functions,
     #[value(name = "mcp_config")]
@@ -294,12 +295,20 @@ pub enum InstallFilter {
 }
 
 impl InstallFilter {
-    pub const NAMES: [&'static str; 5] = ["agents", "roles", "macros", "functions", "mcp_config"];
+    pub const NAMES: [&'static str; 6] = [
+        "agents",
+        "roles",
+        "skills",
+        "macros",
+        "functions",
+        "mcp_config",
+    ];
 
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "agents" => Some(Self::Agents),
             "roles" => Some(Self::Roles),
+            "skills" => Some(Self::Skills),
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
             "mcp_config" => Some(Self::McpConfig),

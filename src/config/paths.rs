@@ -65,7 +65,6 @@ pub fn role_file(name: &str) -> PathBuf {
     roles_dir().join(format!("{name}.md"))
 }
 
-#[allow(dead_code)]
 pub fn skills_dir() -> PathBuf {
     match env::var(get_env_name("skills_dir")) {
         Ok(value) => PathBuf::from(value),
