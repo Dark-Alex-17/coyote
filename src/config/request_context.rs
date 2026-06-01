@@ -891,6 +891,7 @@ impl RequestContext {
             ("env_file", display_path(&paths::env_file())),
             ("agents_dir", display_path(&paths::agents_data_dir())),
             ("roles_dir", display_path(&paths::roles_dir())),
+            ("skills_dir", display_path(&paths::skills_dir())),
             ("sessions_dir", display_path(&self.sessions_dir())),
             ("rags_dir", display_path(&paths::rags_dir())),
             ("macros_dir", display_path(&paths::macros_dir())),
