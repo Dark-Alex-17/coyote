@@ -2495,18 +2495,13 @@ impl RequestContext {
                 format!("Failed to scaffold skill at {}", path.display())
             })?;
         }
-
         let editor = app.editor()?;
         edit_file(&editor, &path)?;
-
-        if self.working_mode.is_repl() {
-            if is_new {
-                println!("✓ Created skill at '{}'.", path.display());
-            } else {
-                println!("✓ Saved skill at '{}'.", path.display());
-            }
+        if is_new {
+            println!("✓ Created skill at '{}'.", path.display());
+        } else {
+            println!("✓ Saved skill at '{}'.", path.display());
         }
-
         Ok(())
     }
 
