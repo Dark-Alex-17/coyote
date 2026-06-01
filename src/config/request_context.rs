@@ -1,5 +1,6 @@
 use super::rag_cache::{RagCache, RagKey};
 use super::session::Session;
+use super::skill_policy::SkillPolicy;
 use super::skill_registry::SkillRegistry;
 use super::todo::TodoList;
 use super::tool_scope::{McpRuntime, ToolScope};
@@ -35,7 +36,7 @@ use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -617,7 +618,7 @@ impl RequestContext {
             }
         }
 
-        role
+        self.skill_registry.effective_role(&role)
     }
 
     pub fn auto_continue_config(&self) -> AutoContinueConfig {
@@ -2067,6 +2068,35 @@ impl RequestContext {
         enabled_mcp_servers: Option<String>,
         abort_signal: AbortSignal,
     ) -> Result<()> {
+        let policy = SkillPolicy::effective(
+            app,
+            self.role.as_ref(),
+            self.agent.as_ref(),
+            self.session.as_ref(),
+        )?;
+
+        let enabled_mcp_servers = if policy.skills_enabled && app.mcp_server_support {
+            let skill_mcps = self.skill_registry.loaded_mcp_servers();
+            match (enabled_mcp_servers.as_deref(), skill_mcps.is_empty()) {
+                (Some("all"), _) | (_, true) => enabled_mcp_servers,
+                (base, false) => {
+                    let mut merged: BTreeSet<String> = skill_mcps;
+                    if let Some(s) = base {
+                        for token in s.split(',') {
+                            let t = token.trim();
+                            if !t.is_empty() {
+                                merged.insert(t.to_string());
+                            }
+                        }
+                    }
+
+                    Some(merged.into_iter().collect::<Vec<_>>().join(","))
+                }
+            }
+        } else {
+            enabled_mcp_servers
+        };
+
         let mut mcp_runtime = McpRuntime::new();
 
         if app.mcp_server_support
@@ -2134,6 +2164,9 @@ impl RequestContext {
         if !mcp_runtime.is_empty() {
             functions.append_mcp_meta_functions(mcp_runtime.server_names());
         }
+        if app.function_calling_support && policy.skills_enabled {
+            functions.append_skill_functions();
+        }
 
         let tool_tracker = self.tool_scope.tool_tracker.clone();
         self.tool_scope = ToolScope {
@@ -2142,6 +2175,30 @@ impl RequestContext {
             tool_tracker,
         };
         Ok(())
+    }
+
+    pub async fn refresh_tool_scope(&mut self, abort_signal: AbortSignal) -> Result<()> {
+        let app = (*self.app.config).clone();
+        let base_mcps = if app.mcp_server_support {
+            if let Some(session) = &self.session {
+                session.enabled_mcp_servers()
+            } else if let Some(agent) = &self.agent {
+                let names = agent.mcp_server_names();
+                if names.is_empty() {
+                    None
+                } else {
+                    Some(names.join(","))
+                }
+            } else if let Some(role) = &self.role {
+                role.enabled_mcp_servers()
+            } else {
+                app.enabled_mcp_servers.clone()
+            }
+        } else {
+            None
+        };
+
+        self.rebuild_tool_scope(&app, base_mcps, abort_signal).await
     }
 
     pub async fn use_role(

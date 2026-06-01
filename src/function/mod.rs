@@ -1048,11 +1048,13 @@ impl ToolCall {
                 })
             }
             _ if cmd_name.starts_with(SKILL_FUNCTION_PREFIX) => {
-                skill::handle_skill_tool(ctx, &cmd_name, &json_data).unwrap_or_else(|e| {
-                    let error_msg = format!("Skill tool failed: {e}");
-                    eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
-                    json!({"tool_call_error": error_msg})
-                })
+                skill::handle_skill_tool(ctx, &cmd_name, &json_data)
+                    .await
+                    .unwrap_or_else(|e| {
+                        let error_msg = format!("Skill tool failed: {e}");
+                        eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        json!({"tool_call_error": error_msg})
+                    })
             }
             _ if cmd_name.starts_with(SUPERVISOR_FUNCTION_PREFIX) => {
                 supervisor::handle_supervisor_tool(ctx, &cmd_name, &json_data)
