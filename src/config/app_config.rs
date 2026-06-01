@@ -394,7 +394,7 @@ impl AppConfig {
         if let Some(Some(v)) = super::read_env_bool(&get_env_name("skills_enabled")) {
             self.skills_enabled = v;
         }
-        
+
         if let Some(v) = super::read_env_value::<String>(&get_env_name("enabled_skills")) {
             self.enabled_skills = v;
         }

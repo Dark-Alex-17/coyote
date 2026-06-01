@@ -22,6 +22,7 @@ use indoc::formatdoc;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use skill::SKILL_FUNCTION_PREFIX;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -33,7 +34,6 @@ use std::{
     process::{Command, Stdio},
 };
 use strum_macros::AsRefStr;
-use skill::SKILL_FUNCTION_PREFIX;
 use supervisor::SUPERVISOR_FUNCTION_PREFIX;
 use todo::TODO_FUNCTION_PREFIX;
 use user_interaction::USER_FUNCTION_PREFIX;

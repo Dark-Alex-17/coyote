@@ -2492,9 +2492,8 @@ impl RequestContext {
         ensure_parent_exists(&path)?;
         let is_new = !path.exists();
         if is_new {
-            fs::write(&path, SKILL_SCAFFOLD).with_context(|| {
-                format!("Failed to scaffold skill at {}", path.display())
-            })?;
+            fs::write(&path, SKILL_SCAFFOLD)
+                .with_context(|| format!("Failed to scaffold skill at {}", path.display()))?;
         }
         let editor = app.editor()?;
         edit_file(&editor, &path)?;
@@ -2506,11 +2505,7 @@ impl RequestContext {
         Ok(())
     }
 
-    pub async fn load_skill_repl(
-        &mut self,
-        name: &str,
-        abort_signal: AbortSignal,
-    ) -> Result<()> {
+    pub async fn load_skill_repl(&mut self, name: &str, abort_signal: AbortSignal) -> Result<()> {
         if !paths::has_skill(name) {
             bail!(
                 "Skill '{name}' is not installed (expected at {})",
@@ -2563,17 +2558,11 @@ impl RequestContext {
         Ok(())
     }
 
-    pub async fn unload_skill_repl(
-        &mut self,
-        name: &str,
-        abort_signal: AbortSignal,
-    ) -> Result<()> {
+    pub async fn unload_skill_repl(&mut self, name: &str, abort_signal: AbortSignal) -> Result<()> {
         self.skill_registry.unload(name)?;
 
         if let Err(e) = self.refresh_tool_scope(abort_signal).await {
-            eprintln!(
-                "Warning: unloaded skill '{name}' but tool scope refresh failed: {e}"
-            );
+            eprintln!("Warning: unloaded skill '{name}' but tool scope refresh failed: {e}");
         }
 
         println!("✓ Unloaded skill '{name}'.");
@@ -3534,7 +3523,8 @@ mod tests {
 
         let input = Input::from_str(&ctx, "hello", None);
         let app = Arc::clone(&ctx.app.config);
-        ctx.after_chat_completion(app.as_ref(), &input, "response", &[]).unwrap();
+        ctx.after_chat_completion(app.as_ref(), &input, "response", &[])
+            .unwrap();
 
         assert!(!ctx.skill_registry.is_loaded("ephemeral"));
         assert!(ctx.skill_registry.is_loaded("persistent"));
@@ -3556,11 +3546,10 @@ mod tests {
 
         let input = Input::from_str(&ctx, "hello", None);
         let app = Arc::clone(&ctx.app.config);
-        let tool_result = ToolResult::new(
-            crate::function::ToolCall::default(),
-            serde_json::json!({}),
-        );
-        ctx.after_chat_completion(app.as_ref(), &input, "", &[tool_result]).unwrap();
+        let tool_result =
+            ToolResult::new(crate::function::ToolCall::default(), serde_json::json!({}));
+        ctx.after_chat_completion(app.as_ref(), &input, "", &[tool_result])
+            .unwrap();
 
         assert!(
             ctx.skill_registry.is_loaded("ephemeral"),
