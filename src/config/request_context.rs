@@ -15,7 +15,7 @@ use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
     FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
-    user_interaction::USER_FUNCTION_PREFIX,
+    skill::SKILL_FUNCTION_PREFIX, user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
@@ -1145,7 +1145,9 @@ impl RequestContext {
                     .declarations()
                     .iter()
                     .filter(|v| {
-                        v.name.starts_with(USER_FUNCTION_PREFIX) && !existing.contains(&v.name)
+                        (v.name.starts_with(USER_FUNCTION_PREFIX)
+                            || v.name.starts_with(SKILL_FUNCTION_PREFIX))
+                            && !existing.contains(&v.name)
                     })
                     .cloned()
                     .collect();
@@ -1942,8 +1944,12 @@ impl RequestContext {
                 }
                 _ => vec![],
             };
-        } else if cmd == ".edit" && args.first() == Some(&"skill") && args.len() == 2 {
+        } else if (cmd == ".edit" && args.first() == Some(&"skill") && args.len() == 2)
+            || (cmd == ".skill" && args.first() == Some(&"load") && args.len() == 2)
+        {
             values = super::map_completion_values(paths::list_skills());
+        } else if cmd == ".skill" && args.first() == Some(&"unload") && args.len() == 2 {
+            values = super::map_completion_values(self.skill_registry.loaded_names());
         } else if cmd == ".install" && args.first() == Some(&"remote") && args.len() >= 2 {
             let prev = args.get(args.len() - 2).copied().unwrap_or("");
             if prev == "--filter" {
