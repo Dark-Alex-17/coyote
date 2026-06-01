@@ -1878,7 +1878,6 @@ impl RequestContext {
                         "loaded".to_string(),
                         "load".to_string(),
                         "unload".to_string(),
-                        "edit".to_string(),
                     ];
                     values.extend(paths::list_skills());
                     super::map_completion_values(values)
@@ -1927,15 +1926,6 @@ impl RequestContext {
                     "macro",
                     "skill",
                     "agent-data",
-                ]),
-                ".edit" => super::map_completion_values(vec![
-                    "config",
-                    "mcp-config",
-                    "role",
-                    "session",
-                    "rag-docs",
-                    "agent-config",
-                    "skill",
                 ]),
                 ".vault" => {
                     let mut values = vec!["add", "get", "update", "delete", "list"];

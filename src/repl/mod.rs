@@ -46,7 +46,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 43]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 44]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -193,7 +193,12 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 43]> = LazyLock::new(|| {
         ReplCommand::new(".macro", "Execute a macro", AssertState::pass()),
         ReplCommand::new(
             ".skill",
-            "List, load, unload, edit, or create skills",
+            "List, load, unload, or create skills",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".edit skill",
+            "Modify an existing skill by name",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -1319,8 +1324,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_43_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 43);
+    fn repl_commands_has_44_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 44);
     }
 
     #[test]
