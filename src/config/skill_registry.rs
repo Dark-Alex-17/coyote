@@ -10,24 +10,7 @@ pub struct SkillRegistry {
     loaded: IndexMap<String, Skill>,
 }
 
-#[allow(dead_code)]
 impl SkillRegistry {
-    pub fn new() -> Self {
-        Self {
-            loaded: IndexMap::new(),
-        }
-    }
-
-    pub fn load(&mut self, name: &str) -> Result<()> {
-        if self.loaded.contains_key(name) {
-            bail!("Skill '{name}' is already loaded");
-        }
-        let skill = Skill::load(name)?;
-        self.loaded.insert(name.to_string(), skill);
-
-        Ok(())
-    }
-
     pub fn insert(&mut self, skill: Skill) -> Result<()> {
         let name = skill.name().to_string();
 
@@ -155,7 +138,7 @@ mod tests {
     #[test]
     fn empty_registry_returns_base_clone() {
         let base = Role::new("test", "You are a helper");
-        let registry = SkillRegistry::new();
+        let registry = SkillRegistry::default();
 
         let effective = registry.effective_role(&base);
 
@@ -164,7 +147,7 @@ mod tests {
 
     #[test]
     fn one_skill_appends_body_after_base_with_separator() {
-        let mut registry = SkillRegistry::new();
+        let mut registry = SkillRegistry::default();
         registry.insert_for_test(make_skill("git-master", "description: D", "Git knowledge"));
 
         let base = Role::new("test", "You are a helper");
@@ -175,7 +158,7 @@ mod tests {
 
     #[test]
     fn two_skills_compose_bodies_in_insertion_order() {
-        let mut registry = SkillRegistry::new();
+        let mut registry = SkillRegistry::default();
         registry.insert_for_test(make_skill("a", "", "Alpha body"));
         registry.insert_for_test(make_skill("b", "", "Beta body"));
 
@@ -187,7 +170,7 @@ mod tests {
 
     #[test]
     fn empty_base_prompt_omits_leading_separator() {
-        let mut registry = SkillRegistry::new();
+        let mut registry = SkillRegistry::default();
         registry.insert_for_test(make_skill("a", "", "Alpha"));
         registry.insert_for_test(make_skill("b", "", "Beta"));
 
@@ -199,7 +182,7 @@ mod tests {
 
     #[test]
     fn embedded_prompt_base_skips_body_composition() {
-        let mut registry = SkillRegistry::new();
+        let mut registry = SkillRegistry::default();
         registry.insert_for_test(make_skill(
             "git-master",
             "enabled_tools: shell",
@@ -216,7 +199,7 @@ mod tests {
 
     #[test]
     fn skills_with_empty_body_do_not_inject_separator() {
-        let mut registry = SkillRegistry::new();
+        let mut registry = SkillRegistry::default();
         registry.insert_for_test(make_skill("knowledge", "enabled_tools: fs", ""));
 
         let base = Role::new("test", "Base");
@@ -227,7 +210,7 @@ mod tests {
 
     #[test]
     fn tools_and_mcps_are_unioned_and_deduplicated() {
-        let mut registry = SkillRegistry::new();
+        let mut registry = SkillRegistry::default();
         registry.insert_for_test(make_skill(
             "a",
             "enabled_tools: shell,fs\nenabled_mcp_servers: github",
@@ -255,7 +238,7 @@ mod tests {
 
     #[test]
     fn no_skill_tool_contributions_preserves_base_none() {
-        let mut registry = SkillRegistry::new();
+        let mut registry = SkillRegistry::default();
         registry.insert_for_test(make_skill("knowledge", "", "Pure knowledge"));
 
         let base = Role::new("test", "Base");
@@ -267,7 +250,7 @@ mod tests {
 
     #[test]
     fn base_some_empty_tools_is_preserved() {
-        let mut registry = SkillRegistry::new();
+        let mut registry = SkillRegistry::default();
         registry.insert_for_test(make_skill("knowledge", "", "Pure knowledge"));
 
         let mut base = Role::new("test", "Base");
@@ -278,18 +261,8 @@ mod tests {
     }
 
     #[test]
-    fn load_already_loaded_returns_error() {
-        let mut registry = SkillRegistry::new();
-        registry.insert_for_test(make_skill("git-master", "", "body"));
-
-        let err = registry.load("git-master").unwrap_err();
-
-        assert!(err.to_string().contains("already loaded"));
-    }
-
-    #[test]
     fn unload_not_loaded_returns_error() {
-        let mut registry = SkillRegistry::new();
+        let mut registry = SkillRegistry::default();
 
         let err = registry.unload("missing").unwrap_err();
 
@@ -298,7 +271,7 @@ mod tests {
 
     #[test]
     fn unload_existing_succeeds_and_removes() {
-        let mut registry = SkillRegistry::new();
+        let mut registry = SkillRegistry::default();
         registry.insert_for_test(make_skill("git-master", "", "body"));
         assert!(registry.is_loaded("git-master"));
 
@@ -308,7 +281,7 @@ mod tests {
 
     #[test]
     fn loaded_names_returns_insertion_order() {
-        let mut registry = SkillRegistry::new();
+        let mut registry = SkillRegistry::default();
 
         registry.insert_for_test(make_skill("zulu", "", "body"));
         registry.insert_for_test(make_skill("alpha", "", "body"));
@@ -322,7 +295,7 @@ mod tests {
 
     #[test]
     fn sweep_removes_only_auto_unload_skills() {
-        let mut registry = SkillRegistry::new();
+        let mut registry = SkillRegistry::default();
         registry.insert_for_test(make_skill("ephemeral", "auto_unload: true", "body"));
         registry.insert_for_test(make_skill("persistent", "", "body"));
 
@@ -334,7 +307,7 @@ mod tests {
 
     #[test]
     fn is_loaded_returns_false_for_unknown() {
-        let registry = SkillRegistry::new();
+        let registry = SkillRegistry::default();
 
         assert!(!registry.is_loaded("nothing"));
     }
