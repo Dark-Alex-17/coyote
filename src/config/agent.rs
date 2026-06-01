@@ -337,6 +337,16 @@ impl Agent {
         &self.config.mcp_servers
     }
 
+    #[allow(dead_code)]
+    pub fn skills_enabled(&self) -> Option<bool> {
+        self.config.skills_enabled
+    }
+
+    #[allow(dead_code)]
+    pub fn enabled_skills(&self) -> Option<&[String]> {
+        self.config.enabled_skills.as_deref()
+    }
+
     pub fn conversation_starters(&self) -> Vec<String> {
         self.config
             .conversation_starters
@@ -614,6 +624,10 @@ pub struct AgentConfig {
     pub mcp_servers: Vec<String>,
     #[serde(default)]
     pub global_tools: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_skills: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation_prompt: Option<String>,
     #[serde(default)]

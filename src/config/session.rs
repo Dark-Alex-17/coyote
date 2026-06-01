@@ -29,6 +29,10 @@ pub struct Session {
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled_mcp_servers: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    skills_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled_skills: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     save_session: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compression_threshold: Option<usize>,
@@ -75,6 +79,16 @@ pub struct Session {
 }
 
 impl Session {
+    #[allow(dead_code)]
+    pub fn skills_enabled(&self) -> Option<bool> {
+        self.skills_enabled
+    }
+
+    #[allow(dead_code)]
+    pub fn enabled_skills(&self) -> Option<&str> {
+        self.enabled_skills.as_deref()
+    }
+
     pub fn new_from_ctx(ctx: &RequestContext, app: &AppConfig, name: &str) -> Self {
         let role = ctx.extract_role(app);
         let mut session = Self {
