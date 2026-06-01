@@ -207,6 +207,13 @@ impl Agent {
         functions.append_teammate_functions();
         functions.append_user_interaction_functions();
 
+        if app.function_calling_support
+            && app.skills_enabled
+            && !matches!(agent_config.skills_enabled, Some(false))
+        {
+            functions.append_skill_functions();
+        }
+
         agent_config.replace_tools_placeholder(&functions);
 
         Ok(Self {
