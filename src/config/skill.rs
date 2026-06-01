@@ -143,6 +143,7 @@ mod tests {
     #[test]
     fn skill_new_parses_body() {
         let skill = Skill::new("test", "You are a git expert");
+
         assert_eq!(skill.name(), "test");
         assert_eq!(skill.body(), "You are a git expert");
         assert_eq!(skill.description(), "");
@@ -157,7 +158,9 @@ mod tests {
             auto_unload: true\n\
             ---\n\
             You are a git expert";
+
         let skill = Skill::new("git-master", content);
+
         assert_eq!(skill.name(), "git-master");
         assert_eq!(skill.description(), "Atomic commits, rebase surgery");
         assert_eq!(skill.enabled_tools(), Some("shell,fs"));
@@ -169,6 +172,7 @@ mod tests {
     #[test]
     fn skill_new_no_metadata_has_defaults() {
         let skill = Skill::new("test", "Just a body");
+
         assert_eq!(skill.description(), "");
         assert_eq!(skill.enabled_tools(), None);
         assert_eq!(skill.enabled_mcp_servers(), None);
@@ -178,7 +182,9 @@ mod tests {
     #[test]
     fn skill_new_metadata_only() {
         let content = "---\ndescription: Just metadata\n---";
+
         let skill = Skill::new("test", content);
+
         assert_eq!(skill.description(), "Just metadata");
         assert_eq!(skill.body(), "");
     }
@@ -186,7 +192,9 @@ mod tests {
     #[test]
     fn skill_new_partial_metadata_leaves_others_none() {
         let content = "---\ndescription: Partial\n---\nthe body";
+
         let skill = Skill::new("test", content);
+
         assert_eq!(skill.description(), "Partial");
         assert_eq!(skill.enabled_tools(), None);
         assert_eq!(skill.enabled_mcp_servers(), None);
@@ -197,7 +205,9 @@ mod tests {
     #[test]
     fn skill_new_ignores_unknown_keys() {
         let content = "---\ndescription: D\nbogus_field: 42\n---\nbody";
+
         let skill = Skill::new("test", content);
+
         assert_eq!(skill.description(), "D");
         assert_eq!(skill.body(), "body");
     }
@@ -205,13 +215,16 @@ mod tests {
     #[test]
     fn skill_new_trims_body_whitespace() {
         let content = "---\ndescription: D\n---\n\n\n  body content  \n\n";
+
         let skill = Skill::new("test", content);
+
         assert_eq!(skill.body(), "body content");
     }
 
     #[test]
     fn skill_default_has_empty_fields() {
         let skill = Skill::default();
+
         assert_eq!(skill.name(), "");
         assert_eq!(skill.body(), "");
         assert_eq!(skill.description(), "");
@@ -223,6 +236,7 @@ mod tests {
     #[test]
     fn is_compatible_knowledge_only_passes_all_combinations() {
         let skill = Skill::new("test", "Just knowledge");
+
         assert!(skill.is_compatible(false, false));
         assert!(skill.is_compatible(true, false));
         assert!(skill.is_compatible(false, true));
@@ -232,7 +246,9 @@ mod tests {
     #[test]
     fn is_compatible_with_tools_requires_function_calling() {
         let content = "---\nenabled_tools: shell\n---\nbody";
+
         let skill = Skill::new("test", content);
+
         assert!(!skill.is_compatible(false, true));
         assert!(!skill.is_compatible(false, false));
         assert!(skill.is_compatible(true, true));
@@ -242,7 +258,9 @@ mod tests {
     #[test]
     fn is_compatible_with_mcp_requires_mcp_enabled() {
         let content = "---\nenabled_mcp_servers: github\n---\nbody";
+
         let skill = Skill::new("test", content);
+
         assert!(!skill.is_compatible(true, false));
         assert!(!skill.is_compatible(false, false));
         assert!(skill.is_compatible(true, true));
@@ -252,7 +270,9 @@ mod tests {
     fn is_compatible_requires_both_when_both_declared() {
         let content =
             "---\nenabled_tools: shell\nenabled_mcp_servers: github\n---\nbody";
+
         let skill = Skill::new("test", content);
+
         assert!(!skill.is_compatible(true, false));
         assert!(!skill.is_compatible(false, true));
         assert!(!skill.is_compatible(false, false));
@@ -262,13 +282,16 @@ mod tests {
     #[test]
     fn is_compatible_empty_string_tools_is_knowledge_only() {
         let content = "---\nenabled_tools: \"\"\n---\nbody";
+
         let skill = Skill::new("test", content);
+
         assert!(skill.is_compatible(false, false));
     }
 
     #[test]
     fn builtin_returns_err_for_unknown_skill() {
         let result = Skill::builtin("nonexistent_skill_xyz");
+
         assert!(result.is_err());
     }
 }
