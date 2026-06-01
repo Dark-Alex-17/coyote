@@ -119,9 +119,11 @@ pub struct Cli {
     /// List all installed skills
     #[arg(long)]
     pub list_skills: bool,
-    /// Open a skill in $EDITOR (creates with a scaffold if missing)
+    /// Pre-load an existing skill into the session (repeatable). If a single
+    /// `--skill <NAME>` is given and the skill doesn't exist, opens $EDITOR
+    /// with a scaffold to create it.
     #[arg(long, value_name = "NAME")]
-    pub skill: Option<String>,
+    pub skill: Vec<String>,
     /// Input text
     #[arg(trailing_var_arg = true)]
     text: Vec<String>,
@@ -309,8 +311,16 @@ mod tests {
 
     #[test]
     fn parse_skill_flag_takes_name() {
-        assert_eq!(parse(&["--skill", "git-master"]).skill.as_deref(), Some("git-master"));
-        assert!(parse(&[]).skill.is_none());
+        assert_eq!(parse(&["--skill", "git-master"]).skill, vec!["git-master"]);
+        assert!(parse(&[]).skill.is_empty());
+    }
+
+    #[test]
+    fn parse_multiple_skill_flags_preserves_order() {
+        assert_eq!(
+            parse(&["--skill", "alpha", "--skill", "beta", "--skill", "gamma"]).skill,
+            vec!["alpha", "beta", "gamma"]
+        );
     }
 
     #[test]
