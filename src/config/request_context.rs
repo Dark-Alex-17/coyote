@@ -822,6 +822,7 @@ impl RequestContext {
         if !app.dry_run {
             self.save_message(app, input, output)?;
         }
+        self.skill_registry.sweep_auto_unload();
         Ok(())
     }
 
@@ -3513,6 +3514,58 @@ mod tests {
         let lm = ctx.last_message.as_ref().unwrap();
         assert_eq!(lm.output, "");
         assert!(lm.continuous);
+    }
+
+    #[test]
+    fn after_chat_completion_sweeps_auto_unload_skills_at_turn_end() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                dry_run: true,
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+
+        let ephemeral = Skill::new("ephemeral", "---\nauto_unload: true\n---\nbody");
+        let persistent = Skill::new("persistent", "---\nauto_unload: false\n---\nbody");
+        ctx.skill_registry.insert(ephemeral).unwrap();
+        ctx.skill_registry.insert(persistent).unwrap();
+
+        let input = Input::from_str(&ctx, "hello", None);
+        let app = Arc::clone(&ctx.app.config);
+        ctx.after_chat_completion(app.as_ref(), &input, "response", &[]).unwrap();
+
+        assert!(!ctx.skill_registry.is_loaded("ephemeral"));
+        assert!(ctx.skill_registry.is_loaded("persistent"));
+    }
+
+    #[test]
+    fn after_chat_completion_preserves_auto_unload_during_tool_loop() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                dry_run: true,
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+
+        let ephemeral = Skill::new("ephemeral", "---\nauto_unload: true\n---\nbody");
+        ctx.skill_registry.insert(ephemeral).unwrap();
+
+        let input = Input::from_str(&ctx, "hello", None);
+        let app = Arc::clone(&ctx.app.config);
+        let tool_result = ToolResult::new(
+            crate::function::ToolCall::default(),
+            serde_json::json!({}),
+        );
+        ctx.after_chat_completion(app.as_ref(), &input, "", &[tool_result]).unwrap();
+
+        assert!(
+            ctx.skill_registry.is_loaded("ephemeral"),
+            "auto_unload skills must persist through tool-using rounds"
+        );
     }
 
     #[test]
