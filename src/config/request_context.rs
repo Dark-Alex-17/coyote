@@ -132,6 +132,13 @@ impl RequestContext {
             functions.append_user_interaction_functions();
         }
 
+        if app.config.function_calling_support {
+            let policy = SkillPolicy::effective(&app.config, None, None, None)?;
+            if policy.skills_enabled {
+                functions.append_skill_functions();
+            }
+        }
+
         let mut mcp_runtime = McpRuntime::default();
         if let Some(registry) = &app.mcp_registry {
             mcp_runtime.sync_from_registry(registry);
