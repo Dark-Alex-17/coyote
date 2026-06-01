@@ -2,11 +2,11 @@ use super::*;
 
 use anyhow::Result;
 use fancy_regex::Regex;
+use log::{debug, info};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::LazyLock;
-use log::{debug, info};
 
 #[derive(Embed)]
 #[folder = "assets/skills/"]
@@ -93,9 +93,8 @@ impl Skill {
         for file in SkillsAsset::iter() {
             debug!("Processing skill file: {}", file.as_ref());
 
-            let embedded_file = SkillsAsset::get(&file).ok_or_else(|| {
-                anyhow!("Failed to load embedded skill file: {}", file.as_ref())
-            })?;
+            let embedded_file = SkillsAsset::get(&file)
+                .ok_or_else(|| anyhow!("Failed to load embedded skill file: {}", file.as_ref()))?;
             let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
             let file_path = paths::skills_dir().join(file.as_ref());
 
@@ -118,9 +117,8 @@ impl Skill {
 
     pub fn load(name: &str) -> Result<Self> {
         let path = paths::skill_file(name);
-        let content = read_to_string(&path).with_context(|| {
-            format!("Failed to read skill '{name}' at {}", path.display())
-        })?;
+        let content = read_to_string(&path)
+            .with_context(|| format!("Failed to read skill '{name}' at {}", path.display()))?;
         Ok(Skill::new(name, &content))
     }
 
@@ -152,7 +150,7 @@ impl Skill {
         if self.declares_tools() && !function_calling_enabled {
             return false;
         }
-        
+
         if self.declares_mcp_servers() && !mcp_enabled {
             return false;
         }
@@ -307,8 +305,7 @@ mod tests {
 
     #[test]
     fn is_compatible_requires_both_when_both_declared() {
-        let content =
-            "---\nenabled_tools: shell\nenabled_mcp_servers: github\n---\nbody";
+        let content = "---\nenabled_tools: shell\nenabled_mcp_servers: github\n---\nbody";
 
         let skill = Skill::new("test", content);
 

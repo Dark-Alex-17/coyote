@@ -93,7 +93,11 @@ impl SkillRegistry {
             tools.extend(parse_csv(skill.enabled_tools()));
             mcps.extend(parse_csv(skill.enabled_mcp_servers()));
             if !skip_body && !skill.body().is_empty() {
-                let separator = if effective.is_empty_prompt() { "" } else { "\n\n" };
+                let separator = if effective.is_empty_prompt() {
+                    ""
+                } else {
+                    "\n\n"
+                };
                 effective.append_to_prompt(separator);
                 effective.append_to_prompt(skill.body());
             }
@@ -242,10 +246,7 @@ mod tests {
 
         let tools_str = effective.enabled_tools().unwrap();
         let tools: BTreeSet<&str> = tools_str.split(',').collect();
-        assert_eq!(
-            tools,
-            BTreeSet::from(["fs", "git", "shell", "web_search"])
-        );
+        assert_eq!(tools, BTreeSet::from(["fs", "git", "shell", "web_search"]));
 
         let mcps_str = effective.enabled_mcp_servers().unwrap();
         let mcps: BTreeSet<&str> = mcps_str.split(',').collect();

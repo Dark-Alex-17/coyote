@@ -375,7 +375,12 @@ fn plan_changes(layout: &RemoteLayout) -> Result<InstallPlan> {
     }
 
     if let Some(src_dir) = &layout.skills {
-        plan_dir_into(src_dir, &paths::skills_dir(), TopCategory::Skills, &mut files)?;
+        plan_dir_into(
+            src_dir,
+            &paths::skills_dir(),
+            TopCategory::Skills,
+            &mut files,
+        )?;
     }
 
     if let Some(src_dir) = &layout.macros {

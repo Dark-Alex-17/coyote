@@ -145,15 +145,9 @@ mod tests {
     fn defaults_yield_skills_enabled_with_empty_universe() {
         let global = AppConfig::default();
 
-        let policy = SkillPolicy::effective_with(
-            &global,
-            None,
-            None,
-            None,
-            &always_true,
-            &empty_installed,
-        )
-        .unwrap();
+        let policy =
+            SkillPolicy::effective_with(&global, None, None, None, &always_true, &empty_installed)
+                .unwrap();
 
         assert!(policy.skills_enabled);
         assert!(policy.enabled.is_empty());
@@ -177,15 +171,9 @@ mod tests {
     fn falls_back_to_visible_when_visible_set_but_no_enabled() {
         let global = make_app_config(true, None, Some(&["alpha", "beta"]));
 
-        let policy = SkillPolicy::effective_with(
-            &global,
-            None,
-            None,
-            None,
-            &always_true,
-            &empty_installed,
-        )
-        .unwrap();
+        let policy =
+            SkillPolicy::effective_with(&global, None, None, None, &always_true, &empty_installed)
+                .unwrap();
 
         assert_eq!(policy.enabled.len(), 2);
         assert!(policy.enabled.contains("alpha"));
@@ -196,15 +184,9 @@ mod tests {
     fn global_enabled_skills_is_effective_when_no_other_levels() {
         let global = make_app_config(true, Some("alpha,beta"), Some(&["alpha", "beta", "gamma"]));
 
-        let policy = SkillPolicy::effective_with(
-            &global,
-            None,
-            None,
-            None,
-            &always_true,
-            &empty_installed,
-        )
-        .unwrap();
+        let policy =
+            SkillPolicy::effective_with(&global, None, None, None, &always_true, &empty_installed)
+                .unwrap();
 
         assert!(policy.enabled.contains("alpha"));
         assert!(policy.enabled.contains("beta"));
@@ -214,10 +196,7 @@ mod tests {
     #[test]
     fn role_overrides_global_enabled_skills() {
         let global = make_app_config(true, Some("alpha"), Some(&["alpha", "beta"]));
-        let role = Role::new(
-            "test",
-            "---\nenabled_skills: beta\n---\nbody",
-        );
+        let role = Role::new("test", "---\nenabled_skills: beta\n---\nbody");
 
         let policy = SkillPolicy::effective_with(
             &global,
@@ -258,14 +237,9 @@ mod tests {
             ..AppConfig::default()
         };
 
-        let policy = SkillPolicy::effective_with(
-            &global,
-            None,
-            None,
-            None,
-            &always_true,
-            &|| vec!["alpha".to_string()],
-        )
+        let policy = SkillPolicy::effective_with(&global, None, None, None, &always_true, &|| {
+            vec!["alpha".to_string()]
+        })
         .unwrap();
 
         assert!(!policy.allows("alpha"));
@@ -275,15 +249,9 @@ mod tests {
     fn allows_returns_true_when_skill_in_enabled_set() {
         let global = make_app_config(true, Some("alpha"), None);
 
-        let policy = SkillPolicy::effective_with(
-            &global,
-            None,
-            None,
-            None,
-            &always_true,
-            &empty_installed,
-        )
-        .unwrap();
+        let policy =
+            SkillPolicy::effective_with(&global, None, None, None, &always_true, &empty_installed)
+                .unwrap();
 
         assert!(policy.allows("alpha"));
         assert!(!policy.allows("beta"));
@@ -293,15 +261,9 @@ mod tests {
     fn validation_rejects_uninstalled_skill_reference() {
         let global = make_app_config(true, Some("ghost"), None);
 
-        let err = SkillPolicy::effective_with(
-            &global,
-            None,
-            None,
-            None,
-            &|_| false,
-            &empty_installed,
-        )
-        .unwrap_err();
+        let err =
+            SkillPolicy::effective_with(&global, None, None, None, &|_| false, &empty_installed)
+                .unwrap_err();
 
         assert!(err.to_string().contains("not installed"));
         assert!(err.to_string().contains("ghost"));
@@ -311,15 +273,9 @@ mod tests {
     fn validation_rejects_skill_not_in_visible_set() {
         let global = make_app_config(true, Some("beta"), Some(&["alpha"]));
 
-        let err = SkillPolicy::effective_with(
-            &global,
-            None,
-            None,
-            None,
-            &always_true,
-            &empty_installed,
-        )
-        .unwrap_err();
+        let err =
+            SkillPolicy::effective_with(&global, None, None, None, &always_true, &empty_installed)
+                .unwrap_err();
 
         assert!(err.to_string().contains("not in visible_skills"));
         assert!(err.to_string().contains("beta"));
@@ -329,15 +285,9 @@ mod tests {
     fn validation_skipped_when_no_explicit_enabled_skills() {
         let global = make_app_config(true, None, None);
 
-        let policy = SkillPolicy::effective_with(
-            &global,
-            None,
-            None,
-            None,
-            &|_| false,
-            &empty_installed,
-        )
-        .unwrap();
+        let policy =
+            SkillPolicy::effective_with(&global, None, None, None, &|_| false, &empty_installed)
+                .unwrap();
 
         assert!(policy.enabled.is_empty());
     }

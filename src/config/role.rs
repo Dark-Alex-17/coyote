@@ -103,9 +103,7 @@ impl Role {
                         role.enabled_mcp_servers = value.as_str().map(|v| v.to_string())
                     }
                     "skills_enabled" => role.skills_enabled = value.as_bool(),
-                    "enabled_skills" => {
-                        role.enabled_skills = value.as_str().map(|v| v.to_string())
-                    }
+                    "enabled_skills" => role.enabled_skills = value.as_str().map(|v| v.to_string()),
                     "auto_continue" => role.auto_continue = value.as_bool(),
                     "max_auto_continues" => {
                         role.max_auto_continues = value.as_u64().map(|v| v as usize)
