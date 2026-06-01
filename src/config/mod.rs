@@ -12,6 +12,7 @@ mod request_context;
 mod role;
 mod session;
 mod skill;
+mod skill_registry;
 pub(crate) mod todo;
 mod tool_scope;
 mod update;
@@ -33,6 +34,8 @@ pub use self::role::{
 use self::session::Session;
 #[allow(unused_imports)]
 pub use self::skill::Skill;
+#[allow(unused_imports)]
+pub use self::skill_registry::SkillRegistry;
 pub use self::update::run_self_update;
 use crate::client::{
     ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,

@@ -81,6 +81,14 @@ impl Skill {
         Ok(Skill::new(name, content))
     }
 
+    pub fn load(name: &str) -> Result<Self> {
+        let path = paths::skill_file(name);
+        let content = read_to_string(&path).with_context(|| {
+            format!("Failed to read skill '{name}' at {}", path.display())
+        })?;
+        Ok(Skill::new(name, &content))
+    }
+
     pub fn list_builtin_skill_names() -> Vec<String> {
         SkillsAsset::iter()
             .filter_map(|v| v.strip_suffix("/SKILL.md").map(|v| v.to_string()))
