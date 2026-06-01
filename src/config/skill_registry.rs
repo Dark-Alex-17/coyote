@@ -6,6 +6,7 @@ use indexmap::IndexMap;
 use std::collections::BTreeSet;
 
 #[allow(dead_code)]
+#[derive(Clone, Default)]
 pub struct SkillRegistry {
     loaded: IndexMap<String, Skill>,
 }
@@ -22,9 +23,20 @@ impl SkillRegistry {
         if self.loaded.contains_key(name) {
             bail!("Skill '{name}' is already loaded");
         }
-
         let skill = Skill::load(name)?;
         self.loaded.insert(name.to_string(), skill);
+
+        Ok(())
+    }
+
+    pub fn insert(&mut self, skill: Skill) -> Result<()> {
+        let name = skill.name().to_string();
+
+        if self.loaded.contains_key(&name) {
+            bail!("Skill '{name}' is already loaded");
+        }
+
+        self.loaded.insert(name, skill);
 
         Ok(())
     }
@@ -82,12 +94,6 @@ impl SkillRegistry {
         }
 
         effective
-    }
-}
-
-impl Default for SkillRegistry {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

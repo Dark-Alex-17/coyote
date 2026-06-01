@@ -123,9 +123,11 @@ impl Skill {
         if self.declares_tools() && !function_calling_enabled {
             return false;
         }
+        
         if self.declares_mcp_servers() && !mcp_enabled {
             return false;
         }
+
         true
     }
 
