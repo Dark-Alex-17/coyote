@@ -1874,13 +1874,11 @@ impl RequestContext {
                 }
                 ".macro" => super::map_completion_values(paths::list_macros()),
                 ".skill" => {
-                    let mut values: Vec<String> = vec![
+                    super::map_completion_values(vec![
                         "loaded".to_string(),
                         "load".to_string(),
                         "unload".to_string(),
-                    ];
-                    values.extend(paths::list_skills());
-                    super::map_completion_values(values)
+                    ])
                 }
                 ".starter" => match &self.agent {
                     Some(agent) => agent
