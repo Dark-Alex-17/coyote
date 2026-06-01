@@ -42,6 +42,11 @@ global_tools:                    # Optional list of additional global tools to e
   - web_search
   - fs
   - python
+skills_enabled: true             # Master switch for skills in this agent (default: inherit from global)
+enabled_skills:                  # Optional list of skills available when this agent runs.
+                                 # Must be a subset of global `visible_skills`. Omit to inherit the global default.
+  - git-master
+  - ai-slop-remover
 dynamic_instructions: false      # Whether to use dynamic instructions for the agent; if false, static instructions are used
 instructions: |                  # Static instructions for the agent; ignored if dynamic instructions are used
   You are a AI agent designed to demonstrate agent capabilities.

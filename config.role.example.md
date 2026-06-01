@@ -10,6 +10,9 @@ temperature: 0.2                      # The temperature to use for this role whe
 top_p: 0                              # The top_p to use for this role when querying the model
 enabled_tools: fs_ls,fs_cat           # A comma-separated list of tools to enable for this role
 enabled_mcp_servers: github,gitmcp    # A comma-separated list of MCP servers to enable for this role
+skills_enabled: true                  # Master switch for skills in this role (default: inherit from global)
+enabled_skills: git-master,ai-slop-remover  # Comma-separated list of skills available when this role is active.
+                                      # Must be a subset of global `visible_skills`. Omit to inherit the global default.
 prompt: null                          # A custom prompt to use for this role that will immediately query
                                       # the model for output instead of using the instructions below
 # Auto-Continue (Todo System)

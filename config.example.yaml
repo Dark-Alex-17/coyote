@@ -80,6 +80,21 @@ mapping_mcp_servers:             # Alias for an MCP server or set of servers
   git: github,gitmcp
 enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 'github,slack,ddg-search')
 
+# ---- Skills ----
+# Skills are modular knowledge or capability packs the LLM can load and unload mid-conversation.
+# See the [Skills documentation](https://github.com/Dark-Alex-17/coyote/wiki/Skills) for more details.
+skills_enabled: true             # Master switch. Set to false to hide all skill management tools from the model.
+visible_skills:                  # The universe of skills allowed to be enabled in any context. Omit (null) for "all installed".
+  - ai-slop-remover
+  - code-review
+  - frontend-ui-ux
+  - git-master
+enabled_skills: null             # Which skills are available by default (no role/agent/session active). null = all visible.
+                                 # Example: only expose two skills in the bare REPL.
+                                 #   enabled_skills:
+                                 #     - git-master
+                                 #     - ai-slop-remover
+
 # ---- Auto-Continue (Todo System) ----
 # The auto-continue system provides built-in task tracking for improved reliability.
 # When enabled, the model can create todo lists and the system will automatically
