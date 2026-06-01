@@ -3,7 +3,7 @@ use super::{
     AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME,
     ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME, GLOBAL_TOOLS_DIR_NAME,
     GLOBAL_TOOLS_UTILS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, ModelsOverride, RAGS_DIR_NAME,
-    ROLES_DIR_NAME,
+    ROLES_DIR_NAME, SKILLS_DIR_NAME,
 };
 use crate::client::ProviderModels;
 use crate::utils::{get_env_name, list_file_names, normalize_env_name};
@@ -63,6 +63,24 @@ pub fn roles_dir() -> PathBuf {
 
 pub fn role_file(name: &str) -> PathBuf {
     roles_dir().join(format!("{name}.md"))
+}
+
+#[allow(dead_code)]
+pub fn skills_dir() -> PathBuf {
+    match env::var(get_env_name("skills_dir")) {
+        Ok(value) => PathBuf::from(value),
+        Err(_) => local_path(SKILLS_DIR_NAME),
+    }
+}
+
+#[allow(dead_code)]
+pub fn skill_dir(name: &str) -> PathBuf {
+    skills_dir().join(name)
+}
+
+#[allow(dead_code)]
+pub fn skill_file(name: &str) -> PathBuf {
+    skill_dir(name).join("SKILL.md")
 }
 
 pub fn macros_dir() -> PathBuf {
@@ -232,6 +250,30 @@ pub fn list_macros() -> Vec<String> {
 pub fn has_macro(name: &str) -> bool {
     let names = list_macros();
     names.contains(&name.to_string())
+}
+
+#[allow(dead_code)]
+pub fn list_skills() -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(rd) = read_dir(skills_dir()) {
+        for entry in rd.flatten() {
+            if let Ok(file_type) = entry.file_type()
+                && file_type.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+                && entry.path().join("SKILL.md").is_file()
+            {
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    names.sort_unstable();
+    names
+}
+
+#[allow(dead_code)]
+pub fn has_skill(name: &str) -> bool {
+    skill_file(name).is_file()
 }
 
 pub fn local_models_override() -> Result<Vec<ProviderModels>> {
