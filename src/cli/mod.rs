@@ -116,6 +116,12 @@ pub struct Cli {
     /// List all macros
     #[arg(long)]
     pub list_macros: bool,
+    /// List all installed skills
+    #[arg(long)]
+    pub list_skills: bool,
+    /// Open a skill in $EDITOR (creates with a scaffold if missing)
+    #[arg(long, value_name = "NAME")]
+    pub skill: Option<String>,
     /// Input text
     #[arg(trailing_var_arg = true)]
     text: Vec<String>,
@@ -298,6 +304,13 @@ mod tests {
         assert!(parse(&["--list-agents"]).list_agents);
         assert!(parse(&["--list-rags"]).list_rags);
         assert!(parse(&["--list-macros"]).list_macros);
+        assert!(parse(&["--list-skills"]).list_skills);
+    }
+
+    #[test]
+    fn parse_skill_flag_takes_name() {
+        assert_eq!(parse(&["--skill", "git-master"]).skill.as_deref(), Some("git-master"));
+        assert!(parse(&[]).skill.is_none());
     }
 
     #[test]

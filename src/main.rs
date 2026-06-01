@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
         || cli.list_agents
         || cli.list_rags
         || cli.list_macros
+        || cli.list_skills
         || cli.list_sessions;
     let vault_flags = cli.add_secret.is_some()
         || cli.get_secret.is_some()
@@ -189,6 +190,16 @@ async fn run(
     if cli.list_macros {
         let macros = paths::list_macros().join("\n");
         println!("{macros}");
+        return Ok(());
+    }
+    if cli.list_skills {
+        let skills = paths::list_skills().join("\n");
+        println!("{skills}");
+        return Ok(());
+    }
+    if let Some(name) = &cli.skill {
+        let app = Arc::clone(&ctx.app.config);
+        ctx.upsert_skill(app.as_ref(), name)?;
         return Ok(());
     }
 
