@@ -56,6 +56,10 @@ pub struct Role {
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled_mcp_servers: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    skills_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled_skills: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     auto_continue: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_auto_continues: Option<usize>,
@@ -97,6 +101,10 @@ impl Role {
                     "enabled_tools" => role.enabled_tools = value.as_str().map(|v| v.to_string()),
                     "enabled_mcp_servers" => {
                         role.enabled_mcp_servers = value.as_str().map(|v| v.to_string())
+                    }
+                    "skills_enabled" => role.skills_enabled = value.as_bool(),
+                    "enabled_skills" => {
+                        role.enabled_skills = value.as_str().map(|v| v.to_string())
                     }
                     "auto_continue" => role.auto_continue = value.as_bool(),
                     "max_auto_continues" => {
@@ -146,6 +154,12 @@ impl Role {
         }
         if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
             metadata.push(format!("enabled_mcp_servers: {enabled_mcp_servers}"));
+        }
+        if let Some(skills_enabled) = self.skills_enabled {
+            metadata.push(format!("skills_enabled: {skills_enabled}"));
+        }
+        if let Some(enabled_skills) = &self.enabled_skills {
+            metadata.push(format!("enabled_skills: {enabled_skills}"));
         }
         if let Some(auto_continue) = self.auto_continue {
             metadata.push(format!("auto_continue: {auto_continue}"));
@@ -269,6 +283,16 @@ impl Role {
 
     pub fn continuation_prompt(&self) -> Option<&str> {
         self.continuation_prompt.as_deref()
+    }
+
+    #[allow(dead_code)]
+    pub fn skills_enabled(&self) -> Option<bool> {
+        self.skills_enabled
+    }
+
+    #[allow(dead_code)]
+    pub fn enabled_skills(&self) -> Option<&str> {
+        self.enabled_skills.as_deref()
     }
 
     pub fn append_to_prompt(&mut self, text: &str) {

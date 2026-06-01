@@ -12,6 +12,7 @@ mod request_context;
 mod role;
 mod session;
 mod skill;
+mod skill_policy;
 mod skill_registry;
 pub(crate) mod todo;
 mod tool_scope;
@@ -34,6 +35,8 @@ pub use self::role::{
 use self::session::Session;
 #[allow(unused_imports)]
 pub use self::skill::Skill;
+#[allow(unused_imports)]
+pub use self::skill_policy::SkillPolicy;
 #[allow(unused_imports)]
 pub use self::skill_registry::SkillRegistry;
 pub use self::update::run_self_update;
@@ -151,6 +154,10 @@ pub struct Config {
     pub enabled_tools: Option<String>,
     pub visible_tools: Option<Vec<String>>,
 
+    pub skills_enabled: bool,
+    pub enabled_skills: Option<String>,
+    pub visible_skills: Option<Vec<String>>,
+
     pub mcp_server_support: bool,
     pub mapping_mcp_servers: IndexMap<String, String>,
     pub enabled_mcp_servers: Option<String>,
@@ -211,6 +218,10 @@ impl Default for Config {
             mapping_tools: Default::default(),
             enabled_tools: None,
             visible_tools: None,
+
+            skills_enabled: true,
+            enabled_skills: None,
+            visible_skills: None,
 
             mcp_server_support: true,
             mapping_mcp_servers: Default::default(),

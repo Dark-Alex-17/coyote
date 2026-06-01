@@ -35,6 +35,10 @@ pub struct AppConfig {
     pub enabled_tools: Option<String>,
     pub visible_tools: Option<Vec<String>>,
 
+    pub skills_enabled: bool,
+    pub enabled_skills: Option<String>,
+    pub visible_skills: Option<Vec<String>>,
+
     pub mcp_server_support: bool,
     pub mapping_mcp_servers: IndexMap<String, String>,
     pub enabled_mcp_servers: Option<String>,
@@ -95,6 +99,10 @@ impl Default for AppConfig {
             mapping_tools: Default::default(),
             enabled_tools: None,
             visible_tools: None,
+
+            skills_enabled: true,
+            enabled_skills: None,
+            visible_skills: None,
 
             mcp_server_support: true,
             mapping_mcp_servers: Default::default(),
@@ -157,6 +165,10 @@ impl AppConfig {
             mapping_tools: config.mapping_tools,
             enabled_tools: config.enabled_tools,
             visible_tools: config.visible_tools,
+
+            skills_enabled: config.skills_enabled,
+            enabled_skills: config.enabled_skills,
+            visible_skills: config.visible_skills,
 
             mcp_server_support: config.mcp_server_support,
             mapping_mcp_servers: config.mapping_mcp_servers,
@@ -377,6 +389,14 @@ impl AppConfig {
         }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("enabled_tools")) {
             self.enabled_tools = v;
+        }
+
+        if let Some(Some(v)) = super::read_env_bool(&get_env_name("skills_enabled")) {
+            self.skills_enabled = v;
+        }
+        
+        if let Some(v) = super::read_env_value::<String>(&get_env_name("enabled_skills")) {
+            self.enabled_skills = v;
         }
 
         if let Some(Some(v)) = super::read_env_bool(&get_env_name("mcp_server_support")) {
