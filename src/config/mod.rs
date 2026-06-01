@@ -11,6 +11,7 @@ mod rag_cache;
 mod request_context;
 mod role;
 mod session;
+mod skill;
 pub(crate) mod todo;
 mod tool_scope;
 mod update;
@@ -30,6 +31,8 @@ pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
 use self::session::Session;
+#[allow(unused_imports)]
+pub use self::skill::Skill;
 pub use self::update::run_self_update;
 use crate::client::{
     ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
@@ -74,6 +77,8 @@ const LIGHT_THEME: &[u8] = include_bytes!("../../assets/monokai-extended-light.t
 const CONFIG_FILE_NAME: &str = "config.yaml";
 const AGENT_GRAPH_FILE_NAME: &str = "graph.yaml";
 const ROLES_DIR_NAME: &str = "roles";
+#[allow(dead_code)]
+const SKILLS_DIR_NAME: &str = "skills";
 const MACROS_DIR_NAME: &str = "macros";
 const ENV_FILE_NAME: &str = ".env";
 const MESSAGES_FILE_NAME: &str = "messages.md";
