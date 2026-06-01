@@ -77,7 +77,6 @@ const LIGHT_THEME: &[u8] = include_bytes!("../../assets/monokai-extended-light.t
 const CONFIG_FILE_NAME: &str = "config.yaml";
 const AGENT_GRAPH_FILE_NAME: &str = "graph.yaml";
 const ROLES_DIR_NAME: &str = "roles";
-#[allow(dead_code)]
 const SKILLS_DIR_NAME: &str = "skills";
 const MACROS_DIR_NAME: &str = "macros";
 const ENV_FILE_NAME: &str = ".env";
