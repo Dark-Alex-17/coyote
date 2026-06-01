@@ -24,7 +24,7 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
     if layout.is_empty() {
         println!(
             "No recognized assets found in {git_url}. Expected one or more of: \
-             agents/, roles/, macros/, functions/tools/, functions/mcp.json"
+             agents/, roles/, skills/, macros/, functions/tools/, functions/mcp.json"
         );
         return Ok(());
     }
@@ -193,6 +193,7 @@ fn run_git(args: Vec<OsString>) -> Result<()> {
 struct RemoteLayout {
     agents: Option<PathBuf>,
     roles: Option<PathBuf>,
+    skills: Option<PathBuf>,
     macros: Option<PathBuf>,
     functions_tools: Option<PathBuf>,
     mcp_json: Option<PathBuf>,
@@ -202,6 +203,7 @@ impl RemoteLayout {
     fn is_empty(&self) -> bool {
         self.agents.is_none()
             && self.roles.is_none()
+            && self.skills.is_none()
             && self.macros.is_none()
             && self.functions_tools.is_none()
             && self.mcp_json.is_none()
@@ -215,20 +217,29 @@ fn scan_remote_layout(root: &Path) -> Result<RemoteLayout> {
     if agents.is_dir() {
         layout.agents = Some(agents);
     }
+
     let roles = root.join("roles");
     if roles.is_dir() {
         layout.roles = Some(roles);
     }
+
+    let skills = root.join("skills");
+    if skills.is_dir() {
+        layout.skills = Some(skills);
+    }
+
     let macros = root.join("macros");
     if macros.is_dir() {
         layout.macros = Some(macros);
     }
+
     let functions = root.join("functions");
     if functions.is_dir() {
         let tools = functions.join("tools");
         if tools.is_dir() {
             layout.functions_tools = Some(tools);
         }
+
         let mcp = functions.join("mcp.json");
         if mcp.is_file() {
             layout.mcp_json = Some(mcp);
@@ -249,6 +260,10 @@ fn apply_filter(mut layout: RemoteLayout, filter: Option<InstallFilter>) -> Remo
         },
         InstallFilter::Roles => RemoteLayout {
             roles: layout.roles.take(),
+            ..RemoteLayout::default()
+        },
+        InstallFilter::Skills => RemoteLayout {
+            skills: layout.skills.take(),
             ..RemoteLayout::default()
         },
         InstallFilter::Macros => RemoteLayout {
@@ -308,6 +323,7 @@ fn walk_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 enum TopCategory {
     Agents,
     Roles,
+    Skills,
     Macros,
     FunctionsTools,
 }
@@ -317,6 +333,7 @@ impl TopCategory {
         match self {
             TopCategory::Agents => "agents",
             TopCategory::Roles => "roles",
+            TopCategory::Skills => "skills",
             TopCategory::Macros => "macros",
             TopCategory::FunctionsTools => "functions/tools",
         }
@@ -356,6 +373,11 @@ fn plan_changes(layout: &RemoteLayout) -> Result<InstallPlan> {
     if let Some(src_dir) = &layout.roles {
         plan_dir_into(src_dir, &paths::roles_dir(), TopCategory::Roles, &mut files)?;
     }
+
+    if let Some(src_dir) = &layout.skills {
+        plan_dir_into(src_dir, &paths::skills_dir(), TopCategory::Skills, &mut files)?;
+    }
+
     if let Some(src_dir) = &layout.macros {
         plan_dir_into(
             src_dir,
@@ -457,6 +479,7 @@ fn print_plan_summary(plan: &InstallPlan) {
     for cat in [
         TopCategory::Agents,
         TopCategory::Roles,
+        TopCategory::Skills,
         TopCategory::Macros,
         TopCategory::FunctionsTools,
     ] {
@@ -982,6 +1005,7 @@ mod tests {
         let l = RemoteLayout {
             agents: Some(PathBuf::from("a")),
             roles: Some(PathBuf::from("r")),
+            skills: Some(PathBuf::from("s")),
             macros: Some(PathBuf::from("m")),
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
@@ -989,8 +1013,8 @@ mod tests {
 
         let out = apply_filter(l, None);
 
-        assert!(out.agents.is_some() && out.roles.is_some() && out.macros.is_some());
-        assert!(out.functions_tools.is_some() && out.mcp_json.is_some());
+        assert!(out.agents.is_some() && out.roles.is_some() && out.skills.is_some());
+        assert!(out.macros.is_some() && out.functions_tools.is_some() && out.mcp_json.is_some());
     }
 
     #[test]
@@ -998,6 +1022,7 @@ mod tests {
         let l = RemoteLayout {
             agents: Some(PathBuf::from("a")),
             roles: None,
+            skills: Some(PathBuf::from("s")),
             macros: None,
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
@@ -1006,6 +1031,7 @@ mod tests {
         let out = apply_filter(l, Some(InstallFilter::Functions));
 
         assert!(out.agents.is_none());
+        assert!(out.skills.is_none());
         assert_eq!(out.functions_tools, Some(PathBuf::from("f")));
         assert!(out.mcp_json.is_none());
     }
@@ -1015,6 +1041,7 @@ mod tests {
         let l = RemoteLayout {
             agents: Some(PathBuf::from("a")),
             roles: None,
+            skills: Some(PathBuf::from("s")),
             macros: None,
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
@@ -1022,7 +1049,7 @@ mod tests {
 
         let out = apply_filter(l, Some(InstallFilter::McpConfig));
 
-        assert!(out.agents.is_none() && out.functions_tools.is_none());
+        assert!(out.agents.is_none() && out.skills.is_none() && out.functions_tools.is_none());
         assert_eq!(out.mcp_json, Some(PathBuf::from("j")));
     }
 
@@ -1031,6 +1058,7 @@ mod tests {
         let l = RemoteLayout {
             agents: Some(PathBuf::from("a")),
             roles: Some(PathBuf::from("r")),
+            skills: Some(PathBuf::from("s")),
             macros: Some(PathBuf::from("m")),
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
@@ -1039,7 +1067,25 @@ mod tests {
         let out = apply_filter(l, Some(InstallFilter::Roles));
 
         assert_eq!(out.roles, Some(PathBuf::from("r")));
-        assert!(out.agents.is_none() && out.macros.is_none());
+        assert!(out.agents.is_none() && out.skills.is_none() && out.macros.is_none());
+        assert!(out.functions_tools.is_none() && out.mcp_json.is_none());
+    }
+
+    #[test]
+    fn apply_filter_skills_keeps_only_skills() {
+        let l = RemoteLayout {
+            agents: Some(PathBuf::from("a")),
+            roles: Some(PathBuf::from("r")),
+            skills: Some(PathBuf::from("s")),
+            macros: Some(PathBuf::from("m")),
+            functions_tools: Some(PathBuf::from("f")),
+            mcp_json: Some(PathBuf::from("j")),
+        };
+
+        let out = apply_filter(l, Some(InstallFilter::Skills));
+
+        assert_eq!(out.skills, Some(PathBuf::from("s")));
+        assert!(out.agents.is_none() && out.roles.is_none() && out.macros.is_none());
         assert!(out.functions_tools.is_none() && out.mcp_json.is_none());
     }
 
@@ -1084,8 +1130,10 @@ mod tests {
     #[test]
     fn scan_remote_layout_finds_known_subdirs() {
         let root = fresh_temp_dir("scan-test-");
+
         fs::create_dir_all(root.join("agents/sample")).unwrap();
         fs::create_dir_all(root.join("roles")).unwrap();
+        fs::create_dir_all(root.join("skills")).unwrap();
         fs::create_dir_all(root.join("macros")).unwrap();
         fs::create_dir_all(root.join("functions/tools")).unwrap();
         touch(&root.join("functions/mcp.json"));
@@ -1094,9 +1142,27 @@ mod tests {
         let layout = scan_remote_layout(&root).unwrap();
         assert!(layout.agents.is_some());
         assert!(layout.roles.is_some());
+        assert!(layout.skills.is_some());
         assert!(layout.macros.is_some());
         assert!(layout.functions_tools.is_some());
         assert!(layout.mcp_json.is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_remote_layout_finds_skills_only() {
+        let root = fresh_temp_dir("scan-skills-only-");
+        fs::create_dir_all(root.join("skills/git-master")).unwrap();
+        touch(&root.join("skills/git-master/SKILL.md"));
+
+        let layout = scan_remote_layout(&root).unwrap();
+
+        assert!(layout.skills.is_some());
+        assert!(layout.agents.is_none());
+        assert!(layout.roles.is_none());
+        assert!(layout.macros.is_none());
+        assert!(layout.functions_tools.is_none());
+        assert!(layout.mcp_json.is_none());
         let _ = fs::remove_dir_all(&root);
     }
 
