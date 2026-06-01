@@ -529,8 +529,8 @@ pub async fn run_repl_command(
     .skill loaded                   # List currently-loaded skills
     .skill load <name>              # Load a skill into the current context
     .skill unload <name>            # Unload a loaded skill
-    .skill edit <name>              # Open an existing skill in $EDITOR
-    .skill <name>                   # Open the skill in $EDITOR; create with a scaffold if missing"#
+    .skill <name>                   # Open the skill in $EDITOR; create with a scaffold if missing
+                                    # (Use `.edit skill <name>` to edit an existing skill without the create-if-missing behavior.)"#
                     ),
                     "loaded" => ctx.list_loaded_skills(),
                     "load" => {
@@ -545,19 +545,6 @@ pub async fn run_repl_command(
                             println!("Usage: .skill unload <name>");
                         } else {
                             ctx.unload_skill_repl(rest, abort_signal.clone()).await?;
-                        }
-                    }
-                    "edit" => {
-                        if rest.is_empty() {
-                            println!("Usage: .skill edit <name>");
-                        } else if !paths::has_skill(rest) {
-                            bail!(
-                                "Skill '{rest}' is not installed (expected at {})",
-                                paths::skill_file(rest).display()
-                            );
-                        } else {
-                            let app = Arc::clone(&ctx.app.config);
-                            ctx.upsert_skill(app.as_ref(), rest)?;
                         }
                     }
                     name => {
@@ -712,9 +699,23 @@ pub async fn run_repl_command(
                     Some("mcp-config") => {
                         ctx.edit_mcp_config()?;
                     }
+                    Some(s) if s == "skill" || s.starts_with("skill ") => {
+                        let name = s.strip_prefix("skill").unwrap_or("").trim();
+                        if name.is_empty() {
+                            println!("Usage: .edit skill <name>");
+                        } else if !paths::has_skill(name) {
+                            bail!(
+                                "Skill '{name}' is not installed (expected at {})",
+                                paths::skill_file(name).display()
+                            );
+                        } else {
+                            let app = Arc::clone(&ctx.app.config);
+                            ctx.upsert_skill(app.as_ref(), name)?;
+                        }
+                    }
                     _ => {
                         println!(
-                            r#"Usage: .edit <config|mcp-config|role|session|rag-docs|agent-config>"#
+                            r#"Usage: .edit <config|mcp-config|role|session|rag-docs|agent-config|skill <name>>"#
                         )
                     }
                 }

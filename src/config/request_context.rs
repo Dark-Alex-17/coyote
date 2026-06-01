@@ -1928,6 +1928,15 @@ impl RequestContext {
                     "skill",
                     "agent-data",
                 ]),
+                ".edit" => super::map_completion_values(vec![
+                    "config",
+                    "mcp-config",
+                    "role",
+                    "session",
+                    "rag-docs",
+                    "agent-config",
+                    "skill",
+                ]),
                 ".vault" => {
                     let mut values = vec!["add", "get", "update", "delete", "list"];
                     values.sort_unstable();
@@ -1938,6 +1947,8 @@ impl RequestContext {
                 }
                 _ => vec![],
             };
+        } else if cmd == ".edit" && args.first() == Some(&"skill") && args.len() == 2 {
+            values = super::map_completion_values(paths::list_skills());
         } else if cmd == ".install" && args.first() == Some(&"remote") && args.len() >= 2 {
             let prev = args.get(args.len() - 2).copied().unwrap_or("");
             if prev == "--filter" {
