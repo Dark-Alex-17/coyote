@@ -197,7 +197,9 @@ async fn run(
         println!("{skills}");
         return Ok(());
     }
-    if let Some(name) = &cli.skill {
+    if let Some(name) = &cli.skill
+        && !paths::has_skill(name)
+    {
         let app = Arc::clone(&ctx.app.config);
         ctx.upsert_skill(app.as_ref(), name)?;
         return Ok(());
@@ -313,6 +315,10 @@ async fn run(
         let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
         ctx.apply_prelude(app.as_ref(), abort_signal.clone())
             .await?;
+    }
+
+    if let Some(name) = &cli.skill {
+        ctx.load_skill_repl(name, abort_signal.clone()).await?;
     }
 
     match is_repl {
