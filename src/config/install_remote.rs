@@ -1294,6 +1294,12 @@ mod tests {
 
     #[test]
     fn merge_non_tty_conflict_aborts_without_force() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping merge_non_tty_conflict_aborts_without_force: requires non-TTY stdout"
+            );
+            return;
+        }
         let dir = fresh_temp_dir("merge-non-tty-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -1370,6 +1376,12 @@ mod tests {
 
     #[test]
     fn handle_missing_secrets_defers_all_in_non_tty() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping handle_missing_secrets_defers_all_in_non_tty: requires non-TTY stdout"
+            );
+            return;
+        }
         let missing = vec![
             "COYOTE_TEST_STEP4_A".to_string(),
             "COYOTE_TEST_STEP4_B".to_string(),
