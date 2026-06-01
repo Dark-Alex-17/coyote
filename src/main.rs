@@ -197,12 +197,18 @@ async fn run(
         println!("{skills}");
         return Ok(());
     }
-    if let Some(name) = &cli.skill
-        && !paths::has_skill(name)
-    {
+    if cli.skill.len() == 1 && !paths::has_skill(&cli.skill[0]) {
+        let name = &cli.skill[0];
         let app = Arc::clone(&ctx.app.config);
         ctx.upsert_skill(app.as_ref(), name)?;
         return Ok(());
+    }
+    if cli.skill.len() > 1 {
+        for name in &cli.skill {
+            if !paths::has_skill(name) {
+                bail!("Skill '{name}' is not installed");
+            }
+        }
     }
 
     if cli.dry_run {
@@ -317,7 +323,7 @@ async fn run(
             .await?;
     }
 
-    if let Some(name) = &cli.skill {
+    for name in &cli.skill {
         ctx.load_skill_repl(name, abort_signal.clone()).await?;
     }
 
