@@ -355,7 +355,6 @@ impl Functions {
         self.declarations.extend(todo::todo_function_declarations());
     }
 
-    #[allow(dead_code)]
     pub fn append_skill_functions(&mut self) {
         self.declarations
             .extend(skill::skill_function_declarations());

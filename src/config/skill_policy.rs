@@ -7,15 +7,12 @@ use super::session::Session;
 use anyhow::{Result, bail};
 use std::collections::HashSet;
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct SkillPolicy {
     pub skills_enabled: bool,
-    pub visible: Option<HashSet<String>>,
     pub enabled: HashSet<String>,
 }
 
-#[allow(dead_code)]
 impl SkillPolicy {
     pub fn effective(
         global: &AppConfig,
@@ -101,7 +98,6 @@ impl SkillPolicy {
 
         Ok(Self {
             skills_enabled,
-            visible,
             enabled,
         })
     }
@@ -160,7 +156,6 @@ mod tests {
         .unwrap();
 
         assert!(policy.skills_enabled);
-        assert!(policy.visible.is_none());
         assert!(policy.enabled.is_empty());
     }
 

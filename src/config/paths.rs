@@ -72,12 +72,10 @@ pub fn skills_dir() -> PathBuf {
     }
 }
 
-#[allow(dead_code)]
 pub fn skill_dir(name: &str) -> PathBuf {
     skills_dir().join(name)
 }
 
-#[allow(dead_code)]
 pub fn skill_file(name: &str) -> PathBuf {
     skill_dir(name).join("SKILL.md")
 }
@@ -251,7 +249,6 @@ pub fn has_macro(name: &str) -> bool {
     names.contains(&name.to_string())
 }
 
-#[allow(dead_code)]
 pub fn list_skills() -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(rd) = read_dir(skills_dir()) {
@@ -270,7 +267,6 @@ pub fn list_skills() -> Vec<String> {
     names
 }
 
-#[allow(dead_code)]
 pub fn has_skill(name: &str) -> bool {
     skill_file(name).is_file()
 }

@@ -337,12 +337,10 @@ impl Agent {
         &self.config.mcp_servers
     }
 
-    #[allow(dead_code)]
     pub fn skills_enabled(&self) -> Option<bool> {
         self.config.skills_enabled
     }
 
-    #[allow(dead_code)]
     pub fn enabled_skills(&self) -> Option<&[String]> {
         self.config.enabled_skills.as_deref()
     }

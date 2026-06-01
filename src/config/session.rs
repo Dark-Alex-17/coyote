@@ -79,12 +79,10 @@ pub struct Session {
 }
 
 impl Session {
-    #[allow(dead_code)]
     pub fn skills_enabled(&self) -> Option<bool> {
         self.skills_enabled
     }
 
-    #[allow(dead_code)]
     pub fn enabled_skills(&self) -> Option<&str> {
         self.enabled_skills.as_deref()
     }

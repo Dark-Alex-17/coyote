@@ -5,7 +5,6 @@ use anyhow::{Result, bail};
 use indexmap::IndexMap;
 use std::collections::BTreeSet;
 
-#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub struct SkillRegistry {
     loaded: IndexMap<String, Skill>,

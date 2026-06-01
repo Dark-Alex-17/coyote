@@ -268,6 +268,7 @@ pub fn install_builtins() -> Result<()> {
     Functions::install_builtin_global_tools(false)?;
     Agent::install_builtin_agents(false)?;
     Macro::install_macros(false)?;
+    Skill::install_builtin_skills(false)?;
     Ok(())
 }
 
@@ -276,18 +277,20 @@ pub enum AssetCategory {
     Agents,
     Macros,
     Functions,
+    Skills,
     #[value(name = "mcp_config")]
     McpConfig,
 }
 
 impl AssetCategory {
-    pub const NAMES: [&'static str; 4] = ["agents", "macros", "functions", "mcp_config"];
+    pub const NAMES: [&'static str; 5] = ["agents", "macros", "functions", "skills", "mcp_config"];
 
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "agents" => Some(Self::Agents),
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
+            "skills" => Some(Self::Skills),
             "mcp_config" => Some(Self::McpConfig),
             _ => None,
         }
@@ -333,6 +336,7 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
         AssetCategory::Agents => ("agents", paths::agents_data_dir()),
         AssetCategory::Macros => ("macros", paths::macros_dir()),
         AssetCategory::Functions => ("functions", paths::functions_dir()),
+        AssetCategory::Skills => ("skills", paths::skills_dir()),
         AssetCategory::McpConfig => ("MCP config", paths::mcp_config_file()),
     };
 
@@ -345,6 +349,7 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
         AssetCategory::Agents => Agent::install_builtin_agents(true)?,
         AssetCategory::Macros => Macro::install_macros(true)?,
         AssetCategory::Functions => Functions::install_builtin_global_tools(true)?,
+        AssetCategory::Skills => Skill::install_builtin_skills(true)?,
         AssetCategory::McpConfig => Functions::install_mcp_config()?,
     }
 
