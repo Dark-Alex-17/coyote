@@ -1,5 +1,6 @@
 use super::rag_cache::{RagCache, RagKey};
 use super::session::Session;
+use super::skill_registry::SkillRegistry;
 use super::todo::TodoList;
 use super::tool_scope::{McpRuntime, ToolScope};
 use super::{
@@ -82,6 +83,7 @@ pub struct RequestContext {
     pub current_depth: usize,
     pub auto_continue_count: usize,
     pub todo_list: TodoList,
+    pub skill_registry: SkillRegistry,
     pub last_continuation_response: Option<String>,
 
     pub render_mode: RenderMode,
@@ -110,6 +112,7 @@ impl RequestContext {
             current_depth: 0,
             auto_continue_count: 0,
             todo_list: TodoList::default(),
+            skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
             render_mode: RenderMode::default(),
         }
@@ -157,6 +160,7 @@ impl RequestContext {
             current_depth: 0,
             auto_continue_count: 0,
             todo_list: TodoList::default(),
+            skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
             render_mode: RenderMode::default(),
         })
@@ -198,6 +202,7 @@ impl RequestContext {
             current_depth: self.current_depth,
             auto_continue_count: 0,
             todo_list: self.todo_list.clone(),
+            skill_registry: self.skill_registry.clone(),
             last_continuation_response: None,
             render_mode: self.render_mode,
         }
@@ -237,6 +242,7 @@ impl RequestContext {
             current_depth,
             auto_continue_count: 0,
             todo_list: TodoList::default(),
+            skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
             render_mode: parent.render_mode,
         }
