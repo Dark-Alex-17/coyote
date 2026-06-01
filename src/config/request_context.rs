@@ -1,5 +1,6 @@
 use super::rag_cache::{RagCache, RagKey};
 use super::session::Session;
+use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
 use super::skill_registry::SkillRegistry;
 use super::todo::TodoList;
@@ -1544,6 +1545,7 @@ impl RequestContext {
             "session" => (self.sessions_dir(), Some(".yaml")),
             "rag" => (paths::rags_dir(), Some(".yaml")),
             "macro" => (paths::macros_dir(), Some(".yaml")),
+            "skill" => (paths::skills_dir(), None),
             "agent-data" => (paths::agents_data_dir(), None),
             _ => bail!("Unknown kind '{kind}'"),
         };
@@ -1869,6 +1871,16 @@ impl RequestContext {
                     super::map_completion_values(values)
                 }
                 ".macro" => super::map_completion_values(paths::list_macros()),
+                ".skill" => {
+                    let mut values: Vec<String> = vec![
+                        "loaded".to_string(),
+                        "load".to_string(),
+                        "unload".to_string(),
+                        "edit".to_string(),
+                    ];
+                    values.extend(paths::list_skills());
+                    super::map_completion_values(values)
+                }
                 ".starter" => match &self.agent {
                     Some(agent) => agent
                         .conversation_starters()
@@ -1911,6 +1923,7 @@ impl RequestContext {
                     "session",
                     "rag",
                     "macro",
+                    "skill",
                     "agent-data",
                 ]),
                 ".vault" => {
@@ -2471,6 +2484,117 @@ impl RequestContext {
             println!("✓ Saved the role to '{}'.", role_path.display());
         }
         Ok(())
+    }
+
+    pub fn upsert_skill(&self, app: &AppConfig, name: &str) -> Result<()> {
+        let path = paths::skill_file(name);
+        ensure_parent_exists(&path)?;
+        let is_new = !path.exists();
+        if is_new {
+            fs::write(&path, SKILL_SCAFFOLD).with_context(|| {
+                format!("Failed to scaffold skill at {}", path.display())
+            })?;
+        }
+
+        let editor = app.editor()?;
+        edit_file(&editor, &path)?;
+
+        if self.working_mode.is_repl() {
+            if is_new {
+                println!("✓ Created skill at '{}'.", path.display());
+            } else {
+                println!("✓ Saved skill at '{}'.", path.display());
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn load_skill_repl(
+        &mut self,
+        name: &str,
+        abort_signal: AbortSignal,
+    ) -> Result<()> {
+        if !paths::has_skill(name) {
+            bail!(
+                "Skill '{name}' is not installed (expected at {})",
+                paths::skill_file(name).display()
+            );
+        }
+
+        let policy = SkillPolicy::effective(
+            &self.app.config,
+            self.role.as_ref(),
+            self.agent.as_ref(),
+            self.session.as_ref(),
+        )?;
+
+        if !policy.skills_enabled {
+            bail!("Skills are disabled in this context");
+        }
+
+        if !policy.allows(name) {
+            bail!("Skill '{name}' is not enabled in this context");
+        }
+
+        let skill = Skill::load(name)?;
+        let fn_on = self.app.config.function_calling_support;
+        let mcp_on = self.app.config.mcp_server_support;
+        let needs_tools = skill
+            .enabled_tools()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let needs_mcps = skill
+            .enabled_mcp_servers()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+
+        if needs_tools && !fn_on {
+            bail!("Skill '{name}' requires function calling, which is disabled");
+        }
+
+        if needs_mcps && !mcp_on {
+            bail!("Skill '{name}' requires MCP servers, which are disabled");
+        }
+
+        self.skill_registry.insert(skill)?;
+        if let Err(e) = self.refresh_tool_scope(abort_signal).await {
+            let _ = self.skill_registry.unload(name);
+            bail!("Loaded skill '{name}' but failed to refresh tool scope: {e}");
+        }
+
+        println!("✓ Loaded skill '{name}'.");
+        Ok(())
+    }
+
+    pub async fn unload_skill_repl(
+        &mut self,
+        name: &str,
+        abort_signal: AbortSignal,
+    ) -> Result<()> {
+        self.skill_registry.unload(name)?;
+
+        if let Err(e) = self.refresh_tool_scope(abort_signal).await {
+            eprintln!(
+                "Warning: unloaded skill '{name}' but tool scope refresh failed: {e}"
+            );
+        }
+
+        println!("✓ Unloaded skill '{name}'.");
+        Ok(())
+    }
+
+    pub fn list_loaded_skills(&self) {
+        let names = self.skill_registry.loaded_names();
+
+        if names.is_empty() {
+            println!("No skills loaded.");
+        } else {
+            println!("Loaded skills:");
+            for name in names {
+                println!("  • {name}");
+            }
+        }
     }
 
     pub async fn apply_prelude(

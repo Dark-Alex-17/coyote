@@ -46,7 +46,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 42]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 43]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -191,6 +191,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 42]> = LazyLock::new(|| {
             AssertState::TrueFalse(StateFlags::RAG, StateFlags::AGENT),
         ),
         ReplCommand::new(".macro", "Execute a macro", AssertState::pass()),
+        ReplCommand::new(
+            ".skill",
+            "List, load, unload, edit, or create skills",
+            AssertState::pass(),
+        ),
         ReplCommand::new(
             ".file",
             "Include files, directories, URLs or commands",
@@ -513,6 +518,54 @@ pub async fn run_repl_command(
     .role <name> [text]...          # Temporarily switch to the role, send the text, and switch back"#
                 ),
             },
+            ".skill" => {
+                let trimmed = args.map(str::trim).unwrap_or("");
+                let mut parts = trimmed.splitn(2, char::is_whitespace);
+                let first = parts.next().unwrap_or("");
+                let rest = parts.next().map(str::trim).unwrap_or("");
+                match first {
+                    "" => println!(
+                        r#"Usage:
+    .skill loaded                   # List currently-loaded skills
+    .skill load <name>              # Load a skill into the current context
+    .skill unload <name>            # Unload a loaded skill
+    .skill edit <name>              # Open an existing skill in $EDITOR
+    .skill <name>                   # Open the skill in $EDITOR; create with a scaffold if missing"#
+                    ),
+                    "loaded" => ctx.list_loaded_skills(),
+                    "load" => {
+                        if rest.is_empty() {
+                            println!("Usage: .skill load <name>");
+                        } else {
+                            ctx.load_skill_repl(rest, abort_signal.clone()).await?;
+                        }
+                    }
+                    "unload" => {
+                        if rest.is_empty() {
+                            println!("Usage: .skill unload <name>");
+                        } else {
+                            ctx.unload_skill_repl(rest, abort_signal.clone()).await?;
+                        }
+                    }
+                    "edit" => {
+                        if rest.is_empty() {
+                            println!("Usage: .skill edit <name>");
+                        } else if !paths::has_skill(rest) {
+                            bail!(
+                                "Skill '{rest}' is not installed (expected at {})",
+                                paths::skill_file(rest).display()
+                            );
+                        } else {
+                            let app = Arc::clone(&ctx.app.config);
+                            ctx.upsert_skill(app.as_ref(), rest)?;
+                        }
+                    }
+                    name => {
+                        let app = Arc::clone(&ctx.app.config);
+                        ctx.upsert_skill(app.as_ref(), name)?;
+                    }
+                }
+            }
             ".session" => {
                 if let Some(name) = graph::active_agent_graph_name(ctx) {
                     bail!(
@@ -779,7 +832,7 @@ pub async fn run_repl_command(
                     ctx.delete(args)?;
                 }
                 _ => {
-                    println!("Usage: .delete <role|session|rag|macro|agent-data>")
+                    println!("Usage: .delete <role|session|rag|macro|skill|agent-data>")
                 }
             },
             ".copy" => {
@@ -1265,8 +1318,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_42_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 42);
+    fn repl_commands_has_43_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 43);
     }
 
     #[test]
