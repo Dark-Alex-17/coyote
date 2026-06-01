@@ -9,7 +9,6 @@ use serde_json::{Value, json};
 
 pub const SKILL_FUNCTION_PREFIX: &str = "skill__";
 
-#[allow(dead_code)]
 pub fn skill_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
         FunctionDeclaration {

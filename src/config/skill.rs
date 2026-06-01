@@ -6,6 +6,7 @@ use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::LazyLock;
+use log::{debug, info};
 
 #[derive(Embed)]
 #[folder = "assets/skills/"]
@@ -39,7 +40,6 @@ pub struct Skill {
     auto_unload: Option<bool>,
 }
 
-#[allow(dead_code)]
 impl Skill {
     pub fn new(name: &str, content: &str) -> Self {
         let mut metadata = "";
@@ -84,11 +84,36 @@ impl Skill {
         skill
     }
 
-    pub fn builtin(name: &str) -> Result<Self> {
-        let content = SkillsAsset::get(&format!("{name}/SKILL.md"))
-            .ok_or_else(|| anyhow!("Unknown skill `{name}`"))?;
-        let content = unsafe { std::str::from_utf8_unchecked(&content.data) };
-        Ok(Skill::new(name, content))
+    pub fn install_builtin_skills(force: bool) -> Result<()> {
+        info!(
+            "Installing built-in skills in {}",
+            paths::skills_dir().display()
+        );
+
+        for file in SkillsAsset::iter() {
+            debug!("Processing skill file: {}", file.as_ref());
+
+            let embedded_file = SkillsAsset::get(&file).ok_or_else(|| {
+                anyhow!("Failed to load embedded skill file: {}", file.as_ref())
+            })?;
+            let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
+            let file_path = paths::skills_dir().join(file.as_ref());
+
+            if file_path.exists() && !force {
+                debug!(
+                    "Skill file already exists, skipping: {}",
+                    file_path.display()
+                );
+                continue;
+            }
+
+            ensure_parent_exists(&file_path)?;
+            info!("Creating skill file: {}", file_path.display());
+            let mut skill_file = File::create(&file_path)?;
+            Write::write_all(&mut skill_file, content.as_bytes())?;
+        }
+
+        Ok(())
     }
 
     pub fn load(name: &str) -> Result<Self> {
@@ -97,12 +122,6 @@ impl Skill {
             format!("Failed to read skill '{name}' at {}", path.display())
         })?;
         Ok(Skill::new(name, &content))
-    }
-
-    pub fn list_builtin_skill_names() -> Vec<String> {
-        SkillsAsset::iter()
-            .filter_map(|v| v.strip_suffix("/SKILL.md").map(|v| v.to_string()))
-            .collect()
     }
 
     pub fn name(&self) -> &str {
@@ -306,12 +325,5 @@ mod tests {
         let skill = Skill::new("test", content);
 
         assert!(skill.is_compatible(false, false));
-    }
-
-    #[test]
-    fn builtin_returns_err_for_unknown_skill() {
-        let result = Skill::builtin("nonexistent_skill_xyz");
-
-        assert!(result.is_err());
     }
 }

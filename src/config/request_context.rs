@@ -4021,6 +4021,43 @@ mod tests {
 
     #[test]
     #[serial]
+    fn install_builtin_skills_force_overwrites_only_with_force() {
+        let _guard = TestConfigDirGuard::new();
+
+        Skill::install_builtin_skills(false).unwrap();
+        let file = paths::skill_file("git-master");
+        assert!(file.exists(), "git-master skill should be installed");
+
+        write(&file, "SENTINEL").unwrap();
+        Skill::install_builtin_skills(false).unwrap();
+        assert_eq!(
+            read_to_string(&file).unwrap(),
+            "SENTINEL",
+            "non-force install must not overwrite an existing skill"
+        );
+
+        Skill::install_builtin_skills(true).unwrap();
+        assert_ne!(
+            read_to_string(&file).unwrap(),
+            "SENTINEL",
+            "force install must overwrite the existing skill"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_skills_installs_all_bundled() {
+        let _guard = TestConfigDirGuard::new();
+
+        Skill::install_builtin_skills(false).unwrap();
+        assert!(paths::skill_file("git-master").exists());
+        assert!(paths::skill_file("ai-slop-remover").exists());
+        assert!(paths::skill_file("code-review").exists());
+        assert!(paths::skill_file("frontend-ui-ux").exists());
+    }
+
+    #[test]
+    #[serial]
     fn install_functions_force_preserves_user_mcp_json() {
         let _guard = TestConfigDirGuard::new();
 
