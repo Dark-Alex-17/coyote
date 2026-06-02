@@ -4,6 +4,7 @@ use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, get_env_name};
 
 use super::paths;
 use anyhow::{Context, Result, anyhow};
+use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ pub struct AppConfig {
     pub wrap: Option<String>,
     pub wrap_code: bool,
     pub(crate) vault_password_file: Option<PathBuf>,
+    pub(crate) secrets_provider: SupportedProvider,
 
     pub function_calling_support: bool,
     pub mapping_tools: IndexMap<String, String>,
@@ -94,6 +96,7 @@ impl Default for AppConfig {
             wrap: None,
             wrap_code: false,
             vault_password_file: None,
+            secrets_provider: SupportedProvider::default(),
 
             function_calling_support: true,
             mapping_tools: Default::default(),
@@ -160,6 +163,7 @@ impl AppConfig {
             wrap: config.wrap,
             wrap_code: config.wrap_code,
             vault_password_file: config.vault_password_file,
+            secrets_provider: config.secrets_provider,
 
             function_calling_support: config.function_calling_support,
             mapping_tools: config.mapping_tools,
@@ -208,6 +212,7 @@ impl AppConfig {
 
             clients: config.clients,
         };
+        app_config.migrate_legacy_password_file();
         app_config.load_envs();
         if let Some(wrap) = app_config.wrap.clone() {
             app_config.set_wrap(&wrap)?;
@@ -216,6 +221,17 @@ impl AppConfig {
         app_config.setup_user_agent();
         app_config.resolve_model()?;
         Ok(app_config)
+    }
+
+    fn migrate_legacy_password_file(&mut self) {
+        let Some(legacy) = self.vault_password_file.take() else {
+            return;
+        };
+        if let SupportedProvider::Local { provider_def } = &mut self.secrets_provider
+            && provider_def.password_file.is_none()
+        {
+            provider_def.password_file = Some(legacy);
+        }
     }
 
     pub fn resolve_model(&mut self) -> Result<()> {
@@ -771,5 +787,69 @@ mod tests {
 
         app.resolve_model().unwrap();
         assert_eq!(app.model_id, "provider:explicit");
+    }
+
+    #[test]
+    fn migrate_legacy_copies_into_empty_local_provider() {
+        let mut app = AppConfig {
+            vault_password_file: Some(PathBuf::from("/tmp/test-coyote-password")),
+            ..AppConfig::default()
+        };
+
+        app.migrate_legacy_password_file();
+
+        match &app.secrets_provider {
+            SupportedProvider::Local { provider_def } => {
+                assert_eq!(
+                    provider_def.password_file,
+                    Some(PathBuf::from("/tmp/test-coyote-password"))
+                );
+            }
+            _ => panic!("expected Local provider"),
+        }
+        assert!(app.vault_password_file.is_none());
+    }
+
+    #[test]
+    fn migrate_legacy_does_not_overwrite_existing_password_file() {
+        let mut app = AppConfig {
+            vault_password_file: Some(PathBuf::from("/tmp/legacy")),
+            ..AppConfig::default()
+        };
+        if let SupportedProvider::Local { provider_def } = &mut app.secrets_provider {
+            provider_def.password_file = Some(PathBuf::from("/tmp/explicit"));
+        }
+
+        app.migrate_legacy_password_file();
+
+        match &app.secrets_provider {
+            SupportedProvider::Local { provider_def } => {
+                assert_eq!(
+                    provider_def.password_file,
+                    Some(PathBuf::from("/tmp/explicit"))
+                );
+            }
+            _ => panic!("expected Local provider"),
+        }
+        assert!(app.vault_password_file.is_none());
+    }
+
+    #[test]
+    fn migrate_legacy_noop_for_non_local_provider() {
+        let mut app = AppConfig {
+            vault_password_file: Some(PathBuf::from("/tmp/orphaned")),
+            secrets_provider: SupportedProvider::Gopass {
+                provider_def: Default::default(),
+            },
+            ..AppConfig::default()
+        };
+
+        app.migrate_legacy_password_file();
+
+        assert!(app.vault_password_file.is_none());
+        assert!(matches!(
+            app.secrets_provider,
+            SupportedProvider::Gopass { .. }
+        ));
     }
 }
