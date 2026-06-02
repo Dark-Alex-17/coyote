@@ -9,7 +9,15 @@ global_tools:
   - fs_ls.sh
   - fs_write.sh
   - fs_patch.sh
-  - fs_mkdir.sh
+  - execute_command.sh
+
+skills_enabled: true
+enabled_skills:
+  - ai-slop-remover
+  - code-review
+  - git-master
+  - frontend-ui-ux
+  - verification-gates
 
 variables:
   - name: project_dir
@@ -38,6 +46,10 @@ initial_state:
   files_to_create: []
   risks: []
   complexity_score: 0
+  review_attempts: 0
+  max_review_attempts: 1
+  review_clean: true
+  review_notes: ""
 
 start: resolve_paths
 
@@ -143,9 +155,23 @@ nodes:
     id: implement
     type: llm
     description: Write code via fs tools. Bounded tool-call loop.
+    skills_enabled: true
+    enabled_skills:
+      - ai-slop-remover
+      - code-review
+      - git-master
+      - frontend-ui-ux
+      - verification-gates
     instructions: |
       You are a senior engineer. Implement the plan by writing code via
       tools. Follow existing patterns in the codebase.
+
+      ## Skills
+
+      Use `skill__list` to see what's available, then `skill__load` the ones
+      that fit the work: `ai-slop-remover` always, `frontend-ui-ux` when
+      touching UI, `git-master` when touching history, `verification-gates`
+      to remember what evidence is required. Unload when a phase ends.
 
       ## Writing code
 
@@ -238,6 +264,73 @@ nodes:
     script: scripts/fix_loop_gate.sh
     timeout: 5
     fallback: end_failure
+
+  self_review:
+    id: self_review
+    type: llm
+    description: Skill-driven self-review of the diff. Catches AI slop, dishonest naming, suppressed errors. Bounded to max_review_attempts.
+    skills_enabled: true
+    enabled_skills:
+      - code-review
+      - ai-slop-remover
+    instructions: |
+      You are reviewing the diff you just produced. Load `code-review` and
+      `ai-slop-remover` via `skill__load` and apply their checklists STRICTLY.
+
+      Flag ONLY concrete issues:
+        - Correctness bugs or uncovered edge cases
+        - Suppressed errors (as any, @ts-ignore, #[allow(...)] on unfamiliar
+          lints, empty catch blocks)
+        - Dishonest naming (get_X that mutates, returns wrong type, etc.)
+        - Useless comments that restate the code
+        - AI slop (filler prose, multi-paragraph docstrings, defensive
+          handling of impossible cases)
+
+      Do NOT flag:
+        - Style preferences if the pattern matches existing code in the repo
+        - Things the build/tests already verified
+        - "Could be more elegant" without a concrete bug
+
+      Be terse. The orchestrator wants signal, not noise. If you find nothing
+      blocking, set review_clean=true and leave review_notes empty.
+
+      Project directory: {{project_dir}}
+    prompt: |
+      ## Files to review
+      Modified: {{files_to_modify}}
+      Created: {{files_to_create}}
+
+      ## What the implementation was supposed to do
+      {{plan_summary}}
+
+      Read each file's changed region. Apply the review skills. Output your verdict.
+    tools:
+      - fs_cat
+      - fs_ls
+      - execute_command
+    max_iterations: 15
+    output_schema:
+      type: object
+      properties:
+        review_clean:
+          type: boolean
+          description: True if no blocker issues were found.
+        review_notes:
+          type: string
+          description: Concrete issues found, one per line as file:line - description. Empty when review_clean is true.
+      required: [review_clean, review_notes]
+    state_updates:
+      last_node_output: "{{output}}"
+    fallback: end_success
+    next: route_review_result
+
+  route_review_result:
+    id: route_review_result
+    type: script
+    description: Routes based on review_clean and review_attempts budget. End on clean or budget exhausted; loop to implement otherwise.
+    script: scripts/route_review_result.sh
+    timeout: 5
+    fallback: end_success
 
   end_success:
     id: end_success
