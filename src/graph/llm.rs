@@ -115,8 +115,10 @@ async fn run(
 
     let saved_agent_skill_state = swap_in_node_skill_policy(node, parent_ctx);
 
+    let composed_role = parent_ctx.skill_registry.effective_role(&role);
+
     let saved_role = parent_ctx.role.clone();
-    parent_ctx.role = Some(role);
+    parent_ctx.role = Some(composed_role);
     let result = match node.timeout {
         Some(secs) => match timeout(
             Duration::from_secs(secs),
