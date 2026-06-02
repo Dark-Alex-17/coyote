@@ -2519,6 +2519,10 @@ impl RequestContext {
     }
 
     pub async fn load_skill_repl(&mut self, name: &str, abort_signal: AbortSignal) -> Result<()> {
+        if !self.app.config.function_calling_support {
+            bail!("Skills require function calling, which is disabled. Enable function calling in your config then try again.");
+        }
+
         if !paths::has_skill(name) {
             bail!(
                 "Skill '{name}' is not installed (expected at {})",
@@ -2542,22 +2546,12 @@ impl RequestContext {
         }
 
         let skill = Skill::load(name)?;
-        let fn_on = self.app.config.function_calling_support;
-        let mcp_on = self.app.config.mcp_server_support;
-        let needs_tools = skill
-            .enabled_tools()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
         let needs_mcps = skill
             .enabled_mcp_servers()
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
 
-        if needs_tools && !fn_on {
-            bail!("Skill '{name}' requires function calling, which is disabled");
-        }
-
-        if needs_mcps && !mcp_on {
+        if needs_mcps && !self.app.config.mcp_server_support {
             bail!("Skill '{name}' requires MCP servers, which are disabled");
         }
 
