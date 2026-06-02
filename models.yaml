@@ -276,6 +276,7 @@
     - name: claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 5
       output_price: 25
       supports_vision: true
@@ -283,6 +284,7 @@
     - name: claude-opus-4-7
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 5
       output_price: 25
       supports_vision: true
@@ -812,6 +814,7 @@
     - name: claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 5
       output_price: 25
       supports_vision: true
@@ -819,6 +822,7 @@
     - name: claude-opus-4-7
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 5
       output_price: 25
       supports_vision: true
@@ -981,6 +985,7 @@
     - name: us.anthropic.claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 5
       output_price: 25
       supports_vision: true
@@ -988,6 +993,7 @@
     - name: us.anthropic.claude-opus-4-7
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 5
       output_price: 25
       supports_vision: true
@@ -1621,6 +1627,7 @@
     - name: anthropic/claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 5
       output_price: 25
       supports_vision: true
@@ -1628,6 +1635,7 @@
     - name: anthropic/claude-opus-4-7
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 5
       output_price: 25
       supports_vision: true
