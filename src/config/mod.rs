@@ -53,6 +53,7 @@ use crate::config::macros::Macro;
 use crate::vault::{GlobalVault, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
+use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, Select};
@@ -75,6 +76,45 @@ pub const TEMP_SESSION_NAME: &str = "temp";
 
 static PASSWORD_FILE_SECRET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"vault_password_file:.*['|"]?\{\{(.+)}}['|"]?"#).unwrap());
+
+fn validate_no_template_in_secrets_provider(content: &str) -> Result<()> {
+    let mut in_block = false;
+
+    for (line_num, line) in content.lines().enumerate() {
+        if line.starts_with("secrets_provider:") {
+            if line.contains("{{") {
+                bail!(
+                    "secret injection cannot be done on the secrets_provider property (line {}): the secrets_provider config is loaded before the vault is initialized",
+                    line_num + 1
+                );
+            }
+            in_block = true;
+            continue;
+        }
+
+        if in_block {
+            let trimmed = line.trim_start();
+
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            if !line.starts_with(char::is_whitespace) {
+                in_block = false;
+                continue;
+            }
+
+            if line.contains("{{") {
+                bail!(
+                    "secret injection cannot be done within the secrets_provider block (line {}): the secrets_provider config is loaded before the vault is initialized",
+                    line_num + 1
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Monokai Extended
 const DARK_THEME: &[u8] = include_bytes!("../../assets/monokai-extended.theme.bin");
@@ -149,6 +189,9 @@ pub struct Config {
     pub wrap_code: bool,
     pub(super) vault_password_file: Option<PathBuf>,
 
+    #[serde(default)]
+    pub(super) secrets_provider: SupportedProvider,
+
     pub function_calling_support: bool,
     pub mapping_tools: IndexMap<String, String>,
     pub enabled_tools: Option<String>,
@@ -213,6 +256,7 @@ impl Default for Config {
             wrap: None,
             wrap_code: false,
             vault_password_file: None,
+            secrets_provider: SupportedProvider::default(),
 
             function_calling_support: true,
             mapping_tools: Default::default(),
@@ -441,7 +485,7 @@ impl Config {
             ..AppConfig::default()
         };
         let vault = Vault::init(&bootstrap_app);
-        let (parsed_config, missing_secrets) = interpolate_secrets(&content, &vault);
+        let (parsed_config, missing_secrets) = interpolate_secrets(&content, &vault)?;
         if !missing_secrets.is_empty() && !info_flag {
             debug!(
                 "Global config references secrets that are missing from the vault: {missing_secrets:?}"
@@ -480,6 +524,7 @@ impl Config {
         if PASSWORD_FILE_SECRET_RE.is_match(content)? {
             bail!("secret injection cannot be done on the vault_password_file property");
         }
+        validate_no_template_in_secrets_provider(content)?;
 
         let config: Self = serde_yaml::from_str(content)
             .map_err(|err| {
@@ -752,6 +797,62 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_secrets_provider_rejects_template_in_field() {
+        let yaml = "\
+secrets_provider:
+  type: aws_secrets_manager
+  aws_profile: '{{AWS_PROFILE}}'
+  aws_region: us-east-1
+";
+        assert!(validate_no_template_in_secrets_provider(yaml).is_err());
+    }
+
+    #[test]
+    fn validate_secrets_provider_rejects_template_in_local_password_file() {
+        let yaml = "\
+secrets_provider:
+  type: local
+  password_file: '{{COYOTE_PASSWORD}}'
+";
+        assert!(validate_no_template_in_secrets_provider(yaml).is_err());
+    }
+
+    #[test]
+    fn validate_secrets_provider_accepts_clean_yaml() {
+        let yaml = "\
+secrets_provider:
+  type: aws_secrets_manager
+  aws_profile: default
+  aws_region: us-east-1
+";
+        assert!(validate_no_template_in_secrets_provider(yaml).is_ok());
+    }
+
+    #[test]
+    fn validate_secrets_provider_allows_templates_outside_block() {
+        let yaml = "\
+secrets_provider:
+  type: local
+  password_file: ~/.coyote_password
+clients:
+  - type: openai
+    api_key: '{{OPENAI_KEY}}'
+";
+        assert!(validate_no_template_in_secrets_provider(yaml).is_ok());
+    }
+
+    #[test]
+    fn validate_secrets_provider_handles_missing_block() {
+        let yaml = "\
+model: openai:gpt-4
+clients:
+  - type: openai
+    api_key: '{{OPENAI_KEY}}'
+";
+        assert!(validate_no_template_in_secrets_provider(yaml).is_ok());
+    }
 
     #[test]
     fn config_defaults_match_expected() {

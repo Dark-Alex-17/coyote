@@ -8,6 +8,7 @@ use indoc::formatdoc;
 use inquire::validator::Validation;
 use inquire::{Confirm, Password, PasswordDisplayMode, Text, min_length, required};
 use std::path::PathBuf;
+use gman::SecretError;
 
 pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> Result<()> {
     let vault_password_file = local_provider
@@ -172,24 +173,34 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
     Ok(())
 }
 
-pub fn interpolate_secrets(content: &str, vault: &Vault) -> (String, Vec<String>) {
+pub fn interpolate_secrets(content: &str, vault: &Vault) -> Result<(String, Vec<String>)> {
     let mut missing_secrets = vec![];
+    let mut fatal_error: Option<anyhow::Error> = None;
+
     let parsed_content: String = content
         .lines()
         .map(|line| {
-            if line.trim_start().starts_with('#') {
+            if line.trim_start().starts_with('#') || fatal_error.is_some() {
                 return line.to_string();
             }
 
             SECRET_RE
                 .replace_all(line, |caps: &fancy_regex::Captures<'_>| {
-                    let secret = vault.get_secret(caps[1].trim(), false);
-                    match secret {
+                    let name = caps[1].trim();
+                    match vault.get_secret(name, false) {
                         Ok(s) => s,
-                        Err(_) => {
-                            missing_secrets.push(caps[1].to_string());
-                            "".to_string()
-                        }
+                        Err(e) => match e.downcast_ref::<SecretError>() {
+                            Some(SecretError::NotFound { .. }) => {
+                                missing_secrets.push(name.to_string());
+                                String::new()
+                            }
+                            _ => {
+                                fatal_error = Some(anyhow!(
+                                    "Failed to fetch secret '{name}' from vault: {e}"
+                                ));
+                                String::new()
+                            }
+                        },
                     }
                 })
                 .to_string()
@@ -197,5 +208,9 @@ pub fn interpolate_secrets(content: &str, vault: &Vault) -> (String, Vec<String>
         .collect::<Vec<_>>()
         .join("\n");
 
-    (parsed_content, missing_secrets)
+    if let Some(err) = fatal_error {
+        return Err(err);
+    }
+
+    Ok((parsed_content, missing_secrets))
 }

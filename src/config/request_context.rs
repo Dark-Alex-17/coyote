@@ -32,6 +32,7 @@ use crate::utils::{
 
 use crate::graph;
 use anyhow::{Context, Error, Result, bail};
+use gman::providers::SupportedProvider;
 #[cfg(test)]
 use indexmap::IndexMap;
 use indoc::formatdoc;
@@ -904,11 +905,50 @@ impl RequestContext {
             ("macros_dir", display_path(&paths::macros_dir())),
             ("functions_dir", display_path(&paths::functions_dir())),
             ("messages_file", display_path(&self.messages_file())),
-            (
-                "vault_password_file",
-                display_path(&app.vault_password_file()),
-            ),
         ];
+
+        items.push(("secrets_provider", app.secrets_provider.to_string()));
+        match &app.secrets_provider {
+            SupportedProvider::Local { provider_def } => {
+                let path = provider_def
+                    .password_file
+                    .clone()
+                    .unwrap_or_else(gman::config::Config::local_provider_password_file);
+                items.push(("vault_password_file", display_path(&path)));
+            }
+            SupportedProvider::AwsSecretsManager { provider_def } => {
+                if let Some(p) = &provider_def.aws_profile {
+                    items.push(("aws_profile", p.clone()));
+                }
+                if let Some(r) = &provider_def.aws_region {
+                    items.push(("aws_region", r.clone()));
+                }
+            }
+            SupportedProvider::GcpSecretManager { provider_def } => {
+                if let Some(id) = &provider_def.gcp_project_id {
+                    items.push(("gcp_project_id", id.clone()));
+                }
+            }
+            SupportedProvider::AzureKeyVault { provider_def } => {
+                if let Some(n) = &provider_def.vault_name {
+                    items.push(("azure_vault_name", n.clone()));
+                }
+            }
+            SupportedProvider::Gopass { provider_def } => {
+                if let Some(s) = &provider_def.store {
+                    items.push(("gopass_store", s.clone()));
+                }
+            }
+            SupportedProvider::OnePassword { provider_def } => {
+                if let Some(v) = &provider_def.vault {
+                    items.push(("op_vault", v.clone()));
+                }
+                if let Some(a) = &provider_def.account {
+                    items.push(("op_account", a.clone()));
+                }
+            }
+        }
+
         if let Ok((_, Some(log_path))) = paths::log_config() {
             items.push(("log_path", display_path(&log_path)));
         }

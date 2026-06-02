@@ -182,7 +182,7 @@ impl McpRegistry {
             return Ok(registry);
         }
 
-        let (parsed_content, missing_secrets) = interpolate_secrets(&content, vault);
+        let (parsed_content, missing_secrets) = interpolate_secrets(&content, vault)?;
 
         if !missing_secrets.is_empty() {
             return Err(anyhow!(formatdoc!(

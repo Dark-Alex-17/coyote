@@ -732,7 +732,7 @@ fn merge_mcp_json(
     write_atomically(&final_path, &serialized)?;
 
     let vault = Vault::init_bare();
-    let (_parsed, missing) = interpolate_secrets(&serialized, &vault);
+    let (_parsed, missing) = interpolate_secrets(&serialized, &vault)?;
     let mut deduped: Vec<String> = Vec::new();
     for s in missing {
         if !deduped.contains(&s) {
