@@ -102,7 +102,6 @@ pub async fn handle_skill_tool(
 }
 
 fn handle_list(ctx: &RequestContext, policy: &SkillPolicy) -> Result<Value> {
-    let function_calling_on = ctx.app.config.function_calling_support;
     let mcp_on = ctx.app.config.mcp_server_support;
 
     let mut entries = Vec::new();
@@ -118,9 +117,9 @@ fn handle_list(ctx: &RequestContext, policy: &SkillPolicy) -> Result<Value> {
                 continue;
             }
         };
-        if !skill.is_compatible(function_calling_on, mcp_on) {
+        if !skill.is_compatible(mcp_on) {
             warn!(
-                "Skill '{name}' filtered from list: declares tools or MCP servers but those features are disabled"
+                "Skill '{name}' filtered from list: declares MCP servers but MCP support is disabled"
             );
             continue;
         }

@@ -146,23 +146,12 @@ impl Skill {
         self.auto_unload.unwrap_or(false)
     }
 
-    pub fn is_compatible(&self, function_calling_enabled: bool, mcp_enabled: bool) -> bool {
-        if self.declares_tools() && !function_calling_enabled {
-            return false;
-        }
-
+    pub fn is_compatible(&self, mcp_enabled: bool) -> bool {
         if self.declares_mcp_servers() && !mcp_enabled {
             return false;
         }
 
         true
-    }
-
-    fn declares_tools(&self) -> bool {
-        self.enabled_tools
-            .as_deref()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false)
     }
 
     fn declares_mcp_servers(&self) -> bool {
@@ -271,25 +260,21 @@ mod tests {
     }
 
     #[test]
-    fn is_compatible_knowledge_only_passes_all_combinations() {
+    fn is_compatible_knowledge_only_passes_both_mcp_states() {
         let skill = Skill::new("test", "Just knowledge");
 
-        assert!(skill.is_compatible(false, false));
-        assert!(skill.is_compatible(true, false));
-        assert!(skill.is_compatible(false, true));
-        assert!(skill.is_compatible(true, true));
+        assert!(skill.is_compatible(false));
+        assert!(skill.is_compatible(true));
     }
 
     #[test]
-    fn is_compatible_with_tools_requires_function_calling() {
+    fn is_compatible_with_tools_only_passes_both_mcp_states() {
         let content = "---\nenabled_tools: shell\n---\nbody";
 
         let skill = Skill::new("test", content);
 
-        assert!(!skill.is_compatible(false, true));
-        assert!(!skill.is_compatible(false, false));
-        assert!(skill.is_compatible(true, true));
-        assert!(skill.is_compatible(true, false));
+        assert!(skill.is_compatible(false));
+        assert!(skill.is_compatible(true));
     }
 
     #[test]
@@ -298,29 +283,26 @@ mod tests {
 
         let skill = Skill::new("test", content);
 
-        assert!(!skill.is_compatible(true, false));
-        assert!(!skill.is_compatible(false, false));
-        assert!(skill.is_compatible(true, true));
+        assert!(!skill.is_compatible(false));
+        assert!(skill.is_compatible(true));
     }
 
     #[test]
-    fn is_compatible_requires_both_when_both_declared() {
+    fn is_compatible_with_both_requires_mcp_enabled() {
         let content = "---\nenabled_tools: shell\nenabled_mcp_servers: github\n---\nbody";
 
         let skill = Skill::new("test", content);
 
-        assert!(!skill.is_compatible(true, false));
-        assert!(!skill.is_compatible(false, true));
-        assert!(!skill.is_compatible(false, false));
-        assert!(skill.is_compatible(true, true));
+        assert!(!skill.is_compatible(false));
+        assert!(skill.is_compatible(true));
     }
 
     #[test]
-    fn is_compatible_empty_string_tools_is_knowledge_only() {
-        let content = "---\nenabled_tools: \"\"\n---\nbody";
+    fn is_compatible_empty_string_mcps_is_knowledge_only() {
+        let content = "---\nenabled_mcp_servers: \"\"\n---\nbody";
 
         let skill = Skill::new("test", content);
 
-        assert!(skill.is_compatible(false, false));
+        assert!(skill.is_compatible(false));
     }
 }
