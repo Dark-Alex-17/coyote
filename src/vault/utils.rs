@@ -2,6 +2,7 @@ use crate::config::ensure_parent_exists;
 use crate::vault::{SECRET_RE, Vault};
 use anyhow::Result;
 use anyhow::anyhow;
+use gman::providers::SupportedProvider;
 use gman::providers::local::LocalProvider;
 use indoc::formatdoc;
 use inquire::validator::Validation;
@@ -34,8 +35,14 @@ pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> R
 }
 
 pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
-    let vault_password_file = vault
-        .local_provider
+    let SupportedProvider::Local {
+        provider_def: local_provider,
+    } = &mut vault.provider
+    else {
+        return Ok(());
+    };
+
+    let vault_password_file = local_provider
         .password_file
         .clone()
         .ok_or_else(|| anyhow!("Password file is not configured"))?;
@@ -148,7 +155,7 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
         match password {
             Ok(pw) => {
                 std::fs::write(&password_file, pw.as_bytes())?;
-                vault.local_provider.password_file = Some(password_file);
+                local_provider.password_file = Some(password_file);
                 println!(
                     "✓ Password file '{}' created.",
                     vault_password_file.display()

@@ -640,7 +640,7 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
     let mut config = json!({});
     let (model, clients_config) = create_client_config(client, &vault).await?;
     config["model"] = model.into();
-    config["vault_password_file"] = vault.password_file()?.display().to_string().into();
+    config["vault_password_file"] = vault.local_password_file()?.display().to_string().into();
     config["stream"] = json!(true);
     config["save"] = json!(true);
     config["keybindings"] = json!("vi");
