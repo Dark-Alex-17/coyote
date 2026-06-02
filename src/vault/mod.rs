@@ -7,9 +7,10 @@ pub use utils::interpolate_secrets;
 use crate::cli::Cli;
 use crate::config::AppConfig;
 use crate::vault::utils::ensure_password_file_initialized;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use fancy_regex::Regex;
 use gman::providers::SecretProvider;
+use gman::providers::SupportedProvider;
 use gman::providers::local::LocalProvider;
 use inquire::{Password, PasswordDisplayMode, required};
 use std::sync::{Arc, LazyLock};
@@ -19,7 +20,7 @@ pub static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{(.+)}}
 
 #[derive(Debug, Default, Clone)]
 pub struct Vault {
-    local_provider: LocalProvider,
+    pub(crate) provider: SupportedProvider,
 }
 
 pub type GlobalVault = Arc<Vault>;
@@ -33,7 +34,11 @@ impl Vault {
             ..LocalProvider::default()
         };
 
-        Self { local_provider }
+        Self {
+            provider: SupportedProvider::Local {
+                provider_def: local_provider,
+            },
+        }
     }
 
     pub fn init(config: &AppConfig) -> Self {
@@ -47,14 +52,34 @@ impl Vault {
         ensure_password_file_initialized(&mut local_provider)
             .expect("Failed to initialize password file");
 
-        Self { local_provider }
+        Self {
+            provider: SupportedProvider::Local {
+                provider_def: local_provider,
+            },
+        }
     }
 
-    pub fn password_file(&self) -> Result<PathBuf> {
-        self.local_provider
-            .password_file
-            .clone()
-            .with_context(|| "A password file is required for the local provider")
+    pub fn local_password_file(&self) -> Result<PathBuf> {
+        match &self.provider {
+            SupportedProvider::Local { provider_def } => provider_def
+                .password_file
+                .clone()
+                .with_context(|| "A password file is required for the local provider"),
+            _ => Err(anyhow!(
+                "password_file is only available for the local provider"
+            )),
+        }
+    }
+
+    fn provider_ref(&self) -> &dyn SecretProvider {
+        match &self.provider {
+            SupportedProvider::Local { provider_def } => provider_def,
+            SupportedProvider::AwsSecretsManager { provider_def } => provider_def,
+            SupportedProvider::GcpSecretManager { provider_def } => provider_def,
+            SupportedProvider::AzureKeyVault { provider_def } => provider_def,
+            SupportedProvider::Gopass { provider_def } => provider_def,
+            SupportedProvider::OnePassword { provider_def } => provider_def,
+        }
     }
 
     pub fn add_secret(&self, secret_name: &str) -> Result<()> {
@@ -66,7 +91,7 @@ impl Vault {
 
         let h = Handle::current();
         tokio::task::block_in_place(|| {
-            h.block_on(self.local_provider.set_secret(secret_name, &secret_value))
+            h.block_on(self.provider_ref().set_secret(secret_name, &secret_value))
         })?;
         println!("✓ Secret '{secret_name}' added to the vault.");
 
@@ -76,7 +101,7 @@ impl Vault {
     pub fn get_secret(&self, secret_name: &str, display_output: bool) -> Result<String> {
         let h = Handle::current();
         let secret = tokio::task::block_in_place(|| {
-            h.block_on(self.local_provider.get_secret(secret_name))
+            h.block_on(self.provider_ref().get_secret(secret_name))
         })?;
 
         if display_output {
@@ -95,7 +120,7 @@ impl Vault {
         let h = Handle::current();
         tokio::task::block_in_place(|| {
             h.block_on(
-                self.local_provider
+                self.provider_ref()
                     .update_secret(secret_name, &secret_value),
             )
         })?;
@@ -106,7 +131,7 @@ impl Vault {
 
     pub fn delete_secret(&self, secret_name: &str) -> Result<()> {
         let h = Handle::current();
-        tokio::task::block_in_place(|| h.block_on(self.local_provider.delete_secret(secret_name)))?;
+        tokio::task::block_in_place(|| h.block_on(self.provider_ref().delete_secret(secret_name)))?;
         println!("✓ Secret '{secret_name}' deleted from the vault.");
 
         Ok(())
@@ -115,7 +140,7 @@ impl Vault {
     pub fn list_secrets(&self, display_output: bool) -> Result<Vec<String>> {
         let h = Handle::current();
         let secrets =
-            tokio::task::block_in_place(|| h.block_on(self.local_provider.list_secrets()))?;
+            tokio::task::block_in_place(|| h.block_on(self.provider_ref().list_secrets()))?;
 
         if display_output {
             if secrets.is_empty() {
@@ -193,6 +218,6 @@ mod tests {
     #[test]
     fn vault_default_creates_instance() {
         let vault = Vault::default();
-        assert!(vault.password_file().is_err());
+        assert!(vault.local_password_file().is_err());
     }
 }
