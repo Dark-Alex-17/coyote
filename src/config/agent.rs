@@ -352,6 +352,14 @@ impl Agent {
         self.config.enabled_skills.as_deref()
     }
 
+    pub fn set_skills_enabled(&mut self, value: Option<bool>) {
+        self.config.skills_enabled = value;
+    }
+
+    pub fn set_enabled_skills(&mut self, value: Option<Vec<String>>) {
+        self.config.enabled_skills = value;
+    }
+
     pub fn conversation_starters(&self) -> Vec<String> {
         self.config
             .conversation_starters
@@ -696,6 +704,8 @@ impl AgentConfig {
             description: graph.description.clone(),
             global_tools: graph.global_tools.clone(),
             mcp_servers: graph.mcp_servers.clone(),
+            skills_enabled: graph.skills_enabled,
+            enabled_skills: graph.enabled_skills.clone(),
             conversation_starters: graph.conversation_starters.clone(),
             variables: graph.variables.clone(),
             can_spawn_agents: graph.has_agent_node(),

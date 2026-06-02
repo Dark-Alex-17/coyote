@@ -31,6 +31,12 @@ pub struct Graph {
     #[serde(default)]
     pub mcp_servers: Vec<String>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_enabled: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_skills: Option<Vec<String>>,
+
     #[serde(default)]
     pub conversation_starters: Vec<String>,
 
@@ -293,6 +299,12 @@ pub struct LlmNode {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_enabled: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_skills: Option<Vec<String>>,
 }
 
 fn default_llm_max_attempts() -> u32 {
