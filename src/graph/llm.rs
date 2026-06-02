@@ -113,6 +113,8 @@ async fn run(
         parent_ctx,
     )?;
 
+    let saved_agent_skill_state = swap_in_node_skill_policy(node, parent_ctx);
+
     let saved_role = parent_ctx.role.clone();
     parent_ctx.role = Some(role);
     let result = match node.timeout {
@@ -128,7 +130,44 @@ async fn run(
         None => run_with_retries(node, &prompt, parent_ctx).await,
     };
     parent_ctx.role = saved_role;
+    restore_agent_skill_policy(parent_ctx, saved_agent_skill_state);
     result
+}
+
+struct SavedAgentSkillPolicy {
+    skills_enabled: Option<bool>,
+    enabled_skills: Option<Vec<String>>,
+}
+
+fn swap_in_node_skill_policy(
+    node: &LlmNode,
+    ctx: &mut RequestContext,
+) -> Option<SavedAgentSkillPolicy> {
+    let agent = ctx.agent.as_mut()?;
+    let saved = SavedAgentSkillPolicy {
+        skills_enabled: agent.skills_enabled(),
+        enabled_skills: agent.enabled_skills().map(|s| s.to_vec()),
+    };
+
+    if let Some(b) = node.skills_enabled {
+        agent.set_skills_enabled(Some(b));
+    }
+
+    if let Some(names) = &node.enabled_skills {
+        agent.set_enabled_skills(Some(names.clone()));
+    }
+
+    Some(saved)
+}
+
+fn restore_agent_skill_policy(ctx: &mut RequestContext, saved: Option<SavedAgentSkillPolicy>) {
+    let Some(saved) = saved else { return };
+    let Some(agent) = ctx.agent.as_mut() else {
+        return;
+    };
+
+    agent.set_skills_enabled(saved.skills_enabled);
+    agent.set_enabled_skills(saved.enabled_skills);
 }
 
 async fn run_with_retries(
@@ -389,6 +428,8 @@ mod tests {
             state_updates: updates,
             output_schema: None,
             timeout: None,
+            skills_enabled: None,
+            enabled_skills: None,
         }
     }
 
