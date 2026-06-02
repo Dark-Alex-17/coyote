@@ -1,7 +1,6 @@
 name: file-reviewer
 description: Reviews a single file's diff for bugs, style issues, and cross-cutting concerns
 version: 1.0.0
-temperature: 0.1
 
 variables:
   - name: project_dir
