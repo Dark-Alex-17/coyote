@@ -84,6 +84,7 @@ enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 
 # Skills are modular knowledge or capability packs the LLM can load and unload mid-conversation.
 # See the [Skills documentation](https://github.com/Dark-Alex-17/coyote/wiki/Skills) for more details.
 skills_enabled: true             # Master switch. Set to false to hide all skill management tools from the model.
+                                 # Skills also require `function_calling_support: true` above to work at all.
 visible_skills:                  # The universe of skills allowed to be enabled in any context. Omit (null) for "all installed".
   - ai-slop-remover
   - code-review
