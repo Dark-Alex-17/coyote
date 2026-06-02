@@ -9,7 +9,7 @@ global_tools:
   - fs_ls.sh
   - fs_write.sh
   - fs_patch.sh
-  - execute_command.sh
+  - fs_mkdir.sh
 
 variables:
   - name: project_dir

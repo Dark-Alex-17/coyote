@@ -28,7 +28,6 @@ global_tools:
   - fs_grep.sh
   - fs_glob.sh
   - fs_ls.sh
-  - execute_command.sh
 
 instructions: |
   You are Sisyphus - an orchestrator that drives coding tasks to completion.
