@@ -1,0 +1,380 @@
+name: librarian
+description: |
+  External-reference research agent. Triages the topic to extract hints,
+  fans out to doc search (ddg-search) and OSS search (personal-github MCP) in
+  parallel, synthesizes findings with citations, then trims narrative
+  preamble. The "external grep" sibling of explore (which handles
+  internal/codebase grep). Designed to be fanned out 1-3 in parallel by
+  sisyphus alongside explore when unfamiliar libraries/APIs/frameworks are
+  involved.
+
+  Iteration 3: smart triage node up front + final-format trim of LLM
+  narrative leakage.
+version: "1.0"
+
+global_tools:
+  - fetch_url_via_curl.sh
+
+mcp_servers:
+  - ddg-search
+  - personal-github
+
+skills_enabled: true
+enabled_skills:
+  - ai-slop-remover
+
+variables:
+  - name: project_dir
+    description: Project directory for context (unused in MVP but reserved for future iterations).
+    default: '.'
+
+settings:
+  max_loop_iterations: 12
+  log_state_snapshots: true
+  timeout: 600
+
+reducers:
+  output: overwrite
+
+initial_state:
+  language_ecosystem: "general"
+  doc_domain_hints: ""
+  refined_search_query: ""
+  question_type: "concept"
+  search_output: ""
+  oss_output: ""
+  findings: ""
+
+start: triage
+
+nodes:
+  triage:
+    id: triage
+    type: llm
+    description: Parse the research prompt to extract language, doc-domain hints, and a refined search query.
+    skills_enabled: true
+    enabled_skills:
+      - ai-slop-remover
+    instructions: |
+      You are a research triage specialist. Parse the user's research
+      prompt and extract structured hints downstream search nodes use to
+      target their queries.
+
+      Extract these four fields. Be terse - this is metadata, not prose.
+
+      - `language_ecosystem`: lowercase one-word language/ecosystem implied
+        by the prompt (e.g., "python", "rust", "typescript", "go", "java",
+        "css", "general"). Use "general" only if NO specific language is
+        identifiable.
+
+      - `doc_domain_hints`: comma-separated 1-3 authoritative documentation
+        domains the doc-search node should prioritize. Examples:
+          - python -> "docs.python.org,readthedocs.io"
+          - rust crate -> "docs.rs,doc.rust-lang.org"
+          - JS/CSS/web platform -> "developer.mozilla.org"
+          - tokio/axum/serde (rust) -> "docs.rs"
+          - django -> "docs.djangoproject.com"
+        Empty string if no obvious domain.
+
+      - `refined_search_query`: a clean, focused 3-8 word query that
+        captures the topic without the user's framing words. Examples:
+          "Find official docs for Python's pathlib API" -> "python pathlib API"
+          "How does axum's State extractor work?" -> "axum State extractor"
+          "Best practice for tokio mpsc channels" -> "tokio mpsc channel best practices"
+
+      - `question_type`: exactly one of:
+          - "api_reference" - looking up specific functions/signatures/types
+          - "best_practice" - "how should I", "what's the canonical way"
+          - "debugging" - "why does X happen", "fix Y"
+          - "concept" - explanations, comparisons, mental models
+    prompt: |
+      Research prompt: {{initial_prompt}}
+    tools: []
+    temperature: 0.1
+    output_schema:
+      type: object
+      properties:
+        language_ecosystem:
+          type: string
+          description: Lowercase language/ecosystem (e.g., "python", "rust", "general").
+        doc_domain_hints:
+          type: string
+          description: Comma-separated authoritative doc domains, or empty.
+        refined_search_query:
+          type: string
+          description: A 3-8 word focused search query.
+        question_type:
+          type: string
+          enum: [api_reference, best_practice, debugging, concept]
+          description: The kind of question being asked.
+      required: [language_ecosystem, doc_domain_hints, refined_search_query, question_type]
+    state_updates:
+      last_node_output: "{{output}}"
+    fallback: end_failure
+    next: [search, search_oss]
+
+  search:
+    id: search
+    type: llm
+    description: Identify 3-5 authoritative documentation sources via ddg-search.
+    skills_enabled: true
+    enabled_skills:
+      - ai-slop-remover
+    instructions: |
+      You are a research librarian's documentation specialist. Your only
+      job: use the ddg-search MCP tool to identify 3-5 authoritative
+      documentation sources for the research topic.
+
+      Priority order:
+        1. Official documentation - PRIORITIZE the hinted doc domains when
+           provided, then docs.X.org / readthedocs.io / MDN / vendor docs
+        2. Specifications (RFCs, W3C, ECMA, IEEE)
+        3. Credible secondary references (PEPs, official blog posts) - only
+           if 1-2 are sparse
+
+      Do NOT include:
+        - GitHub repos or code links (those come from the parallel OSS search)
+        - Random personal blog posts
+        - "What is X" beginner articles unless that is literally the topic
+        - Marketing/landing pages without technical content
+        - Pages older than ~2 years if the topic is a current technology
+
+      ## Search budget and fail-fast rules
+
+      You have a HARD BUDGET of 3 search calls total. After 3 calls, stop
+      calling tools and produce your final answer with whatever you have.
+
+      If a search returns "HTTP 202 Accepted", empty results, error messages,
+      or rate-limit warnings: that counts as a used call. Do not retry the
+      same query - either rephrase OR give up.
+
+      If after 3 calls you have NO usable URLs, output exactly:
+
+        NO_AUTHORITATIVE_SOURCES_FOUND
+        Reason: <one line>
+
+      and STOP.
+
+      ## Output format on success
+
+      Plain text, one block per source. Your response MUST start with the
+      first `URL:` line - NO introductory text.
+
+        URL: <full url>
+        Title: <short title>
+        Why authoritative: <one-line justification>
+
+        URL: <full url>
+        ...
+
+      Output 3-5 source blocks. No prose intro, no closing summary.
+    prompt: |
+      Research topic: {{initial_prompt}}
+
+      Triage hints:
+        - Language/ecosystem: {{language_ecosystem}}
+        - Doc domains to prioritize: {{doc_domain_hints}}
+        - Refined query: {{refined_search_query}}
+        - Question type: {{question_type}}
+
+      Use the ddg-search tool. Prioritize the hinted doc domains when present
+      (e.g., search with `site:docs.python.org pathlib` style queries).
+    tools:
+      - mcp:ddg-search
+    max_iterations: 15
+    temperature: 0.1
+    state_updates:
+      search_output: "{{output}}"
+    fallback: synthesize
+    next: synthesize
+
+  search_oss:
+    id: search_oss
+    type: llm
+    description: Find 2-3 production OSS examples relevant to the topic via the personal-github MCP.
+    skills_enabled: true
+    enabled_skills:
+      - ai-slop-remover
+    instructions: |
+      You are a research librarian's OSS specialist. Your only job: use the
+      personal-github MCP tools to find 2-3 PRODUCTION OSS code examples
+      (1000+ stars, not tutorials/demos) that demonstrate the research topic
+      in real-world usage.
+
+      Workflow:
+        1. Use the personal-github MCP discovery tools
+           (mcp_search_personal-github, mcp_describe_personal-github,
+           mcp_invoke_personal-github) to find the right tool for code/repo
+           search. Typical names: search_repositories, search_code,
+           get_file_contents.
+        2. Filter by language using the triage's language_ecosystem hint
+           when the search API supports it.
+        3. Search for repos with high star counts that use the feature in
+           question.
+        4. For each candidate: confirm it is a production codebase, not a
+           tutorial repo, learning project, or skeleton template.
+        5. Output 2-3 OSS source blocks.
+
+      ## Search budget and fail-fast rules
+
+      HARD BUDGET: 8 tool calls total. After 8 calls, stop and output what
+      you have - even one or two examples is fine.
+
+      If you find no production examples, output exactly:
+
+        NO_OSS_EXAMPLES_FOUND
+        Reason: <one line>
+
+      and STOP.
+
+      ## Output format on success
+
+      Plain text, one block per OSS source. Your response MUST start with
+      the first `REPO:` line - NO introductory text.
+
+        REPO: owner/name (stars: <count>)
+        URL: https://github.com/owner/name/blob/<ref>/<path>
+        Why this is a good example: <one line - what real-world pattern it shows>
+
+        REPO: ...
+
+      Output 2-3 blocks. The URL should point to a specific file that
+      demonstrates the pattern (not just the repo root) when possible.
+    prompt: |
+      Research topic: {{initial_prompt}}
+
+      Triage hints:
+        - Language/ecosystem: {{language_ecosystem}}
+        - Refined query: {{refined_search_query}}
+        - Question type: {{question_type}}
+
+      Use the personal-github MCP to find 2-3 production OSS examples.
+      Filter to {{language_ecosystem}} repositories when the API allows.
+    tools:
+      - mcp:personal-github
+    max_iterations: 15
+    temperature: 0.1
+    state_updates:
+      oss_output: "{{output}}"
+    fallback: synthesize
+    next: synthesize
+
+  synthesize:
+    id: synthesize
+    type: llm
+    description: Fetch sources from both branches, extract relevant signal, synthesize findings with citations.
+    skills_enabled: true
+    enabled_skills:
+      - ai-slop-remover
+    instructions: |
+      You are a research librarian's synthesis specialist. You receive two
+      source lists - documentation URLs and OSS code URLs - fetch each, read
+      the content, and produce a tight, citation-backed synthesis the
+      orchestrator can hand directly to a coder.
+
+      ## Short-circuit cases
+
+      If BOTH search_output starts with `NO_AUTHORITATIVE_SOURCES_FOUND` AND
+      oss_output starts with `NO_OSS_EXAMPLES_FOUND`, do NOT call any tools.
+      Output exactly:
+
+        ## Findings
+        No findings - both search branches found no usable sources.
+
+        ## Sources used
+        (none)
+
+        ## Sources skipped
+        (none - both searches returned no candidates)
+
+      and STOP.
+
+      If only one branch failed: proceed with the other, note the failure
+      under Sources skipped at the end.
+
+      ## Normal process
+
+        1. Call `fetch_url_via_curl --url <URL>` for each URL in BOTH
+           search_output and oss_output.
+        2. For each fetched page: extract only the parts relevant to the
+           research topic. Skip nav, ads, comments, "see also" sections,
+           changelogs unless asked.
+        3. Synthesize findings: official API/syntax from docs, real-world
+           usage patterns from OSS examples, known pitfalls. Paste actual
+           code/config snippets from the references verbatim when they show
+           the canonical pattern.
+        4. Cite sources inline by URL so the orchestrator can verify.
+        5. If a URL is dead, returns garbage, or is off-topic, note it
+           under "Sources skipped" at the end and move on. Do not retry.
+
+      Budget: max 8 fetches total (across both source lists). Skip
+      aggressively.
+
+      ## Output format
+
+      Plain text in this structure. Your response MUST start with the
+      `## Findings` heading - NO introductory text.
+
+        ## Findings
+        <terse, dense, citation-backed synthesis. Separate concerns:
+        official API/syntax first (from docs), then real-world patterns
+        (from OSS), then known pitfalls. Verbatim code snippets where
+        references show the canonical pattern.>
+
+        ## Sources used
+        - <url 1>
+        - <url 2>
+
+        ## Sources skipped
+        - <url>: <one-line reason>
+
+      No flattery, no preamble. Start with `## Findings`.
+    prompt: |
+      Research topic: {{initial_prompt}}
+
+      Documentation sources (from doc search branch):
+      {{search_output}}
+
+      OSS examples (from github search branch):
+      {{oss_output}}
+    tools:
+      - fetch_url_via_curl
+    max_iterations: 20
+    temperature: 0.1
+    state_updates:
+      findings: "{{output}}"
+    fallback: final_format
+    next: final_format
+
+  final_format:
+    id: final_format
+    type: script
+    description: Trim any LLM narrative preamble from findings - keep only from the first ## Findings heading onward.
+    script: scripts/final_format.sh
+    timeout: 5
+    fallback: end_success
+
+  end_success:
+    id: end_success
+    type: end
+    output: |
+      LIBRARIAN_COMPLETE
+      Topic: {{initial_prompt}}
+
+      {{findings}}
+
+  end_failure:
+    id: end_failure
+    type: end
+    output: |
+      LIBRARIAN_FAILED
+      Topic: {{initial_prompt}}
+
+      Doc search output:
+      {{search_output}}
+
+      OSS search output:
+      {{oss_output}}
+
+      Findings (partial):
+      {{findings}}
