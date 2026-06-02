@@ -30,7 +30,7 @@ pub struct AppConfig {
     pub wrap: Option<String>,
     pub wrap_code: bool,
     pub(crate) vault_password_file: Option<PathBuf>,
-    pub(crate) secrets_provider: SupportedProvider,
+    pub(crate) secrets_provider: Option<SupportedProvider>,
 
     pub function_calling_support: bool,
     pub mapping_tools: IndexMap<String, String>,
@@ -96,7 +96,7 @@ impl Default for AppConfig {
             wrap: None,
             wrap_code: false,
             vault_password_file: None,
-            secrets_provider: SupportedProvider::default(),
+            secrets_provider: None,
 
             function_calling_support: true,
             mapping_tools: Default::default(),
@@ -212,7 +212,6 @@ impl AppConfig {
 
             clients: config.clients,
         };
-        app_config.migrate_legacy_password_file();
         app_config.load_envs();
         if let Some(wrap) = app_config.wrap.clone() {
             app_config.set_wrap(&wrap)?;
@@ -221,17 +220,6 @@ impl AppConfig {
         app_config.setup_user_agent();
         app_config.resolve_model()?;
         Ok(app_config)
-    }
-
-    fn migrate_legacy_password_file(&mut self) {
-        let Some(legacy) = self.vault_password_file.take() else {
-            return;
-        };
-        if let SupportedProvider::Local { provider_def } = &mut self.secrets_provider
-            && provider_def.password_file.is_none()
-        {
-            provider_def.password_file = Some(legacy);
-        }
     }
 
     pub fn resolve_model(&mut self) -> Result<()> {
@@ -790,66 +778,40 @@ mod tests {
     }
 
     #[test]
-    fn migrate_legacy_copies_into_empty_local_provider() {
-        let mut app = AppConfig {
-            vault_password_file: Some(PathBuf::from("/tmp/test-coyote-password")),
-            ..AppConfig::default()
-        };
-
-        app.migrate_legacy_password_file();
-
-        match &app.secrets_provider {
-            SupportedProvider::Local { provider_def } => {
-                assert_eq!(
-                    provider_def.password_file,
-                    Some(PathBuf::from("/tmp/test-coyote-password"))
-                );
-            }
-            _ => panic!("expected Local provider"),
-        }
-        assert!(app.vault_password_file.is_none());
+    fn default_secrets_provider_is_none() {
+        let app = AppConfig::default();
+        assert!(app.secrets_provider.is_none());
     }
 
     #[test]
-    fn migrate_legacy_does_not_overwrite_existing_password_file() {
-        let mut app = AppConfig {
-            vault_password_file: Some(PathBuf::from("/tmp/legacy")),
-            ..AppConfig::default()
-        };
-        if let SupportedProvider::Local { provider_def } = &mut app.secrets_provider {
-            provider_def.password_file = Some(PathBuf::from("/tmp/explicit"));
-        }
-
-        app.migrate_legacy_password_file();
-
-        match &app.secrets_provider {
-            SupportedProvider::Local { provider_def } => {
-                assert_eq!(
-                    provider_def.password_file,
-                    Some(PathBuf::from("/tmp/explicit"))
-                );
-            }
-            _ => panic!("expected Local provider"),
-        }
-        assert!(app.vault_password_file.is_none());
-    }
-
-    #[test]
-    fn migrate_legacy_noop_for_non_local_provider() {
-        let mut app = AppConfig {
-            vault_password_file: Some(PathBuf::from("/tmp/orphaned")),
-            secrets_provider: SupportedProvider::Gopass {
+    fn secrets_provider_can_hold_non_local_variant() {
+        let app = AppConfig {
+            secrets_provider: Some(SupportedProvider::Gopass {
                 provider_def: Default::default(),
-            },
+            }),
             ..AppConfig::default()
         };
-
-        app.migrate_legacy_password_file();
-
-        assert!(app.vault_password_file.is_none());
         assert!(matches!(
             app.secrets_provider,
-            SupportedProvider::Gopass { .. }
+            Some(SupportedProvider::Gopass { .. })
+        ));
+    }
+
+    #[test]
+    fn from_config_copies_secrets_provider() {
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            clients: vec![ClientConfig::default()],
+            secrets_provider: Some(SupportedProvider::Gopass {
+                provider_def: Default::default(),
+            }),
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+        assert!(matches!(
+            app.secrets_provider,
+            Some(SupportedProvider::Gopass { .. })
         ));
     }
 }

@@ -42,12 +42,17 @@ impl Vault {
     }
 
     pub fn init(config: &AppConfig) -> Self {
-        let mut provider = config.secrets_provider.clone();
+        let mut provider = match &config.secrets_provider {
+            Some(p) => p.clone(),
+            None => SupportedProvider::Local {
+                provider_def: LocalProvider {
+                    password_file: Some(config.vault_password_file()),
+                    ..LocalProvider::default()
+                },
+            },
+        };
 
         if let SupportedProvider::Local { provider_def } = &mut provider {
-            if provider_def.password_file.is_none() {
-                provider_def.password_file = Some(config.vault_password_file());
-            }
             ensure_password_file_initialized(provider_def)
                 .expect("Failed to initialize password file");
         }
