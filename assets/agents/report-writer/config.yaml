@@ -1,7 +1,6 @@
 name: report-writer
 description: Polishes research findings into a clear, citation-preserving final report
 version: 1.0.0
-temperature: 0.2
 
 instructions: |
   You are a technical writer. You will be given:

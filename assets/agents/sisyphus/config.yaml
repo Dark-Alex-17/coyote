@@ -1,7 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos
 version: 2.0.0
-temperature: 0.1
 
 agent_session: temp
 auto_continue: true

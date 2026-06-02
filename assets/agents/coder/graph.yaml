@@ -4,8 +4,6 @@ description: |
   bounded fix-loop until verified. Designed to be delegated to by sisyphus.
 version: "1.0"
 
-temperature: 0.1
-
 global_tools:
   - fs_cat.sh
   - fs_ls.sh
