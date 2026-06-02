@@ -190,7 +190,7 @@ pub struct Config {
     pub(super) vault_password_file: Option<PathBuf>,
 
     #[serde(default)]
-    pub(super) secrets_provider: SupportedProvider,
+    pub(super) secrets_provider: Option<SupportedProvider>,
 
     pub function_calling_support: bool,
     pub mapping_tools: IndexMap<String, String>,
@@ -256,7 +256,7 @@ impl Default for Config {
             wrap: None,
             wrap_code: false,
             vault_password_file: None,
-            secrets_provider: SupportedProvider::default(),
+            secrets_provider: None,
 
             function_calling_support: true,
             mapping_tools: Default::default(),
