@@ -1,19 +1,8 @@
 {
   "mcpServers": {
     "github": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "run",
-        "-i",
-        "--rm",
-        "-e",
-        "GITHUB_PERSONAL_ACCESS_TOKEN",
-        "ghcr.io/github/github-mcp-server"
-      ],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "YOUR_GITHUB_TOKEN"
-      }
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp"
     },
     "atlassian": {
       "type": "stdio",
@@ -29,6 +18,6 @@
       "type": "stdio",
       "command": "uvx",
       "args": ["duckduckgo-mcp-server"]
-    }
+    },
   }
 }
