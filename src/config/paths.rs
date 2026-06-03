@@ -88,9 +88,7 @@ pub fn validate_skill_name(name: &str) -> Result<()> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        bail!(
-            "Invalid skill name '{name}': only letters, digits, '-', and '_' are allowed"
-        );
+        bail!("Invalid skill name '{name}': only letters, digits, '-', and '_' are allowed");
     }
     Ok(())
 }
