@@ -33,7 +33,7 @@ pub struct Skill {
     #[serde(default)]
     body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    enabled_tools: Option<String>,
+    enabled_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled_mcp_servers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,7 +69,7 @@ impl Skill {
                         }
                     }
                     "enabled_tools" => {
-                        skill.enabled_tools = value.as_str().map(|v| v.to_string());
+                        skill.enabled_tools = parse_skill_string_or_array(value);
                     }
                     "enabled_mcp_servers" => {
                         skill.enabled_mcp_servers = parse_skill_string_or_array(value);
@@ -134,7 +134,7 @@ impl Skill {
         &self.body
     }
 
-    pub fn enabled_tools(&self) -> Option<&str> {
+    pub fn enabled_tools(&self) -> Option<&[String]> {
         self.enabled_tools.as_deref()
     }
 
@@ -207,7 +207,10 @@ mod tests {
 
         assert_eq!(skill.name(), "git-master");
         assert_eq!(skill.description(), "Atomic commits, rebase surgery");
-        assert_eq!(skill.enabled_tools(), Some("shell,fs"));
+        assert_eq!(
+            skill.enabled_tools(),
+            Some(["shell".to_string(), "fs".to_string()].as_slice())
+        );
         assert_eq!(
             skill.enabled_mcp_servers(),
             Some(["github".to_string()].as_slice())

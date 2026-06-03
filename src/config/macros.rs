@@ -33,7 +33,7 @@ pub async fn macro_execute(
     let mut app_config = (*ctx.app.config).clone();
     app_config.temperature = role.temperature();
     app_config.top_p = role.top_p();
-    app_config.enabled_tools = role.enabled_tools().clone();
+    app_config.enabled_tools = role.enabled_tools();
     app_config.enabled_mcp_servers = role.enabled_mcp_servers();
 
     let mut app_state = (*ctx.app).clone();

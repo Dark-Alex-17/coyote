@@ -196,7 +196,8 @@ pub struct Config {
 
     pub function_calling_support: bool,
     pub mapping_tools: IndexMap<String, String>,
-    pub enabled_tools: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
+    pub enabled_tools: Option<Vec<String>>,
     pub visible_tools: Option<Vec<String>>,
 
     pub skills_enabled: bool,

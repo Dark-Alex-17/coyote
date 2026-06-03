@@ -34,7 +34,8 @@ pub struct AppConfig {
 
     pub function_calling_support: bool,
     pub mapping_tools: IndexMap<String, String>,
-    pub enabled_tools: Option<String>,
+    #[serde(default, deserialize_with = "super::deserialize_csv_or_vec")]
+    pub enabled_tools: Option<Vec<String>>,
     pub visible_tools: Option<Vec<String>>,
 
     pub skills_enabled: bool,
@@ -394,7 +395,7 @@ impl AppConfig {
             self.mapping_tools = v;
         }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("enabled_tools")) {
-            self.enabled_tools = v;
+            self.enabled_tools = v.map(|raw| super::csv_to_vec(&raw));
         }
 
         if let Some(Some(v)) = super::read_env_bool(&get_env_name("skills_enabled")) {
@@ -516,7 +517,7 @@ impl AppConfig {
     }
 
     #[allow(dead_code)]
-    pub fn set_enabled_tools_default(&mut self, value: Option<String>) {
+    pub fn set_enabled_tools_default(&mut self, value: Option<Vec<String>>) {
         self.enabled_tools = value;
     }
 

@@ -256,13 +256,13 @@ fn build_inline_role(
     }
 
     if node.tools.as_deref().unwrap_or_default().is_empty() {
-        role.set_enabled_tools(Some(String::new()));
+        role.set_enabled_tools(Some(Vec::new()));
         role.set_enabled_mcp_servers(Some(Vec::new()));
     } else {
         if !regular_tools.is_empty() {
-            role.set_enabled_tools(Some(regular_tools.join(",")));
+            role.set_enabled_tools(Some(regular_tools.to_vec()));
         } else {
-            role.set_enabled_tools(Some(String::new()));
+            role.set_enabled_tools(Some(Vec::new()));
         }
         if !mcp_servers.is_empty() {
             role.set_enabled_mcp_servers(Some(mcp_servers.to_vec()));

@@ -55,7 +55,7 @@ async fn extract_via_extractor(
 
 fn build_extractor_role() -> Result<Role> {
     let mut role = Role::new(EXTRACTOR_ROLE_NAME, EXTRACTOR_ROLE_PROMPT);
-    role.set_enabled_tools(Some(String::new()));
+    role.set_enabled_tools(Some(Vec::new()));
     role.set_enabled_mcp_servers(Some(Vec::new()));
     Ok(role)
 }
@@ -183,7 +183,10 @@ mod tests {
     fn build_extractor_role_disables_tools_and_mcp() {
         let role = build_extractor_role().expect("builtin role must exist");
 
-        assert_eq!(role.enabled_tools().as_deref(), Some(""));
+        assert_eq!(
+            role.enabled_tools().as_deref(),
+            Some([].as_slice())
+        );
         assert_eq!(
             role.enabled_mcp_servers().as_deref(),
             Some([].as_slice())

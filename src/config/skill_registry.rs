@@ -69,14 +69,19 @@ impl SkillRegistry {
         let base_tools_set = effective.enabled_tools().is_some();
         let base_mcps_set = effective.enabled_mcp_servers().is_some();
 
-        let mut tools = parse_csv(effective.enabled_tools().as_deref());
+        let mut tools: BTreeSet<String> = effective
+            .enabled_tools()
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
         let mut mcps: BTreeSet<String> = effective
             .enabled_mcp_servers()
             .map(|v| v.into_iter().collect())
             .unwrap_or_default();
 
         for (_, skill) in &self.loaded {
-            tools.extend(parse_csv(skill.enabled_tools()));
+            if let Some(skill_tools) = skill.enabled_tools() {
+                tools.extend(skill_tools.iter().cloned());
+            }
             if let Some(servers) = skill.enabled_mcp_servers() {
                 mcps.extend(servers.iter().cloned());
             }
@@ -92,7 +97,7 @@ impl SkillRegistry {
         }
 
         if base_tools_set || !tools.is_empty() {
-            effective.set_enabled_tools(Some(join_csv(&tools)));
+            effective.set_enabled_tools(Some(tools.into_iter().collect()));
         }
 
         if base_mcps_set || !mcps.is_empty() {
@@ -101,23 +106,6 @@ impl SkillRegistry {
 
         effective
     }
-}
-
-fn parse_csv(s: Option<&str>) -> BTreeSet<String> {
-    let mut set = BTreeSet::new();
-    if let Some(raw) = s {
-        for token in raw.split(',') {
-            let trimmed = token.trim();
-            if !trimmed.is_empty() {
-                set.insert(trimmed.to_string());
-            }
-        }
-    }
-    set
-}
-
-fn join_csv(set: &BTreeSet<String>) -> String {
-    set.iter().cloned().collect::<Vec<_>>().join(",")
 }
 
 #[cfg(test)]
@@ -199,7 +187,7 @@ mod tests {
 
         assert_eq!(effective.prompt(), "Process: __INPUT__");
         let tools = effective.enabled_tools().expect("tools set by skill");
-        assert!(tools.contains("shell"));
+        assert!(tools.iter().any(|s| s == "shell"));
     }
 
     #[test]
@@ -228,12 +216,12 @@ mod tests {
         ));
 
         let mut base = Role::new("test", "body");
-        base.set_enabled_tools(Some("web_search".to_string()));
+        base.set_enabled_tools(Some(vec!["web_search".to_string()]));
 
         let effective = registry.effective_role(&base);
 
-        let tools_str = effective.enabled_tools().unwrap();
-        let tools: BTreeSet<&str> = tools_str.split(',').collect();
+        let tools_vec = effective.enabled_tools().unwrap();
+        let tools: BTreeSet<&str> = tools_vec.iter().map(|s| s.as_str()).collect();
         assert_eq!(tools, BTreeSet::from(["fs", "git", "shell", "web_search"]));
 
         let mcps_vec = effective.enabled_mcp_servers().unwrap();
@@ -259,10 +247,13 @@ mod tests {
         registry.insert_for_test(make_skill("knowledge", "", "Pure knowledge"));
 
         let mut base = Role::new("test", "Base");
-        base.set_enabled_tools(Some(String::new()));
+        base.set_enabled_tools(Some(Vec::new()));
         let effective = registry.effective_role(&base);
 
-        assert_eq!(effective.enabled_tools().as_deref(), Some(""));
+        assert_eq!(
+            effective.enabled_tools().as_deref(),
+            Some([].as_slice())
+        );
     }
 
     #[test]

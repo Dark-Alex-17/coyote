@@ -8,7 +8,9 @@ name: <role-name>                     # The name of the role
 model: openai:gpt-4o                  # The model to use for this role
 temperature: 0.2                      # The temperature to use for this role when querying the model
 top_p: 0                              # The top_p to use for this role when querying the model
-enabled_tools: fs_ls,fs_cat           # A comma-separated list of tools to enable for this role
+enabled_tools:                        # Tools to enable for this role. Accepts a YAML list (preferred)
+  - fs_ls                             # or a comma-separated string (e.g. `enabled_tools: fs_ls,fs_cat`).
+  - fs_cat                            # Use `all` to enable every visible tool.
 enabled_mcp_servers:                  # MCP servers to enable for this role. Accepts a YAML list (preferred)
   - github                            # or a comma-separated string (e.g. `enabled_mcp_servers: github,gitmcp`).
   - gitmcp                            # Use `all` to enable every configured MCP server.

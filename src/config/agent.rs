@@ -548,7 +548,7 @@ impl RoleLike for Agent {
         self.config.top_p
     }
 
-    fn enabled_tools(&self) -> Option<String> {
+    fn enabled_tools(&self) -> Option<Vec<String>> {
         None
     }
 
@@ -569,15 +569,14 @@ impl RoleLike for Agent {
         self.config.top_p = value;
     }
 
-    fn set_enabled_tools(&mut self, value: Option<String>) {
+    fn set_enabled_tools(&mut self, value: Option<Vec<String>>) {
         match value {
             Some(tools) => {
-                let tools = tools
-                    .split(',')
+                self.config.global_tools = tools
+                    .into_iter()
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty())
                     .collect::<Vec<_>>();
-                self.config.global_tools = tools;
             }
             None => {
                 self.config.global_tools.clear();

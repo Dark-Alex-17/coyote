@@ -28,12 +28,12 @@ pub trait RoleLike {
     fn model(&self) -> &Model;
     fn temperature(&self) -> Option<f64>;
     fn top_p(&self) -> Option<f64>;
-    fn enabled_tools(&self) -> Option<String>;
+    fn enabled_tools(&self) -> Option<Vec<String>>;
     fn enabled_mcp_servers(&self) -> Option<Vec<String>>;
     fn set_model(&mut self, model: Model);
     fn set_temperature(&mut self, value: Option<f64>);
     fn set_top_p(&mut self, value: Option<f64>);
-    fn set_enabled_tools(&mut self, value: Option<String>);
+    fn set_enabled_tools(&mut self, value: Option<Vec<String>>);
     fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>);
 }
 
@@ -51,8 +51,12 @@ pub struct Role {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    enabled_tools: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_tools: Option<Vec<String>>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -106,7 +110,7 @@ impl Role {
                     "model" => role.model_id = value.as_str().map(|v| v.to_string()),
                     "temperature" => role.temperature = value.as_f64(),
                     "top_p" => role.top_p = value.as_f64(),
-                    "enabled_tools" => role.enabled_tools = value.as_str().map(|v| v.to_string()),
+                    "enabled_tools" => role.enabled_tools = parse_string_or_array(value),
                     "enabled_mcp_servers" => {
                         role.enabled_mcp_servers = parse_string_or_array(value)
                     }
@@ -155,8 +159,10 @@ impl Role {
         if let Some(top_p) = self.top_p() {
             metadata.push(format!("top_p: {top_p}"));
         }
-        if let Some(enabled_tools) = self.enabled_tools() {
-            metadata.push(format!("enabled_tools: {enabled_tools}"));
+        if let Some(enabled_tools) = &self.enabled_tools {
+            let inline =
+                serde_json::to_string(enabled_tools).unwrap_or_else(|_| "[]".to_string());
+            metadata.push(format!("enabled_tools: {inline}"));
         }
         if let Some(enabled_mcp_servers) = &self.enabled_mcp_servers {
             let inline =
@@ -236,7 +242,7 @@ impl Role {
         model: &Model,
         temperature: Option<f64>,
         top_p: Option<f64>,
-        enabled_tools: Option<String>,
+        enabled_tools: Option<Vec<String>>,
         enabled_mcp_servers: Option<Vec<String>>,
     ) {
         self.set_model(model.clone());
@@ -371,7 +377,7 @@ impl RoleLike for Role {
         self.top_p
     }
 
-    fn enabled_tools(&self) -> Option<String> {
+    fn enabled_tools(&self) -> Option<Vec<String>> {
         self.enabled_tools.clone()
     }
 
@@ -394,7 +400,7 @@ impl RoleLike for Role {
         self.top_p = value;
     }
 
-    fn set_enabled_tools(&mut self, value: Option<String>) {
+    fn set_enabled_tools(&mut self, value: Option<Vec<String>>) {
         self.enabled_tools = value;
     }
 
@@ -499,7 +505,10 @@ mod tests {
     fn role_new_parses_enabled_tools() {
         let content = "---\nenabled_tools: tool1,tool2\n---\nPrompt";
         let role = Role::new("test", content);
-        assert_eq!(role.enabled_tools(), Some("tool1,tool2".to_string()));
+        assert_eq!(
+            role.enabled_tools(),
+            Some(vec!["tool1".to_string(), "tool2".to_string()])
+        );
     }
 
     #[test]
