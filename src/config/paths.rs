@@ -80,6 +80,21 @@ pub fn skill_file(name: &str) -> PathBuf {
     skill_dir(name).join("SKILL.md")
 }
 
+pub fn validate_skill_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("Skill name cannot be empty");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!(
+            "Invalid skill name '{name}': only letters, digits, '-', and '_' are allowed"
+        );
+    }
+    Ok(())
+}
+
 pub fn macros_dir() -> PathBuf {
     match env::var(get_env_name("macros_dir")) {
         Ok(value) => PathBuf::from(value),
@@ -285,4 +300,43 @@ pub fn local_models_override() -> Result<Vec<ProviderModels>> {
         bail!("Incompatible version")
     }
     Ok(models_override.list)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_skill_name_accepts_alphanumerics_and_dashes() {
+        assert!(validate_skill_name("git-master").is_ok());
+        assert!(validate_skill_name("code_review").is_ok());
+        assert!(validate_skill_name("Skill1").is_ok());
+    }
+
+    #[test]
+    fn validate_skill_name_rejects_empty() {
+        let err = validate_skill_name("").unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn validate_skill_name_rejects_path_traversal() {
+        for bad in ["../escape", "..", "foo/bar", "foo\\bar", "./hidden"] {
+            let err = validate_skill_name(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("Invalid skill name"),
+                "expected rejection for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_skill_name_rejects_other_special_chars() {
+        for bad in ["with space", "null\0byte", "weird?char", "dot.name"] {
+            assert!(
+                validate_skill_name(bad).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+    }
 }

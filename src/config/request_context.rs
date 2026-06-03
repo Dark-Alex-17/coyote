@@ -2584,6 +2584,7 @@ impl RequestContext {
     }
 
     pub fn upsert_skill(&self, app: &AppConfig, name: &str) -> Result<()> {
+        paths::validate_skill_name(name)?;
         let path = paths::skill_file(name);
         ensure_parent_exists(&path)?;
         let is_new = !path.exists();
@@ -2602,6 +2603,7 @@ impl RequestContext {
     }
 
     pub async fn load_skill_repl(&mut self, name: &str, abort_signal: AbortSignal) -> Result<()> {
+        paths::validate_skill_name(name)?;
         if !self.app.config.function_calling_support {
             bail!(
                 "Skills require function calling, which is disabled. Enable function calling in your config then try again."
