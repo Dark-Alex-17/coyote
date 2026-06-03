@@ -16,6 +16,7 @@ mcp_servers:
   - ddg-search
 global_tools:
   - fs_read.sh
+  - fs_cat.sh
   - fs_grep.sh
   - fs_glob.sh
   - fs_ls.sh
@@ -58,9 +59,10 @@ instructions: |
   ## File reading strategy (minimize token usage)
 
   1. **Use grep to find relevant code** — `fs_grep --pattern "auth" --include "*.rs"` finds where things are.
-  2. **Read only what you need** — `fs_read --path "src/main.rs" --offset 50 --limit 30` reads lines 50-79.
-  3. **Never read entire large files** — if 500+ lines, grep first, then read the relevant section.
-  4. **Use glob to discover files** — `fs_glob --pattern "*.rs" --path src/`.
+  2. **Read sections with `fs_read`** — `fs_read --path "src/main.rs" --offset 50 --limit 30` reads lines 50-79. `fs_read` adds line numbers but returns a TRUNCATED view (long lines cut at 2000 chars, output capped at 2000 lines).
+  3. **Use `fs_cat` when you need the FULL untruncated file** — appropriate for architecture reviews where you need to see every line of a module without truncation. Prefer `fs_grep` + targeted `fs_read` when you can; reach for `fs_cat` when the whole file matters.
+  4. **Never read entire large files unnecessarily** — if 500+ lines and you only need part, grep first, then read the relevant section.
+  5. **Use glob to discover files** — `fs_glob --pattern "*.rs" --path src/`.
 
   ## Your process
 
