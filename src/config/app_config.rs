@@ -38,7 +38,8 @@ pub struct AppConfig {
     pub visible_tools: Option<Vec<String>>,
 
     pub skills_enabled: bool,
-    pub enabled_skills: Option<String>,
+    #[serde(default, deserialize_with = "super::deserialize_csv_or_vec")]
+    pub enabled_skills: Option<Vec<String>>,
     pub visible_skills: Option<Vec<String>>,
 
     pub mcp_server_support: bool,
@@ -400,7 +401,7 @@ impl AppConfig {
         }
 
         if let Some(v) = super::read_env_value::<String>(&get_env_name("enabled_skills")) {
-            self.enabled_skills = v;
+            self.enabled_skills = v.map(|raw| super::csv_to_vec(&raw));
         }
 
         if let Some(Some(v)) = super::read_env_bool(&get_env_name("mcp_server_support")) {

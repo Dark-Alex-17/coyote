@@ -57,8 +57,12 @@ pub struct Role {
     enabled_mcp_servers: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skills_enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    enabled_skills: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_skills: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_continue: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,7 +107,7 @@ impl Role {
                         role.enabled_mcp_servers = value.as_str().map(|v| v.to_string())
                     }
                     "skills_enabled" => role.skills_enabled = value.as_bool(),
-                    "enabled_skills" => role.enabled_skills = value.as_str().map(|v| v.to_string()),
+                    "enabled_skills" => role.enabled_skills = parse_enabled_skills_value(value),
                     "auto_continue" => role.auto_continue = value.as_bool(),
                     "max_auto_continues" => {
                         role.max_auto_continues = value.as_u64().map(|v| v as usize)
@@ -157,7 +161,8 @@ impl Role {
             metadata.push(format!("skills_enabled: {skills_enabled}"));
         }
         if let Some(enabled_skills) = &self.enabled_skills {
-            metadata.push(format!("enabled_skills: {enabled_skills}"));
+            let inline = serde_json::to_string(enabled_skills).unwrap_or_else(|_| "[]".to_string());
+            metadata.push(format!("enabled_skills: {inline}"));
         }
         if let Some(auto_continue) = self.auto_continue {
             metadata.push(format!("auto_continue: {auto_continue}"));
@@ -287,7 +292,7 @@ impl Role {
         self.skills_enabled
     }
 
-    pub fn enabled_skills(&self) -> Option<&str> {
+    pub fn enabled_skills(&self) -> Option<&[String]> {
         self.enabled_skills.as_deref()
     }
 
@@ -390,6 +395,28 @@ impl RoleLike for Role {
     fn set_enabled_mcp_servers(&mut self, value: Option<String>) {
         self.enabled_mcp_servers = value;
     }
+}
+
+fn parse_enabled_skills_value(value: &Value) -> Option<Vec<String>> {
+    if value.is_null() {
+        return None;
+    }
+
+    if let Some(s) = value.as_str() {
+        return Some(csv_to_vec(s));
+    }
+
+    if let Some(arr) = value.as_array() {
+        let items: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        return Some(items);
+    }
+
+    None
 }
 
 fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {

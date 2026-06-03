@@ -200,7 +200,8 @@ pub struct Config {
     pub visible_tools: Option<Vec<String>>,
 
     pub skills_enabled: bool,
-    pub enabled_skills: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
+    pub enabled_skills: Option<Vec<String>>,
     pub visible_skills: Option<Vec<String>>,
 
     pub mcp_server_support: bool,
@@ -781,6 +782,72 @@ where
         Some(value)
     };
     Ok(value)
+}
+
+pub(super) fn csv_to_vec(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+pub(super) fn deserialize_csv_or_vec<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct CsvOrVec;
+
+    impl<'de> Visitor<'de> for CsvOrVec {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a comma-separated string, a list of strings, or null")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+            Ok(Some(csv_to_vec(value)))
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> std::result::Result<Self::Value, E> {
+            Ok(Some(csv_to_vec(&value)))
+        }
+
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> std::result::Result<Self::Value, D2::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut vec = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                let trimmed = item.trim().to_string();
+                if !trimmed.is_empty() {
+                    vec.push(trimmed);
+                }
+            }
+            Ok(Some(vec))
+        }
+    }
+
+    deserializer.deserialize_option(CsvOrVec)
 }
 
 fn read_env_bool(key: &str) -> Option<Option<bool>> {
