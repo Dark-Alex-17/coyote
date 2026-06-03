@@ -367,7 +367,7 @@ pub fn interpolate_secrets(content: &str, vault: &Vault) -> Result<(String, Vec<
                     if fatal_error.is_some() {
                         return String::new();
                     }
-                    
+
                     let name = caps[1].trim();
                     match vault.get_secret(name, false) {
                         Ok(s) => s,
