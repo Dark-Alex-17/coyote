@@ -687,6 +687,9 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
         },
     };
     create_vault_password_file(&mut vault)?;
+    if provider_choice.is_some() {
+        vault.validate_round_trip()?;
+    }
 
     let client = Select::new("API Provider (required):", list_client_types()).prompt()?;
 

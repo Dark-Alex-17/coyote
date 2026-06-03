@@ -18,6 +18,6 @@
       "type": "stdio",
       "command": "uvx",
       "args": ["duckduckgo-mcp-server"]
-    },
+    }
   }
 }
