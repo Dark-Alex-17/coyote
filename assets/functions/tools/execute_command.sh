@@ -20,5 +20,5 @@ main() {
     trap "rm -f '$script'" EXIT
     # shellcheck disable=SC2154
     printf '%s\n' "$argc_command" > "$script"
-    bash "$script" >> "$LLM_OUTPUT"
+    bash -e -o pipefail "$script" >> "$LLM_OUTPUT"
 }
