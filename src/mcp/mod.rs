@@ -146,7 +146,7 @@ impl McpRegistry {
     pub async fn init(
         log_path: Option<PathBuf>,
         start_mcp_servers: bool,
-        enabled_mcp_servers: Option<String>,
+        enabled_mcp_servers: Option<Vec<String>>,
         abort_signal: AbortSignal,
         app_config: &AppConfig,
         vault: &Vault,
@@ -216,7 +216,7 @@ impl McpRegistry {
 
     async fn start_select_mcp_servers(
         &mut self,
-        enabled_mcp_servers: Option<String>,
+        enabled_mcp_servers: Option<Vec<String>>,
     ) -> Result<()> {
         if self.config.is_none() {
             debug!(
@@ -292,15 +292,15 @@ impl McpRegistry {
         Ok((id.to_string(), service, catalog))
     }
 
-    fn resolve_server_ids(&self, enabled_mcp_servers: Option<String>) -> Vec<String> {
+    fn resolve_server_ids(&self, enabled_mcp_servers: Option<Vec<String>>) -> Vec<String> {
         if let Some(config) = &self.config
             && let Some(servers) = enabled_mcp_servers
         {
-            if servers == "all" {
+            if servers.iter().any(|s| s.trim() == "all") {
                 config.mcp_servers.keys().cloned().collect()
             } else {
                 let enabled_servers: HashSet<String> =
-                    servers.split(',').map(|s| s.trim().to_string()).collect();
+                    servers.into_iter().map(|s| s.trim().to_string()).collect();
                 config
                     .mcp_servers
                     .keys()
@@ -754,7 +754,7 @@ mod tests {
     #[test]
     fn resolve_all_returns_all_configured_servers() {
         let registry = make_registry_with_config(&["github", "slack", "jira"]);
-        let mut ids = registry.resolve_server_ids(Some("all".to_string()));
+        let mut ids = registry.resolve_server_ids(Some(vec!["all".to_string()]));
         ids.sort();
         assert_eq!(ids, vec!["github", "jira", "slack"]);
     }
@@ -762,7 +762,8 @@ mod tests {
     #[test]
     fn resolve_comma_separated_returns_matching_servers() {
         let registry = make_registry_with_config(&["github", "slack", "jira"]);
-        let mut ids = registry.resolve_server_ids(Some("github, jira".to_string()));
+        let mut ids = registry
+            .resolve_server_ids(Some(vec!["github".to_string(), "jira".to_string()]));
         ids.sort();
         assert_eq!(ids, vec!["github", "jira"]);
     }
@@ -770,7 +771,7 @@ mod tests {
     #[test]
     fn resolve_single_server_name() {
         let registry = make_registry_with_config(&["github", "slack"]);
-        let ids = registry.resolve_server_ids(Some("slack".to_string()));
+        let ids = registry.resolve_server_ids(Some(vec!["slack".to_string()]));
         assert_eq!(ids, vec!["slack"]);
     }
 
@@ -784,28 +785,35 @@ mod tests {
     #[test]
     fn resolve_no_config_returns_empty() {
         let registry = McpRegistry::default();
-        let ids = registry.resolve_server_ids(Some("all".to_string()));
+        let ids = registry.resolve_server_ids(Some(vec!["all".to_string()]));
         assert!(ids.is_empty());
     }
 
     #[test]
     fn resolve_nonexistent_server_filtered_out() {
         let registry = make_registry_with_config(&["github"]);
-        let ids = registry.resolve_server_ids(Some("github, nonexistent".to_string()));
+        let ids = registry.resolve_server_ids(Some(vec![
+            "github".to_string(),
+            "nonexistent".to_string(),
+        ]));
         assert_eq!(ids, vec!["github"]);
     }
 
     #[test]
     fn resolve_all_nonexistent_returns_empty() {
         let registry = make_registry_with_config(&["github"]);
-        let ids = registry.resolve_server_ids(Some("foo, bar".to_string()));
+        let ids =
+            registry.resolve_server_ids(Some(vec!["foo".to_string(), "bar".to_string()]));
         assert!(ids.is_empty());
     }
 
     #[test]
     fn resolve_trims_whitespace() {
         let registry = make_registry_with_config(&["github", "slack"]);
-        let mut ids = registry.resolve_server_ids(Some("  github  ,  slack  ".to_string()));
+        let mut ids = registry.resolve_server_ids(Some(vec![
+            "  github  ".to_string(),
+            "  slack  ".to_string(),
+        ]));
         ids.sort();
         assert_eq!(ids, vec!["github", "slack"]);
     }

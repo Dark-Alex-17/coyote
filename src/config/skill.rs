@@ -35,7 +35,7 @@ pub struct Skill {
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled_tools: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    enabled_mcp_servers: Option<String>,
+    enabled_mcp_servers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_unload: Option<bool>,
 }
@@ -72,7 +72,7 @@ impl Skill {
                         skill.enabled_tools = value.as_str().map(|v| v.to_string());
                     }
                     "enabled_mcp_servers" => {
-                        skill.enabled_mcp_servers = value.as_str().map(|v| v.to_string());
+                        skill.enabled_mcp_servers = parse_skill_string_or_array(value);
                     }
                     "auto_unload" => {
                         skill.auto_unload = value.as_bool();
@@ -138,7 +138,7 @@ impl Skill {
         self.enabled_tools.as_deref()
     }
 
-    pub fn enabled_mcp_servers(&self) -> Option<&str> {
+    pub fn enabled_mcp_servers(&self) -> Option<&[String]> {
         self.enabled_mcp_servers.as_deref()
     }
 
@@ -157,9 +157,27 @@ impl Skill {
     fn declares_mcp_servers(&self) -> bool {
         self.enabled_mcp_servers
             .as_deref()
-            .map(|s| !s.trim().is_empty())
+            .map(|servers| !servers.is_empty())
             .unwrap_or(false)
     }
+}
+
+fn parse_skill_string_or_array(value: &Value) -> Option<Vec<String>> {
+    if value.is_null() {
+        return None;
+    }
+    if let Some(s) = value.as_str() {
+        return Some(csv_to_vec(s));
+    }
+    if let Some(arr) = value.as_array() {
+        let items: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        return Some(items);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -190,7 +208,10 @@ mod tests {
         assert_eq!(skill.name(), "git-master");
         assert_eq!(skill.description(), "Atomic commits, rebase surgery");
         assert_eq!(skill.enabled_tools(), Some("shell,fs"));
-        assert_eq!(skill.enabled_mcp_servers(), Some("github"));
+        assert_eq!(
+            skill.enabled_mcp_servers(),
+            Some(["github".to_string()].as_slice())
+        );
         assert!(skill.auto_unload());
         assert_eq!(skill.body(), "You are a git expert");
     }

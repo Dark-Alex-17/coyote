@@ -128,7 +128,7 @@ fn handle_list(ctx: &RequestContext, policy: &SkillPolicy) -> Result<Value> {
             "name": skill.name(),
             "description": skill.description(),
             "grants_tools": csv_to_vec(skill.enabled_tools()),
-            "grants_mcp_servers": csv_to_vec(skill.enabled_mcp_servers()),
+            "grants_mcp_servers": skill.enabled_mcp_servers().unwrap_or_default(),
             "loaded": ctx.skill_registry.is_loaded(skill.name()),
         }));
     }
@@ -170,7 +170,7 @@ async fn handle_load(
         .unwrap_or(false);
     let mcps_declared = skill
         .enabled_mcp_servers()
-        .map(|s| !s.trim().is_empty())
+        .map(|v| !v.is_empty())
         .unwrap_or(false);
 
     if tools_declared && !function_calling_on {

@@ -206,7 +206,8 @@ pub struct Config {
 
     pub mcp_server_support: bool,
     pub mapping_mcp_servers: IndexMap<String, String>,
-    pub enabled_mcp_servers: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
+    pub enabled_mcp_servers: Option<Vec<String>>,
 
     pub auto_continue: bool,
     pub max_auto_continues: usize,

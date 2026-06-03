@@ -29,12 +29,12 @@ pub trait RoleLike {
     fn temperature(&self) -> Option<f64>;
     fn top_p(&self) -> Option<f64>;
     fn enabled_tools(&self) -> Option<String>;
-    fn enabled_mcp_servers(&self) -> Option<String>;
+    fn enabled_mcp_servers(&self) -> Option<Vec<String>>;
     fn set_model(&mut self, model: Model);
     fn set_temperature(&mut self, value: Option<f64>);
     fn set_top_p(&mut self, value: Option<f64>);
     fn set_enabled_tools(&mut self, value: Option<String>);
-    fn set_enabled_mcp_servers(&mut self, value: Option<String>);
+    fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>);
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -53,8 +53,12 @@ pub struct Role {
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled_tools: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    enabled_mcp_servers: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_mcp_servers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skills_enabled: Option<bool>,
     #[serde(
@@ -104,10 +108,10 @@ impl Role {
                     "top_p" => role.top_p = value.as_f64(),
                     "enabled_tools" => role.enabled_tools = value.as_str().map(|v| v.to_string()),
                     "enabled_mcp_servers" => {
-                        role.enabled_mcp_servers = value.as_str().map(|v| v.to_string())
+                        role.enabled_mcp_servers = parse_string_or_array(value)
                     }
                     "skills_enabled" => role.skills_enabled = value.as_bool(),
-                    "enabled_skills" => role.enabled_skills = parse_enabled_skills_value(value),
+                    "enabled_skills" => role.enabled_skills = parse_string_or_array(value),
                     "auto_continue" => role.auto_continue = value.as_bool(),
                     "max_auto_continues" => {
                         role.max_auto_continues = value.as_u64().map(|v| v as usize)
@@ -154,8 +158,10 @@ impl Role {
         if let Some(enabled_tools) = self.enabled_tools() {
             metadata.push(format!("enabled_tools: {enabled_tools}"));
         }
-        if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
-            metadata.push(format!("enabled_mcp_servers: {enabled_mcp_servers}"));
+        if let Some(enabled_mcp_servers) = &self.enabled_mcp_servers {
+            let inline =
+                serde_json::to_string(enabled_mcp_servers).unwrap_or_else(|_| "[]".to_string());
+            metadata.push(format!("enabled_mcp_servers: {inline}"));
         }
         if let Some(skills_enabled) = self.skills_enabled {
             metadata.push(format!("skills_enabled: {skills_enabled}"));
@@ -231,7 +237,7 @@ impl Role {
         temperature: Option<f64>,
         top_p: Option<f64>,
         enabled_tools: Option<String>,
-        enabled_mcp_servers: Option<String>,
+        enabled_mcp_servers: Option<Vec<String>>,
     ) {
         self.set_model(model.clone());
         if temperature.is_some() {
@@ -369,7 +375,7 @@ impl RoleLike for Role {
         self.enabled_tools.clone()
     }
 
-    fn enabled_mcp_servers(&self) -> Option<String> {
+    fn enabled_mcp_servers(&self) -> Option<Vec<String>> {
         self.enabled_mcp_servers.clone()
     }
 
@@ -392,12 +398,12 @@ impl RoleLike for Role {
         self.enabled_tools = value;
     }
 
-    fn set_enabled_mcp_servers(&mut self, value: Option<String>) {
+    fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>) {
         self.enabled_mcp_servers = value;
     }
 }
 
-fn parse_enabled_skills_value(value: &Value) -> Option<Vec<String>> {
+fn parse_string_or_array(value: &Value) -> Option<Vec<String>> {
     if value.is_null() {
         return None;
     }
@@ -500,7 +506,10 @@ mod tests {
     fn role_new_parses_enabled_mcp_servers() {
         let content = "---\nenabled_mcp_servers: github,jira\n---\nPrompt";
         let role = Role::new("test", content);
-        assert_eq!(role.enabled_mcp_servers(), Some("github,jira".to_string()));
+        assert_eq!(
+            role.enabled_mcp_servers(),
+            Some(vec!["github".to_string(), "jira".to_string()])
+        );
     }
 
     #[test]
