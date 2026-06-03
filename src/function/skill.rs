@@ -283,5 +283,4 @@ mod tests {
 
         assert!(required, "skill__list should have no required parameters");
     }
-
 }

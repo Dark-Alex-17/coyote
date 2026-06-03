@@ -160,8 +160,7 @@ impl Role {
             metadata.push(format!("top_p: {top_p}"));
         }
         if let Some(enabled_tools) = &self.enabled_tools {
-            let inline =
-                serde_json::to_string(enabled_tools).unwrap_or_else(|_| "[]".to_string());
+            let inline = serde_json::to_string(enabled_tools).unwrap_or_else(|_| "[]".to_string());
             metadata.push(format!("enabled_tools: {inline}"));
         }
         if let Some(enabled_mcp_servers) = &self.enabled_mcp_servers {

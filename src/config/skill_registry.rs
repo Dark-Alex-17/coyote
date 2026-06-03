@@ -250,10 +250,7 @@ mod tests {
         base.set_enabled_tools(Some(Vec::new()));
         let effective = registry.effective_role(&base);
 
-        assert_eq!(
-            effective.enabled_tools().as_deref(),
-            Some([].as_slice())
-        );
+        assert_eq!(effective.enabled_tools().as_deref(), Some([].as_slice()));
     }
 
     #[test]

@@ -762,8 +762,8 @@ mod tests {
     #[test]
     fn resolve_comma_separated_returns_matching_servers() {
         let registry = make_registry_with_config(&["github", "slack", "jira"]);
-        let mut ids = registry
-            .resolve_server_ids(Some(vec!["github".to_string(), "jira".to_string()]));
+        let mut ids =
+            registry.resolve_server_ids(Some(vec!["github".to_string(), "jira".to_string()]));
         ids.sort();
         assert_eq!(ids, vec!["github", "jira"]);
     }
@@ -792,18 +792,15 @@ mod tests {
     #[test]
     fn resolve_nonexistent_server_filtered_out() {
         let registry = make_registry_with_config(&["github"]);
-        let ids = registry.resolve_server_ids(Some(vec![
-            "github".to_string(),
-            "nonexistent".to_string(),
-        ]));
+        let ids = registry
+            .resolve_server_ids(Some(vec!["github".to_string(), "nonexistent".to_string()]));
         assert_eq!(ids, vec!["github"]);
     }
 
     #[test]
     fn resolve_all_nonexistent_returns_empty() {
         let registry = make_registry_with_config(&["github"]);
-        let ids =
-            registry.resolve_server_ids(Some(vec!["foo".to_string(), "bar".to_string()]));
+        let ids = registry.resolve_server_ids(Some(vec!["foo".to_string(), "bar".to_string()]));
         assert!(ids.is_empty());
     }
 

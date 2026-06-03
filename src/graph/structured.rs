@@ -183,13 +183,7 @@ mod tests {
     fn build_extractor_role_disables_tools_and_mcp() {
         let role = build_extractor_role().expect("builtin role must exist");
 
-        assert_eq!(
-            role.enabled_tools().as_deref(),
-            Some([].as_slice())
-        );
-        assert_eq!(
-            role.enabled_mcp_servers().as_deref(),
-            Some([].as_slice())
-        );
+        assert_eq!(role.enabled_tools().as_deref(), Some([].as_slice()));
+        assert_eq!(role.enabled_mcp_servers().as_deref(), Some([].as_slice()));
     }
 }
