@@ -3392,7 +3392,10 @@ mod tests {
         ctx.tool_scope.functions.append_todo_functions();
 
         let mut role = Role::new("r", "p");
-        role.set_enabled_tools(Some(vec!["todo__init".to_string(), "todo__add".to_string()]));
+        role.set_enabled_tools(Some(vec![
+            "todo__init".to_string(),
+            "todo__add".to_string(),
+        ]));
 
         let fns = ctx.select_functions(&role).unwrap();
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();

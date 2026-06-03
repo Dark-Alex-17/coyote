@@ -109,8 +109,8 @@ impl SkillPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::csv_to_vec;
+    use super::*;
 
     fn always_true(_: &str) -> bool {
         true
