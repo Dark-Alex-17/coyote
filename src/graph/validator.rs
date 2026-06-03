@@ -1008,7 +1008,10 @@ mod tests {
     #[test]
     fn llm_node_skill_in_graph_set_passes() {
         let mut graph = graph_with(
-            vec![("l", llm_node("l", None, Some("end"))), ("end", end_node("end"))],
+            vec![
+                ("l", llm_node("l", None, Some("end"))),
+                ("end", end_node("end")),
+            ],
             "l",
         );
         graph.enabled_skills = Some(vec!["code-review".into(), "git-master".into()]);
@@ -1031,7 +1034,10 @@ mod tests {
     #[test]
     fn llm_node_skill_not_in_graph_set_errors() {
         let mut graph = graph_with(
-            vec![("l", llm_node("l", None, Some("end"))), ("end", end_node("end"))],
+            vec![
+                ("l", llm_node("l", None, Some("end"))),
+                ("end", end_node("end")),
+            ],
             "l",
         );
         graph.enabled_skills = Some(vec!["code-review".into()]);
@@ -1043,10 +1049,10 @@ mod tests {
 
         assert!(!result.is_valid());
         assert!(
-            result.errors.iter().any(|e| e
-                .message
-                .contains("'git-master'")
-                && e.message.contains("graph-level")),
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("'git-master'") && e.message.contains("graph-level")),
             "expected git-master subset error, got: {:?}",
             result.errors
         );
@@ -1055,7 +1061,10 @@ mod tests {
     #[test]
     fn llm_node_empty_skill_name_errors() {
         let mut graph = graph_with(
-            vec![("l", llm_node("l", None, Some("end"))), ("end", end_node("end"))],
+            vec![
+                ("l", llm_node("l", None, Some("end"))),
+                ("end", end_node("end")),
+            ],
             "l",
         );
         graph.enabled_skills = Some(vec!["code-review".into()]);
@@ -1079,7 +1088,10 @@ mod tests {
     #[test]
     fn llm_node_skill_when_no_graph_set_is_permitted_by_validator() {
         let mut graph = graph_with(
-            vec![("l", llm_node("l", None, Some("end"))), ("end", end_node("end"))],
+            vec![
+                ("l", llm_node("l", None, Some("end"))),
+                ("end", end_node("end")),
+            ],
             "l",
         );
         if let NodeType::Llm(ref mut n) = graph.nodes.get_mut("l").unwrap().node_type {

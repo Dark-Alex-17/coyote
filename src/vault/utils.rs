@@ -2,6 +2,7 @@ use crate::config::ensure_parent_exists;
 use crate::vault::{SECRET_RE, Vault};
 use anyhow::Result;
 use anyhow::anyhow;
+use gman::SecretError;
 use gman::providers::SupportedProvider;
 use gman::providers::aws_secrets_manager::AwsSecretsManagerProvider;
 use gman::providers::azure_key_vault::AzureKeyVaultProvider;
@@ -14,7 +15,6 @@ use inquire::validator::Validation;
 use inquire::{Confirm, Password, PasswordDisplayMode, Select, Text, min_length, required};
 use std::path::PathBuf;
 use std::process::Command;
-use gman::SecretError;
 
 pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> Result<()> {
     let vault_password_file = local_provider
@@ -322,9 +322,7 @@ fn advisory_preflight(label: &str, cli: &str, args: &[&str]) {
             if !stderr.trim().is_empty() {
                 eprintln!("    {}", stderr.trim());
             }
-            eprintln!(
-                "    Setup will continue. Fix authentication before using --add-secret etc."
-            );
+            eprintln!("    Setup will continue. Fix authentication before using --add-secret etc.");
         }
         Err(_) => {
             eprintln!(
@@ -375,9 +373,8 @@ pub fn interpolate_secrets(content: &str, vault: &Vault) -> Result<(String, Vec<
                                 String::new()
                             }
                             Some(SecretError::AuthFailed { .. }) => {
-                                let base = format!(
-                                    "Failed to fetch secret '{name}' from vault: {e}"
-                                );
+                                let base =
+                                    format!("Failed to fetch secret '{name}' from vault: {e}");
                                 let msg = match vault.auth_hint() {
                                     Some(hint) => format!("{base}\n\nHint: {hint}"),
                                     None => base,
