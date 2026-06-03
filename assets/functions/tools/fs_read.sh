@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -e
 
-# @describe Read a file with line numbers, offset, and limit. For directories, lists entries.
-# Prefer this over fs_cat for controlled reading. Use offset/limit to read specific sections.
+# @describe Read a TRUNCATED view of a file with line numbers, offset, and limit. For directories, lists entries.
+# IMPORTANT: This tool truncates output — lines over 2000 chars are cut off, and output is capped at 2000 lines by default.
+# If you need the FULL, untruncated contents of a file, use fs_cat instead.
+# Use this tool when you want line numbers, want to read a specific section via --offset/--limit, or are scanning a large file.
 # Use the grep tool to find specific content before reading, then read with offset to target the relevant section.
 
 # @option --path! The absolute path to the file or directory to read

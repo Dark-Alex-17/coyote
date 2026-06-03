@@ -14,6 +14,7 @@ mcp_servers:
   - ddg-search
 global_tools:
   - fs_read.sh
+  - fs_cat.sh
   - fs_grep.sh
   - fs_glob.sh
   - fs_ls.sh
@@ -39,15 +40,17 @@ instructions: |
   1. **Find first, read second** — never read a file without knowing why.
   2. **Use grep to locate** — `fs_grep --pattern "struct User" --include "*.rs"` finds where things are.
   3. **Use glob to discover** — `fs_glob --pattern "*.rs" --path src/` finds files by name.
-  4. **Read targeted sections** — `fs_read --path "src/main.rs" --offset 50 --limit 30` reads only lines 50-79.
-  5. **Never read entire large files** — if a file is 500+ lines, read the relevant section only.
+  4. **Prefer `fs_read` with offset/limit** — `fs_read --path "src/main.rs" --offset 50 --limit 30` reads lines 50-79 only. `fs_read` adds line numbers but TRUNCATES long lines (over 2000 chars) and caps output at 2000 lines by default.
+  5. **Use `fs_cat` only when you need the entire file untruncated** — for exploration this should be rare. If you find yourself reaching for `fs_cat`, ask whether `fs_grep` + a targeted `fs_read` would answer your question instead.
+  6. **Never read entire large files** — if a file is 500+ lines, read the relevant section only.
 
   ## Available actions
 
   - `fs_grep --pattern "struct User" --include "*.rs"` — find content across files
   - `fs_glob --pattern "*.rs" --path src/` — find files by name pattern
-  - `fs_read --path "src/main.rs"` — read a file (with line numbers)
-  - `fs_read --path "src/main.rs" --offset 100 --limit 50` — read lines 100-149 only
+  - `fs_read --path "src/main.rs"` — read a TRUNCATED view with line numbers (default 2000 lines, lines over 2000 chars cut off)
+  - `fs_read --path "src/main.rs" --offset 100 --limit 50` — read lines 100-149 only (with line numbers, truncation rules still apply)
+  - `fs_cat --path "src/main.rs"` — read the FULL untruncated file (no line numbers); use only when you actually need every line
   - `fs_ls --path "src/"` — list directory contents
 
   ## Output format

@@ -252,7 +252,7 @@ instructions: |
 
     Shell-based file writes break on multi-line content, special characters, quoted strings, and nested language blocks (Python triple-strings, JSON, etc.). `fs_write` and `fs_patch` handle these correctly because they don't go through shell parsing.
 
-  - **For reading files**, prefer `fs_read` over `cat` via `execute_command`. `fs_read` supports offset/limit for partial reads.
+  - **For reading files**, prefer `fs_read` over `cat` via `execute_command`. `fs_read` adds line numbers and supports `--offset`/`--limit` for partial reads, but returns a TRUNCATED view (long lines cut at 2000 chars, output capped at 2000 lines by default). When you need the FULL untruncated file (e.g., for handoff to a sub-agent or to read an entire small config), use `fs_cat` instead.
   - **For listing/searching**, prefer `fs_ls`, `fs_glob`, `fs_grep` over shell equivalents (`ls`, `find`, `grep`).
 
   `execute_command` is for: git operations, build/test commands, package management, runtime inspection (`ps`, `df`, etc.) — anything where the shell IS the right interface.
