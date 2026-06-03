@@ -34,8 +34,48 @@ right_prompt:
   '{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
 
 # ---- Vault ----
-# See the [Vault documentation](https://github.com/Dark-Alex-17/coyote/wiki/Vault) for more information on the Coyote vault
+# See the [Vault documentation](https://github.com/Dark-Alex-17/coyote/wiki/Vault) for more information on the Coyote vault.
+#
+# The secrets_provider tells Coyote where to read and write secrets referenced via {{SECRET_NAME}} syntax.
+#
+# Shorthand: set vault_password_file to enable the local provider with that password file.
 vault_password_file: null        # Path to a file containing the password for the Coyote vault (cannot be a secret template)
+#
+# Explicit: set secrets_provider to one of the supported types below. When secrets_provider is set,
+# vault_password_file is ignored. Note: secrets_provider itself cannot use {{SECRET}} template syntax.
+# The vault must be initialized before any secrets can be resolved.
+#
+# Local (same as the shorthand above):
+# secrets_provider:
+#   type: local
+#   password_file: ~/.coyote_password
+#
+# AWS Secrets Manager (requires an authenticated AWS CLI; see `aws sso login` or `aws configure`):
+# secrets_provider:
+#   type: aws_secrets_manager
+#   aws_profile: default
+#   aws_region: us-east-1
+#
+# GCP Secret Manager (requires `gcloud auth application-default login`):
+# secrets_provider:
+#   type: gcp_secret_manager
+#   gcp_project_id: my-project-id
+#
+# Azure Key Vault (requires `az login`):
+# secrets_provider:
+#   type: azure_key_vault
+#   vault_name: my-vault-name
+#
+# gopass (requires the `gopass` CLI to be installed and initialized):
+# secrets_provider:
+#   type: gopass
+#   store: my-store              # Optional; omit to use the default store
+#
+# 1Password (requires the `op` CLI to be installed and signed in via `op signin`):
+# secrets_provider:
+#   type: one_password
+#   vault: Production            # Optional; omit to use the default vault
+#   account: my.1password.com    # Optional; omit to use the default account
 
 # ---- Function Calling ----
 # See the [Tools documentation](https://github.com/Dark-Alex-17/coyote/wiki/Tools) for more details
