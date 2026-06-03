@@ -3,10 +3,11 @@ set -e
 
 # @describe Search file contents using regular expressions. Returns matching file paths and lines.
 # Use this to find relevant code before reading files. Much faster than reading files to search.
+# --path accepts either a directory (recursive search with exclude rules applied) or a single file.
 
 # @option --pattern! The regex pattern to search for in file contents
-# @option --path The directory to search in (defaults to current working directory)
-# @option --include File pattern to filter by (e.g. "*.rs", "*.{ts,tsx}", "*.py")
+# @option --path The directory OR file to search in (defaults to current working directory)
+# @option --include File pattern to filter by (e.g. "*.rs", "*.{ts,tsx}", "*.py"). Ignored when --path is a single file.
 
 # @env LLM_OUTPUT=/dev/stdout The output path
 
@@ -19,33 +20,37 @@ main() {
     local search_path="${argc_path:-.}"
     local include_filter="${argc_include:-}"
 
-    if [[ ! -d "$search_path" ]]; then
-        echo "Error: directory not found: $search_path" >> "$LLM_OUTPUT"
+    if [[ ! -e "$search_path" ]]; then
+        echo "Error: path not found: $search_path" >> "$LLM_OUTPUT"
         return 1
     fi
 
-    local grep_args=(-rn --color=never)
+    local grep_args=(-nH --color=never)
 
-    grep_args+=(
-        --exclude-dir='.git'
-        --exclude-dir='node_modules'
-        --exclude-dir='target'
-        --exclude-dir='dist'
-        --exclude-dir='build'
-        --exclude-dir='__pycache__'
-        --exclude-dir='vendor'
-        --exclude-dir='.build'
-        --exclude-dir='.next'
-        --exclude='*.min.js'
-        --exclude='*.min.css'
-        --exclude='*.map'
-        --exclude='*.lock'
-        --exclude='package-lock.json'
-    )
-
-    if [[ -n "$include_filter" ]]; then
-        grep_args+=("--include=$include_filter")
+    if [[ -d "$search_path" ]]; then
+        grep_args+=(-r)
+        grep_args+=(
+            --exclude-dir='.git'
+            --exclude-dir='node_modules'
+            --exclude-dir='target'
+            --exclude-dir='dist'
+            --exclude-dir='build'
+            --exclude-dir='__pycache__'
+            --exclude-dir='vendor'
+            --exclude-dir='.build'
+            --exclude-dir='.next'
+            --exclude='*.min.js'
+            --exclude='*.min.css'
+            --exclude='*.map'
+            --exclude='*.lock'
+            --exclude='package-lock.json'
+        )
+        if [[ -n "$include_filter" ]]; then
+            grep_args+=("--include=$include_filter")
+        fi
     fi
+    # If --path is a single file, --include and the exclude rules are ignored
+    # (they only matter when recursing into a directory tree).
 
     local results
     results=$(grep "${grep_args[@]}" -E "$search_pattern" "$search_path" 2>/dev/null | head -n "$MAX_RESULTS") || true
