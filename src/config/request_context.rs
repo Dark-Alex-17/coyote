@@ -1719,6 +1719,19 @@ impl RequestContext {
                     self.update_app_config(|app| app.enabled_tools = value);
                 }
             }
+            "enabled_skills" => {
+                let raw: Option<String> = super::parse_value(value)?;
+                let parsed: Option<Vec<String>> = raw.map(|s| super::csv_to_vec(&s));
+                self.update_app_config(|app| app.enabled_skills = parsed.clone());
+            }
+            "skills_enabled" => {
+                let value: Option<bool> = super::parse_value(value)?;
+                if let Some(session) = self.session.as_mut() {
+                    session.set_skills_enabled(value);
+                } else {
+                    self.update_app_config(|app| app.skills_enabled = value.unwrap_or(true));
+                }
+            }
             "enabled_mcp_servers" => {
                 let value: Option<String> = super::parse_value(value)?;
                 if let Some(servers) = value.as_ref() {
@@ -1965,6 +1978,7 @@ impl RequestContext {
                         "dry_run",
                         "function_calling_support",
                         "mcp_server_support",
+                        "skills_enabled",
                         "stream",
                         "save",
                         "highlight",
@@ -2063,6 +2077,14 @@ impl RequestContext {
                         .collect()
                 }
                 "mcp_server_support" => super::complete_bool(app.mcp_server_support),
+                "skills_enabled" => {
+                    let current = if let Some(session) = &self.session {
+                        session.skills_enabled()
+                    } else {
+                        Some(app.skills_enabled)
+                    };
+                    super::complete_option_bool(current)
+                }
                 "enabled_mcp_servers" => {
                     let mut prefix = String::new();
                     let mut ignores = HashSet::new();
