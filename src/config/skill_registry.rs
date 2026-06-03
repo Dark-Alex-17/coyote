@@ -1,5 +1,6 @@
 use super::role::{Role, RoleLike};
 use super::skill::Skill;
+use super::skill_policy::SkillPolicy;
 
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
@@ -58,8 +59,8 @@ impl SkillRegistry {
         self.loaded.retain(|_, skill| !skill.auto_unload());
     }
 
-    pub fn effective_role(&self, base: &Role) -> Role {
-        if self.loaded.is_empty() {
+    pub fn effective_role(&self, base: &Role, policy: &SkillPolicy) -> Role {
+        if !policy.skills_enabled || self.loaded.is_empty() {
             return base.clone();
         }
 
@@ -78,7 +79,10 @@ impl SkillRegistry {
             .map(|v| v.into_iter().collect())
             .unwrap_or_default();
 
-        for (_, skill) in &self.loaded {
+        for (name, skill) in &self.loaded {
+            if !policy.allows(name) {
+                continue;
+            }
             if let Some(skill_tools) = skill.enabled_tools() {
                 tools.extend(skill_tools.iter().cloned());
             }
@@ -113,6 +117,14 @@ impl SkillRegistry {
     fn insert_for_test(&mut self, skill: Skill) {
         self.loaded.insert(skill.name().to_string(), skill);
     }
+
+    fn effective_role_for_test(&self, base: &Role) -> Role {
+        let policy = SkillPolicy {
+            skills_enabled: true,
+            enabled: self.loaded.keys().cloned().collect(),
+        };
+        self.effective_role(base, &policy)
+    }
 }
 
 #[cfg(test)]
@@ -133,7 +145,7 @@ mod tests {
         let base = Role::new("test", "You are a helper");
         let registry = SkillRegistry::default();
 
-        let effective = registry.effective_role(&base);
+        let effective = registry.effective_role_for_test(&base);
 
         assert_eq!(effective.prompt(), base.prompt());
     }
@@ -144,7 +156,7 @@ mod tests {
         registry.insert_for_test(make_skill("git-master", "description: D", "Git knowledge"));
 
         let base = Role::new("test", "You are a helper");
-        let effective = registry.effective_role(&base);
+        let effective = registry.effective_role_for_test(&base);
 
         assert_eq!(effective.prompt(), "You are a helper\n\nGit knowledge");
     }
@@ -156,7 +168,7 @@ mod tests {
         registry.insert_for_test(make_skill("b", "", "Beta body"));
 
         let base = Role::new("test", "Base");
-        let effective = registry.effective_role(&base);
+        let effective = registry.effective_role_for_test(&base);
 
         assert_eq!(effective.prompt(), "Base\n\nAlpha body\n\nBeta body");
     }
@@ -168,7 +180,7 @@ mod tests {
         registry.insert_for_test(make_skill("b", "", "Beta"));
 
         let base = Role::new("test", "");
-        let effective = registry.effective_role(&base);
+        let effective = registry.effective_role_for_test(&base);
 
         assert_eq!(effective.prompt(), "Alpha\n\nBeta");
     }
@@ -183,7 +195,7 @@ mod tests {
         ));
 
         let base = Role::new("test", "Process: __INPUT__");
-        let effective = registry.effective_role(&base);
+        let effective = registry.effective_role_for_test(&base);
 
         assert_eq!(effective.prompt(), "Process: __INPUT__");
         let tools = effective.enabled_tools().expect("tools set by skill");
@@ -196,7 +208,7 @@ mod tests {
         registry.insert_for_test(make_skill("knowledge", "enabled_tools: fs", ""));
 
         let base = Role::new("test", "Base");
-        let effective = registry.effective_role(&base);
+        let effective = registry.effective_role_for_test(&base);
 
         assert_eq!(effective.prompt(), "Base");
     }
@@ -218,7 +230,7 @@ mod tests {
         let mut base = Role::new("test", "body");
         base.set_enabled_tools(Some(vec!["web_search".to_string()]));
 
-        let effective = registry.effective_role(&base);
+        let effective = registry.effective_role_for_test(&base);
 
         let tools_vec = effective.enabled_tools().unwrap();
         let tools: BTreeSet<&str> = tools_vec.iter().map(|s| s.as_str()).collect();
@@ -235,7 +247,7 @@ mod tests {
         registry.insert_for_test(make_skill("knowledge", "", "Pure knowledge"));
 
         let base = Role::new("test", "Base");
-        let effective = registry.effective_role(&base);
+        let effective = registry.effective_role_for_test(&base);
 
         assert!(effective.enabled_tools().is_none());
         assert!(effective.enabled_mcp_servers().is_none());
@@ -248,7 +260,7 @@ mod tests {
 
         let mut base = Role::new("test", "Base");
         base.set_enabled_tools(Some(Vec::new()));
-        let effective = registry.effective_role(&base);
+        let effective = registry.effective_role_for_test(&base);
 
         assert_eq!(effective.enabled_tools().as_deref(), Some([].as_slice()));
     }

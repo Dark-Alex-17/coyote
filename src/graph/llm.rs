@@ -2,7 +2,7 @@ use super::state::StateManager;
 use super::structured;
 use super::types::LlmNode;
 use crate::client::{Model, ModelType, call_chat_completions};
-use crate::config::{Input, RequestContext, Role, RoleLike};
+use crate::config::{Input, RequestContext, Role, RoleLike, SkillPolicy};
 use crate::utils::create_abort_signal;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use serde_json::Value;
@@ -115,7 +115,15 @@ async fn run(
 
     let saved_agent_skill_state = swap_in_node_skill_policy(node, parent_ctx);
 
-    let composed_role = parent_ctx.skill_registry.effective_role(&role);
+    let composed_role = match SkillPolicy::effective(
+        &parent_ctx.app.config,
+        parent_ctx.role.as_ref(),
+        parent_ctx.agent.as_ref(),
+        parent_ctx.session.as_ref(),
+    ) {
+        Ok(policy) => parent_ctx.skill_registry.effective_role(&role, &policy),
+        Err(_) => role,
+    };
 
     let saved_role = parent_ctx.role.clone();
     parent_ctx.role = Some(composed_role);
