@@ -627,7 +627,15 @@ impl RequestContext {
             }
         }
 
-        self.skill_registry.effective_role(&role)
+        match SkillPolicy::effective(
+            app,
+            self.role.as_ref(),
+            self.agent.as_ref(),
+            self.session.as_ref(),
+        ) {
+            Ok(policy) => self.skill_registry.effective_role(&role, &policy),
+            Err(_) => role,
+        }
     }
 
     pub fn auto_continue_config(&self) -> AutoContinueConfig {
