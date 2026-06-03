@@ -15,6 +15,9 @@ source "$LLM_PROMPT_UTILS_FILE"
 
 # shellcheck disable=SC2154
 main() {
+    argc_contents="$(jq -r '.contents' <<< "$LLM_TOOL_RAW_JSON")"
+    argc_path="$(jq -r '.path' <<< "$LLM_TOOL_RAW_JSON")"
+
     if [[ -f "$argc_path" ]]; then
         printf "%s" "$argc_contents" | git diff --no-index "$argc_path" - || true
         guard_operation "Apply changes?"

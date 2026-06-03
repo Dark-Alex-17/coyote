@@ -16,6 +16,9 @@ source "$LLM_PROMPT_UTILS_FILE"
 
 # shellcheck disable=SC2154
 main() {
+    argc_contents="$(jq -r '.contents' <<< "$LLM_TOOL_RAW_JSON")"
+    argc_path="$(jq -r '.path' <<< "$LLM_TOOL_RAW_JSON")"
+
     if [[ ! -f "$argc_path" ]]; then
         error "Unable to find the specified file: $argc_path"
         exit 1

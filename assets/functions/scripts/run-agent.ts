@@ -11,7 +11,7 @@ async function main(): Promise<void> {
   const agentData = parseRawData(rawData);
 
   const configDir = "{config_dir}";
-  setupEnv(configDir, agentFunc);
+  setupEnv(configDir, agentFunc, rawData);
 
   const agentToolsPath = join(configDir, "agents", "{agent_name}", "tools.ts");
   await run(agentToolsPath, agentFunc, agentData);
@@ -48,13 +48,14 @@ function parseArgv(): { agentFunc: string; rawData: string } {
   return { agentFunc, rawData: agentData };
 }
 
-function setupEnv(configDir: string, agentFunc: string): void {
+function setupEnv(configDir: string, agentFunc: string, rawData: string): void {
   loadEnv(join(configDir, ".env"));
   process.env["LLM_ROOT_DIR"] = configDir;
   process.env["LLM_AGENT_NAME"] = "{agent_name}";
   process.env["LLM_AGENT_FUNC"] = agentFunc;
   process.env["LLM_AGENT_ROOT_DIR"] = join(configDir, "agents", "{agent_name}");
   process.env["LLM_AGENT_CACHE_DIR"] = join(configDir, "cache", "{agent_name}");
+  process.env["LLM_AGENT_RAW_JSON"] = rawData;
 }
 
 function loadEnv(filePath: string): void {
