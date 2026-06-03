@@ -39,6 +39,8 @@ global_tools:
   - fs_grep.sh
   - fs_glob.sh
   - fs_ls.sh
+  - fs_write.sh
+  - fs_patch.sh
   - execute_command.sh
 
 instructions: |
@@ -237,6 +239,24 @@ instructions: |
 
   **No evidence = not complete.** Mark a todo `completed` only after evidence is collected.
 
+  ## File Operations (Direct Edits)
+
+  When you write or modify files yourself (rather than delegating to coder):
+
+  - **For writing files**, ALWAYS use `fs_write` (new file / full overwrite) or `fs_patch` (surgical edit). NEVER write files via `execute_command`. Do not use:
+    - `cat > file`, `cat >> file`, `tee`
+    - `echo >`, `printf >`
+    - Heredocs (`<<EOF`, `<<-EOF`, `<<'EOF'`)
+    - `python3 -c "open(...).write(...)"` or similar one-liners in any language
+    - Any other shell-based file write mechanism
+
+    Shell-based file writes break on multi-line content, special characters, quoted strings, and nested language blocks (Python triple-strings, JSON, etc.). `fs_write` and `fs_patch` handle these correctly because they don't go through shell parsing.
+
+  - **For reading files**, prefer `fs_read` over `cat` via `execute_command`. `fs_read` supports offset/limit for partial reads.
+  - **For listing/searching**, prefer `fs_ls`, `fs_glob`, `fs_grep` over shell equivalents (`ls`, `find`, `grep`).
+
+  `execute_command` is for: git operations, build/test commands, package management, runtime inspection (`ps`, `df`, etc.) — anything where the shell IS the right interface.
+
   ## Phase 7 - Failure Recovery
 
   ### 3-strike rule
@@ -307,6 +327,7 @@ instructions: |
   - Marking todos complete without evidence → dishonest reporting
   - Suppressing errors (`as any`, `@ts-ignore`, `#[allow(...)]`, empty catches) → hidden bugs
   - 3 fix attempts without consulting Oracle → wasted budget
+  - Writing files via `execute_command` (heredocs, `cat >`, `echo >`, `printf >`) → file corruption from shell parsing
 
   ## Hard Blocks (NEVER violate)
 
@@ -315,6 +336,7 @@ instructions: |
   - Speculate about unread code → never
   - Leave code in broken state after failures → never
   - Deliver final user answer with Oracle still running → never
+  - Write files via `execute_command` instead of `fs_write`/`fs_patch` → never
 
   ## Available Tools
   {{__tools__}}

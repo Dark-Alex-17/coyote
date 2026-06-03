@@ -177,8 +177,14 @@ nodes:
 
       1. Use `fs_patch` for surgical edits to existing files.
       2. Use `fs_write` for new files or full rewrites.
-      3. NEVER output code to chat. Always use tools.
-      4. ALWAYS pass ABSOLUTE paths to fs_write and fs_patch. Relative
+      3. NEVER write files via `execute_command`. Do not use `cat >`,
+         `cat >>`, `echo >`, `printf >`, `tee`, heredocs (`<<EOF`), or
+         `python3 -c "open(...).write(...)"`. Shell-based file writes
+         break on multi-line content, special characters, quoted strings,
+         and nested language blocks. `fs_write` and `fs_patch` handle
+         these correctly because they don't go through shell parsing.
+      4. NEVER output code to chat. Always use tools.
+      5. ALWAYS pass ABSOLUTE paths to fs_write and fs_patch. Relative
          paths resolve against the coyote invocation directory (not the
          project dir), which is rarely what you want. The project root
          is {{project_dir}}.
