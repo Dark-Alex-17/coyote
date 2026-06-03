@@ -14,8 +14,8 @@ use super::{
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
-    FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
-    skill::SKILL_FUNCTION_PREFIX, user_interaction::USER_FUNCTION_PREFIX,
+    FunctionDeclaration, Functions, ToolCallTracker, ToolResult, skill::SKILL_FUNCTION_PREFIX,
+    user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
@@ -910,7 +910,10 @@ impl RequestContext {
         match &app.secrets_provider {
             None => {
                 items.push(("secrets_provider", "local".to_string()));
-                items.push(("vault_password_file", display_path(&app.vault_password_file())));
+                items.push((
+                    "vault_password_file",
+                    display_path(&app.vault_password_file()),
+                ));
             }
             Some(provider) => {
                 items.push(("secrets_provider", provider.to_string()));
@@ -1930,13 +1933,11 @@ impl RequestContext {
                     super::map_completion_values(values)
                 }
                 ".macro" => super::map_completion_values(paths::list_macros()),
-                ".skill" => {
-                    super::map_completion_values(vec![
-                        "loaded".to_string(),
-                        "load".to_string(),
-                        "unload".to_string(),
-                    ])
-                }
+                ".skill" => super::map_completion_values(vec![
+                    "loaded".to_string(),
+                    "load".to_string(),
+                    "unload".to_string(),
+                ]),
                 ".starter" => match &self.agent {
                     Some(agent) => agent
                         .conversation_starters()
@@ -2568,7 +2569,9 @@ impl RequestContext {
 
     pub async fn load_skill_repl(&mut self, name: &str, abort_signal: AbortSignal) -> Result<()> {
         if !self.app.config.function_calling_support {
-            bail!("Skills require function calling, which is disabled. Enable function calling in your config then try again.");
+            bail!(
+                "Skills require function calling, which is disabled. Enable function calling in your config then try again."
+            );
         }
 
         if !paths::has_skill(name) {

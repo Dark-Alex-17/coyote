@@ -162,18 +162,14 @@ impl Vault {
             SupportedProvider::AwsSecretsManager { .. } => Some(
                 "Try `aws sso login` (for SSO setups) or `aws configure` (for static keys), then retry.",
             ),
-            SupportedProvider::GcpSecretManager { .. } => Some(
-                "Try `gcloud auth application-default login`, then retry.",
-            ),
-            SupportedProvider::AzureKeyVault { .. } => Some(
-                "Try `az login`, then retry.",
-            ),
-            SupportedProvider::Gopass { .. } => Some(
-                "Make sure `gopass init` has been run and `gopass` is on your PATH.",
-            ),
-            SupportedProvider::OnePassword { .. } => Some(
-                "Try `op signin`, then retry.",
-            ),
+            SupportedProvider::GcpSecretManager { .. } => {
+                Some("Try `gcloud auth application-default login`, then retry.")
+            }
+            SupportedProvider::AzureKeyVault { .. } => Some("Try `az login`, then retry."),
+            SupportedProvider::Gopass { .. } => {
+                Some("Make sure `gopass init` has been run and `gopass` is on your PATH.")
+            }
+            SupportedProvider::OnePassword { .. } => Some("Try `op signin`, then retry."),
             SupportedProvider::Local { .. } => None,
         }
     }
