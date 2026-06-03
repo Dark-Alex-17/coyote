@@ -552,8 +552,8 @@ impl RoleLike for Agent {
         None
     }
 
-    fn enabled_mcp_servers(&self) -> Option<String> {
-        self.config.mcp_servers.clone().join(",").into()
+    fn enabled_mcp_servers(&self) -> Option<Vec<String>> {
+        Some(self.config.mcp_servers.clone())
     }
 
     fn set_model(&mut self, model: Model) {
@@ -585,15 +585,14 @@ impl RoleLike for Agent {
         }
     }
 
-    fn set_enabled_mcp_servers(&mut self, value: Option<String>) {
+    fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>) {
         match value {
             Some(servers) => {
-                let servers = servers
-                    .split(',')
+                self.config.mcp_servers = servers
+                    .into_iter()
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty())
                     .collect::<Vec<_>>();
-                self.config.mcp_servers = servers;
             }
             None => {
                 self.config.mcp_servers.clear();

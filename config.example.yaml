@@ -118,7 +118,14 @@ visible_tools:                   # Which tools are visible to be compiled (and a
 mcp_server_support: true         # Enables or disables MCP servers (globally).
 mapping_mcp_servers:             # Alias for an MCP server or set of servers
   git: github,gitmcp
-enabled_mcp_servers: null        # Which MCP servers to enable by default (e.g. 'github,slack,ddg-search')
+enabled_mcp_servers: null        # Which MCP servers to enable by default.
+                                 # Accepts either a YAML list or a comma-separated string. Use 'all' to enable everything.
+                                 # Example (list form):
+                                 #   enabled_mcp_servers:
+                                 #     - github
+                                 #     - slack
+                                 # Example (comma-separated form):
+                                 #   enabled_mcp_servers: github,slack,ddg-search
 
 # ---- Skills ----
 # Skills are modular knowledge or capability packs the LLM can load and unload mid-conversation.

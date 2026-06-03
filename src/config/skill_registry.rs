@@ -38,8 +38,8 @@ impl SkillRegistry {
     pub fn loaded_mcp_servers(&self) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for skill in self.loaded.values() {
-            if let Some(csv) = skill.enabled_mcp_servers() {
-                for token in csv.split(',') {
+            if let Some(servers) = skill.enabled_mcp_servers() {
+                for token in servers {
                     let t = token.trim();
                     if !t.is_empty() {
                         out.insert(t.to_string());
@@ -70,11 +70,16 @@ impl SkillRegistry {
         let base_mcps_set = effective.enabled_mcp_servers().is_some();
 
         let mut tools = parse_csv(effective.enabled_tools().as_deref());
-        let mut mcps = parse_csv(effective.enabled_mcp_servers().as_deref());
+        let mut mcps: BTreeSet<String> = effective
+            .enabled_mcp_servers()
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
 
         for (_, skill) in &self.loaded {
             tools.extend(parse_csv(skill.enabled_tools()));
-            mcps.extend(parse_csv(skill.enabled_mcp_servers()));
+            if let Some(servers) = skill.enabled_mcp_servers() {
+                mcps.extend(servers.iter().cloned());
+            }
             if !skip_body && !skill.body().is_empty() {
                 let separator = if effective.is_empty_prompt() {
                     ""
@@ -91,7 +96,7 @@ impl SkillRegistry {
         }
 
         if base_mcps_set || !mcps.is_empty() {
-            effective.set_enabled_mcp_servers(Some(join_csv(&mcps)));
+            effective.set_enabled_mcp_servers(Some(mcps.into_iter().collect()));
         }
 
         effective
@@ -231,8 +236,8 @@ mod tests {
         let tools: BTreeSet<&str> = tools_str.split(',').collect();
         assert_eq!(tools, BTreeSet::from(["fs", "git", "shell", "web_search"]));
 
-        let mcps_str = effective.enabled_mcp_servers().unwrap();
-        let mcps: BTreeSet<&str> = mcps_str.split(',').collect();
+        let mcps_vec = effective.enabled_mcp_servers().unwrap();
+        let mcps: BTreeSet<&str> = mcps_vec.iter().map(|s| s.as_str()).collect();
         assert_eq!(mcps, BTreeSet::from(["github", "jira"]));
     }
 

@@ -710,7 +710,7 @@ impl RequestContext {
         }
     }
 
-    pub fn set_enabled_mcp_servers_on_role_like(&mut self, value: Option<String>) -> bool {
+    pub fn set_enabled_mcp_servers_on_role_like(&mut self, value: Option<Vec<String>>) -> bool {
         match self.role_like_mut() {
             Some(role_like) => {
                 role_like.set_enabled_mcp_servers(value);
@@ -858,7 +858,7 @@ impl RequestContext {
             ),
             (
                 "enabled_mcp_servers",
-                super::format_option_value(&role.enabled_mcp_servers()),
+                super::format_option_value(&role.enabled_mcp_servers().map(|v| v.join(","))),
             ),
             (
                 "max_output_tokens",
@@ -1279,10 +1279,10 @@ impl RequestContext {
                     }
 
                     let mut server_names: HashSet<String> = Default::default();
-                    if enabled_mcp_servers == "all" {
+                    if enabled_mcp_servers.iter().any(|s| s.trim() == "all") {
                         server_names.extend(mcp_declaration_names);
                     } else {
-                        for item in enabled_mcp_servers.split(',') {
+                        for item in enabled_mcp_servers.iter() {
                             let item = item.trim();
                             if item.is_empty() {
                                 continue;
@@ -1733,8 +1733,9 @@ impl RequestContext {
                 }
             }
             "enabled_mcp_servers" => {
-                let value: Option<String> = super::parse_value(value)?;
-                if let Some(servers) = value.as_ref() {
+                let raw: Option<String> = super::parse_value(value)?;
+                let parsed: Option<Vec<String>> = raw.map(|s| super::csv_to_vec(&s));
+                if let Some(servers) = parsed.as_ref() {
                     let Some(mcp_config) = &self.app.mcp_config else {
                         bail!(
                             "No MCP servers are configured. Please configure MCP servers first before setting 'enabled_mcp_servers'."
@@ -1746,7 +1747,7 @@ impl RequestContext {
                         );
                     }
 
-                    if !servers.split(',').all(|s| {
+                    if !servers.iter().all(|s| {
                         let server = s.trim();
                         server == "all" || mcp_config.mcp_servers.contains_key(server)
                     }) {
@@ -1755,8 +1756,8 @@ impl RequestContext {
                         );
                     }
                 }
-                if !self.set_enabled_mcp_servers_on_role_like(value.clone()) {
-                    self.update_app_config(|app| app.enabled_mcp_servers = value.clone());
+                if !self.set_enabled_mcp_servers_on_role_like(parsed.clone()) {
+                    self.update_app_config(|app| app.enabled_mcp_servers = parsed.clone());
                 }
                 if self.app.config.mcp_server_support {
                     let app = Arc::clone(&self.app.config);
@@ -2163,7 +2164,7 @@ impl RequestContext {
     async fn rebuild_tool_scope(
         &mut self,
         app: &AppConfig,
-        enabled_mcp_servers: Option<String>,
+        enabled_mcp_servers: Option<Vec<String>>,
         abort_signal: AbortSignal,
     ) -> Result<()> {
         let policy = SkillPolicy::effective(
@@ -2175,21 +2176,23 @@ impl RequestContext {
 
         let enabled_mcp_servers = if policy.skills_enabled && app.mcp_server_support {
             let skill_mcps = self.skill_registry.loaded_mcp_servers();
-            match (enabled_mcp_servers.as_deref(), skill_mcps.is_empty()) {
-                (Some("all"), _) | (_, true) => enabled_mcp_servers,
-                (base, false) => {
-                    let mut merged: BTreeSet<String> = skill_mcps;
-                    if let Some(s) = base {
-                        for token in s.split(',') {
-                            let t = token.trim();
-                            if !t.is_empty() {
-                                merged.insert(t.to_string());
-                            }
+            let has_all = enabled_mcp_servers
+                .as_ref()
+                .map(|v| v.iter().any(|s| s.trim() == "all"))
+                .unwrap_or(false);
+            if has_all || skill_mcps.is_empty() {
+                enabled_mcp_servers
+            } else {
+                let mut merged: BTreeSet<String> = skill_mcps;
+                if let Some(servers) = &enabled_mcp_servers {
+                    for token in servers {
+                        let t = token.trim();
+                        if !t.is_empty() {
+                            merged.insert(t.to_string());
                         }
                     }
-
-                    Some(merged.into_iter().collect::<Vec<_>>().join(","))
                 }
+                Some(merged.into_iter().collect())
             }
         } else {
             enabled_mcp_servers
@@ -2201,12 +2204,12 @@ impl RequestContext {
             && let Some(mcp_config) = &self.app.mcp_config
         {
             let server_ids: Vec<String> = match &enabled_mcp_servers {
-                Some(servers) if servers == "all" => {
+                Some(servers) if servers.iter().any(|s| s.trim() == "all") => {
                     mcp_config.mcp_servers.keys().cloned().collect()
                 }
                 Some(servers) => {
                     let mut ids = Vec::new();
-                    for item in servers.split(',').map(|s| s.trim()) {
+                    for item in servers.iter().map(|s| s.trim()) {
                         if mcp_config.mcp_servers.contains_key(item) {
                             ids.push(item.to_string());
                         } else if let Some(mapped) = app.mapping_mcp_servers.get(item) {
@@ -2285,7 +2288,7 @@ impl RequestContext {
                 if names.is_empty() {
                     None
                 } else {
-                    Some(names.join(","))
+                    Some(names.to_vec())
                 }
             } else if let Some(role) = &self.role {
                 role.enabled_mcp_servers()
@@ -2445,7 +2448,7 @@ impl RequestContext {
         }
 
         let mcp_servers = if app.mcp_server_support {
-            (!agent.mcp_server_names().is_empty()).then(|| agent.mcp_server_names().join(","))
+            (!agent.mcp_server_names().is_empty()).then(|| agent.mcp_server_names().to_vec())
         } else {
             if !agent.mcp_server_names().is_empty() {
                 bail!(
@@ -2621,7 +2624,7 @@ impl RequestContext {
         let skill = Skill::load(name)?;
         let needs_mcps = skill
             .enabled_mcp_servers()
-            .map(|s| !s.trim().is_empty())
+            .map(|v| !v.is_empty())
             .unwrap_or(false);
 
         if needs_mcps && !self.app.config.mcp_server_support {
@@ -2728,13 +2731,13 @@ impl RequestContext {
         &self,
         app: &AppConfig,
         start_mcp_servers: bool,
-    ) -> Option<String> {
+    ) -> Option<Vec<String>> {
         if !start_mcp_servers || !app.mcp_server_support {
             return None;
         }
         if let Some(agent) = self.agent.as_ref() {
             return (!agent.mcp_server_names().is_empty())
-                .then(|| agent.mcp_server_names().join(","));
+                .then(|| agent.mcp_server_names().to_vec());
         }
         if let Some(session) = self.session.as_ref() {
             return session.enabled_mcp_servers();
@@ -3227,7 +3230,7 @@ mod tests {
         let app = ctx.app.config.clone();
         let abort = utils::create_abort_signal();
 
-        run_async(ctx.rebuild_tool_scope(&app, Some("all".to_string()), abort)).unwrap();
+        run_async(ctx.rebuild_tool_scope(&app, Some(vec!["all".to_string()]), abort)).unwrap();
 
         assert!(ctx.tool_scope.mcp_runtime.is_empty());
     }
@@ -3255,7 +3258,7 @@ mod tests {
         let app = ctx.app.config.clone();
         let abort = utils::create_abort_signal();
 
-        run_async(ctx.rebuild_tool_scope(&app, Some("all".to_string()), abort)).unwrap();
+        run_async(ctx.rebuild_tool_scope(&app, Some(vec!["all".to_string()]), abort)).unwrap();
 
         assert!(ctx.tool_scope.mcp_runtime.is_empty());
     }
@@ -3417,7 +3420,7 @@ mod tests {
         };
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let mut role = Role::new("r", "p");
-        role.set_enabled_mcp_servers(Some("all".to_string()));
+        role.set_enabled_mcp_servers(Some(vec!["all".to_string()]));
         let result = ctx.select_enabled_mcp_servers(&role);
         assert!(result.is_empty());
     }
@@ -3430,7 +3433,7 @@ mod tests {
             .append_mcp_meta_functions(vec!["github".into(), "slack".into()]);
 
         let mut role = Role::new("r", "p");
-        role.set_enabled_mcp_servers(Some("all".to_string()));
+        role.set_enabled_mcp_servers(Some(vec!["all".to_string()]));
 
         let fns = ctx.select_enabled_mcp_servers(&role);
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
@@ -3447,7 +3450,7 @@ mod tests {
             .append_mcp_meta_functions(vec!["github".into(), "slack".into()]);
 
         let mut role = Role::new("r", "p");
-        role.set_enabled_mcp_servers(Some("github".to_string()));
+        role.set_enabled_mcp_servers(Some(vec!["github".to_string()]));
 
         let fns = ctx.select_enabled_mcp_servers(&role);
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();

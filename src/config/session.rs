@@ -26,8 +26,12 @@ pub struct Session {
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled_tools: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    enabled_mcp_servers: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_mcp_servers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skills_enabled: Option<bool>,
     #[serde(
@@ -196,7 +200,13 @@ impl Session {
             data["enabled_tools"] = enabled_tools.into();
         }
         if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
-            data["enabled_mcp_servers"] = enabled_mcp_servers.into();
+            data["enabled_mcp_servers"] = json!(enabled_mcp_servers);
+        }
+        if let Some(skills_enabled) = self.skills_enabled() {
+            data["skills_enabled"] = skills_enabled.into();
+        }
+        if let Some(enabled_skills) = self.enabled_skills() {
+            data["enabled_skills"] = json!(enabled_skills);
         }
         if let Some(save_session) = self.save_session() {
             data["save_session"] = save_session.into();
@@ -257,7 +267,15 @@ impl Session {
         }
 
         if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
-            items.push(("enabled_mcp_servers", enabled_mcp_servers));
+            items.push(("enabled_mcp_servers", enabled_mcp_servers.join(",")));
+        }
+
+        if let Some(skills_enabled) = self.skills_enabled() {
+            items.push(("skills_enabled", skills_enabled.to_string()));
+        }
+
+        if let Some(enabled_skills) = self.enabled_skills() {
+            items.push(("enabled_skills", enabled_skills.join(",")));
         }
 
         if let Some(save_session) = self.save_session() {
@@ -697,7 +715,7 @@ impl RoleLike for Session {
         self.enabled_tools.clone()
     }
 
-    fn enabled_mcp_servers(&self) -> Option<String> {
+    fn enabled_mcp_servers(&self) -> Option<Vec<String>> {
         self.enabled_mcp_servers.clone()
     }
 
@@ -731,7 +749,7 @@ impl RoleLike for Session {
         }
     }
 
-    fn set_enabled_mcp_servers(&mut self, value: Option<String>) {
+    fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>) {
         if self.enabled_mcp_servers != value {
             self.enabled_mcp_servers = value;
             self.dirty = true;
