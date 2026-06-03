@@ -243,7 +243,9 @@ instructions: |
 
   When you write or modify files yourself (rather than delegating to coder):
 
-  - **For writing files**, ALWAYS use `fs_write` (new file / full overwrite) or `fs_patch` (surgical edit). NEVER write files via `execute_command`. Do not use:
+  - **For editing an existing file**, prefer `fs_patch`. It's a surgical edit that preserves unchanged content. Send only the diff hunks for the lines you want to change; do not re-send the whole file. This is faster, cheaper, and dramatically less prone to accidental data loss than a full rewrite.
+  - **For writing a NEW file or doing a COMPLETE rewrite**, use `fs_write`. Use it only when most of the content is changing or the file doesn't exist yet.
+  - **NEVER write files via `execute_command`.** Do not use:
     - `cat > file`, `cat >> file`, `tee`
     - `echo >`, `printf >`
     - Heredocs (`<<EOF`, `<<-EOF`, `<<'EOF'`)
