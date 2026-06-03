@@ -374,6 +374,17 @@ pub fn interpolate_secrets(content: &str, vault: &Vault) -> Result<(String, Vec<
                                 missing_secrets.push(name.to_string());
                                 String::new()
                             }
+                            Some(SecretError::AuthFailed { .. }) => {
+                                let base = format!(
+                                    "Failed to fetch secret '{name}' from vault: {e}"
+                                );
+                                let msg = match vault.auth_hint() {
+                                    Some(hint) => format!("{base}\n\nHint: {hint}"),
+                                    None => base,
+                                };
+                                fatal_error = Some(anyhow!("{msg}"));
+                                String::new()
+                            }
                             _ => {
                                 fatal_error = Some(anyhow!(
                                     "Failed to fetch secret '{name}' from vault: {e}"

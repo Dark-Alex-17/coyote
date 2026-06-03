@@ -8,7 +8,7 @@ pub use utils::prompt_provider_choice;
 use crate::cli::Cli;
 use crate::config::AppConfig;
 use crate::vault::utils::ensure_password_file_initialized;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
 use gman::providers::SecretProvider;
 use gman::providers::SupportedProvider;
@@ -155,6 +155,63 @@ impl Vault {
         }
 
         Ok(secrets)
+    }
+
+    pub fn auth_hint(&self) -> Option<&'static str> {
+        match &self.provider {
+            SupportedProvider::AwsSecretsManager { .. } => Some(
+                "Try `aws sso login` (for SSO setups) or `aws configure` (for static keys), then retry.",
+            ),
+            SupportedProvider::GcpSecretManager { .. } => Some(
+                "Try `gcloud auth application-default login`, then retry.",
+            ),
+            SupportedProvider::AzureKeyVault { .. } => Some(
+                "Try `az login`, then retry.",
+            ),
+            SupportedProvider::Gopass { .. } => Some(
+                "Make sure `gopass init` has been run and `gopass` is on your PATH.",
+            ),
+            SupportedProvider::OnePassword { .. } => Some(
+                "Try `op signin`, then retry.",
+            ),
+            SupportedProvider::Local { .. } => None,
+        }
+    }
+
+    pub fn validate_round_trip(&self) -> Result<()> {
+        const PROBE_KEY: &str = "__coyote_setup_probe__";
+        const PROBE_VALUE: &str = "ok";
+
+        let h = Handle::current();
+        let result: Result<()> = tokio::task::block_in_place(|| {
+            h.block_on(async {
+                self.provider_ref()
+                    .set_secret(PROBE_KEY, PROBE_VALUE)
+                    .await
+                    .with_context(|| "vault write probe failed")?;
+                let got = self
+                    .provider_ref()
+                    .get_secret(PROBE_KEY)
+                    .await
+                    .with_context(|| "vault read probe failed")?;
+                let _ = self.provider_ref().delete_secret(PROBE_KEY).await;
+                if got != PROBE_VALUE {
+                    bail!("vault read probe returned an unexpected value");
+                }
+                Ok(())
+            })
+        });
+
+        result.with_context(|| {
+            let base = "Vault validation failed. Check that your credentials have permission to create, read, and delete secrets in the configured backend.";
+            match self.auth_hint() {
+                Some(hint) => format!("{base}\n\nHint: {hint}"),
+                None => base.to_string(),
+            }
+        })?;
+
+        println!("✓ Vault validation succeeded.");
+        Ok(())
     }
 
     pub fn handle_vault_flags(cli: Cli, vault: &Vault) -> Result<()> {
