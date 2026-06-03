@@ -10,6 +10,9 @@ set -e
 source "$LLM_PROMPT_UTILS_FILE"
 
 main() {
+    # shellcheck disable=SC2154
+    argc_command="$(jq -r '.command' <<< "$LLM_TOOL_RAW_JSON")"
+
     guard_operation
     local script
     script="$(mktemp)"

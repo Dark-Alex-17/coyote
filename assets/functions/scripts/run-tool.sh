@@ -29,6 +29,7 @@ setup_env() {
     export LLM_TOOL_NAME="{function_name}"
     export LLM_TOOL_CACHE_DIR="$LLM_ROOT_DIR/cache/{function_name}"
     export LLM_PROMPT_UTILS_FILE="{prompt_utils_file}"
+    export LLM_TOOL_RAW_JSON="$tool_data"
 }
 
 load_env() {

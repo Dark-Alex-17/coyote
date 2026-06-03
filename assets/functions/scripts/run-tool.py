@@ -32,7 +32,7 @@ def main():
     tool_data = parse_raw_data(raw_data)
 
     root_dir = "{root_dir}"
-    setup_env(root_dir)
+    setup_env(root_dir, raw_data)
 
     tool_path = "{tool_path}.py"
     run(tool_path, "run", tool_data)
@@ -65,11 +65,12 @@ def parse_argv():
     return tool_data
 
 
-def setup_env(root_dir):
+def setup_env(root_dir, raw_data):
     load_env(os.path.join(root_dir, ".env"))
     os.environ["LLM_ROOT_DIR"] = root_dir
     os.environ["LLM_TOOL_NAME"] = "{function_name}"
     os.environ["LLM_TOOL_CACHE_DIR"] = os.path.join(root_dir, "cache", "{function_name}")
+    os.environ["LLM_TOOL_RAW_JSON"] = raw_data
 
 
 def load_env(file_path):

@@ -11,7 +11,7 @@ async function main(): Promise<void> {
   const toolData = parseRawData(rawData);
 
   const rootDir = "{root_dir}";
-  setupEnv(rootDir);
+  setupEnv(rootDir, rawData);
 
   const toolPath = "{tool_path}.ts";
   await run(toolPath, "run", toolData);
@@ -45,11 +45,12 @@ function parseArgv(): string {
   return toolData;
 }
 
-function setupEnv(rootDir: string): void {
+function setupEnv(rootDir: string, rawData: string): void {
   loadEnv(join(rootDir, ".env"));
   process.env["LLM_ROOT_DIR"] = rootDir;
   process.env["LLM_TOOL_NAME"] = "{function_name}";
   process.env["LLM_TOOL_CACHE_DIR"] = join(rootDir, "cache", "{function_name}");
+  process.env["LLM_TOOL_RAW_JSON"] = rawData;
 }
 
 function loadEnv(filePath: string): void {

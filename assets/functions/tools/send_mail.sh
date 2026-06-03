@@ -14,6 +14,10 @@ set -e
 
 # shellcheck disable=SC2154
 main() {
+    argc_recipient="$(jq -r '.recipient' <<< "$LLM_TOOL_RAW_JSON")"
+    argc_subject="$(jq -r '.subject' <<< "$LLM_TOOL_RAW_JSON")"
+    argc_body="$(jq -r '.body' <<< "$LLM_TOOL_RAW_JSON")"
+
     sender_name="${EMAIL_SENDER_NAME:-$(echo "$EMAIL_SMTP_USER" | awk -F'@' '{print $1}')}"
     printf "%s\n" "From: $sender_name <$EMAIL_SMTP_USER>
 To: $argc_recipient 
