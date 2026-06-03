@@ -131,10 +131,13 @@ visible_skills:                  # The universe of skills allowed to be enabled 
   - frontend-ui-ux
   - git-master
 enabled_skills: null             # Which skills are available by default (no role/agent/session active). null = all visible.
-                                 # Example: only expose two skills in the bare REPL.
+                                 # Accepts either a YAML list or a comma-separated string.
+                                 # Example (list form):
                                  #   enabled_skills:
                                  #     - git-master
                                  #     - ai-slop-remover
+                                 # Example (comma-separated form):
+                                 #   enabled_skills: git-master,ai-slop-remover
 
 # ---- Auto-Continue (Todo System) ----
 # The auto-continue system provides built-in task tracking for improved reliability.

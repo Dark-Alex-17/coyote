@@ -67,10 +67,10 @@ impl SkillPolicy {
             .map(|v| v.iter().cloned().collect());
 
         let enabled_raw: Option<Vec<String>> = session
-            .and_then(|s| parse_csv_opt(s.enabled_skills()))
+            .and_then(|s| s.enabled_skills().map(|v| v.to_vec()))
             .or_else(|| agent.and_then(|a| a.enabled_skills().map(|v| v.to_vec())))
-            .or_else(|| role.and_then(|r| parse_csv_opt(r.enabled_skills())))
-            .or_else(|| parse_csv_opt(global.enabled_skills.as_deref()));
+            .or_else(|| role.and_then(|r| r.enabled_skills().map(|v| v.to_vec())))
+            .or_else(|| global.enabled_skills.clone());
 
         let enabled: HashSet<String> = match enabled_raw {
             Some(explicit) => {
@@ -107,18 +107,10 @@ impl SkillPolicy {
     }
 }
 
-fn parse_csv_opt(s: Option<&str>) -> Option<Vec<String>> {
-    s.map(|raw| {
-        raw.split(',')
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::csv_to_vec;
 
     fn always_true(_: &str) -> bool {
         true
@@ -135,7 +127,7 @@ mod tests {
     ) -> AppConfig {
         AppConfig {
             skills_enabled,
-            enabled_skills: enabled.map(|s| s.to_string()),
+            enabled_skills: enabled.map(csv_to_vec),
             visible_skills: visible.map(|v| v.iter().map(|s| s.to_string()).collect()),
             ..AppConfig::default()
         }

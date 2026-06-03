@@ -30,8 +30,12 @@ pub struct Session {
     enabled_mcp_servers: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skills_enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    enabled_skills: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_skills: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     save_session: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,8 +87,15 @@ impl Session {
         self.skills_enabled
     }
 
-    pub fn enabled_skills(&self) -> Option<&str> {
+    pub fn enabled_skills(&self) -> Option<&[String]> {
         self.enabled_skills.as_deref()
+    }
+
+    pub fn set_skills_enabled(&mut self, value: Option<bool>) {
+        if self.skills_enabled != value {
+            self.skills_enabled = value;
+            self.dirty = true;
+        }
     }
 
     pub fn new_from_ctx(ctx: &RequestContext, app: &AppConfig, name: &str) -> Self {

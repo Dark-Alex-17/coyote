@@ -12,8 +12,9 @@ enabled_tools: fs_ls,fs_cat           # A comma-separated list of tools to enabl
 enabled_mcp_servers: github,gitmcp    # A comma-separated list of MCP servers to enable for this role
 skills_enabled: true                  # Master switch for skills in this role (default: inherit from global).
                                       # Skills also require `function_calling_support: true` in the global config.
-enabled_skills: git-master,ai-slop-remover  # Comma-separated list of skills available when this role is active.
-                                      # Must be a subset of global `visible_skills`. Omit to inherit the global default.
+enabled_skills:                       # Skills available when this role is active. Accepts a YAML list (preferred)
+  - git-master                        # or a comma-separated string (e.g. `enabled_skills: git-master,ai-slop-remover`).
+  - ai-slop-remover                   # Must be a subset of global `visible_skills`. Omit to inherit the global default.
 prompt: null                          # A custom prompt to use for this role that will immediately query
                                       # the model for output instead of using the instructions below
 # Auto-Continue (Todo System)
