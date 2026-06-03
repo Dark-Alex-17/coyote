@@ -24,8 +24,12 @@ pub struct Session {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    enabled_tools: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_tools: Option<Vec<String>>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -197,7 +201,7 @@ impl Session {
             data["top_p"] = top_p.into();
         }
         if let Some(enabled_tools) = self.enabled_tools() {
-            data["enabled_tools"] = enabled_tools.into();
+            data["enabled_tools"] = json!(enabled_tools);
         }
         if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
             data["enabled_mcp_servers"] = json!(enabled_mcp_servers);
@@ -263,7 +267,7 @@ impl Session {
         }
 
         if let Some(enabled_tools) = self.enabled_tools() {
-            items.push(("enabled_tools", enabled_tools));
+            items.push(("enabled_tools", enabled_tools.join(",")));
         }
 
         if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
@@ -711,7 +715,7 @@ impl RoleLike for Session {
         self.top_p
     }
 
-    fn enabled_tools(&self) -> Option<String> {
+    fn enabled_tools(&self) -> Option<Vec<String>> {
         self.enabled_tools.clone()
     }
 
@@ -742,7 +746,7 @@ impl RoleLike for Session {
         }
     }
 
-    fn set_enabled_tools(&mut self, value: Option<String>) {
+    fn set_enabled_tools(&mut self, value: Option<Vec<String>>) {
         if self.enabled_tools != value {
             self.enabled_tools = value;
             self.dirty = true;

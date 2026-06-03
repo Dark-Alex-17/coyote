@@ -700,7 +700,7 @@ impl RequestContext {
         }
     }
 
-    pub fn set_enabled_tools_on_role_like(&mut self, value: Option<String>) -> bool {
+    pub fn set_enabled_tools_on_role_like(&mut self, value: Option<Vec<String>>) -> bool {
         match self.role_like_mut() {
             Some(role_like) => {
                 role_like.set_enabled_tools(value);
@@ -854,7 +854,7 @@ impl RequestContext {
             ("top_p", super::format_option_value(&role.top_p())),
             (
                 "enabled_tools",
-                super::format_option_value(&role.enabled_tools()),
+                super::format_option_value(&role.enabled_tools().map(|v| v.join(","))),
             ),
             (
                 "enabled_mcp_servers",
@@ -1148,10 +1148,10 @@ impl RequestContext {
                 }
 
                 let mut tool_names: HashSet<String> = Default::default();
-                if enabled_tools == "all" {
+                if enabled_tools.iter().any(|s| s.trim() == "all") {
                     tool_names.extend(declaration_names);
                 } else {
-                    for item in enabled_tools.split(',') {
+                    for item in enabled_tools.iter() {
                         let item = item.trim();
                         if item.is_empty() {
                             continue;
@@ -1714,9 +1714,10 @@ impl RequestContext {
                 }
             }
             "enabled_tools" => {
-                let value = super::parse_value(value)?;
-                if !self.set_enabled_tools_on_role_like(value.clone()) {
-                    self.update_app_config(|app| app.enabled_tools = value);
+                let raw: Option<String> = super::parse_value(value)?;
+                let parsed: Option<Vec<String>> = raw.map(|s| super::csv_to_vec(&s));
+                if !self.set_enabled_tools_on_role_like(parsed.clone()) {
+                    self.update_app_config(|app| app.enabled_tools = parsed.clone());
                 }
             }
             "enabled_skills" => {
@@ -3366,7 +3367,7 @@ mod tests {
         };
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let mut role = Role::new("r", "p");
-        role.set_enabled_tools(Some("all".to_string()));
+        role.set_enabled_tools(Some(vec!["all".to_string()]));
         assert!(ctx.select_functions(&role).is_none());
     }
 
@@ -3377,7 +3378,7 @@ mod tests {
         ctx.tool_scope.functions.append_user_interaction_functions();
 
         let mut role = Role::new("r", "p");
-        role.set_enabled_tools(Some("all".to_string()));
+        role.set_enabled_tools(Some(vec!["all".to_string()]));
 
         let fns = ctx.select_functions(&role).unwrap();
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
@@ -3391,7 +3392,7 @@ mod tests {
         ctx.tool_scope.functions.append_todo_functions();
 
         let mut role = Role::new("r", "p");
-        role.set_enabled_tools(Some("todo__init, todo__add".to_string()));
+        role.set_enabled_tools(Some(vec!["todo__init".to_string(), "todo__add".to_string()]));
 
         let fns = ctx.select_functions(&role).unwrap();
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();

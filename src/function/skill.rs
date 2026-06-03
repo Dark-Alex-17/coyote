@@ -127,7 +127,7 @@ fn handle_list(ctx: &RequestContext, policy: &SkillPolicy) -> Result<Value> {
         entries.push(json!({
             "name": skill.name(),
             "description": skill.description(),
-            "grants_tools": csv_to_vec(skill.enabled_tools()),
+            "grants_tools": skill.enabled_tools().unwrap_or_default(),
             "grants_mcp_servers": skill.enabled_mcp_servers().unwrap_or_default(),
             "loaded": ctx.skill_registry.is_loaded(skill.name()),
         }));
@@ -166,7 +166,7 @@ async fn handle_load(
 
     let tools_declared = skill
         .enabled_tools()
-        .map(|s| !s.trim().is_empty())
+        .map(|v| !v.is_empty())
         .unwrap_or(false);
     let mcps_declared = skill
         .enabled_mcp_servers()
@@ -224,16 +224,6 @@ async fn handle_unload(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
         "status": "ok",
         "unloaded": name
     }))
-}
-
-fn csv_to_vec(csv: Option<&str>) -> Vec<String> {
-    csv.map(|raw| {
-        raw.split(',')
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect()
-    })
-    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -294,17 +284,4 @@ mod tests {
         assert!(required, "skill__list should have no required parameters");
     }
 
-    #[test]
-    fn csv_to_vec_empty_input() {
-        assert!(csv_to_vec(None).is_empty());
-        assert!(csv_to_vec(Some("")).is_empty());
-        assert!(csv_to_vec(Some("   ")).is_empty());
-    }
-
-    #[test]
-    fn csv_to_vec_parses_and_trims() {
-        let v = csv_to_vec(Some("a, b ,c,, d"));
-
-        assert_eq!(v, vec!["a", "b", "c", "d"]);
-    }
 }
