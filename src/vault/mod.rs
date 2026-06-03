@@ -3,6 +3,7 @@ mod utils;
 use std::path::PathBuf;
 pub use utils::create_vault_password_file;
 pub use utils::interpolate_secrets;
+pub use utils::prompt_provider_choice;
 
 use crate::cli::Cli;
 use crate::config::AppConfig;

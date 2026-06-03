@@ -50,7 +50,9 @@ use crate::utils::*;
 pub use macros::macro_execute;
 
 use crate::config::macros::Macro;
-use crate::vault::{GlobalVault, Vault, create_vault_password_file, interpolate_secrets};
+use crate::vault::{
+    GlobalVault, Vault, create_vault_password_file, interpolate_secrets, prompt_provider_choice,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
 use gman::providers::SupportedProvider;
@@ -677,7 +679,13 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
         process::exit(0);
     }
 
-    let mut vault = Vault::init_bare();
+    let provider_choice = prompt_provider_choice()?;
+    let mut vault = match &provider_choice {
+        None => Vault::init_bare(),
+        Some(provider) => Vault {
+            provider: provider.clone(),
+        },
+    };
     create_vault_password_file(&mut vault)?;
 
     let client = Select::new("API Provider (required):", list_client_types()).prompt()?;
@@ -685,7 +693,16 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
     let mut config = json!({});
     let (model, clients_config) = create_client_config(client, &vault).await?;
     config["model"] = model.into();
-    config["vault_password_file"] = vault.local_password_file()?.display().to_string().into();
+    match &provider_choice {
+        None => {
+            config["vault_password_file"] =
+                vault.local_password_file()?.display().to_string().into();
+        }
+        Some(provider) => {
+            config["secrets_provider"] = serde_json::to_value(provider)
+                .with_context(|| "failed to serialize secrets_provider config")?;
+        }
+    }
     config["stream"] = json!(true);
     config["save"] = json!(true);
     config["keybindings"] = json!("vi");
