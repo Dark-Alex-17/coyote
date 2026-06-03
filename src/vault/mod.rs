@@ -16,6 +16,7 @@ use gman::providers::local::LocalProvider;
 use inquire::{Password, PasswordDisplayMode, required};
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
+use uuid::Uuid;
 
 pub static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{(.+)}}").unwrap());
 
@@ -175,22 +176,22 @@ impl Vault {
     }
 
     pub fn validate_round_trip(&self) -> Result<()> {
-        const PROBE_KEY: &str = "__coyote_setup_probe__";
         const PROBE_VALUE: &str = "ok";
+        let probe_key = format!("__coyote_setup_probe_{}__", Uuid::new_v4().simple());
 
         let h = Handle::current();
         let result: Result<()> = tokio::task::block_in_place(|| {
             h.block_on(async {
                 self.provider_ref()
-                    .set_secret(PROBE_KEY, PROBE_VALUE)
+                    .set_secret(&probe_key, PROBE_VALUE)
                     .await
                     .with_context(|| "vault write probe failed")?;
                 let got = self
                     .provider_ref()
-                    .get_secret(PROBE_KEY)
+                    .get_secret(&probe_key)
                     .await
                     .with_context(|| "vault read probe failed")?;
-                let _ = self.provider_ref().delete_secret(PROBE_KEY).await;
+                let _ = self.provider_ref().delete_secret(&probe_key).await;
                 if got != PROBE_VALUE {
                     bail!("vault read probe returned an unexpected value");
                 }
