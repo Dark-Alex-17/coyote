@@ -13,7 +13,7 @@ use gman::providers::one_password::OnePasswordProvider;
 use indoc::formatdoc;
 use inquire::validator::Validation;
 use inquire::{Confirm, Password, PasswordDisplayMode, Select, Text, min_length, required};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> Result<()> {
@@ -91,6 +91,7 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
         match password {
             Ok(pw) => {
                 std::fs::write(&vault_password_file, pw.as_bytes())?;
+                set_password_file_permissions(&vault_password_file)?;
                 println!(
                     "✓ Password file '{}' updated.",
                     vault_password_file.display()
@@ -162,6 +163,7 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
         match password {
             Ok(pw) => {
                 std::fs::write(&password_file, pw.as_bytes())?;
+                set_password_file_permissions(&password_file)?;
                 local_provider.password_file = Some(password_file);
                 println!(
                     "✓ Password file '{}' created.",
@@ -405,4 +407,20 @@ pub fn interpolate_secrets(content: &str, vault: &Vault) -> Result<(String, Vec<
     }
 
     Ok((parsed_content, missing_secrets))
+}
+
+#[cfg(unix)]
+fn set_password_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        anyhow!(
+            "Failed to set 0600 permissions on '{}': {e}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn set_password_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }

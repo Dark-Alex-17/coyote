@@ -14,6 +14,21 @@ review_attempts=$(echo "$state" | jq -r '.review_attempts // 0')
 max_review_attempts=$(echo "$state" | jq -r '.max_review_attempts // 1')
 review_notes=$(echo "$state" | jq -r '.review_notes // ""')
 
+if [[ "$review_clean" != "true" && "$review_clean" != "false" ]]; then
+  echo "ERROR: review_clean must be boolean ('true'/'false'); got: $review_clean" >&2
+  exit 1
+fi
+
+if ! [[ "$review_attempts" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: review_attempts must be a non-negative integer; got: $review_attempts" >&2
+  exit 1
+fi
+
+if ! [[ "$max_review_attempts" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: max_review_attempts must be a non-negative integer; got: $max_review_attempts" >&2
+  exit 1
+fi
+
 if [[ "$review_clean" == "true" ]]; then
   jq -nc '{"_next": "end_success"}'
   exit 0

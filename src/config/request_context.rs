@@ -1737,6 +1737,18 @@ impl RequestContext {
             "enabled_skills" => {
                 let raw: Option<String> = super::parse_value(value)?;
                 let parsed: Option<Vec<String>> = raw.map(|s| super::csv_to_vec(&s));
+                if let Some(names) = parsed.as_ref() {
+                    let visible =
+                        paths::list_visible_skills(self.app.config.visible_skills.as_deref());
+                    for name in names {
+                        paths::validate_skill_name(name)?;
+                        if !visible.iter().any(|s| s == name) {
+                            bail!(
+                                "enabled_skills references skill '{name}' which is not visible (check global 'visible_skills' and that the skill is installed)"
+                            );
+                        }
+                    }
+                }
                 self.update_app_config(|app| app.enabled_skills = parsed.clone());
             }
             "skills_enabled" => {
@@ -2650,7 +2662,9 @@ impl RequestContext {
 
         self.skill_registry.insert(skill)?;
         if let Err(e) = self.refresh_tool_scope(abort_signal).await {
-            let _ = self.skill_registry.unload(name);
+            if let Err(unload_err) = self.skill_registry.unload(name) {
+                warn!("Failed to unload skill '{name}' during error recovery: {unload_err}");
+            }
             bail!("Loaded skill '{name}' but failed to refresh tool scope: {e}");
         }
 
@@ -2659,10 +2673,15 @@ impl RequestContext {
     }
 
     pub async fn unload_skill_repl(&mut self, name: &str, abort_signal: AbortSignal) -> Result<()> {
-        self.skill_registry.unload(name)?;
+        let skill = self.skill_registry.unload(name)?;
 
         if let Err(e) = self.refresh_tool_scope(abort_signal).await {
-            eprintln!("Warning: unloaded skill '{name}' but tool scope refresh failed: {e}");
+            if let Err(restore_err) = self.skill_registry.insert(skill) {
+                warn!(
+                    "Failed to restore skill '{name}' after tool-scope refresh failure: {restore_err}"
+                );
+            }
+            bail!("Unloaded skill '{name}' but failed to refresh tool scope; restored: {e}");
         }
 
         println!("✓ Unloaded skill '{name}'.");

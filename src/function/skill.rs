@@ -105,7 +105,7 @@ fn handle_list(ctx: &RequestContext, policy: &SkillPolicy) -> Result<Value> {
     let mcp_on = ctx.app.config.mcp_server_support;
 
     let mut entries = Vec::new();
-    for name in paths::list_skills() {
+    for name in paths::list_visible_skills(ctx.app.config.visible_skills.as_deref()) {
         if !policy.allows(&name) {
             continue;
         }
@@ -193,7 +193,10 @@ async fn handle_load(
     }
 
     if let Err(e) = ctx.refresh_tool_scope(create_abort_signal()).await {
-        let _ = ctx.skill_registry.unload(name);
+        if let Err(unload_err) = ctx.skill_registry.unload(name) {
+            warn!("Failed to unload skill '{name}' during error recovery: {unload_err}");
+        }
+
         return Ok(json!({
             "error": format!("Loaded skill '{name}' but failed to refresh tool scope: {e}")
         }));
@@ -212,13 +215,20 @@ async fn handle_unload(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
         _ => return Ok(json!({"error": "name is required"})),
     };
 
+    if let Err(e) = paths::validate_skill_name(name) {
+        return Ok(json!({"error": e.to_string()}));
+    }
+
     let skill = match ctx.skill_registry.unload(name) {
         Ok(s) => s,
         Err(e) => return Ok(json!({"error": e.to_string()})),
     };
 
     if let Err(e) = ctx.refresh_tool_scope(create_abort_signal()).await {
-        let _ = ctx.skill_registry.insert(skill);
+        if let Err(insert_err) = ctx.skill_registry.insert(skill) {
+            warn!("Failed to restore skill '{name}' after unload recovery: {insert_err}");
+        }
+
         return Ok(json!({
             "error": format!(
                 "Unloaded skill '{name}' but failed to refresh tool scope; restored: {e}"
