@@ -23,7 +23,7 @@ use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
-pub static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{(.+)}}").unwrap());
+pub static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{([^{}]+)}}").unwrap());
 
 #[derive(Debug, Default, Clone)]
 pub struct Vault {
