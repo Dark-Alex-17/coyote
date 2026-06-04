@@ -93,6 +93,7 @@ impl AgentValidationContext {
 pub struct GraphValidator {
     base_dir: PathBuf,
     agent_ctx: Option<AgentValidationContext>,
+    skill_exists: fn(&str) -> bool,
 }
 
 impl GraphValidator {
@@ -100,11 +101,18 @@ impl GraphValidator {
         Self {
             base_dir: base_dir.into(),
             agent_ctx: None,
+            skill_exists: paths::has_skill,
         }
     }
 
     pub fn with_agent_context(mut self, ctx: AgentValidationContext) -> Self {
         self.agent_ctx = Some(ctx);
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_skill_exists(mut self, f: fn(&str) -> bool) -> Self {
+        self.skill_exists = f;
         self
     }
 
@@ -196,24 +204,14 @@ impl GraphValidator {
             .as_ref()
             .and_then(|c| c.app_config.visible_skills.as_deref());
 
+        let skill_exists = self.skill_exists;
         let check_visibility = |name: &str| -> Option<String> {
             match visible_skills {
-                Some(list) => {
-                    if !list.iter().any(|s| s == name) {
-                        Some(format!(
-                            "'{name}' is not in the global 'visible_skills' allow-list"
-                        ))
-                    } else {
-                        None
-                    }
-                }
-                None => {
-                    if !paths::has_skill(name) {
-                        Some(format!("'{name}' is not installed"))
-                    } else {
-                        None
-                    }
-                }
+                Some(list) if !list.iter().any(|s| s == name) => Some(format!(
+                    "'{name}' is not in the global 'visible_skills' allow-list"
+                )),
+                None if !skill_exists(name) => Some(format!("'{name}' is not installed")),
+                _ => None,
             }
         };
 
@@ -1375,7 +1373,7 @@ mod tests {
     }
 
     fn validator() -> GraphValidator {
-        GraphValidator::new(env::current_dir().unwrap())
+        GraphValidator::new(env::current_dir().unwrap()).with_skill_exists(|_: &str| true)
     }
 
     #[test]

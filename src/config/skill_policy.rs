@@ -277,7 +277,10 @@ mod tests {
             SkillPolicy::effective_with(&global, None, None, None, &always_true, &empty_installed)
                 .unwrap_err();
 
-        assert!(err.to_string().contains("not in visible_skills"));
+        assert!(
+            err.to_string()
+                .contains("not in the global 'visible_skills'")
+        );
         assert!(err.to_string().contains("beta"));
     }
 
