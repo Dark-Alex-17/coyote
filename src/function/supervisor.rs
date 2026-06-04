@@ -469,7 +469,7 @@ pub async fn run_agent_for_graph(
         child_ctx.init_agent_shared_variables()?;
     }
 
-    let input = Input::from_str(&child_ctx, prompt, None);
+    let input = Input::from_str(&child_ctx, prompt, None)?;
 
     debug!("Spawning agent '{agent_name}' for graph node as '{agent_id}'");
 
@@ -635,7 +635,7 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         child_ctx.init_agent_shared_variables()?;
     }
 
-    let input = Input::from_str(&child_ctx, &prompt, None);
+    let input = Input::from_str(&child_ctx, &prompt, None)?;
 
     debug!("Spawning child agent '{agent_name}' as '{agent_id}'");
 
@@ -1228,7 +1228,7 @@ async fn summarize_output(ctx: &RequestContext, agent_name: &str, output: &str) 
         "Summarize the following sub-agent output from '{}':\n\n{}",
         agent_name, output
     );
-    let input = Input::from_str(ctx, &user_message, Some(role));
+    let input = Input::from_str(ctx, &user_message, Some(role))?;
 
     let summary = input.fetch_chat_text().await?;
 

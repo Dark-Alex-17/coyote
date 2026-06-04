@@ -76,7 +76,7 @@ async fn run_one_shot(prompt: &str, ctx: &mut RequestContext) -> Result<String> 
     let abort = create_abort_signal();
     let app_cfg = Arc::clone(&ctx.app.config);
     let role_for_input = ctx.role.clone();
-    let input = Input::from_str(ctx, prompt, role_for_input);
+    let input = Input::from_str(ctx, prompt, role_for_input)?;
     let client = input.create_client()?;
     ctx.before_chat_completion(&input)?;
     let (output, tool_results) =

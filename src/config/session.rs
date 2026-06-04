@@ -106,8 +106,8 @@ impl Session {
         }
     }
 
-    pub fn new_from_ctx(ctx: &RequestContext, app: &AppConfig, name: &str) -> Self {
-        let role = ctx.extract_role(app);
+    pub fn new_from_ctx(ctx: &RequestContext, app: &AppConfig, name: &str) -> Result<Self> {
+        let role = ctx.extract_role(app)?;
         let mut session = Self {
             name: name.to_string(),
             save_session: app.save_session,
@@ -115,7 +115,7 @@ impl Session {
         };
         session.set_role(role);
         session.dirty = false;
-        session
+        Ok(session)
     }
 
     pub fn load_from_ctx(
@@ -817,7 +817,7 @@ mod tests {
             functions: Functions::default(),
         });
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
-        let session = Session::new_from_ctx(&ctx, &app_config, "test-session");
+        let session = Session::new_from_ctx(&ctx, &app_config, "test-session").unwrap();
 
         assert_eq!(session.name(), "test-session");
         assert_eq!(session.save_session(), app_config.save_session);
