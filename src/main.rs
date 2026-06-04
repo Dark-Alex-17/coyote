@@ -197,14 +197,18 @@ async fn run(
         println!("{skills}");
         return Ok(());
     }
-    if cli.skill.len() == 1 && !paths::has_skill(&cli.skill[0]) {
+    if cli.skill.len() == 1 {
         let name = &cli.skill[0];
-        let app = Arc::clone(&ctx.app.config);
-        ctx.upsert_skill(app.as_ref(), name)?;
-        return Ok(());
+        paths::validate_skill_name(name)?;
+        if !paths::has_skill(name) {
+            let app = Arc::clone(&ctx.app.config);
+            ctx.upsert_skill(app.as_ref(), name)?;
+            return Ok(());
+        }
     }
     if cli.skill.len() > 1 {
         for name in &cli.skill {
+            paths::validate_skill_name(name)?;
             if !paths::has_skill(name) {
                 bail!("Skill '{name}' is not installed");
             }

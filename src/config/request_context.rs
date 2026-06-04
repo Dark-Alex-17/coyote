@@ -1231,7 +1231,8 @@ impl RequestContext {
                 if let Some(ref tool_names) = role_filter {
                     agent_functions.retain(|v| {
                         tool_names.contains(&v.name)
-                            || v.name.starts_with(SKILL_FUNCTION_PREFIX)
+                            || (!matches!(agent.skills_enabled(), Some(false))
+                                && v.name.starts_with(SKILL_FUNCTION_PREFIX))
                             || v.name.starts_with(USER_FUNCTION_PREFIX)
                     });
                 }
