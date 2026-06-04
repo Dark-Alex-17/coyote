@@ -487,6 +487,7 @@ impl Config {
 
         let bootstrap_app = AppConfig {
             vault_password_file: config.vault_password_file.clone(),
+            secrets_provider: config.secrets_provider.clone(),
             ..AppConfig::default()
         };
         let vault = Vault::init(&bootstrap_app);
