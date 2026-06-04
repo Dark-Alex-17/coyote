@@ -731,7 +731,7 @@ fn merge_mcp_json(
         serde_json::to_string_pretty(&merged).context("failed to serialize merged mcp.json")?;
     write_atomically(&final_path, &serialized)?;
 
-    let vault = Vault::init_bare();
+    let vault = Vault::init_bare()?;
     let (_parsed, missing) = interpolate_secrets(&serialized, &vault)?;
     let mut deduped: Vec<String> = Vec::new();
     for s in missing {
@@ -860,7 +860,7 @@ fn handle_missing_secrets(missing: &[String]) -> Result<()> {
 }
 
 fn prompt_for_each_secret(missing: &[String]) -> Result<(Vec<String>, Vec<String>)> {
-    let mut vault = Vault::init_bare();
+    let mut vault = Vault::init_bare()?;
     let mut password_file_ensured = false;
     let mut added = Vec::new();
     let mut deferred = Vec::new();
@@ -914,6 +914,62 @@ fn print_secret_summary(added: &[String], deferred: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::get_env_name;
+    use serial_test::serial;
+    use std::env;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestVaultConfigGuard {
+        dir_key: String,
+        file_key: String,
+        previous_dir: Option<OsString>,
+        previous_file: Option<OsString>,
+        path: PathBuf,
+    }
+
+    impl TestVaultConfigGuard {
+        fn new(label: &str) -> Self {
+            let dir_key = get_env_name("config_dir");
+            let file_key = get_env_name("config_file");
+            let previous_dir = env::var_os(&dir_key);
+            let previous_file = env::var_os(&file_key);
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!("coyote-vault-test-{label}-{unique}"));
+            fs::create_dir_all(&path).unwrap();
+            let config_path = path.join("config.yaml");
+            fs::write(&config_path, "{}").unwrap();
+            unsafe {
+                env::set_var(&dir_key, &path);
+                env::set_var(&file_key, &config_path);
+            }
+            Self {
+                dir_key,
+                file_key,
+                previous_dir,
+                previous_file,
+                path,
+            }
+        }
+    }
+
+    impl Drop for TestVaultConfigGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous_dir {
+                    Some(p) => env::set_var(&self.dir_key, p),
+                    None => env::remove_var(&self.dir_key),
+                }
+                match &self.previous_file {
+                    Some(p) => env::set_var(&self.file_key, p),
+                    None => env::remove_var(&self.file_key),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn parse_url_no_ref() {
@@ -1253,7 +1309,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_into_empty_local_adds_all_remote_servers() {
+        let _guard = TestVaultConfigGuard::new("merge-empty");
         let dir = fresh_temp_dir("merge-empty-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -1270,7 +1328,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_force_replaces_local_on_conflict() {
+        let _guard = TestVaultConfigGuard::new("merge-force");
         let dir = fresh_temp_dir("merge-force-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -1336,7 +1396,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
     async fn merge_detects_missing_secrets_in_output() {
+        let _guard = TestVaultConfigGuard::new("merge-secret");
         let dir = fresh_temp_dir("merge-secret-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -1352,7 +1414,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_is_idempotent_on_re_run() {
+        let _guard = TestVaultConfigGuard::new("merge-idempotent");
         let dir = fresh_temp_dir("merge-idempotent-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
