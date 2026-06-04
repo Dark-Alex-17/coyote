@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
     if vault_flags {
         let cfg = Config::load_with_interpolation(true).await?;
         let app_config = AppConfig::from_config(cfg)?;
-        let vault = Vault::init(&app_config);
+        let vault = Vault::init(&app_config)?;
         return Vault::handle_vault_flags(cli, &vault);
     }
 
@@ -197,17 +197,17 @@ async fn run(
         println!("{skills}");
         return Ok(());
     }
-    if cli.skill.len() == 1 {
-        let name = &cli.skill[0];
+    let skills = cli.skills();
+    if skills.len() == 1 {
+        let name = &skills[0];
         paths::validate_skill_name(name)?;
         if !paths::has_skill(name) {
             let app = Arc::clone(&ctx.app.config);
             ctx.upsert_skill(app.as_ref(), name)?;
             return Ok(());
         }
-    }
-    if cli.skill.len() > 1 {
-        for name in &cli.skill {
+    } else if skills.len() > 1 {
+        for name in &skills {
             paths::validate_skill_name(name)?;
             if !paths::has_skill(name) {
                 bail!("Skill '{name}' is not installed");
@@ -327,7 +327,7 @@ async fn run(
             .await?;
     }
 
-    for name in &cli.skill {
+    for name in &cli.skills() {
         ctx.load_skill_repl(name, abort_signal.clone()).await?;
     }
 

@@ -137,13 +137,16 @@ pub(super) fn session_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 pub(super) fn secrets_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
     match load_app_config_for_completion() {
-        Ok(app_config) => Vault::init(&app_config)
-            .list_secrets(false)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|s| s.starts_with(&*cur))
-            .map(CompletionCandidate::new)
-            .collect(),
+        Ok(app_config) => match Vault::init(&app_config) {
+            Ok(vault) => vault
+                .list_secrets(false)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| s.starts_with(&*cur))
+                .map(CompletionCandidate::new)
+                .collect(),
+            Err(_) => vec![],
+        },
         Err(_) => vec![],
     }
 }

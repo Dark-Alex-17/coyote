@@ -80,7 +80,7 @@ impl Vault {
         }
     }
 
-    pub fn init(config: &AppConfig) -> Self {
+    pub fn init(config: &AppConfig) -> Result<Self> {
         let mut provider = match &config.secrets_provider {
             Some(p) => p.clone(),
             None => SupportedProvider::Local {
@@ -92,11 +92,10 @@ impl Vault {
         };
 
         if let SupportedProvider::Local { provider_def } = &mut provider {
-            ensure_password_file_initialized(provider_def)
-                .expect("Failed to initialize password file");
+            ensure_password_file_initialized(provider_def)?;
         }
 
-        Self { provider }
+        Ok(Self { provider })
     }
 
     pub fn local_password_file(&self) -> Result<PathBuf> {

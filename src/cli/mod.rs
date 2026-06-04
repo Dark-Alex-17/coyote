@@ -10,6 +10,7 @@ use clap::ValueHint;
 use clap::{Parser, crate_authors, crate_description, crate_version};
 use clap_complete::ArgValueCompleter;
 use is_terminal::IsTerminal;
+use std::collections::HashSet;
 use std::io::{Read, stdin};
 
 #[derive(Parser, Debug)]
@@ -163,6 +164,18 @@ pub struct Cli {
 }
 
 impl Cli {
+    pub fn skills(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::with_capacity(self.skill.len());
+        for name in &self.skill {
+            if seen.insert(name.clone()) {
+                out.push(name.clone());
+            }
+        }
+
+        out
+    }
+
     pub fn text(&self) -> Result<Option<String>> {
         let mut stdin_text = String::new();
         if !stdin().is_terminal() {
@@ -321,6 +334,21 @@ mod tests {
             parse(&["--skill", "alpha", "--skill", "beta", "--skill", "gamma"]).skill,
             vec!["alpha", "beta", "gamma"]
         );
+    }
+
+    #[test]
+    fn skills_method_dedupes_preserving_first_occurrence() {
+        let cli = parse(&[
+            "--skill", "alpha", "--skill", "beta", "--skill", "alpha", "--skill", "gamma",
+            "--skill", "beta",
+        ]);
+
+        assert_eq!(cli.skills(), vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn skills_method_returns_empty_when_no_flags() {
+        assert!(parse(&[]).skills().is_empty());
     }
 
     #[test]
