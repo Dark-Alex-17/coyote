@@ -4,7 +4,7 @@ use super::paths;
 use super::role::Role;
 use super::session::Session;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use std::collections::HashSet;
 
 #[derive(Debug)]
@@ -76,16 +76,24 @@ impl SkillPolicy {
             Some(explicit) => {
                 let set: HashSet<String> = explicit.into_iter().collect();
                 for name in &set {
-                    if !skill_exists(name) {
-                        bail!("enabled_skills references skill '{name}' which is not installed");
-                    }
-
-                    if let Some(vs) = &visible
-                        && !vs.contains(name)
-                    {
-                        bail!(
-                            "enabled_skills references skill '{name}' which is not in visible_skills"
-                        );
+                    paths::validate_skill_name(name).map_err(|e| {
+                        anyhow!("enabled_skills contains invalid name '{name}': {e}")
+                    })?;
+                    match &visible {
+                        Some(vs) => {
+                            if !vs.contains(name) {
+                                bail!(
+                                    "enabled_skills references skill '{name}' which is not in the global 'visible_skills' allow-list"
+                                );
+                            }
+                        }
+                        None => {
+                            if !skill_exists(name) {
+                                bail!(
+                                    "enabled_skills references skill '{name}' which is not installed"
+                                );
+                            }
+                        }
                     }
                 }
                 set

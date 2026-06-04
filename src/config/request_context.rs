@@ -1738,14 +1738,22 @@ impl RequestContext {
                 let raw: Option<String> = super::parse_value(value)?;
                 let parsed: Option<Vec<String>> = raw.map(|s| super::csv_to_vec(&s));
                 if let Some(names) = parsed.as_ref() {
-                    let visible =
-                        paths::list_visible_skills(self.app.config.visible_skills.as_deref());
+                    let visible = self.app.config.visible_skills.as_deref();
                     for name in names {
                         paths::validate_skill_name(name)?;
-                        if !visible.iter().any(|s| s == name) {
-                            bail!(
-                                "enabled_skills references skill '{name}' which is not visible (check global 'visible_skills' and that the skill is installed)"
-                            );
+                        match visible {
+                            Some(vs) => {
+                                if !vs.iter().any(|s| s == name) {
+                                    bail!(
+                                        "skill '{name}' is not in the global 'visible_skills' allow-list"
+                                    );
+                                }
+                            }
+                            None => {
+                                if !paths::has_skill(name) {
+                                    bail!("skill '{name}' is not installed");
+                                }
+                            }
                         }
                     }
                 }

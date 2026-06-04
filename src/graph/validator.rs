@@ -196,9 +196,25 @@ impl GraphValidator {
             .as_ref()
             .and_then(|c| c.app_config.visible_skills.as_deref());
 
-        let is_visible = |name: &str| match visible_skills {
-            None => true,
-            Some(list) => list.iter().any(|s| s == name),
+        let check_visibility = |name: &str| -> Option<String> {
+            match visible_skills {
+                Some(list) => {
+                    if !list.iter().any(|s| s == name) {
+                        Some(format!(
+                            "'{name}' is not in the global 'visible_skills' allow-list"
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                None => {
+                    if !paths::has_skill(name) {
+                        Some(format!("'{name}' is not installed"))
+                    } else {
+                        None
+                    }
+                }
+            }
         };
 
         if let Some(graph_skills) = &graph.enabled_skills {
@@ -209,10 +225,9 @@ impl GraphValidator {
                     ));
                     continue;
                 }
-
-                if !is_visible(name) {
+                if let Some(reason) = check_visibility(name) {
                     result.error(ValidationError::new(format!(
-                        "graph 'enabled_skills' references '{name}' which is not in global 'visible_skills'"
+                        "graph 'enabled_skills': {reason}"
                     )));
                 }
             }
@@ -234,13 +249,10 @@ impl GraphValidator {
                     ));
                     continue;
                 }
-
-                if !is_visible(name) {
+                if let Some(reason) = check_visibility(name) {
                     result.error(ValidationError::with_node(
                         node_id,
-                        format!(
-                            "llm node 'enabled_skills' references '{name}' which is not in global 'visible_skills'"
-                        ),
+                        format!("llm node 'enabled_skills': {reason}"),
                     ));
                     continue;
                 }
