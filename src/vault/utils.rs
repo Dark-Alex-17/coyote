@@ -355,6 +355,19 @@ fn required_cli_preflight(label: &str, cli: &str, install_url: &str) {
 }
 
 pub fn interpolate_secrets(content: &str, vault: &Vault) -> Result<(String, Vec<String>)> {
+    interpolate_secrets_with(content, vault.auth_hint(), |name| {
+        vault.get_secret(name, false)
+    })
+}
+
+fn interpolate_secrets_with<F>(
+    content: &str,
+    auth_hint: Option<&'static str>,
+    mut get_secret: F,
+) -> Result<(String, Vec<String>)>
+where
+    F: FnMut(&str) -> Result<String>,
+{
     let mut missing_secrets = vec![];
     let mut fatal_error: Option<anyhow::Error> = None;
 
@@ -372,7 +385,7 @@ pub fn interpolate_secrets(content: &str, vault: &Vault) -> Result<(String, Vec<
                     }
 
                     let name = caps[1].trim();
-                    match vault.get_secret(name, false) {
+                    match get_secret(name) {
                         Ok(s) => s,
                         Err(e) => match e.downcast_ref::<SecretError>() {
                             Some(SecretError::NotFound { .. }) => {
@@ -382,7 +395,7 @@ pub fn interpolate_secrets(content: &str, vault: &Vault) -> Result<(String, Vec<
                             Some(SecretError::AuthFailed { .. }) => {
                                 let base =
                                     format!("Failed to fetch secret '{name}' from vault: {e}");
-                                let msg = match vault.auth_hint() {
+                                let msg = match auth_hint {
                                     Some(hint) => format!("{base}\n\nHint: {hint}"),
                                     None => base,
                                 };
@@ -424,4 +437,163 @@ fn set_password_file_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_password_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Error;
+    use std::cell::RefCell;
+
+    fn not_found(name: &str) -> Error {
+        Error::new(SecretError::NotFound {
+            key: name.to_string(),
+            provider: "test",
+        })
+    }
+
+    fn auth_failed() -> Error {
+        Error::new(SecretError::AuthFailed {
+            provider: "test",
+            source: anyhow!("auth failure"),
+        })
+    }
+
+    struct Calls(RefCell<Vec<String>>);
+
+    impl Calls {
+        fn new() -> Self {
+            Self(RefCell::new(Vec::new()))
+        }
+
+        fn record(&self, name: &str) {
+            self.0.borrow_mut().push(name.to_string());
+        }
+
+        fn snapshot(&self) -> Vec<String> {
+            self.0.borrow().clone()
+        }
+    }
+
+    #[test]
+    fn interpolates_single_secret_per_line() {
+        let (out, missing) =
+            interpolate_secrets_with("api_key={{API_KEY}}", None, |name| match name {
+                "API_KEY" => Ok("sk-12345".to_string()),
+                other => panic!("unexpected lookup: {other}"),
+            })
+            .unwrap();
+
+        assert_eq!(out, "api_key=sk-12345");
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn regex_matches_each_secret_independently_when_one_per_line() {
+        let calls = Calls::new();
+        let (out, missing) = interpolate_secrets_with("{{ONE}}\nmiddle\n{{TWO}}", None, |name| {
+            calls.record(name);
+            Ok(name.to_lowercase())
+        })
+        .unwrap();
+
+        assert_eq!(calls.snapshot(), vec!["ONE".to_string(), "TWO".to_string()]);
+        assert_eq!(out, "one\nmiddle\ntwo");
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn skips_comment_lines() {
+        let calls = Calls::new();
+
+        let (out, missing) =
+            interpolate_secrets_with("# api_key={{NEVER_FETCHED}}\nreal={{S}}", None, |name| {
+                calls.record(name);
+                Ok("v".to_string())
+            })
+            .unwrap();
+
+        assert_eq!(out, "# api_key={{NEVER_FETCHED}}\nreal=v");
+        assert!(missing.is_empty());
+        assert_eq!(calls.snapshot(), vec!["S".to_string()]);
+    }
+
+    #[test]
+    fn missing_secrets_become_empty_strings_and_are_reported() {
+        let (out, missing) = interpolate_secrets_with(
+            "a={{HAVE}}\nb={{MISSING_1}}\nc={{MISSING_2}}",
+            None,
+            |name| match name {
+                "HAVE" => Ok("present".to_string()),
+                missing => Err(not_found(missing)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(out, "a=present\nb=\nc=");
+        assert_eq!(
+            missing,
+            vec!["MISSING_1".to_string(), "MISSING_2".to_string()]
+        );
+    }
+
+    #[test]
+    fn fatal_failure_short_circuits_remaining_lines() {
+        let calls = Calls::new();
+        let result =
+            interpolate_secrets_with("a={{S1}}\nb={{S2}}\nc={{S3}}\nd={{S4}}", None, |name| {
+                calls.record(name);
+                match name {
+                    "S1" => Ok("first".to_string()),
+                    "S2" => Err(auth_failed()),
+                    other => Ok(format!("late-{other}")),
+                }
+            });
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("S2"),
+            "error should name the offending secret, got: {err}"
+        );
+        assert_eq!(
+            calls.snapshot(),
+            vec!["S1".to_string(), "S2".to_string()],
+            "lookups must stop at the failing secret - S3 and S4 should never be fetched"
+        );
+    }
+
+    #[test]
+    fn auth_failure_appends_hint_when_provided() {
+        let result = interpolate_secrets_with(
+            "k={{K}}",
+            Some("run `coyote --authenticate` to reauth"),
+            |_| Err(auth_failed()),
+        );
+
+        let err = result.unwrap_err().to_string();
+
+        assert!(err.contains("Hint:"), "expected hint in error, got: {err}");
+        assert!(
+            err.contains("coyote --authenticate"),
+            "expected hint contents, got: {err}"
+        );
+    }
+
+    #[test]
+    fn regex_greedy_capture_collapses_multi_secret_line_into_single_lookup() {
+        let calls = Calls::new();
+        let (out, missing) = interpolate_secrets_with("url={{URL}} key={{KEY}}", None, |name| {
+            calls.record(name);
+            Err(not_found(name))
+        })
+        .unwrap();
+
+        assert_eq!(
+            calls.snapshot(),
+            vec!["URL}} key={{KEY".to_string()],
+            "greedy regex spans first {{ to last }}, collapsing the whole line into one bogus lookup"
+        );
+        assert_eq!(out, "url=");
+        assert_eq!(missing, vec!["URL}} key={{KEY".to_string()]);
+    }
 }

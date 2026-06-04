@@ -490,7 +490,7 @@ impl Config {
             secrets_provider: config.secrets_provider.clone(),
             ..AppConfig::default()
         };
-        let vault = Vault::init(&bootstrap_app);
+        let vault = Vault::init(&bootstrap_app)?;
         let (parsed_config, missing_secrets) = interpolate_secrets(&content, &vault)?;
         if !missing_secrets.is_empty() && !info_flag {
             debug!(

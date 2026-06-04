@@ -129,13 +129,13 @@ async fn run(
         }
     };
 
-    if policy.skills_enabled
-        && node
-            .tools
-            .as_deref()
-            .map(|t| !t.is_empty())
-            .unwrap_or(false)
-    {
+    let node_has_enabled_skills = node
+        .enabled_skills
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    if policy.skills_enabled && node_has_enabled_skills {
         let mut tools = role.enabled_tools().map(|v| v.to_vec()).unwrap_or_default();
         for decl in skill_function_declarations() {
             if !tools.contains(&decl.name) {

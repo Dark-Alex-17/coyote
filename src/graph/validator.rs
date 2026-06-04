@@ -228,6 +228,12 @@ impl GraphValidator {
                     ));
                     continue;
                 }
+                if let Err(e) = paths::validate_skill_name(name) {
+                    result.error(ValidationError::new(format!(
+                        "graph 'enabled_skills' contains an invalid skill name: '{name}': {e}"
+                    )));
+                    continue;
+                }
                 if let Some(reason) = check_visibility(name) {
                     result.error(ValidationError::new(format!(
                         "graph 'enabled_skills': {reason}"
@@ -250,6 +256,12 @@ impl GraphValidator {
                         node_id,
                         "llm node 'enabled_skills' contains an empty skill name",
                     ));
+                    continue;
+                }
+                if let Err(e) = paths::validate_skill_name(name) {
+                    result.error(ValidationError::new(format!(
+                        "llm node 'enabled_skills' contains an invalid skill name: '{name}': {e}"
+                    )));
                     continue;
                 }
                 if let Some(reason) = check_visibility(name) {
