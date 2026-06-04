@@ -270,6 +270,7 @@ pub fn list_skills() -> Vec<String> {
                 && file_type.is_dir()
                 && let Some(name) = entry.file_name().to_str()
                 && entry.path().join("SKILL.md").is_file()
+                && validate_skill_name(name).is_ok()
             {
                 names.push(name.to_string());
             }
@@ -307,6 +308,7 @@ pub fn local_models_override() -> Result<Vec<ProviderModels>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, time};
 
     #[test]
     fn validate_skill_name_accepts_alphanumerics_and_dashes() {
@@ -350,5 +352,36 @@ mod tests {
                 "has_skill({bad:?}) should be false for an invalid name"
             );
         }
+    }
+
+    #[test]
+    fn list_skills_skips_invalid_directory_names() {
+        let unique = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("coyote-list-skills-test-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let prev = env::var_os(get_env_name("skills_dir"));
+        unsafe {
+            env::set_var(get_env_name("skills_dir"), &root);
+        }
+
+        for name in ["valid-skill", "with space", ".hidden", "dot.name"] {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("SKILL.md"), "body").unwrap();
+        }
+
+        let listed = list_skills();
+        assert_eq!(listed, vec!["valid-skill".to_string()]);
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(get_env_name("skills_dir"), v),
+                None => env::remove_var(get_env_name("skills_dir")),
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }

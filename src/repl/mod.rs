@@ -708,6 +708,8 @@ pub async fn run_repl_command(
                         let name = s.strip_prefix("skill").unwrap_or("").trim();
                         if name.is_empty() {
                             println!("Usage: .edit skill <name>");
+                        } else if let Err(e) = paths::validate_skill_name(name) {
+                            bail!(e);
                         } else if !paths::has_skill(name) {
                             bail!(
                                 "Skill '{name}' is not installed (expected at {})",
