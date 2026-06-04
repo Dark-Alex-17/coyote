@@ -1,10 +1,3 @@
-use anyhow::{Context, Result, bail};
-use indexmap::IndexMap;
-use inquire::{Confirm, Select};
-use std::ffi::{OsStr, OsString};
-use std::fs;
-use std::path::{Path, PathBuf};
-use indoc::formatdoc;
 use crate::config::{InstallFilter, paths};
 #[cfg(not(windows))]
 use crate::function::Language;
@@ -12,6 +5,13 @@ use crate::mcp::{McpServer, McpServersConfig};
 use crate::utils;
 use crate::utils::IS_STDOUT_TERMINAL;
 use crate::vault::{Vault, create_vault_password_file, interpolate_secrets};
+use anyhow::{Context, Result, bail};
+use indexmap::IndexMap;
+use indoc::formatdoc;
+use inquire::{Confirm, Select};
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool) -> Result<()> {
     let (url, reference) = parse_url_with_ref(git_url)?;
@@ -735,11 +735,14 @@ fn merge_mcp_json(
     let missing = match interpolate_secrets(&serialized, &vault) {
         Ok((_, missing)) => missing,
         Err(e) => {
-            eprintln!("{}", formatdoc!{"
+            eprintln!(
+                "{}",
+                formatdoc! {"
                 Skipping secret resolution for merged mcp.json: {e:#}
                 Continuing without resolving missing secrets
                 You may need to add any additional missing secrets to the vault manually.
-            "});
+            "}
+            );
             Vec::new()
         }
     };
