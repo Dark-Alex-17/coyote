@@ -538,8 +538,47 @@ mod tests {
     }
 
     #[test]
+    fn interpolates_multiple_secrets_on_same_line() {
+        let calls = Calls::new();
+
+        let (out, missing) = interpolate_secrets_with("url={{URL}} key={{KEY}}", None, |name| {
+            calls.record(name);
+            match name {
+                "URL" => Ok("https://example.test".to_string()),
+                "KEY" => Ok("sk-12345".to_string()),
+                other => panic!("unexpected lookup: {other}"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(calls.snapshot(), vec!["URL".to_string(), "KEY".to_string()]);
+        assert_eq!(out, "url=https://example.test key=sk-12345");
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn regex_rejects_braces_in_secret_names() {
+        let calls = Calls::new();
+
+        let (out, missing) =
+            interpolate_secrets_with("literal {{ {NOT_A_NAME} }} text", None, |name| {
+                calls.record(name);
+                Ok(format!("got-{name}"))
+            })
+            .unwrap();
+
+        assert!(
+            calls.snapshot().is_empty(),
+            "name with embedded braces must not match"
+        );
+        assert_eq!(out, "literal {{ {NOT_A_NAME} }} text");
+        assert!(missing.is_empty());
+    }
+
+    #[test]
     fn fatal_failure_short_circuits_remaining_lines() {
         let calls = Calls::new();
+
         let result =
             interpolate_secrets_with("a={{S1}}\nb={{S2}}\nc={{S3}}\nd={{S4}}", None, |name| {
                 calls.record(name);
@@ -577,23 +616,5 @@ mod tests {
             err.contains("coyote --authenticate"),
             "expected hint contents, got: {err}"
         );
-    }
-
-    #[test]
-    fn regex_greedy_capture_collapses_multi_secret_line_into_single_lookup() {
-        let calls = Calls::new();
-        let (out, missing) = interpolate_secrets_with("url={{URL}} key={{KEY}}", None, |name| {
-            calls.record(name);
-            Err(not_found(name))
-        })
-        .unwrap();
-
-        assert_eq!(
-            calls.snapshot(),
-            vec!["URL}} key={{KEY".to_string()],
-            "greedy regex spans first {{ to last }}, collapsing the whole line into one bogus lookup"
-        );
-        assert_eq!(out, "url=");
-        assert_eq!(missing, vec!["URL}} key={{KEY".to_string()]);
     }
 }
