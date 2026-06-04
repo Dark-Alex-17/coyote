@@ -1,6 +1,9 @@
 mod utils;
 
+use std::fs::read_to_string;
 use std::path::PathBuf;
+
+use crate::config::paths;
 pub use utils::create_vault_password_file;
 pub use utils::interpolate_secrets;
 pub use utils::prompt_provider_choice;
@@ -14,6 +17,7 @@ use gman::providers::SecretProvider;
 use gman::providers::SupportedProvider;
 use gman::providers::local::LocalProvider;
 use inquire::{Password, PasswordDisplayMode, required};
+use serde_yaml::Value;
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
 use uuid::Uuid;
@@ -28,17 +32,49 @@ pub struct Vault {
 pub type GlobalVault = Arc<Vault>;
 
 impl Vault {
-    pub fn init_bare() -> Self {
-        let vault_password_file = AppConfig::default().vault_password_file();
-        let local_provider = LocalProvider {
-            password_file: Some(vault_password_file),
-            git_branch: None,
-            ..LocalProvider::default()
+    pub fn init_bare() -> Result<Self> {
+        let config_path = paths::config_file();
+        if !config_path.exists() {
+            bail!(
+                "Coyote config not found at {}. Run first-run setup before using the vault.",
+                config_path.display()
+            );
+        }
+        let content = read_to_string(&config_path)
+            .with_context(|| format!("failed to read config at {}", config_path.display()))?;
+        let value: Value = serde_yaml::from_str(&content)
+            .with_context(|| format!("failed to parse config at {}", config_path.display()))?;
+
+        let provider = match value.get("secrets_provider") {
+            Some(v) if !v.is_null() => serde_yaml::from_value::<SupportedProvider>(v.clone())
+                .with_context(|| "failed to parse 'secrets_provider' from config")?,
+            _ => {
+                let password_file = value
+                    .get("vault_password_file")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| AppConfig::default().vault_password_file());
+                SupportedProvider::Local {
+                    provider_def: LocalProvider {
+                        password_file: Some(password_file),
+                        git_branch: None,
+                        ..LocalProvider::default()
+                    },
+                }
+            }
         };
 
+        Ok(Self { provider })
+    }
+
+    pub fn default_local() -> Self {
         Self {
             provider: SupportedProvider::Local {
-                provider_def: local_provider,
+                provider_def: LocalProvider {
+                    password_file: Some(AppConfig::default().vault_password_file()),
+                    git_branch: None,
+                    ..LocalProvider::default()
+                },
             },
         }
     }

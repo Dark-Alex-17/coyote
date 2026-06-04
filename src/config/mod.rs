@@ -685,7 +685,7 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
 
     let provider_choice = prompt_provider_choice()?;
     let mut vault = match &provider_choice {
-        None => Vault::init_bare(),
+        None => Vault::default_local(),
         Some(provider) => Vault {
             provider: provider.clone(),
         },
