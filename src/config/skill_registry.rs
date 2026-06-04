@@ -2,7 +2,7 @@ use super::role::{Role, RoleLike};
 use super::skill::Skill;
 use super::skill_policy::SkillPolicy;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
 use std::collections::BTreeSet;
 
@@ -24,12 +24,10 @@ impl SkillRegistry {
         Ok(())
     }
 
-    pub fn unload(&mut self, name: &str) -> Result<()> {
-        if self.loaded.shift_remove(name).is_none() {
-            bail!("Skill '{name}' is not loaded");
-        }
-
-        Ok(())
+    pub fn unload(&mut self, name: &str) -> Result<Skill> {
+        self.loaded
+            .shift_remove(name)
+            .ok_or_else(|| anyhow!("Skill '{name}' is not loaded"))
     }
 
     pub fn loaded_names(&self) -> Vec<String> {
@@ -67,17 +65,13 @@ impl SkillRegistry {
         let mut effective = base.clone();
         let skip_body = effective.is_embedded_prompt();
 
-        let base_tools_set = effective.enabled_tools().is_some();
-        let base_mcps_set = effective.enabled_mcp_servers().is_some();
+        let base_tools = effective.enabled_tools();
+        let base_tools_set = base_tools.is_some();
+        let base_mcps = effective.enabled_mcp_servers();
+        let base_mcps_set = base_mcps.is_some();
 
-        let mut tools: BTreeSet<String> = effective
-            .enabled_tools()
-            .map(|v| v.into_iter().collect())
-            .unwrap_or_default();
-        let mut mcps: BTreeSet<String> = effective
-            .enabled_mcp_servers()
-            .map(|v| v.into_iter().collect())
-            .unwrap_or_default();
+        let mut tools: BTreeSet<String> = base_tools.unwrap_or_default().into_iter().collect();
+        let mut mcps: BTreeSet<String> = base_mcps.unwrap_or_default().into_iter().collect();
 
         for (name, skill) in &self.loaded {
             if !policy.allows(name) {

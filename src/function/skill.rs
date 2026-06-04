@@ -212,12 +212,18 @@ async fn handle_unload(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
         _ => return Ok(json!({"error": "name is required"})),
     };
 
-    if let Err(e) = ctx.skill_registry.unload(name) {
-        return Ok(json!({"error": e.to_string()}));
-    }
+    let skill = match ctx.skill_registry.unload(name) {
+        Ok(s) => s,
+        Err(e) => return Ok(json!({"error": e.to_string()})),
+    };
 
     if let Err(e) = ctx.refresh_tool_scope(create_abort_signal()).await {
-        warn!("Unloaded skill '{name}' but failed to refresh tool scope: {e}");
+        let _ = ctx.skill_registry.insert(skill);
+        return Ok(json!({
+            "error": format!(
+                "Unloaded skill '{name}' but failed to refresh tool scope; restored: {e}"
+            )
+        }));
     }
 
     Ok(json!({
