@@ -259,7 +259,9 @@ impl GraphValidator {
                     continue;
                 }
                 if let Err(e) = paths::validate_skill_name(name) {
-                    result.error(ValidationError::new(format!(
+                    result.error(ValidationError::with_node(
+                        node_id,
+                        format!(
                         "llm node 'enabled_skills' contains an invalid skill name: '{name}': {e}"
                     )));
                     continue;
