@@ -4,7 +4,7 @@ use inquire::{Confirm, Select};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-
+use indoc::formatdoc;
 use crate::config::{InstallFilter, paths};
 #[cfg(not(windows))]
 use crate::function::Language;
@@ -732,7 +732,17 @@ fn merge_mcp_json(
     write_atomically(&final_path, &serialized)?;
 
     let vault = Vault::init_bare()?;
-    let (_parsed, missing) = interpolate_secrets(&serialized, &vault)?;
+    let missing = match interpolate_secrets(&serialized, &vault) {
+        Ok((_, missing)) => missing,
+        Err(e) => {
+            eprintln!("{}", formatdoc!{"
+                Skipping secret resolution for merged mcp.json: {e:#}
+                Continuing without resolving missing secrets
+                You may need to add any additional missing secrets to the vault manually.
+            "});
+            Vec::new()
+        }
+    };
     let mut deduped: Vec<String> = Vec::new();
     for s in missing {
         if !deduped.contains(&s) {
