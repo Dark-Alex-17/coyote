@@ -191,6 +191,33 @@ impl GraphValidator {
     }
 
     fn validate_llm_skills(&self, graph: &Graph, result: &mut ValidationResult) {
+        let visible_skills = self
+            .agent_ctx
+            .as_ref()
+            .and_then(|c| c.app_config.visible_skills.as_deref());
+
+        let is_visible = |name: &str| match visible_skills {
+            None => true,
+            Some(list) => list.iter().any(|s| s == name),
+        };
+
+        if let Some(graph_skills) = &graph.enabled_skills {
+            for name in graph_skills {
+                if name.trim().is_empty() {
+                    result.error(ValidationError::new(
+                        "graph 'enabled_skills' contains an empty skill name",
+                    ));
+                    continue;
+                }
+
+                if !is_visible(name) {
+                    result.error(ValidationError::new(format!(
+                        "graph 'enabled_skills' references '{name}' which is not in global 'visible_skills'"
+                    )));
+                }
+            }
+        }
+
         for (node_id, node) in &graph.nodes {
             let NodeType::Llm(llm) = &node.node_type else {
                 continue;
@@ -207,6 +234,17 @@ impl GraphValidator {
                     ));
                     continue;
                 }
+
+                if !is_visible(name) {
+                    result.error(ValidationError::with_node(
+                        node_id,
+                        format!(
+                            "llm node 'enabled_skills' references '{name}' which is not in global 'visible_skills'"
+                        ),
+                    ));
+                    continue;
+                }
+
                 if let Some(graph_skills) = &graph.enabled_skills
                     && !graph_skills.iter().any(|g| g == name)
                 {

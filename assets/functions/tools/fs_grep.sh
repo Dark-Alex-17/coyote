@@ -28,6 +28,8 @@ main() {
     local grep_args=(-nH --color=never)
 
     if [[ -d "$search_path" ]]; then
+        # Use -r (not -R) so symlinks to directories are NOT followed - this avoids
+        # infinite loops on pathological symlink cycles (e.g. `ln -s . loop`).
         grep_args+=(-r)
         grep_args+=(
             --exclude-dir='.git'

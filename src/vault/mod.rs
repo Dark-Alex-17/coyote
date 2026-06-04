@@ -17,6 +17,7 @@ use gman::providers::SecretProvider;
 use gman::providers::SupportedProvider;
 use gman::providers::local::LocalProvider;
 use inquire::{Password, PasswordDisplayMode, required};
+use log::warn;
 use serde_yaml::Value;
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
@@ -228,7 +229,9 @@ impl Vault {
                     .await
                     .with_context(|| "vault read probe failed")?;
                 if got != PROBE_VALUE {
-                    let _ = self.provider_ref().delete_secret(&probe_key).await;
+                    if let Err(cleanup_err) = self.provider_ref().delete_secret(&probe_key).await {
+                        warn!("vault probe cleanup failed for key '{probe_key}': {cleanup_err}");
+                    }
                     bail!("vault read probe returned an unexpected value");
                 }
 
