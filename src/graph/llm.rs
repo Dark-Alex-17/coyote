@@ -3,6 +3,7 @@ use super::structured;
 use super::types::LlmNode;
 use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::{Input, RequestContext, Role, RoleLike, SkillPolicy};
+use crate::function::skill::skill_function_declarations;
 use crate::utils::create_abort_signal;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use serde_json::Value;
@@ -105,7 +106,7 @@ async fn run(
     let (regular_tools, mcp_servers) = categorize_tools(node.tools.as_deref());
     validate_tools_subset(&regular_tools, &mcp_servers, parent_ctx)?;
 
-    let role = build_inline_role(
+    let mut role = build_inline_role(
         node,
         instructions.as_deref(),
         &regular_tools,
@@ -121,6 +122,23 @@ async fn run(
         parent_ctx.agent.as_ref(),
         parent_ctx.session.as_ref(),
     )?;
+
+    if policy.skills_enabled
+        && node
+            .tools
+            .as_deref()
+            .map(|t| !t.is_empty())
+            .unwrap_or(false)
+    {
+        let mut tools = role.enabled_tools().map(|v| v.to_vec()).unwrap_or_default();
+        for decl in skill_function_declarations() {
+            if !tools.contains(&decl.name) {
+                tools.push(decl.name);
+            }
+        }
+        role.set_enabled_tools(Some(tools));
+    }
+
     let composed_role = parent_ctx.skill_registry.effective_role(&role, &policy);
 
     let saved_role = parent_ctx.role.clone();

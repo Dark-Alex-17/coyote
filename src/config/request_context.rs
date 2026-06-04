@@ -1229,7 +1229,11 @@ impl RequestContext {
                     .collect();
 
                 if let Some(ref tool_names) = role_filter {
-                    agent_functions.retain(|v| tool_names.contains(&v.name));
+                    agent_functions.retain(|v| {
+                        tool_names.contains(&v.name)
+                            || v.name.starts_with(SKILL_FUNCTION_PREFIX)
+                            || v.name.starts_with(USER_FUNCTION_PREFIX)
+                    });
                 }
 
                 let tool_names: HashSet<String> = agent_functions
