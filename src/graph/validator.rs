@@ -205,7 +205,12 @@ impl GraphValidator {
             .and_then(|c| c.app_config.visible_skills.as_deref());
 
         let skill_exists = self.skill_exists;
+        let has_agent_ctx = self.agent_ctx.is_some();
         let check_visibility = |name: &str| -> Option<String> {
+            if !has_agent_ctx {
+                return None;
+            }
+
             match visible_skills {
                 Some(list) if !list.iter().any(|s| s == name) => Some(format!(
                     "'{name}' is not in the global 'visible_skills' allow-list"
