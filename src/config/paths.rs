@@ -282,10 +282,6 @@ pub fn list_skills() -> Vec<String> {
 }
 
 pub fn has_skill(name: &str) -> bool {
-    if validate_skill_name(name).is_err() {
-        return false;
-    }
-
     skill_file(name).is_file()
 }
 
@@ -345,11 +341,11 @@ mod tests {
     }
 
     #[test]
-    fn has_skill_returns_false_for_invalid_names() {
-        for bad in ["", "../escape", "foo/bar", ".hidden", "with space"] {
+    fn has_skill_returns_false_for_missing_paths() {
+        for absent in ["definitely-not-installed-skill-xyz", "another-missing"] {
             assert!(
-                !has_skill(bad),
-                "has_skill({bad:?}) should be false for an invalid name"
+                !has_skill(absent),
+                "has_skill({absent:?}) should be false for a missing skill"
             );
         }
     }

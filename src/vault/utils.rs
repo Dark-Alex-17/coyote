@@ -13,9 +13,9 @@ use gman::providers::one_password::OnePasswordProvider;
 use indoc::formatdoc;
 use inquire::validator::Validation;
 use inquire::{Confirm, Password, PasswordDisplayMode, Select, Text, min_length, required};
+use log::debug;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use log::debug;
 
 pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> Result<()> {
     let vault_password_file = local_provider
