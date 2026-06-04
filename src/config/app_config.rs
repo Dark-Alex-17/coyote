@@ -3,7 +3,7 @@ use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, get_env_name};
 
 use super::paths;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
 use serde::Deserialize;
@@ -216,6 +216,7 @@ impl AppConfig {
             clients: config.clients,
         };
         app_config.load_envs();
+        app_config.validate_visible_skills()?;
         if let Some(wrap) = app_config.wrap.clone() {
             app_config.set_wrap(&wrap)?;
         }
@@ -225,11 +226,28 @@ impl AppConfig {
         Ok(app_config)
     }
 
+    fn validate_visible_skills(&self) -> Result<()> {
+        let Some(skills) = self.visible_skills.as_ref() else {
+            return Ok(());
+        };
+
+        for name in skills {
+            paths::validate_skill_name(name)
+                .map_err(|e| anyhow!("invalid entry in visible_skills: {e}"))?;
+
+            if !paths::has_skill(name) {
+                bail!("visible_skills references skill '{name}' which is not installed");
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn resolve_model(&mut self) -> Result<()> {
         if self.model_id.is_empty() {
             let models = list_models(self, crate::client::ModelType::Chat);
             if models.is_empty() {
-                anyhow::bail!("No available model");
+                bail!("No available model");
             }
             self.model_id = models[0].id();
         }

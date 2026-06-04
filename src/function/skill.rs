@@ -104,8 +104,13 @@ pub async fn handle_skill_tool(
 fn handle_list(ctx: &RequestContext, policy: &SkillPolicy) -> Result<Value> {
     let mcp_on = ctx.app.config.mcp_server_support;
 
+    let visible_names: Vec<String> = match ctx.app.config.visible_skills.as_deref() {
+        Some(list) => list.to_vec(),
+        None => paths::list_skills(),
+    };
+
     let mut entries = Vec::new();
-    for name in paths::list_visible_skills(ctx.app.config.visible_skills.as_deref()) {
+    for name in visible_names {
         if !policy.allows(&name) {
             continue;
         }

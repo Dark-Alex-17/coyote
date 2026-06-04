@@ -289,17 +289,6 @@ pub fn has_skill(name: &str) -> bool {
     skill_file(name).is_file()
 }
 
-pub fn list_visible_skills(visible: Option<&[String]>) -> Vec<String> {
-    let installed = list_skills();
-    match visible {
-        None => installed,
-        Some(allow) => installed
-            .into_iter()
-            .filter(|name| allow.iter().any(|v| v == name))
-            .collect(),
-    }
-}
-
 pub fn local_models_override() -> Result<Vec<ProviderModels>> {
     let model_override_path = models_override_file();
     let err = || {
