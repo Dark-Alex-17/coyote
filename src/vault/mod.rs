@@ -191,10 +191,16 @@ impl Vault {
                     .get_secret(&probe_key)
                     .await
                     .with_context(|| "vault read probe failed")?;
-                let _ = self.provider_ref().delete_secret(&probe_key).await;
                 if got != PROBE_VALUE {
+                    let _ = self.provider_ref().delete_secret(&probe_key).await;
                     bail!("vault read probe returned an unexpected value");
                 }
+
+                self.provider_ref()
+                    .delete_secret(&probe_key)
+                    .await
+                    .with_context(|| "vault delete probe failed")?;
+
                 Ok(())
             })
         });
