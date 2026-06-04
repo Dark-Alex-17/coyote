@@ -177,7 +177,7 @@ impl Vault {
 
     pub fn validate_round_trip(&self) -> Result<()> {
         const PROBE_VALUE: &str = "ok";
-        let probe_key = format!("__coyote_setup_probe_{}__", Uuid::new_v4().simple());
+        let probe_key = format!("coyote-setup-probe-{}", Uuid::new_v4().simple());
 
         let h = Handle::current();
         let result: Result<()> = tokio::task::block_in_place(|| {
