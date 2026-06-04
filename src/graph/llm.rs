@@ -116,12 +116,18 @@ async fn run(
 
     let saved_agent_skill_state = swap_in_node_skill_policy(node, parent_ctx);
 
-    let policy = SkillPolicy::effective(
+    let policy = match SkillPolicy::effective(
         &parent_ctx.app.config,
         parent_ctx.role.as_ref(),
         parent_ctx.agent.as_ref(),
         parent_ctx.session.as_ref(),
-    )?;
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            restore_agent_skill_policy(parent_ctx, saved_agent_skill_state);
+            return Err(e);
+        }
+    };
 
     if policy.skills_enabled
         && node
