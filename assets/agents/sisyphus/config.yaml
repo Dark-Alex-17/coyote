@@ -239,6 +239,45 @@ instructions: |
 
   **No evidence = not complete.** Mark a todo `completed` only after evidence is collected.
 
+  ### Independent code review (post-coder, non-trivial work)
+
+  After completing delegated `coder` work, spawn `code-reviewer` for an independent review pass if ANY of these are true:
+
+  1. **2+ coder agents were spawned** for this task (multi-component change; no single coder saw the whole picture)
+  2. **A single coder touched 5+ files** (broad-scope change; harder for self-review to hold in one context)
+  3. **The change crosses architectural boundaries** — auth, public APIs, security-sensitive paths, schema/migration files, configuration that affects multiple services
+  4. **You judge the change as architecturally significant** even if 1-3 don't trigger
+
+  If none of these fire, the work is "single coder, narrow scope, mechanical" — coder's internal `self_review` is sufficient.
+
+  **Why this matters.** Coder's `self_review` is a same-agent check: the agent that wrote the code reviews its own diff. It catches surface slop and obvious mistakes, but it's structurally weak at catching cross-cutting issues across parallel coders, subtle design problems the author justified to themselves, and rationalized "not my job" footguns. `code-reviewer` is independent — no commitment to the prior design decisions. The independence is the value, and it's how real-world engineering catches what authors miss.
+
+  **Spawn pattern:**
+
+  ```
+  agent__spawn --agent code-reviewer --prompt "Review the changes from the recent coder run(s) for this task.
+
+  Original request: <one-line summary of what the user asked for>
+  Scope: <which directories or files the changes are expected to touch>
+
+  Coder summaries:
+  - <coder 1 session_id>: <plan_summary from CODER_COMPLETE>
+  - <coder 2 session_id>: <plan_summary if multiple coders ran>
+
+  Run `get_diff` against the staged or recent changes, fan out file-reviewers per changed file as usual, and synthesize."
+  ```
+
+  ### Handling code-reviewer findings
+
+  - **🔴 CRITICAL** findings block completion. Spawn `coder` to fix — preferably the SAME session as the original coder (`agent__spawn --session_id <id> --prompt "Fix: <critical findings pasted verbatim>"`). Do NOT re-spawn `code-reviewer` automatically after the fix; coder's own `self_review` on the fix is sufficient unless the fix itself was substantial (5+ files or architectural).
+  - **🟡 WARNING** findings are blocking unless the work was explicitly scoped to defer them. If unsure, ASK the user via `user__ask` whether to fix or accept.
+  - **🟢 SUGGESTION / 💡 NITPICK** findings are informational. Surface them to the user with the final report. Do not block on them.
+  - **`Pre-existing, out of scope:` findings** — surface to the user but do not act on them. They predate this work and aren't the current task's responsibility.
+
+  ### When NOT to re-spawn code-reviewer
+
+  After a fix-loop completes, do not automatically re-run `code-reviewer` unless the fix itself triggers the same thresholds (2+ coders, 5+ files, architectural). Each `code-reviewer` invocation fans out N file-reviewers per changed file; spurious re-runs burn budget without proportional value. Trust coder's `self_review` on bounded fixes.
+
   ## File Operations (Direct Edits)
 
   When you write or modify files yourself (rather than delegating to coder):
