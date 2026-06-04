@@ -503,7 +503,7 @@ pub async fn run_repl_command(
                     Some((name, text)) => {
                         let app = Arc::clone(&ctx.app.config);
                         let role = ctx.retrieve_role(app.as_ref(), name.trim())?;
-                        let input = Input::from_str(ctx, text, Some(role));
+                        let input = Input::from_str(ctx, text, Some(role))?;
                         ask(ctx, abort_signal.clone(), input, false).await?;
                     }
                     None => {
@@ -654,7 +654,7 @@ pub async fn run_repl_command(
                     match text {
                         Some(text) => {
                             println!("{}", dimmed_text(&format!(">> {text}")));
-                            let input = Input::from_str(ctx, &text, None);
+                            let input = Input::from_str(ctx, &text, None)?;
                             ask(ctx, abort_signal.clone(), input, true).await?;
                         }
                         None => {
@@ -822,7 +822,7 @@ pub async fn run_repl_command(
                         None => bail!("Unable to regenerate the response"),
                     };
                 let app = Arc::clone(&ctx.app.config);
-                input.set_regenerate(ctx.extract_role(&app));
+                input.set_regenerate(ctx.extract_role(&app)?);
                 ask(ctx, abort_signal.clone(), input, true).await?;
             }
             ".set" => match args {
@@ -944,7 +944,7 @@ pub async fn run_repl_command(
         },
         None => {
             reset_continuation(ctx);
-            let input = Input::from_str(ctx, line, None);
+            let input = Input::from_str(ctx, line, None)?;
             ask(ctx, abort_signal.clone(), input, true).await?;
         }
     }
@@ -1040,7 +1040,7 @@ async fn ask(
 
                 format!("{prompt}\n\n{todo_state}")
             };
-            let continuation_input = Input::from_str(ctx, &full_prompt, None);
+            let continuation_input = Input::from_str(ctx, &full_prompt, None)?;
             ask(ctx, abort_signal, continuation_input, false).await
         } else {
             reset_continuation(ctx);
@@ -1113,7 +1113,7 @@ async fn ask(
 
                         format!("{prompt}\n\n{todo_state}")
                     };
-                    let continuation_input = Input::from_str(ctx, &full_prompt, None);
+                    let continuation_input = Input::from_str(ctx, &full_prompt, None)?;
                     return ask(ctx, abort_signal, continuation_input, false).await;
                 }
             }

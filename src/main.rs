@@ -457,7 +457,7 @@ async fn shell_execute(
                 }
                 'd' => {
                     let role = ctx.retrieve_role(app.as_ref(), EXPLAIN_SHELL_ROLE)?;
-                    let input = Input::from_str(ctx, &eval_str, Some(role));
+                    let input = Input::from_str(ctx, &eval_str, Some(role))?;
                     if input.stream() {
                         call_chat_completions_streaming(
                             &input,
@@ -502,7 +502,7 @@ async fn create_input(
 ) -> Result<Input> {
     let text = text.unwrap_or_default();
     let input = if file.is_empty() {
-        Input::from_str(ctx, &text, None)
+        Input::from_str(ctx, &text, None)?
     } else {
         Input::from_files_with_spinner(ctx, &text, file.to_vec(), None, abort_signal).await?
     };

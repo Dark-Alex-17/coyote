@@ -37,6 +37,7 @@ use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
+use log::warn;
 use parking_lot::RwLock;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
@@ -601,7 +602,7 @@ impl RequestContext {
         }
     }
 
-    pub fn extract_role(&self, app: &AppConfig) -> Role {
+    pub fn extract_role(&self, app: &AppConfig) -> Result<Role> {
         let mut role = if let Some(session) = self.session.as_ref() {
             session.to_role()
         } else if let Some(agent) = self.agent.as_ref() {
@@ -627,15 +628,13 @@ impl RequestContext {
             }
         }
 
-        match SkillPolicy::effective(
+        let policy = SkillPolicy::effective(
             app,
             self.role.as_ref(),
             self.agent.as_ref(),
             self.session.as_ref(),
-        ) {
-            Ok(policy) => self.skill_registry.effective_role(&role, &policy),
-            Err(_) => role,
-        }
+        )?;
+        Ok(self.skill_registry.effective_role(&role, &policy))
     }
 
     pub fn auto_continue_config(&self) -> AutoContinueConfig {
@@ -852,7 +851,7 @@ impl RequestContext {
             Some(rag) => rag.get_config(),
             None => (app.rag_reranker_model.clone(), app.rag_top_k),
         };
-        let role = self.extract_role(app);
+        let role = self.extract_role(app)?;
         let mut items = vec![
             ("model", role.model().id()),
             (
@@ -1025,7 +1024,10 @@ impl RequestContext {
 
     pub fn generate_prompt_context(&self, app: &AppConfig) -> HashMap<&str, String> {
         let mut output = HashMap::new();
-        let role = self.extract_role(app);
+        let role = self.extract_role(app).unwrap_or_else(|err| {
+            warn!("failed to compute effective role for prompt rendering: {err}");
+            Role::default()
+        });
         output.insert("model", role.model().id());
         output.insert("client_name", role.model().client_name().to_string());
         output.insert("model_name", role.model().name().to_string());
@@ -2364,12 +2366,12 @@ impl RequestContext {
                         format!("Failed to cleanup previous '{TEMP_SESSION_NAME}' session")
                     })?;
                 }
-                session = Some(Session::new_from_ctx(self, app, TEMP_SESSION_NAME));
+                session = Some(Session::new_from_ctx(self, app, TEMP_SESSION_NAME)?);
             }
             Some(name) => {
                 let session_path = self.session_file(name);
                 if !session_path.exists() {
-                    session = Some(Session::new_from_ctx(self, app, name));
+                    session = Some(Session::new_from_ctx(self, app, name)?);
                 } else {
                     session = Some(Session::load_from_ctx(self, app, name, &session_path)?);
                 }
@@ -2788,7 +2790,7 @@ impl RequestContext {
             .summarization_prompt
             .clone()
             .unwrap_or_else(|| SUMMARIZATION_PROMPT.into());
-        let input = Input::from_str(self, &prompt, None);
+        let input = Input::from_str(self, &prompt, None)?;
         let summary = input.fetch_chat_text().await?;
         let summary_context_prompt = self
             .app
@@ -2823,7 +2825,7 @@ impl RequestContext {
             None => bail!("No chat history"),
         };
         let role = self.retrieve_role(app, CREATE_TITLE_ROLE)?;
-        let input = Input::from_str(self, &text, Some(role));
+        let input = Input::from_str(self, &text, Some(role))?;
         let text = input.fetch_chat_text().await?;
         if let Some(session) = self.session.as_mut() {
             session.set_autoname(&text);
@@ -3077,7 +3079,7 @@ mod tests {
         let app = ctx.app.config.clone();
         let role = Role::new("myrole", "my prompt");
         ctx.use_role_obj(role).unwrap();
-        let extracted = ctx.extract_role(&app);
+        let extracted = ctx.extract_role(&app).unwrap();
         assert_eq!(extracted.name(), "myrole");
     }
 
@@ -3085,7 +3087,7 @@ mod tests {
     fn extract_role_returns_default_when_nothing_active() {
         let ctx = create_test_ctx();
         let app = ctx.app.config.clone();
-        let extracted = ctx.extract_role(&app);
+        let extracted = ctx.extract_role(&app).unwrap();
         assert_eq!(extracted.name(), "");
     }
 
@@ -3576,7 +3578,7 @@ mod tests {
     #[test]
     fn discontinuous_last_message_sets_continuous_false() {
         let mut ctx = create_test_ctx();
-        let input = Input::from_str(&ctx, "test", None);
+        let input = Input::from_str(&ctx, "test", None).unwrap();
         ctx.last_message = Some(LastMessage::new(input, "reply".to_string()));
         assert!(ctx.last_message.as_ref().unwrap().continuous);
         ctx.discontinuous_last_message();
@@ -3594,7 +3596,7 @@ mod tests {
     #[test]
     fn before_chat_completion_sets_last_message() {
         let mut ctx = create_test_ctx();
-        let input = Input::from_str(&ctx, "hello", None);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
         ctx.before_chat_completion(&input).unwrap();
         assert!(ctx.last_message.is_some());
         let lm = ctx.last_message.as_ref().unwrap();
@@ -3618,7 +3620,7 @@ mod tests {
         ctx.skill_registry.insert(ephemeral).unwrap();
         ctx.skill_registry.insert(persistent).unwrap();
 
-        let input = Input::from_str(&ctx, "hello", None);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
         let app = Arc::clone(&ctx.app.config);
         ctx.after_chat_completion(app.as_ref(), &input, "response", &[])
             .unwrap();
@@ -3641,7 +3643,7 @@ mod tests {
         let ephemeral = Skill::new("ephemeral", "---\nauto_unload: true\n---\nbody");
         ctx.skill_registry.insert(ephemeral).unwrap();
 
-        let input = Input::from_str(&ctx, "hello", None);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
         let app = Arc::clone(&ctx.app.config);
         let tool_result =
             ToolResult::new(crate::function::ToolCall::default(), serde_json::json!({}));
@@ -3803,7 +3805,7 @@ mod tests {
     fn session_new_from_ctx_captures_state() {
         let _guard = TestConfigDirGuard::new();
         let ctx = create_test_ctx();
-        let session = Session::new_from_ctx(&ctx, &ctx.app.config, "test-session");
+        let session = Session::new_from_ctx(&ctx, &ctx.app.config, "test-session").unwrap();
         assert_eq!(session.name(), "test-session");
         assert!(session.is_empty());
     }
@@ -3813,7 +3815,7 @@ mod tests {
     fn session_save_creates_file() {
         let _guard = TestConfigDirGuard::new();
         let ctx = create_test_ctx();
-        let mut session = Session::new_from_ctx(&ctx, &ctx.app.config, "save-test");
+        let mut session = Session::new_from_ctx(&ctx, &ctx.app.config, "save-test").unwrap();
         let session_path = ctx.session_file("save-test");
         ensure_parent_exists(&session_path).unwrap();
 

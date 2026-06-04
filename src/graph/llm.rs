@@ -115,15 +115,13 @@ async fn run(
 
     let saved_agent_skill_state = swap_in_node_skill_policy(node, parent_ctx);
 
-    let composed_role = match SkillPolicy::effective(
+    let policy = SkillPolicy::effective(
         &parent_ctx.app.config,
         parent_ctx.role.as_ref(),
         parent_ctx.agent.as_ref(),
         parent_ctx.session.as_ref(),
-    ) {
-        Ok(policy) => parent_ctx.skill_registry.effective_role(&role, &policy),
-        Err(_) => role,
-    };
+    )?;
+    let composed_role = parent_ctx.skill_registry.effective_role(&role, &policy);
 
     let saved_role = parent_ctx.role.clone();
     parent_ctx.role = Some(composed_role);
@@ -203,7 +201,7 @@ async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -
     let abort = create_abort_signal();
     let app_cfg = Arc::clone(&ctx.app.config);
     let role_for_input = ctx.role.clone();
-    let mut input = Input::from_str(ctx, prompt, role_for_input);
+    let mut input = Input::from_str(ctx, prompt, role_for_input)?;
     let mut accumulated = String::new();
 
     for turn in 0..node.max_iterations {
