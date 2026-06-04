@@ -5,7 +5,7 @@ use crate::mcp::{McpServer, McpServersConfig};
 use crate::utils;
 use crate::utils::IS_STDOUT_TERMINAL;
 use crate::vault::{Vault, create_vault_password_file, interpolate_secrets};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, Select};
@@ -418,6 +418,26 @@ fn plan_dir_into(
         let rel = src
             .strip_prefix(src_dir)
             .expect("walk_files only returns paths under src_dir");
+
+        if category == TopCategory::Skills {
+            let skill_name = rel
+                .components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "remote skill bundle has unparseable path component: {}",
+                        rel.display()
+                    )
+                })?;
+            paths::validate_skill_name(skill_name).with_context(|| {
+                format!(
+                    "remote skill '{skill_name}' has an invalid name \
+                     (skill names must contain only ASCII alphanumerics, '-', or '_')"
+                )
+            })?;
+        }
+
         let dst = dst_dir.join(rel);
         let kind = classify_file(&src, &dst)?;
         out.push(PlannedFile {
