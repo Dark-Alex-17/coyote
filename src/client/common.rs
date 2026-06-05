@@ -354,7 +354,9 @@ pub async fn create_config(
         "type": client,
     });
     for (key, desc, help_message, is_secret) in prompts {
-        let env_name = format!("{client}_{key}").to_ascii_uppercase();
+        let env_name = format!("{client}-{key}")
+            .to_ascii_uppercase()
+            .replace("_", "-");
         let required = std::env::var(&env_name).is_err();
         let value = if !is_secret {
             prompt_input_string(desc, required, *help_message)?
