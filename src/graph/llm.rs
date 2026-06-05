@@ -2,7 +2,10 @@ use super::state::StateManager;
 use super::structured;
 use super::types::LlmNode;
 use crate::client::{Model, ModelType, call_chat_completions};
-use crate::config::{Input, RequestContext, Role, RoleLike, SkillPolicy};
+use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
+use crate::config::{
+    Input, RequestContext, Role, RoleLike, SkillPolicy, should_inject_skill_instructions,
+};
 use crate::function::skill::skill_function_declarations;
 use crate::utils::create_abort_signal;
 use anyhow::{Context, Error, Result, anyhow, bail};
@@ -137,6 +140,31 @@ async fn run(
             }
         }
         role.set_enabled_tools(Some(tools));
+    }
+
+    if should_inject_skill_instructions(&parent_ctx.app.config, &policy) {
+        let app = &parent_ctx.app.config;
+        let agent = parent_ctx.agent.as_ref();
+        let inject = node
+            .inject_skill_instructions
+            .or_else(|| agent.map(|a| a.inject_skill_instructions()))
+            .unwrap_or(app.inject_skill_instructions);
+
+        if inject {
+            let instructions = node
+                .skill_instructions
+                .clone()
+                .or_else(|| agent.and_then(|a| a.skill_instructions_value()))
+                .or_else(|| app.skill_instructions.clone());
+            let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
+
+            role.append_to_prompt(separator);
+            role.append_to_prompt(
+                instructions
+                    .as_deref()
+                    .unwrap_or(DEFAULT_SKILL_INSTRUCTIONS),
+            );
+        }
     }
 
     let composed_role = parent_ctx.skill_registry.effective_role(&role, &policy);
@@ -456,6 +484,8 @@ mod tests {
             timeout: None,
             skills_enabled: None,
             enabled_skills: None,
+            inject_skill_instructions: None,
+            skill_instructions: None,
         }
     }
 

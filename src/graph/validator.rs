@@ -950,6 +950,8 @@ mod tests {
             mcp_servers: Vec::new(),
             skills_enabled: None,
             enabled_skills: None,
+            inject_skill_instructions: None,
+            skill_instructions: None,
             conversation_starters: Vec::new(),
             variables: Vec::new(),
             settings: GraphSettings::default(),
@@ -1051,6 +1053,8 @@ mod tests {
                 timeout: None,
                 skills_enabled: None,
                 enabled_skills: None,
+                inject_skill_instructions: None,
+                skill_instructions: None,
             }),
             next: next.map(NextTargets::from),
         }

@@ -3,14 +3,16 @@ use super::app_config::AppConfig;
 use super::paths;
 use super::role::Role;
 use super::session::Session;
+use super::skill::Skill;
 
 use anyhow::{Result, anyhow, bail};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 #[derive(Debug)]
 pub struct SkillPolicy {
     pub skills_enabled: bool,
     pub enabled: HashSet<String>,
+    pub compatible_enabled: BTreeSet<String>,
 }
 
 impl SkillPolicy {
@@ -27,20 +29,27 @@ impl SkillPolicy {
             session,
             &paths::has_skill,
             &paths::list_skills,
+            &|name, mcp_on| {
+                Skill::load(name)
+                    .map(|s| s.is_compatible(mcp_on))
+                    .unwrap_or(false)
+            },
         )
     }
 
-    fn effective_with<F, G>(
+    fn effective_with<F, G, H>(
         global: &AppConfig,
         role: Option<&Role>,
         agent: Option<&Agent>,
         session: Option<&Session>,
         skill_exists: &F,
         list_installed: &G,
+        skill_is_compatible: &H,
     ) -> Result<Self>
     where
         F: Fn(&str) -> bool,
         G: Fn() -> Vec<String>,
+        H: Fn(&str, bool) -> bool,
     {
         let mut skills_enabled = global.skills_enabled;
         if let Some(r) = role
@@ -104,9 +113,21 @@ impl SkillPolicy {
             },
         };
 
+        let compatible_enabled: BTreeSet<String> = if skills_enabled {
+            let mcp_on = global.mcp_server_support;
+            enabled
+                .iter()
+                .filter(|name| skill_is_compatible(name, mcp_on))
+                .cloned()
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+
         Ok(Self {
             skills_enabled,
             enabled,
+            compatible_enabled,
         })
     }
 
@@ -128,6 +149,10 @@ mod tests {
         Vec::new()
     }
 
+    fn all_compatible(_: &str, _: bool) -> bool {
+        true
+    }
+
     fn make_app_config(
         skills_enabled: bool,
         enabled: Option<&str>,
@@ -145,9 +170,16 @@ mod tests {
     fn defaults_yield_skills_enabled_with_empty_universe() {
         let global = AppConfig::default();
 
-        let policy =
-            SkillPolicy::effective_with(&global, None, None, None, &always_true, &empty_installed)
-                .unwrap();
+        let policy = SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &always_true,
+            &empty_installed,
+            &all_compatible,
+        )
+        .unwrap();
 
         assert!(policy.skills_enabled);
         assert!(policy.enabled.is_empty());
@@ -158,9 +190,16 @@ mod tests {
         let global = AppConfig::default();
         let installed = || vec!["alpha".to_string(), "beta".to_string()];
 
-        let policy =
-            SkillPolicy::effective_with(&global, None, None, None, &always_true, &installed)
-                .unwrap();
+        let policy = SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &always_true,
+            &installed,
+            &all_compatible,
+        )
+        .unwrap();
 
         assert_eq!(policy.enabled.len(), 2);
         assert!(policy.enabled.contains("alpha"));
@@ -171,9 +210,16 @@ mod tests {
     fn falls_back_to_visible_when_visible_set_but_no_enabled() {
         let global = make_app_config(true, None, Some(&["alpha", "beta"]));
 
-        let policy =
-            SkillPolicy::effective_with(&global, None, None, None, &always_true, &empty_installed)
-                .unwrap();
+        let policy = SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &always_true,
+            &empty_installed,
+            &all_compatible,
+        )
+        .unwrap();
 
         assert_eq!(policy.enabled.len(), 2);
         assert!(policy.enabled.contains("alpha"));
@@ -184,9 +230,16 @@ mod tests {
     fn global_enabled_skills_is_effective_when_no_other_levels() {
         let global = make_app_config(true, Some("alpha,beta"), Some(&["alpha", "beta", "gamma"]));
 
-        let policy =
-            SkillPolicy::effective_with(&global, None, None, None, &always_true, &empty_installed)
-                .unwrap();
+        let policy = SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &always_true,
+            &empty_installed,
+            &all_compatible,
+        )
+        .unwrap();
 
         assert!(policy.enabled.contains("alpha"));
         assert!(policy.enabled.contains("beta"));
@@ -205,6 +258,7 @@ mod tests {
             None,
             &always_true,
             &empty_installed,
+            &all_compatible,
         )
         .unwrap();
 
@@ -224,6 +278,7 @@ mod tests {
             None,
             &always_true,
             &empty_installed,
+            &all_compatible,
         )
         .unwrap();
 
@@ -237,9 +292,15 @@ mod tests {
             ..AppConfig::default()
         };
 
-        let policy = SkillPolicy::effective_with(&global, None, None, None, &always_true, &|| {
-            vec!["alpha".to_string()]
-        })
+        let policy = SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &always_true,
+            &|| vec!["alpha".to_string()],
+            &all_compatible,
+        )
         .unwrap();
 
         assert!(!policy.allows("alpha"));
@@ -249,9 +310,16 @@ mod tests {
     fn allows_returns_true_when_skill_in_enabled_set() {
         let global = make_app_config(true, Some("alpha"), None);
 
-        let policy =
-            SkillPolicy::effective_with(&global, None, None, None, &always_true, &empty_installed)
-                .unwrap();
+        let policy = SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &always_true,
+            &empty_installed,
+            &all_compatible,
+        )
+        .unwrap();
 
         assert!(policy.allows("alpha"));
         assert!(!policy.allows("beta"));
@@ -261,9 +329,16 @@ mod tests {
     fn validation_rejects_uninstalled_skill_reference() {
         let global = make_app_config(true, Some("ghost"), None);
 
-        let err =
-            SkillPolicy::effective_with(&global, None, None, None, &|_| false, &empty_installed)
-                .unwrap_err();
+        let err = SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &|_| false,
+            &empty_installed,
+            &all_compatible,
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("not installed"));
         assert!(err.to_string().contains("ghost"));
@@ -273,9 +348,16 @@ mod tests {
     fn validation_rejects_skill_not_in_visible_set() {
         let global = make_app_config(true, Some("beta"), Some(&["alpha"]));
 
-        let err =
-            SkillPolicy::effective_with(&global, None, None, None, &always_true, &empty_installed)
-                .unwrap_err();
+        let err = SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &always_true,
+            &empty_installed,
+            &all_compatible,
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string()
@@ -288,9 +370,16 @@ mod tests {
     fn validation_skipped_when_no_explicit_enabled_skills() {
         let global = make_app_config(true, None, None);
 
-        let policy =
-            SkillPolicy::effective_with(&global, None, None, None, &|_| false, &empty_installed)
-                .unwrap();
+        let policy = SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &|_| false,
+            &empty_installed,
+            &all_compatible,
+        )
+        .unwrap();
 
         assert!(policy.enabled.is_empty());
     }
@@ -307,9 +396,142 @@ mod tests {
             None,
             &always_true,
             &empty_installed,
+            &all_compatible,
         )
         .unwrap();
 
         assert!(policy.enabled.is_empty());
+    }
+
+    #[test]
+    fn compatible_enabled_is_empty_when_skills_disabled() {
+        let global = AppConfig {
+            skills_enabled: false,
+            enabled_skills: Some(vec!["alpha".into()]),
+            visible_skills: Some(vec!["alpha".into()]),
+            ..AppConfig::default()
+        };
+
+        let policy = SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &always_true,
+            &empty_installed,
+            &all_compatible,
+        )
+        .unwrap();
+
+        assert!(!policy.skills_enabled);
+        assert!(policy.compatible_enabled.is_empty());
+    }
+
+    #[test]
+    fn compatible_enabled_short_circuits_callback_when_skills_disabled() {
+        use std::cell::Cell;
+        let global = AppConfig {
+            skills_enabled: false,
+            enabled_skills: Some(vec!["alpha".into()]),
+            visible_skills: Some(vec!["alpha".into()]),
+            ..AppConfig::default()
+        };
+        let invoked = Cell::new(0u32);
+        let counting = |_: &str, _: bool| {
+            invoked.set(invoked.get() + 1);
+            true
+        };
+
+        SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &always_true,
+            &empty_installed,
+            &counting,
+        )
+        .unwrap();
+
+        assert_eq!(
+            invoked.get(),
+            0,
+            "skill_is_compatible callback must not run when skills are disabled"
+        );
+    }
+
+    #[test]
+    fn compatible_enabled_includes_all_when_callback_passes() {
+        let global = make_app_config(true, Some("alpha,beta"), Some(&["alpha", "beta"]));
+
+        let policy = SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &always_true,
+            &empty_installed,
+            &all_compatible,
+        )
+        .unwrap();
+
+        assert_eq!(policy.compatible_enabled.len(), 2);
+        assert!(policy.compatible_enabled.contains("alpha"));
+        assert!(policy.compatible_enabled.contains("beta"));
+    }
+
+    #[test]
+    fn compatible_enabled_excludes_incompatible_skills() {
+        let global = make_app_config(true, Some("alpha,beta"), Some(&["alpha", "beta"]));
+        let only_alpha_compat = |name: &str, _: bool| name == "alpha";
+
+        let policy = SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &always_true,
+            &empty_installed,
+            &only_alpha_compat,
+        )
+        .unwrap();
+
+        assert!(policy.compatible_enabled.contains("alpha"));
+        assert!(!policy.compatible_enabled.contains("beta"));
+        assert_eq!(policy.compatible_enabled.len(), 1);
+    }
+
+    #[test]
+    fn compatible_enabled_passes_mcp_flag_to_callback() {
+        use std::cell::Cell;
+        let global = AppConfig {
+            skills_enabled: true,
+            mcp_server_support: false,
+            enabled_skills: Some(vec!["alpha".into()]),
+            visible_skills: Some(vec!["alpha".into()]),
+            ..AppConfig::default()
+        };
+        let observed_mcp = Cell::new(None::<bool>);
+        let capture = |_: &str, mcp_on: bool| {
+            observed_mcp.set(Some(mcp_on));
+            true
+        };
+
+        SkillPolicy::effective_with(
+            &global,
+            None,
+            None,
+            None,
+            &always_true,
+            &empty_installed,
+            &capture,
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed_mcp.get(),
+            Some(false),
+            "callback must receive mcp_server_support flag from AppConfig"
+        );
     }
 }

@@ -79,6 +79,10 @@ pub struct Role {
     inject_todo_instructions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     continuation_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inject_skill_instructions: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skill_instructions: Option<String>,
 
     #[serde(skip)]
     model: Model,
@@ -123,6 +127,10 @@ impl Role {
                     "inject_todo_instructions" => role.inject_todo_instructions = value.as_bool(),
                     "continuation_prompt" => {
                         role.continuation_prompt = value.as_str().map(|v| v.to_string())
+                    }
+                    "inject_skill_instructions" => role.inject_skill_instructions = value.as_bool(),
+                    "skill_instructions" => {
+                        role.skill_instructions = value.as_str().map(|v| v.to_string())
                     }
                     _ => (),
                 }
@@ -188,6 +196,14 @@ impl Role {
         }
         if let Some(continuation_prompt) = &self.continuation_prompt {
             metadata.push(format!("continuation_prompt: {continuation_prompt}"));
+        }
+        if let Some(inject_skill_instructions) = self.inject_skill_instructions {
+            metadata.push(format!(
+                "inject_skill_instructions: {inject_skill_instructions}"
+            ));
+        }
+        if let Some(skill_instructions) = &self.skill_instructions {
+            metadata.push(format!("skill_instructions: {skill_instructions}"));
         }
         if metadata.is_empty() {
             format!("{}\n", self.prompt)
@@ -297,6 +313,14 @@ impl Role {
 
     pub fn continuation_prompt(&self) -> Option<&str> {
         self.continuation_prompt.as_deref()
+    }
+
+    pub fn inject_skill_instructions(&self) -> Option<bool> {
+        self.inject_skill_instructions
+    }
+
+    pub fn skill_instructions(&self) -> Option<&str> {
+        self.skill_instructions.as_deref()
     }
 
     pub fn skills_enabled(&self) -> Option<bool> {

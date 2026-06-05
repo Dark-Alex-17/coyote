@@ -37,6 +37,12 @@ pub struct Graph {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_skills: Option<Vec<String>>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_skill_instructions: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_instructions: Option<String>,
+
     #[serde(default)]
     pub conversation_starters: Vec<String>,
 
@@ -305,6 +311,12 @@ pub struct LlmNode {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_skills: Option<Vec<String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_skill_instructions: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_instructions: Option<String>,
 }
 
 fn default_llm_max_attempts() -> u32 {

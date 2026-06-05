@@ -26,6 +26,9 @@ auto_continue: false             # Enable automatic continuation when incomplete
 max_auto_continues: 10           # Maximum number of automatic continuations before stopping
 inject_todo_instructions: true   # Inject the default todo tool usage instructions into the agent's system prompt
 continuation_prompt: null        # Custom prompt used when auto-continuing (optional; uses default if null)
+inject_skill_instructions: true  # Inject a short hint pointing the model at `skill__list` when skills are enabled
+                                 # (default: true). Suppressed automatically when no skills are available.
+skill_instructions: null         # Custom text for the skill hint (optional; uses built-in default if null)
 # Sub-Agent Spawning System
 # Enable this agent to spawn and manage child agents in parallel.
 # See https://github.com/Dark-Alex-17/coyote/wiki/Agents for detailed documentation.

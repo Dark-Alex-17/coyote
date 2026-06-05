@@ -39,6 +39,7 @@ use indoc::formatdoc;
 use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
 use log::warn;
 use parking_lot::RwLock;
+use prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
 use std::io::Write;
@@ -51,6 +52,20 @@ pub struct AutoContinueConfig {
     pub max_continues: usize,
     pub inject_instructions: bool,
     pub continuation_prompt: Option<String>,
+}
+
+pub struct SkillInstructionsConfig {
+    pub inject: bool,
+    pub instructions: Option<String>,
+}
+
+/// Must stay in sync with the predicate that registers `skill__*` tools in `rebuild_tool_scope`
+/// (and in `graph::llm::run_llm_node`). Telling the model to call tools that are not exposed
+/// is a footgun. `compatible_enabled` is the post-filter universe that `skill__list` would
+/// actually return (cascade-allowed AND surviving `Skill::is_compatible` for current
+/// `mcp_server_support`), so an empty set means the hint has nothing to point at.
+pub fn should_inject_skill_instructions(app: &AppConfig, policy: &SkillPolicy) -> bool {
+    app.function_calling_support && policy.skills_enabled && !policy.compatible_enabled.is_empty()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -634,7 +649,60 @@ impl RequestContext {
             self.agent.as_ref(),
             self.session.as_ref(),
         )?;
+
+        if should_inject_skill_instructions(app, &policy) {
+            let config = self.skill_instructions_config();
+            
+            if config.inject {
+                let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
+                
+                role.append_to_prompt(separator);
+                role.append_to_prompt(
+                    config
+                        .instructions
+                        .as_deref()
+                        .unwrap_or(DEFAULT_SKILL_INSTRUCTIONS),
+                );
+            }
+        }
+
         Ok(self.skill_registry.effective_role(&role, &policy))
+    }
+
+    pub fn skill_instructions_config(&self) -> SkillInstructionsConfig {
+        if let Some(agent) = &self.agent {
+            return SkillInstructionsConfig {
+                inject: agent.inject_skill_instructions(),
+                instructions: agent.skill_instructions_value(),
+            };
+        }
+
+        let app = &self.app.config;
+        let inject = self
+            .session
+            .as_ref()
+            .and_then(|s| s.inject_skill_instructions())
+            .or_else(|| {
+                self.role
+                    .as_ref()
+                    .and_then(|r| r.inject_skill_instructions())
+            })
+            .unwrap_or(app.inject_skill_instructions);
+        let instructions = self
+            .session
+            .as_ref()
+            .and_then(|s| s.skill_instructions().map(|v| v.to_string()))
+            .or_else(|| {
+                self.role
+                    .as_ref()
+                    .and_then(|r| r.skill_instructions().map(|v| v.to_string()))
+            })
+            .or_else(|| app.skill_instructions.clone());
+
+        SkillInstructionsConfig {
+            inject,
+            instructions,
+        }
     }
 
     pub fn auto_continue_config(&self) -> AutoContinueConfig {
@@ -1707,7 +1775,7 @@ impl RequestContext {
         }
 
         let value = match key {
-            "continuation_prompt" => raw_value,
+            "continuation_prompt" | "skill_instructions" => raw_value,
             _ => {
                 if raw_value.contains(char::is_whitespace) {
                     bail!("Usage: .set <key> <value>. If value is null, unset key.");
@@ -1907,6 +1975,22 @@ impl RequestContext {
                     self.update_app_config(|app| app.continuation_prompt = value);
                 }
             }
+            "inject_skill_instructions" => {
+                let value: bool = value.parse().with_context(|| "Invalid value")?;
+                if let Some(session) = self.session.as_mut() {
+                    session.set_inject_skill_instructions(Some(value));
+                } else {
+                    self.update_app_config(|app| app.inject_skill_instructions = value);
+                }
+            }
+            "skill_instructions" => {
+                let value: Option<String> = super::parse_value(value)?;
+                if let Some(session) = self.session.as_mut() {
+                    session.set_skill_instructions(value);
+                } else {
+                    self.update_app_config(|app| app.skill_instructions = value);
+                }
+            }
             _ => bail!("Unknown key '{key}'"),
         }
         Ok(())
@@ -2006,6 +2090,8 @@ impl RequestContext {
                         "enabled_tools",
                         "enabled_mcp_servers",
                         "inject_todo_instructions",
+                        "inject_skill_instructions",
+                        "skill_instructions",
                         "max_auto_continues",
                         "save_session",
                         "compression_threshold",
@@ -2172,6 +2258,11 @@ impl RequestContext {
                     super::complete_bool(config.inject_instructions)
                 }
                 "continuation_prompt" => vec!["null".to_string()],
+                "inject_skill_instructions" => {
+                    let config = self.skill_instructions_config();
+                    super::complete_bool(config.inject)
+                }
+                "skill_instructions" => vec!["null".to_string()],
                 _ => vec![],
             };
             values = candidates.into_iter().map(|v| (v, None)).collect();
@@ -3121,6 +3212,108 @@ mod tests {
         let app = ctx.app.config.clone();
         let extracted = ctx.extract_role(&app).unwrap();
         assert_eq!(extracted.name(), "");
+    }
+
+    #[test]
+    fn should_inject_skill_instructions_requires_function_calling() {
+        let app = AppConfig {
+            function_calling_support: false,
+            ..AppConfig::default()
+        };
+
+        let policy = SkillPolicy {
+            skills_enabled: true,
+            enabled: ["a".to_string()].into_iter().collect(),
+            compatible_enabled: ["a".to_string()].into_iter().collect(),
+        };
+
+        assert!(!should_inject_skill_instructions(&app, &policy));
+    }
+
+    #[test]
+    fn should_inject_skill_instructions_requires_skills_enabled() {
+        let app = AppConfig {
+            function_calling_support: true,
+            ..AppConfig::default()
+        };
+
+        let policy = SkillPolicy {
+            skills_enabled: false,
+            enabled: ["a".to_string()].into_iter().collect(),
+            compatible_enabled: ["a".to_string()].into_iter().collect(),
+        };
+
+        assert!(!should_inject_skill_instructions(&app, &policy));
+    }
+
+    #[test]
+    fn should_inject_skill_instructions_suppresses_when_no_compatible_skills() {
+        let app = AppConfig {
+            function_calling_support: true,
+            ..AppConfig::default()
+        };
+
+        // `enabled` has names, but none survive the compatibility filter — hint must suppress.
+        let policy = SkillPolicy {
+            skills_enabled: true,
+            enabled: ["a".to_string()].into_iter().collect(),
+            compatible_enabled: Default::default(),
+        };
+
+        assert!(!should_inject_skill_instructions(&app, &policy));
+    }
+
+    #[test]
+    fn should_inject_skill_instructions_when_all_conditions_met() {
+        let app = AppConfig {
+            function_calling_support: true,
+            ..AppConfig::default()
+        };
+
+        let policy = SkillPolicy {
+            skills_enabled: true,
+            enabled: ["a".to_string()].into_iter().collect(),
+            compatible_enabled: ["a".to_string()].into_iter().collect(),
+        };
+
+        assert!(should_inject_skill_instructions(&app, &policy));
+    }
+
+    #[test]
+    fn skill_instructions_config_falls_back_to_app_default() {
+        let ctx = create_test_ctx();
+
+        let cfg = ctx.skill_instructions_config();
+
+        assert!(cfg.inject);
+        assert!(cfg.instructions.is_none());
+    }
+
+    #[test]
+    fn skill_instructions_config_respects_role_disable() {
+        let mut ctx = create_test_ctx();
+        let role = Role::new("r", "---\ninject_skill_instructions: false\n---\nhello");
+        ctx.use_role_obj(role).unwrap();
+
+        let cfg = ctx.skill_instructions_config();
+
+        assert!(!cfg.inject);
+    }
+
+    #[test]
+    fn skill_instructions_config_session_overrides_role() {
+        let mut ctx = create_test_ctx();
+        let role = Role::new("r", "---\ninject_skill_instructions: false\n---\nhello");
+        ctx.use_role_obj(role).unwrap();
+        let mut session = Session::default();
+        session.set_inject_skill_instructions(Some(true));
+        session.set_skill_instructions(Some("custom hint".into()));
+        ctx.session = Some(session);
+
+        let cfg = ctx.skill_instructions_config();
+
+        assert!(cfg.inject);
+        assert_eq!(cfg.instructions.as_deref(), Some("custom hint"));
     }
 
     #[test]

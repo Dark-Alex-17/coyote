@@ -1,5 +1,13 @@
 use indoc::indoc;
 
+pub(crate) const DEFAULT_SKILL_INSTRUCTIONS: &str = indoc! {"
+    ## Skills
+    Specialized skills may be available in this context. Call `skill__list` early in a task to
+    discover any that match the work, then `skill__load` the relevant ones. Their instructions and
+    granted tools will become active for subsequent turns. Call `skill__unload` when their work is
+    complete to keep the context lean."
+};
+
 pub(in crate::config) const DEFAULT_TODO_INSTRUCTIONS: &str = indoc! {"
     ## Task Tracking
     You have built-in task tracking tools. Use them to track your progress:

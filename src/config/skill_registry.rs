@@ -116,6 +116,7 @@ impl SkillRegistry {
         let policy = SkillPolicy {
             skills_enabled: true,
             enabled: self.loaded.keys().cloned().collect(),
+            compatible_enabled: self.loaded.keys().cloned().collect(),
         };
         self.effective_role(base, &policy)
     }

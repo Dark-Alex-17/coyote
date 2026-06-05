@@ -162,6 +162,10 @@ auto_continue: false              # Enable automatic continuation when incomplet
 max_auto_continues: 10            # Maximum number of automatic continuations before stopping (default: 10)
 inject_todo_instructions: true    # Inject default todo usage instructions into the system prompt (default: true)
 continuation_prompt: null         # Custom prompt used when auto-continuing. If null, uses built-in default
+inject_skill_instructions: true   # Inject a short hint pointing the model at `skill__list` when skills are enabled in
+                                  # this context. Only injected if `function_calling_support`, `skills_enabled`, and the
+                                  # effective enabled skill set is non-empty (default: true).
+skill_instructions: null          # Custom text used for the skill hint when injected. If null, uses built-in default.
 
 # ---- Session ----
 # See the [Session documentation](https://github.com/Dark-Alex-17/coyote/wiki/Sessions) for more information

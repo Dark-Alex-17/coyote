@@ -30,5 +30,8 @@ auto_continue: false                  # Enable automatic continuation when incom
 max_auto_continues: 10                # Maximum number of automatic continuations before stopping (default: 10)
 inject_todo_instructions: true        # Inject default todo tool usage instructions into the system prompt (default: true)
 continuation_prompt: null             # Custom prompt used when auto-continuing. If null, uses built-in default
+inject_skill_instructions: true       # Inject a short hint pointing the model at `skill__list` when skills are enabled 
+                                      # (default: true). Suppressed automatically when no skills are available.
+skill_instructions: null              # Custom text for the skill hint (optional; uses built-in default if null)
 ---
 You are an expert at doing things. This is where you write the instructions for the role.

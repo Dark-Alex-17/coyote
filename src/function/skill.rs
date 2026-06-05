@@ -14,9 +14,11 @@ pub fn skill_function_declarations() -> Vec<FunctionDeclaration> {
         FunctionDeclaration {
             name: format!("{SKILL_FUNCTION_PREFIX}list"),
             description:
-                "List skills available in this context. Returns each skill's name, description, \
-                 what tools and MCP servers it grants on load, and whether it is currently loaded. \
-                 Call this to discover skills before using skill__load."
+                "List skills available in this context. Call this early in any non-trivial task to \
+                 discover specialized skills that may apply to the work before deciding on an \
+                 approach. Returns each skill's name, description, what tools and MCP servers it \
+                 grants on load, and whether it is currently loaded. Pair with `skill__load` to \
+                 activate the skills you choose."
                     .to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -28,9 +30,10 @@ pub fn skill_function_declarations() -> Vec<FunctionDeclaration> {
         FunctionDeclaration {
             name: format!("{SKILL_FUNCTION_PREFIX}load"),
             description:
-                "Load a skill module into the current context. The skill's instructions and any \
-                 tools or MCP servers it grants become active for subsequent turns. Call \
-                 skill__unload when the skill's work is complete to keep the context lean."
+                "Load a skill module into the current context after confirming via `skill__list` \
+                 that it applies to the task at hand. The skill's instructions and any tools or \
+                 MCP servers it grants become active for subsequent turns. Call `skill__unload` \
+                 when the skill's work is complete to keep the context lean."
                     .to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -102,8 +105,6 @@ pub async fn handle_skill_tool(
 }
 
 fn handle_list(ctx: &RequestContext, policy: &SkillPolicy) -> Result<Value> {
-    let mcp_on = ctx.app.config.mcp_server_support;
-
     let visible_names: Vec<String> = match ctx.app.config.visible_skills.as_deref() {
         Some(list) => list.to_vec(),
         None => paths::list_skills(),
@@ -111,7 +112,7 @@ fn handle_list(ctx: &RequestContext, policy: &SkillPolicy) -> Result<Value> {
 
     let mut entries = Vec::new();
     for name in visible_names {
-        if !policy.allows(&name) {
+        if !policy.compatible_enabled.contains(&name) {
             continue;
         }
 
@@ -122,12 +123,6 @@ fn handle_list(ctx: &RequestContext, policy: &SkillPolicy) -> Result<Value> {
                 continue;
             }
         };
-        if !skill.is_compatible(mcp_on) {
-            warn!(
-                "Skill '{name}' filtered from list: declares MCP servers but MCP support is disabled"
-            );
-            continue;
-        }
 
         entries.push(json!({
             "name": skill.name(),

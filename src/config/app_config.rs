@@ -52,6 +52,8 @@ pub struct AppConfig {
     pub max_auto_continues: usize,
     pub inject_todo_instructions: bool,
     pub continuation_prompt: Option<String>,
+    pub inject_skill_instructions: bool,
+    pub skill_instructions: Option<String>,
 
     pub repl_prelude: Option<String>,
     pub cmd_prelude: Option<String>,
@@ -118,6 +120,8 @@ impl Default for AppConfig {
             max_auto_continues: 10,
             inject_todo_instructions: true,
             continuation_prompt: None,
+            inject_skill_instructions: true,
+            skill_instructions: None,
 
             repl_prelude: None,
             cmd_prelude: None,
@@ -185,6 +189,8 @@ impl AppConfig {
             max_auto_continues: config.max_auto_continues,
             inject_todo_instructions: config.inject_todo_instructions,
             continuation_prompt: config.continuation_prompt,
+            inject_skill_instructions: config.inject_skill_instructions,
+            skill_instructions: config.skill_instructions,
 
             repl_prelude: config.repl_prelude,
             cmd_prelude: config.cmd_prelude,

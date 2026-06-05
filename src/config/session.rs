@@ -56,6 +56,10 @@ pub struct Session {
     inject_todo_instructions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     continuation_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inject_skill_instructions: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skill_instructions: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     role_name: Option<String>,
@@ -227,6 +231,12 @@ impl Session {
         if let Some(continuation_prompt) = self.continuation_prompt() {
             data["continuation_prompt"] = continuation_prompt.into();
         }
+        if let Some(inject_skill_instructions) = self.inject_skill_instructions() {
+            data["inject_skill_instructions"] = inject_skill_instructions.into();
+        }
+        if let Some(skill_instructions) = self.skill_instructions() {
+            data["skill_instructions"] = skill_instructions.into();
+        }
         let (tokens, percent) = self.tokens_usage();
         data["total_tokens"] = tokens.into();
         if let Some(max_input_tokens) = self.model().max_input_tokens() {
@@ -304,6 +314,15 @@ impl Session {
         }
         if let Some(continuation_prompt) = self.continuation_prompt() {
             items.push(("continuation_prompt", continuation_prompt.to_string()));
+        }
+        if let Some(inject_skill_instructions) = self.inject_skill_instructions() {
+            items.push((
+                "inject_skill_instructions",
+                inject_skill_instructions.to_string(),
+            ));
+        }
+        if let Some(skill_instructions) = self.skill_instructions() {
+            items.push(("skill_instructions", skill_instructions.to_string()));
         }
 
         if let Some(max_input_tokens) = self.model().max_input_tokens() {
@@ -446,6 +465,14 @@ impl Session {
         self.continuation_prompt.as_deref()
     }
 
+    pub fn inject_skill_instructions(&self) -> Option<bool> {
+        self.inject_skill_instructions
+    }
+
+    pub fn skill_instructions(&self) -> Option<&str> {
+        self.skill_instructions.as_deref()
+    }
+
     pub fn set_inject_todo_instructions(&mut self, value: Option<bool>) {
         if self.inject_todo_instructions != value {
             self.inject_todo_instructions = value;
@@ -456,6 +483,20 @@ impl Session {
     pub fn set_continuation_prompt(&mut self, value: Option<String>) {
         if self.continuation_prompt != value {
             self.continuation_prompt = value;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_inject_skill_instructions(&mut self, value: Option<bool>) {
+        if self.inject_skill_instructions != value {
+            self.inject_skill_instructions = value;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_skill_instructions(&mut self, value: Option<String>) {
+        if self.skill_instructions != value {
+            self.skill_instructions = value;
             self.dirty = true;
         }
     }

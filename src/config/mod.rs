@@ -6,7 +6,7 @@ mod install_remote;
 mod macros;
 mod mcp_factory;
 pub(crate) mod paths;
-mod prompts;
+pub(crate) mod prompts;
 mod rag_cache;
 mod request_context;
 mod role;
@@ -28,7 +28,7 @@ pub use self::app_state::AppState;
 pub use self::input::Input;
 pub use self::install_remote::{install_remote, install_remote_from_repl_args};
 #[allow(unused_imports)]
-pub use self::request_context::{RenderMode, RequestContext};
+pub use self::request_context::{RenderMode, RequestContext, should_inject_skill_instructions};
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
@@ -214,6 +214,8 @@ pub struct Config {
     pub max_auto_continues: usize,
     pub inject_todo_instructions: bool,
     pub continuation_prompt: Option<String>,
+    pub inject_skill_instructions: bool,
+    pub skill_instructions: Option<String>,
 
     pub repl_prelude: Option<String>,
     pub cmd_prelude: Option<String>,
@@ -280,6 +282,8 @@ impl Default for Config {
             max_auto_continues: 10,
             inject_todo_instructions: true,
             continuation_prompt: None,
+            inject_skill_instructions: true,
+            skill_instructions: None,
 
             repl_prelude: None,
             cmd_prelude: None,

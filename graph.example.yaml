@@ -63,6 +63,9 @@ enabled_skills:
   - code-review
   - git-master
   - ai-slop-remover
+inject_skill_instructions: true   # Inject a hint pointing the model at `skill__list`. Defaults to true; suppressed
+                                  # automatically when no skills are available.
+skill_instructions: null          # Custom text for the skill hint (optional; uses the built-in default if omitted).
 
 conversation_starters:             # Suggested prompts surfaced in the UI
   - "Research the current state of WebAssembly outside the browser"
@@ -176,6 +179,9 @@ nodes:
     skills_enabled: true       # Whether skills are enabled on this llm node; defaults to 'true'
     enabled_skills:
       - ai-slop-remover
+    inject_skill_instructions: true   # Override skill-hint injection for just this node. Falls back to
+                                      # agent/graph/global default when omitted.
+    skill_instructions: null          # Per-node skill-hint text override; uses the built-in default when omitted.
     output_schema:             # Optional JSON Schema. The output is parsed to JSON
       type: object             # and its top-level object keys auto-merge into state
       properties:              # (so `topic` / `needs_deep_dive` become {{topic}} etc).

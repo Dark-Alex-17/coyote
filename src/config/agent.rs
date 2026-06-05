@@ -464,6 +464,14 @@ impl Agent {
         self.config.continuation_prompt.clone()
     }
 
+    pub fn inject_skill_instructions(&self) -> bool {
+        self.config.inject_skill_instructions
+    }
+
+    pub fn skill_instructions_value(&self) -> Option<String> {
+        self.config.skill_instructions.clone()
+    }
+
     pub fn can_spawn_agents(&self) -> bool {
         self.config.can_spawn_agents
     }
@@ -625,6 +633,10 @@ pub struct AgentConfig {
     pub inject_todo_instructions: bool,
     #[serde(default = "default_true")]
     pub inject_spawn_instructions: bool,
+    #[serde(default = "default_true")]
+    pub inject_skill_instructions: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compression_threshold: Option<usize>,
     #[serde(default)]
@@ -704,6 +716,8 @@ impl AgentConfig {
             mcp_servers: graph.mcp_servers.clone(),
             skills_enabled: graph.skills_enabled,
             enabled_skills: graph.enabled_skills.clone(),
+            inject_skill_instructions: graph.inject_skill_instructions.unwrap_or(true),
+            skill_instructions: graph.skill_instructions.clone(),
             conversation_starters: graph.conversation_starters.clone(),
             variables: graph.variables.clone(),
             can_spawn_agents: graph.has_agent_node(),
