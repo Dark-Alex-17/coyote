@@ -1,3 +1,84 @@
+## v0.6.0 (2026-06-05)
+
+### Feat
+
+- added skill hint prompt injection and configuration
+- Fallthrough on missing secrets during mcp.json merging
+- validate visible_skills field at config load time
+- implemented reflexion (sorta) in sisyphus for significant code changes to delegate to the code-reviewer agent
+- improved explore agent
+- removed conditional fallback of LLM_*_RAW_JSON from built-ins
+- updated enabled_skills handling to support both list and comma-separated strings
+- added new REPL set commands for toggling skills and changing what skills are enabled
+- upgraded to the latest version of mcp-remote
+- fs_grep now works with both files and directories
+- improved code reviewer agents with skills
+- added round trip validation for vault providers to ensure permissions and authentication
+- created new first-time run wizard for secrets provider
+- vault_password_file or nothing at all is shorthand for just using the local gman provider for secret management
+- refactored gman usage to be generic and work with various vault providers and use the SupportedProvider enum directly for configurations
+- created initial parity gman generalization for vault provider
+- Refactored the sisyhpus agent system to utilize the new skills system to improve performance and reliability
+- llm graph nodes support skills
+- updated sisyphus and coder tools
+- removed potentially confusing tab completions for .skill
+- .edit skill <name> support from within the REPL
+- Added skills_dir to the info output of Coyote
+- Created a few auto built-in skills
+- Added support for auto_unload skills during chat
+- cleaned up skill implementation
+- support multiple skill flags to load multiple skills at CLI startup
+- Modified --skill CLI to allow users to specify skills to start the REPL or CLI with.
+- added CLI --skill flag for modifying skills easily
+- REPL integration with skills
+- dynamic loading/unloading of skill tools and MCP servers whenever load_skill/unload_skill are invoked
+- created built-in functions for listing, loading, and unloading skills
+- implemented the skills policy to track available skills per context
+- added remote install and install support for skills
+- created the skill registry
+- decided to make skills persist to disk like agents and not in-memory like built-in roles
+- scaffold skill module
+
+### Fix
+
+- disable skills for specific built-in roles
+- redirect stderr into user's /dev/tty for guards
+- azure doesn't support underscores in key vault
+- accidental regression on enabled_skills being empty = all
+- greedy secrets regex caused multiple secrets on one line to fail
+- add agent context check to skill visibility validation
+- enforced global visible_skills in llm node validation and improved skill loading error handling across the project
+- restore agent skill policy on error during effective policy calculation
+- apply the same validation for skill filenames on list_skills as happens everywhere else
+- the vault's init_bare should try to load the provisioned secret_provider from the config file without also interpolating any of the rest of the configuration file. It should only fail if the user has not yet created a configuration file; i.e. done a first-time run.
+- the vault roundtrip test used characters that are unsupported by some major secrets providers
+- fixed tool filtering logic for skills and user functions in agents
+- privilege leak when unloading skills and leaving tool scope untouched
+- When bootstrapping an app config to interpolate secrets, clone the secrets provider configuration as well so config secrets stored in remote vaults can be used properly
+- forgot to move back up the vault probe value error to be before the delete
+- don't silently fail on skill role composition extraction in llm nodes
+- set -euo pipefail for the temp script in execute_command.sh tool
+- added forgotten skill name validation to has_skill to prevent side-channel attacks
+- use unique values for the secrets round trip verification
+- stop interpolating a line if any errors occur
+- added path validation for skill names
+- effective_policy unconditionally overwrote skill values for role-like structs
+- updated execute_command to not mangle heredocs and also added explicit instructions to the coder and sisyphus agents to use fs_write and fs_patch over execute_command when writing files
+- llm nodes accidentally skipped skill_registry::effective_role because I was passing an inline role instead
+- updated temperature values for all agents and roles
+- added back in require_max_tokens for new Claude models
+- skill support also requires function calling to be enabled
+- non_tty tests break on some TTY terminals
+- skill loading on agents
+- forgot to bootstrap skills on REPL startup
+- remove now deprecated .skill edit command
+
+### Refactor
+
+- removed redundant skill name validation from has_skill function
+- support both CSV and list formats for enabled_tools
+- Support both CSV and list formats for enabled_mcp_servers
+
 ## v0.5.0 (2026-05-27)
 
 ### Feat
