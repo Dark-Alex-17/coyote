@@ -173,6 +173,7 @@ nodes:
     # catches violations at load time). `skills_enabled: false` would
     # disable skills entirely for this node (no meta-tools exposed).
     # Nothing is auto-loaded: the model decides when to load a skill.
+    skills_enabled: true       # Whether skills are enabled on this llm node; defaults to 'true'
     enabled_skills:
       - ai-slop-remover
     output_schema:             # Optional JSON Schema. The output is parsed to JSON
