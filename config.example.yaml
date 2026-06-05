@@ -137,21 +137,25 @@ enabled_mcp_servers: null        # Which MCP servers to enable by default.
 # ---- Skills ----
 # Skills are modular knowledge or capability packs the LLM can load and unload mid-conversation.
 # See the [Skills documentation](https://github.com/Dark-Alex-17/coyote/wiki/Skills) for more details.
-skills_enabled: true             # Master switch. Set to false to hide all skill management tools from the model.
-                                 # Skills also require `function_calling_support: true` above to work at all.
-visible_skills:                  # The universe of skills allowed to be enabled in any context. Omit (null) for "all installed".
+skills_enabled: true              # Master switch. Set to false to hide all skill management tools from the model.
+                                  # Skills also require `function_calling_support: true` above to work at all.
+visible_skills:                   # The universe of skills allowed to be enabled in any context. Omit (null) for "all installed".
   - ai-slop-remover
   - code-review
   - frontend-ui-ux
   - git-master
-enabled_skills: null             # Which skills are available by default (no role/agent/session active). null = all visible.
-                                 # Accepts either a YAML list or a comma-separated string.
-                                 # Example (list form):
-                                 #   enabled_skills:
-                                 #     - git-master
-                                 #     - ai-slop-remover
-                                 # Example (comma-separated form):
-                                 #   enabled_skills: git-master,ai-slop-remover
+enabled_skills: null              # Which skills are available by default (no role/agent/session active). null = all visible.
+                                  # Accepts either a YAML list or a comma-separated string.
+                                  # Example (list form):
+                                  #   enabled_skills:
+                                  #     - git-master
+                                  #     - ai-slop-remover
+                                  # Example (comma-separated form):
+                                  #   enabled_skills: git-master,ai-slop-remover
+inject_skill_instructions: true   # Inject a short hint pointing the model at `skill__list` when skills are enabled in
+                                  # this context. Only injected if `function_calling_support`, `skills_enabled`, and the
+                                  # effective enabled skill set is non-empty (default: true).
+skill_instructions: null          # Custom text used for the skill hint when injected. If null, uses built-in default.
 
 # ---- Auto-Continue (Todo System) ----
 # The auto-continue system provides built-in task tracking for improved reliability.
@@ -162,10 +166,6 @@ auto_continue: false              # Enable automatic continuation when incomplet
 max_auto_continues: 10            # Maximum number of automatic continuations before stopping (default: 10)
 inject_todo_instructions: true    # Inject default todo usage instructions into the system prompt (default: true)
 continuation_prompt: null         # Custom prompt used when auto-continuing. If null, uses built-in default
-inject_skill_instructions: true   # Inject a short hint pointing the model at `skill__list` when skills are enabled in
-                                  # this context. Only injected if `function_calling_support`, `skills_enabled`, and the
-                                  # effective enabled skill set is non-empty (default: true).
-skill_instructions: null          # Custom text used for the skill hint when injected. If null, uses built-in default.
 
 # ---- Session ----
 # See the [Session documentation](https://github.com/Dark-Alex-17/coyote/wiki/Sessions) for more information
