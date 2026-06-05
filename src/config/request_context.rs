@@ -3073,11 +3073,12 @@ mod tests {
     use super::super::mcp_factory::McpFactory;
     use super::*;
     use crate::config::AppState;
-    use crate::function::ToolCall;
+    use crate::function::{ToolCall, skill};
     use crate::mcp::{McpServer, McpServersConfig, McpTransportType};
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
+    use serde_json::json;
     use serial_test::serial;
     use std::env;
     use std::fs::{create_dir_all, remove_dir_all, write};
@@ -3661,12 +3662,14 @@ mod tests {
     fn select_functions_suppresses_skill_tools_when_role_skills_enabled_false() {
         let mut ctx = create_test_ctx();
         ctx.tool_scope.functions.append_skill_functions();
+        ctx.tool_scope.functions.append_todo_functions();
 
         let mut role = Role::new("r", "---\nskills_enabled: false\n---\np");
-        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+        role.set_enabled_tools(Some(vec!["todo__init".to_string()]));
 
         let fns = ctx.select_functions(&role).unwrap();
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"todo__init"));
         assert!(!names.contains(&"skill__list"));
         assert!(!names.contains(&"skill__load"));
         assert!(!names.contains(&"skill__unload"));
@@ -3722,6 +3725,57 @@ mod tests {
         assert!(names.contains(&"skill__list"));
         assert!(names.contains(&"skill__load"));
         assert!(names.contains(&"skill__unload"));
+    }
+
+    #[test]
+    fn fork_for_branch_clones_skill_registry() {
+        let mut ctx = create_test_ctx();
+        let skill = Skill::new("shared", "---\nauto_unload: false\n---\nbody");
+        ctx.skill_registry.insert(skill).unwrap();
+
+        let fork = ctx.fork_for_branch();
+
+        assert!(
+            fork.skill_registry.is_loaded("shared"),
+            "Parallel branches must share loaded skills with parent"
+        );
+        assert!(ctx.skill_registry.is_loaded("shared"));
+    }
+
+    #[test]
+    fn handle_skill_tool_returns_error_when_skills_disabled() {
+        let mut ctx = create_test_ctx();
+        let role = Role::new("r", "---\nskills_enabled: false\n---\np");
+        ctx.use_role_obj(role).unwrap();
+
+        let result = run_async(skill::handle_skill_tool(
+            &mut ctx,
+            "skill__list",
+            &json!({}),
+        ))
+        .unwrap();
+
+        assert!(
+            result.get("error").is_some(),
+            "Expected error when skills are disabled, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn handle_unload_returns_error_when_skill_not_loaded() {
+        let mut ctx = create_test_ctx();
+
+        let result = run_async(skill::handle_skill_tool(
+            &mut ctx,
+            "skill__unload",
+            &json!({"name": "ghost"}),
+        ))
+        .unwrap();
+
+        assert!(
+            result.get("error").is_some(),
+            "Expected error when unloading unloaded skill, got: {result:?}"
+        );
     }
 
     #[test]
@@ -3994,8 +4048,7 @@ mod tests {
 
         let input = Input::from_str(&ctx, "hello", None).unwrap();
         let app = Arc::clone(&ctx.app.config);
-        let tool_result =
-            ToolResult::new(crate::function::ToolCall::default(), serde_json::json!({}));
+        let tool_result = ToolResult::new(crate::function::ToolCall::default(), json!({}));
         ctx.after_chat_completion(app.as_ref(), &input, "", &[tool_result])
             .unwrap();
 
