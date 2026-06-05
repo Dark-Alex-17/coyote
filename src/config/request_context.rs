@@ -652,10 +652,10 @@ impl RequestContext {
 
         if should_inject_skill_instructions(app, &policy) {
             let config = self.skill_instructions_config();
-            
+
             if config.inject {
                 let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
-                
+
                 role.append_to_prompt(separator);
                 role.append_to_prompt(
                     config
@@ -1275,7 +1275,8 @@ impl RequestContext {
                     .iter()
                     .filter(|v| {
                         (v.name.starts_with(USER_FUNCTION_PREFIX)
-                            || v.name.starts_with(SKILL_FUNCTION_PREFIX))
+                            || (!matches!(role.skills_enabled(), Some(false))
+                                && v.name.starts_with(SKILL_FUNCTION_PREFIX)))
                             && !existing.contains(&v.name)
                     })
                     .cloned()
@@ -3639,6 +3640,129 @@ mod tests {
         assert!(names.contains(&"todo__init"));
         assert!(names.contains(&"todo__add"));
         assert!(!names.contains(&"todo__done"));
+    }
+
+    #[test]
+    fn select_functions_re_adds_skill_tools_when_role_skills_enabled_unset() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_skill_functions();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"skill__list"));
+        assert!(names.contains(&"skill__load"));
+        assert!(names.contains(&"skill__unload"));
+    }
+
+    #[test]
+    fn select_functions_suppresses_skill_tools_when_role_skills_enabled_false() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_skill_functions();
+
+        let mut role = Role::new("r", "---\nskills_enabled: false\n---\np");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(!names.contains(&"skill__list"));
+        assert!(!names.contains(&"skill__load"));
+        assert!(!names.contains(&"skill__unload"));
+    }
+
+    #[test]
+    fn select_functions_still_re_adds_user_tools_when_role_skills_enabled_false() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_user_interaction_functions();
+        ctx.tool_scope.functions.append_skill_functions();
+
+        let mut role = Role::new("r", "---\nskills_enabled: false\n---\np");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"user__ask"));
+        assert!(!names.contains(&"skill__list"));
+    }
+
+    #[test]
+    #[serial]
+    fn select_functions_re_adds_skill_tools_when_agent_skills_enabled_not_false() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_skill_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\nversion: \"1.0\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: ok\n"
+            ),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+        ctx.tool_scope.functions.append_skill_functions();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"skill__list"));
+        assert!(names.contains(&"skill__load"));
+        assert!(names.contains(&"skill__unload"));
+    }
+
+    #[test]
+    #[serial]
+    fn select_functions_suppresses_skill_tools_when_agent_skills_enabled_false() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_skill_agent_off_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\nversion: \"1.0\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: ok\n"
+            ),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+        ctx.agent
+            .as_mut()
+            .expect("agent loaded")
+            .set_skills_enabled(Some(false));
+        ctx.tool_scope.functions.append_skill_functions();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(!names.contains(&"skill__list"));
+        assert!(!names.contains(&"skill__load"));
+        assert!(!names.contains(&"skill__unload"));
     }
 
     #[test]

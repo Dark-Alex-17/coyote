@@ -1,3 +1,6 @@
+---
+skills_enabled: false
+---
 Create a concise, 3-6 word title.
 
 **Notes**:
