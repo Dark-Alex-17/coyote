@@ -93,6 +93,7 @@ impl AgentValidationContext {
 pub struct GraphValidator {
     base_dir: PathBuf,
     agent_ctx: Option<AgentValidationContext>,
+    skill_exists: fn(&str) -> bool,
 }
 
 impl GraphValidator {
@@ -100,11 +101,18 @@ impl GraphValidator {
         Self {
             base_dir: base_dir.into(),
             agent_ctx: None,
+            skill_exists: paths::has_skill,
         }
     }
 
     pub fn with_agent_context(mut self, ctx: AgentValidationContext) -> Self {
         self.agent_ctx = Some(ctx);
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_skill_exists(mut self, f: fn(&str) -> bool) -> Self {
+        self.skill_exists = f;
         self
     }
 
@@ -119,6 +127,7 @@ impl GraphValidator {
         self.validate_approval_routes(graph, &mut result);
         self.validate_rag_nodes(graph, &mut result);
         self.validate_llm_nodes(graph, &mut result);
+        self.validate_llm_skills(graph, &mut result);
         self.validate_max_concurrency(graph, &mut result);
         self.validate_map_branches(graph, &mut result);
         self.validate_parallel_user_interaction(graph, &mut result);
@@ -185,6 +194,98 @@ impl GraphValidator {
                     node_id,
                     format!("llm node references unknown model '{model_id}'"),
                 ));
+            }
+        }
+    }
+
+    fn validate_llm_skills(&self, graph: &Graph, result: &mut ValidationResult) {
+        let visible_skills = self
+            .agent_ctx
+            .as_ref()
+            .and_then(|c| c.app_config.visible_skills.as_deref());
+
+        let skill_exists = self.skill_exists;
+        let has_agent_ctx = self.agent_ctx.is_some();
+        let check_visibility = |name: &str| -> Option<String> {
+            if !has_agent_ctx {
+                return None;
+            }
+
+            match visible_skills {
+                Some(list) if !list.iter().any(|s| s == name) => Some(format!(
+                    "'{name}' is not in the global 'visible_skills' allow-list"
+                )),
+                None if !skill_exists(name) => Some(format!("'{name}' is not installed")),
+                _ => None,
+            }
+        };
+
+        if let Some(graph_skills) = &graph.enabled_skills {
+            for name in graph_skills {
+                if name.trim().is_empty() {
+                    result.error(ValidationError::new(
+                        "graph 'enabled_skills' contains an empty skill name",
+                    ));
+                    continue;
+                }
+                if let Err(e) = paths::validate_skill_name(name) {
+                    result.error(ValidationError::new(format!(
+                        "graph 'enabled_skills' contains an invalid skill name: '{name}': {e}"
+                    )));
+                    continue;
+                }
+                if let Some(reason) = check_visibility(name) {
+                    result.error(ValidationError::new(format!(
+                        "graph 'enabled_skills': {reason}"
+                    )));
+                }
+            }
+        }
+
+        for (node_id, node) in &graph.nodes {
+            let NodeType::Llm(llm) = &node.node_type else {
+                continue;
+            };
+            let Some(node_skills) = &llm.enabled_skills else {
+                continue;
+            };
+
+            for name in node_skills {
+                if name.trim().is_empty() {
+                    result.error(ValidationError::with_node(
+                        node_id,
+                        "llm node 'enabled_skills' contains an empty skill name",
+                    ));
+                    continue;
+                }
+                if let Err(e) = paths::validate_skill_name(name) {
+                    result.error(ValidationError::with_node(
+                        node_id,
+                        format!(
+                        "llm node 'enabled_skills' contains an invalid skill name: '{name}': {e}"
+                    )));
+                    continue;
+                }
+                if let Some(reason) = check_visibility(name) {
+                    result.error(ValidationError::with_node(
+                        node_id,
+                        format!("llm node 'enabled_skills': {reason}"),
+                    ));
+                    continue;
+                }
+
+                if let Some(graph_skills) = &graph.enabled_skills
+                    && !graph_skills.iter().any(|g| g == name)
+                {
+                    result.error(ValidationError::with_node(
+                        node_id,
+                        format!(
+                            "llm node 'enabled_skills' references '{name}' which is not in \
+                             graph-level 'enabled_skills' ({})",
+                            graph_skills.join(", ")
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -847,6 +948,8 @@ mod tests {
             top_p: None,
             global_tools: Vec::new(),
             mcp_servers: Vec::new(),
+            skills_enabled: None,
+            enabled_skills: None,
             conversation_starters: Vec::new(),
             variables: Vec::new(),
             settings: GraphSettings::default(),
@@ -946,6 +1049,8 @@ mod tests {
                 state_updates: None,
                 output_schema: None,
                 timeout: None,
+                skills_enabled: None,
+                enabled_skills: None,
             }),
             next: next.map(NextTargets::from),
         }
@@ -965,6 +1070,111 @@ mod tests {
 
         assert!(!result.is_valid());
         assert!(result.errors.iter().any(|e| e.message.contains("ghost")));
+    }
+
+    #[test]
+    fn llm_node_skill_in_graph_set_passes() {
+        let mut graph = graph_with(
+            vec![
+                ("l", llm_node("l", None, Some("end"))),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+        graph.enabled_skills = Some(vec!["code-review".into(), "git-master".into()]);
+        if let NodeType::Llm(ref mut n) = graph.nodes.get_mut("l").unwrap().node_type {
+            n.enabled_skills = Some(vec!["code-review".into()]);
+        }
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("enabled_skills")),
+            "unexpected enabled_skills error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn llm_node_skill_not_in_graph_set_errors() {
+        let mut graph = graph_with(
+            vec![
+                ("l", llm_node("l", None, Some("end"))),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+        graph.enabled_skills = Some(vec!["code-review".into()]);
+        if let NodeType::Llm(ref mut n) = graph.nodes.get_mut("l").unwrap().node_type {
+            n.enabled_skills = Some(vec!["git-master".into()]);
+        }
+
+        let result = validator().validate(&graph);
+
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("'git-master'") && e.message.contains("graph-level")),
+            "expected git-master subset error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn llm_node_empty_skill_name_errors() {
+        let mut graph = graph_with(
+            vec![
+                ("l", llm_node("l", None, Some("end"))),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+        graph.enabled_skills = Some(vec!["code-review".into()]);
+        if let NodeType::Llm(ref mut n) = graph.nodes.get_mut("l").unwrap().node_type {
+            n.enabled_skills = Some(vec!["".into()]);
+        }
+
+        let result = validator().validate(&graph);
+
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("empty skill name")),
+            "expected empty-skill-name error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn llm_node_skill_when_no_graph_set_is_permitted_by_validator() {
+        let mut graph = graph_with(
+            vec![
+                ("l", llm_node("l", None, Some("end"))),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+        if let NodeType::Llm(ref mut n) = graph.nodes.get_mut("l").unwrap().node_type {
+            n.enabled_skills = Some(vec!["anything".into()]);
+        }
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("enabled_skills")),
+            "validator should not block when graph.enabled_skills is None: {:?}",
+            result.errors
+        );
     }
 
     fn agent_ctx(tools: &[&str], mcp: &[&str]) -> AgentValidationContext {
@@ -1182,7 +1392,7 @@ mod tests {
     }
 
     fn validator() -> GraphValidator {
-        GraphValidator::new(env::current_dir().unwrap())
+        GraphValidator::new(env::current_dir().unwrap()).with_skill_exists(|_: &str| true)
     }
 
     #[test]

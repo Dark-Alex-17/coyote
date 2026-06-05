@@ -25,7 +25,7 @@ if [[ -z "$cmd" || "$cmd" == "null" ]]; then
   jq -nc '{
     "tests_ok": true,
     "tests_output": "(no test command available for this project type)",
-    "_next": "end_success"
+    "_next": "self_review"
   }'
   exit 0
 fi
@@ -40,7 +40,7 @@ if (( exit_code == 0 )); then
     '{
       "tests_ok": true,
       "tests_output": ("Ran: " + $cmd + "\n\n" + $out),
-      "_next": "end_success"
+      "_next": "self_review"
     }'
 else
   jq -nc \

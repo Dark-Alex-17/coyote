@@ -41,6 +41,29 @@ global_tools:                      # Tool universe an `llm` node's `tools:` whit
 mcp_servers:                       # MCP servers an `llm` node may reference via `mcp:<server>`
   - ddg-search
 
+# ---------------------------------------------------------------------------
+# Skills policy (optional)
+# Skills only attach to `llm` nodes inside a graph. Both fields are optional.
+#
+#   skills_enabled:  master switch for skills across every `llm` node in the
+#                    graph. false here turns skills off entirely, regardless of
+#                    per-node settings. Omitting it inherits the agent / global
+#                    cascade (default true).
+#   enabled_skills:  the *universe* of skill names any `llm` node in this graph
+#                    may reference in its own `enabled_skills`. The validator
+#                    rejects per-node entries outside this list at load time.
+#                    Omit to inherit the agent / global cascade.
+#
+# Per-node usage is documented on the `triage` llm node below. There is no
+# auto-load: the model uses `skill__list` / `skill__load` / `skill__unload` to
+# bring skills in as it needs them, exactly like in normal-agent contexts.
+# ---------------------------------------------------------------------------
+skills_enabled: true
+enabled_skills:
+  - code-review
+  - git-master
+  - ai-slop-remover
+
 conversation_starters:             # Suggested prompts surfaced in the UI
   - "Research the current state of WebAssembly outside the browser"
 
@@ -143,6 +166,15 @@ nodes:
       {{initial_prompt}}
     tools: []                  # Tool whitelist. Omitted or [] = no tools at all.
                                # A list narrows to exactly those entries.
+    # --- Skills on llm nodes (optional) ------------------------------------
+    # `enabled_skills` narrows what this node's model can see / load via the
+    # built-in `skill__list` / `skill__load` / `skill__unload` meta-tools.
+    # Must be a subset of the graph-level `enabled_skills` (the validator
+    # catches violations at load time). `skills_enabled: false` would
+    # disable skills entirely for this node (no meta-tools exposed).
+    # Nothing is auto-loaded: the model decides when to load a skill.
+    enabled_skills:
+      - ai-slop-remover
     output_schema:             # Optional JSON Schema. The output is parsed to JSON
       type: object             # and its top-level object keys auto-merge into state
       properties:              # (so `topic` / `needs_deep_dive` become {{topic}} etc).

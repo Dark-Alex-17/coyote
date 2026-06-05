@@ -28,13 +28,13 @@ pub trait RoleLike {
     fn model(&self) -> &Model;
     fn temperature(&self) -> Option<f64>;
     fn top_p(&self) -> Option<f64>;
-    fn enabled_tools(&self) -> Option<String>;
-    fn enabled_mcp_servers(&self) -> Option<String>;
+    fn enabled_tools(&self) -> Option<Vec<String>>;
+    fn enabled_mcp_servers(&self) -> Option<Vec<String>>;
     fn set_model(&mut self, model: Model);
     fn set_temperature(&mut self, value: Option<f64>);
     fn set_top_p(&mut self, value: Option<f64>);
-    fn set_enabled_tools(&mut self, value: Option<String>);
-    fn set_enabled_mcp_servers(&mut self, value: Option<String>);
+    fn set_enabled_tools(&mut self, value: Option<Vec<String>>);
+    fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>);
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -51,10 +51,26 @@ pub struct Role {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_tools: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_mcp_servers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    enabled_tools: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    enabled_mcp_servers: Option<String>,
+    skills_enabled: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_skills: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_continue: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -94,10 +110,12 @@ impl Role {
                     "model" => role.model_id = value.as_str().map(|v| v.to_string()),
                     "temperature" => role.temperature = value.as_f64(),
                     "top_p" => role.top_p = value.as_f64(),
-                    "enabled_tools" => role.enabled_tools = value.as_str().map(|v| v.to_string()),
+                    "enabled_tools" => role.enabled_tools = parse_string_or_array(value),
                     "enabled_mcp_servers" => {
-                        role.enabled_mcp_servers = value.as_str().map(|v| v.to_string())
+                        role.enabled_mcp_servers = parse_string_or_array(value)
                     }
+                    "skills_enabled" => role.skills_enabled = value.as_bool(),
+                    "enabled_skills" => role.enabled_skills = parse_string_or_array(value),
                     "auto_continue" => role.auto_continue = value.as_bool(),
                     "max_auto_continues" => {
                         role.max_auto_continues = value.as_u64().map(|v| v as usize)
@@ -141,11 +159,21 @@ impl Role {
         if let Some(top_p) = self.top_p() {
             metadata.push(format!("top_p: {top_p}"));
         }
-        if let Some(enabled_tools) = self.enabled_tools() {
-            metadata.push(format!("enabled_tools: {enabled_tools}"));
+        if let Some(enabled_tools) = &self.enabled_tools {
+            let inline = serde_json::to_string(enabled_tools).unwrap_or_else(|_| "[]".to_string());
+            metadata.push(format!("enabled_tools: {inline}"));
         }
-        if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
-            metadata.push(format!("enabled_mcp_servers: {enabled_mcp_servers}"));
+        if let Some(enabled_mcp_servers) = &self.enabled_mcp_servers {
+            let inline =
+                serde_json::to_string(enabled_mcp_servers).unwrap_or_else(|_| "[]".to_string());
+            metadata.push(format!("enabled_mcp_servers: {inline}"));
+        }
+        if let Some(skills_enabled) = self.skills_enabled {
+            metadata.push(format!("skills_enabled: {skills_enabled}"));
+        }
+        if let Some(enabled_skills) = &self.enabled_skills {
+            let inline = serde_json::to_string(enabled_skills).unwrap_or_else(|_| "[]".to_string());
+            metadata.push(format!("enabled_skills: {inline}"));
         }
         if let Some(auto_continue) = self.auto_continue {
             metadata.push(format!("auto_continue: {auto_continue}"));
@@ -213,8 +241,8 @@ impl Role {
         model: &Model,
         temperature: Option<f64>,
         top_p: Option<f64>,
-        enabled_tools: Option<String>,
-        enabled_mcp_servers: Option<String>,
+        enabled_tools: Option<Vec<String>>,
+        enabled_mcp_servers: Option<Vec<String>>,
     ) {
         self.set_model(model.clone());
         if temperature.is_some() {
@@ -269,6 +297,14 @@ impl Role {
 
     pub fn continuation_prompt(&self) -> Option<&str> {
         self.continuation_prompt.as_deref()
+    }
+
+    pub fn skills_enabled(&self) -> Option<bool> {
+        self.skills_enabled
+    }
+
+    pub fn enabled_skills(&self) -> Option<&[String]> {
+        self.enabled_skills.as_deref()
     }
 
     pub fn append_to_prompt(&mut self, text: &str) {
@@ -340,11 +376,11 @@ impl RoleLike for Role {
         self.top_p
     }
 
-    fn enabled_tools(&self) -> Option<String> {
+    fn enabled_tools(&self) -> Option<Vec<String>> {
         self.enabled_tools.clone()
     }
 
-    fn enabled_mcp_servers(&self) -> Option<String> {
+    fn enabled_mcp_servers(&self) -> Option<Vec<String>> {
         self.enabled_mcp_servers.clone()
     }
 
@@ -363,13 +399,35 @@ impl RoleLike for Role {
         self.top_p = value;
     }
 
-    fn set_enabled_tools(&mut self, value: Option<String>) {
+    fn set_enabled_tools(&mut self, value: Option<Vec<String>>) {
         self.enabled_tools = value;
     }
 
-    fn set_enabled_mcp_servers(&mut self, value: Option<String>) {
+    fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>) {
         self.enabled_mcp_servers = value;
     }
+}
+
+fn parse_string_or_array(value: &Value) -> Option<Vec<String>> {
+    if value.is_null() {
+        return None;
+    }
+
+    if let Some(s) = value.as_str() {
+        return Some(csv_to_vec(s));
+    }
+
+    if let Some(arr) = value.as_array() {
+        let items: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        return Some(items);
+    }
+
+    None
 }
 
 fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
@@ -446,14 +504,20 @@ mod tests {
     fn role_new_parses_enabled_tools() {
         let content = "---\nenabled_tools: tool1,tool2\n---\nPrompt";
         let role = Role::new("test", content);
-        assert_eq!(role.enabled_tools(), Some("tool1,tool2".to_string()));
+        assert_eq!(
+            role.enabled_tools(),
+            Some(vec!["tool1".to_string(), "tool2".to_string()])
+        );
     }
 
     #[test]
     fn role_new_parses_enabled_mcp_servers() {
         let content = "---\nenabled_mcp_servers: github,jira\n---\nPrompt";
         let role = Role::new("test", content);
-        assert_eq!(role.enabled_mcp_servers(), Some("github,jira".to_string()));
+        assert_eq!(
+            role.enabled_mcp_servers(),
+            Some(vec!["github".to_string(), "jira".to_string()])
+        );
     }
 
     #[test]

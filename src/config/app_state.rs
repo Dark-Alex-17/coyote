@@ -43,7 +43,7 @@ impl AppState {
         start_mcp_servers: bool,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        let vault = Arc::new(Vault::init(&config));
+        let vault = Arc::new(Vault::init(&config)?);
 
         let mcp_registry = McpRegistry::init(
             log_path,

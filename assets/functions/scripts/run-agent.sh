@@ -32,6 +32,7 @@ setup_env() {
     export LLM_AGENT_ROOT_DIR="$LLM_ROOT_DIR/agents/{agent_name}"
     export LLM_AGENT_CACHE_DIR="$LLM_ROOT_DIR/cache/{agent_name}"
     export LLM_PROMPT_UTILS_FILE="{prompt_utils_file}"
+    export LLM_AGENT_RAW_JSON="$agent_data"
 }
 
 load_env() {

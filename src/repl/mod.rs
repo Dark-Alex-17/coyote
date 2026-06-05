@@ -46,7 +46,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 42]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 44]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -191,6 +191,16 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 42]> = LazyLock::new(|| {
             AssertState::TrueFalse(StateFlags::RAG, StateFlags::AGENT),
         ),
         ReplCommand::new(".macro", "Execute a macro", AssertState::pass()),
+        ReplCommand::new(
+            ".skill",
+            "List, load, unload, or create skills",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".edit skill",
+            "Modify an existing skill by name",
+            AssertState::pass(),
+        ),
         ReplCommand::new(
             ".file",
             "Include files, directories, URLs or commands",
@@ -493,7 +503,7 @@ pub async fn run_repl_command(
                     Some((name, text)) => {
                         let app = Arc::clone(&ctx.app.config);
                         let role = ctx.retrieve_role(app.as_ref(), name.trim())?;
-                        let input = Input::from_str(ctx, text, Some(role));
+                        let input = Input::from_str(ctx, text, Some(role))?;
                         ask(ctx, abort_signal.clone(), input, false).await?;
                     }
                     None => {
@@ -513,6 +523,41 @@ pub async fn run_repl_command(
     .role <name> [text]...          # Temporarily switch to the role, send the text, and switch back"#
                 ),
             },
+            ".skill" => {
+                let trimmed = args.map(str::trim).unwrap_or("");
+                let mut parts = trimmed.splitn(2, char::is_whitespace);
+                let first = parts.next().unwrap_or("");
+                let rest = parts.next().map(str::trim).unwrap_or("");
+                match first {
+                    "" => println!(
+                        r#"Usage:
+    .skill loaded                   # List currently-loaded skills
+    .skill load <name>              # Load a skill into the current context
+    .skill unload <name>            # Unload a loaded skill
+    .skill <name>                   # Open the skill in $EDITOR; create with a scaffold if missing
+                                    # (Use `.edit skill <name>` to edit an existing skill without the create-if-missing behavior.)"#
+                    ),
+                    "loaded" => ctx.list_loaded_skills(),
+                    "load" => {
+                        if rest.is_empty() {
+                            println!("Usage: .skill load <name>");
+                        } else {
+                            ctx.load_skill_repl(rest, abort_signal.clone()).await?;
+                        }
+                    }
+                    "unload" => {
+                        if rest.is_empty() {
+                            println!("Usage: .skill unload <name>");
+                        } else {
+                            ctx.unload_skill_repl(rest, abort_signal.clone()).await?;
+                        }
+                    }
+                    name => {
+                        let app = Arc::clone(&ctx.app.config);
+                        ctx.upsert_skill(app.as_ref(), name)?;
+                    }
+                }
+            }
             ".session" => {
                 if let Some(name) = graph::active_agent_graph_name(ctx) {
                     bail!(
@@ -609,7 +654,7 @@ pub async fn run_repl_command(
                     match text {
                         Some(text) => {
                             println!("{}", dimmed_text(&format!(">> {text}")));
-                            let input = Input::from_str(ctx, &text, None);
+                            let input = Input::from_str(ctx, &text, None)?;
                             ask(ctx, abort_signal.clone(), input, true).await?;
                         }
                         None => {
@@ -659,9 +704,25 @@ pub async fn run_repl_command(
                     Some("mcp-config") => {
                         ctx.edit_mcp_config()?;
                     }
+                    Some(s) if s == "skill" || s.starts_with("skill ") => {
+                        let name = s.strip_prefix("skill").unwrap_or("").trim();
+                        if name.is_empty() {
+                            println!("Usage: .edit skill <name>");
+                        } else if let Err(e) = paths::validate_skill_name(name) {
+                            bail!(e);
+                        } else if !paths::has_skill(name) {
+                            bail!(
+                                "Skill '{name}' is not installed (expected at {})",
+                                paths::skill_file(name).display()
+                            );
+                        } else {
+                            let app = Arc::clone(&ctx.app.config);
+                            ctx.upsert_skill(app.as_ref(), name)?;
+                        }
+                    }
                     _ => {
                         println!(
-                            r#"Usage: .edit <config|mcp-config|role|session|rag-docs|agent-config>"#
+                            r#"Usage: .edit <config|mcp-config|role|session|rag-docs|agent-config|skill <name>>"#
                         )
                     }
                 }
@@ -763,7 +824,7 @@ pub async fn run_repl_command(
                         None => bail!("Unable to regenerate the response"),
                     };
                 let app = Arc::clone(&ctx.app.config);
-                input.set_regenerate(ctx.extract_role(&app));
+                input.set_regenerate(ctx.extract_role(&app)?);
                 ask(ctx, abort_signal.clone(), input, true).await?;
             }
             ".set" => match args {
@@ -779,7 +840,7 @@ pub async fn run_repl_command(
                     ctx.delete(args)?;
                 }
                 _ => {
-                    println!("Usage: .delete <role|session|rag|macro|agent-data>")
+                    println!("Usage: .delete <role|session|rag|macro|skill|agent-data>")
                 }
             },
             ".copy" => {
@@ -885,7 +946,7 @@ pub async fn run_repl_command(
         },
         None => {
             reset_continuation(ctx);
-            let input = Input::from_str(ctx, line, None);
+            let input = Input::from_str(ctx, line, None)?;
             ask(ctx, abort_signal.clone(), input, true).await?;
         }
     }
@@ -981,7 +1042,7 @@ async fn ask(
 
                 format!("{prompt}\n\n{todo_state}")
             };
-            let continuation_input = Input::from_str(ctx, &full_prompt, None);
+            let continuation_input = Input::from_str(ctx, &full_prompt, None)?;
             ask(ctx, abort_signal, continuation_input, false).await
         } else {
             reset_continuation(ctx);
@@ -1054,7 +1115,7 @@ async fn ask(
 
                         format!("{prompt}\n\n{todo_state}")
                     };
-                    let continuation_input = Input::from_str(ctx, &full_prompt, None);
+                    let continuation_input = Input::from_str(ctx, &full_prompt, None)?;
                     return ask(ctx, abort_signal, continuation_input, false).await;
                 }
             }
@@ -1265,8 +1326,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_42_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 42);
+    fn repl_commands_has_44_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 44);
     }
 
     #[test]

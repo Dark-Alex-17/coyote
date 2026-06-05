@@ -2426,9 +2426,9 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "gman"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "742225eb41061a0938aa0924ce8d08a1ec48875789b72ce3f0cb02eda52ab1db"
+checksum = "20bc3b0ed380d792157e067f2f1f1ce871d4c799dc8e23ece46340a48cd49942"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2466,6 +2466,7 @@ dependencies = [
  "serde_with",
  "serde_yaml",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "validator",
  "which",

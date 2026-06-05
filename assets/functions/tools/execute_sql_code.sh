@@ -14,6 +14,8 @@ source "$LLM_PROMPT_UTILS_FILE"
 
 # shellcheck disable=SC2154
 main() {
+    argc_code="$(jq -r '.code' <<< "$LLM_TOOL_RAW_JSON")"
+
     if ! grep -qi '^select' <<<"$argc_code"; then
         guard_operation ""
     fi

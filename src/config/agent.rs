@@ -207,6 +207,13 @@ impl Agent {
         functions.append_teammate_functions();
         functions.append_user_interaction_functions();
 
+        if app.function_calling_support
+            && app.skills_enabled
+            && !matches!(agent_config.skills_enabled, Some(false))
+        {
+            functions.append_skill_functions();
+        }
+
         agent_config.replace_tools_placeholder(&functions);
 
         Ok(Self {
@@ -335,6 +342,22 @@ impl Agent {
 
     pub fn mcp_server_names(&self) -> &[String] {
         &self.config.mcp_servers
+    }
+
+    pub fn skills_enabled(&self) -> Option<bool> {
+        self.config.skills_enabled
+    }
+
+    pub fn enabled_skills(&self) -> Option<&[String]> {
+        self.config.enabled_skills.as_deref()
+    }
+
+    pub fn set_skills_enabled(&mut self, value: Option<bool>) {
+        self.config.skills_enabled = value;
+    }
+
+    pub fn set_enabled_skills(&mut self, value: Option<Vec<String>>) {
+        self.config.enabled_skills = value;
     }
 
     pub fn conversation_starters(&self) -> Vec<String> {
@@ -525,12 +548,12 @@ impl RoleLike for Agent {
         self.config.top_p
     }
 
-    fn enabled_tools(&self) -> Option<String> {
+    fn enabled_tools(&self) -> Option<Vec<String>> {
         None
     }
 
-    fn enabled_mcp_servers(&self) -> Option<String> {
-        self.config.mcp_servers.clone().join(",").into()
+    fn enabled_mcp_servers(&self) -> Option<Vec<String>> {
+        Some(self.config.mcp_servers.clone())
     }
 
     fn set_model(&mut self, model: Model) {
@@ -546,15 +569,14 @@ impl RoleLike for Agent {
         self.config.top_p = value;
     }
 
-    fn set_enabled_tools(&mut self, value: Option<String>) {
+    fn set_enabled_tools(&mut self, value: Option<Vec<String>>) {
         match value {
             Some(tools) => {
-                let tools = tools
-                    .split(',')
+                self.config.global_tools = tools
+                    .into_iter()
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty())
                     .collect::<Vec<_>>();
-                self.config.global_tools = tools;
             }
             None => {
                 self.config.global_tools.clear();
@@ -562,15 +584,14 @@ impl RoleLike for Agent {
         }
     }
 
-    fn set_enabled_mcp_servers(&mut self, value: Option<String>) {
+    fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>) {
         match value {
             Some(servers) => {
-                let servers = servers
-                    .split(',')
+                self.config.mcp_servers = servers
+                    .into_iter()
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty())
                     .collect::<Vec<_>>();
-                self.config.mcp_servers = servers;
             }
             None => {
                 self.config.mcp_servers.clear();
@@ -614,6 +635,10 @@ pub struct AgentConfig {
     pub mcp_servers: Vec<String>,
     #[serde(default)]
     pub global_tools: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_skills: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation_prompt: Option<String>,
     #[serde(default)]
@@ -677,6 +702,8 @@ impl AgentConfig {
             description: graph.description.clone(),
             global_tools: graph.global_tools.clone(),
             mcp_servers: graph.mcp_servers.clone(),
+            skills_enabled: graph.skills_enabled,
+            enabled_skills: graph.enabled_skills.clone(),
             conversation_starters: graph.conversation_starters.clone(),
             variables: graph.variables.clone(),
             can_spawn_agents: graph.has_agent_node(),

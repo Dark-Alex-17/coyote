@@ -11,6 +11,9 @@ mod rag_cache;
 mod request_context;
 mod role;
 mod session;
+mod skill;
+mod skill_policy;
+mod skill_registry;
 pub(crate) mod todo;
 mod tool_scope;
 mod update;
@@ -30,6 +33,12 @@ pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
 use self::session::Session;
+#[allow(unused_imports)]
+pub use self::skill::Skill;
+#[allow(unused_imports)]
+pub use self::skill_policy::SkillPolicy;
+#[allow(unused_imports)]
+pub use self::skill_registry::SkillRegistry;
 pub use self::update::run_self_update;
 use crate::client::{
     ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
@@ -41,9 +50,12 @@ use crate::utils::*;
 pub use macros::macro_execute;
 
 use crate::config::macros::Macro;
-use crate::vault::{GlobalVault, Vault, create_vault_password_file, interpolate_secrets};
+use crate::vault::{
+    GlobalVault, Vault, create_vault_password_file, interpolate_secrets, prompt_provider_choice,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
+use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, Select};
@@ -67,6 +79,45 @@ pub const TEMP_SESSION_NAME: &str = "temp";
 static PASSWORD_FILE_SECRET_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"vault_password_file:.*['|"]?\{\{(.+)}}['|"]?"#).unwrap());
 
+fn validate_no_template_in_secrets_provider(content: &str) -> Result<()> {
+    let mut in_block = false;
+
+    for (line_num, line) in content.lines().enumerate() {
+        if line.starts_with("secrets_provider:") {
+            if line.contains("{{") {
+                bail!(
+                    "secret injection cannot be done on the secrets_provider property (line {}): the secrets_provider config is loaded before the vault is initialized",
+                    line_num + 1
+                );
+            }
+            in_block = true;
+            continue;
+        }
+
+        if in_block {
+            let trimmed = line.trim_start();
+
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            if !line.starts_with(char::is_whitespace) {
+                in_block = false;
+                continue;
+            }
+
+            if line.contains("{{") {
+                bail!(
+                    "secret injection cannot be done within the secrets_provider block (line {}): the secrets_provider config is loaded before the vault is initialized",
+                    line_num + 1
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Monokai Extended
 const DARK_THEME: &[u8] = include_bytes!("../../assets/monokai-extended.theme.bin");
 const LIGHT_THEME: &[u8] = include_bytes!("../../assets/monokai-extended-light.theme.bin");
@@ -74,6 +125,7 @@ const LIGHT_THEME: &[u8] = include_bytes!("../../assets/monokai-extended-light.t
 const CONFIG_FILE_NAME: &str = "config.yaml";
 const AGENT_GRAPH_FILE_NAME: &str = "graph.yaml";
 const ROLES_DIR_NAME: &str = "roles";
+const SKILLS_DIR_NAME: &str = "skills";
 const MACROS_DIR_NAME: &str = "macros";
 const ENV_FILE_NAME: &str = ".env";
 const MESSAGES_FILE_NAME: &str = "messages.md";
@@ -139,14 +191,24 @@ pub struct Config {
     pub wrap_code: bool,
     pub(super) vault_password_file: Option<PathBuf>,
 
+    #[serde(default)]
+    pub(super) secrets_provider: Option<SupportedProvider>,
+
     pub function_calling_support: bool,
     pub mapping_tools: IndexMap<String, String>,
-    pub enabled_tools: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
+    pub enabled_tools: Option<Vec<String>>,
     pub visible_tools: Option<Vec<String>>,
+
+    pub skills_enabled: bool,
+    #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
+    pub enabled_skills: Option<Vec<String>>,
+    pub visible_skills: Option<Vec<String>>,
 
     pub mcp_server_support: bool,
     pub mapping_mcp_servers: IndexMap<String, String>,
-    pub enabled_mcp_servers: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
+    pub enabled_mcp_servers: Option<Vec<String>>,
 
     pub auto_continue: bool,
     pub max_auto_continues: usize,
@@ -199,11 +261,16 @@ impl Default for Config {
             wrap: None,
             wrap_code: false,
             vault_password_file: None,
+            secrets_provider: None,
 
             function_calling_support: true,
             mapping_tools: Default::default(),
             enabled_tools: None,
             visible_tools: None,
+
+            skills_enabled: true,
+            enabled_skills: None,
+            visible_skills: None,
 
             mcp_server_support: true,
             mapping_mcp_servers: Default::default(),
@@ -250,6 +317,7 @@ pub fn install_builtins() -> Result<()> {
     Functions::install_builtin_global_tools(false)?;
     Agent::install_builtin_agents(false)?;
     Macro::install_macros(false)?;
+    Skill::install_builtin_skills(false)?;
     Ok(())
 }
 
@@ -258,18 +326,20 @@ pub enum AssetCategory {
     Agents,
     Macros,
     Functions,
+    Skills,
     #[value(name = "mcp_config")]
     McpConfig,
 }
 
 impl AssetCategory {
-    pub const NAMES: [&'static str; 4] = ["agents", "macros", "functions", "mcp_config"];
+    pub const NAMES: [&'static str; 5] = ["agents", "macros", "functions", "skills", "mcp_config"];
 
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "agents" => Some(Self::Agents),
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
+            "skills" => Some(Self::Skills),
             "mcp_config" => Some(Self::McpConfig),
             _ => None,
         }
@@ -280,6 +350,7 @@ impl AssetCategory {
 pub enum InstallFilter {
     Agents,
     Roles,
+    Skills,
     Macros,
     Functions,
     #[value(name = "mcp_config")]
@@ -287,12 +358,20 @@ pub enum InstallFilter {
 }
 
 impl InstallFilter {
-    pub const NAMES: [&'static str; 5] = ["agents", "roles", "macros", "functions", "mcp_config"];
+    pub const NAMES: [&'static str; 6] = [
+        "agents",
+        "roles",
+        "skills",
+        "macros",
+        "functions",
+        "mcp_config",
+    ];
 
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "agents" => Some(Self::Agents),
             "roles" => Some(Self::Roles),
+            "skills" => Some(Self::Skills),
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
             "mcp_config" => Some(Self::McpConfig),
@@ -306,6 +385,7 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
         AssetCategory::Agents => ("agents", paths::agents_data_dir()),
         AssetCategory::Macros => ("macros", paths::macros_dir()),
         AssetCategory::Functions => ("functions", paths::functions_dir()),
+        AssetCategory::Skills => ("skills", paths::skills_dir()),
         AssetCategory::McpConfig => ("MCP config", paths::mcp_config_file()),
     };
 
@@ -318,6 +398,7 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
         AssetCategory::Agents => Agent::install_builtin_agents(true)?,
         AssetCategory::Macros => Macro::install_macros(true)?,
         AssetCategory::Functions => Functions::install_builtin_global_tools(true)?,
+        AssetCategory::Skills => Skill::install_builtin_skills(true)?,
         AssetCategory::McpConfig => Functions::install_mcp_config()?,
     }
 
@@ -406,10 +487,11 @@ impl Config {
 
         let bootstrap_app = AppConfig {
             vault_password_file: config.vault_password_file.clone(),
+            secrets_provider: config.secrets_provider.clone(),
             ..AppConfig::default()
         };
-        let vault = Vault::init(&bootstrap_app);
-        let (parsed_config, missing_secrets) = interpolate_secrets(&content, &vault);
+        let vault = Vault::init(&bootstrap_app)?;
+        let (parsed_config, missing_secrets) = interpolate_secrets(&content, &vault)?;
         if !missing_secrets.is_empty() && !info_flag {
             debug!(
                 "Global config references secrets that are missing from the vault: {missing_secrets:?}"
@@ -448,6 +530,7 @@ impl Config {
         if PASSWORD_FILE_SECRET_RE.is_match(content)? {
             bail!("secret injection cannot be done on the vault_password_file property");
         }
+        validate_no_template_in_secrets_provider(content)?;
 
         let config: Self = serde_yaml::from_str(content)
             .map_err(|err| {
@@ -600,15 +683,33 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
         process::exit(0);
     }
 
-    let mut vault = Vault::init_bare();
+    let provider_choice = prompt_provider_choice()?;
+    let mut vault = match &provider_choice {
+        None => Vault::default_local(),
+        Some(provider) => Vault {
+            provider: provider.clone(),
+        },
+    };
     create_vault_password_file(&mut vault)?;
+    if provider_choice.is_some() {
+        vault.validate_round_trip()?;
+    }
 
     let client = Select::new("API Provider (required):", list_client_types()).prompt()?;
 
     let mut config = json!({});
     let (model, clients_config) = create_client_config(client, &vault).await?;
     config["model"] = model.into();
-    config["vault_password_file"] = vault.password_file()?.display().to_string().into();
+    match &provider_choice {
+        None => {
+            config["vault_password_file"] =
+                vault.local_password_file()?.display().to_string().into();
+        }
+        Some(provider) => {
+            config["secrets_provider"] = serde_json::to_value(provider)
+                .with_context(|| "failed to serialize secrets_provider config")?;
+        }
+    }
     config["stream"] = json!(true);
     config["save"] = json!(true);
     config["keybindings"] = json!("vi");
@@ -686,6 +787,72 @@ where
     Ok(value)
 }
 
+pub(super) fn csv_to_vec(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+pub(super) fn deserialize_csv_or_vec<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct CsvOrVec;
+
+    impl<'de> Visitor<'de> for CsvOrVec {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a comma-separated string, a list of strings, or null")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+            Ok(Some(csv_to_vec(value)))
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> std::result::Result<Self::Value, E> {
+            Ok(Some(csv_to_vec(&value)))
+        }
+
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> std::result::Result<Self::Value, D2::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut vec = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                let trimmed = item.trim().to_string();
+                if !trimmed.is_empty() {
+                    vec.push(trimmed);
+                }
+            }
+            Ok(Some(vec))
+        }
+    }
+
+    deserializer.deserialize_option(CsvOrVec)
+}
+
 fn read_env_bool(key: &str) -> Option<Option<bool>> {
     let value = env::var(key).ok()?;
     Some(parse_bool(&value))
@@ -720,6 +887,62 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_secrets_provider_rejects_template_in_field() {
+        let yaml = "\
+secrets_provider:
+  type: aws_secrets_manager
+  aws_profile: '{{AWS_PROFILE}}'
+  aws_region: us-east-1
+";
+        assert!(validate_no_template_in_secrets_provider(yaml).is_err());
+    }
+
+    #[test]
+    fn validate_secrets_provider_rejects_template_in_local_password_file() {
+        let yaml = "\
+secrets_provider:
+  type: local
+  password_file: '{{COYOTE_PASSWORD}}'
+";
+        assert!(validate_no_template_in_secrets_provider(yaml).is_err());
+    }
+
+    #[test]
+    fn validate_secrets_provider_accepts_clean_yaml() {
+        let yaml = "\
+secrets_provider:
+  type: aws_secrets_manager
+  aws_profile: default
+  aws_region: us-east-1
+";
+        assert!(validate_no_template_in_secrets_provider(yaml).is_ok());
+    }
+
+    #[test]
+    fn validate_secrets_provider_allows_templates_outside_block() {
+        let yaml = "\
+secrets_provider:
+  type: local
+  password_file: ~/.coyote_password
+clients:
+  - type: openai
+    api_key: '{{OPENAI_KEY}}'
+";
+        assert!(validate_no_template_in_secrets_provider(yaml).is_ok());
+    }
+
+    #[test]
+    fn validate_secrets_provider_handles_missing_block() {
+        let yaml = "\
+model: openai:gpt-4
+clients:
+  - type: openai
+    api_key: '{{OPENAI_KEY}}'
+";
+        assert!(validate_no_template_in_secrets_provider(yaml).is_ok());
+    }
 
     #[test]
     fn config_defaults_match_expected() {

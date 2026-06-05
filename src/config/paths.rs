@@ -3,7 +3,7 @@ use super::{
     AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME,
     ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME, GLOBAL_TOOLS_DIR_NAME,
     GLOBAL_TOOLS_UTILS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, ModelsOverride, RAGS_DIR_NAME,
-    ROLES_DIR_NAME,
+    ROLES_DIR_NAME, SKILLS_DIR_NAME,
 };
 use crate::client::ProviderModels;
 use crate::utils::{get_env_name, list_file_names, normalize_env_name};
@@ -63,6 +63,34 @@ pub fn roles_dir() -> PathBuf {
 
 pub fn role_file(name: &str) -> PathBuf {
     roles_dir().join(format!("{name}.md"))
+}
+
+pub fn skills_dir() -> PathBuf {
+    match env::var(get_env_name("skills_dir")) {
+        Ok(value) => PathBuf::from(value),
+        Err(_) => local_path(SKILLS_DIR_NAME),
+    }
+}
+
+pub fn skill_dir(name: &str) -> PathBuf {
+    skills_dir().join(name)
+}
+
+pub fn skill_file(name: &str) -> PathBuf {
+    skill_dir(name).join("SKILL.md")
+}
+
+pub fn validate_skill_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("Skill name cannot be empty");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("Invalid skill name '{name}': only letters, digits, '-', and '_' are allowed");
+    }
+    Ok(())
 }
 
 pub fn macros_dir() -> PathBuf {
@@ -234,6 +262,29 @@ pub fn has_macro(name: &str) -> bool {
     names.contains(&name.to_string())
 }
 
+pub fn list_skills() -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(rd) = read_dir(skills_dir()) {
+        for entry in rd.flatten() {
+            if let Ok(file_type) = entry.file_type()
+                && file_type.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+                && entry.path().join("SKILL.md").is_file()
+                && validate_skill_name(name).is_ok()
+            {
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    names.sort_unstable();
+    names
+}
+
+pub fn has_skill(name: &str) -> bool {
+    skill_file(name).is_file()
+}
+
 pub fn local_models_override() -> Result<Vec<ProviderModels>> {
     let model_override_path = models_override_file();
     let err = || {
@@ -248,4 +299,85 @@ pub fn local_models_override() -> Result<Vec<ProviderModels>> {
         bail!("Incompatible version")
     }
     Ok(models_override.list)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, time};
+
+    #[test]
+    fn validate_skill_name_accepts_alphanumerics_and_dashes() {
+        assert!(validate_skill_name("git-master").is_ok());
+        assert!(validate_skill_name("code_review").is_ok());
+        assert!(validate_skill_name("Skill1").is_ok());
+    }
+
+    #[test]
+    fn validate_skill_name_rejects_empty() {
+        let err = validate_skill_name("").unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn validate_skill_name_rejects_path_traversal() {
+        for bad in ["../escape", "..", "foo/bar", "foo\\bar", "./hidden"] {
+            let err = validate_skill_name(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("Invalid skill name"),
+                "expected rejection for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_skill_name_rejects_other_special_chars() {
+        for bad in ["with space", "null\0byte", "weird?char", "dot.name"] {
+            assert!(
+                validate_skill_name(bad).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn has_skill_returns_false_for_missing_paths() {
+        for absent in ["definitely-not-installed-skill-xyz", "another-missing"] {
+            assert!(
+                !has_skill(absent),
+                "has_skill({absent:?}) should be false for a missing skill"
+            );
+        }
+    }
+
+    #[test]
+    fn list_skills_skips_invalid_directory_names() {
+        let unique = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("coyote-list-skills-test-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let prev = env::var_os(get_env_name("skills_dir"));
+        unsafe {
+            env::set_var(get_env_name("skills_dir"), &root);
+        }
+
+        for name in ["valid-skill", "with space", ".hidden", "dot.name"] {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("SKILL.md"), "body").unwrap();
+        }
+
+        let listed = list_skills();
+        assert_eq!(listed, vec!["valid-skill".to_string()]);
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(get_env_name("skills_dir"), v),
+                None => env::remove_var(get_env_name("skills_dir")),
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
 }

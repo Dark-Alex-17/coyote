@@ -1,10 +1,3 @@
-use anyhow::{Context, Result, bail};
-use indexmap::IndexMap;
-use inquire::{Confirm, Select};
-use std::ffi::{OsStr, OsString};
-use std::fs;
-use std::path::{Path, PathBuf};
-
 use crate::config::{InstallFilter, paths};
 #[cfg(not(windows))]
 use crate::function::Language;
@@ -12,6 +5,13 @@ use crate::mcp::{McpServer, McpServersConfig};
 use crate::utils;
 use crate::utils::IS_STDOUT_TERMINAL;
 use crate::vault::{Vault, create_vault_password_file, interpolate_secrets};
+use anyhow::{Context, Result, anyhow, bail};
+use indexmap::IndexMap;
+use indoc::formatdoc;
+use inquire::{Confirm, Select};
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool) -> Result<()> {
     let (url, reference) = parse_url_with_ref(git_url)?;
@@ -24,7 +24,7 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
     if layout.is_empty() {
         println!(
             "No recognized assets found in {git_url}. Expected one or more of: \
-             agents/, roles/, macros/, functions/tools/, functions/mcp.json"
+             agents/, roles/, skills/, macros/, functions/tools/, functions/mcp.json"
         );
         return Ok(());
     }
@@ -193,6 +193,7 @@ fn run_git(args: Vec<OsString>) -> Result<()> {
 struct RemoteLayout {
     agents: Option<PathBuf>,
     roles: Option<PathBuf>,
+    skills: Option<PathBuf>,
     macros: Option<PathBuf>,
     functions_tools: Option<PathBuf>,
     mcp_json: Option<PathBuf>,
@@ -202,6 +203,7 @@ impl RemoteLayout {
     fn is_empty(&self) -> bool {
         self.agents.is_none()
             && self.roles.is_none()
+            && self.skills.is_none()
             && self.macros.is_none()
             && self.functions_tools.is_none()
             && self.mcp_json.is_none()
@@ -215,20 +217,29 @@ fn scan_remote_layout(root: &Path) -> Result<RemoteLayout> {
     if agents.is_dir() {
         layout.agents = Some(agents);
     }
+
     let roles = root.join("roles");
     if roles.is_dir() {
         layout.roles = Some(roles);
     }
+
+    let skills = root.join("skills");
+    if skills.is_dir() {
+        layout.skills = Some(skills);
+    }
+
     let macros = root.join("macros");
     if macros.is_dir() {
         layout.macros = Some(macros);
     }
+
     let functions = root.join("functions");
     if functions.is_dir() {
         let tools = functions.join("tools");
         if tools.is_dir() {
             layout.functions_tools = Some(tools);
         }
+
         let mcp = functions.join("mcp.json");
         if mcp.is_file() {
             layout.mcp_json = Some(mcp);
@@ -249,6 +260,10 @@ fn apply_filter(mut layout: RemoteLayout, filter: Option<InstallFilter>) -> Remo
         },
         InstallFilter::Roles => RemoteLayout {
             roles: layout.roles.take(),
+            ..RemoteLayout::default()
+        },
+        InstallFilter::Skills => RemoteLayout {
+            skills: layout.skills.take(),
             ..RemoteLayout::default()
         },
         InstallFilter::Macros => RemoteLayout {
@@ -308,6 +323,7 @@ fn walk_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 enum TopCategory {
     Agents,
     Roles,
+    Skills,
     Macros,
     FunctionsTools,
 }
@@ -317,6 +333,7 @@ impl TopCategory {
         match self {
             TopCategory::Agents => "agents",
             TopCategory::Roles => "roles",
+            TopCategory::Skills => "skills",
             TopCategory::Macros => "macros",
             TopCategory::FunctionsTools => "functions/tools",
         }
@@ -356,6 +373,16 @@ fn plan_changes(layout: &RemoteLayout) -> Result<InstallPlan> {
     if let Some(src_dir) = &layout.roles {
         plan_dir_into(src_dir, &paths::roles_dir(), TopCategory::Roles, &mut files)?;
     }
+
+    if let Some(src_dir) = &layout.skills {
+        plan_dir_into(
+            src_dir,
+            &paths::skills_dir(),
+            TopCategory::Skills,
+            &mut files,
+        )?;
+    }
+
     if let Some(src_dir) = &layout.macros {
         plan_dir_into(
             src_dir,
@@ -391,6 +418,26 @@ fn plan_dir_into(
         let rel = src
             .strip_prefix(src_dir)
             .expect("walk_files only returns paths under src_dir");
+
+        if category == TopCategory::Skills {
+            let skill_name = rel
+                .components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "remote skill bundle has unparseable path component: {}",
+                        rel.display()
+                    )
+                })?;
+            paths::validate_skill_name(skill_name).with_context(|| {
+                format!(
+                    "remote skill '{skill_name}' has an invalid name \
+                     (skill names must contain only ASCII alphanumerics, '-', or '_')"
+                )
+            })?;
+        }
+
         let dst = dst_dir.join(rel);
         let kind = classify_file(&src, &dst)?;
         out.push(PlannedFile {
@@ -457,6 +504,7 @@ fn print_plan_summary(plan: &InstallPlan) {
     for cat in [
         TopCategory::Agents,
         TopCategory::Roles,
+        TopCategory::Skills,
         TopCategory::Macros,
         TopCategory::FunctionsTools,
     ] {
@@ -703,8 +751,21 @@ fn merge_mcp_json(
         serde_json::to_string_pretty(&merged).context("failed to serialize merged mcp.json")?;
     write_atomically(&final_path, &serialized)?;
 
-    let vault = Vault::init_bare();
-    let (_parsed, missing) = interpolate_secrets(&serialized, &vault);
+    let vault = Vault::init_bare()?;
+    let missing = match interpolate_secrets(&serialized, &vault) {
+        Ok((_, missing)) => missing,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                formatdoc! {"
+                Skipping secret resolution for merged mcp.json: {e:#}
+                Continuing without resolving missing secrets
+                You may need to add any additional missing secrets to the vault manually.
+            "}
+            );
+            Vec::new()
+        }
+    };
     let mut deduped: Vec<String> = Vec::new();
     for s in missing {
         if !deduped.contains(&s) {
@@ -832,7 +893,7 @@ fn handle_missing_secrets(missing: &[String]) -> Result<()> {
 }
 
 fn prompt_for_each_secret(missing: &[String]) -> Result<(Vec<String>, Vec<String>)> {
-    let mut vault = Vault::init_bare();
+    let mut vault = Vault::init_bare()?;
     let mut password_file_ensured = false;
     let mut added = Vec::new();
     let mut deferred = Vec::new();
@@ -886,6 +947,62 @@ fn print_secret_summary(added: &[String], deferred: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::get_env_name;
+    use serial_test::serial;
+    use std::env;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestVaultConfigGuard {
+        dir_key: String,
+        file_key: String,
+        previous_dir: Option<OsString>,
+        previous_file: Option<OsString>,
+        path: PathBuf,
+    }
+
+    impl TestVaultConfigGuard {
+        fn new(label: &str) -> Self {
+            let dir_key = get_env_name("config_dir");
+            let file_key = get_env_name("config_file");
+            let previous_dir = env::var_os(&dir_key);
+            let previous_file = env::var_os(&file_key);
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!("coyote-vault-test-{label}-{unique}"));
+            fs::create_dir_all(&path).unwrap();
+            let config_path = path.join("config.yaml");
+            fs::write(&config_path, "{}").unwrap();
+            unsafe {
+                env::set_var(&dir_key, &path);
+                env::set_var(&file_key, &config_path);
+            }
+            Self {
+                dir_key,
+                file_key,
+                previous_dir,
+                previous_file,
+                path,
+            }
+        }
+    }
+
+    impl Drop for TestVaultConfigGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous_dir {
+                    Some(p) => env::set_var(&self.dir_key, p),
+                    None => env::remove_var(&self.dir_key),
+                }
+                match &self.previous_file {
+                    Some(p) => env::set_var(&self.file_key, p),
+                    None => env::remove_var(&self.file_key),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn parse_url_no_ref() {
@@ -982,6 +1099,7 @@ mod tests {
         let l = RemoteLayout {
             agents: Some(PathBuf::from("a")),
             roles: Some(PathBuf::from("r")),
+            skills: Some(PathBuf::from("s")),
             macros: Some(PathBuf::from("m")),
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
@@ -989,8 +1107,8 @@ mod tests {
 
         let out = apply_filter(l, None);
 
-        assert!(out.agents.is_some() && out.roles.is_some() && out.macros.is_some());
-        assert!(out.functions_tools.is_some() && out.mcp_json.is_some());
+        assert!(out.agents.is_some() && out.roles.is_some() && out.skills.is_some());
+        assert!(out.macros.is_some() && out.functions_tools.is_some() && out.mcp_json.is_some());
     }
 
     #[test]
@@ -998,6 +1116,7 @@ mod tests {
         let l = RemoteLayout {
             agents: Some(PathBuf::from("a")),
             roles: None,
+            skills: Some(PathBuf::from("s")),
             macros: None,
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
@@ -1006,6 +1125,7 @@ mod tests {
         let out = apply_filter(l, Some(InstallFilter::Functions));
 
         assert!(out.agents.is_none());
+        assert!(out.skills.is_none());
         assert_eq!(out.functions_tools, Some(PathBuf::from("f")));
         assert!(out.mcp_json.is_none());
     }
@@ -1015,6 +1135,7 @@ mod tests {
         let l = RemoteLayout {
             agents: Some(PathBuf::from("a")),
             roles: None,
+            skills: Some(PathBuf::from("s")),
             macros: None,
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
@@ -1022,7 +1143,7 @@ mod tests {
 
         let out = apply_filter(l, Some(InstallFilter::McpConfig));
 
-        assert!(out.agents.is_none() && out.functions_tools.is_none());
+        assert!(out.agents.is_none() && out.skills.is_none() && out.functions_tools.is_none());
         assert_eq!(out.mcp_json, Some(PathBuf::from("j")));
     }
 
@@ -1031,6 +1152,7 @@ mod tests {
         let l = RemoteLayout {
             agents: Some(PathBuf::from("a")),
             roles: Some(PathBuf::from("r")),
+            skills: Some(PathBuf::from("s")),
             macros: Some(PathBuf::from("m")),
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
@@ -1039,7 +1161,25 @@ mod tests {
         let out = apply_filter(l, Some(InstallFilter::Roles));
 
         assert_eq!(out.roles, Some(PathBuf::from("r")));
-        assert!(out.agents.is_none() && out.macros.is_none());
+        assert!(out.agents.is_none() && out.skills.is_none() && out.macros.is_none());
+        assert!(out.functions_tools.is_none() && out.mcp_json.is_none());
+    }
+
+    #[test]
+    fn apply_filter_skills_keeps_only_skills() {
+        let l = RemoteLayout {
+            agents: Some(PathBuf::from("a")),
+            roles: Some(PathBuf::from("r")),
+            skills: Some(PathBuf::from("s")),
+            macros: Some(PathBuf::from("m")),
+            functions_tools: Some(PathBuf::from("f")),
+            mcp_json: Some(PathBuf::from("j")),
+        };
+
+        let out = apply_filter(l, Some(InstallFilter::Skills));
+
+        assert_eq!(out.skills, Some(PathBuf::from("s")));
+        assert!(out.agents.is_none() && out.roles.is_none() && out.macros.is_none());
         assert!(out.functions_tools.is_none() && out.mcp_json.is_none());
     }
 
@@ -1084,8 +1224,10 @@ mod tests {
     #[test]
     fn scan_remote_layout_finds_known_subdirs() {
         let root = fresh_temp_dir("scan-test-");
+
         fs::create_dir_all(root.join("agents/sample")).unwrap();
         fs::create_dir_all(root.join("roles")).unwrap();
+        fs::create_dir_all(root.join("skills")).unwrap();
         fs::create_dir_all(root.join("macros")).unwrap();
         fs::create_dir_all(root.join("functions/tools")).unwrap();
         touch(&root.join("functions/mcp.json"));
@@ -1094,9 +1236,27 @@ mod tests {
         let layout = scan_remote_layout(&root).unwrap();
         assert!(layout.agents.is_some());
         assert!(layout.roles.is_some());
+        assert!(layout.skills.is_some());
         assert!(layout.macros.is_some());
         assert!(layout.functions_tools.is_some());
         assert!(layout.mcp_json.is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_remote_layout_finds_skills_only() {
+        let root = fresh_temp_dir("scan-skills-only-");
+        fs::create_dir_all(root.join("skills/git-master")).unwrap();
+        touch(&root.join("skills/git-master/SKILL.md"));
+
+        let layout = scan_remote_layout(&root).unwrap();
+
+        assert!(layout.skills.is_some());
+        assert!(layout.agents.is_none());
+        assert!(layout.roles.is_none());
+        assert!(layout.macros.is_none());
+        assert!(layout.functions_tools.is_none());
+        assert!(layout.mcp_json.is_none());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1182,7 +1342,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_into_empty_local_adds_all_remote_servers() {
+        let _guard = TestVaultConfigGuard::new("merge-empty");
         let dir = fresh_temp_dir("merge-empty-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -1199,7 +1361,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_force_replaces_local_on_conflict() {
+        let _guard = TestVaultConfigGuard::new("merge-force");
         let dir = fresh_temp_dir("merge-force-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -1223,6 +1387,12 @@ mod tests {
 
     #[test]
     fn merge_non_tty_conflict_aborts_without_force() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping merge_non_tty_conflict_aborts_without_force: requires non-TTY stdout"
+            );
+            return;
+        }
         let dir = fresh_temp_dir("merge-non-tty-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -1259,7 +1429,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
     async fn merge_detects_missing_secrets_in_output() {
+        let _guard = TestVaultConfigGuard::new("merge-secret");
         let dir = fresh_temp_dir("merge-secret-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -1275,7 +1447,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_is_idempotent_on_re_run() {
+        let _guard = TestVaultConfigGuard::new("merge-idempotent");
         let dir = fresh_temp_dir("merge-idempotent-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -1299,6 +1473,12 @@ mod tests {
 
     #[test]
     fn handle_missing_secrets_defers_all_in_non_tty() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping handle_missing_secrets_defers_all_in_non_tty: requires non-TTY stdout"
+            );
+            return;
+        }
         let missing = vec![
             "COYOTE_TEST_STEP4_A".to_string(),
             "COYOTE_TEST_STEP4_B".to_string(),

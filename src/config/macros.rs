@@ -29,12 +29,12 @@ pub async fn macro_execute(
     let variables = macro_value
         .resolve_variables(&new_args)
         .map_err(|err| anyhow!("{err}. Usage: {}", macro_value.usage(name)))?;
-    let role = ctx.extract_role(ctx.app.config.as_ref());
+    let role = ctx.extract_role(ctx.app.config.as_ref())?;
     let mut app_config = (*ctx.app.config).clone();
     app_config.temperature = role.temperature();
     app_config.top_p = role.top_p();
-    app_config.enabled_tools = role.enabled_tools().clone();
-    app_config.enabled_mcp_servers = role.enabled_mcp_servers().clone();
+    app_config.enabled_tools = role.enabled_tools();
+    app_config.enabled_mcp_servers = role.enabled_mcp_servers();
 
     let mut app_state = (*ctx.app).clone();
     app_state.config = Arc::new(app_config);

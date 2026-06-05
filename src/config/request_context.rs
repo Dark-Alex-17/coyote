@@ -1,5 +1,8 @@
 use super::rag_cache::{RagCache, RagKey};
 use super::session::Session;
+use super::skill::{SKILL_SCAFFOLD, Skill};
+use super::skill_policy::SkillPolicy;
+use super::skill_registry::SkillRegistry;
 use super::todo::TodoList;
 use super::tool_scope::{McpRuntime, ToolScope};
 use super::{
@@ -11,7 +14,7 @@ use super::{
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
-    FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
+    FunctionDeclaration, Functions, ToolCallTracker, ToolResult, skill::SKILL_FUNCTION_PREFIX,
     user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::mcp::{
@@ -29,12 +32,14 @@ use crate::utils::{
 
 use crate::graph;
 use anyhow::{Context, Error, Result, bail};
+use gman::providers::SupportedProvider;
 #[cfg(test)]
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
+use log::warn;
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -82,6 +87,7 @@ pub struct RequestContext {
     pub current_depth: usize,
     pub auto_continue_count: usize,
     pub todo_list: TodoList,
+    pub skill_registry: SkillRegistry,
     pub last_continuation_response: Option<String>,
 
     pub render_mode: RenderMode,
@@ -110,6 +116,7 @@ impl RequestContext {
             current_depth: 0,
             auto_continue_count: 0,
             todo_list: TodoList::default(),
+            skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
             render_mode: RenderMode::default(),
         }
@@ -125,6 +132,13 @@ impl RequestContext {
         let mut functions = app.functions.clone();
         if working_mode.is_repl() {
             functions.append_user_interaction_functions();
+        }
+
+        if app.config.function_calling_support {
+            let policy = SkillPolicy::effective(&app.config, None, None, None)?;
+            if policy.skills_enabled {
+                functions.append_skill_functions();
+            }
         }
 
         let mut mcp_runtime = McpRuntime::default();
@@ -157,6 +171,7 @@ impl RequestContext {
             current_depth: 0,
             auto_continue_count: 0,
             todo_list: TodoList::default(),
+            skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
             render_mode: RenderMode::default(),
         })
@@ -198,6 +213,7 @@ impl RequestContext {
             current_depth: self.current_depth,
             auto_continue_count: 0,
             todo_list: self.todo_list.clone(),
+            skill_registry: self.skill_registry.clone(),
             last_continuation_response: None,
             render_mode: self.render_mode,
         }
@@ -237,6 +253,7 @@ impl RequestContext {
             current_depth,
             auto_continue_count: 0,
             todo_list: TodoList::default(),
+            skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
             render_mode: parent.render_mode,
         }
@@ -585,7 +602,7 @@ impl RequestContext {
         }
     }
 
-    pub fn extract_role(&self, app: &AppConfig) -> Role {
+    pub fn extract_role(&self, app: &AppConfig) -> Result<Role> {
         let mut role = if let Some(session) = self.session.as_ref() {
             session.to_role()
         } else if let Some(agent) = self.agent.as_ref() {
@@ -611,7 +628,13 @@ impl RequestContext {
             }
         }
 
-        role
+        let policy = SkillPolicy::effective(
+            app,
+            self.role.as_ref(),
+            self.agent.as_ref(),
+            self.session.as_ref(),
+        )?;
+        Ok(self.skill_registry.effective_role(&role, &policy))
     }
 
     pub fn auto_continue_config(&self) -> AutoContinueConfig {
@@ -684,7 +707,7 @@ impl RequestContext {
         }
     }
 
-    pub fn set_enabled_tools_on_role_like(&mut self, value: Option<String>) -> bool {
+    pub fn set_enabled_tools_on_role_like(&mut self, value: Option<Vec<String>>) -> bool {
         match self.role_like_mut() {
             Some(role_like) => {
                 role_like.set_enabled_tools(value);
@@ -694,7 +717,7 @@ impl RequestContext {
         }
     }
 
-    pub fn set_enabled_mcp_servers_on_role_like(&mut self, value: Option<String>) -> bool {
+    pub fn set_enabled_mcp_servers_on_role_like(&mut self, value: Option<Vec<String>>) -> bool {
         match self.role_like_mut() {
             Some(role_like) => {
                 role_like.set_enabled_mcp_servers(value);
@@ -814,6 +837,7 @@ impl RequestContext {
         if !app.dry_run {
             self.save_message(app, input, output)?;
         }
+        self.skill_registry.sweep_auto_unload();
         Ok(())
     }
 
@@ -827,7 +851,7 @@ impl RequestContext {
             Some(rag) => rag.get_config(),
             None => (app.rag_reranker_model.clone(), app.rag_top_k),
         };
-        let role = self.extract_role(app);
+        let role = self.extract_role(app)?;
         let mut items = vec![
             ("model", role.model().id()),
             (
@@ -837,11 +861,11 @@ impl RequestContext {
             ("top_p", super::format_option_value(&role.top_p())),
             (
                 "enabled_tools",
-                super::format_option_value(&role.enabled_tools()),
+                super::format_option_value(&role.enabled_tools().map(|v| v.join(","))),
             ),
             (
                 "enabled_mcp_servers",
-                super::format_option_value(&role.enabled_mcp_servers()),
+                super::format_option_value(&role.enabled_mcp_servers().map(|v| v.join(","))),
             ),
             (
                 "max_output_tokens",
@@ -882,16 +906,67 @@ impl RequestContext {
             ("env_file", display_path(&paths::env_file())),
             ("agents_dir", display_path(&paths::agents_data_dir())),
             ("roles_dir", display_path(&paths::roles_dir())),
+            ("skills_dir", display_path(&paths::skills_dir())),
             ("sessions_dir", display_path(&self.sessions_dir())),
             ("rags_dir", display_path(&paths::rags_dir())),
             ("macros_dir", display_path(&paths::macros_dir())),
             ("functions_dir", display_path(&paths::functions_dir())),
             ("messages_file", display_path(&self.messages_file())),
-            (
-                "vault_password_file",
-                display_path(&app.vault_password_file()),
-            ),
         ];
+
+        match &app.secrets_provider {
+            None => {
+                items.push(("secrets_provider", "local".to_string()));
+                items.push((
+                    "vault_password_file",
+                    display_path(&app.vault_password_file()),
+                ));
+            }
+            Some(provider) => {
+                items.push(("secrets_provider", provider.to_string()));
+                match provider {
+                    SupportedProvider::Local { provider_def } => {
+                        let path = provider_def
+                            .password_file
+                            .clone()
+                            .unwrap_or_else(gman::config::Config::local_provider_password_file);
+                        items.push(("vault_password_file", display_path(&path)));
+                    }
+                    SupportedProvider::AwsSecretsManager { provider_def } => {
+                        if let Some(p) = &provider_def.aws_profile {
+                            items.push(("aws_profile", p.clone()));
+                        }
+                        if let Some(r) = &provider_def.aws_region {
+                            items.push(("aws_region", r.clone()));
+                        }
+                    }
+                    SupportedProvider::GcpSecretManager { provider_def } => {
+                        if let Some(id) = &provider_def.gcp_project_id {
+                            items.push(("gcp_project_id", id.clone()));
+                        }
+                    }
+                    SupportedProvider::AzureKeyVault { provider_def } => {
+                        if let Some(n) = &provider_def.vault_name {
+                            items.push(("azure_vault_name", n.clone()));
+                        }
+                    }
+                    SupportedProvider::Gopass { provider_def } => {
+                        if let Some(s) = &provider_def.store {
+                            items.push(("gopass_store", s.clone()));
+                        }
+                    }
+                    SupportedProvider::OnePassword { provider_def } => {
+                        if let Some(v) = &provider_def.vault {
+                            items.push(("op_vault", v.clone()));
+                        }
+                        if let Some(a) = &provider_def.account {
+                            items.push(("op_account", a.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
         if let Ok((_, Some(log_path))) = paths::log_config() {
             items.push(("log_path", display_path(&log_path)));
         }
@@ -949,7 +1024,10 @@ impl RequestContext {
 
     pub fn generate_prompt_context(&self, app: &AppConfig) -> HashMap<&str, String> {
         let mut output = HashMap::new();
-        let role = self.extract_role(app);
+        let role = self.extract_role(app).unwrap_or_else(|err| {
+            warn!("failed to compute effective role for prompt rendering: {err}");
+            Role::default()
+        });
         output.insert("model", role.model().id());
         output.insert("client_name", role.model().client_name().to_string());
         output.insert("model_name", role.model().name().to_string());
@@ -1080,10 +1158,10 @@ impl RequestContext {
                 }
 
                 let mut tool_names: HashSet<String> = Default::default();
-                if enabled_tools == "all" {
+                if enabled_tools.iter().any(|s| s.trim() == "all") {
                     tool_names.extend(declaration_names);
                 } else {
-                    for item in enabled_tools.split(',') {
+                    for item in enabled_tools.iter() {
                         let item = item.trim();
                         if item.is_empty() {
                             continue;
@@ -1128,7 +1206,9 @@ impl RequestContext {
                     .declarations()
                     .iter()
                     .filter(|v| {
-                        v.name.starts_with(USER_FUNCTION_PREFIX) && !existing.contains(&v.name)
+                        (v.name.starts_with(USER_FUNCTION_PREFIX)
+                            || v.name.starts_with(SKILL_FUNCTION_PREFIX))
+                            && !existing.contains(&v.name)
                     })
                     .cloned()
                     .collect();
@@ -1149,7 +1229,12 @@ impl RequestContext {
                     .collect();
 
                 if let Some(ref tool_names) = role_filter {
-                    agent_functions.retain(|v| tool_names.contains(&v.name));
+                    agent_functions.retain(|v| {
+                        tool_names.contains(&v.name)
+                            || (!matches!(agent.skills_enabled(), Some(false))
+                                && v.name.starts_with(SKILL_FUNCTION_PREFIX))
+                            || v.name.starts_with(USER_FUNCTION_PREFIX)
+                    });
                 }
 
                 let tool_names: HashSet<String> = agent_functions
@@ -1209,10 +1294,10 @@ impl RequestContext {
                     }
 
                     let mut server_names: HashSet<String> = Default::default();
-                    if enabled_mcp_servers == "all" {
+                    if enabled_mcp_servers.iter().any(|s| s.trim() == "all") {
                         server_names.extend(mcp_declaration_names);
                     } else {
-                        for item in enabled_mcp_servers.split(',') {
+                        for item in enabled_mcp_servers.iter() {
                             let item = item.trim();
                             if item.is_empty() {
                                 continue;
@@ -1537,6 +1622,7 @@ impl RequestContext {
             "session" => (self.sessions_dir(), Some(".yaml")),
             "rag" => (paths::rags_dir(), Some(".yaml")),
             "macro" => (paths::macros_dir(), Some(".yaml")),
+            "skill" => (paths::skills_dir(), None),
             "agent-data" => (paths::agents_data_dir(), None),
             _ => bail!("Unknown kind '{kind}'"),
         };
@@ -1643,14 +1729,49 @@ impl RequestContext {
                 }
             }
             "enabled_tools" => {
-                let value = super::parse_value(value)?;
-                if !self.set_enabled_tools_on_role_like(value.clone()) {
-                    self.update_app_config(|app| app.enabled_tools = value);
+                let raw: Option<String> = super::parse_value(value)?;
+                let parsed: Option<Vec<String>> = raw.map(|s| super::csv_to_vec(&s));
+                if !self.set_enabled_tools_on_role_like(parsed.clone()) {
+                    self.update_app_config(|app| app.enabled_tools = parsed.clone());
+                }
+            }
+            "enabled_skills" => {
+                let raw: Option<String> = super::parse_value(value)?;
+                let parsed: Option<Vec<String>> = raw.map(|s| super::csv_to_vec(&s));
+                if let Some(names) = parsed.as_ref() {
+                    let visible = self.app.config.visible_skills.as_deref();
+                    for name in names {
+                        paths::validate_skill_name(name)?;
+                        match visible {
+                            Some(vs) => {
+                                if !vs.iter().any(|s| s == name) {
+                                    bail!(
+                                        "skill '{name}' is not in the global 'visible_skills' allow-list"
+                                    );
+                                }
+                            }
+                            None => {
+                                if !paths::has_skill(name) {
+                                    bail!("skill '{name}' is not installed");
+                                }
+                            }
+                        }
+                    }
+                }
+                self.update_app_config(|app| app.enabled_skills = parsed.clone());
+            }
+            "skills_enabled" => {
+                let value: Option<bool> = super::parse_value(value)?;
+                if let Some(session) = self.session.as_mut() {
+                    session.set_skills_enabled(value);
+                } else {
+                    self.update_app_config(|app| app.skills_enabled = value.unwrap_or(true));
                 }
             }
             "enabled_mcp_servers" => {
-                let value: Option<String> = super::parse_value(value)?;
-                if let Some(servers) = value.as_ref() {
+                let raw: Option<String> = super::parse_value(value)?;
+                let parsed: Option<Vec<String>> = raw.map(|s| super::csv_to_vec(&s));
+                if let Some(servers) = parsed.as_ref() {
                     let Some(mcp_config) = &self.app.mcp_config else {
                         bail!(
                             "No MCP servers are configured. Please configure MCP servers first before setting 'enabled_mcp_servers'."
@@ -1662,7 +1783,7 @@ impl RequestContext {
                         );
                     }
 
-                    if !servers.split(',').all(|s| {
+                    if !servers.iter().all(|s| {
                         let server = s.trim();
                         server == "all" || mcp_config.mcp_servers.contains_key(server)
                     }) {
@@ -1671,8 +1792,8 @@ impl RequestContext {
                         );
                     }
                 }
-                if !self.set_enabled_mcp_servers_on_role_like(value.clone()) {
-                    self.update_app_config(|app| app.enabled_mcp_servers = value.clone());
+                if !self.set_enabled_mcp_servers_on_role_like(parsed.clone()) {
+                    self.update_app_config(|app| app.enabled_mcp_servers = parsed.clone());
                 }
                 if self.app.config.mcp_server_support {
                     let app = Arc::clone(&self.app.config);
@@ -1862,6 +1983,11 @@ impl RequestContext {
                     super::map_completion_values(values)
                 }
                 ".macro" => super::map_completion_values(paths::list_macros()),
+                ".skill" => super::map_completion_values(vec![
+                    "loaded".to_string(),
+                    "load".to_string(),
+                    "unload".to_string(),
+                ]),
                 ".starter" => match &self.agent {
                     Some(agent) => agent
                         .conversation_starters()
@@ -1889,6 +2015,7 @@ impl RequestContext {
                         "dry_run",
                         "function_calling_support",
                         "mcp_server_support",
+                        "skills_enabled",
                         "stream",
                         "save",
                         "highlight",
@@ -1904,6 +2031,7 @@ impl RequestContext {
                     "session",
                     "rag",
                     "macro",
+                    "skill",
                     "agent-data",
                 ]),
                 ".vault" => {
@@ -1916,6 +2044,12 @@ impl RequestContext {
                 }
                 _ => vec![],
             };
+        } else if (cmd == ".edit" && args.first() == Some(&"skill") && args.len() == 2)
+            || (cmd == ".skill" && args.first() == Some(&"load") && args.len() == 2)
+        {
+            values = super::map_completion_values(paths::list_skills());
+        } else if cmd == ".skill" && args.first() == Some(&"unload") && args.len() == 2 {
+            values = super::map_completion_values(self.skill_registry.loaded_names());
         } else if cmd == ".install" && args.first() == Some(&"remote") && args.len() >= 2 {
             let prev = args.get(args.len() - 2).copied().unwrap_or("");
             if prev == "--filter" {
@@ -1980,6 +2114,14 @@ impl RequestContext {
                         .collect()
                 }
                 "mcp_server_support" => super::complete_bool(app.mcp_server_support),
+                "skills_enabled" => {
+                    let current = if let Some(session) = &self.session {
+                        session.skills_enabled()
+                    } else {
+                        Some(app.skills_enabled)
+                    };
+                    super::complete_option_bool(current)
+                }
                 "enabled_mcp_servers" => {
                     let mut prefix = String::new();
                     let mut ignores = HashSet::new();
@@ -2058,21 +2200,52 @@ impl RequestContext {
     async fn rebuild_tool_scope(
         &mut self,
         app: &AppConfig,
-        enabled_mcp_servers: Option<String>,
+        enabled_mcp_servers: Option<Vec<String>>,
         abort_signal: AbortSignal,
     ) -> Result<()> {
+        let policy = SkillPolicy::effective(
+            app,
+            self.role.as_ref(),
+            self.agent.as_ref(),
+            self.session.as_ref(),
+        )?;
+
+        let enabled_mcp_servers = if policy.skills_enabled && app.mcp_server_support {
+            let skill_mcps = self.skill_registry.loaded_mcp_servers();
+            let has_all = enabled_mcp_servers
+                .as_ref()
+                .map(|v| v.iter().any(|s| s.trim() == "all"))
+                .unwrap_or(false);
+            if has_all || skill_mcps.is_empty() {
+                enabled_mcp_servers
+            } else {
+                let mut merged: BTreeSet<String> = skill_mcps;
+                if let Some(servers) = &enabled_mcp_servers {
+                    for token in servers {
+                        let t = token.trim();
+                        if !t.is_empty() {
+                            merged.insert(t.to_string());
+                        }
+                    }
+                }
+                Some(merged.into_iter().collect())
+            }
+        } else {
+            enabled_mcp_servers
+        };
+
         let mut mcp_runtime = McpRuntime::new();
 
         if app.mcp_server_support
             && let Some(mcp_config) = &self.app.mcp_config
         {
             let server_ids: Vec<String> = match &enabled_mcp_servers {
-                Some(servers) if servers == "all" => {
+                Some(servers) if servers.iter().any(|s| s.trim() == "all") => {
                     mcp_config.mcp_servers.keys().cloned().collect()
                 }
                 Some(servers) => {
                     let mut ids = Vec::new();
-                    for item in servers.split(',').map(|s| s.trim()) {
+                    for item in servers.iter().map(|s| s.trim()) {
                         if mcp_config.mcp_servers.contains_key(item) {
                             ids.push(item.to_string());
                         } else if let Some(mapped) = app.mapping_mcp_servers.get(item) {
@@ -2128,6 +2301,9 @@ impl RequestContext {
         if !mcp_runtime.is_empty() {
             functions.append_mcp_meta_functions(mcp_runtime.server_names());
         }
+        if app.function_calling_support && policy.skills_enabled {
+            functions.append_skill_functions();
+        }
 
         let tool_tracker = self.tool_scope.tool_tracker.clone();
         self.tool_scope = ToolScope {
@@ -2136,6 +2312,30 @@ impl RequestContext {
             tool_tracker,
         };
         Ok(())
+    }
+
+    pub async fn refresh_tool_scope(&mut self, abort_signal: AbortSignal) -> Result<()> {
+        let app = (*self.app.config).clone();
+        let base_mcps = if app.mcp_server_support {
+            if let Some(session) = &self.session {
+                session.enabled_mcp_servers()
+            } else if let Some(agent) = &self.agent {
+                let names = agent.mcp_server_names();
+                if names.is_empty() {
+                    None
+                } else {
+                    Some(names.to_vec())
+                }
+            } else if let Some(role) = &self.role {
+                role.enabled_mcp_servers()
+            } else {
+                app.enabled_mcp_servers.clone()
+            }
+        } else {
+            None
+        };
+
+        self.rebuild_tool_scope(&app, base_mcps, abort_signal).await
     }
 
     pub async fn use_role(
@@ -2191,12 +2391,12 @@ impl RequestContext {
                         format!("Failed to cleanup previous '{TEMP_SESSION_NAME}' session")
                     })?;
                 }
-                session = Some(Session::new_from_ctx(self, app, TEMP_SESSION_NAME));
+                session = Some(Session::new_from_ctx(self, app, TEMP_SESSION_NAME)?);
             }
             Some(name) => {
                 let session_path = self.session_file(name);
                 if !session_path.exists() {
-                    session = Some(Session::new_from_ctx(self, app, name));
+                    session = Some(Session::new_from_ctx(self, app, name)?);
                 } else {
                     session = Some(Session::load_from_ctx(self, app, name, &session_path)?);
                 }
@@ -2284,7 +2484,7 @@ impl RequestContext {
         }
 
         let mcp_servers = if app.mcp_server_support {
-            (!agent.mcp_server_names().is_empty()).then(|| agent.mcp_server_names().join(","))
+            (!agent.mcp_server_names().is_empty()).then(|| agent.mcp_server_names().to_vec())
         } else {
             if !agent.mcp_server_names().is_empty() {
                 bail!(
@@ -2410,6 +2610,106 @@ impl RequestContext {
         Ok(())
     }
 
+    pub fn upsert_skill(&self, app: &AppConfig, name: &str) -> Result<()> {
+        paths::validate_skill_name(name)?;
+        let path = paths::skill_file(name);
+        ensure_parent_exists(&path)?;
+        let is_new = !path.exists();
+        if is_new {
+            fs::write(&path, SKILL_SCAFFOLD)
+                .with_context(|| format!("Failed to scaffold skill at {}", path.display()))?;
+        }
+        let editor = app.editor()?;
+        edit_file(&editor, &path)?;
+        if is_new {
+            println!("✓ Created skill at '{}'.", path.display());
+        } else {
+            println!("✓ Saved skill at '{}'.", path.display());
+        }
+        Ok(())
+    }
+
+    pub async fn load_skill_repl(&mut self, name: &str, abort_signal: AbortSignal) -> Result<()> {
+        paths::validate_skill_name(name)?;
+        if !self.app.config.function_calling_support {
+            bail!(
+                "Skills require function calling, which is disabled. Enable function calling in your config then try again."
+            );
+        }
+
+        if !paths::has_skill(name) {
+            bail!(
+                "Skill '{name}' is not installed (expected at {})",
+                paths::skill_file(name).display()
+            );
+        }
+
+        let policy = SkillPolicy::effective(
+            &self.app.config,
+            self.role.as_ref(),
+            self.agent.as_ref(),
+            self.session.as_ref(),
+        )?;
+
+        if !policy.skills_enabled {
+            bail!("Skills are disabled in this context");
+        }
+
+        if !policy.allows(name) {
+            bail!("Skill '{name}' is not enabled in this context");
+        }
+
+        let skill = Skill::load(name)?;
+        let needs_mcps = skill
+            .enabled_mcp_servers()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+
+        if needs_mcps && !self.app.config.mcp_server_support {
+            bail!("Skill '{name}' requires MCP servers, which are disabled");
+        }
+
+        self.skill_registry.insert(skill)?;
+        if let Err(e) = self.refresh_tool_scope(abort_signal).await {
+            if let Err(unload_err) = self.skill_registry.unload(name) {
+                warn!("Failed to unload skill '{name}' during error recovery: {unload_err}");
+            }
+            bail!("Loaded skill '{name}' but failed to refresh tool scope: {e}");
+        }
+
+        println!("✓ Loaded skill '{name}'.");
+        Ok(())
+    }
+
+    pub async fn unload_skill_repl(&mut self, name: &str, abort_signal: AbortSignal) -> Result<()> {
+        let skill = self.skill_registry.unload(name)?;
+
+        if let Err(e) = self.refresh_tool_scope(abort_signal).await {
+            if let Err(restore_err) = self.skill_registry.insert(skill) {
+                warn!(
+                    "Failed to restore skill '{name}' after tool-scope refresh failure: {restore_err}"
+                );
+            }
+            bail!("Unloaded skill '{name}' but failed to refresh tool scope; restored: {e}");
+        }
+
+        println!("✓ Unloaded skill '{name}'.");
+        Ok(())
+    }
+
+    pub fn list_loaded_skills(&self) {
+        let names = self.skill_registry.loaded_names();
+
+        if names.is_empty() {
+            println!("No skills loaded.");
+        } else {
+            println!("Loaded skills:");
+            for name in names {
+                println!("  • {name}");
+            }
+        }
+    }
+
     pub async fn apply_prelude(
         &mut self,
         app: &AppConfig,
@@ -2476,13 +2776,13 @@ impl RequestContext {
         &self,
         app: &AppConfig,
         start_mcp_servers: bool,
-    ) -> Option<String> {
+    ) -> Option<Vec<String>> {
         if !start_mcp_servers || !app.mcp_server_support {
             return None;
         }
         if let Some(agent) = self.agent.as_ref() {
             return (!agent.mcp_server_names().is_empty())
-                .then(|| agent.mcp_server_names().join(","));
+                .then(|| agent.mcp_server_names().to_vec());
         }
         if let Some(session) = self.session.as_ref() {
             return session.enabled_mcp_servers();
@@ -2522,7 +2822,7 @@ impl RequestContext {
             .summarization_prompt
             .clone()
             .unwrap_or_else(|| SUMMARIZATION_PROMPT.into());
-        let input = Input::from_str(self, &prompt, None);
+        let input = Input::from_str(self, &prompt, None)?;
         let summary = input.fetch_chat_text().await?;
         let summary_context_prompt = self
             .app
@@ -2557,7 +2857,7 @@ impl RequestContext {
             None => bail!("No chat history"),
         };
         let role = self.retrieve_role(app, CREATE_TITLE_ROLE)?;
-        let input = Input::from_str(self, &text, Some(role));
+        let input = Input::from_str(self, &text, Some(role))?;
         let text = input.fetch_chat_text().await?;
         if let Some(session) = self.session.as_mut() {
             session.set_autoname(&text);
@@ -2811,7 +3111,7 @@ mod tests {
         let app = ctx.app.config.clone();
         let role = Role::new("myrole", "my prompt");
         ctx.use_role_obj(role).unwrap();
-        let extracted = ctx.extract_role(&app);
+        let extracted = ctx.extract_role(&app).unwrap();
         assert_eq!(extracted.name(), "myrole");
     }
 
@@ -2819,7 +3119,7 @@ mod tests {
     fn extract_role_returns_default_when_nothing_active() {
         let ctx = create_test_ctx();
         let app = ctx.app.config.clone();
-        let extracted = ctx.extract_role(&app);
+        let extracted = ctx.extract_role(&app).unwrap();
         assert_eq!(extracted.name(), "");
     }
 
@@ -2975,7 +3275,7 @@ mod tests {
         let app = ctx.app.config.clone();
         let abort = utils::create_abort_signal();
 
-        run_async(ctx.rebuild_tool_scope(&app, Some("all".to_string()), abort)).unwrap();
+        run_async(ctx.rebuild_tool_scope(&app, Some(vec!["all".to_string()]), abort)).unwrap();
 
         assert!(ctx.tool_scope.mcp_runtime.is_empty());
     }
@@ -3003,7 +3303,7 @@ mod tests {
         let app = ctx.app.config.clone();
         let abort = utils::create_abort_signal();
 
-        run_async(ctx.rebuild_tool_scope(&app, Some("all".to_string()), abort)).unwrap();
+        run_async(ctx.rebuild_tool_scope(&app, Some(vec!["all".to_string()]), abort)).unwrap();
 
         assert!(ctx.tool_scope.mcp_runtime.is_empty());
     }
@@ -3111,7 +3411,7 @@ mod tests {
         };
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let mut role = Role::new("r", "p");
-        role.set_enabled_tools(Some("all".to_string()));
+        role.set_enabled_tools(Some(vec!["all".to_string()]));
         assert!(ctx.select_functions(&role).is_none());
     }
 
@@ -3122,7 +3422,7 @@ mod tests {
         ctx.tool_scope.functions.append_user_interaction_functions();
 
         let mut role = Role::new("r", "p");
-        role.set_enabled_tools(Some("all".to_string()));
+        role.set_enabled_tools(Some(vec!["all".to_string()]));
 
         let fns = ctx.select_functions(&role).unwrap();
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
@@ -3136,7 +3436,10 @@ mod tests {
         ctx.tool_scope.functions.append_todo_functions();
 
         let mut role = Role::new("r", "p");
-        role.set_enabled_tools(Some("todo__init, todo__add".to_string()));
+        role.set_enabled_tools(Some(vec![
+            "todo__init".to_string(),
+            "todo__add".to_string(),
+        ]));
 
         let fns = ctx.select_functions(&role).unwrap();
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
@@ -3165,7 +3468,7 @@ mod tests {
         };
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let mut role = Role::new("r", "p");
-        role.set_enabled_mcp_servers(Some("all".to_string()));
+        role.set_enabled_mcp_servers(Some(vec!["all".to_string()]));
         let result = ctx.select_enabled_mcp_servers(&role);
         assert!(result.is_empty());
     }
@@ -3178,7 +3481,7 @@ mod tests {
             .append_mcp_meta_functions(vec!["github".into(), "slack".into()]);
 
         let mut role = Role::new("r", "p");
-        role.set_enabled_mcp_servers(Some("all".to_string()));
+        role.set_enabled_mcp_servers(Some(vec!["all".to_string()]));
 
         let fns = ctx.select_enabled_mcp_servers(&role);
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
@@ -3195,7 +3498,7 @@ mod tests {
             .append_mcp_meta_functions(vec!["github".into(), "slack".into()]);
 
         let mut role = Role::new("r", "p");
-        role.set_enabled_mcp_servers(Some("github".to_string()));
+        role.set_enabled_mcp_servers(Some(vec!["github".to_string()]));
 
         let fns = ctx.select_enabled_mcp_servers(&role);
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
@@ -3307,7 +3610,7 @@ mod tests {
     #[test]
     fn discontinuous_last_message_sets_continuous_false() {
         let mut ctx = create_test_ctx();
-        let input = Input::from_str(&ctx, "test", None);
+        let input = Input::from_str(&ctx, "test", None).unwrap();
         ctx.last_message = Some(LastMessage::new(input, "reply".to_string()));
         assert!(ctx.last_message.as_ref().unwrap().continuous);
         ctx.discontinuous_last_message();
@@ -3325,12 +3628,64 @@ mod tests {
     #[test]
     fn before_chat_completion_sets_last_message() {
         let mut ctx = create_test_ctx();
-        let input = Input::from_str(&ctx, "hello", None);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
         ctx.before_chat_completion(&input).unwrap();
         assert!(ctx.last_message.is_some());
         let lm = ctx.last_message.as_ref().unwrap();
         assert_eq!(lm.output, "");
         assert!(lm.continuous);
+    }
+
+    #[test]
+    fn after_chat_completion_sweeps_auto_unload_skills_at_turn_end() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                dry_run: true,
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+
+        let ephemeral = Skill::new("ephemeral", "---\nauto_unload: true\n---\nbody");
+        let persistent = Skill::new("persistent", "---\nauto_unload: false\n---\nbody");
+        ctx.skill_registry.insert(ephemeral).unwrap();
+        ctx.skill_registry.insert(persistent).unwrap();
+
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+        let app = Arc::clone(&ctx.app.config);
+        ctx.after_chat_completion(app.as_ref(), &input, "response", &[])
+            .unwrap();
+
+        assert!(!ctx.skill_registry.is_loaded("ephemeral"));
+        assert!(ctx.skill_registry.is_loaded("persistent"));
+    }
+
+    #[test]
+    fn after_chat_completion_preserves_auto_unload_during_tool_loop() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                dry_run: true,
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+
+        let ephemeral = Skill::new("ephemeral", "---\nauto_unload: true\n---\nbody");
+        ctx.skill_registry.insert(ephemeral).unwrap();
+
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+        let app = Arc::clone(&ctx.app.config);
+        let tool_result =
+            ToolResult::new(crate::function::ToolCall::default(), serde_json::json!({}));
+        ctx.after_chat_completion(app.as_ref(), &input, "", &[tool_result])
+            .unwrap();
+
+        assert!(
+            ctx.skill_registry.is_loaded("ephemeral"),
+            "auto_unload skills must persist through tool-using rounds"
+        );
     }
 
     #[test]
@@ -3482,7 +3837,7 @@ mod tests {
     fn session_new_from_ctx_captures_state() {
         let _guard = TestConfigDirGuard::new();
         let ctx = create_test_ctx();
-        let session = Session::new_from_ctx(&ctx, &ctx.app.config, "test-session");
+        let session = Session::new_from_ctx(&ctx, &ctx.app.config, "test-session").unwrap();
         assert_eq!(session.name(), "test-session");
         assert!(session.is_empty());
     }
@@ -3492,7 +3847,7 @@ mod tests {
     fn session_save_creates_file() {
         let _guard = TestConfigDirGuard::new();
         let ctx = create_test_ctx();
-        let mut session = Session::new_from_ctx(&ctx, &ctx.app.config, "save-test");
+        let mut session = Session::new_from_ctx(&ctx, &ctx.app.config, "save-test").unwrap();
         let session_path = ctx.session_file("save-test");
         ensure_parent_exists(&session_path).unwrap();
 
@@ -3835,6 +4190,43 @@ mod tests {
             "SENTINEL",
             "force install must overwrite the existing file"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_skills_force_overwrites_only_with_force() {
+        let _guard = TestConfigDirGuard::new();
+
+        Skill::install_builtin_skills(false).unwrap();
+        let file = paths::skill_file("git-master");
+        assert!(file.exists(), "git-master skill should be installed");
+
+        write(&file, "SENTINEL").unwrap();
+        Skill::install_builtin_skills(false).unwrap();
+        assert_eq!(
+            read_to_string(&file).unwrap(),
+            "SENTINEL",
+            "non-force install must not overwrite an existing skill"
+        );
+
+        Skill::install_builtin_skills(true).unwrap();
+        assert_ne!(
+            read_to_string(&file).unwrap(),
+            "SENTINEL",
+            "force install must overwrite the existing skill"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_skills_installs_all_bundled() {
+        let _guard = TestConfigDirGuard::new();
+
+        Skill::install_builtin_skills(false).unwrap();
+        assert!(paths::skill_file("git-master").exists());
+        assert!(paths::skill_file("ai-slop-remover").exists());
+        assert!(paths::skill_file("code-review").exists());
+        assert!(paths::skill_file("frontend-ui-ux").exists());
     }
 
     #[test]

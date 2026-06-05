@@ -15,8 +15,6 @@ description: |
 
 version: "1.0"
 
-temperature: 0.0
-
 global_tools:
   - web_search_coyote.sh
   - fetch_url_via_curl.sh

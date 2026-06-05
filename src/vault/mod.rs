@@ -1,60 +1,124 @@
 mod utils;
 
+use std::fs::read_to_string;
 use std::path::PathBuf;
+
+use crate::config::paths;
 pub use utils::create_vault_password_file;
 pub use utils::interpolate_secrets;
+pub use utils::prompt_provider_choice;
 
 use crate::cli::Cli;
 use crate::config::AppConfig;
 use crate::vault::utils::ensure_password_file_initialized;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
 use gman::providers::SecretProvider;
+use gman::providers::SupportedProvider;
 use gman::providers::local::LocalProvider;
 use inquire::{Password, PasswordDisplayMode, required};
+use log::warn;
+use serde_yaml::Value;
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
+use uuid::Uuid;
 
-pub static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{(.+)}}").unwrap());
+pub static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{([^{}]+)}}").unwrap());
 
 #[derive(Debug, Default, Clone)]
 pub struct Vault {
-    local_provider: LocalProvider,
+    pub(crate) provider: SupportedProvider,
 }
 
 pub type GlobalVault = Arc<Vault>;
 
 impl Vault {
-    pub fn init_bare() -> Self {
-        let vault_password_file = AppConfig::default().vault_password_file();
-        let local_provider = LocalProvider {
-            password_file: Some(vault_password_file),
-            git_branch: None,
-            ..LocalProvider::default()
+    pub fn init_bare() -> Result<Self> {
+        let config_path = paths::config_file();
+        if !config_path.exists() {
+            bail!(
+                "Coyote config not found at {}. Run first-run setup before using the vault.",
+                config_path.display()
+            );
+        }
+        let content = read_to_string(&config_path)
+            .with_context(|| format!("failed to read config at {}", config_path.display()))?;
+        let value: Value = serde_yaml::from_str(&content)
+            .with_context(|| format!("failed to parse config at {}", config_path.display()))?;
+
+        let provider = match value.get("secrets_provider") {
+            Some(v) if !v.is_null() => serde_yaml::from_value::<SupportedProvider>(v.clone())
+                .with_context(|| "failed to parse 'secrets_provider' from config")?,
+            _ => {
+                let password_file = value
+                    .get("vault_password_file")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| AppConfig::default().vault_password_file());
+                SupportedProvider::Local {
+                    provider_def: LocalProvider {
+                        password_file: Some(password_file),
+                        git_branch: None,
+                        ..LocalProvider::default()
+                    },
+                }
+            }
         };
 
-        Self { local_provider }
+        Ok(Self { provider })
     }
 
-    pub fn init(config: &AppConfig) -> Self {
-        let vault_password_file = config.vault_password_file();
-        let mut local_provider = LocalProvider {
-            password_file: Some(vault_password_file),
-            git_branch: None,
-            ..LocalProvider::default()
+    pub fn default_local() -> Self {
+        Self {
+            provider: SupportedProvider::Local {
+                provider_def: LocalProvider {
+                    password_file: Some(AppConfig::default().vault_password_file()),
+                    git_branch: None,
+                    ..LocalProvider::default()
+                },
+            },
+        }
+    }
+
+    pub fn init(config: &AppConfig) -> Result<Self> {
+        let mut provider = match &config.secrets_provider {
+            Some(p) => p.clone(),
+            None => SupportedProvider::Local {
+                provider_def: LocalProvider {
+                    password_file: Some(config.vault_password_file()),
+                    ..LocalProvider::default()
+                },
+            },
         };
 
-        ensure_password_file_initialized(&mut local_provider)
-            .expect("Failed to initialize password file");
+        if let SupportedProvider::Local { provider_def } = &mut provider {
+            ensure_password_file_initialized(provider_def)?;
+        }
 
-        Self { local_provider }
+        Ok(Self { provider })
     }
 
-    pub fn password_file(&self) -> Result<PathBuf> {
-        self.local_provider
-            .password_file
-            .clone()
-            .with_context(|| "A password file is required for the local provider")
+    pub fn local_password_file(&self) -> Result<PathBuf> {
+        match &self.provider {
+            SupportedProvider::Local { provider_def } => provider_def
+                .password_file
+                .clone()
+                .with_context(|| "A password file is required for the local provider"),
+            _ => Err(anyhow!(
+                "password_file is only available for the local provider"
+            )),
+        }
+    }
+
+    fn provider_ref(&self) -> &dyn SecretProvider {
+        match &self.provider {
+            SupportedProvider::Local { provider_def } => provider_def,
+            SupportedProvider::AwsSecretsManager { provider_def } => provider_def,
+            SupportedProvider::GcpSecretManager { provider_def } => provider_def,
+            SupportedProvider::AzureKeyVault { provider_def } => provider_def,
+            SupportedProvider::Gopass { provider_def } => provider_def,
+            SupportedProvider::OnePassword { provider_def } => provider_def,
+        }
     }
 
     pub fn add_secret(&self, secret_name: &str) -> Result<()> {
@@ -66,7 +130,7 @@ impl Vault {
 
         let h = Handle::current();
         tokio::task::block_in_place(|| {
-            h.block_on(self.local_provider.set_secret(secret_name, &secret_value))
+            h.block_on(self.provider_ref().set_secret(secret_name, &secret_value))
         })?;
         println!("✓ Secret '{secret_name}' added to the vault.");
 
@@ -76,7 +140,7 @@ impl Vault {
     pub fn get_secret(&self, secret_name: &str, display_output: bool) -> Result<String> {
         let h = Handle::current();
         let secret = tokio::task::block_in_place(|| {
-            h.block_on(self.local_provider.get_secret(secret_name))
+            h.block_on(self.provider_ref().get_secret(secret_name))
         })?;
 
         if display_output {
@@ -95,7 +159,7 @@ impl Vault {
         let h = Handle::current();
         tokio::task::block_in_place(|| {
             h.block_on(
-                self.local_provider
+                self.provider_ref()
                     .update_secret(secret_name, &secret_value),
             )
         })?;
@@ -106,7 +170,7 @@ impl Vault {
 
     pub fn delete_secret(&self, secret_name: &str) -> Result<()> {
         let h = Handle::current();
-        tokio::task::block_in_place(|| h.block_on(self.local_provider.delete_secret(secret_name)))?;
+        tokio::task::block_in_place(|| h.block_on(self.provider_ref().delete_secret(secret_name)))?;
         println!("✓ Secret '{secret_name}' deleted from the vault.");
 
         Ok(())
@@ -115,7 +179,7 @@ impl Vault {
     pub fn list_secrets(&self, display_output: bool) -> Result<Vec<String>> {
         let h = Handle::current();
         let secrets =
-            tokio::task::block_in_place(|| h.block_on(self.local_provider.list_secrets()))?;
+            tokio::task::block_in_place(|| h.block_on(self.provider_ref().list_secrets()))?;
 
         if display_output {
             if secrets.is_empty() {
@@ -128,6 +192,67 @@ impl Vault {
         }
 
         Ok(secrets)
+    }
+
+    pub fn auth_hint(&self) -> Option<&'static str> {
+        match &self.provider {
+            SupportedProvider::AwsSecretsManager { .. } => Some(
+                "Try `aws sso login` (for SSO setups) or `aws configure` (for static keys), then retry.",
+            ),
+            SupportedProvider::GcpSecretManager { .. } => {
+                Some("Try `gcloud auth application-default login`, then retry.")
+            }
+            SupportedProvider::AzureKeyVault { .. } => Some("Try `az login`, then retry."),
+            SupportedProvider::Gopass { .. } => {
+                Some("Make sure `gopass init` has been run and `gopass` is on your PATH.")
+            }
+            SupportedProvider::OnePassword { .. } => Some("Try `op signin`, then retry."),
+            SupportedProvider::Local { .. } => None,
+        }
+    }
+
+    pub fn validate_round_trip(&self) -> Result<()> {
+        const PROBE_VALUE: &str = "ok";
+        let probe_key = format!("coyote-setup-probe-{}", Uuid::new_v4().simple());
+
+        let h = Handle::current();
+        let result: Result<()> = tokio::task::block_in_place(|| {
+            h.block_on(async {
+                self.provider_ref()
+                    .set_secret(&probe_key, PROBE_VALUE)
+                    .await
+                    .with_context(|| "vault write probe failed")?;
+                let got = self
+                    .provider_ref()
+                    .get_secret(&probe_key)
+                    .await
+                    .with_context(|| "vault read probe failed")?;
+                if got != PROBE_VALUE {
+                    if let Err(cleanup_err) = self.provider_ref().delete_secret(&probe_key).await {
+                        warn!("vault probe cleanup failed for key '{probe_key}': {cleanup_err}");
+                    }
+                    bail!("vault read probe returned an unexpected value");
+                }
+
+                self.provider_ref()
+                    .delete_secret(&probe_key)
+                    .await
+                    .with_context(|| "vault delete probe failed")?;
+
+                Ok(())
+            })
+        });
+
+        result.with_context(|| {
+            let base = "Vault validation failed. Check that your credentials have permission to create, read, and delete secrets in the configured backend.";
+            match self.auth_hint() {
+                Some(hint) => format!("{base}\n\nHint: {hint}"),
+                None => base.to_string(),
+            }
+        })?;
+
+        println!("✓ Vault validation succeeded.");
+        Ok(())
     }
 
     pub fn handle_vault_flags(cli: Cli, vault: &Vault) -> Result<()> {
@@ -193,6 +318,6 @@ mod tests {
     #[test]
     fn vault_default_creates_instance() {
         let vault = Vault::default();
-        assert!(vault.password_file().is_err());
+        assert!(vault.local_password_file().is_err());
     }
 }

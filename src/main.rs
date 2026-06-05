@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
         || cli.list_agents
         || cli.list_rags
         || cli.list_macros
+        || cli.list_skills
         || cli.list_sessions;
     let vault_flags = cli.add_secret.is_some()
         || cli.get_secret.is_some()
@@ -112,7 +113,7 @@ async fn main() -> Result<()> {
     if vault_flags {
         let cfg = Config::load_with_interpolation(true).await?;
         let app_config = AppConfig::from_config(cfg)?;
-        let vault = Vault::init(&app_config);
+        let vault = Vault::init(&app_config)?;
         return Vault::handle_vault_flags(cli, &vault);
     }
 
@@ -190,6 +191,28 @@ async fn run(
         let macros = paths::list_macros().join("\n");
         println!("{macros}");
         return Ok(());
+    }
+    if cli.list_skills {
+        let skills = paths::list_skills().join("\n");
+        println!("{skills}");
+        return Ok(());
+    }
+    let skills = cli.skills();
+    if skills.len() == 1 {
+        let name = &skills[0];
+        paths::validate_skill_name(name)?;
+        if !paths::has_skill(name) {
+            let app = Arc::clone(&ctx.app.config);
+            ctx.upsert_skill(app.as_ref(), name)?;
+            return Ok(());
+        }
+    } else if skills.len() > 1 {
+        for name in &skills {
+            paths::validate_skill_name(name)?;
+            if !paths::has_skill(name) {
+                bail!("Skill '{name}' is not installed");
+            }
+        }
     }
 
     if cli.dry_run {
@@ -302,6 +325,10 @@ async fn run(
         let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
         ctx.apply_prelude(app.as_ref(), abort_signal.clone())
             .await?;
+    }
+
+    for name in &cli.skills() {
+        ctx.load_skill_repl(name, abort_signal.clone()).await?;
     }
 
     match is_repl {
@@ -434,7 +461,7 @@ async fn shell_execute(
                 }
                 'd' => {
                     let role = ctx.retrieve_role(app.as_ref(), EXPLAIN_SHELL_ROLE)?;
-                    let input = Input::from_str(ctx, &eval_str, Some(role));
+                    let input = Input::from_str(ctx, &eval_str, Some(role))?;
                     if input.stream() {
                         call_chat_completions_streaming(
                             &input,
@@ -479,7 +506,7 @@ async fn create_input(
 ) -> Result<Input> {
     let text = text.unwrap_or_default();
     let input = if file.is_empty() {
-        Input::from_str(ctx, &text, None)
+        Input::from_str(ctx, &text, None)?
     } else {
         Input::from_files_with_spinner(ctx, &text, file.to_vec(), None, abort_signal).await?
     };

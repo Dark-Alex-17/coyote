@@ -10,6 +10,7 @@ use clap::ValueHint;
 use clap::{Parser, crate_authors, crate_description, crate_version};
 use clap_complete::ArgValueCompleter;
 use is_terminal::IsTerminal;
+use std::collections::HashSet;
 use std::io::{Read, stdin};
 
 #[derive(Parser, Debug)]
@@ -116,6 +117,14 @@ pub struct Cli {
     /// List all macros
     #[arg(long)]
     pub list_macros: bool,
+    /// List all installed skills
+    #[arg(long)]
+    pub list_skills: bool,
+    /// Pre-load an existing skill into the session (repeatable). If a single
+    /// `--skill <NAME>` is given and the skill doesn't exist, opens $EDITOR
+    /// with a scaffold to create it.
+    #[arg(long, value_name = "NAME")]
+    pub skill: Vec<String>,
     /// Input text
     #[arg(trailing_var_arg = true)]
     text: Vec<String>,
@@ -155,6 +164,18 @@ pub struct Cli {
 }
 
 impl Cli {
+    pub fn skills(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::with_capacity(self.skill.len());
+        for name in &self.skill {
+            if seen.insert(name.clone()) {
+                out.push(name.clone());
+            }
+        }
+
+        out
+    }
+
     pub fn text(&self) -> Result<Option<String>> {
         let mut stdin_text = String::new();
         if !stdin().is_terminal() {
@@ -298,6 +319,36 @@ mod tests {
         assert!(parse(&["--list-agents"]).list_agents);
         assert!(parse(&["--list-rags"]).list_rags);
         assert!(parse(&["--list-macros"]).list_macros);
+        assert!(parse(&["--list-skills"]).list_skills);
+    }
+
+    #[test]
+    fn parse_skill_flag_takes_name() {
+        assert_eq!(parse(&["--skill", "git-master"]).skill, vec!["git-master"]);
+        assert!(parse(&[]).skill.is_empty());
+    }
+
+    #[test]
+    fn parse_multiple_skill_flags_preserves_order() {
+        assert_eq!(
+            parse(&["--skill", "alpha", "--skill", "beta", "--skill", "gamma"]).skill,
+            vec!["alpha", "beta", "gamma"]
+        );
+    }
+
+    #[test]
+    fn skills_method_dedupes_preserving_first_occurrence() {
+        let cli = parse(&[
+            "--skill", "alpha", "--skill", "beta", "--skill", "alpha", "--skill", "gamma",
+            "--skill", "beta",
+        ]);
+
+        assert_eq!(cli.skills(), vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn skills_method_returns_empty_when_no_flags() {
+        assert!(parse(&[]).skills().is_empty());
     }
 
     #[test]

@@ -55,8 +55,8 @@ async fn extract_via_extractor(
 
 fn build_extractor_role() -> Result<Role> {
     let mut role = Role::new(EXTRACTOR_ROLE_NAME, EXTRACTOR_ROLE_PROMPT);
-    role.set_enabled_tools(Some(String::new()));
-    role.set_enabled_mcp_servers(Some(String::new()));
+    role.set_enabled_tools(Some(Vec::new()));
+    role.set_enabled_mcp_servers(Some(Vec::new()));
     Ok(role)
 }
 
@@ -76,7 +76,7 @@ async fn run_one_shot(prompt: &str, ctx: &mut RequestContext) -> Result<String> 
     let abort = create_abort_signal();
     let app_cfg = Arc::clone(&ctx.app.config);
     let role_for_input = ctx.role.clone();
-    let input = Input::from_str(ctx, prompt, role_for_input);
+    let input = Input::from_str(ctx, prompt, role_for_input)?;
     let client = input.create_client()?;
     ctx.before_chat_completion(&input)?;
     let (output, tool_results) =
@@ -183,7 +183,7 @@ mod tests {
     fn build_extractor_role_disables_tools_and_mcp() {
         let role = build_extractor_role().expect("builtin role must exist");
 
-        assert_eq!(role.enabled_tools().as_deref(), Some(""));
-        assert_eq!(role.enabled_mcp_servers().as_deref(), Some(""));
+        assert_eq!(role.enabled_tools().as_deref(), Some([].as_slice()));
+        assert_eq!(role.enabled_mcp_servers().as_deref(), Some([].as_slice()));
     }
 }

@@ -3,7 +3,8 @@ use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, get_env_name};
 
 use super::paths;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
+use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -29,15 +30,23 @@ pub struct AppConfig {
     pub wrap: Option<String>,
     pub wrap_code: bool,
     pub(crate) vault_password_file: Option<PathBuf>,
+    pub(crate) secrets_provider: Option<SupportedProvider>,
 
     pub function_calling_support: bool,
     pub mapping_tools: IndexMap<String, String>,
-    pub enabled_tools: Option<String>,
+    #[serde(default, deserialize_with = "super::deserialize_csv_or_vec")]
+    pub enabled_tools: Option<Vec<String>>,
     pub visible_tools: Option<Vec<String>>,
+
+    pub skills_enabled: bool,
+    #[serde(default, deserialize_with = "super::deserialize_csv_or_vec")]
+    pub enabled_skills: Option<Vec<String>>,
+    pub visible_skills: Option<Vec<String>>,
 
     pub mcp_server_support: bool,
     pub mapping_mcp_servers: IndexMap<String, String>,
-    pub enabled_mcp_servers: Option<String>,
+    #[serde(default, deserialize_with = "super::deserialize_csv_or_vec")]
+    pub enabled_mcp_servers: Option<Vec<String>>,
 
     pub auto_continue: bool,
     pub max_auto_continues: usize,
@@ -90,11 +99,16 @@ impl Default for AppConfig {
             wrap: None,
             wrap_code: false,
             vault_password_file: None,
+            secrets_provider: None,
 
             function_calling_support: true,
             mapping_tools: Default::default(),
             enabled_tools: None,
             visible_tools: None,
+
+            skills_enabled: true,
+            enabled_skills: None,
+            visible_skills: None,
 
             mcp_server_support: true,
             mapping_mcp_servers: Default::default(),
@@ -152,11 +166,16 @@ impl AppConfig {
             wrap: config.wrap,
             wrap_code: config.wrap_code,
             vault_password_file: config.vault_password_file,
+            secrets_provider: config.secrets_provider,
 
             function_calling_support: config.function_calling_support,
             mapping_tools: config.mapping_tools,
             enabled_tools: config.enabled_tools,
             visible_tools: config.visible_tools,
+
+            skills_enabled: config.skills_enabled,
+            enabled_skills: config.enabled_skills,
+            visible_skills: config.visible_skills,
 
             mcp_server_support: config.mcp_server_support,
             mapping_mcp_servers: config.mapping_mcp_servers,
@@ -197,6 +216,7 @@ impl AppConfig {
             clients: config.clients,
         };
         app_config.load_envs();
+        app_config.validate_visible_skills()?;
         if let Some(wrap) = app_config.wrap.clone() {
             app_config.set_wrap(&wrap)?;
         }
@@ -206,11 +226,28 @@ impl AppConfig {
         Ok(app_config)
     }
 
+    fn validate_visible_skills(&self) -> Result<()> {
+        let Some(skills) = self.visible_skills.as_ref() else {
+            return Ok(());
+        };
+
+        for name in skills {
+            paths::validate_skill_name(name)
+                .map_err(|e| anyhow!("invalid entry in visible_skills: {e}"))?;
+
+            if !paths::has_skill(name) {
+                bail!("visible_skills references skill '{name}' which is not installed");
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn resolve_model(&mut self) -> Result<()> {
         if self.model_id.is_empty() {
             let models = list_models(self, crate::client::ModelType::Chat);
             if models.is_empty() {
-                anyhow::bail!("No available model");
+                bail!("No available model");
             }
             self.model_id = models[0].id();
         }
@@ -376,7 +413,15 @@ impl AppConfig {
             self.mapping_tools = v;
         }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("enabled_tools")) {
-            self.enabled_tools = v;
+            self.enabled_tools = v.map(|raw| super::csv_to_vec(&raw));
+        }
+
+        if let Some(Some(v)) = super::read_env_bool(&get_env_name("skills_enabled")) {
+            self.skills_enabled = v;
+        }
+
+        if let Some(v) = super::read_env_value::<String>(&get_env_name("enabled_skills")) {
+            self.enabled_skills = v.map(|raw| super::csv_to_vec(&raw));
         }
 
         if let Some(Some(v)) = super::read_env_bool(&get_env_name("mcp_server_support")) {
@@ -388,7 +433,7 @@ impl AppConfig {
             self.mapping_mcp_servers = v;
         }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("enabled_mcp_servers")) {
-            self.enabled_mcp_servers = v;
+            self.enabled_mcp_servers = v.map(|raw| super::csv_to_vec(&raw));
         }
 
         if let Some(v) = super::read_env_value::<String>(&get_env_name("repl_prelude")) {
@@ -490,12 +535,12 @@ impl AppConfig {
     }
 
     #[allow(dead_code)]
-    pub fn set_enabled_tools_default(&mut self, value: Option<String>) {
+    pub fn set_enabled_tools_default(&mut self, value: Option<Vec<String>>) {
         self.enabled_tools = value;
     }
 
     #[allow(dead_code)]
-    pub fn set_enabled_mcp_servers_default(&mut self, value: Option<String>) {
+    pub fn set_enabled_mcp_servers_default(&mut self, value: Option<Vec<String>>) {
         self.enabled_mcp_servers = value;
     }
 
@@ -751,5 +796,43 @@ mod tests {
 
         app.resolve_model().unwrap();
         assert_eq!(app.model_id, "provider:explicit");
+    }
+
+    #[test]
+    fn default_secrets_provider_is_none() {
+        let app = AppConfig::default();
+        assert!(app.secrets_provider.is_none());
+    }
+
+    #[test]
+    fn secrets_provider_can_hold_non_local_variant() {
+        let app = AppConfig {
+            secrets_provider: Some(SupportedProvider::Gopass {
+                provider_def: Default::default(),
+            }),
+            ..AppConfig::default()
+        };
+        assert!(matches!(
+            app.secrets_provider,
+            Some(SupportedProvider::Gopass { .. })
+        ));
+    }
+
+    #[test]
+    fn from_config_copies_secrets_provider() {
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            clients: vec![ClientConfig::default()],
+            secrets_provider: Some(SupportedProvider::Gopass {
+                provider_def: Default::default(),
+            }),
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+        assert!(matches!(
+            app.secrets_provider,
+            Some(SupportedProvider::Gopass { .. })
+        ));
     }
 }

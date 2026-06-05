@@ -38,10 +38,10 @@ pub struct Input {
 }
 
 impl Input {
-    pub fn from_str(ctx: &RequestContext, text: &str, role: Option<Role>) -> Self {
-        let (role, with_session, with_agent) = resolve_role(ctx, role);
+    pub fn from_str(ctx: &RequestContext, text: &str, role: Option<Role>) -> Result<Self> {
+        let (role, with_session, with_agent) = resolve_role(ctx, role)?;
         let captured = capture_input_config(ctx, &role);
-        Self {
+        Ok(Self {
             app_config: Arc::clone(&ctx.app.config),
             stream_enabled: captured.stream_enabled,
             session: captured.session,
@@ -60,7 +60,7 @@ impl Input {
             rag_name: None,
             with_session,
             with_agent,
-        }
+        })
     }
 
     pub async fn from_files(
@@ -111,7 +111,7 @@ impl Input {
                 ));
             }
         }
-        let (role, with_session, with_agent) = resolve_role(ctx, role);
+        let (role, with_session, with_agent) = resolve_role(ctx, role)?;
         let captured = capture_input_config(ctx, &role);
         Ok(Self {
             app_config: Arc::clone(&ctx.app.config),
@@ -398,14 +398,14 @@ impl Input {
     }
 }
 
-fn resolve_role(ctx: &RequestContext, role: Option<Role>) -> (Role, bool, bool) {
+fn resolve_role(ctx: &RequestContext, role: Option<Role>) -> Result<(Role, bool, bool)> {
     match role {
-        Some(v) => (v, false, false),
-        None => (
-            ctx.extract_role(ctx.app.config.as_ref()),
+        Some(v) => Ok((v, false, false)),
+        None => Ok((
+            ctx.extract_role(ctx.app.config.as_ref())?,
             ctx.session.is_some(),
             ctx.agent.is_some(),
-        ),
+        )),
     }
 }
 
@@ -600,7 +600,7 @@ mod tests {
     fn resolve_role_with_explicit_role() {
         let ctx = create_test_ctx();
         let role = Role::new("custom", "be helpful");
-        let (resolved, with_session, with_agent) = resolve_role(&ctx, Some(role));
+        let (resolved, with_session, with_agent) = resolve_role(&ctx, Some(role)).unwrap();
         assert_eq!(resolved.name(), "custom");
         assert!(!with_session);
         assert!(!with_agent);
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn resolve_role_without_role_no_session_no_agent() {
         let ctx = create_test_ctx();
-        let (resolved, with_session, with_agent) = resolve_role(&ctx, None);
+        let (resolved, with_session, with_agent) = resolve_role(&ctx, None).unwrap();
         assert_eq!(resolved.name(), "");
         assert!(!with_session);
         assert!(!with_agent);
@@ -619,7 +619,7 @@ mod tests {
     fn resolve_role_without_role_with_session() {
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
-        let (_resolved, with_session, with_agent) = resolve_role(&ctx, None);
+        let (_resolved, with_session, with_agent) = resolve_role(&ctx, None).unwrap();
         assert!(with_session);
         assert!(!with_agent);
     }
@@ -629,7 +629,7 @@ mod tests {
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
         let role = Role::new("explicit", "prompt");
-        let (_resolved, with_session, _with_agent) = resolve_role(&ctx, Some(role));
+        let (_resolved, with_session, _with_agent) = resolve_role(&ctx, Some(role)).unwrap();
         assert!(!with_session);
     }
 
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn input_from_str_captures_text() {
         let ctx = create_test_ctx();
-        let input = Input::from_str(&ctx, "hello world", None);
+        let input = Input::from_str(&ctx, "hello world", None).unwrap();
         assert_eq!(input.text(), "hello world");
     }
 
@@ -703,7 +703,7 @@ mod tests {
     fn input_from_str_with_explicit_role() {
         let ctx = create_test_ctx();
         let role = Role::new("pirate", "you are a pirate");
-        let input = Input::from_str(&ctx, "ahoy", Some(role));
+        let input = Input::from_str(&ctx, "ahoy", Some(role)).unwrap();
         assert_eq!(input.role().name(), "pirate");
         assert!(!input.with_agent());
     }
@@ -715,28 +715,28 @@ mod tests {
         config.stream = false;
         state.config = Arc::new(config);
         let ctx = RequestContext::new(Arc::new(state), WorkingMode::Cmd);
-        let input = Input::from_str(&ctx, "test", None);
+        let input = Input::from_str(&ctx, "test", None).unwrap();
         assert!(!input.stream_enabled);
     }
 
     #[test]
     fn input_is_empty_with_no_text_and_no_medias() {
         let ctx = create_test_ctx();
-        let input = Input::from_str(&ctx, "", None);
+        let input = Input::from_str(&ctx, "", None).unwrap();
         assert!(input.is_empty());
     }
 
     #[test]
     fn input_is_not_empty_with_text() {
         let ctx = create_test_ctx();
-        let input = Input::from_str(&ctx, "hello", None);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
         assert!(!input.is_empty());
     }
 
     #[test]
     fn input_set_text_changes_text() {
         let ctx = create_test_ctx();
-        let mut input = Input::from_str(&ctx, "original", None);
+        let mut input = Input::from_str(&ctx, "original", None).unwrap();
         input.set_text("modified".to_string());
         assert_eq!(input.text(), "modified");
     }
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn input_text_returns_patched_when_set() {
         let ctx = create_test_ctx();
-        let mut input = Input::from_str(&ctx, "original", None);
+        let mut input = Input::from_str(&ctx, "original", None).unwrap();
         input.patched_text = Some("patched".to_string());
         assert_eq!(input.text(), "patched");
     }
@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn input_clear_patch_restores_original() {
         let ctx = create_test_ctx();
-        let mut input = Input::from_str(&ctx, "original", None);
+        let mut input = Input::from_str(&ctx, "original", None).unwrap();
         input.patched_text = Some("patched".to_string());
         input.clear_patch();
         assert_eq!(input.text(), "original");
@@ -761,7 +761,7 @@ mod tests {
     #[test]
     fn input_set_continue_output_accumulates() {
         let ctx = create_test_ctx();
-        let mut input = Input::from_str(&ctx, "test", None);
+        let mut input = Input::from_str(&ctx, "test", None).unwrap();
         assert!(input.continue_output().is_none());
         input.set_continue_output("first ");
         assert_eq!(input.continue_output(), Some("first "));
@@ -772,7 +772,7 @@ mod tests {
     #[test]
     fn input_set_regenerate_sets_flag_and_clears_tool_calls() {
         let ctx = create_test_ctx();
-        let mut input = Input::from_str(&ctx, "test", None);
+        let mut input = Input::from_str(&ctx, "test", None).unwrap();
         let role = input.role().clone();
         assert!(!input.regenerate());
         input.set_regenerate(role);
@@ -784,7 +784,7 @@ mod tests {
     fn input_summary_truncates_long_text() {
         let ctx = create_test_ctx();
         let long_text = "a".repeat(200);
-        let input = Input::from_str(&ctx, &long_text, None);
+        let input = Input::from_str(&ctx, &long_text, None).unwrap();
         let summary = input.summary();
         assert!(summary.len() < 200);
         assert!(summary.ends_with("..."));
@@ -793,35 +793,35 @@ mod tests {
     #[test]
     fn input_summary_preserves_short_text() {
         let ctx = create_test_ctx();
-        let input = Input::from_str(&ctx, "short", None);
+        let input = Input::from_str(&ctx, "short", None).unwrap();
         assert_eq!(input.summary(), "short");
     }
 
     #[test]
     fn input_raw_with_no_files() {
         let ctx = create_test_ctx();
-        let input = Input::from_str(&ctx, "hello", None);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
         assert_eq!(input.raw(), "hello");
     }
 
     #[test]
     fn input_render_with_no_medias() {
         let ctx = create_test_ctx();
-        let input = Input::from_str(&ctx, "hello", None);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
         assert_eq!(input.render(), "hello");
     }
 
     #[test]
     fn input_with_agent_false_when_no_agent() {
         let ctx = create_test_ctx();
-        let input = Input::from_str(&ctx, "test", None);
+        let input = Input::from_str(&ctx, "test", None).unwrap();
         assert!(!input.with_agent());
     }
 
     #[test]
     fn input_session_returns_none_when_with_session_false() {
         let ctx = create_test_ctx();
-        let input = Input::from_str(&ctx, "test", Some(Role::new("r", "p")));
+        let input = Input::from_str(&ctx, "test", Some(Role::new("r", "p"))).unwrap();
         let session = Some(Session::default());
         assert!(input.session(&session).is_none());
     }
@@ -830,7 +830,7 @@ mod tests {
     fn input_session_returns_some_when_with_session_true() {
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
-        let input = Input::from_str(&ctx, "test", None);
+        let input = Input::from_str(&ctx, "test", None).unwrap();
         let session = Some(Session::default());
         assert!(input.session(&session).is_some());
     }

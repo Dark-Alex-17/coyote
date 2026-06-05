@@ -32,7 +32,7 @@ def main():
     agent_data = parse_raw_data(raw_data)
 
     root_dir = "{config_dir}"
-    setup_env(root_dir, agent_func)
+    setup_env(root_dir, agent_func, raw_data)
 
     agent_tools_path = os.path.join(root_dir, "agents/{agent_name}/tools.py")
     run(agent_tools_path, agent_func, agent_data)
@@ -65,13 +65,14 @@ def parse_argv():
     return agent_func, agent_data
 
 
-def setup_env(root_dir, agent_func):
+def setup_env(root_dir, agent_func, raw_data):
     load_env(os.path.join(root_dir, ".env"))
     os.environ["LLM_ROOT_DIR"] = root_dir
     os.environ["LLM_AGENT_NAME"] = "{agent_name}"
     os.environ["LLM_AGENT_FUNC"] = agent_func
     os.environ["LLM_AGENT_ROOT_DIR"] = os.path.join(root_dir, "agents", "{agent_name}")
     os.environ["LLM_AGENT_CACHE_DIR"] = os.path.join(root_dir, "cache", "{agent_name}")
+    os.environ["LLM_AGENT_RAW_JSON"] = raw_data
 
 
 def load_env(file_path):

@@ -24,10 +24,26 @@ pub struct Session {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_tools: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_mcp_servers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    enabled_tools: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    enabled_mcp_servers: Option<String>,
+    skills_enabled: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_skills: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     save_session: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,8 +91,23 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new_from_ctx(ctx: &RequestContext, app: &AppConfig, name: &str) -> Self {
-        let role = ctx.extract_role(app);
+    pub fn skills_enabled(&self) -> Option<bool> {
+        self.skills_enabled
+    }
+
+    pub fn enabled_skills(&self) -> Option<&[String]> {
+        self.enabled_skills.as_deref()
+    }
+
+    pub fn set_skills_enabled(&mut self, value: Option<bool>) {
+        if self.skills_enabled != value {
+            self.skills_enabled = value;
+            self.dirty = true;
+        }
+    }
+
+    pub fn new_from_ctx(ctx: &RequestContext, app: &AppConfig, name: &str) -> Result<Self> {
+        let role = ctx.extract_role(app)?;
         let mut session = Self {
             name: name.to_string(),
             save_session: app.save_session,
@@ -84,7 +115,7 @@ impl Session {
         };
         session.set_role(role);
         session.dirty = false;
-        session
+        Ok(session)
     }
 
     pub fn load_from_ctx(
@@ -170,10 +201,16 @@ impl Session {
             data["top_p"] = top_p.into();
         }
         if let Some(enabled_tools) = self.enabled_tools() {
-            data["enabled_tools"] = enabled_tools.into();
+            data["enabled_tools"] = json!(enabled_tools);
         }
         if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
-            data["enabled_mcp_servers"] = enabled_mcp_servers.into();
+            data["enabled_mcp_servers"] = json!(enabled_mcp_servers);
+        }
+        if let Some(skills_enabled) = self.skills_enabled() {
+            data["skills_enabled"] = skills_enabled.into();
+        }
+        if let Some(enabled_skills) = self.enabled_skills() {
+            data["enabled_skills"] = json!(enabled_skills);
         }
         if let Some(save_session) = self.save_session() {
             data["save_session"] = save_session.into();
@@ -230,11 +267,19 @@ impl Session {
         }
 
         if let Some(enabled_tools) = self.enabled_tools() {
-            items.push(("enabled_tools", enabled_tools));
+            items.push(("enabled_tools", enabled_tools.join(",")));
         }
 
         if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
-            items.push(("enabled_mcp_servers", enabled_mcp_servers));
+            items.push(("enabled_mcp_servers", enabled_mcp_servers.join(",")));
+        }
+
+        if let Some(skills_enabled) = self.skills_enabled() {
+            items.push(("skills_enabled", skills_enabled.to_string()));
+        }
+
+        if let Some(enabled_skills) = self.enabled_skills() {
+            items.push(("enabled_skills", enabled_skills.join(",")));
         }
 
         if let Some(save_session) = self.save_session() {
@@ -670,11 +715,11 @@ impl RoleLike for Session {
         self.top_p
     }
 
-    fn enabled_tools(&self) -> Option<String> {
+    fn enabled_tools(&self) -> Option<Vec<String>> {
         self.enabled_tools.clone()
     }
 
-    fn enabled_mcp_servers(&self) -> Option<String> {
+    fn enabled_mcp_servers(&self) -> Option<Vec<String>> {
         self.enabled_mcp_servers.clone()
     }
 
@@ -701,14 +746,14 @@ impl RoleLike for Session {
         }
     }
 
-    fn set_enabled_tools(&mut self, value: Option<String>) {
+    fn set_enabled_tools(&mut self, value: Option<Vec<String>>) {
         if self.enabled_tools != value {
             self.enabled_tools = value;
             self.dirty = true;
         }
     }
 
-    fn set_enabled_mcp_servers(&mut self, value: Option<String>) {
+    fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>) {
         if self.enabled_mcp_servers != value {
             self.enabled_mcp_servers = value;
             self.dirty = true;
@@ -772,7 +817,7 @@ mod tests {
             functions: Functions::default(),
         });
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
-        let session = Session::new_from_ctx(&ctx, &app_config, "test-session");
+        let session = Session::new_from_ctx(&ctx, &app_config, "test-session").unwrap();
 
         assert_eq!(session.name(), "test-session");
         assert_eq!(session.save_session(), app_config.save_session);

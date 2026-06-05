@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -e
 
-# @describe Apply a patch to a file at the specified path.
-# This can be used to edit a file without having to rewrite the whole file.
+# @describe Apply a unified-diff patch to a file at the specified path. Use this for editing an existing file. It's the
+# PREFERRED way to modify a file. Prefer this over fs_write whenever the file already exists: it sends less data,
+# preserves unchanged content automatically, and is less prone to accidental data loss from full rewrites.
+# Use fs_write only when you are creating a new file or doing a complete rewrite where most of the content changes.
 
 # @option --path! The path of the file to apply the patch to
 # @option --contents! The patch to apply to the file
@@ -14,6 +16,9 @@ source "$LLM_PROMPT_UTILS_FILE"
 
 # shellcheck disable=SC2154
 main() {
+    argc_contents="$(jq -r '.contents' <<< "$LLM_TOOL_RAW_JSON")"
+    argc_path="$(jq -r '.path' <<< "$LLM_TOOL_RAW_JSON")"
+
     if [[ ! -f "$argc_path" ]]; then
         error "Unable to find the specified file: $argc_path"
         exit 1
