@@ -507,7 +507,9 @@ open_link() {
 
 guard_operation() {
 	if [[ -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
-		ans="$(confirm "${1:-Are you sure you want to continue?}")"
+		# 2>/dev/tty: keep the prompt off the host-captured stderr pipe so it
+		# can't leak into tool_call_error JSON when the wrapped command fails.
+		ans="$(confirm "${1:-Are you sure you want to continue?}" 2>/dev/tty)"
 
 		if [[ "$ans" == 0 ]]; then
 			error "Operation aborted!" 2>&1
@@ -657,7 +659,8 @@ guard_path() {
 	confirmation_prompt="$2"
 
 	if [[ ! "$path" == "$(pwd)"* && -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
-		ans="$(confirm "$confirmation_prompt")"
+		# 2>/dev/tty: see guard_operation — prevents prompt text leaking via captured stderr.
+		ans="$(confirm "$confirmation_prompt" 2>/dev/tty)"
 
 		if [[ "$ans" == 0 ]]; then
 			error "Operation aborted!" >&2
