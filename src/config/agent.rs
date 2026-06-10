@@ -352,6 +352,10 @@ impl Agent {
         self.config.enabled_skills.as_deref()
     }
 
+    pub fn memory(&self) -> Option<bool> {
+        self.config.memory
+    }
+
     pub fn set_skills_enabled(&mut self, value: Option<bool>) {
         self.config.skills_enabled = value;
     }
@@ -637,6 +641,8 @@ pub struct AgentConfig {
     pub inject_skill_instructions: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compression_threshold: Option<usize>,
     #[serde(default)]

@@ -83,6 +83,8 @@ pub struct Role {
     inject_skill_instructions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skill_instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory: Option<bool>,
 
     #[serde(skip)]
     model: Model,
@@ -132,6 +134,7 @@ impl Role {
                     "skill_instructions" => {
                         role.skill_instructions = value.as_str().map(|v| v.to_string())
                     }
+                    "memory" => role.memory = value.as_bool(),
                     _ => (),
                 }
             }
@@ -204,6 +207,9 @@ impl Role {
         }
         if let Some(skill_instructions) = &self.skill_instructions {
             metadata.push(format!("skill_instructions: {skill_instructions}"));
+        }
+        if let Some(memory) = self.memory {
+            metadata.push(format!("memory: {memory}"));
         }
         if metadata.is_empty() {
             format!("{}\n", self.prompt)
@@ -321,6 +327,10 @@ impl Role {
 
     pub fn skill_instructions(&self) -> Option<&str> {
         self.skill_instructions.as_deref()
+    }
+
+    pub fn memory(&self) -> Option<bool> {
+        self.memory
     }
 
     pub fn skills_enabled(&self) -> Option<bool> {

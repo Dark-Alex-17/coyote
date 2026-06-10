@@ -46,6 +46,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{env, fs};
+use super::memory::{WorkspaceMemory, MemoryStore};
 
 pub struct AutoContinueConfig {
     pub enabled: bool,
@@ -57,6 +58,21 @@ pub struct AutoContinueConfig {
 pub struct SkillInstructionsConfig {
     pub inject: bool,
     pub instructions: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryConfig {
+    pub enabled: bool,
+    pub workspace: Option<WorkspaceMemory>,
+}
+
+impl MemoryConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            workspace: None,
+        }
+    }
 }
 
 /// Must stay in sync with the predicate that registers `skill__*` tools in `rebuild_tool_scope`
@@ -703,6 +719,52 @@ impl RequestContext {
             inject,
             instructions,
         }
+    }
+
+    pub fn memory_config(&self) -> MemoryConfig {
+        if let Some(agent) = &self.agent
+            && graph::agent_has_graph(agent.name())
+        {
+            return MemoryConfig::disabled();
+        }
+
+        let agent_pref = self.agent.as_ref().and_then(|a| a.memory());
+        let session_pref = self.session.as_ref().and_then(|s| s.memory());
+        let role_pref = self.role.as_ref().and_then(|r| r.memory());
+        let app_pref = self.app.config.memory;
+
+        let resolved = agent_pref
+            .or(session_pref)
+            .or(role_pref)
+            .or(app_pref)
+            .unwrap_or(true);
+        if !resolved {
+            return MemoryConfig::disabled();
+        }
+
+        let cwd = env::current_dir().ok();
+        let store = cwd.as_deref().map(MemoryStore::new);
+        let workspace = store.as_ref().and_then(|s| s.workspace.clone());
+
+        let global_exists = paths::global_memory_index_path().exists();
+        let workspace_exists = workspace.is_some();
+
+        if !global_exists && !workspace_exists {
+            return MemoryConfig::disabled();
+        }
+
+        MemoryConfig {
+            enabled: true,
+            workspace,
+        }
+    }
+
+    pub fn should_inject_memory(&self) -> bool {
+        self.memory_config().enabled
+    }
+
+    pub fn should_register_memory_tools(&self) -> bool {
+        self.should_inject_memory() && self.app.config.function_calling_support
     }
 
     pub fn auto_continue_config(&self) -> AutoContinueConfig {

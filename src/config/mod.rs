@@ -231,6 +231,10 @@ pub struct Config {
     pub summarization_prompt: Option<String>,
     pub summary_context_prompt: Option<String>,
 
+    pub memory: Option<bool>,
+    pub memory_cap_with_tools: Option<usize>,
+    pub memory_cap_without_tools: Option<usize>,
+
     pub rag_embedding_model: Option<String>,
     pub rag_reranker_model: Option<String>,
     pub rag_top_k: usize,
@@ -298,6 +302,10 @@ impl Default for Config {
             compression_threshold: 4000,
             summarization_prompt: None,
             summary_context_prompt: None,
+
+            memory: None,
+            memory_cap_with_tools: None,
+            memory_cap_without_tools: None,
 
             rag_embedding_model: None,
             rag_reranker_model: None,

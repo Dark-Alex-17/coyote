@@ -60,6 +60,8 @@ pub struct Session {
     inject_skill_instructions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skill_instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     role_name: Option<String>,
@@ -237,6 +239,9 @@ impl Session {
         if let Some(skill_instructions) = self.skill_instructions() {
             data["skill_instructions"] = skill_instructions.into();
         }
+        if let Some(memory) = self.memory() {
+            data["memory"] = memory.into();
+        }
         let (tokens, percent) = self.tokens_usage();
         data["total_tokens"] = tokens.into();
         if let Some(max_input_tokens) = self.model().max_input_tokens() {
@@ -323,6 +328,9 @@ impl Session {
         }
         if let Some(skill_instructions) = self.skill_instructions() {
             items.push(("skill_instructions", skill_instructions.to_string()));
+        }
+        if let Some(memory) = self.memory() {
+            items.push(("memory", memory.to_string()));
         }
 
         if let Some(max_input_tokens) = self.model().max_input_tokens() {
@@ -473,6 +481,10 @@ impl Session {
         self.skill_instructions.as_deref()
     }
 
+    pub fn memory(&self) -> Option<bool> {
+        self.memory
+    }
+
     pub fn set_inject_todo_instructions(&mut self, value: Option<bool>) {
         if self.inject_todo_instructions != value {
             self.inject_todo_instructions = value;
@@ -490,6 +502,13 @@ impl Session {
     pub fn set_inject_skill_instructions(&mut self, value: Option<bool>) {
         if self.inject_skill_instructions != value {
             self.inject_skill_instructions = value;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_memory(&mut self, value: Option<bool>) {
+        if self.memory != value {
+            self.memory = value;
             self.dirty = true;
         }
     }
