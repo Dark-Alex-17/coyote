@@ -1,10 +1,5 @@
 use super::role::Role;
-use super::{
-    AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME,
-    ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME, GLOBAL_TOOLS_DIR_NAME,
-    GLOBAL_TOOLS_UTILS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, ModelsOverride, RAGS_DIR_NAME,
-    ROLES_DIR_NAME, SKILLS_DIR_NAME,
-};
+use super::{AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME, ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME, GLOBAL_TOOLS_DIR_NAME, GLOBAL_TOOLS_UTILS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME, SKILLS_DIR_NAME, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME};
 use crate::client::ProviderModels;
 use crate::utils::{get_env_name, list_file_names, normalize_env_name};
 
@@ -193,6 +188,14 @@ pub fn agent_functions_file(name: &str) -> Result<PathBuf> {
 
 pub fn models_override_file() -> PathBuf {
     local_path("models-override.yaml")
+}
+
+pub fn global_memory_dir() -> PathBuf {
+    config_dir().join(MEMORY_DIR_NAME)
+}
+
+pub fn global_memory_index_path() -> PathBuf {
+    global_memory_dir().join(MEMORY_INDEX_FILE_NAME)
 }
 
 pub fn log_config() -> Result<(LevelFilter, Option<PathBuf>)> {

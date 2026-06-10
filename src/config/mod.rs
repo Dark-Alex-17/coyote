@@ -5,6 +5,7 @@ mod input;
 mod install_remote;
 mod macros;
 mod mcp_factory;
+pub(crate) mod memory;
 pub(crate) mod paths;
 pub(crate) mod prompts;
 mod rag_cache;
@@ -138,6 +139,10 @@ const GLOBAL_TOOLS_DIR_NAME: &str = "tools";
 const GLOBAL_TOOLS_UTILS_DIR_NAME: &str = "utils";
 const BASH_PROMPT_UTILS_FILE_NAME: &str = "prompt-utils.sh";
 const MCP_FILE_NAME: &str = "mcp.json";
+const MEMORY_DIR_NAME: &str = "memory";
+const MEMORY_INDEX_FILE_NAME: &str = "MEMORY.md";
+const WORKSPACE_MEMORY_FILE_NAME: &str = "COYOTE.md";
+const WORKSPACE_MEMORY_DIR_NAME: &str = ".coyote";
 const DEFAULT_VISIBLE_TOOLS: [&str; 18] = [
     "execute_command.sh",
     "execute_py_code.py",
