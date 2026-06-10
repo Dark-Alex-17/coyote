@@ -119,7 +119,11 @@ fn prepare_chat_completions(
             format!("{base_url}/google/models/{model_name}:{func}")
         }
         ModelCategory::Claude => {
-            format!("{base_url}/anthropic/models/{model_name}:streamRawPredict")
+            let func = match data.stream {
+                true => "streamRawPredict",
+                false => "rawPredict",
+            };
+            format!("{base_url}/anthropic/models/{model_name}:{func}")
         }
         ModelCategory::Mistral => {
             let func = match data.stream {

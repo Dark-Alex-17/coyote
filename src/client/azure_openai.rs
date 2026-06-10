@@ -18,7 +18,7 @@ pub struct AzureOpenAIConfig {
 impl AzureOpenAIClient {
     config_get_fn!(api_base, get_api_base);
     config_get_fn!(api_key, get_api_key);
-    
+
     create_client_config!([
         (
             "api_base",
