@@ -75,6 +75,9 @@ pub struct Cli {
     /// Turn off stream mode
     #[arg(short = 'S', long)]
     pub no_stream: bool,
+    /// Disable memory for this invocation
+    #[arg(long)]
+    pub no_memory: bool,
     /// Display the message without sending it
     #[arg(long)]
     pub dry_run: bool,
