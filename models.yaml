@@ -329,6 +329,13 @@
 #  - https://docs.anthropic.com/en/api/messages
 - provider: claude
   models:
+    - name: claude-fable-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 10
+      output_price: 50
+      supports_function_calling: true
+      supports_vision: true
     - name: claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -867,6 +874,13 @@
       max_input_tokens: 1048576
       supports_vision: true
       supports_function_calling: true
+    - name: claude-fable-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 10
+      output_price: 50
+      supports_function_calling: true
+      supports_vision: true
     - name: claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1038,6 +1052,13 @@
 #  - https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-call.html
 - provider: bedrock
   models:
+    - name: us.anthropic.claude-fable-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 10
+      output_price: 50
+      supports_function_calling: true
+      supports_vision: true
     - name: us.anthropic.claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1729,6 +1750,13 @@
       max_input_tokens: 131072
       input_price: 0.1
       output_price: 0.2
+    - name: anthropic/claude-fable-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 10
+      output_price: 50
+      supports_function_calling: true
+      supports_vision: true
     - name: anthropic/claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
