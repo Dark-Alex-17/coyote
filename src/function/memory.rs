@@ -1,6 +1,6 @@
 use std::collections::HashSet;
-use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::{env, fs};
 
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
@@ -192,22 +192,52 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
                 path: target_dir.join(format!("{name}.md")),
                 frontmatter: MemoryFrontmatter {
                     name: name.clone(),
-                    description: Some(description),
+                    description: Some(description.clone()),
                     kind,
                 },
                 body: content,
             };
             file.save()?;
 
+            let index_path = target_dir.join("MEMORY.md");
+            let index_updated = ensure_index_entry(&index_path, &name, &description)?;
+
             Ok(json!({
                 "status": "ok",
                 "path": file.path.display().to_string(),
-                "reminder": "Update MEMORY.md to keep the index accurate.",
+                "index_path": index_path.display().to_string(),
+                "index_updated": index_updated,
             }))
         }
         "lint" => lint_memory(&store),
         _ => bail!("unknown memory action: {action}"),
     }
+}
+
+fn ensure_index_entry(index_path: &Path, name: &str, description: &str) -> Result<bool> {
+    let existing = fs::read_to_string(index_path).unwrap_or_default();
+    let already_referenced =
+        existing.contains(&format!("[[{name}]]")) || existing.contains(&format!("{name}.md"));
+
+    if already_referenced {
+        return Ok(false);
+    }
+
+    let entry = format!("- [[{name}]]: {description}\n");
+    let new_content = if existing.is_empty() {
+        format!("# Memory Index\n\n{entry}")
+    } else if existing.ends_with('\n') {
+        format!("{existing}{entry}")
+    } else {
+        format!("{existing}\n{entry}")
+    };
+
+    if let Some(parent) = index_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(index_path, new_content)?;
+    Ok(true)
 }
 
 fn arg_str(args: &Value, key: &str) -> Result<String> {
@@ -337,6 +367,49 @@ mod tests {
     fn extract_wikilinks_handles_empty_and_no_links() {
         assert!(extract_wikilinks("").is_empty());
         assert!(extract_wikilinks("nothing here").is_empty());
+    }
+
+    #[test]
+    fn ensure_index_entry_appends_when_missing() {
+        let root = temp_root("index_append");
+        let index = root.join("MEMORY.md");
+        fs::write(&index, "# Memory Index\n\n- [[existing]] — already here\n").unwrap();
+
+        let updated = ensure_index_entry(&index, "new_one", "newly added").unwrap();
+        assert!(updated);
+        let content = fs::read_to_string(&index).unwrap();
+        assert!(content.contains("- [[existing]] — already here"));
+        assert!(content.contains("- [[new_one]] — newly added"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_index_entry_skips_when_referenced() {
+        let root = temp_root("index_skip");
+        let index = root.join("MEMORY.md");
+        let original = "# Memory Index\n\n- [[existing]] — already here\n";
+        fs::write(&index, original).unwrap();
+
+        let updated = ensure_index_entry(&index, "existing", "different description").unwrap();
+        assert!(!updated);
+        assert_eq!(fs::read_to_string(&index).unwrap(), original);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_index_entry_creates_index_when_absent() {
+        let root = temp_root("index_create");
+        let index = root.join("memory").join("MEMORY.md");
+
+        let updated = ensure_index_entry(&index, "first", "first ever").unwrap();
+        assert!(updated);
+        let content = fs::read_to_string(&index).unwrap();
+        assert!(content.starts_with("# Memory Index"));
+        assert!(content.contains("- [[first]] — first ever"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
