@@ -253,8 +253,7 @@ fn workspace_label(w: &WorkspaceMemory) -> Value {
 
 fn lint_memory(store: &MemoryStore) -> Result<Value> {
     let files = store.list_files()?;
-    let names: HashSet<&str> =
-        files.iter().map(|f| f.frontmatter.name.as_str()).collect();
+    let names: HashSet<&str> = files.iter().map(|f| f.frontmatter.name.as_str()).collect();
 
     let mut oversized = Vec::new();
     let mut broken_links = Vec::new();
@@ -293,12 +292,13 @@ fn extract_wikilinks(body: &str) -> Vec<String> {
     let bytes = body.as_bytes();
     let mut i = 0;
     while i + 1 < bytes.len() {
-        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
-            if let Some(end_rel) = body[i + 2..].find("]]") {
-                out.push(body[i + 2..i + 2 + end_rel].to_string());
-                i = i + 2 + end_rel + 2;
-                continue;
-            }
+        if bytes[i] == b'['
+            && bytes[i + 1] == b'['
+            && let Some(end_rel) = body[i + 2..].find("]]")
+        {
+            out.push(body[i + 2..i + 2 + end_rel].to_string());
+            i = i + 2 + end_rel + 2;
+            continue;
         }
         i += 1;
     }
@@ -466,10 +466,7 @@ mod tests {
         assert!(!orphan_names.contains(&"referenced"));
 
         let broken = report["broken_wikilinks"].as_array().unwrap();
-        let broken_targets: Vec<&str> = broken
-            .iter()
-            .filter_map(|v| v["to"].as_str())
-            .collect();
+        let broken_targets: Vec<&str> = broken.iter().filter_map(|v| v["to"].as_str()).collect();
         assert!(broken_targets.contains(&"missing"));
         assert!(broken_targets.contains(&"also_missing"));
 

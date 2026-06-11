@@ -20,10 +20,10 @@ use crate::parsers::{bash, python, typescript};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use indoc::formatdoc;
+use memory::MEMORY_FUNCTION_PREFIX;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use memory::MEMORY_FUNCTION_PREFIX;
 use skill::SKILL_FUNCTION_PREFIX;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -360,6 +360,11 @@ impl Functions {
     pub fn append_memory_functions(&mut self) {
         self.declarations
             .extend(memory::memory_function_declarations());
+    }
+
+    pub fn remove_memory_functions(&mut self) {
+        self.declarations
+            .retain(|f| !f.name.starts_with(MEMORY_FUNCTION_PREFIX));
     }
 
     pub fn append_skill_functions(&mut self) {

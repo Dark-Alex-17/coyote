@@ -5,7 +5,13 @@ use super::skill_policy::SkillPolicy;
 use super::skill_registry::SkillRegistry;
 use super::todo::TodoList;
 use super::tool_scope::{McpRuntime, ToolScope};
-use super::{AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE, Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, RIGHT_PROMPT, Role, RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags, TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, paths, memory};
+use super::{
+    AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
+    Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, RIGHT_PROMPT, Role,
+    RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
+    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, memory,
+    paths,
+};
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
@@ -25,6 +31,9 @@ use crate::utils::{
     list_file_names, now, render_prompt, temp_file,
 };
 
+use super::memory::{
+    DEFAULT_MEMORY_CAP_WITH_TOOLS, DEFAULT_MEMORY_CAP_WITHOUT_TOOLS, MemoryStore, WorkspaceMemory,
+};
 use crate::graph;
 use anyhow::{Context, Error, Result, bail};
 use gman::providers::SupportedProvider;
@@ -41,7 +50,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{env, fs};
-use super::memory::{WorkspaceMemory, MemoryStore, DEFAULT_MEMORY_CAP_WITH_TOOLS, DEFAULT_MEMORY_CAP_WITHOUT_TOOLS};
 
 pub struct AutoContinueConfig {
     pub enabled: bool,
@@ -677,11 +685,13 @@ impl RequestContext {
             }
         }
 
-        if self.should_inject_memory()
-            && let Some(cwd) = env::current_dir().ok()
-        {
-            let store = MemoryStore::new(&cwd);
-            let with_tools = self.should_register_memory_tools();
+        let memory_config = self.memory_config();
+        if memory_config.enabled {
+            let store = MemoryStore {
+                global_dir: paths::global_memory_dir(),
+                workspace: memory_config.workspace,
+            };
+            let with_tools = app.function_calling_support;
             let cap = if with_tools {
                 app.memory_cap_with_tools
                     .unwrap_or(DEFAULT_MEMORY_CAP_WITH_TOOLS)
@@ -2078,6 +2088,24 @@ impl RequestContext {
                     self.update_app_config(|app| app.skill_instructions = value);
                 }
             }
+            "memory" => {
+                let value: bool = value.parse().with_context(|| "Invalid value")?;
+
+                if let Some(session) = self.session.as_mut() {
+                    session.set_memory(Some(value));
+                } else {
+                    self.update_app_config(|app| app.memory = Some(value));
+                }
+
+                let should_register = self.should_register_memory_tools();
+                let already_registered = self.tool_scope.functions.contains("memory__read");
+
+                if should_register && !already_registered {
+                    self.tool_scope.functions.append_memory_functions();
+                } else if !should_register && already_registered {
+                    self.tool_scope.functions.remove_memory_functions();
+                }
+            }
             _ => bail!("Unknown key '{key}'"),
         }
         Ok(())
@@ -2350,6 +2378,7 @@ impl RequestContext {
                     super::complete_bool(config.inject)
                 }
                 "skill_instructions" => vec!["null".to_string()],
+                "memory" => super::complete_bool(self.should_inject_memory()),
                 _ => vec![],
             };
             values = candidates.into_iter().map(|v| (v, None)).collect();
@@ -3280,12 +3309,12 @@ mod tests {
     #[test]
     fn should_register_memory_tools_false_when_function_calling_off() {
         let mut ctx = create_test_ctx();
-        
+
         ctx.update_app_config(|app| {
             app.memory = Some(true);
             app.function_calling_support = false;
         });
-        
+
         assert!(
             !ctx.should_register_memory_tools(),
             "memory tools must require function_calling_support even when memory itself would otherwise be enabled"

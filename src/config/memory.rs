@@ -5,22 +5,29 @@ use anyhow::{Context, Result};
 use log::warn;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{paths, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME, WORKSPACE_MEMORY_DIR_NAME, WORKSPACE_MEMORY_FILE_NAME};
+use crate::config::{
+    MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME, WORKSPACE_MEMORY_DIR_NAME, WORKSPACE_MEMORY_FILE_NAME,
+    paths,
+};
 
 pub const DEFAULT_MEMORY_CAP_WITH_TOOLS: usize = 6_000;
 pub const DEFAULT_MEMORY_CAP_WITHOUT_TOOLS: usize = 12_000;
 
 #[derive(Debug, Clone)]
 pub enum WorkspaceMemory {
-    Structured { workspace_root: PathBuf, dir: PathBuf },
-    Lite { workspace_root: PathBuf, file: PathBuf },
+    Structured {
+        workspace_root: PathBuf,
+        dir: PathBuf,
+    },
+    Lite {
+        workspace_root: PathBuf,
+        file: PathBuf,
+    },
 }
 
 pub fn discover_workspace_memory(start: &Path) -> Option<WorkspaceMemory> {
     for dir in start.ancestors() {
-        let structured = dir
-            .join(WORKSPACE_MEMORY_DIR_NAME)
-            .join(MEMORY_DIR_NAME);
+        let structured = dir.join(WORKSPACE_MEMORY_DIR_NAME).join(MEMORY_DIR_NAME);
         if structured.join(MEMORY_INDEX_FILE_NAME).exists() {
             return Some(WorkspaceMemory::Structured {
                 workspace_root: dir.to_path_buf(),
@@ -181,7 +188,7 @@ pub fn build_memory_section(
         buf.push_str("\n</global_index>\n");
         consumed += s.chars().count();
     }
-    
+
     if let Some(s) = &workspace_index {
         buf.push_str("<workspace_index>\n");
         buf.push_str(s);
@@ -193,8 +200,7 @@ pub fn build_memory_section(
         warn!(
             "memory indexes ({} chars) exceed cap ({} chars); injecting fully - \
              consider raising memory_cap_* in config or shrinking MEMORY.md",
-            consumed,
-            cap
+            consumed, cap
         );
     }
 
@@ -214,7 +220,7 @@ pub fn build_memory_section(
             buf.push_str("\n</file>\n");
             budget = budget.saturating_sub(needed);
         }
-        
+
         if omitted > 0 {
             buf.push_str(&format!(
                 "<!-- {} memory file(s) omitted; enable function calling for full access -->\n",
@@ -340,7 +346,11 @@ mod tests {
             .join(WORKSPACE_MEMORY_DIR_NAME)
             .join(MEMORY_DIR_NAME);
         fs::create_dir_all(&structured).unwrap();
-        fs::write(structured.join(MEMORY_INDEX_FILE_NAME), "workspace-index-content").unwrap();
+        fs::write(
+            structured.join(MEMORY_INDEX_FILE_NAME),
+            "workspace-index-content",
+        )
+        .unwrap();
         fs::write(
             structured.join("foo.md"),
             "---\nname: foo\n---\nfoo body that should not appear\n",
@@ -431,9 +441,9 @@ mod tests {
     #[test]
     fn parse_frontmatter_extracts_yaml() {
         let raw = "---\nname: foo\ndescription: a thing\ntype: user\n---\nBody text\n";
-        
+
         let (fm, body) = parse_frontmatter(raw).unwrap();
-        
+
         assert_eq!(fm.name, "foo");
         assert_eq!(fm.description.as_deref(), Some("a thing"));
         assert_eq!(fm.kind.as_deref(), Some("user"));
@@ -443,9 +453,9 @@ mod tests {
     #[test]
     fn parse_frontmatter_handles_missing_block() {
         let raw = "# Just markdown, no frontmatter\nbody";
-        
+
         let (fm, body) = parse_frontmatter(raw).unwrap();
-        
+
         assert_eq!(fm.name, "");
         assert!(fm.kind.is_none());
         assert_eq!(body, raw);
@@ -454,9 +464,9 @@ mod tests {
     #[test]
     fn parse_frontmatter_handles_unterminated_block() {
         let raw = "---\nname: oops\nno closing delimiter\n# rest of doc";
-        
+
         let (fm, body) = parse_frontmatter(raw).unwrap();
-        
+
         assert_eq!(fm.name, "");
         assert_eq!(body, raw);
     }
