@@ -51,6 +51,8 @@ enabled_skills:                  # Optional list of skills available when this a
 inject_skill_instructions: true  # Inject a short hint pointing the model at `skill__list` when skills are enabled
                                  # (default: true). Suppressed automatically when no skills are available.
 skill_instructions: null         # Custom text for the skill hint (optional; uses built-in default if null)
+memory: null                     # Per-agent memory override (default: inherit). Set to `false` to disable memory
+                                 # for this agent regardless of workspace/global presence. See the Memory wiki page.
 
 dynamic_instructions: false      # Whether to use dynamic instructions for the agent; if false, static instructions are used
 instructions: |                  # Static instructions for the agent; ignored if dynamic instructions are used

@@ -22,6 +22,8 @@ enabled_skills:                       # Skills available when this role is activ
 inject_skill_instructions: true       # Inject a short hint pointing the model at `skill__list` when skills are enabled 
                                       # (default: true). Suppressed automatically when no skills are available.
 skill_instructions: null              # Custom text for the skill hint (optional; uses built-in default if null)
+memory: null                          # Per-role memory override (default: inherit). Set to `false` to disable memory
+                                      # when this role is active. See the Memory wiki page.
 
 prompt: null                          # A custom prompt to use for this role that will immediately query
                                       # the model for output instead of using the instructions below

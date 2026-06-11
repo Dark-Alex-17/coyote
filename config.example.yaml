@@ -176,6 +176,17 @@ summarization_prompt: >          # The text prompt used for creating a concise s
 summary_context_prompt: >        # The text prompt used for including the summary of the entire session as context to the model
   'This is a summary of the chat history as a recap: '
 
+# ---- Memory ----
+# See the [Memory documentation](https://github.com/Dark-Alex-17/coyote/wiki/Memory) for more information.
+# Memory is opt-in by workspace presence (a `COYOTE.md` or `.coyote/memory/MEMORY.md`)
+# and global presence (`<config_dir>/memory/MEMORY.md`). Set `memory: false` to disable
+# even when memory files exist. The cascade is: agent > session > role > app.
+memory: null                     # null = enabled when memory exists on disk; true = force on; false = force off
+memory_cap_with_tools: null      # Char cap for injected memory when function calling is available (default: 6000).
+                                 # Only MEMORY.md indexes are injected; the LLM uses memory__read to fetch drill files.
+memory_cap_without_tools: null   # Char cap when function calling is unavailable (default: 12000).
+                                 # Indexes plus drill file bodies are injected up to this cap.
+
 # ---- RAG ----
 # See the [RAG Docs](https://github.com/Dark-Alex-17/coyote/wiki/RAG) for more details.
 rag_embedding_model: null        # Specifies the embedding model used for context retrieval
