@@ -22,9 +22,9 @@ use crate::client::{
 };
 use crate::config::paths;
 use crate::config::{
-    Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, RequestContext,
-    SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, install_builtins,
-    list_agents, load_env_file, macro_execute, sync_models,
+    Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, MemoryScope,
+    RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
+    install_builtins, list_agents, load_env_file, macro_execute, sync_models,
 };
 use crate::render::{prompt_theme, render_error};
 use crate::repl::Repl;
@@ -42,7 +42,7 @@ use log4rs::config::{Appender, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
 use oauth::OAuthProvider;
 use std::path::PathBuf;
-use std::{env, process, sync::Arc};
+use std::{env, fs, process, sync::Arc};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -300,6 +300,31 @@ async fn run(
     }
     if cli.save_session {
         ctx.set_save_session_this_time()?;
+    }
+    if let Some(scope) = cli.init_memory {
+        let (path, content) = match scope {
+            MemoryScope::Global => (
+                paths::global_memory_index_path(),
+                "# Global Memory\n\n<!-- Universal facts about you go here. The LLM uses this as always-on context. -->\n<!-- Drill files (when created) are listed below. -->\n",
+            ),
+            MemoryScope::Workspace => (
+                std::env::current_dir()?.join("COYOTE.md"),
+                "# Workspace Memory\n\n<!-- Facts about this project go here. The LLM uses this as always-on context. -->\n",
+            ),
+        };
+
+        if path.exists() {
+            eprintln!("Memory marker already exists at '{}'.", path.display());
+            return Ok(());
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::write(&path, content)?;
+        println!("✓ Created memory marker at '{}'.", path.display());
+        return Ok(());
     }
     if cli.info {
         let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);

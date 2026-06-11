@@ -364,6 +364,12 @@ impl AssetCategory {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MemoryScope {
+    Global,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum InstallFilter {
     Agents,
     Roles,

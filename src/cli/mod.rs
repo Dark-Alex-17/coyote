@@ -4,7 +4,7 @@ use crate::cli::completer::{
     ShellCompletion, agent_completer, macro_completer, model_completer, rag_completer,
     role_completer, secrets_completer, session_completer,
 };
-use crate::config::{AssetCategory, InstallFilter};
+use crate::config::{AssetCategory, InstallFilter, MemoryScope};
 use anyhow::{Context, Result};
 use clap::ValueHint;
 use clap::{Parser, crate_authors, crate_description, crate_version};
@@ -78,6 +78,9 @@ pub struct Cli {
     /// Disable memory for this invocation
     #[arg(long)]
     pub no_memory: bool,
+    /// Bootstrap a memory marker so coyote begins loading memory next run
+    #[arg(long, value_name = "SCOPE", value_enum)]
+    pub init_memory: Option<MemoryScope>,
     /// Display the message without sending it
     #[arg(long)]
     pub dry_run: bool,
