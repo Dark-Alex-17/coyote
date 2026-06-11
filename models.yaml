@@ -332,6 +332,7 @@
     - name: claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 10
       output_price: 50
       supports_function_calling: true
@@ -877,6 +878,7 @@
     - name: claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 10
       output_price: 50
       supports_function_calling: true
@@ -1055,6 +1057,7 @@
     - name: us.anthropic.claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 10
       output_price: 50
       supports_function_calling: true
@@ -1753,6 +1756,7 @@
     - name: anthropic/claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
+      require_max_tokens: true
       input_price: 10
       output_price: 50
       supports_function_calling: true
