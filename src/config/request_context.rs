@@ -1046,6 +1046,15 @@ impl RequestContext {
                 "compression_threshold",
                 app.compression_threshold.to_string(),
             ),
+            ("memory", super::format_option_value(&app.memory)),
+            (
+                "memory_cap_with_tools",
+                super::format_option_value(&app.memory_cap_with_tools),
+            ),
+            (
+                "memory_cap_without_tools",
+                super::format_option_value(&app.memory_cap_without_tools),
+            ),
             (
                 "rag_reranker_model",
                 super::format_option_value(&rag_reranker_model),
@@ -1072,6 +1081,7 @@ impl RequestContext {
             ("roles_dir", display_path(&paths::roles_dir())),
             ("skills_dir", display_path(&paths::skills_dir())),
             ("sessions_dir", display_path(&self.sessions_dir())),
+            ("memory_dir", display_path(&paths::global_memory_dir())),
             ("rags_dir", display_path(&paths::rags_dir())),
             ("macros_dir", display_path(&paths::macros_dir())),
             ("functions_dir", display_path(&paths::functions_dir())),
