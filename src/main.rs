@@ -309,7 +309,7 @@ async fn run(
                 "# Global Memory\n\n<!-- Universal facts about you go here. The LLM uses this as always-on context. -->\n<!-- Drill files (when created) are listed below. -->\n",
             ),
             MemoryScope::Workspace => (
-                std::env::current_dir()?.join("COYOTE.md"),
+                env::current_dir()?.join("COYOTE.md"),
                 "# Workspace Memory\n\n<!-- Facts about this project go here. The LLM uses this as always-on context. -->\n",
             ),
         };

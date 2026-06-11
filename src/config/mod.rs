@@ -143,6 +143,8 @@ const MEMORY_DIR_NAME: &str = "memory";
 const MEMORY_INDEX_FILE_NAME: &str = "MEMORY.md";
 const WORKSPACE_MEMORY_FILE_NAME: &str = "COYOTE.md";
 const WORKSPACE_MEMORY_DIR_NAME: &str = ".coyote";
+const GIT_DIR_NAME: &str = ".git";
+const GITIGNORE_FILE_NAME: &str = ".gitignore";
 const DEFAULT_VISIBLE_TOOLS: [&str; 18] = [
     "execute_command.sh",
     "execute_py_code.py",

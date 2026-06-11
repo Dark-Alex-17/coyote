@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::RequestContext;
-use crate::config::memory::{MemoryFile, MemoryFrontmatter, MemoryStore, WorkspaceMemory};
+use crate::config::memory::{
+    MemoryFile, MemoryFrontmatter, MemoryStore, WorkspaceMemory, bootstrap_workspace_memory,
+    find_git_root,
+};
 use crate::config::paths;
 
 pub const MEMORY_FUNCTION_PREFIX: &str = "memory__";
@@ -185,7 +188,7 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
 
             let target_dir = match scope.as_str() {
                 "global" => paths::global_memory_dir(),
-                "workspace" => workspace_write_dir(&store)?,
+                "workspace" => workspace_write_dir(&store, &cwd)?,
                 other => bail!("unknown scope '{}': use 'global' or 'workspace'", other),
             };
             let file = MemoryFile {
@@ -254,13 +257,19 @@ fn find_file(store: &MemoryStore, name: &str) -> Result<Option<MemoryFile>> {
         .find(|f| f.frontmatter.name == name))
 }
 
-fn workspace_write_dir(store: &MemoryStore) -> Result<PathBuf> {
+fn workspace_write_dir(store: &MemoryStore, cwd: &Path) -> Result<PathBuf> {
     match &store.workspace {
         Some(WorkspaceMemory::Structured { dir, .. }) => Ok(dir.clone()),
         Some(WorkspaceMemory::Lite { workspace_root, .. }) => {
             Ok(paths::workspace_memory_dir_for(workspace_root))
         }
-        None => bail!("no workspace memory discoverable; cannot write workspace-scoped memory"),
+        None => match find_git_root(cwd) {
+            Some(git_root) => bootstrap_workspace_memory(&git_root),
+            None => bail!(
+                "no workspace memory discoverable and not inside a git repository for auto-bootstrap. \
+                 If you want workspace memory, run `coyote --init-memory workspace`."
+            ),
+        },
     }
 }
 
@@ -425,7 +434,7 @@ mod tests {
             workspace: discover_workspace_memory(&workspace),
         };
 
-        let dir = workspace_write_dir(&store).unwrap();
+        let dir = workspace_write_dir(&store, &workspace).unwrap();
         assert_eq!(dir, structured);
 
         let _ = fs::remove_dir_all(&root);
@@ -443,14 +452,14 @@ mod tests {
             workspace: discover_workspace_memory(&workspace),
         };
 
-        let dir = workspace_write_dir(&store).unwrap();
+        let dir = workspace_write_dir(&store, &workspace).unwrap();
         assert_eq!(dir, workspace.join(".coyote").join("memory"));
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn workspace_write_dir_errors_when_no_workspace() {
+    fn workspace_write_dir_errors_when_no_workspace_and_no_git() {
         let root = temp_root("ws_none");
         let bare = root.join("nowhere");
         fs::create_dir_all(&bare).unwrap();
@@ -460,8 +469,33 @@ mod tests {
             workspace: discover_workspace_memory(&bare),
         };
 
-        let err = workspace_write_dir(&store).unwrap_err();
-        assert!(err.to_string().contains("no workspace memory discoverable"));
+        let err = workspace_write_dir(&store, &bare).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no workspace memory discoverable"));
+        assert!(msg.contains("coyote --init-memory workspace"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_write_dir_auto_bootstraps_inside_git_repo() {
+        let root = temp_root("ws_bootstrap");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let nested = repo.join("src").join("deep");
+        fs::create_dir_all(&nested).unwrap();
+
+        let store = MemoryStore {
+            global_dir: root.join("g"),
+            workspace: discover_workspace_memory(&nested),
+        };
+        assert!(store.workspace.is_none());
+
+        let dir = workspace_write_dir(&store, &nested).unwrap();
+        assert_eq!(dir, repo.join(".coyote").join("memory"));
+        assert!(dir.join("MEMORY.md").exists());
+        let gi = fs::read_to_string(repo.join(".gitignore")).unwrap();
+        assert!(gi.contains(".coyote/memory/"));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -6,8 +6,8 @@ use log::warn;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME, WORKSPACE_MEMORY_DIR_NAME, WORKSPACE_MEMORY_FILE_NAME,
-    paths,
+    GIT_DIR_NAME, GITIGNORE_FILE_NAME, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME,
+    WORKSPACE_MEMORY_DIR_NAME, WORKSPACE_MEMORY_FILE_NAME, paths,
 };
 
 pub const DEFAULT_MEMORY_CAP_WITH_TOOLS: usize = 6_000;
@@ -44,6 +44,70 @@ pub fn discover_workspace_memory(start: &Path) -> Option<WorkspaceMemory> {
         }
     }
     None
+}
+
+pub fn find_git_root(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        if dir.join(GIT_DIR_NAME).exists() {
+            return Some(dir.to_path_buf());
+        }
+    }
+
+    None
+}
+
+pub fn bootstrap_workspace_memory(git_root: &Path) -> Result<PathBuf> {
+    let mem_dir = paths::workspace_memory_dir_for(git_root);
+    fs::create_dir_all(&mem_dir)
+        .with_context(|| format!("create memory dir {}", mem_dir.display()))?;
+
+    let index_path = mem_dir.join(MEMORY_INDEX_FILE_NAME);
+    if !index_path.exists() {
+        fs::write(&index_path, "# Workspace Memory Index\n\n")
+            .with_context(|| format!("write {}", index_path.display()))?;
+    }
+
+    let gitignore_appended = append_gitignore_entry(git_root)?;
+    let suffix = if gitignore_appended {
+        " (appended .coyote/memory/ to .gitignore)"
+    } else {
+        ""
+    };
+    warn!(
+        "auto-bootstrapped workspace memory at {}{}",
+        mem_dir.display(),
+        suffix
+    );
+
+    Ok(mem_dir)
+}
+
+fn append_gitignore_entry(git_root: &Path) -> Result<bool> {
+    let gitignore = git_root.join(GITIGNORE_FILE_NAME);
+    let entry = format!("{WORKSPACE_MEMORY_DIR_NAME}/{MEMORY_DIR_NAME}/");
+    let entry_no_slash = format!("{WORKSPACE_MEMORY_DIR_NAME}/{MEMORY_DIR_NAME}");
+
+    let existing = fs::read_to_string(&gitignore).unwrap_or_default();
+    let already_present = existing.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == entry || trimmed == entry_no_slash
+    });
+
+    if already_present {
+        return Ok(false);
+    }
+
+    let new_content = if existing.is_empty() {
+        format!("{entry}\n")
+    } else if existing.ends_with('\n') {
+        format!("{existing}{entry}\n")
+    } else {
+        format!("{existing}\n{entry}\n")
+    };
+
+    fs::write(&gitignore, new_content).with_context(|| format!("write {}", gitignore.display()))?;
+
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -511,6 +575,158 @@ mod tests {
 
         let found = discover_workspace_memory(&nested);
         assert!(matches!(found, Some(WorkspaceMemory::Structured { .. })));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_git_root_returns_dir_containing_git_dir() {
+        let root = temp_root("git_root");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+
+        assert_eq!(find_git_root(&repo), Some(repo.clone()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_git_root_walks_up_from_nested_dir() {
+        let root = temp_root("git_root_walk");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+        let nested = repo.join("a").join("b").join("c");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(find_git_root(&nested), Some(repo));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_git_root_treats_git_file_as_repo_marker() {
+        let root = temp_root("git_root_worktree");
+        let worktree = root.join("worktree");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(
+            worktree.join(GIT_DIR_NAME),
+            "gitdir: /elsewhere/.git/worktrees/wt\n",
+        )
+        .unwrap();
+
+        assert_eq!(find_git_root(&worktree), Some(worktree));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_git_root_returns_none_when_no_git() {
+        let root = temp_root("git_root_missing");
+        let bare = root.join("bare");
+        fs::create_dir_all(&bare).unwrap();
+
+        assert_eq!(find_git_root(&bare), None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrap_creates_structured_layout_and_index() {
+        let root = temp_root("bootstrap_layout");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+
+        let mem_dir = bootstrap_workspace_memory(&repo).unwrap();
+
+        assert_eq!(mem_dir, paths::workspace_memory_dir_for(&repo));
+        assert!(mem_dir.is_dir());
+        let index = mem_dir.join(MEMORY_INDEX_FILE_NAME);
+        assert!(index.exists());
+        let body = fs::read_to_string(&index).unwrap();
+        assert!(body.starts_with("# Workspace Memory Index"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrap_creates_gitignore_when_absent() {
+        let root = temp_root("bootstrap_gi_new");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+
+        bootstrap_workspace_memory(&repo).unwrap();
+
+        let gi = repo.join(GITIGNORE_FILE_NAME);
+        assert!(gi.exists());
+        let body = fs::read_to_string(&gi).unwrap();
+        assert!(body.contains(".coyote/memory/"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrap_appends_to_existing_gitignore_without_trailing_newline() {
+        let root = temp_root("bootstrap_gi_append");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+        fs::write(repo.join(GITIGNORE_FILE_NAME), "target/").unwrap();
+
+        bootstrap_workspace_memory(&repo).unwrap();
+
+        let body = fs::read_to_string(repo.join(GITIGNORE_FILE_NAME)).unwrap();
+        assert!(body.contains("target/"));
+        assert!(body.contains(".coyote/memory/"));
+        assert!(body.ends_with('\n'));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrap_is_idempotent_on_gitignore_entry() {
+        let root = temp_root("bootstrap_gi_idempotent");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+        let original = "target/\n.coyote/memory/\n";
+        fs::write(repo.join(GITIGNORE_FILE_NAME), original).unwrap();
+
+        bootstrap_workspace_memory(&repo).unwrap();
+
+        let body = fs::read_to_string(repo.join(GITIGNORE_FILE_NAME)).unwrap();
+        assert_eq!(body, original, "gitignore must be untouched");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrap_treats_entry_without_trailing_slash_as_present() {
+        let root = temp_root("bootstrap_gi_no_slash");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+        let original = ".coyote/memory\n";
+        fs::write(repo.join(GITIGNORE_FILE_NAME), original).unwrap();
+
+        bootstrap_workspace_memory(&repo).unwrap();
+
+        let body = fs::read_to_string(repo.join(GITIGNORE_FILE_NAME)).unwrap();
+        assert_eq!(body, original);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrap_does_not_clobber_existing_index() {
+        let root = temp_root("bootstrap_existing_index");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+        let mem_dir = paths::workspace_memory_dir_for(&repo);
+        fs::create_dir_all(&mem_dir).unwrap();
+        let preserved = "# Custom Index\n\n- [[foo]]: keep me\n";
+        fs::write(mem_dir.join(MEMORY_INDEX_FILE_NAME), preserved).unwrap();
+
+        bootstrap_workspace_memory(&repo).unwrap();
+
+        let body = fs::read_to_string(mem_dir.join(MEMORY_INDEX_FILE_NAME)).unwrap();
+        assert_eq!(body, preserved);
 
         let _ = fs::remove_dir_all(&root);
     }
