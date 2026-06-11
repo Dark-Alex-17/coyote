@@ -2041,11 +2041,15 @@ impl RequestContext {
                 } else {
                     self.update_app_config(|app| app.auto_continue = value);
                 }
-                if value
+                let should_register = self.agent.is_none()
                     && self.app.config.function_calling_support
-                    && !self.tool_scope.functions.contains("todo__init")
-                {
+                    && self.auto_continue_config().enabled;
+                let already_registered = self.tool_scope.functions.contains("todo__init");
+
+                if should_register && !already_registered {
                     self.tool_scope.functions.append_todo_functions();
+                } else if !should_register && already_registered {
+                    self.tool_scope.functions.remove_todo_functions();
                 }
             }
             "max_auto_continues" => {

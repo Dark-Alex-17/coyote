@@ -357,6 +357,11 @@ impl Functions {
         self.declarations.extend(todo::todo_function_declarations());
     }
 
+    pub fn remove_todo_functions(&mut self) {
+        self.declarations
+            .retain(|f| !f.name.starts_with(TODO_FUNCTION_PREFIX));
+    }
+
     pub fn append_memory_functions(&mut self) {
         self.declarations
             .extend(memory::memory_function_declarations());
