@@ -2,6 +2,7 @@ use super::*;
 
 use crate::{
     client::Model,
+    config::memory,
     function::{Functions, run_llm_function},
 };
 
@@ -19,7 +20,7 @@ use fancy_regex::Captures;
 use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
-use std::{ffi::OsStr, path::Path};
+use std::{env, ffi::OsStr, path::Path};
 
 const DEFAULT_AGENT_NAME: &str = "rag";
 
@@ -212,6 +213,20 @@ impl Agent {
             && !matches!(agent_config.skills_enabled, Some(false))
         {
             functions.append_skill_functions();
+        }
+
+        if app.function_calling_support
+            && !matches!(agent_config.memory, Some(false))
+            && !matches!(app.memory, Some(false))
+        {
+            let memory_exists = paths::global_memory_index_path().exists()
+                || env::current_dir()
+                    .ok()
+                    .and_then(|cwd| memory::discover_workspace_memory(&cwd))
+                    .is_some();
+            if memory_exists {
+                functions.append_memory_functions();
+            }
         }
 
         agent_config.replace_tools_placeholder(&functions);
