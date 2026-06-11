@@ -1,3 +1,4 @@
+pub(crate) mod memory;
 pub(crate) mod skill;
 pub(crate) mod supervisor;
 pub(crate) mod todo;
@@ -22,6 +23,7 @@ use indoc::formatdoc;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use memory::MEMORY_FUNCTION_PREFIX;
 use skill::SKILL_FUNCTION_PREFIX;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -353,6 +355,11 @@ impl Functions {
 
     pub fn append_todo_functions(&mut self) {
         self.declarations.extend(todo::todo_function_declarations());
+    }
+
+    pub fn append_memory_functions(&mut self) {
+        self.declarations
+            .extend(memory::memory_function_declarations());
     }
 
     pub fn append_skill_functions(&mut self) {
@@ -1042,6 +1049,13 @@ impl ToolCall {
             _ if cmd_name.starts_with(TODO_FUNCTION_PREFIX) => {
                 todo::handle_todo_tool(ctx, &cmd_name, &json_data).unwrap_or_else(|e| {
                     let error_msg = format!("Todo tool failed: {e}");
+                    eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    json!({"tool_call_error": error_msg})
+                })
+            }
+            _ if cmd_name.starts_with(MEMORY_FUNCTION_PREFIX) => {
+                memory::handle_memory_tool(ctx, &cmd_name, &json_data).unwrap_or_else(|e| {
+                    let error_msg = format!("Memory tool failed: {e}");
                     eprintln!("{}", warning_text(&format!("⚠️ {error_msg} ⚠️")));
                     json!({"tool_call_error": error_msg})
                 })

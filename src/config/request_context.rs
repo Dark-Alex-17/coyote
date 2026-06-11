@@ -2482,6 +2482,9 @@ impl RequestContext {
         if app.function_calling_support && policy.skills_enabled {
             functions.append_skill_functions();
         }
+        if self.should_register_memory_tools() {
+            functions.append_memory_functions();
+        }
 
         let tool_tracker = self.tool_scope.tool_tracker.clone();
         self.tool_scope = ToolScope {

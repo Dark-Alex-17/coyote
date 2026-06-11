@@ -1,5 +1,5 @@
 use super::role::Role;
-use super::{AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME, ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME, GLOBAL_TOOLS_DIR_NAME, GLOBAL_TOOLS_UTILS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME, SKILLS_DIR_NAME, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME};
+use super::{AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME, ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME, GLOBAL_TOOLS_DIR_NAME, GLOBAL_TOOLS_UTILS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME, SKILLS_DIR_NAME, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME, WORKSPACE_MEMORY_DIR_NAME};
 use crate::client::ProviderModels;
 use crate::utils::{get_env_name, list_file_names, normalize_env_name};
 
@@ -8,7 +8,7 @@ use log::LevelFilter;
 use std::collections::HashSet;
 use std::env;
 use std::fs::{read_dir, read_to_string};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn config_dir() -> PathBuf {
     if let Ok(v) = env::var(get_env_name("config_dir")) {
@@ -196,6 +196,12 @@ pub fn global_memory_dir() -> PathBuf {
 
 pub fn global_memory_index_path() -> PathBuf {
     global_memory_dir().join(MEMORY_INDEX_FILE_NAME)
+}
+
+pub fn workspace_memory_dir_for(workspace_root: &Path) -> PathBuf {
+    workspace_root
+        .join(WORKSPACE_MEMORY_DIR_NAME)
+        .join(MEMORY_DIR_NAME)
 }
 
 pub fn log_config() -> Result<(LevelFilter, Option<PathBuf>)> {
