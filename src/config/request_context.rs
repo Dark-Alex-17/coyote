@@ -5,12 +5,7 @@ use super::skill_policy::SkillPolicy;
 use super::skill_registry::SkillRegistry;
 use super::todo::TodoList;
 use super::tool_scope::{McpRuntime, ToolScope};
-use super::{
-    AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
-    Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, RIGHT_PROMPT, Role,
-    RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
-    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, paths,
-};
+use super::{AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE, Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, RIGHT_PROMPT, Role, RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags, TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, paths, memory};
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
@@ -46,7 +41,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{env, fs};
-use super::memory::{WorkspaceMemory, MemoryStore};
+use super::memory::{WorkspaceMemory, MemoryStore, DEFAULT_MEMORY_CAP_WITH_TOOLS, DEFAULT_MEMORY_CAP_WITHOUT_TOOLS};
 
 pub struct AutoContinueConfig {
     pub enabled: bool,
@@ -679,6 +674,35 @@ impl RequestContext {
                         .as_deref()
                         .unwrap_or(DEFAULT_SKILL_INSTRUCTIONS),
                 );
+            }
+        }
+
+        if self.should_inject_memory()
+            && let Some(cwd) = env::current_dir().ok()
+        {
+            let store = MemoryStore::new(&cwd);
+            let with_tools = self.should_register_memory_tools();
+            let cap = if with_tools {
+                app.memory_cap_with_tools
+                    .unwrap_or(DEFAULT_MEMORY_CAP_WITH_TOOLS)
+            } else {
+                app.memory_cap_without_tools
+                    .unwrap_or(DEFAULT_MEMORY_CAP_WITHOUT_TOOLS)
+            };
+            match memory::build_memory_section(&store, with_tools, cap) {
+                Ok(Some(section)) => {
+                    let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
+                    role.append_to_prompt(separator);
+                    role.append_to_prompt(&section);
+                    role.append_to_prompt("\n\n");
+                    role.append_to_prompt(if with_tools {
+                        prompts::DEFAULT_MEMORY_INSTRUCTIONS
+                    } else {
+                        prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => warn!("memory injection failed: {}", e),
             }
         }
 
@@ -3223,6 +3247,31 @@ mod tests {
         assert!(ctx.app.config.save);
         assert_eq!(ctx.app.config.compression_threshold, 1234);
         assert!(!Arc::ptr_eq(&ctx.app.config, &previous));
+    }
+
+    #[test]
+    fn memory_config_app_some_false_disables_via_cascade() {
+        let mut ctx = create_test_ctx();
+
+        ctx.update_app_config(|app| app.memory = Some(false));
+
+        assert!(
+            !ctx.should_inject_memory(),
+            "AppConfig.memory=Some(false) must disable memory regardless of on-disk content (this is the --no-memory CLI path)"
+        );
+    }
+
+    #[test]
+    fn memory_config_role_false_beats_app_true_in_cascade() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.memory = Some(true));
+        let role = Role::new("memory_off_role", "---\nmemory: false\n---\n");
+        assert_eq!(role.memory(), Some(false), "metadata parser sanity check");
+        ctx.role = Some(role);
+        assert!(
+            !ctx.should_inject_memory(),
+            "Role::memory=Some(false) must win over AppConfig::memory=Some(true)"
+        );
     }
 
     #[test]

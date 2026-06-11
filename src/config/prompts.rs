@@ -8,6 +8,37 @@ pub(crate) const DEFAULT_SKILL_INSTRUCTIONS: &str = indoc! {"
     complete to keep the context lean."
 };
 
+pub(crate) const DEFAULT_MEMORY_INSTRUCTIONS: &str = indoc! {"
+    ## Memory
+    A persistent memory file system survives across sessions. The MEMORY.md content shown above is
+    your always-on context; put universal facts (user identity, hard rules, binding feedback) directly
+    in MEMORY.md so they appear on every turn. Drill files hold deeper, on-demand context.
+
+    Tools:
+        - `memory__read(name)`: Read a specific drill file's full content.
+        - `memory__write(name, content, scope)`: Create or replace a drill file (scope: 'global' | 'workspace').
+        - `memory__list()`: See all known drill files and their metadata.
+        - `memory__lint()`: Health-check memory for orphans, broken links, oversized files.
+
+    RULES:
+        - Every interaction has two outputs: your answer AND any memory updates the conversation warrants.
+          Don't let learnings evaporate into chat history.
+        - When you create or modify a drill file, also update MEMORY.md so the index stays accurate.
+        - Use [[wikilink]] notation in memory files to reference other memories by their `name:` slug.
+        - NEVER write secrets, credentials, or API keys to memory — memory is plaintext on disk.
+          Use coyote's Vault for secrets.
+        - Keep individual drill files focused (under ~2K chars). Split large topics across linked files."
+};
+
+pub(crate) const DEFAULT_MEMORY_INSTRUCTIONS_READONLY: &str = indoc! {"
+    ## Memory (read-only)
+    The memory content shown above persists across sessions. In this session it is READ-ONLY — the user
+    maintains memory files manually outside the conversation.
+
+    Reference the memory content as authoritative context about the user and their workspace.
+    Do not propose writing to memory or call any `memory__*` tools — they are unavailable."
+};
+
 pub(in crate::config) const DEFAULT_TODO_INSTRUCTIONS: &str = indoc! {"
     ## Task Tracking
     You have built-in task tracking tools. Use them to track your progress:

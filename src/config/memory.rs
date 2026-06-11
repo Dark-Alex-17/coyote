@@ -2,9 +2,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use log::warn;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{paths, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME, WORKSPACE_MEMORY_DIR_NAME, WORKSPACE_MEMORY_FILE_NAME};
+
+pub const DEFAULT_MEMORY_CAP_WITH_TOOLS: usize = 6_000;
+pub const DEFAULT_MEMORY_CAP_WITHOUT_TOOLS: usize = 12_000;
 
 #[derive(Debug, Clone)]
 pub enum WorkspaceMemory {
@@ -156,6 +160,73 @@ impl MemoryStore {
     }
 }
 
+pub fn build_memory_section(
+    store: &MemoryStore,
+    with_tools: bool,
+    cap: usize,
+) -> Result<Option<String>> {
+    let global_index = store.load_global_index()?;
+    let workspace_index = store.load_workspace_index()?;
+
+    if global_index.is_none() && workspace_index.is_none() {
+        return Ok(None);
+    }
+
+    let mut buf = String::from("<memory>\n");
+    let mut consumed = 0usize;
+
+    if let Some(s) = &global_index {
+        buf.push_str("<global_index>\n");
+        buf.push_str(s);
+        buf.push_str("\n</global_index>\n");
+        consumed += s.chars().count();
+    }
+    
+    if let Some(s) = &workspace_index {
+        buf.push_str("<workspace_index>\n");
+        buf.push_str(s);
+        buf.push_str("\n</workspace_index>\n");
+        consumed += s.chars().count();
+    }
+
+    if consumed > cap {
+        warn!(
+            "memory indexes ({} chars) exceed cap ({} chars); injecting fully - \
+             consider raising memory_cap_* in config or shrinking MEMORY.md",
+            consumed,
+            cap
+        );
+    }
+
+    if !with_tools {
+        let mut budget = cap.saturating_sub(consumed);
+        let mut files = store.list_files()?;
+        files.sort_by(|a, b| a.frontmatter.name.cmp(&b.frontmatter.name));
+        let mut omitted = 0usize;
+        for f in files {
+            let needed = f.body.chars().count() + 50;
+            if needed > budget {
+                omitted += 1;
+                continue;
+            }
+            buf.push_str(&format!("<file name=\"{}\">\n", f.frontmatter.name));
+            buf.push_str(&f.body);
+            buf.push_str("\n</file>\n");
+            budget = budget.saturating_sub(needed);
+        }
+        
+        if omitted > 0 {
+            buf.push_str(&format!(
+                "<!-- {} memory file(s) omitted; enable function calling for full access -->\n",
+                omitted
+            ));
+        }
+    }
+
+    buf.push_str("</memory>");
+    Ok(Some(buf))
+}
+
 fn collect_md_files(dir: &Path, out: &mut Vec<MemoryFile>) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -170,7 +241,7 @@ fn collect_md_files(dir: &Path, out: &mut Vec<MemoryFile>) -> Result<()> {
 
         match MemoryFile::load(&path) {
             Ok(f) => out.push(f),
-            Err(e) => log::warn!("skip malformed memory file {}: {}", path.display(), e),
+            Err(e) => warn!("skip malformed memory file {}: {}", path.display(), e),
         }
     }
 
@@ -241,6 +312,118 @@ mod tests {
 
         let found = discover_workspace_memory(&workspace);
         assert!(matches!(found, Some(WorkspaceMemory::Structured { .. })));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_memory_section_returns_none_when_no_memory_exists() {
+        let root = temp_root("none");
+        let workspace = root.join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let store = MemoryStore {
+            global_dir: root.join("global"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+
+        assert!(build_memory_section(&store, true, 6_000).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_memory_section_injects_only_indexes_with_tools_on() {
+        let root = temp_root("indexes_only");
+        let workspace = root.join("ws");
+        let structured = workspace
+            .join(WORKSPACE_MEMORY_DIR_NAME)
+            .join(MEMORY_DIR_NAME);
+        fs::create_dir_all(&structured).unwrap();
+        fs::write(structured.join(MEMORY_INDEX_FILE_NAME), "workspace-index-content").unwrap();
+        fs::write(
+            structured.join("foo.md"),
+            "---\nname: foo\n---\nfoo body that should not appear\n",
+        )
+        .unwrap();
+
+        let store = MemoryStore {
+            global_dir: root.join("global"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+
+        let section = build_memory_section(&store, true, 6_000)
+            .unwrap()
+            .expect("memory section should exist");
+        assert!(section.contains("workspace-index-content"));
+        assert!(!section.contains("foo body that should not appear"));
+        assert!(section.starts_with("<memory>"));
+        assert!(section.ends_with("</memory>"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_memory_section_injects_drill_bodies_alphabetically_without_tools() {
+        let root = temp_root("drill_bodies");
+        let workspace = root.join("ws");
+        let structured = workspace
+            .join(WORKSPACE_MEMORY_DIR_NAME)
+            .join(MEMORY_DIR_NAME);
+        fs::create_dir_all(&structured).unwrap();
+        fs::write(structured.join(MEMORY_INDEX_FILE_NAME), "idx").unwrap();
+        fs::write(
+            structured.join("zebra.md"),
+            "---\nname: zebra\n---\nzebra body\n",
+        )
+        .unwrap();
+        fs::write(
+            structured.join("alpha.md"),
+            "---\nname: alpha\n---\nalpha body\n",
+        )
+        .unwrap();
+
+        let store = MemoryStore {
+            global_dir: root.join("global"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+
+        let section = build_memory_section(&store, false, 6_000)
+            .unwrap()
+            .expect("memory section should exist");
+        let alpha_pos = section.find("alpha body").expect("alpha body missing");
+        let zebra_pos = section.find("zebra body").expect("zebra body missing");
+        assert!(alpha_pos < zebra_pos, "drill bodies must be alphabetical");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_memory_section_omits_drill_bodies_when_cap_exceeded() {
+        let root = temp_root("cap");
+        let workspace = root.join("ws");
+        let structured = workspace
+            .join(WORKSPACE_MEMORY_DIR_NAME)
+            .join(MEMORY_DIR_NAME);
+        fs::create_dir_all(&structured).unwrap();
+        fs::write(structured.join(MEMORY_INDEX_FILE_NAME), "idx").unwrap();
+        let big_body = "x".repeat(200);
+        fs::write(
+            structured.join("big.md"),
+            format!("---\nname: big\n---\n{}\n", big_body),
+        )
+        .unwrap();
+
+        let store = MemoryStore {
+            global_dir: root.join("global"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+
+        let section = build_memory_section(&store, false, 100)
+            .unwrap()
+            .expect("memory section should exist");
+        assert!(!section.contains(&big_body));
+        assert!(section.contains("memory file(s) omitted"));
 
         let _ = fs::remove_dir_all(&root);
     }
