@@ -3278,6 +3278,21 @@ mod tests {
     }
 
     #[test]
+    fn should_register_memory_tools_false_when_function_calling_off() {
+        let mut ctx = create_test_ctx();
+        
+        ctx.update_app_config(|app| {
+            app.memory = Some(true);
+            app.function_calling_support = false;
+        });
+        
+        assert!(
+            !ctx.should_register_memory_tools(),
+            "memory tools must require function_calling_support even when memory itself would otherwise be enabled"
+        );
+    }
+
+    #[test]
     fn use_role_obj_sets_role() {
         let mut ctx = create_test_ctx();
         let role = Role::new("test", "test prompt");

@@ -427,4 +427,81 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn parse_frontmatter_extracts_yaml() {
+        let raw = "---\nname: foo\ndescription: a thing\ntype: user\n---\nBody text\n";
+        
+        let (fm, body) = parse_frontmatter(raw).unwrap();
+        
+        assert_eq!(fm.name, "foo");
+        assert_eq!(fm.description.as_deref(), Some("a thing"));
+        assert_eq!(fm.kind.as_deref(), Some("user"));
+        assert_eq!(body, "Body text\n");
+    }
+
+    #[test]
+    fn parse_frontmatter_handles_missing_block() {
+        let raw = "# Just markdown, no frontmatter\nbody";
+        
+        let (fm, body) = parse_frontmatter(raw).unwrap();
+        
+        assert_eq!(fm.name, "");
+        assert!(fm.kind.is_none());
+        assert_eq!(body, raw);
+    }
+
+    #[test]
+    fn parse_frontmatter_handles_unterminated_block() {
+        let raw = "---\nname: oops\nno closing delimiter\n# rest of doc";
+        
+        let (fm, body) = parse_frontmatter(raw).unwrap();
+        
+        assert_eq!(fm.name, "");
+        assert_eq!(body, raw);
+    }
+
+    #[test]
+    fn memory_file_save_and_load_roundtrip() {
+        let root = temp_root("roundtrip");
+        let path = root.join("test.md");
+        let file = MemoryFile {
+            path: path.clone(),
+            frontmatter: MemoryFrontmatter {
+                name: "test".into(),
+                description: Some("a test".into()),
+                kind: Some("user".into()),
+            },
+            body: "Hello world\nmore text".into(),
+        };
+        file.save().unwrap();
+        let loaded = MemoryFile::load(&path).unwrap();
+        assert_eq!(loaded.frontmatter.name, "test");
+        assert_eq!(loaded.frontmatter.description.as_deref(), Some("a test"));
+        assert_eq!(loaded.frontmatter.kind.as_deref(), Some("user"));
+        assert_eq!(loaded.body, "Hello world\nmore text");
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("type: user"), "kind must serialize as 'type:'");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discover_walks_up_from_nested_dir() {
+        let root = temp_root("walk_up");
+        let workspace = root.join("ws");
+        let mem_dir = workspace
+            .join(WORKSPACE_MEMORY_DIR_NAME)
+            .join(MEMORY_DIR_NAME);
+        fs::create_dir_all(&mem_dir).unwrap();
+        fs::write(mem_dir.join(MEMORY_INDEX_FILE_NAME), "idx").unwrap();
+        let nested = workspace.join("src").join("deep").join("path");
+        fs::create_dir_all(&nested).unwrap();
+
+        let found = discover_workspace_memory(&nested);
+        assert!(matches!(found, Some(WorkspaceMemory::Structured { .. })));
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

@@ -340,6 +340,93 @@ mod tests {
     }
 
     #[test]
+    fn workspace_write_dir_returns_structured_dir_directly() {
+        let root = temp_root("ws_structured");
+        let workspace = root.join("ws");
+        let structured = workspace.join(".coyote").join("memory");
+        fs::create_dir_all(&structured).unwrap();
+        fs::write(structured.join("MEMORY.md"), "idx").unwrap();
+
+        let store = MemoryStore {
+            global_dir: root.join("g"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+
+        let dir = workspace_write_dir(&store).unwrap();
+        assert_eq!(dir, structured);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_write_dir_promotes_lite_to_structured_subdir() {
+        let root = temp_root("ws_lite_promote");
+        let workspace = root.join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("COYOTE.md"), "lite").unwrap();
+
+        let store = MemoryStore {
+            global_dir: root.join("g"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+
+        let dir = workspace_write_dir(&store).unwrap();
+        assert_eq!(dir, workspace.join(".coyote").join("memory"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_write_dir_errors_when_no_workspace() {
+        let root = temp_root("ws_none");
+        let bare = root.join("nowhere");
+        fs::create_dir_all(&bare).unwrap();
+
+        let store = MemoryStore {
+            global_dir: root.join("g"),
+            workspace: discover_workspace_memory(&bare),
+        };
+
+        let err = workspace_write_dir(&store).unwrap_err();
+        assert!(err.to_string().contains("no workspace memory discoverable"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_file_returns_matching_file() {
+        let root = temp_root("find_file");
+        let workspace = root.join("ws");
+        let structured = workspace.join(".coyote").join("memory");
+        fs::create_dir_all(&structured).unwrap();
+        fs::write(structured.join("MEMORY.md"), "idx").unwrap();
+        fs::write(
+            structured.join("target.md"),
+            "---\nname: target\n---\nfound me\n",
+        )
+        .unwrap();
+        fs::write(
+            structured.join("other.md"),
+            "---\nname: other\n---\nignored\n",
+        )
+        .unwrap();
+
+        let store = MemoryStore {
+            global_dir: root.join("g"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+
+        let hit = find_file(&store, "target").unwrap();
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().body.trim(), "found me");
+
+        let miss = find_file(&store, "nope").unwrap();
+        assert!(miss.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn lint_flags_orphans_broken_links_and_oversized() {
         let root = temp_root("lint");
         let workspace = root.join("ws");
