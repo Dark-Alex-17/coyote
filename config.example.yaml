@@ -181,6 +181,8 @@ summary_context_prompt: >        # The text prompt used for including the summar
 # Memory is opt-in by workspace presence (a `COYOTE.md` or `.coyote/memory/MEMORY.md`)
 # and global presence (`<config_dir>/memory/MEMORY.md`). Set `memory: false` to disable
 # even when memory files exist. The cascade is: agent > session > role > app.
+# Bootstrap with `coyote --init-memory [global|workspace]` to create the marker file
+# the LLM needs before it will write any memory.
 memory: null                     # null = enabled when memory exists on disk; true = force on; false = force off
 memory_cap_with_tools: null      # Char cap for injected memory when function calling is available (default: 6000).
                                  # Only MEMORY.md indexes are injected; the LLM uses memory__read to fetch drill files.
