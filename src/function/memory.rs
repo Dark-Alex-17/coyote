@@ -373,13 +373,13 @@ mod tests {
     fn ensure_index_entry_appends_when_missing() {
         let root = temp_root("index_append");
         let index = root.join("MEMORY.md");
-        fs::write(&index, "# Memory Index\n\n- [[existing]] — already here\n").unwrap();
+        fs::write(&index, "# Memory Index\n\n- [[existing]]: already here\n").unwrap();
 
         let updated = ensure_index_entry(&index, "new_one", "newly added").unwrap();
         assert!(updated);
         let content = fs::read_to_string(&index).unwrap();
-        assert!(content.contains("- [[existing]] — already here"));
-        assert!(content.contains("- [[new_one]] — newly added"));
+        assert!(content.contains("- [[existing]]: already here"));
+        assert!(content.contains("- [[new_one]]: newly added"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -388,7 +388,7 @@ mod tests {
     fn ensure_index_entry_skips_when_referenced() {
         let root = temp_root("index_skip");
         let index = root.join("MEMORY.md");
-        let original = "# Memory Index\n\n- [[existing]] — already here\n";
+        let original = "# Memory Index\n\n- [[existing]]: already here\n";
         fs::write(&index, original).unwrap();
 
         let updated = ensure_index_entry(&index, "existing", "different description").unwrap();
@@ -407,7 +407,7 @@ mod tests {
         assert!(updated);
         let content = fs::read_to_string(&index).unwrap();
         assert!(content.starts_with("# Memory Index"));
-        assert!(content.contains("- [[first]] — first ever"));
+        assert!(content.contains("- [[first]]: first ever"));
 
         let _ = fs::remove_dir_all(&root);
     }
