@@ -120,6 +120,7 @@ pub struct RequestContext {
     pub escalation_queue: Option<Arc<EscalationQueue>>,
     pub current_depth: usize,
     pub auto_continue_count: usize,
+    pub pending_agents_guardrail_count: u32,
     pub todo_list: TodoList,
     pub skill_registry: SkillRegistry,
     pub last_continuation_response: Option<String>,
@@ -149,6 +150,7 @@ impl RequestContext {
             escalation_queue: None,
             current_depth: 0,
             auto_continue_count: 0,
+            pending_agents_guardrail_count: 0,
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
@@ -204,6 +206,7 @@ impl RequestContext {
             escalation_queue: None,
             current_depth: 0,
             auto_continue_count: 0,
+            pending_agents_guardrail_count: 0,
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
@@ -246,6 +249,7 @@ impl RequestContext {
             escalation_queue: self.escalation_queue.clone(),
             current_depth: self.current_depth,
             auto_continue_count: 0,
+            pending_agents_guardrail_count: 0,
             todo_list: self.todo_list.clone(),
             skill_registry: self.skill_registry.clone(),
             last_continuation_response: None,
@@ -286,6 +290,7 @@ impl RequestContext {
             escalation_queue: parent.escalation_queue.clone(),
             current_depth,
             auto_continue_count: 0,
+            pending_agents_guardrail_count: 0,
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
@@ -2787,7 +2792,7 @@ impl RequestContext {
 
         if self.agent.take().is_some() {
             if let Some(supervisor) = self.supervisor.clone() {
-                supervisor.read().cancel_all();
+                supervisor.read().cancel_recursive();
             }
             self.supervisor = None;
             self.parent_supervisor = None;
@@ -2796,6 +2801,7 @@ impl RequestContext {
             self.escalation_queue = None;
             self.current_depth = 0;
             self.auto_continue_count = 0;
+            self.pending_agents_guardrail_count = 0;
             self.todo_list = TodoList::default();
             self.rag.take();
             self.discontinuous_last_message();

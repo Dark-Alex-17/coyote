@@ -5,6 +5,7 @@ pub mod taskqueue;
 use crate::utils::AbortSignal;
 use fmt::{Debug, Formatter};
 use mailbox::Inbox;
+use parking_lot::RwLock;
 use taskqueue::TaskQueue;
 
 use anyhow::{Result, bail};
@@ -33,6 +34,7 @@ pub struct AgentHandle {
     pub inbox: Arc<Inbox>,
     pub abort_signal: AbortSignal,
     pub join_handle: JoinHandle<Result<AgentResult>>,
+    pub child_supervisor: Option<Arc<RwLock<Supervisor>>>,
 }
 
 pub struct Supervisor {
@@ -103,6 +105,10 @@ impl Supervisor {
         self.handles.get(id).map(|h| &h.inbox)
     }
 
+    pub fn abort_signal_for(&self, id: &str) -> Option<AbortSignal> {
+        self.handles.get(id).map(|h| h.abort_signal.clone())
+    }
+
     pub fn list_agents(&self) -> Vec<(&str, &str)> {
         self.handles
             .values()
@@ -113,6 +119,15 @@ impl Supervisor {
     pub fn cancel_all(&self) {
         for handle in self.handles.values() {
             handle.abort_signal.set_ctrlc();
+        }
+    }
+
+    pub fn cancel_recursive(&self) {
+        for handle in self.handles.values() {
+            handle.abort_signal.set_ctrlc();
+            if let Some(child_sup) = handle.child_supervisor.as_ref() {
+                child_sup.read().cancel_recursive();
+            }
         }
     }
 }
@@ -152,6 +167,7 @@ mod tests {
             inbox: Arc::new(Inbox::new()),
             abort_signal: create_abort_signal(),
             join_handle,
+            child_supervisor: None,
         }
     }
 

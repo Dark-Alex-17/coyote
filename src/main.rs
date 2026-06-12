@@ -26,6 +26,7 @@ use crate::config::{
     RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
     install_builtins, list_agents, load_env_file, macro_execute, sync_models,
 };
+use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
 use crate::render::{prompt_theme, render_error};
 use crate::repl::Repl;
 use crate::utils::*;
@@ -35,7 +36,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use client::ClientConfig;
 use inquire::{Select, Text, set_global_render_config};
-use log::LevelFilter;
+use log::{LevelFilter, warn};
 use log4rs::append::console::ConsoleAppender;
 use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Logger, Root};
@@ -419,6 +420,21 @@ async fn start_directive(
             abort_signal,
         )
         .await?;
+    } else {
+        match check_pending_agents_guardrail(ctx) {
+            GuardrailAction::Inject(prompt) => {
+                let guardrail_input = Input::from_str(ctx, &prompt, None)?;
+                return start_directive(ctx, guardrail_input, code_mode, abort_signal).await;
+            }
+            GuardrailAction::ForceTerminate(ids) => {
+                warn!(
+                    "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
+                    ids.len(),
+                    ids
+                );
+            }
+            GuardrailAction::NoAction => {}
+        }
     }
 
     ctx.exit_session()?;

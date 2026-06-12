@@ -7,8 +7,10 @@ use crate::config::{
     Input, RequestContext, Role, RoleLike, SkillPolicy, should_inject_skill_instructions,
 };
 use crate::function::skill::skill_function_declarations;
+use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
 use crate::utils::create_abort_signal;
 use anyhow::{Context, Error, Result, anyhow, bail};
+use log::warn;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -266,7 +268,28 @@ async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -
         }
 
         if tool_results.is_empty() {
-            return Ok(accumulated);
+            match check_pending_agents_guardrail(ctx) {
+                GuardrailAction::NoAction => return Ok(accumulated),
+                GuardrailAction::ForceTerminate(ids) => {
+                    warn!(
+                        "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
+                        ids.len(),
+                        ids
+                    );
+                    return Ok(accumulated);
+                }
+                GuardrailAction::Inject(prompt) => {
+                    if turn + 1 == node.max_iterations {
+                        bail!(
+                            "llm node hit max_iterations ({}) before LLM concluded",
+                            node.max_iterations
+                        );
+                    }
+                    let role = ctx.role.clone();
+                    input = Input::from_str(ctx, &prompt, role)?;
+                    continue;
+                }
+            }
         }
 
         if turn + 1 == node.max_iterations {

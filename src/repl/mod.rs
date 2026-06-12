@@ -12,6 +12,7 @@ use crate::config::{
     macro_execute,
 };
 use crate::config::{AssetCategory, paths};
+use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
 use crate::render::render_error;
 use crate::utils::{
     AbortSignal, abortable_run_with_spinner, create_abort_signal, dimmed_text, set_text, temp_file,
@@ -306,6 +307,9 @@ Type ".help" for additional help.
                 }
                 Ok(Signal::CtrlC) => {
                     self.abort_signal.set_ctrlc();
+                    if let Some(supervisor) = self.ctx.read().supervisor.clone() {
+                        supervisor.read().cancel_recursive();
+                    }
                     println!("(To exit, press Ctrl+D or enter \".exit\")\n");
                 }
                 Ok(Signal::CtrlD) => {
@@ -315,6 +319,11 @@ Type ".help" for additional help.
                 _ => {}
             }
         }
+
+        if let Some(supervisor) = self.ctx.read().supervisor.clone() {
+            supervisor.read().cancel_recursive();
+        }
+
         self.ctx.write().exit_session()?;
         Ok(())
     }
@@ -435,6 +444,7 @@ pub async fn run_repl_command(
     abort_signal: AbortSignal,
     mut line: &str,
 ) -> Result<bool> {
+    ctx.pending_agents_guardrail_count = 0;
     if let Ok(Some(captures)) = MULTILINE_RE.captures(line)
         && let Some(text_match) = captures.get(1)
     {
@@ -1011,6 +1021,20 @@ async fn ask(
         )
         .await
     } else {
+        match check_pending_agents_guardrail(ctx) {
+            GuardrailAction::Inject(prompt) => {
+                let guardrail_input = Input::from_str(ctx, &prompt, None)?;
+                return ask(ctx, abort_signal, guardrail_input, false).await;
+            }
+            GuardrailAction::ForceTerminate(ids) => {
+                warn!(
+                    "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
+                    ids.len(),
+                    ids
+                );
+            }
+            GuardrailAction::NoAction => {}
+        }
         let do_continue = should_continue(ctx);
 
         if do_continue {

@@ -93,6 +93,36 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     agent__collect --id agent_explore_e5f6g7h8
     ```
 
+    ### CRITICAL: Never end your turn with pending agents
+
+    Spawned agents do NOT report back on their own. They run in the background until you
+    actively reclaim them with `agent__collect` (to get their output) or `agent__cancel`
+    (to discard them). If you spawn agents and then emit a final message without reclaiming
+    them, the system will detect the unreclaimed agents and reject the turn-end, injecting
+    a reminder forcing you to handle them. After several such reminders, the system will
+    auto-cancel them and warn you that work was lost.
+
+    The correct flow when you have nothing else to do:
+
+    ```
+    # WRONG - do NOT do this:
+    agent__spawn --agent explore --prompt \"...\"
+    agent__spawn --agent explore --prompt \"...\"
+    # ... emit text like \"I will synthesize once they report back.\" and stop
+    # ^ The agents will be abandoned. Their output will be lost.
+
+    # RIGHT - always do this:
+    agent__spawn --agent explore --prompt \"...\"
+    agent__spawn --agent explore --prompt \"...\"
+    agent__collect --id <first_id>   # blocks until done
+    agent__collect --id <second_id>  # blocks until done
+    # ... NOW you can synthesize and end your turn
+    ```
+
+    `agent__collect` is a **blocking wait**: it pauses your execution until the agent
+    completes, then returns the output as a tool result. Use it freely — it is the
+    correct primitive for \"I'm done with my own work and just need the agents' results\".
+
     ### Parallel Spawning (DEFAULT for multi-agent work)
 
     When a task needs multiple agents, **spawn them all at once**, then collect:
