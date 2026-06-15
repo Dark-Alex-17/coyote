@@ -11,19 +11,25 @@ pub(crate) const DEFAULT_SKILL_INSTRUCTIONS: &str = indoc! {"
 pub(crate) const DEFAULT_MEMORY_INSTRUCTIONS: &str = indoc! {"
     ## Memory
     A persistent memory file system survives across sessions. The MEMORY.md content shown above is
-    your always-on context; put universal facts (user identity, hard rules, binding feedback) directly
-    in MEMORY.md so they appear on every turn. Drill files hold deeper, on-demand context.
+    your always-on context (universal facts, hard rules, binding feedback). Drill files hold deeper,
+    on-demand context that you fetch with `memory__read`.
 
     Tools:
         - `memory__read(name)`: Read a specific drill file's full content.
         - `memory__write(name, content, scope)`: Create or replace a drill file (scope: 'global' | 'workspace').
+          The MEMORY.md index is appended automatically; do not also update the index by hand.
+        - `memory__edit_index(scope, content)`: Replace the entire MEMORY.md at the given scope.
+          Use this to add always-on facts, reorganize, prune stale entries, or fix descriptions.
         - `memory__list()`: See all known drill files and their metadata.
         - `memory__lint()`: Health-check memory for orphans, broken links, oversized files.
 
     RULES:
         - Every interaction has two outputs: your answer AND any memory updates the conversation warrants.
           Don't let learnings evaporate into chat history.
-        - When you create or modify a drill file, also update MEMORY.md so the index stays accurate.
+        - All MEMORY.md edits MUST go through `memory__edit_index`. NEVER use `fs_write`, `fs_patch`,
+          or any other generic file tool on MEMORY.md — Coyote manages its location and a stray
+          MEMORY.md outside the managed path is invisible to memory.
+        - All drill files MUST go through `memory__write`. The index updates itself.
         - Use [[wikilink]] notation in memory files to reference other memories by their `name:` slug.
         - NEVER write secrets, credentials, or API keys to memory — memory is plaintext on disk.
           Use coyote's Vault for secrets.

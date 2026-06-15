@@ -129,6 +129,41 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
             },
             agent: false,
         },
+        FunctionDeclaration {
+            name: format!("{MEMORY_FUNCTION_PREFIX}edit_index"),
+            description:
+                "Replace the entire MEMORY.md index at the given scope. Use to add always-on facts, \
+                 reorganize, prune stale entries, or fix descriptions. Coyote manages the path; \
+                 NEVER use fs_write or any other generic file tool on MEMORY.md."
+                    .to_string(),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
+                properties: Some(IndexMap::from([
+                    (
+                        "scope".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some(
+                                "Where to edit: 'global' (user-level) or 'workspace' (project-level)"
+                                    .into(),
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "content".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some("Full new contents of MEMORY.md".into()),
+                            ..Default::default()
+                        },
+                    ),
+                ])),
+                required: Some(vec!["scope".to_string(), "content".to_string()]),
+                ..Default::default()
+            },
+            agent: false,
+        },
     ]
 }
 
@@ -212,9 +247,31 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
                 "index_updated": index_updated,
             }))
         }
+        "edit_index" => {
+            let scope = arg_str(args, "scope")?;
+            let content = arg_str(args, "content")?;
+            let target_dir = match scope.as_str() {
+                "global" => paths::global_memory_dir(),
+                "workspace" => workspace_write_dir(&store, &cwd)?,
+                other => bail!("unknown scope '{}': use 'global' or 'workspace'", other),
+            };
+            let index_path = write_memory_index(&target_dir, &content)?;
+
+            Ok(json!({
+                "status": "ok",
+                "path": index_path.display().to_string(),
+            }))
+        }
         "lint" => lint_memory(&store),
         _ => bail!("unknown memory action: {action}"),
     }
+}
+
+fn write_memory_index(target_dir: &Path, content: &str) -> Result<PathBuf> {
+    fs::create_dir_all(target_dir)?;
+    let index_path = target_dir.join("MEMORY.md");
+    fs::write(&index_path, content)?;
+    Ok(index_path)
 }
 
 fn ensure_index_entry(index_path: &Path, name: &str, description: &str) -> Result<bool> {
@@ -529,6 +586,39 @@ mod tests {
 
         let miss = find_file(&store, "nope").unwrap();
         assert!(miss.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_index_creates_dir_and_writes_content() {
+        let root = temp_root("write_index_create");
+        let target = root.join("nested").join(".coyote").join("memory");
+
+        let path =
+            write_memory_index(&target, "# Workspace Memory Index\n\n- [[foo]]: hello\n").unwrap();
+
+        assert_eq!(path, target.join("MEMORY.md"));
+        assert!(path.exists());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# Workspace Memory Index\n\n- [[foo]]: hello\n"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_index_replaces_existing_content() {
+        let root = temp_root("write_index_replace");
+        fs::create_dir_all(&root).unwrap();
+        let index = root.join("MEMORY.md");
+        fs::write(&index, "# Old\n\n- [[stale]]: gone\n").unwrap();
+
+        let path = write_memory_index(&root, "# New\n").unwrap();
+
+        assert_eq!(path, index);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# New\n");
 
         let _ = fs::remove_dir_all(&root);
     }
