@@ -600,6 +600,14 @@ patch_file() {
 
           for (i = 2; i <= hunkTotalOriginalLines[hunkIndex]; i++) {
             if (lines[nextLineIndex] != hunkOriginalLines[hunkIndex,i]) {
+              if (i - 1 > bestPartialLen[hunkIndex]) {
+                bestPartialLen[hunkIndex] = i - 1
+                bestPartialAnchorLine[hunkIndex] = lineIndex
+                bestPartialHunkPos[hunkIndex] = i
+                bestPartialDivergeLine[hunkIndex] = nextLineIndex
+                bestPartialExpected[hunkIndex] = hunkOriginalLines[hunkIndex,i]
+                bestPartialActual[hunkIndex] = lines[nextLineIndex]
+              }
               nextLineIndex = 0
               break
             }
@@ -621,7 +629,32 @@ patch_file() {
         }
 
         if (hunkIndex != totalHunks + 1) {
+          failingHunk = hunkIndex
           print "error: unable to apply patch" > "/dev/stderr"
+          print "" > "/dev/stderr"
+          print "Hunk " failingHunk " of " totalHunks " did not match the file." > "/dev/stderr"
+
+          if (bestPartialLen[failingHunk] == 0) {
+            print "" > "/dev/stderr"
+            print "The first context/removed line of hunk " failingHunk " was not found anywhere in the file:" > "/dev/stderr"
+            print "  expected: " hunkOriginalLines[failingHunk, 1] > "/dev/stderr"
+          } else {
+            print "" > "/dev/stderr"
+            print "Closest match: anchored at file line " bestPartialAnchorLine[failingHunk] ", matched " bestPartialLen[failingHunk] " of " hunkTotalOriginalLines[failingHunk] " original lines before diverging." > "/dev/stderr"
+            print "" > "/dev/stderr"
+            print "At file line " bestPartialDivergeLine[failingHunk] " (hunk original line " bestPartialHunkPos[failingHunk] "):" > "/dev/stderr"
+            print "  expected: " bestPartialExpected[failingHunk] > "/dev/stderr"
+            print "  actual:   " bestPartialActual[failingHunk] > "/dev/stderr"
+          }
+
+          print "" > "/dev/stderr"
+          print "Lines must match byte-for-byte (no fuzzy matching). Check escaping, whitespace, and quoting." > "/dev/stderr"
+
+          if (failingHunk < totalHunks) {
+            print "" > "/dev/stderr"
+            print (totalHunks - failingHunk) " subsequent hunk(s) were not attempted (patcher aborts on first failure)." > "/dev/stderr"
+          }
+
           exit 1
         }
     }
