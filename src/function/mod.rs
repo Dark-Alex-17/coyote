@@ -1292,11 +1292,13 @@ pub fn run_llm_function(
         let mut buffer = [0; 1024];
         let mut reader = stdout;
         let mut out = io::stdout();
+        let mut buf = Vec::new();
         while let Ok(n) = reader.read(&mut buffer) {
             if n == 0 {
                 break;
             }
             let chunk = &buffer[0..n];
+            buf.extend_from_slice(chunk);
             let mut last_pos = 0;
             for (i, &byte) in chunk.iter().enumerate() {
                 if byte == b'\n' {
@@ -1310,6 +1312,7 @@ pub fn run_llm_function(
             }
             let _ = out.flush();
         }
+        buf
     });
 
     let stderr_thread = std::thread::spawn(move || {
@@ -1342,17 +1345,21 @@ pub fn run_llm_function(
     let status = child
         .wait()
         .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
-    let _ = stdout_thread.join();
+    let stdout_bytes = stdout_thread.join().unwrap_or_default();
     let stderr_bytes = stderr_thread.join().unwrap_or_default();
 
     let exit_code = status.code().unwrap_or_default();
     if exit_code != 0 {
         let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+        let stdout = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
         let tool_error_message = format!("Tool call '{command_name}' exited with code {exit_code}");
         eprintln!("{}", warning_text(&format!("⚠️ {tool_error_message} ⚠️")));
         let mut error_json = json!({"tool_call_error": tool_error_message});
         if !stderr.is_empty() {
             error_json["stderr"] = json!(stderr);
+        }
+        if !stdout.is_empty() {
+            error_json["stdout"] = json!(stdout);
         }
         debug!("Tool call error: {error_json:?}");
         return Ok(Some(error_json.to_string()));
