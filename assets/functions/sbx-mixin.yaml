@@ -1,0 +1,44 @@
+schemaVersion: "1"
+kind: mixin
+name: built-in-tools
+description: >
+  Installs binaries and allows network domains required by Coyote's built-in
+  global tools and the default MCP server set. Auto-applied by Coyote's sbx
+  mixin discovery when running `coyote --sandbox`.
+
+network:
+  allowedDomains:
+    # fetch_url_via_jina + jina reader fallback
+    - "r.jina.ai:443"
+    # get_current_weather (.sh, .py, .ts)
+    - "wttr.in:443"
+    # search_arxiv (the .sh tool still uses http://, so :80 is required until fixed)
+    - "export.arxiv.org:443"
+    - "export.arxiv.org:80"
+    # search_arxiv + search_wikipedia may follow DOI redirects
+    - "doi.org:443"
+    # search_wikipedia
+    - "en.wikipedia.org:443"
+    # search_wolframalpha
+    - "api.wolframalpha.com:443"
+    # web_search_perplexity
+    - "api.perplexity.ai:443"
+    # web_search_tavily
+    - "api.tavily.com:443"
+    # send_twilio
+    - "api.twilio.com:443"
+    # MCP: github (built-in mcp.json: api.githubcopilot.com)
+    - "api.githubcopilot.com:443"
+    # MCP: atlassian (built-in mcp.json: mcp-remote -> mcp.atlassian.com)
+    - "mcp.atlassian.com:443"
+    # MCP: ddg-search (built-in mcp.json: uvx duckduckgo-mcp-server)
+    - "duckduckgo.com:443"
+    - "html.duckduckgo.com:443"
+    - "lite.duckduckgo.com:443"
+    # MCP: npx-based servers (mcp-remote) pull from npm
+    - "registry.npmjs.org:443"
+    # MCP: docker server may pull images from common registries
+    - "ghcr.io:443"
+    - "registry-1.docker.io:443"
+    - "auth.docker.io:443"
+    - "production.cloudflare.docker.com:443"

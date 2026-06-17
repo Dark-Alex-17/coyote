@@ -113,20 +113,22 @@ network:
       headerName: Authorization
       valueFormat: "Bearer %s"
   allowedDomains:
+    # Coyote release + self-update + model-registry sync
     - "github.com:443"
     - "api.github.com:443"
     - "raw.githubusercontent.com:443"
     - "objects.githubusercontent.com:443"
     - "*.githubusercontent.com:443"
+    # Coyote install paths (cargo install + uv + rustup + Python tool deps at runtime)
     - "crates.io:443"
     - "static.crates.io:443"
     - "pypi.org:443"
     - "files.pythonhosted.org:443"
-    - "registry.npmjs.org:443"
     - "astral.sh:443"
     - "sh.rustup.rs:443"
     - "static.rust-lang.org:443"
 
+    # LLM model OAuth + API endpoints
     - "claude.ai:443"
     - "console.anthropic.com:443"
     - "accounts.google.com:443"
@@ -139,22 +141,6 @@ network:
     # separately (see README "Extending").
     - "*.amazonaws.com:443"
     - "models.inference.ai.azure.com:443"
-
-    - "api.githubcopilot.com:443"
-    - "mcp.atlassian.com:443"
-    - "duckduckgo.com:443"
-    - "html.duckduckgo.com:443"
-    - "lite.duckduckgo.com:443"
-
-    - "wttr.in:443"
-    # search_arxiv.sh uses http://, so :80 is required until the tool is fixed
-    - "export.arxiv.org:443"
-    - "export.arxiv.org:80"
-    - "en.wikipedia.org:443"
-    - "api.wolframalpha.com:443"
-    - "api.twilio.com:443"
-    - "api.tavily.com:443"
-    - "doi.org:443"
 
 credentials:
   sources:
@@ -261,12 +247,29 @@ commands:
           cmake \
           clang libclang-dev \
           musl-tools \
-          libssl-dev
+          libssl-dev \
+          pandoc \
+          bzip2
       user: "1000"
-      description: Install system prerequisites
+      description: Install system prerequisites (including pandoc for fetch_url_via_curl)
     - command: "curl -LsSf https://astral.sh/uv/install.sh | sh"
       user: "1000"
       description: Install uv (required for Python-based custom tools)
+    - command: |
+        set -euo pipefail
+        USQL_VERSION="0.19.20"
+        ARCH=$(uname -m)
+        case "$ARCH" in
+          x86_64) USQL_ARCH=amd64 ;;
+          aarch64) USQL_ARCH=arm64 ;;
+          *) echo "Unsupported arch for usql install: $ARCH" >&2; exit 1 ;;
+        esac
+        curl -sSL "https://github.com/xo/usql/releases/download/v${USQL_VERSION}/usql_static-${USQL_VERSION}-linux-${USQL_ARCH}.tar.bz2" -o /tmp/usql.tar.bz2
+        sudo tar -xjf /tmp/usql.tar.bz2 -C /usr/local/bin
+        sudo chmod +x /usr/local/bin/usql
+        rm -f /tmp/usql.tar.bz2
+      user: "1000"
+      description: Install the usql universal SQL CLI (used by the built-in sql agent and execute_sql_code tool)
     - command: |
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
           sh -s -- -y \
