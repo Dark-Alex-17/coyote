@@ -6,7 +6,7 @@ use crate::cli::completer::{
 };
 use crate::config::{AssetCategory, InstallFilter, MemoryScope};
 use anyhow::{Context, Result};
-use clap::ValueHint;
+use clap::{ArgGroup, ValueHint};
 use clap::{Parser, crate_authors, crate_description, crate_version};
 use clap_complete::ArgValueCompleter;
 use is_terminal::IsTerminal;
@@ -27,7 +27,20 @@ use std::io::{Read, stdin};
 {usage-heading} {usage}
 
 {all-args}{after-help}
-"
+",
+	group(
+		ArgGroup::new("sbx-mode")
+			.args(["sandbox", "fresh"])
+			.multiple(true)
+			.conflicts_with_all([
+				"model", "prompt", "role", "session", "agent", "rag", "rebuild_rag",
+				"macro_name", "execute", "code", "file", "no_stream", "no_memory",
+				"init_memory", "dry_run", "info", "build_tools", "install",
+				"install_from", "sync_models", "list_models", "list_roles",
+				"list_sessions", "list_agents", "list_rags", "list_macros",
+				"list_skills", "skill", "tail_logs", "completions", "update",
+			])
+	),
 )]
 pub struct Cli {
     /// Select a LLM model
@@ -168,8 +181,11 @@ pub struct Cli {
     #[arg(long, requires = "update")]
     pub force: bool,
     /// Launch Coyote inside a Docker sandbox (via `sbx`); name defaults to current directory basename
-    #[arg(long, exclusive = true, value_name = "NAME")]
+    #[arg(long, value_name = "NAME")]
     pub sandbox: Option<Option<String>>,
+    /// Create the sandbox without copying host config or vault password file
+    #[arg(long, requires = "sandbox")]
+    pub fresh: bool,
 }
 
 impl Cli {
@@ -514,5 +530,24 @@ mod tests {
     #[test]
     fn parse_sandbox_is_exclusive() {
         assert!(Cli::try_parse_from(["coyote", "--sandbox", "--agent", "foo"]).is_err());
+    }
+
+    #[test]
+    fn parse_fresh_flag_requires_sandbox() {
+        assert!(Cli::try_parse_from(["coyote", "--fresh"]).is_err());
+    }
+
+    #[test]
+    fn parse_fresh_flag_with_sandbox() {
+        let cli = parse(&["--sandbox", "--fresh"]);
+        assert_eq!(cli.sandbox, Some(None));
+        assert!(cli.fresh);
+    }
+
+    #[test]
+    fn parse_fresh_flag_with_named_sandbox() {
+        let cli = parse(&["--sandbox", "foo", "--fresh"]);
+        assert_eq!(cli.sandbox, Some(Some("foo".to_string())));
+        assert!(cli.fresh);
     }
 }

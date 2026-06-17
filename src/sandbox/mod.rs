@@ -19,7 +19,7 @@ const SANDBOX_AGENT: &str = "coyote";
 #[folder = "assets/sbx-kit/"]
 struct EmbeddedKit;
 
-pub fn launch(name: Option<String>) -> Result<()> {
+pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
     ensure_sbx_installed()?;
     bail_if_nested()?;
 
@@ -28,6 +28,14 @@ pub fn launch(name: Option<String>) -> Result<()> {
 
     if sandbox_exists(&name)? {
         info!("Re-attaching to existing sandbox '{name}'");
+        if fresh {
+            debug!("--fresh ignored: re-attaching to existing sandbox '{name}'");
+        }
+    } else if fresh {
+        let msg = format!("Creating fresh sandbox '{name}' (no host config will be copied)");
+        info!("{msg}");
+        println!("{msg}");
+        create_sandbox(&name, &kit_path)?;
     } else {
         create_sandbox(&name, &kit_path)?;
         copy_host_files(&name)?;
