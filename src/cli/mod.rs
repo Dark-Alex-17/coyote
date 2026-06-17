@@ -183,7 +183,7 @@ pub struct Cli {
     /// Launch Coyote inside a Docker sandbox (via `sbx`); name defaults to current directory basename
     #[arg(long, value_name = "NAME")]
     pub sandbox: Option<Option<String>>,
-    /// Create the sandbox without copying host config or vault password file
+    /// Create the sandbox without bootstrapping the host config or vault password file
     #[arg(long, requires = "sandbox")]
     pub fresh: bool,
 }
