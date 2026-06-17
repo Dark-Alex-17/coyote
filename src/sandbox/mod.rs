@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use which::which;
 
+mod mixins;
+
 use crate::config::paths;
+use crate::sandbox::mixins::DiscoveredMixin;
 use crate::utils::run_command_with_output;
 use crate::vault::Vault;
 
@@ -19,26 +22,39 @@ const SANDBOX_AGENT: &str = "coyote";
 #[folder = "assets/sbx-kit/"]
 struct EmbeddedKit;
 
-pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
+pub fn launch(name: Option<String>, fresh: bool, no_mixins: bool) -> Result<()> {
     ensure_sbx_installed()?;
     bail_if_nested()?;
 
     let name = resolve_name(name)?;
     let kit_path = resolve_kit_path()?;
 
+    let discovered = if no_mixins {
+        Vec::new()
+    } else {
+        mixins::discover()?
+    };
+
     if sandbox_exists(&name)? {
         info!("Re-attaching to existing sandbox '{name}'");
         if fresh {
             debug!("--fresh ignored: re-attaching to existing sandbox '{name}'");
         }
-    } else if fresh {
-        let msg = format!("Creating fresh sandbox '{name}' (no host config will be copied)");
-        info!("{msg}");
-        println!("{msg}");
-        create_sandbox(&name, &kit_path)?;
+        if no_mixins {
+            debug!("--no-mixins ignored: re-attaching to existing sandbox '{name}'");
+        }
     } else {
-        create_sandbox(&name, &kit_path)?;
-        copy_host_files(&name)?;
+        mixins::log_discovery(&discovered, no_mixins);
+
+        if fresh {
+            let msg = format!("Creating fresh sandbox '{name}' (no host config will be copied)");
+            info!("{msg}");
+            println!("{msg}");
+            create_sandbox(&name, &kit_path, &discovered)?;
+        } else {
+            create_sandbox(&name, &kit_path, &discovered)?;
+            copy_host_files(&name)?;
+        }
     }
 
     exec_run(&name, &kit_path)
@@ -192,21 +208,11 @@ fn sandbox_exists(name: &str) -> Result<bool> {
         .any(|line| line.split_whitespace().next() == Some(name)))
 }
 
-fn create_sandbox(name: &str, kit_path: &Path) -> Result<()> {
+fn create_sandbox(name: &str, kit_path: &Path, mixins: &[DiscoveredMixin]) -> Result<()> {
     info!("Creating sandbox '{name}'");
-    let kit_str = kit_path
-        .to_str()
-        .ok_or_else(|| anyhow!("Kit path is not valid UTF-8: {}", kit_path.display()))?;
+    let args = build_create_args(name, kit_path, mixins)?;
     let status = Command::new(SBX_BINARY)
-        .args([
-            "create",
-            "--kit",
-            kit_str,
-            SANDBOX_AGENT,
-            "--name",
-            name,
-            ".",
-        ])
+        .args(&args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -218,6 +224,38 @@ fn create_sandbox(name: &str, kit_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn build_create_args(
+    name: &str,
+    kit_path: &Path,
+    mixins: &[DiscoveredMixin],
+) -> Result<Vec<String>> {
+    let kit_str = kit_path
+        .to_str()
+        .ok_or_else(|| anyhow!("Kit path is not valid UTF-8: {}", kit_path.display()))?;
+
+    let mut args = vec![
+        "create".to_string(),
+        "--kit".to_string(),
+        kit_str.to_string(),
+    ];
+
+    for mixin in mixins {
+        let mixin_str = mixin
+            .path
+            .to_str()
+            .ok_or_else(|| anyhow!("Mixin path is not valid UTF-8: {}", mixin.path.display()))?;
+        args.push("--kit".to_string());
+        args.push(mixin_str.to_string());
+    }
+
+    args.push(SANDBOX_AGENT.to_string());
+    args.push("--name".to_string());
+    args.push(name.to_string());
+    args.push(".".to_string());
+
+    Ok(args)
 }
 
 fn copy_host_files(name: &str) -> Result<()> {
@@ -392,5 +430,61 @@ mod tests {
 
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
+    }
+
+    #[test]
+    fn build_create_args_emits_base_kit_before_mixins() {
+        let kit = PathBuf::from("/cache/sbx-kit");
+        let mixins = vec![
+            DiscoveredMixin {
+                path: PathBuf::from("/cfg/sbx-mixin.yaml"),
+                label: "user".into(),
+                install_count: 0,
+                domain_count: 0,
+            },
+            DiscoveredMixin {
+                path: PathBuf::from("/cfg/agents/sql/sbx-mixin.yaml"),
+                label: "sql".into(),
+                install_count: 0,
+                domain_count: 0,
+            },
+        ];
+
+        let args = build_create_args("my-box", &kit, &mixins).unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "create".to_string(),
+                "--kit".to_string(),
+                "/cache/sbx-kit".to_string(),
+                "--kit".to_string(),
+                "/cfg/sbx-mixin.yaml".to_string(),
+                "--kit".to_string(),
+                "/cfg/agents/sql/sbx-mixin.yaml".to_string(),
+                "coyote".to_string(),
+                "--name".to_string(),
+                "my-box".to_string(),
+                ".".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_create_args_with_no_mixins_omits_mixin_kits() {
+        let kit = PathBuf::from("/cache/sbx-kit");
+        let args = build_create_args("box", &kit, &[]).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "create".to_string(),
+                "--kit".to_string(),
+                "/cache/sbx-kit".to_string(),
+                "coyote".to_string(),
+                "--name".to_string(),
+                "box".to_string(),
+                ".".to_string(),
+            ]
+        );
     }
 }

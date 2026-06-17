@@ -30,7 +30,7 @@ use std::io::{Read, stdin};
 ",
 	group(
 		ArgGroup::new("sbx-mode")
-			.args(["sandbox", "fresh"])
+			.args(["sandbox", "fresh", "no_mixins"])
 			.multiple(true)
 			.conflicts_with_all([
 				"model", "prompt", "role", "session", "agent", "rag", "rebuild_rag",
@@ -186,6 +186,9 @@ pub struct Cli {
     /// Create the sandbox without bootstrapping the host config or vault password file
     #[arg(long, requires = "sandbox")]
     pub fresh: bool,
+    /// Skip discovery and application of all sbx mixins (user and built-in)
+    #[arg(long, requires = "sandbox")]
+    pub no_mixins: bool,
 }
 
 impl Cli {
@@ -549,5 +552,24 @@ mod tests {
         let cli = parse(&["--sandbox", "foo", "--fresh"]);
         assert_eq!(cli.sandbox, Some(Some("foo".to_string())));
         assert!(cli.fresh);
+    }
+
+    #[test]
+    fn parse_no_mixins_requires_sandbox() {
+        assert!(Cli::try_parse_from(["coyote", "--no-mixins"]).is_err());
+    }
+
+    #[test]
+    fn parse_no_mixins_with_sandbox() {
+        let cli = parse(&["--sandbox", "--no-mixins"]);
+        assert!(cli.no_mixins);
+    }
+
+    #[test]
+    fn parse_sandbox_with_fresh_and_no_mixins() {
+        let cli = parse(&["--sandbox", "foo", "--fresh", "--no-mixins"]);
+        assert_eq!(cli.sandbox, Some(Some("foo".to_string())));
+        assert!(cli.fresh);
+        assert!(cli.no_mixins);
     }
 }

@@ -4,7 +4,7 @@ use super::{
     ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME, GLOBAL_TOOLS_DIR_NAME,
     GLOBAL_TOOLS_UTILS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, MEMORY_DIR_NAME,
     MEMORY_INDEX_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME, SBX_KIT_DIR_NAME,
-    SBX_KIT_HASH_FILE, SKILLS_DIR_NAME, WORKSPACE_MEMORY_DIR_NAME,
+    SBX_KIT_HASH_FILE, SBX_MIXIN_FILE_NAME, SKILLS_DIR_NAME, WORKSPACE_MEMORY_DIR_NAME,
 };
 use crate::client::ProviderModels;
 use crate::utils::{get_env_name, list_file_names, normalize_env_name};
@@ -38,6 +38,27 @@ pub fn cache_path() -> PathBuf {
 
 pub fn sandbox_kit_override() -> Option<PathBuf> {
     env::var_os(get_env_name("sandbox_kit")).map(PathBuf::from)
+}
+
+pub fn sbx_mixin_file() -> PathBuf {
+    config_dir().join(SBX_MIXIN_FILE_NAME)
+}
+
+pub fn global_tools_sbx_mixin_file() -> PathBuf {
+    functions_dir().join(SBX_MIXIN_FILE_NAME)
+}
+
+pub fn find_workspace_sbx_mixin(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let candidate = dir
+            .join(WORKSPACE_MEMORY_DIR_NAME)
+            .join(SBX_MIXIN_FILE_NAME);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
 }
 
 pub fn oauth_tokens_path() -> PathBuf {
