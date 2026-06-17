@@ -1,0 +1,33 @@
+schemaVersion: "1"
+kind: mixin
+name: vault-aws-secrets-manager
+description: >
+  Installs the AWS CLI v2 so the Coyote vault can read secrets from AWS
+  Secrets Manager inside the sandbox. The AWS Rust SDK does not strictly
+  require the CLI, but most users authenticate via `aws sso login` or
+  `aws configure`, which need the CLI to be installed. After install, run
+  the appropriate auth command in the sandbox; cached credentials persist
+  for the lifetime of the sandbox.
+
+network:
+  allowedDomains:
+    - "awscli.amazonaws.com:443"
+    - "sts.amazonaws.com:443"
+    - "*.sts.amazonaws.com:443"
+    - "*.secretsmanager.amazonaws.com:443"
+    - "*.amazonaws.com:443"
+    - "*.awsapps.com:443"
+
+commands:
+  install:
+    - command: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y unzip
+        ARCH=$(uname -m)
+        curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}.zip" -o /tmp/awscliv2.zip
+        unzip -q /tmp/awscliv2.zip -d /tmp
+        sudo /tmp/aws/install
+        rm -rf /tmp/awscliv2.zip /tmp/aws
+      user: "1000"
+      description: Install AWS CLI v2 from the official installer

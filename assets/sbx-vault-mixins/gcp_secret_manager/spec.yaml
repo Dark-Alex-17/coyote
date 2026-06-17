@@ -1,0 +1,34 @@
+schemaVersion: "1"
+kind: mixin
+name: vault-gcp-secret-manager
+description: >
+  Installs the Google Cloud CLI (`gcloud`) so the Coyote vault can read
+  secrets from GCP Secret Manager inside the sandbox. The GCP Rust SDK does
+  not strictly require the CLI, but most users authenticate via
+  `gcloud auth application-default login`, which needs the CLI to be
+  installed. After install, run that command in the sandbox; the ADC file
+  persists for the lifetime of the sandbox.
+
+network:
+  allowedDomains:
+    - "packages.cloud.google.com:443"
+    - "accounts.google.com:443"
+    - "oauth2.googleapis.com:443"
+    - "secretmanager.googleapis.com:443"
+    - "cloudresourcemanager.googleapis.com:443"
+    - "*.googleapis.com:443"
+
+commands:
+  install:
+    - command: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y apt-transport-https ca-certificates gnupg
+        echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+          | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list >/dev/null
+        curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+          | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+        sudo apt-get update
+        sudo apt-get install -y google-cloud-cli
+      user: "1000"
+      description: Install gcloud CLI from Google's official apt repository

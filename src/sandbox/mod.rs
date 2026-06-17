@@ -9,6 +9,8 @@ use which::which;
 
 mod mixins;
 
+use gman::providers::SupportedProvider;
+
 use crate::config::paths;
 use crate::sandbox::mixins::DiscoveredMixin;
 use crate::utils::run_command_with_output;
@@ -22,6 +24,10 @@ const SANDBOX_AGENT: &str = "coyote";
 #[folder = "assets/sbx-kit/"]
 struct EmbeddedKit;
 
+#[derive(RustEmbed)]
+#[folder = "assets/sbx-vault-mixins/"]
+struct EmbeddedVaultMixins;
+
 pub fn launch(name: Option<String>, fresh: bool, no_mixins: bool) -> Result<()> {
     ensure_sbx_installed()?;
     bail_if_nested()?;
@@ -32,7 +38,13 @@ pub fn launch(name: Option<String>, fresh: bool, no_mixins: bool) -> Result<()> 
     let discovered = if no_mixins {
         Vec::new()
     } else {
-        mixins::discover()?
+        let mut all = mixins::discover()?;
+        if let Ok(vault) = Vault::init_bare()
+            && let Some(vault_mixin) = extract_vault_mixin(&vault.provider)?
+        {
+            all.insert(0, vault_mixin);
+        }
+        all
     };
 
     if sandbox_exists(&name)? {
@@ -187,6 +199,99 @@ fn compute_kit_hash() -> Result<String> {
     for entry in &entries {
         let file = EmbeddedKit::get(entry)
             .ok_or_else(|| anyhow!("Embedded kit file missing during hash: {entry}"))?;
+        hasher.update(entry.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(&file.data);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn extract_vault_mixin(provider: &SupportedProvider) -> Result<Option<DiscoveredMixin>> {
+    let provider_dir = match provider {
+        SupportedProvider::Local { .. } => return Ok(None),
+        SupportedProvider::AwsSecretsManager { .. } => "aws_secrets_manager",
+        SupportedProvider::GcpSecretManager { .. } => "gcp_secret_manager",
+        SupportedProvider::AzureKeyVault { .. } => "azure_key_vault",
+        SupportedProvider::Gopass { .. } => "gopass",
+        SupportedProvider::OnePassword { .. } => "one_password",
+    };
+
+    let cache_root = extract_vault_mixins_cache()?;
+    let provider_root = cache_root.join(provider_dir);
+    let spec_path = provider_root.join("spec.yaml");
+
+    if !spec_path.exists() {
+        bail!(
+            "Embedded vault mixin for '{provider_dir}' is missing spec.yaml at {}",
+            spec_path.display()
+        );
+    }
+
+    let label = format!("<built-in: vault-{provider_dir}>");
+    let (install_count, domain_count) = mixins::summarize(&spec_path)?;
+
+    Ok(Some(DiscoveredMixin {
+        path: provider_root,
+        label,
+        install_count,
+        domain_count,
+    }))
+}
+
+fn extract_vault_mixins_cache() -> Result<PathBuf> {
+    let cache_root = paths::sbx_vault_mixins_dir();
+    let new_hash = compute_vault_mixins_hash()?;
+    let hash_file = paths::sbx_vault_mixins_hash_file();
+    if let Ok(existing) = fs::read_to_string(&hash_file)
+        && existing == new_hash
+    {
+        return Ok(cache_root);
+    }
+
+    if cache_root.exists() {
+        fs::remove_dir_all(&cache_root).with_context(|| {
+            format!(
+                "Failed to clear stale vault mixins at {}",
+                cache_root.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(&cache_root)
+        .with_context(|| format!("Failed to create {}", cache_root.display()))?;
+
+    for entry in EmbeddedVaultMixins::iter() {
+        let file = EmbeddedVaultMixins::get(&entry).ok_or_else(|| {
+            anyhow!("Embedded vault mixin file missing during extraction: {entry}")
+        })?;
+        let dest = cache_root.join(entry.as_ref());
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+
+        fs::write(&dest, &file.data)
+            .with_context(|| format!("Failed to write {}", dest.display()))?;
+    }
+
+    fs::write(&hash_file, &new_hash)
+        .with_context(|| format!("Failed to write {}", hash_file.display()))?;
+    debug!(
+        "Extracted embedded sbx-vault-mixins to {}",
+        cache_root.display()
+    );
+
+    Ok(cache_root)
+}
+
+fn compute_vault_mixins_hash() -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut entries: Vec<_> = EmbeddedVaultMixins::iter().collect();
+    entries.sort();
+
+    for entry in &entries {
+        let file = EmbeddedVaultMixins::get(entry)
+            .ok_or_else(|| anyhow!("Embedded vault mixin file missing during hash: {entry}"))?;
         hasher.update(entry.as_bytes());
         hasher.update(b"\0");
         hasher.update(&file.data);
@@ -486,5 +591,105 @@ mod tests {
                 ".".to_string(),
             ]
         );
+    }
+
+    mod vault_mixins {
+        use super::*;
+        use gman::providers::aws_secrets_manager::AwsSecretsManagerProvider;
+        use gman::providers::azure_key_vault::AzureKeyVaultProvider;
+        use gman::providers::gcp_secret_manager::GcpSecretManagerProvider;
+        use gman::providers::gopass::GopassProvider;
+        use gman::providers::local::LocalProvider;
+        use gman::providers::one_password::OnePasswordProvider;
+        use serial_test::serial;
+
+        #[test]
+        fn returns_none_for_local() {
+            let p = SupportedProvider::Local {
+                provider_def: LocalProvider::default(),
+            };
+            assert!(extract_vault_mixin(&p).unwrap().is_none());
+        }
+
+        #[test]
+        #[serial]
+        fn returns_some_for_aws() {
+            let p = SupportedProvider::AwsSecretsManager {
+                provider_def: AwsSecretsManagerProvider {
+                    aws_profile: None,
+                    aws_region: None,
+                },
+            };
+            let m = extract_vault_mixin(&p)
+                .unwrap()
+                .expect("expected vault mixin");
+            assert!(m.path.join("spec.yaml").exists());
+            assert!(m.label.contains("aws_secrets_manager"));
+        }
+
+        #[test]
+        #[serial]
+        fn returns_some_for_gcp() {
+            let p = SupportedProvider::GcpSecretManager {
+                provider_def: GcpSecretManagerProvider {
+                    gcp_project_id: None,
+                },
+            };
+            let m = extract_vault_mixin(&p)
+                .unwrap()
+                .expect("expected vault mixin");
+            assert!(m.path.join("spec.yaml").exists());
+            assert!(m.label.contains("gcp_secret_manager"));
+        }
+
+        #[test]
+        #[serial]
+        fn returns_some_for_one_password() {
+            let p = SupportedProvider::OnePassword {
+                provider_def: OnePasswordProvider {
+                    vault: None,
+                    account: None,
+                },
+            };
+            let m = extract_vault_mixin(&p)
+                .unwrap()
+                .expect("expected vault mixin");
+            assert!(m.path.join("spec.yaml").exists());
+            assert!(m.label.contains("one_password"));
+        }
+
+        #[test]
+        #[serial]
+        fn returns_some_for_azure() {
+            let p = SupportedProvider::AzureKeyVault {
+                provider_def: AzureKeyVaultProvider { vault_name: None },
+            };
+            let m = extract_vault_mixin(&p)
+                .unwrap()
+                .expect("expected vault mixin");
+            assert!(m.path.join("spec.yaml").exists());
+            assert!(m.label.contains("azure_key_vault"));
+        }
+
+        #[test]
+        #[serial]
+        fn returns_some_for_gopass() {
+            let p = SupportedProvider::Gopass {
+                provider_def: GopassProvider { store: None },
+            };
+            let m = extract_vault_mixin(&p)
+                .unwrap()
+                .expect("expected vault mixin");
+            assert!(m.path.join("spec.yaml").exists());
+            assert!(m.label.contains("gopass"));
+        }
+
+        #[test]
+        fn hash_is_deterministic() {
+            let h1 = compute_vault_mixins_hash().unwrap();
+            let h2 = compute_vault_mixins_hash().unwrap();
+            assert_eq!(h1, h2);
+            assert_eq!(h1.len(), 64);
+        }
     }
 }

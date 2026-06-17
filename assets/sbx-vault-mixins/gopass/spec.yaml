@@ -1,0 +1,30 @@
+schemaVersion: "1"
+kind: mixin
+name: vault-gopass
+description: >
+  Installs `gopass` and `gpg` so the Coyote vault can read secrets from a
+  gopass store inside the sandbox. The store must be cloned manually
+  (gopass walks a user-specific git remote, so v1 only allowlists github.com
+  and gitlab.com; add other hosts via a user mixin if needed). After install,
+  run `gopass setup` or `gopass clone <remote>` in the sandbox.
+
+network:
+  allowedDomains:
+    - "github.com:443"
+    - "api.github.com:443"
+    - "objects.githubusercontent.com:443"
+    - "gitlab.com:443"
+
+commands:
+  install:
+    - command: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y gnupg2 git
+        GOPASS_VERSION="1.15.13"
+        ARCH=$(dpkg --print-architecture)
+        curl -sSL "https://github.com/gopasspw/gopass/releases/download/v${GOPASS_VERSION}/gopass_${GOPASS_VERSION}_linux_${ARCH}.deb" -o /tmp/gopass.deb
+        sudo dpkg -i /tmp/gopass.deb
+        rm -f /tmp/gopass.deb
+      user: "1000"
+      description: Install gnupg2, git, and gopass from the official .deb release

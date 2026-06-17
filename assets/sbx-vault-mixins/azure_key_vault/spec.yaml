@@ -1,0 +1,24 @@
+schemaVersion: "1"
+kind: mixin
+name: vault-azure-key-vault
+description: >
+  Installs the Azure CLI (`az`) so the Coyote vault can read secrets from
+  Azure Key Vault inside the sandbox. After install, run `az login` in the
+  sandbox to authenticate; the session token persists for the lifetime of
+  the sandbox.
+
+network:
+  allowedDomains:
+    - "aka.ms:443"
+    - "packages.microsoft.com:443"
+    - "azurecliprod.blob.core.windows.net:443"
+    - "login.microsoftonline.com:443"
+    - "graph.microsoft.com:443"
+    - "management.azure.com:443"
+    - "*.vault.azure.net:443"
+
+commands:
+  install:
+    - command: "curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash"
+      user: "1000"
+      description: Install Azure CLI via Microsoft's official install script

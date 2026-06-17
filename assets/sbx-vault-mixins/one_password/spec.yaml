@@ -1,0 +1,31 @@
+schemaVersion: "1"
+kind: mixin
+name: vault-one-password
+description: >
+  Installs the 1Password CLI (`op`) so the Coyote vault can decrypt secrets
+  inside the sandbox. After install, run `op signin` in the sandbox to
+  authenticate; credentials persist for the lifetime of the sandbox.
+
+network:
+  allowedDomains:
+    - "downloads.1password.com:443"
+    - "cache.agilebits.com:443"
+    - "my.1password.com:443"
+    - "my.1password.eu:443"
+    - "my.1password.ca:443"
+    - "events.1password.com:443"
+
+commands:
+  install:
+    - command: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y unzip
+        OP_VERSION="v2.30.3"
+        ARCH=$(dpkg --print-architecture)
+        curl -sSL "https://cache.agilebits.com/dist/1P/op2/pkg/${OP_VERSION}/op_linux_${ARCH}_${OP_VERSION}.zip" -o /tmp/op.zip
+        sudo unzip -od /usr/local/bin /tmp/op.zip op
+        sudo chmod +x /usr/local/bin/op
+        rm -f /tmp/op.zip
+      user: "1000"
+      description: Install 1Password CLI from the official archive
