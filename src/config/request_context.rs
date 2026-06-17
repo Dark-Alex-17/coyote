@@ -2401,7 +2401,7 @@ impl RequestContext {
                 _ => vec![],
             };
             values = candidates.into_iter().map(|v| (v, None)).collect();
-        } else if cmd == ".vault" && args.len() == 2 {
+        } else if cmd == ".vault" && args.len() == 2 && args[0] != "list" {
             values = self
                 .app
                 .vault
