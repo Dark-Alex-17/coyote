@@ -18,6 +18,7 @@ use crate::utils::{
     AbortSignal, abortable_run_with_spinner, create_abort_signal, dimmed_text, set_text, temp_file,
 };
 
+use crate::sandbox::SANDBOX_ENV_FLAG;
 use crate::{config, graph, resolve_oauth_client};
 use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
@@ -278,7 +279,12 @@ Type ".help" for additional help.
 "#,
                 env!("CARGO_CRATE_NAME"),
                 env!("CARGO_PKG_VERSION"),
-            )
+            );
+            if env::var_os(SANDBOX_ENV_FLAG).is_some() {
+                eprintln!(
+                    "Sandbox mode is enabled. All changes made to the Coyote config will not persist to the host machine."
+                );
+            }
         }
 
         loop {

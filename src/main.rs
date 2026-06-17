@@ -10,6 +10,7 @@ mod repl;
 mod utils;
 mod mcp;
 mod parsers;
+mod sandbox;
 mod supervisor;
 mod vault;
 
@@ -56,6 +57,7 @@ async fn main() -> Result<()> {
         shell.generate_completions(&mut cmd);
         return Ok(());
     }
+
     if cli.tail_logs {
         tail_logs(cli.disable_log_colors).await;
         return Ok(());
@@ -90,6 +92,10 @@ async fn main() -> Result<()> {
         let force = cli.force;
         return tokio::task::spawn_blocking(move || config::run_self_update(version, force))
             .await?;
+    }
+
+    if let Some(name) = &cli.sandbox {
+        return sandbox::launch(name.clone());
     }
 
     install_builtins()?;

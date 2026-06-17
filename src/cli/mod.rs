@@ -167,6 +167,9 @@ pub struct Cli {
     /// With --update, update even if Coyote was installed via a package manager
     #[arg(long, requires = "update")]
     pub force: bool,
+    /// Launch Coyote inside a Docker sandbox (via `sbx`); name defaults to current directory basename
+    #[arg(long, exclusive = true, value_name = "NAME")]
+    pub sandbox: Option<Option<String>>,
 }
 
 impl Cli {
@@ -494,5 +497,22 @@ mod tests {
     #[test]
     fn parse_force_without_update_fails() {
         assert!(Cli::try_parse_from(["coyote", "--force"]).is_err());
+    }
+
+    #[test]
+    fn parse_sandbox_flag_no_value() {
+        let cli = parse(&["--sandbox"]);
+        assert_eq!(cli.sandbox, Some(None));
+    }
+
+    #[test]
+    fn parse_sandbox_flag_with_name() {
+        let cli = parse(&["--sandbox", "my-box"]);
+        assert_eq!(cli.sandbox, Some(Some("my-box".to_string())));
+    }
+
+    #[test]
+    fn parse_sandbox_is_exclusive() {
+        assert!(Cli::try_parse_from(["coyote", "--sandbox", "--agent", "foo"]).is_err());
     }
 }

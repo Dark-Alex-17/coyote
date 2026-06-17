@@ -3,8 +3,8 @@ use super::{
     AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME,
     ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME, GLOBAL_TOOLS_DIR_NAME,
     GLOBAL_TOOLS_UTILS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, MEMORY_DIR_NAME,
-    MEMORY_INDEX_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME, SKILLS_DIR_NAME,
-    WORKSPACE_MEMORY_DIR_NAME,
+    MEMORY_INDEX_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME, SBX_KIT_DIR_NAME,
+    SBX_KIT_HASH_FILE, SKILLS_DIR_NAME, WORKSPACE_MEMORY_DIR_NAME,
 };
 use crate::client::ProviderModels;
 use crate::utils::{get_env_name, list_file_names, normalize_env_name};
@@ -36,6 +36,10 @@ pub fn cache_path() -> PathBuf {
     base_dir.join(env!("CARGO_CRATE_NAME"))
 }
 
+pub fn sandbox_kit_override() -> Option<PathBuf> {
+    env::var_os(get_env_name("sandbox_kit")).map(PathBuf::from)
+}
+
 pub fn oauth_tokens_path() -> PathBuf {
     cache_path().join("oauth")
 }
@@ -46,6 +50,14 @@ pub fn token_file(client_name: &str) -> PathBuf {
 
 pub fn log_path() -> PathBuf {
     cache_path().join(format!("{}.log", env!("CARGO_CRATE_NAME")))
+}
+
+pub fn sbx_kit_dir() -> PathBuf {
+    cache_path().join(SBX_KIT_DIR_NAME)
+}
+
+pub fn sbx_kit_hash_file() -> PathBuf {
+    sbx_kit_dir().join(SBX_KIT_HASH_FILE)
 }
 
 pub fn config_file() -> PathBuf {
@@ -362,6 +374,30 @@ mod tests {
                 !has_skill(absent),
                 "has_skill({absent:?}) should be false for a missing skill"
             );
+        }
+    }
+
+    #[test]
+    fn sandbox_kit_override_reflects_env_var_state() {
+        let env_name = get_env_name("sandbox_kit");
+        let prev = env::var_os(&env_name);
+
+        unsafe {
+            env::remove_var(&env_name);
+        }
+        assert_eq!(sandbox_kit_override(), None);
+
+        let probe = PathBuf::from("/tmp/coyote-sandbox-kit-probe");
+        unsafe {
+            env::set_var(&env_name, &probe);
+        }
+        assert_eq!(sandbox_kit_override(), Some(probe));
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
+            }
         }
     }
 
