@@ -25,6 +25,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [REPL](https://github.com/Dark-Alex-17/coyote/wiki/REPL): Interactive Read-Eval-Print Loop for conversational interactions with LLMs and Coyote.
   * [Custom REPL Prompt](https://github.com/Dark-Alex-17/coyote/wiki/REPL-Prompt): Customize the REPL prompt to provide useful contextual information.
 * [Vault](https://github.com/Dark-Alex-17/coyote/wiki/Vault): Securely store and manage sensitive information such as API keys and credentials.
+* [Sandboxes](https://github.com/Dark-Alex-17/coyote/wiki/Sandboxes): Launch Coyote inside an isolated [Docker Sandbox](https://docs.docker.com/ai/sandboxes/) with one command. Host config and vault credentials are projected in automatically; everything else is delegated to the `sbx` CLI.
 * [Shell Integrations](https://github.com/Dark-Alex-17/coyote/wiki/Shell-Integrations): Seamlessly integrate Coyote with your shell environment for enhanced command-line assistance.
 * [Function Calling](https://github.com/Dark-Alex-17/coyote/wiki/Tools): Leverage function calling capabilities to extend Coyote's functionality with custom tools
     * [Creating Custom Tools](https://github.com/Dark-Alex-17/coyote/wiki/Custom-Tools): You can create your own custom tools to enhance Coyote's capabilities.
