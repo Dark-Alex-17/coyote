@@ -1037,6 +1037,10 @@ impl RequestContext {
                 super::format_option_value(&role.enabled_mcp_servers().map(|v| v.join(","))),
             ),
             (
+                "enabled_skills",
+                super::format_option_value(&role.enabled_skills().map(|v| v.join(","))),
+            ),
+            (
                 "max_output_tokens",
                 role.model()
                     .max_tokens_param()
@@ -1071,6 +1075,7 @@ impl RequestContext {
                 app.function_calling_support.to_string(),
             ),
             ("mcp_server_support", app.mcp_server_support.to_string()),
+            ("skills_enabled", app.skills_enabled.to_string()),
             ("auto_continue", app.auto_continue.to_string()),
             ("max_auto_continues", app.max_auto_continues.to_string()),
             ("stream", app.stream.to_string()),
@@ -1090,6 +1095,7 @@ impl RequestContext {
             ("rags_dir", display_path(&paths::rags_dir())),
             ("macros_dir", display_path(&paths::macros_dir())),
             ("functions_dir", display_path(&paths::functions_dir())),
+            ("sbx_kit_dir", display_path(&paths::sbx_kit_dir())),
             ("messages_file", display_path(&self.messages_file())),
         ];
 
