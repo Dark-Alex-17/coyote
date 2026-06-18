@@ -15,7 +15,8 @@ use crate::config::{AssetCategory, paths};
 use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
 use crate::render::render_error;
 use crate::utils::{
-    AbortSignal, abortable_run_with_spinner, create_abort_signal, dimmed_text, set_text, temp_file,
+    AbortSignal, SHELL, abortable_run_with_spinner, create_abort_signal, dimmed_text, run_command,
+    set_text, temp_file,
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
@@ -961,9 +962,13 @@ pub async fn run_repl_command(
             _ => unknown_command()?,
         },
         None => {
-            reset_continuation(ctx);
-            let input = Input::from_str(ctx, line, None)?;
-            ask(ctx, abort_signal.clone(), input, true).await?;
+            if let Some(cmd) = try_extract_shell_command(line) {
+                handle_shell_passthrough(cmd)?;
+            } else {
+                reset_continuation(ctx);
+                let input = Input::from_str(ctx, line, None)?;
+                ask(ctx, abort_signal.clone(), input, true).await?;
+            }
         }
     }
 
@@ -1179,10 +1184,12 @@ fn dump_repl_help() {
         .join("\n");
     println!(
         r###"{head}
+{:<24} Run an arbitrary shell command (stdout/stderr stream to your terminal; Ctrl+C interrupts)
 
 Type ::: to start multi-line editing, type ::: to finish it.
 Press Ctrl+O to open an editor for editing the input buffer.
 Press Ctrl+C to cancel the response, Ctrl+D to exit the REPL."###,
+        "!<command>",
     );
 }
 
@@ -1196,6 +1203,25 @@ fn parse_command(line: &str) -> Option<(&str, Option<&str>)> {
         }
         _ => None,
     }
+}
+
+fn try_extract_shell_command(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('!')?;
+    Some(rest.trim_start())
+}
+
+fn handle_shell_passthrough(cmd: &str) -> Result<()> {
+    if cmd.is_empty() {
+        eprintln!("Usage: !<command>");
+        return Ok(());
+    }
+
+    let status = run_command(&SHELL.cmd, &[&SHELL.arg, cmd], None)?;
+    if status != 0 {
+        eprintln!("[exit {status}]");
+    }
+
+    Ok(())
 }
 
 fn split_first_arg(args: Option<&str>) -> Option<(&str, Option<&str>)> {
@@ -1530,6 +1556,57 @@ mod tests {
     #[test]
     fn parse_command_dot_only() {
         assert_eq!(parse_command("."), Some((".", None)));
+    }
+
+    #[test]
+    fn try_extract_shell_command_strips_bang() {
+        assert_eq!(try_extract_shell_command("!ls"), Some("ls"));
+        assert_eq!(try_extract_shell_command("!ls -la"), Some("ls -la"));
+    }
+
+    #[test]
+    fn try_extract_shell_command_trims_inner_whitespace() {
+        assert_eq!(try_extract_shell_command("!   echo hi"), Some("echo hi"));
+        assert_eq!(try_extract_shell_command("! ls"), Some("ls"));
+    }
+
+    #[test]
+    fn try_extract_shell_command_only_bang_yields_empty() {
+        assert_eq!(try_extract_shell_command("!"), Some(""));
+        assert_eq!(try_extract_shell_command("!   "), Some(""));
+    }
+
+    #[test]
+    fn try_extract_shell_command_rejects_leading_whitespace() {
+        assert!(try_extract_shell_command(" !ls").is_none());
+        assert!(try_extract_shell_command("\t!ls").is_none());
+    }
+
+    #[test]
+    fn try_extract_shell_command_rejects_inline_bang() {
+        assert!(try_extract_shell_command("echo !foo").is_none());
+        assert!(try_extract_shell_command("hello world").is_none());
+    }
+
+    #[test]
+    fn try_extract_shell_command_strips_one_leading_bang() {
+        assert_eq!(try_extract_shell_command("!!ls"), Some("!ls"));
+    }
+
+    #[test]
+    fn try_extract_shell_command_preserves_pipes_and_redirects() {
+        assert_eq!(
+            try_extract_shell_command("!ls -la | grep yaml"),
+            Some("ls -la | grep yaml")
+        );
+        assert_eq!(
+            try_extract_shell_command("!cat foo.txt > /tmp/out"),
+            Some("cat foo.txt > /tmp/out")
+        );
+        assert_eq!(
+            try_extract_shell_command(r#"!echo "$HOME""#),
+            Some(r#"echo "$HOME""#)
+        );
     }
 
     #[test]
