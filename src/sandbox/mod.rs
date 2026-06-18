@@ -381,15 +381,11 @@ fn copy_host_files(name: &str) -> Result<()> {
 
     match resolve_vault_password_file() {
         Some(password_file) if password_file.exists() => {
-            let dest_path = match password_file.strip_prefix(&home_dir) {
-                Ok(rel) => format!("/home/agent/{}", rel.display()),
-                Err(_) => password_file.display().to_string(),
-            };
-            if let Some(parent) = Path::new(&dest_path).parent()
-                && let Some(parent_str) = parent.to_str()
-                && !parent_str.is_empty()
+            let dest_path = host_to_sandbox_path(&password_file, &home_dir, cfg!(windows))?;
+            if let Some(parent) = sandbox_path_parent(&dest_path)
+                && !parent.is_empty()
             {
-                ensure_sandbox_dir(name, parent_str)?;
+                ensure_sandbox_dir(name, parent)?;
             }
             let dest = format!("{name}:{dest_path}");
             sbx_cp(&password_file.display().to_string(), &dest)?;
@@ -406,6 +402,60 @@ fn copy_host_files(name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn host_to_sandbox_path(
+    host_path: &Path,
+    home_dir: &Path,
+    is_windows_host: bool,
+) -> Result<String> {
+    let host_str = host_path.to_str().context("Host path is not valid UTF-8")?;
+    let home_str = home_dir
+        .to_str()
+        .context("Home directory is not valid UTF-8")?;
+
+    if let Some(rel) = strip_host_home(host_str, home_str) {
+        let unixified = rel.replace('\\', "/");
+        return Ok(format!("/home/agent/{unixified}"));
+    }
+
+    if is_windows_host {
+        bail!(
+            "Path '{host_str}' is outside your Windows user profile ({home_str}). \
+             Sandbox mode cannot copy files from outside %USERPROFILE% into a Linux \
+             sandbox. Move the file under your user profile and update your config \
+             accordingly."
+        );
+    }
+
+    Ok(host_str.to_string())
+}
+
+fn strip_host_home(path: &str, home: &str) -> Option<String> {
+    let path_norm: String = path
+        .chars()
+        .map(|c| if c == '\\' { '/' } else { c })
+        .collect();
+    let home_norm: String = home
+        .chars()
+        .map(|c| if c == '\\' { '/' } else { c })
+        .collect();
+    let home_norm = home_norm.trim_end_matches('/');
+
+    if home_norm.is_empty() || path_norm.len() <= home_norm.len() {
+        return None;
+    }
+
+    let (head, tail) = path_norm.split_at(home_norm.len());
+    if head != home_norm || !tail.starts_with('/') {
+        return None;
+    }
+
+    Some(tail[1..].to_string())
+}
+
+fn sandbox_path_parent(linux_path: &str) -> Option<&str> {
+    linux_path.rsplit_once('/').map(|(parent, _)| parent)
 }
 
 fn ensure_sandbox_dir(sandbox: &str, dir: &str) -> Result<()> {
@@ -690,6 +740,135 @@ mod tests {
             let h2 = compute_vault_mixins_hash().unwrap();
             assert_eq!(h1, h2);
             assert_eq!(h1.len(), 64);
+        }
+    }
+
+    mod host_to_sandbox_path_tests {
+        use super::*;
+
+        #[test]
+        fn linux_under_home() {
+            let dest = host_to_sandbox_path(
+                Path::new("/home/atusa/.coyote_password"),
+                Path::new("/home/atusa"),
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(dest, "/home/agent/.coyote_password");
+        }
+
+        #[test]
+        fn linux_nested_under_home() {
+            let dest = host_to_sandbox_path(
+                Path::new("/home/atusa/.config/coyote/.password"),
+                Path::new("/home/atusa"),
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(dest, "/home/agent/.config/coyote/.password");
+        }
+
+        #[test]
+        fn linux_outside_home_returns_verbatim() {
+            let dest = host_to_sandbox_path(
+                Path::new("/etc/coyote/.password"),
+                Path::new("/home/atusa"),
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(dest, "/etc/coyote/.password");
+        }
+
+        #[test]
+        fn macos_under_home_with_spaces() {
+            let dest = host_to_sandbox_path(
+                Path::new("/Users/atusa/Library/Application Support/coyote/.password"),
+                Path::new("/Users/atusa"),
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(
+                dest,
+                "/home/agent/Library/Application Support/coyote/.password"
+            );
+        }
+
+        #[test]
+        fn windows_under_home_converts_backslashes() {
+            let dest = host_to_sandbox_path(
+                Path::new(r"C:\Users\atusa\.coyote_password"),
+                Path::new(r"C:\Users\atusa"),
+                true,
+            )
+            .unwrap();
+
+            assert_eq!(dest, "/home/agent/.coyote_password");
+        }
+
+        #[test]
+        fn windows_nested_under_home() {
+            let dest = host_to_sandbox_path(
+                Path::new(r"C:\Users\atusa\Documents\my\vault.txt"),
+                Path::new(r"C:\Users\atusa"),
+                true,
+            )
+            .unwrap();
+
+            assert_eq!(dest, "/home/agent/Documents/my/vault.txt");
+        }
+
+        #[test]
+        fn windows_outside_home_bails_with_clear_error() {
+            let err = host_to_sandbox_path(
+                Path::new(r"C:\Program Files\Coyote\vault.txt"),
+                Path::new(r"C:\Users\atusa"),
+                true,
+            )
+            .unwrap_err();
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Program Files"),
+                "error should name the offending path: {msg}"
+            );
+            assert!(
+                msg.contains("user profile"),
+                "error should explain the limitation: {msg}"
+            );
+        }
+
+        #[test]
+        fn windows_tolerates_trailing_slash_in_home() {
+            let dest = host_to_sandbox_path(
+                Path::new(r"C:\Users\atusa\foo"),
+                Path::new(r"C:\Users\atusa\"),
+                true,
+            )
+            .unwrap();
+
+            assert_eq!(dest, "/home/agent/foo");
+        }
+
+        #[test]
+        fn sandbox_path_parent_extracts_parent_for_nested() {
+            assert_eq!(
+                sandbox_path_parent("/home/agent/.coyote_password"),
+                Some("/home/agent")
+            );
+            assert_eq!(
+                sandbox_path_parent("/etc/coyote/.password"),
+                Some("/etc/coyote")
+            );
+        }
+
+        #[test]
+        fn sandbox_path_parent_handles_edge_cases() {
+            assert_eq!(sandbox_path_parent("/file"), Some(""));
+            assert_eq!(sandbox_path_parent("noparent"), None);
         }
     }
 }
