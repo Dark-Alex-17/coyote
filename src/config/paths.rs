@@ -42,9 +42,7 @@ pub fn sandbox_kit_override() -> Option<PathBuf> {
 }
 
 pub fn translate_sandboxed_home_path(path: &Path) -> Option<PathBuf> {
-    if env::var_os("IS_SANDBOX").is_none() {
-        return None;
-    }
+    env::var_os("IS_SANDBOX")?;
 
     let s = path.to_str()?;
 
