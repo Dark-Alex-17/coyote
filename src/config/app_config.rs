@@ -278,7 +278,7 @@ impl AppConfig {
                 if path.exists() {
                     return path.clone();
                 }
-                
+
                 if let Some(translated) = paths::translate_sandboxed_home_path(path)
                     && translated.exists()
                 {
@@ -287,10 +287,10 @@ impl AppConfig {
                         path.display(),
                         translated.display()
                     );
-                    
+
                     return translated;
                 }
-                
+
                 gman::config::Config::local_provider_password_file()
             }
             None => gman::config::Config::local_provider_password_file(),

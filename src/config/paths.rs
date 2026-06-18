@@ -51,7 +51,7 @@ pub fn translate_sandboxed_home_path(path: &Path) -> Option<PathBuf> {
     if let Some(translated) = translate_unix_home_style(s, "/home/") {
         return Some(translated);
     }
-    
+
     if let Some(translated) = translate_unix_home_style(s, "/Users/") {
         return Some(translated);
     }
@@ -65,11 +65,11 @@ fn translate_unix_home_style(s: &str, prefix: &str) -> Option<PathBuf> {
         Some((u, t)) => (u, t),
         None => (rest, ""),
     };
-    
+
     if user.is_empty() || user == "agent" {
         return None;
     }
-    
+
     Some(if tail.is_empty() {
         PathBuf::from("/home/agent")
     } else {
@@ -79,25 +79,21 @@ fn translate_unix_home_style(s: &str, prefix: &str) -> Option<PathBuf> {
 
 fn translate_windows_users_path(s: &str) -> Option<PathBuf> {
     let bytes = s.as_bytes();
-    if bytes.len() < 4
-        || !bytes[0].is_ascii_alphabetic()
-        || bytes[1] != b':'
-        || bytes[2] != b'\\'
-    {
+    if bytes.len() < 4 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
         return None;
     }
-    
+
     let after_drive = &s[3..];
     let rest = after_drive.strip_prefix("Users\\")?;
     let (user, tail) = match rest.split_once('\\') {
         Some((u, t)) => (u, t.replace('\\', "/")),
         None => (rest, String::new()),
     };
-    
+
     if user.is_empty() || user == "agent" {
         return None;
     }
-    
+
     Some(if tail.is_empty() {
         PathBuf::from("/home/agent")
     } else {
