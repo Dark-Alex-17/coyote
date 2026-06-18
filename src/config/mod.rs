@@ -671,6 +671,7 @@ bitflags::bitflags! {
         const SESSION = 1 << 2;
         const RAG = 1 << 3;
         const AGENT = 1 << 4;
+        const FUNCTION_CALLING = 1 << 5;
     }
 }
 

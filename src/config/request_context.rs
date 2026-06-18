@@ -371,6 +371,9 @@ impl RequestContext {
         if self.rag.is_some() {
             flags |= StateFlags::RAG;
         }
+        if self.app.config.function_calling_support {
+            flags |= StateFlags::FUNCTION_CALLING;
+        }
         flags
     }
 
@@ -447,6 +450,34 @@ impl RequestContext {
             rag.export()
         } else {
             bail!("No RAG")
+        }
+    }
+
+    pub fn tools_info(&self) -> Result<String> {
+        if !self.app.config.function_calling_support {
+            bail!(
+                "Function calling is disabled. Enable it by setting `function_calling_support: true` in your config or running `.set function_calling_support true`."
+            );
+        }
+        let role = self.extract_role(&self.app.config)?;
+        match self.select_functions(&role) {
+            None => Ok("No tools enabled for the next request.\n".to_string()),
+            Some(functions) => {
+                let mut names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+                names.sort_unstable();
+                let mut out = format!(
+                    "Tools enabled for the next request: {}\n\n",
+                    functions.len()
+                );
+
+                for name in names {
+                    out.push_str("  ");
+                    out.push_str(name);
+                    out.push('\n');
+                }
+
+                Ok(out)
+            }
         }
     }
 
@@ -4062,9 +4093,47 @@ mod tests {
     }
 
     #[test]
-    fn state_empty_context() {
+    fn state_empty_context_has_no_context_flags() {
         let ctx = create_test_ctx();
-        assert_eq!(ctx.state(), StateFlags::empty());
+
+        let state = ctx.state();
+
+        assert!(!state.contains(StateFlags::ROLE));
+        assert!(!state.contains(StateFlags::SESSION));
+        assert!(!state.contains(StateFlags::SESSION_EMPTY));
+        assert!(!state.contains(StateFlags::AGENT));
+        assert!(!state.contains(StateFlags::RAG));
+    }
+
+    #[test]
+    fn state_includes_function_calling_when_app_enables_it() {
+        let ctx = create_test_ctx();
+
+        assert!(ctx.state().contains(StateFlags::FUNCTION_CALLING));
+    }
+
+    #[test]
+    fn state_omits_function_calling_when_app_disables_it() {
+        let app_state = {
+            let config = AppConfig {
+                function_calling_support: false,
+                ..AppConfig::default()
+            };
+            Arc::new(AppState {
+                config: Arc::new(config),
+                vault: Arc::new(Vault::default()),
+                mcp_factory: Arc::new(McpFactory::default()),
+                rag_cache: Arc::new(RagCache::default()),
+                mcp_config: None,
+                mcp_log_path: None,
+                mcp_registry: None,
+                functions: Functions::default(),
+            })
+        };
+
+        let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+
+        assert!(!ctx.state().contains(StateFlags::FUNCTION_CALLING));
     }
 
     #[test]
@@ -4090,6 +4159,89 @@ mod tests {
         ctx.role = Some(Role::new("r", "p"));
         let state = ctx.state();
         assert!(state.contains(StateFlags::SESSION_EMPTY));
+    }
+
+    #[test]
+    fn tools_info_returns_message_when_no_tools_enabled() {
+        let ctx = create_test_ctx();
+
+        let info = ctx.tools_info().unwrap();
+
+        assert!(
+            info.contains("No tools enabled"),
+            "expected 'No tools enabled' message, got: {info}"
+        );
+    }
+
+    #[test]
+    fn tools_info_lists_enabled_tool_names_alphabetically() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_todo_functions();
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["all".to_string()]));
+        ctx.role = Some(role);
+
+        let info = ctx.tools_info().unwrap();
+
+        assert!(
+            info.contains("Tools enabled for the next request:"),
+            "expected count line, got: {info}"
+        );
+        assert!(
+            info.contains("todo__init"),
+            "expected todo__init in output, got: {info}"
+        );
+
+        let positions: Vec<usize> = info
+            .lines()
+            .filter(|line| line.trim().starts_with("todo__"))
+            .enumerate()
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !positions.is_empty(),
+            "expected at least one todo__ entry, got: {info}"
+        );
+
+        let todo_lines: Vec<&str> = info
+            .lines()
+            .filter(|line| line.trim().starts_with("todo__"))
+            .collect();
+        let mut sorted = todo_lines.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            todo_lines, sorted,
+            "expected todo__ entries to be alphabetically sorted, got: {todo_lines:?}"
+        );
+    }
+
+    #[test]
+    fn tools_info_errors_when_function_calling_disabled() {
+        let app_state = {
+            let config = AppConfig {
+                function_calling_support: false,
+                ..AppConfig::default()
+            };
+            Arc::new(AppState {
+                config: Arc::new(config),
+                vault: Arc::new(Vault::default()),
+                mcp_factory: Arc::new(McpFactory::default()),
+                rag_cache: Arc::new(RagCache::default()),
+                mcp_config: None,
+                mcp_log_path: None,
+                mcp_registry: None,
+                functions: Functions::default(),
+            })
+        };
+        let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+
+        let err = ctx.tools_info().unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Function calling is disabled"),
+            "expected error to mention function calling, got: {msg}"
+        );
     }
 
     #[test]

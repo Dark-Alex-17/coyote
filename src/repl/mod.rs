@@ -49,10 +49,15 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 44]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 45]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
+        ReplCommand::new(
+            ".info tools",
+            "Show the list of enabled tools to be passed to the LLM",
+            AssertState::True(StateFlags::FUNCTION_CALLING),
+        ),
         ReplCommand::new(
             ".authenticate",
             "Authenticate the current model client via OAuth (if configured)",
@@ -478,6 +483,10 @@ pub async fn run_repl_command(
                 }
                 Some("agent") => {
                     let info = ctx.agent_info()?;
+                    print!("{info}");
+                }
+                Some("tools") => {
+                    let info = ctx.tools_info()?;
                     print!("{info}");
                 }
                 Some(_) => unknown_command()?,
@@ -1382,8 +1391,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_44_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 44);
+    fn repl_commands_has_45_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 45);
     }
 
     #[test]
