@@ -1,3 +1,47 @@
+## v0.7.0 (2026-06-18)
+
+### Feat
+
+- added configurable cache path via the COYOTE_CACHE_PATH environment variable
+- added a memory option to .set tab completions
+- Added a diagnostic .info tools subcommand to make it easier to see what tools are enabled in all contexts
+- Added additional info outputs for enabled skills and sbx directories
+- directly execute shell commands from within the REPL
+- created mixin kit for built-in functions and MCP servers
+- Added sbx mixins for the secrets providers so users can also bootstrap those as well.
+- added support for loading sbx mixins that are dynamically discovered in the users workspace and config directory
+- Added a --fresh flag to let users create a truly bare bones sandbox without bootstrapping their config
+- initial built-in sandboxing support powered by Docker sbx
+- Added the ability to auto-bootstrap workspace memory when in git repos
+- Added explicit guardrail handling for pending agents
+- auto-append memory to memory index and don't necessarily require the LLM to remember to do it after a write
+- Added an --init-memory [global|workspace] flag to easily and quickly enable memory
+- added memory global configuration settings to the output of --info and .info
+- added .set memory REPL commands to control memory injection and applied formatting
+- Create the built-in memory management tools
+- Append the memory system prompts (readonly or r/w) to the system prompt when applicable
+- Created the --no-memory CLI flag to disable memory for this invocation
+- Added the memory configuration properties and storage to the main app config, roles, sessions, and agents.
+- initial scaffolding of a memory system
+
+### Fix
+
+- rebuild the tool scope after dynamically updating the skills_enabled value in the REPL
+- properly resolve Windows-based local vault password file locations and bootstrap them into the sandbox when possible
+- auto-translation of user-prefixed Mac and Linux paths for the vault password file when running inside a sandbox
+- don't attempt to auto complete .vault list in the REPL; that's the end of the command
+- buffer tool stdout as well as stderr so that any tools that error to stdout are captured and included in the response to the model, enabling the model to see what went wrong and to reason about how to fix it.
+- auto-bootstrapped memory was accidentally putting the MEMORY.md directly in the repo root rather than .coyote/memory/MEMORY.md
+- improved the fs_patch script description and added improved error handling to it.
+- added in forgotten require_max_tokens to the fable model
+- append memory functions to non-graph based agents on init
+- when auto_continue is disabled via the .set auto_continue false command, it should strip the todo functions from the list of functions
+- use rawPredict for non-streaming Claude requests
+
+### Refactor
+
+- Migrated the .skills command completion to use StateFlags and updated the help messages
+
 ## v0.6.0 (2026-06-05)
 
 ### Feat
