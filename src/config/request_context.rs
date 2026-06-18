@@ -1984,6 +1984,7 @@ impl RequestContext {
                 } else {
                     self.update_app_config(|app| app.skills_enabled = value.unwrap_or(true));
                 }
+                self.refresh_tool_scope(abort_signal.clone()).await?;
             }
             "enabled_mcp_servers" => {
                 let raw: Option<String> = super::parse_value(value)?;
@@ -3791,6 +3792,44 @@ mod tests {
         assert!(
             !names.iter().any(|n| n.starts_with("user__")),
             "CMD mode should NOT include user interaction functions, got: {names:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn update_skills_enabled_false_removes_skill_meta_tools_from_scope() {
+        let _guard = TestConfigDirGuard::new();
+        let app_state = app_state_with_mcp_config(false, &[]);
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Repl);
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        run_async(ctx.rebuild_tool_scope(&app, None, abort.clone())).unwrap();
+
+        let names_before: Vec<String> = ctx
+            .tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert!(
+            names_before.iter().any(|n| n.starts_with("skill__")),
+            "expected skill__* functions before toggle, got: {names_before:?}"
+        );
+
+        run_async(ctx.update("skills_enabled false", abort)).unwrap();
+
+        let names_after: Vec<String> = ctx
+            .tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert!(
+            !names_after.iter().any(|n| n.starts_with("skill__")),
+            "expected skill__* functions to be removed after `.set skills_enabled false`, got: {names_after:?}"
         );
     }
 
