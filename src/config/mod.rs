@@ -672,6 +672,8 @@ bitflags::bitflags! {
         const RAG = 1 << 3;
         const AGENT = 1 << 4;
         const FUNCTION_CALLING = 1 << 5;
+        const AUTO_CONTINUE = 1 << 6;
+        const SKILLS_ENABLED = 1 << 7;
     }
 }
 

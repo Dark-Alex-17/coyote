@@ -374,7 +374,27 @@ impl RequestContext {
         if self.app.config.function_calling_support {
             flags |= StateFlags::FUNCTION_CALLING;
         }
+        if self.auto_continue_config().enabled {
+            flags |= StateFlags::AUTO_CONTINUE;
+        }
+        if self.resolved_skills_enabled() {
+            flags |= StateFlags::SKILLS_ENABLED;
+        }
         flags
+    }
+
+    pub fn resolved_skills_enabled(&self) -> bool {
+        if let Some(agent) = &self.agent
+            && let Some(value) = agent.skills_enabled()
+        {
+            return value;
+        }
+        let app = &self.app.config;
+        self.session
+            .as_ref()
+            .and_then(|s| s.skills_enabled())
+            .or_else(|| self.role.as_ref().and_then(|r| r.skills_enabled()))
+            .unwrap_or(app.skills_enabled)
     }
 
     pub fn messages_file(&self) -> PathBuf {
@@ -451,6 +471,22 @@ impl RequestContext {
         } else {
             bail!("No RAG")
         }
+    }
+
+    pub fn todo_info(&self) -> Result<String> {
+        if !self.auto_continue_config().enabled {
+            bail!(
+                "Auto-continuation is disabled. Enable it by setting `auto_continue: true` in your config or running `.set auto_continue true`."
+            );
+        }
+
+        if self.todo_list.is_empty() {
+            return Ok("No todos in the running list.\n".to_string());
+        }
+
+        let mut out = self.todo_list.render_for_model();
+        out.push('\n');
+        Ok(out)
     }
 
     pub fn tools_info(&self) -> Result<String> {
@@ -2239,11 +2275,6 @@ impl RequestContext {
                     super::map_completion_values(values)
                 }
                 ".macro" => super::map_completion_values(paths::list_macros()),
-                ".skill" => super::map_completion_values(vec![
-                    "loaded".to_string(),
-                    "load".to_string(),
-                    "unload".to_string(),
-                ]),
                 ".starter" => match &self.agent {
                     Some(agent) => agent
                         .conversation_starters()
@@ -4152,6 +4183,43 @@ mod tests {
     }
 
     #[test]
+    fn state_includes_skills_enabled_when_app_enables_it() {
+        let ctx = create_test_ctx();
+
+        assert!(ctx.state().contains(StateFlags::SKILLS_ENABLED));
+    }
+
+    #[test]
+    fn state_omits_skills_enabled_when_app_disables_it() {
+        let mut ctx = create_test_ctx();
+
+        ctx.update_app_config(|app| app.skills_enabled = false);
+
+        assert!(!ctx.state().contains(StateFlags::SKILLS_ENABLED));
+    }
+
+    #[test]
+    fn state_skills_enabled_respects_session_override() {
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_skills_enabled(Some(false));
+
+        ctx.session = Some(session);
+
+        assert!(!ctx.state().contains(StateFlags::SKILLS_ENABLED));
+    }
+
+    #[test]
+    fn state_skills_enabled_respects_role_override() {
+        let mut ctx = create_test_ctx();
+        let role = Role::new("r", "---\nskills_enabled: false\n---\nbody");
+
+        ctx.role = Some(role);
+
+        assert!(!ctx.state().contains(StateFlags::SKILLS_ENABLED));
+    }
+
+    #[test]
     fn state_omits_function_calling_when_app_disables_it() {
         let app_state = {
             let config = AppConfig {
@@ -4198,6 +4266,61 @@ mod tests {
         ctx.role = Some(Role::new("r", "p"));
         let state = ctx.state();
         assert!(state.contains(StateFlags::SESSION_EMPTY));
+    }
+
+    #[test]
+    fn todo_info_errors_when_auto_continue_disabled() {
+        let ctx = create_test_ctx();
+        let err = ctx.todo_info().unwrap_err();
+
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("Auto-continuation is disabled"),
+            "expected error to mention auto-continuation, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn todo_info_returns_empty_message_when_list_is_empty() {
+        let mut ctx = create_test_ctx();
+
+        ctx.update_app_config(|app| app.auto_continue = true);
+
+        let info = ctx.todo_info().unwrap();
+        assert!(
+            info.contains("No todos in the running list"),
+            "expected 'No todos' message, got: {info}"
+        );
+    }
+
+    #[test]
+    fn todo_info_renders_running_list() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.auto_continue = true);
+        ctx.init_todo_list("Map Labs");
+        ctx.add_todo("Discover columns");
+        ctx.add_todo("Write report");
+
+        ctx.mark_todo_done(1);
+
+        let info = ctx.todo_info().unwrap();
+        assert!(
+            info.contains("Goal: Map Labs"),
+            "expected goal in output, got: {info}"
+        );
+        assert!(
+            info.contains("Progress: 1/2 completed"),
+            "expected progress line, got: {info}"
+        );
+        assert!(
+            info.contains("Discover columns"),
+            "expected first task, got: {info}"
+        );
+        assert!(
+            info.contains("Write report"),
+            "expected second task, got: {info}"
+        );
     }
 
     #[test]

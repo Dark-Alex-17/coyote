@@ -49,7 +49,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 45]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 49]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -169,6 +169,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 45]> = LazyLock::new(|| {
             AssertState::pass(),
         ),
         ReplCommand::new(
+            ".info todo",
+            "Show the current todo list driving auto-continuation",
+            AssertState::True(StateFlags::AUTO_CONTINUE),
+        ),
+        ReplCommand::new(
             ".rag",
             "Initialize or access RAG",
             AssertState::False(StateFlags::AGENT),
@@ -201,13 +206,28 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 45]> = LazyLock::new(|| {
         ReplCommand::new(".macro", "Execute a macro", AssertState::pass()),
         ReplCommand::new(
             ".skill",
-            "List, load, unload, or create skills",
-            AssertState::pass(),
+            "Create a new skill",
+            AssertState::True(StateFlags::SKILLS_ENABLED),
+        ),
+        ReplCommand::new(
+            ".skill load",
+            "Load a skill into the current context",
+            AssertState::True(StateFlags::SKILLS_ENABLED),
+        ),
+        ReplCommand::new(
+            ".skill loaded",
+            "List currently-loaded skills",
+            AssertState::True(StateFlags::SKILLS_ENABLED),
+        ),
+        ReplCommand::new(
+            ".skill unload",
+            "Unload a skill from the current context",
+            AssertState::True(StateFlags::SKILLS_ENABLED),
         ),
         ReplCommand::new(
             ".edit skill",
             "Modify an existing skill by name",
-            AssertState::pass(),
+            AssertState::True(StateFlags::SKILLS_ENABLED),
         ),
         ReplCommand::new(
             ".file",
@@ -487,6 +507,10 @@ pub async fn run_repl_command(
                 }
                 Some("tools") => {
                     let info = ctx.tools_info()?;
+                    print!("{info}");
+                }
+                Some("todo") => {
+                    let info = ctx.todo_info()?;
                     print!("{info}");
                 }
                 Some(_) => unknown_command()?,
@@ -1391,8 +1415,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_45_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 45);
+    fn repl_commands_has_49_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 49);
     }
 
     #[test]
