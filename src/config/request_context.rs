@@ -2296,6 +2296,7 @@ impl RequestContext {
                         "inject_skill_instructions",
                         "skill_instructions",
                         "max_auto_continues",
+                        "memory",
                         "save_session",
                         "compression_threshold",
                         "rag_reranker_model",
