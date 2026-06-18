@@ -645,6 +645,7 @@ mod tests {
 
     mod vault_mixins {
         use super::*;
+        use crate::utils::get_env_name;
         use gman::providers::aws_secrets_manager::AwsSecretsManagerProvider;
         use gman::providers::azure_key_vault::AzureKeyVaultProvider;
         use gman::providers::gcp_secret_manager::GcpSecretManagerProvider;
@@ -652,6 +653,46 @@ mod tests {
         use gman::providers::local::LocalProvider;
         use gman::providers::one_password::OnePasswordProvider;
         use serial_test::serial;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct TestCacheDirGuard {
+            key: String,
+            previous: Option<std::ffi::OsString>,
+            path: PathBuf,
+        }
+
+        impl TestCacheDirGuard {
+            fn new() -> Self {
+                let key = get_env_name("cache_dir");
+                let previous = env::var_os(&key);
+                let unique = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let path = env::temp_dir().join(format!("coyote-sandbox-vault-tests-{unique}"));
+                fs::create_dir_all(&path).unwrap();
+                unsafe {
+                    env::set_var(&key, &path);
+                }
+                Self {
+                    key,
+                    previous,
+                    path,
+                }
+            }
+        }
+
+        impl Drop for TestCacheDirGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.previous {
+                        Some(v) => env::set_var(&self.key, v),
+                        None => env::remove_var(&self.key),
+                    }
+                }
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
 
         #[test]
         fn returns_none_for_local() {
@@ -664,6 +705,7 @@ mod tests {
         #[test]
         #[serial]
         fn returns_some_for_aws() {
+            let _guard = TestCacheDirGuard::new();
             let p = SupportedProvider::AwsSecretsManager {
                 provider_def: AwsSecretsManagerProvider {
                     aws_profile: None,
@@ -680,6 +722,7 @@ mod tests {
         #[test]
         #[serial]
         fn returns_some_for_gcp() {
+            let _guard = TestCacheDirGuard::new();
             let p = SupportedProvider::GcpSecretManager {
                 provider_def: GcpSecretManagerProvider {
                     gcp_project_id: None,
@@ -695,6 +738,7 @@ mod tests {
         #[test]
         #[serial]
         fn returns_some_for_one_password() {
+            let _guard = TestCacheDirGuard::new();
             let p = SupportedProvider::OnePassword {
                 provider_def: OnePasswordProvider {
                     vault: None,
@@ -711,6 +755,7 @@ mod tests {
         #[test]
         #[serial]
         fn returns_some_for_azure() {
+            let _guard = TestCacheDirGuard::new();
             let p = SupportedProvider::AzureKeyVault {
                 provider_def: AzureKeyVaultProvider { vault_name: None },
             };
@@ -724,6 +769,7 @@ mod tests {
         #[test]
         #[serial]
         fn returns_some_for_gopass() {
+            let _guard = TestCacheDirGuard::new();
             let p = SupportedProvider::Gopass {
                 provider_def: GopassProvider { store: None },
             };

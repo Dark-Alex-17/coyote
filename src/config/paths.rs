@@ -33,8 +33,14 @@ pub fn local_path(name: &str) -> PathBuf {
 }
 
 pub fn cache_path() -> PathBuf {
-    let base_dir = dirs::cache_dir().unwrap_or_else(env::temp_dir);
-    base_dir.join(env!("CARGO_CRATE_NAME"))
+    if let Ok(v) = env::var(get_env_name("cache_dir")) {
+        PathBuf::from(v)
+    } else if let Ok(v) = env::var("XDG_CACHE_HOME") {
+        PathBuf::from(v).join(env!("CARGO_CRATE_NAME"))
+    } else {
+        let base_dir = dirs::cache_dir().unwrap_or_else(env::temp_dir);
+        base_dir.join(env!("CARGO_CRATE_NAME"))
+    }
 }
 
 pub fn sandbox_kit_override() -> Option<PathBuf> {
