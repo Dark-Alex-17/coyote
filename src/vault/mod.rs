@@ -17,13 +17,38 @@ use gman::providers::SecretProvider;
 use gman::providers::SupportedProvider;
 use gman::providers::local::LocalProvider;
 use inquire::{Password, PasswordDisplayMode, required};
-use log::warn;
+use log::{info, warn};
 use serde_yaml::Value;
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
 pub static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{([^{}]+)}}").unwrap());
+
+fn apply_sandboxed_home_translation(provider_def: &mut LocalProvider) {
+    let Some(ref pf) = provider_def.password_file else {
+        return;
+    };
+
+    if pf.exists() {
+        return;
+    }
+
+    let Some(translated) = paths::translate_sandboxed_home_path(pf) else {
+        return;
+    };
+
+    if !translated.exists() {
+        return;
+    }
+
+    info!(
+        "vault password file '{}' not found; resolved to sandboxed path '{}'",
+        pf.display(),
+        translated.display()
+    );
+    provider_def.password_file = Some(translated);
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct Vault {
@@ -92,6 +117,7 @@ impl Vault {
         };
 
         if let SupportedProvider::Local { provider_def } = &mut provider {
+            apply_sandboxed_home_translation(provider_def);
             ensure_password_file_initialized(provider_def)?;
         }
 

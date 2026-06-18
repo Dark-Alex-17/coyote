@@ -41,6 +41,70 @@ pub fn sandbox_kit_override() -> Option<PathBuf> {
     env::var_os(get_env_name("sandbox_kit")).map(PathBuf::from)
 }
 
+pub fn translate_sandboxed_home_path(path: &Path) -> Option<PathBuf> {
+    if env::var_os("IS_SANDBOX").is_none() {
+        return None;
+    }
+
+    let s = path.to_str()?;
+
+    if let Some(translated) = translate_unix_home_style(s, "/home/") {
+        return Some(translated);
+    }
+    
+    if let Some(translated) = translate_unix_home_style(s, "/Users/") {
+        return Some(translated);
+    }
+
+    translate_windows_users_path(s)
+}
+
+fn translate_unix_home_style(s: &str, prefix: &str) -> Option<PathBuf> {
+    let rest = s.strip_prefix(prefix)?;
+    let (user, tail) = match rest.split_once('/') {
+        Some((u, t)) => (u, t),
+        None => (rest, ""),
+    };
+    
+    if user.is_empty() || user == "agent" {
+        return None;
+    }
+    
+    Some(if tail.is_empty() {
+        PathBuf::from("/home/agent")
+    } else {
+        PathBuf::from(format!("/home/agent/{tail}"))
+    })
+}
+
+fn translate_windows_users_path(s: &str) -> Option<PathBuf> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 4
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || bytes[2] != b'\\'
+    {
+        return None;
+    }
+    
+    let after_drive = &s[3..];
+    let rest = after_drive.strip_prefix("Users\\")?;
+    let (user, tail) = match rest.split_once('\\') {
+        Some((u, t)) => (u, t.replace('\\', "/")),
+        None => (rest, String::new()),
+    };
+    
+    if user.is_empty() || user == "agent" {
+        return None;
+    }
+    
+    Some(if tail.is_empty() {
+        PathBuf::from("/home/agent")
+    } else {
+        PathBuf::from(format!("/home/agent/{tail}"))
+    })
+}
+
 pub fn sbx_mixin_file() -> PathBuf {
     config_dir().join(SBX_MIXIN_FILE_NAME)
 }
@@ -404,6 +468,173 @@ mod tests {
                 !has_skill(absent),
                 "has_skill({absent:?}) should be false for a missing skill"
             );
+        }
+    }
+
+    mod sandbox_home_translation {
+        use super::*;
+        use serial_test::serial;
+
+        fn with_sandbox<F: FnOnce()>(f: F) {
+            let prev = env::var_os("IS_SANDBOX");
+            unsafe {
+                env::set_var("IS_SANDBOX", "1");
+            }
+            f();
+            unsafe {
+                match prev {
+                    Some(v) => env::set_var("IS_SANDBOX", v),
+                    None => env::remove_var("IS_SANDBOX"),
+                }
+            }
+        }
+
+        fn without_sandbox<F: FnOnce()>(f: F) {
+            let prev = env::var_os("IS_SANDBOX");
+            unsafe {
+                env::remove_var("IS_SANDBOX");
+            }
+            f();
+            unsafe {
+                if let Some(v) = prev {
+                    env::set_var("IS_SANDBOX", v);
+                }
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn returns_none_when_not_in_sandbox() {
+            without_sandbox(|| {
+                let p = Path::new("/home/atusa/.coyote_password");
+                assert_eq!(translate_sandboxed_home_path(p), None);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn translates_host_home_to_agent_home() {
+            with_sandbox(|| {
+                let p = Path::new("/home/atusa/.coyote_password");
+                assert_eq!(
+                    translate_sandboxed_home_path(p),
+                    Some(PathBuf::from("/home/agent/.coyote_password"))
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn translates_nested_host_home_path() {
+            with_sandbox(|| {
+                let p = Path::new("/home/atusa/.config/coyote/.password");
+                assert_eq!(
+                    translate_sandboxed_home_path(p),
+                    Some(PathBuf::from("/home/agent/.config/coyote/.password"))
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn returns_none_when_path_already_targets_agent_home() {
+            with_sandbox(|| {
+                let p = Path::new("/home/agent/.coyote_password");
+                assert_eq!(translate_sandboxed_home_path(p), None);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn returns_none_when_path_is_outside_home() {
+            with_sandbox(|| {
+                let p = Path::new("/etc/coyote/.coyote_password");
+                assert_eq!(translate_sandboxed_home_path(p), None);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn returns_none_for_relative_path() {
+            with_sandbox(|| {
+                let p = Path::new(".coyote_password");
+                assert_eq!(translate_sandboxed_home_path(p), None);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn returns_none_for_first_segment_not_home() {
+            with_sandbox(|| {
+                let p = Path::new("/opt/atusa/.coyote_password");
+                assert_eq!(translate_sandboxed_home_path(p), None);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn translates_macos_users_path() {
+            with_sandbox(|| {
+                let p = Path::new("/Users/atusa/.coyote_password");
+                assert_eq!(
+                    translate_sandboxed_home_path(p),
+                    Some(PathBuf::from("/home/agent/.coyote_password"))
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn translates_macos_nested_path() {
+            with_sandbox(|| {
+                let p = Path::new("/Users/atusa/.config/coyote/.password");
+                assert_eq!(
+                    translate_sandboxed_home_path(p),
+                    Some(PathBuf::from("/home/agent/.config/coyote/.password"))
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn returns_none_when_macos_path_already_targets_agent() {
+            with_sandbox(|| {
+                let p = Path::new("/Users/agent/.coyote_password");
+                assert_eq!(translate_sandboxed_home_path(p), None);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn translates_windows_drive_letter_path() {
+            with_sandbox(|| {
+                let p = Path::new("C:\\Users\\atusa\\.coyote_password");
+                assert_eq!(
+                    translate_sandboxed_home_path(p),
+                    Some(PathBuf::from("/home/agent/.coyote_password"))
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn translates_windows_nested_path() {
+            with_sandbox(|| {
+                let p = Path::new("D:\\Users\\atusa\\.config\\coyote\\.password");
+                assert_eq!(
+                    translate_sandboxed_home_path(p),
+                    Some(PathBuf::from("/home/agent/.config/coyote/.password"))
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn returns_none_when_windows_path_already_targets_agent() {
+            with_sandbox(|| {
+                let p = Path::new("C:\\Users\\agent\\.coyote_password");
+                assert_eq!(translate_sandboxed_home_path(p), None);
+            });
         }
     }
 

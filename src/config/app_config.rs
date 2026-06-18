@@ -274,10 +274,25 @@ impl AppConfig {
 
     pub fn vault_password_file(&self) -> PathBuf {
         match &self.vault_password_file {
-            Some(path) => match path.exists() {
-                true => path.clone(),
-                false => gman::config::Config::local_provider_password_file(),
-            },
+            Some(path) => {
+                if path.exists() {
+                    return path.clone();
+                }
+                
+                if let Some(translated) = paths::translate_sandboxed_home_path(path)
+                    && translated.exists()
+                {
+                    info!(
+                        "vault_password_file '{}' not found; resolved to sandboxed path '{}'",
+                        path.display(),
+                        translated.display()
+                    );
+                    
+                    return translated;
+                }
+                
+                gman::config::Config::local_provider_password_file()
+            }
             None => gman::config::Config::local_provider_password_file(),
         }
     }
