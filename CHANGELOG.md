@@ -1,3 +1,9 @@
+## v0.7.1 (2026-06-19)
+
+### Fix
+
+- sbx mixins must be passed in directories, not as files and the files must be named spec.yaml per new sbx version
+
 ## v0.7.0 (2026-06-18)
 
 ### Feat

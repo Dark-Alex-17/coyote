@@ -1,6 +1,6 @@
 [package]
 name = "coyote-ai"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 authors = ["Alex Clarke <alex.j.tusa@gmail.com>"]
 description = "An all-in-one, batteries included LLM CLI Tool"
