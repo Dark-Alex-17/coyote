@@ -147,6 +147,7 @@ const SBX_KIT_DIR_NAME: &str = "sbx-kit";
 const SBX_KIT_HASH_FILE: &str = "kit.sha256";
 const SBX_MIXIN_FILE_NAME: &str = "sbx-mixin.yaml";
 const SBX_VAULT_MIXINS_DIR_NAME: &str = "sbx-vault-mixins";
+const SBX_MIXIN_KITS_DIR_NAME: &str = "sbx-mixin-kits";
 const GIT_DIR_NAME: &str = ".git";
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
 const DEFAULT_VISIBLE_TOOLS: [&str; 18] = [

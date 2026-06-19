@@ -347,12 +347,13 @@ fn build_create_args(
     ];
 
     for mixin in mixins {
-        let mixin_str = mixin
-            .path
+        let mixin_kit = mixin.kit_path()?;
+        let mixin_str = mixin_kit
             .to_str()
-            .ok_or_else(|| anyhow!("Mixin path is not valid UTF-8: {}", mixin.path.display()))?;
+            .ok_or_else(|| anyhow!("Mixin kit path is not valid UTF-8: {}", mixin_kit.display()))?
+            .to_string();
         args.push("--kit".to_string());
-        args.push(mixin_str.to_string());
+        args.push(mixin_str);
     }
 
     args.push(SANDBOX_AGENT.to_string());
@@ -590,15 +591,24 @@ mod tests {
     #[test]
     fn build_create_args_emits_base_kit_before_mixins() {
         let kit = PathBuf::from("/cache/sbx-kit");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir_a = env::temp_dir().join(format!("coyote-mixin-a-{unique}"));
+        let dir_b = env::temp_dir().join(format!("coyote-mixin-b-{unique}"));
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
         let mixins = vec![
             DiscoveredMixin {
-                path: PathBuf::from("/cfg/sbx-mixin.yaml"),
+                path: dir_a.clone(),
                 label: "user".into(),
                 install_count: 0,
                 domain_count: 0,
             },
             DiscoveredMixin {
-                path: PathBuf::from("/cfg/agents/sql/sbx-mixin.yaml"),
+                path: dir_b.clone(),
                 label: "sql".into(),
                 install_count: 0,
                 domain_count: 0,
@@ -614,15 +624,18 @@ mod tests {
                 "--kit".to_string(),
                 "/cache/sbx-kit".to_string(),
                 "--kit".to_string(),
-                "/cfg/sbx-mixin.yaml".to_string(),
+                dir_a.display().to_string(),
                 "--kit".to_string(),
-                "/cfg/agents/sql/sbx-mixin.yaml".to_string(),
+                dir_b.display().to_string(),
                 "coyote".to_string(),
                 "--name".to_string(),
                 "my-box".to_string(),
                 ".".to_string(),
             ]
         );
+
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
     }
 
     #[test]
