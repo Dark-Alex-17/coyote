@@ -137,7 +137,10 @@ async fn main() -> Result<()> {
         )
         .await?,
     );
-    let ctx = RequestContext::bootstrap(app_state, working_mode, info_flag)?;
+    let mut ctx = RequestContext::bootstrap(app_state, working_mode, info_flag)?;
+    let app_config = Arc::clone(&ctx.app.config);
+    ctx.bootstrap_tools(&app_config, start_mcp_servers, abort_signal.clone())
+        .await?;
 
     {
         let app = &*ctx.app.config;
