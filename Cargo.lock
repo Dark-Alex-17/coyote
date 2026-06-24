@@ -1402,7 +1402,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "coyote-ai"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ansi_colours",
  "anyhow",

@@ -1,3 +1,9 @@
+## v0.7.3 (2026-06-24)
+
+### Fix
+
+- apply bootstrapping of functions at startup to fix edge case
+
 ## v0.7.2 (2026-06-19)
 
 ### Fix
