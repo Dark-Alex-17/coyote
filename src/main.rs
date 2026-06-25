@@ -39,7 +39,10 @@ use client::ClientConfig;
 use inquire::{Select, Text, set_global_render_config};
 use log::{LevelFilter, warn};
 use log4rs::append::console::ConsoleAppender;
-use log4rs::append::file::FileAppender;
+use log4rs::append::rolling_file::RollingFileAppender;
+use log4rs::append::rolling_file::policy::compound::CompoundPolicy;
+use log4rs::append::rolling_file::policy::compound::roll::fixed_window::FixedWindowRoller;
+use log4rs::append::rolling_file::policy::compound::trigger::size::SizeTrigger;
 use log4rs::config::{Appender, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
 use oauth::OAuthProvider;
@@ -585,7 +588,20 @@ fn setup_logger() -> Result<Option<PathBuf>> {
         }
         Some(path) => {
             ensure_parent_exists(&path)?;
-            let file_appender = FileAppender::builder().encoder(encoder.clone()).build(path);
+
+            let archive_pattern = path
+                .with_extension("archived.{}.log")
+                .to_string_lossy()
+                .into_owned();
+            let trigger = SizeTrigger::new(10 * 1024 * 1024);
+            let roller = FixedWindowRoller::builder()
+                .build(&archive_pattern, 5)
+                .unwrap();
+            let policy = CompoundPolicy::new(Box::new(trigger), Box::new(roller));
+
+            let file_appender = RollingFileAppender::builder()
+                .encoder(encoder.clone())
+                .build(path, Box::new(policy));
 
             match file_appender {
                 Ok(appender) => {
@@ -608,7 +624,7 @@ fn setup_logger() -> Result<Option<PathBuf>> {
 fn init_file_logger(
     log_level: LevelFilter,
     log_filter: Option<String>,
-    file_appender: FileAppender,
+    file_appender: RollingFileAppender,
 ) -> log4rs::Config {
     let root_log_level = if log_filter.is_some() {
         LevelFilter::Off
