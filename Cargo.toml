@@ -49,7 +49,7 @@ textwrap = "0.16.0"
 ansi_colours = "1.2.2"
 eventsource-stream = "0.2.3"
 log = "0.4.28"
-log4rs = { version = "1.4.0", features = ["file_appender"] }
+log4rs = { version = "1.4.0", features = ["file_appender", "rolling_file_appender", "compound_policy", "fixed_window_roller", "size_trigger"] }
 shell-words = "1.1.0"
 sha2 = "0.10.8"
 unicode-width = "0.2.0"
