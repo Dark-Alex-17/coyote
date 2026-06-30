@@ -39,7 +39,7 @@ switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
 
 if (-not $BinDir) {
   if ($isWin) { $BinDir = Join-Path $env:LOCALAPPDATA 'coyote\bin' }
-  else { $home = $env:HOME; if (-not $home) { $home = (Get-Item -Path ~).FullName }; $BinDir = Join-Path $home '.local/bin' }
+  else { $userHome = $env:HOME; if (-not $userHome) { $userHome = (Get-Item -Path ~).FullName }; $BinDir = Join-Path $userHome '.local/bin' }
 }
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
@@ -95,13 +95,13 @@ if ($asset.name -match '\.zip$') {
   [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $extractDir)
 } elseif ($asset.name -match '\.tar\.gz$' -or $asset.name -match '\.tgz$') {
   $tar = Get-Command tar -ErrorAction SilentlyContinue
-  if ($tar) { & $tar.FullName -xzf $archive -C $extractDir }
+  if ($tar) { & $tar.Source -xzf $archive -C $extractDir }
   else { Fail "Asset is tar archive but 'tar' is not available." }
 } else {
   try { Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $extractDir) }
   catch {
     $tar = Get-Command tar -ErrorAction SilentlyContinue
-    if ($tar) { & $tar.FullName -xf $archive -C $extractDir } else { Fail "Unknown archive format; neither zip nor tar workable." }
+    if ($tar) { & $tar.Source -xf $archive -C $extractDir } else { Fail "Unknown archive format; neither zip nor tar workable." }
   }
 }
 

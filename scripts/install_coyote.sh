@@ -133,30 +133,21 @@ else
   echo "Error: unsupported OS for this installer: $OS" >&2; exit 1
 fi
 
+DL_URLS=$(grep -oE '"browser_download_url":[[:space:]]*"[^"]+"' "$JSON" \
+  | sed -E 's/.*"browser_download_url":[[:space:]]*"//; s/"$//' \
+  || true)
+
 ASSET_NAME=""; ASSET_URL=""
 for candidate in "${ASSET_CANDIDATES[@]}"; do
-  NAME=$(grep -oE '"name":\s*"[^"]+"' "$JSON" | sed 's/"name":\s*"//; s/"$//' | grep -Fx "$candidate" || true)
-  if [[ -n "$NAME" ]]; then
-    ASSET_NAME="$NAME"
-    ASSET_URL=$(awk -v pat="$NAME" '
-      BEGIN{ FS=":"; want=0 }
-      /"name"/ {
-        line=$0;
-        gsub(/^\s+|\s+$/,"",line);
-        gsub(/"name"\s*:\s*"|"/ ,"", line);
-        want = (line==pat) ? 1 : 0;
-        next
-      }
-      want==1 && /"browser_download_url"/ {
-        u=$0;
-        gsub(/^\s+|\s+$/,"",u);
-        gsub(/.*"browser_download_url"\s*:\s*"|".*/ ,"", u);
-        print u;
-        exit
-      }
-    ' "$JSON")
-    if [[ -n "$ASSET_URL" ]]; then break; fi
-  fi
+  while IFS= read -r url; do
+    [[ -z "$url" ]] && continue
+    if [[ "$url" == */"$candidate" ]]; then
+      ASSET_NAME="$candidate"
+      ASSET_URL="$url"
+      break
+    fi
+  done <<< "$DL_URLS"
+  [[ -n "$ASSET_URL" ]] && break
 done
 
 if [[ -z "$ASSET_URL" ]]; then
