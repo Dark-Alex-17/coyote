@@ -98,7 +98,7 @@ You can use the following command to run a bash script that downloads and instal
 OS (Linux/MacOS) and architecture (x86_64/arm64):
 
 ```shell
-curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/main/install_coyote.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/install_coyote.sh | bash
 ```
 
 #### Windows/Linux/MacOS (`PowerShell`)
@@ -106,7 +106,7 @@ You can use the following command to run a PowerShell script that downloads and 
 for your OS (Windows/Linux/MacOS) and architecture (x86_64/arm64):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/main/scripts/install_coyote.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/install_coyote.ps1 | iex"
 ```
 
 ### Manual
