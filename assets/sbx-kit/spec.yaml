@@ -257,7 +257,7 @@ commands:
       description: Install uv (required for Python-based custom tools)
     - command: |
         set -euo pipefail
-        USQL_VERSION="0.21.4"
+        USQL_VERSION=0.21.4
         ARCH=$(uname -m)
         case "$ARCH" in
           x86_64) USQL_ARCH=amd64 ;;
@@ -266,7 +266,7 @@ commands:
         esac
         TMPDIR=$(mktemp -d)
         trap 'rm -rf "$TMPDIR"' EXIT
-        curl -fsSL "https://github.com/xo/usql/releases/download/v${USQL_VERSION}/usql_static-${USQL_VERSION}-linux-${USQL_ARCH}.tar.bz2" -o "$TMPDIR/usql.tar.bz2"
+        curl -fsSL --retry 3 "https://github.com/xo/usql/releases/download/v${USQL_VERSION}/usql_static-${USQL_VERSION}-linux-${USQL_ARCH}.tar.bz2" -o "$TMPDIR/usql.tar.bz2"
         tar -xjf "$TMPDIR/usql.tar.bz2" -C "$TMPDIR"
         sudo install -m 0755 "$TMPDIR/usql_static" /usr/local/bin/usql
       user: '1000'
