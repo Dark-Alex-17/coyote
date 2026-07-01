@@ -461,7 +461,7 @@ fn sandbox_path_parent(linux_path: &str) -> Option<&str> {
 
 fn ensure_sandbox_dir(sandbox: &str, dir: &str) -> Result<()> {
     let dir_q = shell_words::quote(dir);
-    let cmd = format!("sudo mkdir -p {dir_q} && sudo chown agent:agent {dir_q}");
+    let cmd = format!("sudo mkdir -p {dir_q} && sudo chown -R agent:agent {dir_q}");
 
     debug!("sbx exec {sandbox}: {cmd}");
 
