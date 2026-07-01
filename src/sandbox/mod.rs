@@ -356,9 +356,9 @@ fn build_create_args(
         args.push(mixin_str);
     }
 
-    args.push(SANDBOX_AGENT.to_string());
     args.push("--name".to_string());
     args.push(name.to_string());
+    args.push(SANDBOX_AGENT.to_string());
     args.push(".".to_string());
 
     Ok(args)
@@ -373,6 +373,7 @@ fn copy_host_files(name: &str) -> Result<()> {
         let src = format!("{}/", config_dir.display());
         let dest = format!("{name}:/home/agent/.config/");
         sbx_cp(&src, &dest)?;
+        chown_agent_recursive(name, "/home/agent/.config")?;
     } else {
         debug!(
             "Skipping config copy: {} does not exist",
@@ -390,6 +391,7 @@ fn copy_host_files(name: &str) -> Result<()> {
             }
             let dest = format!("{name}:{dest_path}");
             sbx_cp(&password_file.display().to_string(), &dest)?;
+            chown_agent_recursive(name, &dest_path)?;
         }
         Some(password_file) => {
             debug!(
@@ -461,7 +463,7 @@ fn sandbox_path_parent(linux_path: &str) -> Option<&str> {
 
 fn ensure_sandbox_dir(sandbox: &str, dir: &str) -> Result<()> {
     let dir_q = shell_words::quote(dir);
-    let cmd = format!("sudo mkdir -p {dir_q} && sudo chown -R agent:agent {dir_q}");
+    let cmd = format!("sudo mkdir -p {dir_q} && sudo chown agent:agent {dir_q}");
 
     debug!("sbx exec {sandbox}: {cmd}");
 
@@ -515,6 +517,27 @@ fn exec_run(name: &str, kit_path: &Path) -> Result<()> {
 
     if !status.success() {
         bail!("`sbx run` exited with {status}");
+    }
+
+    Ok(())
+}
+
+fn chown_agent_recursive(sandbox: &str, path: &str) -> Result<()> {
+    let path_q = shell_words::quote(path);
+    let cmd = format!("sudo chown -R agent:agent {path_q}");
+
+    debug!("sbx exec {sandbox}: {cmd}");
+
+    let status = Command::new(SBX_BINARY)
+        .args(["exec", sandbox, "sh", "-c", &cmd])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("Failed to spawn `sbx exec` to chown copied files")?;
+
+    if !status.success() {
+        bail!("Chowning '{path}' in sandbox failed: sbx exec exited with {status}");
     }
 
     Ok(())
@@ -627,9 +650,9 @@ mod tests {
                 dir_a.display().to_string(),
                 "--kit".to_string(),
                 dir_b.display().to_string(),
-                "coyote".to_string(),
                 "--name".to_string(),
                 "my-box".to_string(),
+                "coyote".to_string(),
                 ".".to_string(),
             ]
         );
@@ -648,9 +671,9 @@ mod tests {
                 "create".to_string(),
                 "--kit".to_string(),
                 "/cache/sbx-kit".to_string(),
-                "coyote".to_string(),
                 "--name".to_string(),
                 "box".to_string(),
+                "coyote".to_string(),
                 ".".to_string(),
             ]
         );
