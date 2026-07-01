@@ -69,7 +69,7 @@ pub fn launch(name: Option<String>, fresh: bool, no_mixins: bool) -> Result<()> 
         }
     }
 
-    exec_run(&name, &kit_path)
+    exec_run(&name)
 }
 
 fn ensure_sbx_installed() -> Result<()> {
@@ -316,6 +316,7 @@ fn sandbox_exists(name: &str) -> Result<bool> {
 fn create_sandbox(name: &str, kit_path: &Path, mixins: &[DiscoveredMixin]) -> Result<()> {
     info!("Creating sandbox '{name}'");
     let args = build_create_args(name, kit_path, mixins)?;
+    debug!("sbx {}", args.join(" "));
     let status = Command::new(SBX_BINARY)
         .args(&args)
         .stdin(Stdio::inherit())
@@ -503,12 +504,10 @@ fn sbx_cp(src: &str, dest: &str) -> Result<()> {
     Ok(())
 }
 
-fn exec_run(name: &str, kit_path: &Path) -> Result<()> {
-    let kit_str = kit_path
-        .to_str()
-        .ok_or_else(|| anyhow!("Kit path is not valid UTF-8: {}", kit_path.display()))?;
+fn exec_run(name: &str) -> Result<()> {
+    debug!("sbx run --name {name}");
     let status = Command::new(SBX_BINARY)
-        .args(["run", name, "--kit", kit_str])
+        .args(["run", "--name", name])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

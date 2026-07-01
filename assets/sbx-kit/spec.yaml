@@ -6,14 +6,14 @@
 #   sbx cp $HOME/.coyote_password testing:/home/agent/
 #   sbx run testing --kit ./sbx-kit/
 schemaVersion: '1'
-kind: agent
+kind: sandbox
 name: coyote
 displayName: Coyote
 description: >
   An all-in-one, batteries-included LLM CLI tool featuring Shell Assistant,
   CLI & REPL mode, RAG, AI tools & agents, MCP servers, skills, and macros.
 
-agent:
+sandbox:
   image: 'docker/sandbox-templates:shell-docker'
   aiFilename: COYOTE.md
   entrypoint:
@@ -293,7 +293,7 @@ commands:
       background: false
       description: Bootstrap Coyote config directory on first sandbox start
 
-memory: |
+agentContext: |
   ## Sandbox environment
 
   You are running inside a Docker sandbox launched via `sbx run coyote`. The
