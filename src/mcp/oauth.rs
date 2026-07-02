@@ -1,4 +1,4 @@
-use crate::client::oauth::{OAuthProvider, load_oauth_tokens, run_oauth_flow};
+use crate::client::oauth::{OAuthProvider, TokenRequestFormat, load_oauth_tokens, run_oauth_flow};
 use crate::config::paths;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -61,6 +61,10 @@ impl OAuthProvider for McpOAuthProvider {
 
     fn scopes(&self) -> &str {
         &self.scopes
+    }
+
+    fn token_request_format(&self) -> TokenRequestFormat {
+        TokenRequestFormat::FormUrlEncoded
     }
 
     fn uses_localhost_redirect(&self) -> bool {
