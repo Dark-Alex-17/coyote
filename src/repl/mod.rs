@@ -565,8 +565,7 @@ pub async fn run_repl_command(
                                     .cloned();
                                 match server_spec {
                                     None => bail!(
-                                        "MCP server '{}' not found in config. \
-                                         Check your mcp_config.json.",
+                                        "MCP server '{}' not found in mcp.json.",
                                         server_name
                                     ),
                                     Some(spec) if !spec.is_remote() => bail!(
