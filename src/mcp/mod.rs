@@ -433,8 +433,12 @@ async fn spawn_stdio_mcp_server(
         let log_file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(log_path)?;
-        let (transport, _) = TokioChildProcess::builder(cmd).stderr(log_file).spawn()?;
+            .open(log_path)
+            .with_context(|| format!("Failed to open MCP log file at '{}'", log_path.display()))?;
+        let (transport, _) = TokioChildProcess::builder(cmd)
+            .stderr(log_file)
+            .spawn()
+            .with_context(|| format!("Failed to spawn MCP server: {command}"))?;
         transport
     } else {
         TokioChildProcess::new(cmd)?
