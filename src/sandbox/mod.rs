@@ -343,6 +343,8 @@ fn build_create_args(
 
     let mut args = vec![
         "create".to_string(),
+        "--name".to_string(),
+        name.to_string(),
         "--kit".to_string(),
         kit_str.to_string(),
     ];
@@ -357,8 +359,6 @@ fn build_create_args(
         args.push(mixin_str);
     }
 
-    args.push("--name".to_string());
-    args.push(name.to_string());
     args.push(SANDBOX_AGENT.to_string());
     args.push(".".to_string());
 
@@ -370,11 +370,17 @@ fn copy_host_files(name: &str) -> Result<()> {
     let home_dir = dirs::home_dir().context("Could not determine home directory")?;
 
     if config_dir.exists() {
-        ensure_sandbox_dir(name, "/home/agent/.config")?;
-        let src = format!("{}/", config_dir.display());
-        let dest = format!("{name}:/home/agent/.config/");
-        sbx_cp(&src, &dest)?;
-        chown_agent_recursive(name, "/home/agent/.config")?;
+        let sandbox_config_dir = "/home/agent/.config/coyote";
+        ensure_sandbox_dir(name, sandbox_config_dir)?;
+        let dest = format!("{name}:{sandbox_config_dir}/");
+        for entry in fs::read_dir(&config_dir)
+            .with_context(|| format!("Failed to read {}", config_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            sbx_cp(&path.display().to_string(), &dest)?;
+        }
+        chown_agent_recursive(name, sandbox_config_dir)?;
     } else {
         debug!(
             "Skipping config copy: {} does not exist",
@@ -643,14 +649,14 @@ mod tests {
             args,
             vec![
                 "create".to_string(),
+                "--name".to_string(),
+                "my-box".to_string(),
                 "--kit".to_string(),
                 "/cache/sbx-kit".to_string(),
                 "--kit".to_string(),
                 dir_a.display().to_string(),
                 "--kit".to_string(),
                 dir_b.display().to_string(),
-                "--name".to_string(),
-                "my-box".to_string(),
                 "coyote".to_string(),
                 ".".to_string(),
             ]
@@ -668,10 +674,10 @@ mod tests {
             args,
             vec![
                 "create".to_string(),
-                "--kit".to_string(),
-                "/cache/sbx-kit".to_string(),
                 "--name".to_string(),
                 "box".to_string(),
+                "--kit".to_string(),
+                "/cache/sbx-kit".to_string(),
                 "coyote".to_string(),
                 ".".to_string(),
             ]
