@@ -564,10 +564,9 @@ pub async fn run_repl_command(
                                     .and_then(|c| c.mcp_servers.get(server_name))
                                     .cloned();
                                 match server_spec {
-                                    None => bail!(
-                                        "MCP server '{}' not found in mcp.json.",
-                                        server_name
-                                    ),
+                                    None => {
+                                        bail!("MCP server '{}' not found in mcp.json.", server_name)
+                                    }
                                     Some(spec) if !spec.is_remote() => bail!(
                                         "MCP server '{}' uses stdio transport; \
                                          OAuth is only supported for http/sse servers.",
