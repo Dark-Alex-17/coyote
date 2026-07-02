@@ -135,6 +135,7 @@ const RAGS_DIR_NAME: &str = "rags";
 const FUNCTIONS_DIR_NAME: &str = "functions";
 const FUNCTIONS_BIN_DIR_NAME: &str = "bin";
 const AGENTS_DIR_NAME: &str = "agents";
+const REPL_HISTORY_DIR_NAME: &str = "repl-history";
 const GLOBAL_TOOLS_DIR_NAME: &str = "tools";
 const GLOBAL_TOOLS_UTILS_DIR_NAME: &str = "utils";
 const BASH_PROMPT_UTILS_FILE_NAME: &str = "prompt-utils.sh";

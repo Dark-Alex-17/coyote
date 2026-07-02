@@ -449,7 +449,8 @@ Type ".help" for additional help.
         }
 
         if app.save_shell_history {
-            let history_path = paths::config_dir().join("repl_history");
+            let ctx = ctx.read();
+            let history_path = paths::repl_history_file(&ctx.session);
             if let Ok(history) = FileBackedHistory::with_file(1000, history_path) {
                 editor = editor.with_history(Box::new(history));
             }

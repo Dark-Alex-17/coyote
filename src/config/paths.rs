@@ -8,6 +8,8 @@ use super::{
     SKILLS_DIR_NAME, WORKSPACE_MEMORY_DIR_NAME,
 };
 use crate::client::ProviderModels;
+use crate::config::REPL_HISTORY_DIR_NAME;
+use crate::config::session::Session;
 use crate::utils::{get_env_name, list_file_names, normalize_env_name};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -318,6 +320,20 @@ pub fn workspace_memory_dir_for(workspace_root: &Path) -> PathBuf {
     workspace_root
         .join(WORKSPACE_MEMORY_DIR_NAME)
         .join(MEMORY_DIR_NAME)
+}
+
+pub fn repl_history_dir() -> PathBuf {
+    cache_path().join(REPL_HISTORY_DIR_NAME)
+}
+
+pub fn repl_history_file(session: &Option<Session>) -> PathBuf {
+    let history_key = if let Some(session) = &session {
+        format!("session_{}", session.name().replace('/', "_"))
+    } else {
+        "default".to_string()
+    };
+
+    repl_history_dir().join(history_key)
 }
 
 pub fn log_config() -> Result<(LevelFilter, Option<PathBuf>)> {
