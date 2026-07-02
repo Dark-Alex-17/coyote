@@ -6,7 +6,10 @@ use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
-use crate::client::{call_chat_completions, call_chat_completions_streaming, init_client, oauth};
+use crate::client::{
+    Message, MessageRole, call_chat_completions, call_chat_completions_streaming, init_client,
+    oauth,
+};
 use crate::config::{
     AgentVariables, AppConfig, AssertState, Input, LastMessage, RequestContext, StateFlags,
     macro_execute,
@@ -29,9 +32,9 @@ use log::warn;
 use parking_lot::RwLock;
 use reedline::CursorConfig;
 use reedline::{
-    ColumnarMenu, EditCommand, EditMode, Emacs, KeyCode, KeyModifiers, Keybindings, Reedline,
-    ReedlineEvent, ReedlineMenu, ValidationResult, Validator, Vi, default_emacs_keybindings,
-    default_vi_insert_keybindings, default_vi_normal_keybindings,
+    ColumnarMenu, EditCommand, EditMode, Emacs, FileBackedHistory, KeyCode, KeyModifiers,
+    Keybindings, Reedline, ReedlineEvent, ReedlineMenu, ValidationResult, Validator, Vi,
+    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
 };
 use reedline::{MenuBuilder, Signal};
 use std::sync::LazyLock;
@@ -318,6 +321,58 @@ Type ".help" for additional help.
             }
         }
 
+        {
+            let (messages_snapshot, compressed_count) = {
+                let ctx = self.ctx.read();
+                if let Some(session) = &ctx.session {
+                    let msgs: Vec<Message> = session
+                        .messages()
+                        .iter()
+                        .filter(|m| !m.role.is_system())
+                        .cloned()
+                        .collect();
+                    let compressed = session.compressed_messages().len();
+                    (msgs, compressed)
+                } else {
+                    (vec![], 0)
+                }
+            };
+
+            if !messages_snapshot.is_empty() || compressed_count > 0 {
+                let app = Arc::clone(&self.ctx.read().app.config);
+                if compressed_count > 0 {
+                    println!(
+                        "{}",
+                        dimmed_text(&format!(
+                            "({compressed_count} earlier messages not shown; compressed for context)"
+                        ))
+                    );
+                    println!();
+                }
+
+                for message in &messages_snapshot {
+                    match message.role {
+                        MessageRole::User => {
+                            if let Some(text) = message.content.as_text() {
+                                println!("{}", dimmed_text("You:"));
+                                println!("{text}");
+                                println!();
+                            }
+                        }
+                        MessageRole::Assistant => {
+                            if let Some(text) = message.content.as_text() {
+                                app.print_markdown(text)?;
+                                println!();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                println!("{}", dimmed_text("─── ↑ previous conversation ───"));
+                println!();
+            }
+        }
+
         loop {
             if self.abort_signal.aborted_ctrld() {
                 break;
@@ -391,6 +446,13 @@ Type ".help" for additional help.
             let temp_file = temp_file("-repl-", ".md");
             let command = process::Command::new(cmd);
             editor = editor.with_buffer_editor(command, temp_file);
+        }
+
+        if app.save_shell_history {
+            let history_path = paths::config_dir().join("repl_history");
+            if let Ok(history) = FileBackedHistory::with_file(1000, history_path) {
+                editor = editor.with_history(Box::new(history));
+            }
         }
 
         Ok(editor)
@@ -682,6 +744,46 @@ pub async fn run_repl_command(
                     }
                     if let Some(session) = ctx.session.as_mut() {
                         session.set_autonaming(false);
+                    }
+                }
+                if let Some(session) = &ctx.session {
+                    let messages_snapshot: Vec<Message> = session
+                        .messages()
+                        .iter()
+                        .filter(|m| !m.role.is_system())
+                        .cloned()
+                        .collect();
+                    let compressed_count = session.compressed_messages().len();
+                    if !messages_snapshot.is_empty() || compressed_count > 0 {
+                        if compressed_count > 0 {
+                            println!(
+                                "{}",
+                                dimmed_text(&format!(
+                                    "({compressed_count} earlier messages not shown — compressed for context)"
+                                ))
+                            );
+                            println!();
+                        }
+                        for message in &messages_snapshot {
+                            match message.role {
+                                MessageRole::User => {
+                                    if let Some(text) = message.content.as_text() {
+                                        println!("{}", dimmed_text("You:"));
+                                        println!("{text}");
+                                        println!();
+                                    }
+                                }
+                                MessageRole::Assistant => {
+                                    if let Some(text) = message.content.as_text() {
+                                        app.print_markdown(text)?;
+                                        println!();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        println!("{}", dimmed_text("─── ↑ previous conversation ───"));
+                        println!();
                     }
                 }
             }

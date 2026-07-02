@@ -133,6 +133,13 @@ impl MessageContent {
         }
     }
 
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            MessageContent::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
     pub fn merge_prompt(&mut self, replace_fn: impl Fn(&str) -> String) {
         match self {
             MessageContent::Text(text) => *text = replace_fn(text),

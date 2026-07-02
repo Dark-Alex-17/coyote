@@ -163,6 +163,14 @@ impl Session {
         self.messages.is_empty() && self.compressed_messages.is_empty()
     }
 
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    pub fn compressed_messages(&self) -> &[Message] {
+        &self.compressed_messages
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
