@@ -28,11 +28,12 @@ use crate::config::{
     install_builtins, list_agents, load_env_file, macro_execute, sync_models,
 };
 use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
+use crate::mcp::McpServersConfig;
 use crate::render::{prompt_theme, render_error};
 use crate::repl::Repl;
 use crate::utils::*;
-use crate::vault::Vault;
-use anyhow::{Result, anyhow, bail};
+use crate::vault::{Vault, interpolate_secrets};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use client::ClientConfig;
@@ -117,6 +118,48 @@ async fn main() -> Result<()> {
         let (client_name, provider) =
             resolve_oauth_client(client_arg.as_deref(), &app_config.clients)?;
         oauth::run_oauth_flow(&*provider, &client_name).await?;
+        return Ok(());
+    }
+
+    if let Some(server_name) = &cli.auth_mcp {
+        let cfg = Config::load_with_interpolation(true).await?;
+        let app_config = AppConfig::from_config(cfg)?;
+        let vault = Vault::init(&app_config)?;
+        let mcp_path = paths::mcp_config_file();
+        if !mcp_path.exists() {
+            bail!(
+                "No MCP configuration file found at '{}'",
+                mcp_path.display()
+            );
+        }
+
+        let raw = tokio::fs::read_to_string(&mcp_path)
+            .await
+            .with_context(|| format!("Failed to read MCP config at '{}'", mcp_path.display()))?;
+
+        let (content, missing) = interpolate_secrets(&raw, &vault)?;
+        if !missing.is_empty() {
+            bail!(
+                "MCP config references vault secrets that are missing: {:?}",
+                missing
+            );
+        }
+
+        let mcp_config: McpServersConfig =
+            serde_json::from_str(&content).context("Failed to parse MCP config file")?;
+        let spec = mcp_config
+            .mcp_servers
+            .get(server_name.as_str())
+            .ok_or_else(|| anyhow!("MCP server '{server_name}' not found in mcp.json"))?;
+        if !spec.is_remote() {
+            bail!(
+                "MCP server '{server_name}' is a stdio server; OAuth is only supported for http/sse servers"
+            );
+        }
+
+        let url = spec.url.as_deref().expect("validated: remote spec has url");
+        mcp::oauth::run_mcp_oauth_flow(server_name, url, spec.oauth_client_id.as_deref()).await?;
+
         return Ok(());
     }
 

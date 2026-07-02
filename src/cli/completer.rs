@@ -5,9 +5,9 @@ use crate::utils::list_file_names;
 use crate::vault::Vault;
 use clap_complete::{CompletionCandidate, Shell, generate};
 use clap_complete_nushell::Nushell;
-use std::env;
 use std::ffi::OsStr;
 use std::io;
+use std::{env, fs};
 
 const COYOTE_CLI_NAME: &str = "coyote";
 
@@ -131,6 +131,34 @@ pub(super) fn session_completer(current: &OsStr) -> Vec<CompletionCandidate> {
         .into_iter()
         .filter(|s| s.starts_with(&*cur))
         .map(CompletionCandidate::new)
+        .collect()
+}
+
+pub(super) fn mcp_server_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    let cur = current.to_string_lossy();
+    let content = match fs::read_to_string(paths::mcp_config_file()) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let servers = match json.get("mcpServers").and_then(|v| v.as_object()) {
+        Some(s) => s,
+        None => return vec![],
+    };
+
+    servers
+        .iter()
+        .filter(|(_, v)| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|t| t == "http" || t == "sse")
+                .unwrap_or(false)
+        })
+        .filter(|(k, _)| k.starts_with(&*cur))
+        .map(|(k, _)| CompletionCandidate::new(k))
         .collect()
 }
 

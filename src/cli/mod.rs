@@ -1,8 +1,8 @@
 mod completer;
 
 use crate::cli::completer::{
-    ShellCompletion, agent_completer, macro_completer, model_completer, rag_completer,
-    role_completer, secrets_completer, session_completer,
+    ShellCompletion, agent_completer, macro_completer, mcp_server_completer, model_completer,
+    rag_completer, role_completer, secrets_completer, session_completer,
 };
 use crate::config::{AssetCategory, InstallFilter, MemoryScope};
 use anyhow::{Context, Result};
@@ -171,6 +171,9 @@ pub struct Cli {
     /// Authenticate with an LLM provider using OAuth (e.g., --authenticate client_name)
     #[arg(long, exclusive = true, value_name = "CLIENT_NAME")]
     pub authenticate: Option<Option<String>>,
+    /// Authenticate with an OAuth-protected remote MCP server (e.g., --auth-mcp server_name)
+    #[arg(long, exclusive = true, value_name = "SERVER_NAME", add = ArgValueCompleter::new(mcp_server_completer))]
+    pub auth_mcp: Option<String>,
     /// Generate static shell completion scripts
     #[arg(long, value_name = "SHELL", value_enum)]
     pub completions: Option<ShellCompletion>,
