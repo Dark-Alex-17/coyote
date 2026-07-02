@@ -1,0 +1,11 @@
+schemaVersion: '1'
+kind: mixin
+name: sisyphus-ddg
+description: >
+  Allows Sisyphus to hit all domains since it utilizes the DuckDuckGo
+  MCP server. This allows the MCP server to actually perform web searches
+  on arbitrary domains and retrieve info for the agent.
+
+network:
+  allowedDomains:
+    - '*'
