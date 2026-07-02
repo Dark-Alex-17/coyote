@@ -1,3 +1,20 @@
+## v0.7.4 (2026-07-02)
+
+### Feat
+
+- Pin specific usql version to sbx kit
+- recursively take ownership over the copied in coyote config for the sbx
+- explicitly specify the COYOTE_CONFIG_DIR in the sbx kit
+- --tail-logs can track log rollovers and incoporates a sleep timer to minimize idle CPU cycles
+- Added support for log rolling so log files don't just blow up over time
+
+### Fix
+
+- Added back in --kit specification for the running of the sbx
+- sbx isn't copying base files in their respective directories
+- Update deprecated sbx kit config
+- Properly chown the coyote config recursively and password file in the sbx
+
 ## v0.7.3 (2026-06-24)
 
 ### Fix
