@@ -252,9 +252,14 @@ commands:
           bzip2
       user: '1000'
       description: Install system prerequisites (including pandoc for fetch_url_via_curl)
-    - command: 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+    - command: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        if [ -f "$HOME/.local/bin/uv" ]; then
+          printf '#!/bin/sh\nexec uv tool run "$@"\n' > "$HOME/.local/bin/uvx"
+          chmod +x "$HOME/.local/bin/uvx"
+        fi
       user: '1000'
-      description: Install uv (required for Python-based custom tools)
+      description: Install uv and write a uvx shell wrapper (the installer may place a macOS binary at this path on Docker-for-Mac hosts, which the Linux container cannot execute)
     - command: |
         set -euo pipefail
         USQL_VERSION=0.21.4
