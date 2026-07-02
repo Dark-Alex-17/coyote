@@ -377,6 +377,14 @@
           thinking:
             type: enabled
             budget_tokens: 16000
+    - name: claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 3
+      output_price: 15
+      supports_vision: true
+      supports_function_calling: true
     - name: claude-sonnet-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -922,6 +930,14 @@
           thinking:
             type: enabled
             budget_tokens: 16000
+    - name: claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 3
+      output_price: 15
+      supports_vision: true
+      supports_function_calling: true
     - name: claude-sonnet-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -1103,6 +1119,14 @@
             thinking:
               type: enabled
               budget_tokens: 16000
+    - name: us.anthropic.claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 3
+      output_price: 15
+      supports_vision: true
+      supports_function_calling: true
     - name: us.anthropic.claude-sonnet-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -1783,6 +1807,14 @@
       require_max_tokens: true
       input_price: 5
       output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+    - name: anthropic/claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 3
+      output_price: 15
       supports_vision: true
       supports_function_calling: true
     - name: anthropic/claude-sonnet-4.6
