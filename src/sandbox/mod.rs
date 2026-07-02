@@ -69,7 +69,7 @@ pub fn launch(name: Option<String>, fresh: bool, no_mixins: bool) -> Result<()> 
         }
     }
 
-    exec_run(&name)
+    exec_run(&name, &kit_path)
 }
 
 fn ensure_sbx_installed() -> Result<()> {
@@ -510,10 +510,13 @@ fn sbx_cp(src: &str, dest: &str) -> Result<()> {
     Ok(())
 }
 
-fn exec_run(name: &str) -> Result<()> {
-    debug!("sbx run --name {name}");
+fn exec_run(name: &str, kit_path: &Path) -> Result<()> {
+    let kit_str = kit_path
+        .to_str()
+        .ok_or_else(|| anyhow!("Kit path is not valid UTF-8: {}", kit_path.display()))?;
+    debug!("sbx run --name {name} --kit {kit_str}");
     let status = Command::new(SBX_BINARY)
-        .args(["run", "--name", name])
+        .args(["run", "--name", name, "--kit", kit_str])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
