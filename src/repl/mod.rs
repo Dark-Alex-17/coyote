@@ -368,7 +368,7 @@ Type ".help" for additional help.
                         _ => {}
                     }
                 }
-                println!("{}", dimmed_text("─── ↑ previous conversation ───"));
+                println!("{}", dimmed_text("─── ↑ previous conversation ↑ ───"));
                 println!();
             }
         }
@@ -783,7 +783,7 @@ pub async fn run_repl_command(
                                 _ => {}
                             }
                         }
-                        println!("{}", dimmed_text("─── ↑ previous conversation ───"));
+                        println!("{}", dimmed_text("─── ↑ previous conversation ↑ ───"));
                         println!();
                     }
                 }
