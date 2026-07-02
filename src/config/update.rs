@@ -68,6 +68,14 @@ fn normalize_version(requested: Option<String>) -> Option<String> {
     }
 }
 
+fn preferred_update_target() -> Option<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
+        _ => None,
+    }
+}
+
 fn is_dir_writable(dir: &Path) -> bool {
     let probe = dir.join(format!(".coyote-update-write-test-{}", process::id()));
     match OpenOptions::new().write(true).create_new(true).open(&probe) {
@@ -146,6 +154,9 @@ pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
         .show_download_progress(interactive);
     if let Some(tag) = &target_tag {
         builder.target_version_tag(tag.as_str());
+    }
+    if let Some(target) = preferred_update_target() {
+        builder.target(target);
     }
     let status = builder
         .build()
