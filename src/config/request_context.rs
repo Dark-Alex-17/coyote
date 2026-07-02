@@ -709,6 +709,10 @@ impl RequestContext {
     }
 
     pub fn extract_role(&self, app: &AppConfig) -> Result<Role> {
+        self.extract_role_impl(app, true)
+    }
+
+    fn extract_role_impl(&self, app: &AppConfig, inject_memory: bool) -> Result<Role> {
         let mut role = if let Some(session) = self.session.as_ref() {
             session.to_role()
         } else if let Some(agent) = self.agent.as_ref() {
@@ -757,34 +761,36 @@ impl RequestContext {
             }
         }
 
-        let memory_config = self.memory_config();
-        if memory_config.enabled {
-            let store = MemoryStore {
-                global_dir: paths::global_memory_dir(),
-                workspace: memory_config.workspace,
-            };
-            let with_tools = app.function_calling_support;
-            let cap = if with_tools {
-                app.memory_cap_with_tools
-                    .unwrap_or(DEFAULT_MEMORY_CAP_WITH_TOOLS)
-            } else {
-                app.memory_cap_without_tools
-                    .unwrap_or(DEFAULT_MEMORY_CAP_WITHOUT_TOOLS)
-            };
-            match memory::build_memory_section(&store, with_tools, cap) {
-                Ok(Some(section)) => {
-                    let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
-                    role.append_to_prompt(separator);
-                    role.append_to_prompt(&section);
-                    role.append_to_prompt("\n\n");
-                    role.append_to_prompt(if with_tools {
-                        prompts::DEFAULT_MEMORY_INSTRUCTIONS
-                    } else {
-                        prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY
-                    });
+        if inject_memory {
+            let memory_config = self.memory_config();
+            if memory_config.enabled {
+                let store = MemoryStore {
+                    global_dir: paths::global_memory_dir(),
+                    workspace: memory_config.workspace,
+                };
+                let with_tools = app.function_calling_support;
+                let cap = if with_tools {
+                    app.memory_cap_with_tools
+                        .unwrap_or(DEFAULT_MEMORY_CAP_WITH_TOOLS)
+                } else {
+                    app.memory_cap_without_tools
+                        .unwrap_or(DEFAULT_MEMORY_CAP_WITHOUT_TOOLS)
+                };
+                match memory::build_memory_section(&store, with_tools, cap) {
+                    Ok(Some(section)) => {
+                        let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
+                        role.append_to_prompt(separator);
+                        role.append_to_prompt(&section);
+                        role.append_to_prompt("\n\n");
+                        role.append_to_prompt(if with_tools {
+                            prompts::DEFAULT_MEMORY_INSTRUCTIONS
+                        } else {
+                            prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => warn!("memory injection failed: {}", e),
                 }
-                Ok(None) => {}
-                Err(e) => warn!("memory injection failed: {}", e),
             }
         }
 
@@ -1276,7 +1282,7 @@ impl RequestContext {
 
     pub fn generate_prompt_context(&self, app: &AppConfig) -> HashMap<&str, String> {
         let mut output = HashMap::new();
-        let role = self.extract_role(app).unwrap_or_else(|err| {
+        let role = self.extract_role_impl(app, false).unwrap_or_else(|err| {
             warn!("failed to compute effective role for prompt rendering: {err}");
             Role::default()
         });
