@@ -20,7 +20,7 @@ use crate::utils::{
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
-use crate::{config, graph, resolve_oauth_client};
+use crate::{config, graph, mcp, resolve_oauth_client};
 use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
@@ -49,7 +49,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 49]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 50]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -61,6 +61,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 49]> = LazyLock::new(|| {
         ReplCommand::new(
             ".authenticate",
             "Authenticate the current model client via OAuth (if configured)",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mcp auth",
+            "Authenticate with an MCP server via OAuth",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -541,6 +546,55 @@ pub async fn run_repl_command(
                 let (client_name, provider) = resolve_oauth_client(Some(client.name()), &clients)?;
                 oauth::run_oauth_flow(&*provider, &client_name).await?;
             }
+            ".mcp" => match args {
+                Some(args) => {
+                    let mut parts = args.splitn(2, char::is_whitespace);
+                    let sub = parts.next().unwrap_or("").trim();
+                    let rest = parts.next().map(str::trim).unwrap_or("");
+                    match sub {
+                        "auth" => {
+                            if rest.is_empty() {
+                                println!("Usage: .mcp auth <server_name>");
+                            } else {
+                                let server_name = rest;
+                                let server_spec = ctx
+                                    .app
+                                    .mcp_config
+                                    .as_ref()
+                                    .and_then(|c| c.mcp_servers.get(server_name))
+                                    .cloned();
+                                match server_spec {
+                                    None => bail!(
+                                        "MCP server '{}' not found in config. \
+                                         Check your mcp_config.json.",
+                                        server_name
+                                    ),
+                                    Some(spec) if !spec.is_remote() => bail!(
+                                        "MCP server '{}' uses stdio transport; \
+                                         OAuth is only supported for http/sse servers.",
+                                        server_name
+                                    ),
+                                    Some(spec) => {
+                                        let url = spec
+                                            .url
+                                            .as_deref()
+                                            .expect("validated: remote spec has url");
+                                        let client_id = spec.oauth_client_id.as_deref();
+                                        mcp::oauth::run_mcp_oauth_flow(server_name, url, client_id)
+                                            .await?;
+                                        println!(
+                                            "Authentication saved. \
+                                             Restart Coyote to connect to '{server_name}'."
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ => unknown_command()?,
+                    }
+                }
+                None => println!("Usage: .mcp auth <server_name>"),
+            },
             ".prompt" => match args {
                 Some(text) => {
                     let app = Arc::clone(&ctx.app.config);
@@ -1415,8 +1469,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_49_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 49);
+    fn repl_commands_has_50_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 50);
     }
 
     #[test]

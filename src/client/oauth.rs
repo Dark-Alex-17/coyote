@@ -53,6 +53,10 @@ pub trait OAuthProvider: Send + Sync {
     fn extra_request_headers(&self) -> Vec<(&str, &str)> {
         vec![]
     }
+
+    fn fixed_redirect_uri(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,14 +76,16 @@ pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> 
 
     let state = Uuid::new_v4().to_string();
 
-    let redirect_uri = if provider.uses_localhost_redirect() {
+    let (redirect_uri, use_callback_listener) = if let Some(fixed) = provider.fixed_redirect_uri() {
+        (fixed, true)
+    } else if provider.uses_localhost_redirect() {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let uri = format!("http://127.0.0.1:{port}/callback");
         drop(listener);
-        uri
+        (uri, true)
     } else {
-        provider.redirect_uri().to_string()
+        (provider.redirect_uri().to_string(), false)
     };
 
     let encoded_scopes = urlencoding::encode(provider.scopes());
@@ -112,7 +118,7 @@ pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> 
 
     let _ = open::that(&authorize_url);
 
-    let (code, returned_state) = if provider.uses_localhost_redirect() {
+    let (code, returned_state) = if use_callback_listener {
         listen_for_oauth_callback(&redirect_uri)?
     } else {
         let input = Text::new("Paste the authorization code:").prompt()?;

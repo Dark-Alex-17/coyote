@@ -1,4 +1,6 @@
-use crate::mcp::{ConnectedServer, JsonField, McpServer, McpTransportType, spawn_mcp_server};
+use crate::mcp::{
+    ConnectedServer, JsonField, McpServer, McpTransportType, oauth, spawn_mcp_server,
+};
 
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -99,7 +101,12 @@ impl McpFactory {
             return Ok(existing);
         }
 
-        let handle = spawn_mcp_server(spec, log_path).await?;
+        let bearer_token = if spec.is_remote() {
+            oauth::load_valid_mcp_token(name)
+        } else {
+            None
+        };
+        let handle = spawn_mcp_server(spec, log_path, bearer_token).await?;
         self.insert_active(key, &handle);
         Ok(handle)
     }
@@ -125,6 +132,7 @@ mod tests {
             cwd: None,
             url: None,
             headers: None,
+            oauth_client_id: None,
         }
     }
 
@@ -141,6 +149,7 @@ mod tests {
             cwd: None,
             url: Some(url.to_string()),
             headers,
+            oauth_client_id: None,
         }
     }
 

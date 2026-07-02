@@ -2340,6 +2340,17 @@ impl RequestContext {
                 }
                 _ => vec![],
             };
+        } else if cmd == ".mcp" && args.first() == Some(&"auth") && args.len() == 2 {
+            if let Some(mcp_config) = &self.app.mcp_config {
+                values = super::map_completion_values(
+                    mcp_config
+                        .mcp_servers
+                        .iter()
+                        .filter(|(_, spec)| spec.is_remote())
+                        .map(|(name, _)| name.clone())
+                        .collect(),
+                );
+            }
         } else if (cmd == ".edit" && args.first() == Some(&"skill") && args.len() == 2)
             || (cmd == ".skill" && args.first() == Some(&"load") && args.len() == 2)
         {
@@ -3687,6 +3698,7 @@ mod tests {
                         cwd: None,
                         url: None,
                         headers: None,
+                        oauth_client_id: None,
                     },
                 );
             }
