@@ -18,10 +18,16 @@ pub(crate) const DEFAULT_MEMORY_INSTRUCTIONS: &str = indoc! {"
         - `memory__read(name)`: Read a specific drill file's full content.
         - `memory__write(name, content, scope)`: Create or replace a drill file (scope: 'global' | 'workspace').
           The MEMORY.md index is appended automatically; do not also update the index by hand.
+          Optional `superseded_by` / `expires` (YYYY-MM-DD) mark a memory as stale for later cleanup.
+        - `memory__rename(name, new_name, scope)`: Rename a drill file. Its index entry and every
+          [[wikilink]] to it are rewritten automatically.
+        - `memory__delete(name, scope)`: Delete a drill file and its index entry. Reports any
+          [[wikilinks]] left dangling in other files.
         - `memory__edit_index(scope, content)`: Replace the entire MEMORY.md at the given scope.
           Use this to add always-on facts, reorganize, prune stale entries, or fix descriptions.
         - `memory__list()`: See all known drill files and their metadata.
-        - `memory__lint()`: Health-check memory for orphans, broken links, oversized files.
+        - `memory__lint()`: Health-check memory for orphans, broken links, oversized files,
+          stale (superseded/expired) files, and index descriptions that drifted from the files.
 
     RULES:
         - Every interaction has two outputs: your answer AND any memory updates the conversation warrants.
@@ -29,7 +35,11 @@ pub(crate) const DEFAULT_MEMORY_INSTRUCTIONS: &str = indoc! {"
         - All MEMORY.md edits MUST go through `memory__edit_index`. NEVER use `fs_write`, `fs_patch`,
           or any other generic file tool on MEMORY.md — Coyote manages its location and a stray
           MEMORY.md outside the managed path is invisible to memory.
-        - All drill files MUST go through `memory__write`. The index updates itself.
+        - All drill files MUST go through `memory__write`. The index updates itself. Renames and
+          deletions MUST go through `memory__rename` / `memory__delete` so links stay intact.
+        - When a fact becomes outdated, update it in place, delete it, or mark the old file with
+          `superseded_by`/`expires` so `memory__lint` flags it later. Never leave contradictory
+          memories side by side.
         - Use [[wikilink]] notation in memory files to reference other memories by their `name:` slug.
         - NEVER write secrets, credentials, or API keys to memory — memory is plaintext on disk.
           Use coyote's Vault for secrets.

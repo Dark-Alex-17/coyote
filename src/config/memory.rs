@@ -118,6 +118,14 @@ pub struct MemoryFrontmatter {
     pub description: Option<String>,
     #[serde(default, rename = "type")]
     pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -545,6 +553,7 @@ mod tests {
                 name: "test".into(),
                 description: Some("a test".into()),
                 kind: Some("user".into()),
+                ..Default::default()
             },
             body: "Hello world\nmore text".into(),
         };
