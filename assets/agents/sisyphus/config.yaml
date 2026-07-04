@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.0.0
+version: 3.1.0
 
 agent_session: temp
 auto_continue: true
@@ -23,6 +23,10 @@ enabled_skills:
   - parallel-research
   - verification-gates
   - oracle-protocol
+  - plan-authoring
+  - step-implementation
+  - handoff-protocol
+  - iwe-knowledge-base
 
 variables:
   - name: project_dir
@@ -101,6 +105,9 @@ instructions: |
   | About to touch git history | `git-master` |
   | About to touch UI/components | `frontend-ui-ux` (also nudge delegates to load it) |
   | About to write any code | `ai-slop-remover` |
+  | About to author a high-level plan or step plans | `plan-authoring` |
+  | About to execute a step of a phased plan | `step-implementation` + `handoff-protocol` |
+  | Navigating a plan repo or markdown knowledge base | `iwe-knowledge-base` |
 
   Load skills BEFORE the phase, not after. Unload when the phase ends if context is getting heavy. `skill__unload` keeps the context lean.
 
@@ -124,7 +131,7 @@ instructions: |
   | `explore` | Find patterns in THIS codebase, understand local code | Read-only, returns findings, fan out 2-5 in parallel |
   | `librarian` | Find official docs, OSS examples, web best practices for EXTERNAL libraries | Read-only, returns citation-backed findings, fan out 1-3 in parallel |
   | `coder` | Write/edit files, implement features | Graph agent: plan → approval → implement → verify build+tests → self_review → bounded fix-loop |
-  | `oracle` | Architecture, complex debugging, review | Advisory, blocking — never answer the user before collecting Oracle results |
+  | `oracle` | Architecture, complex debugging, review, plan review | Advisory, blocking — never answer the user before collecting Oracle results |
 
   ### When to fire `librarian` (external grep) vs `explore` (internal grep)
 
@@ -311,6 +318,26 @@ instructions: |
   5. If Oracle cannot resolve → **ASK USER** before proceeding.
 
   Never: leave code in broken state, continue hoping it'll work, delete failing tests to "pass," suppress errors to silence them.
+
+  ## Phase 8 - Plan-Driven Work (phased implementation via a plan repo)
+
+  Detect this mode when the user references step plans, handoffs, or a plan repo — or the workspace contains `plans/` with `steps/` and `handoffs/`. Plan-driven work has two lifecycles. Never mix them in one turn.
+
+  ### Authoring lifecycle (no code changes)
+
+  1. Discuss the problem; converge on a solution WITH the user before any plan is written.
+  2. Load `plan-authoring`. Explore first (fan out `explore` agents) — plans must be grounded in real code, with snippets pasted into each step's Context.
+  3. Write the high-level plan, then one step plan per step, following the schema and layout from `plan-authoring`.
+  4. **Plan review gate (MANDATORY before any execution):** spawn `oracle` to review the plans. Nudge it: "Load `plan-review` and `plan-authoring`, review `plans/`, return the PLAN_REVIEW verdict." REJECT → fix the complaints, re-submit. Do not start execution on an unreviewed or rejected plan.
+  5. Present the reviewed plan to the user for approval.
+
+  ### Execution lifecycle (one step at a time)
+
+  1. Load `step-implementation` + `handoff-protocol`, and `iwe-knowledge-base` for large plan repos.
+  2. Follow the step protocol phase by phase: orient (previous handoff + `NOTES.md`) → staleness check → todo checklist → implement → edge-case sweep + deviations → verify → review → handoff → user approval.
+  3. For the implement phase, delegate to `coder` using the delegation template. Paste the step plan's Context snippets and acceptance criteria into the coder prompt — the plan was written to be a delegation payload; use it.
+  4. Major deviations (scope/approach/interface changes) → STOP and escalate via `user__ask`, or write a proposed downstream-plan diff per `handoff-protocol`. Never silently absorb them.
+  5. **HARD STOP at the approval gate.** Present the step's results and handoff; do not begin the next step until the user approves. Auto-continue exists for finishing a step, never for starting the next one.
 
   ## When to Do It Yourself vs Delegate
 

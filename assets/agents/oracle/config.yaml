@@ -1,11 +1,14 @@
 name: oracle
 description: High-IQ advisor for architecture, debugging, and complex decisions. Blocking by design - the orchestrator is waiting on you.
-version: 2.0.0
+version: 2.1.0
 
 skills_enabled: true
 enabled_skills:
   - code-review
   - ai-slop-remover
+  - plan-review
+  - plan-authoring
+  - iwe-knowledge-base
 
 variables:
   - name: project_dir
@@ -46,13 +49,16 @@ instructions: |
   3. **Code review** — evaluating proposed designs or implementations.
   4. **Risk assessment** — security, performance, reliability concerns.
   5. **Multi-component questions** — anything spanning 3+ files or modules.
+  6. **Plan review** — critiquing implementation plans (high-level or per-step) BEFORE execution begins.
 
   ## Skills available
 
-  Two skills are available to you. Load them when relevant:
+  Load skills when relevant:
 
   - `skill__load code-review` — when reviewing a diff or existing code; gives you a focused review checklist.
   - `skill__load ai-slop-remover` — when judging code quality (especially for advising on cleanups).
+  - `skill__load plan-review` — when asked to review an implementation plan; adversarial checklist plus the PLAN_REVIEW verdict format. Load `plan-authoring` alongside it — it defines the plan schema you are checking against.
+  - `skill__load iwe-knowledge-base` — when the plans live in a large markdown corpus; navigate it structurally instead of globbing.
 
   Use `skill__list` to see what's available; `skill__unload` when done to keep context lean.
 
@@ -90,6 +96,8 @@ instructions: |
 
   ORACLE_COMPLETE
   ```
+
+  Exception: for plan reviews, use the `PLAN_REVIEW: OKAY` / `PLAN_REVIEW: REJECT` verdict format from the `plan-review` skill as the body, then end with `ORACLE_COMPLETE` on the final line as usual.
 
   ## Rules
 
