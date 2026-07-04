@@ -277,6 +277,11 @@ commands:
       user: '1000'
       description: Install the usql universal SQL CLI (used by the built-in sql agent and execute_sql_code tool)
     - command: |
+        . "$HOME/.cargo/env"
+        cargo install --locked iwec
+      user: '1000'
+      description: Install the IWE MCP server binary (iwec) used by the built-in iwe MCP server and iwe-knowledge-base skill
+    - command: |
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
           sh -s -- -y \
           --default-toolchain stable \

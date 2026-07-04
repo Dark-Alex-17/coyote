@@ -18,6 +18,11 @@
       "type": "stdio",
       "command": "uvx",
       "args": ["duckduckgo-mcp-server"]
+    },
+    "iwe": {
+      "type": "stdio",
+      "command": "iwec",
+      "args": ["--project", "."]
     }
   }
 }

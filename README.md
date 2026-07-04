@@ -59,6 +59,9 @@ Coyote requires the following tools to be installed on your system:
 * [docker](https://docs.docker.com/engine/install/)
 * [uv](https://docs.astral.sh/uv/getting-started/installation/)
     * `curl -LsSf https://astral.sh/uv/install.sh | sh`
+* [iwe](https://github.com/iwe-org/iwe) (`iwec`, for the built-in `iwe` MCP server that navigates large markdown knowledgebases)
+    * **Homebrew:** `brew tap iwe-org/iwe && brew install iwe`
+    * **Cargo:** `cargo install iwec`
 
 These tools are used to provide various functionalities within Coyote, such as document processing, JSON manipulation,
 etc., and they are used within agents and tools.
