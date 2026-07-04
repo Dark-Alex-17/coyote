@@ -37,7 +37,7 @@ Every `agent__spawn` result includes a session_id. **Use it.**
 
 Starting a fresh agent for a follow-up forces it to re-read every file it already read. That's 70%+ wasted tokens, plus the agent loses the reasoning it built up.
 
-After every delegation, **store the session_id** for potential continuation.
+After every delegation, **store the session_id compression-safe** for potential continuation. Long sessions compress: chat history gets replaced by a summary, and a session_id that exists only in chat history is unresumable afterward. Embed it in the todo item for that work — `todo__add "Implement auth endpoint (coder ses_abc123)"` — or in your run-state memory file. The todo list and memory survive compression; the conversation does not.
 
 ## Skill nudges to delegates
 

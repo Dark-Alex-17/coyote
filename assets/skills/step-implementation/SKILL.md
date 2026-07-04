@@ -28,6 +28,8 @@ Discrepancies are deviations — handle them via Phase 5's protocol BEFORE imple
 
 `todo__init` with the step objective, then one `todo__add` per task in the plan's Tasks section, in order. Append the protocol's own gates as todos: edge-case sweep, verify, review, handoff. Mark items done with `todo__done` as you go — never batch. The checklist is what survives context compression; keep it truthful.
 
+When you spawn an agent whose session you may need to resume, embed its session_id in the corresponding todo item text (`"Implement task 3 (coder ses_abc123)"`). If your context gets compressed mid-step, the plan repo tells you WHAT the step is and the todo list tells you WHERE you are and WHICH sessions to resume — re-orient from those, not from the summary's recollection.
+
 ## Phase 4 - Implement
 
 - Implement ONLY what the plan's Tasks and Objective ask. Out of scope means out of scope.
