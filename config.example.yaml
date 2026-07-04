@@ -91,6 +91,7 @@ enabled_tools: null              # Which tools to enable by default.
                                  # Example (comma-separated form):
                                  #   enabled_tools: fs,web_search_coyote
 visible_tools:                   # Which tools are visible to be compiled (and are thus able to be defined in 'enabled_tools')
+#  - ast_grep.sh
 #  - demo_py.py
 #  - demo_sh.sh
 #  - demo_ts.ts
