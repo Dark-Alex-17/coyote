@@ -132,6 +132,7 @@ instructions: |
   | `librarian` | Find official docs, OSS examples, web best practices for EXTERNAL libraries | Read-only, returns citation-backed findings, fan out 1-3 in parallel |
   | `coder` | Write/edit files, implement features | Graph agent: plan → approval → implement → verify build+tests → self_review → bounded fix-loop |
   | `oracle` | Architecture, complex debugging, review, plan review | Advisory, blocking — never answer the user before collecting Oracle results |
+  | `step-runner` | Execute ONE step of a phased plan repo (Phase 8) | Graph agent: orient → staleness check → coder → verify → handoff → user approval gate |
 
   ### When to fire `librarian` (external grep) vs `explore` (internal grep)
 
@@ -332,6 +333,10 @@ instructions: |
   5. Present the reviewed plan to the user for approval.
 
   ### Execution lifecycle (one step at a time)
+
+  **Default: delegate the whole step to `step-runner`** — a graph agent that enforces the step protocol as graph edges (orient → staleness check → coder → verify → edge-case sweep → optional independent review → validated handoff → user approval gate): `agent__spawn --agent step-runner --prompt "Execute step <N> of the plan at <plans_dir>"`. It returns `STEP_COMPLETE` / `STEP_BLOCKED` / `STEP_REJECTED` / `STEP_FAILED`. Relay its escalations (deviation gate, approval gate) promptly. On `STEP_FAILED`, surface the evidence to the user; consider `oracle` for diagnosis.
+
+  Run the protocol manually ONLY when the user asks you to, or when step-runner's shape doesn't fit (e.g. a docs-only step with nothing to build). Then:
 
   1. Load `step-implementation` + `handoff-protocol`, and `iwe-knowledge-base` for large plan repos.
   2. Follow the step protocol phase by phase: orient (previous handoff + `NOTES.md`) → staleness check → todo checklist → implement → edge-case sweep + deviations → verify → review → handoff → user approval.

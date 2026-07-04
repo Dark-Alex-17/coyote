@@ -5118,6 +5118,45 @@ mod tests {
 
     #[test]
     #[serial]
+    fn bundled_graph_agents_parse_and_validate() {
+        use crate::graph::GraphParser;
+        use crate::graph::validator::GraphValidator;
+
+        let _guard = TestConfigDirGuard::new();
+
+        Agent::install_builtin_agents(false).unwrap();
+        Skill::install_builtin_skills(false).unwrap();
+
+        let mut checked = Vec::new();
+        for entry in std::fs::read_dir(paths::agents_data_dir()).unwrap() {
+            let dir = entry.unwrap().path();
+            let graph_path = dir.join("graph.yaml");
+            if !graph_path.exists() {
+                continue;
+            }
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            let graph = GraphParser::new(&dir)
+                .load_from_file(&graph_path)
+                .unwrap_or_else(|e| panic!("graph.yaml for '{name}' failed to parse: {e}"));
+            let result = GraphValidator::new(&dir).validate(&graph);
+            assert!(
+                result.errors.is_empty(),
+                "graph.yaml for '{name}' failed validation: {:#?}",
+                result.errors
+            );
+            checked.push(name);
+        }
+        checked.sort();
+        for expected in ["coder", "librarian", "step-runner"] {
+            assert!(
+                checked.iter().any(|n| n == expected),
+                "expected bundled graph agent '{expected}' to be checked; found {checked:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
     fn install_functions_force_preserves_user_mcp_json() {
         let _guard = TestConfigDirGuard::new();
 

@@ -1,0 +1,599 @@
+name: step-runner
+description: |
+  Executes ONE step of a phased implementation plan (plans/ repo) with the
+  step protocol enforced as graph edges: orient -> staleness check ->
+  implement (coder) -> verify -> edge-case sweep -> optional independent
+  review -> evidence-backed handoff -> user approval gate. Designed to be
+  delegated to by sisyphus.
+version: "1.0"
+
+global_tools:
+  - fs_cat.sh
+  - fs_ls.sh
+  - fs_write.sh
+  - fs_patch.sh
+  - execute_command.sh
+
+skills_enabled: true
+enabled_skills:
+  - step-implementation
+  - handoff-protocol
+  - code-review
+  - ai-slop-remover
+
+variables:
+  - name: project_dir
+    description: |
+      Absolute path to the project directory. Defaults to "." (the directory
+      coyote was invoked from). The coder sub-agent resolves its own
+      project_dir the same way, so invoke step-runner FROM the project root
+      unless you override this for both.
+    default: "."
+  - name: plans_dir
+    description: |
+      Path to the plan repo. Relative paths resolve against project_dir.
+      Expected layout: <plans_dir>/steps/NN-<slug>.md,
+      <plans_dir>/handoffs/, <plans_dir>/NOTES.md.
+    default: "plans"
+  - name: step
+    description: |
+      Which step to execute: a step number, or "next" to pick the first
+      in-progress (resume) or pending step plan.
+    default: "next"
+
+settings:
+  max_loop_iterations: 20
+  log_state_snapshots: true
+  validate_before_run: true
+  timeout: 7200
+
+initial_state:
+  project_dir: ""
+  plans_dir: ""
+  step_number: 0
+  step_slug: ""
+  step_title: ""
+  step_plan_path: ""
+  step_plan: ""
+  prev_handoff_path: "(none)"
+  prev_handoff: "(none - this is the first step)"
+  notes_path: ""
+  notes: "(none)"
+  handoff_path: ""
+  blocking_reason: ""
+  plan_summary: ""
+  implementation_brief: ""
+  staleness_report: ""
+  has_major_deviation: false
+  deviation_summary: ""
+  user_feedback: ""
+  fix_instructions: ""
+  fix_attempts: 0
+  max_fix_attempts: 2
+  coder_result: ""
+  format_output: ""
+  lint_ok: true
+  lint_output: ""
+  build_ok: true
+  build_output: ""
+  tests_ok: true
+  tests_output: ""
+  edge_case_report: ""
+  downstream_updates: ""
+  needs_independent_review: false
+  review_report: ""
+  review_attempts: 0
+  max_review_attempts: 1
+  handoff_attempts: 0
+  handoff_fix: ""
+  step_summary: ""
+
+start: resolve_step
+
+nodes:
+  resolve_step:
+    id: resolve_step
+    type: script
+    description: |
+      Locate the step plan, previous handoff, and NOTES.md; parse frontmatter;
+      check depends_on satisfaction against existing handoffs; mark the plan
+      in-progress. Routes to gate_blocked when dependencies are unsatisfied.
+    script: scripts/resolve_step.sh
+    timeout: 30
+    fallback: end_failure
+    next: orient
+
+  gate_blocked:
+    id: gate_blocked
+    type: approval
+    description: Escalate unsatisfied dependencies instead of building on missing ground.
+    question: |
+      Step {{step_number}} ({{step_title}}) is BLOCKED:
+
+      {{blocking_reason}}
+
+      Proceed anyway?
+    options:
+      - "yes"
+      - "no"
+    routes:
+      "yes": orient
+      "no": end_blocked
+    on_other: end_blocked
+
+  orient:
+    id: orient
+    type: llm
+    description: |
+      Read-only orientation and staleness check: merge the previous handoff's
+      directives with the step plan, then verify the plan's assumptions
+      against the CURRENT codebase before any edit.
+    skills_enabled: true
+    enabled_skills:
+      - step-implementation
+    instructions: |
+      You are orienting for one step of a phased implementation plan. Load
+      `step-implementation` and apply its Orient and Staleness-check phases.
+      You are READ-ONLY in this node: no edits, no fixes.
+
+      1. Read the previous handoff (below). Note directives aimed at this
+         step, deviations that changed the codebase, and bare assertions
+         that need re-verification.
+      2. Staleness-check the step plan against the code at {{project_dir}}:
+         grep the symbols it references (via execute_command), read its
+         Context snippets at their claimed locations with fs_cat, confirm
+         its Test commands exist.
+      3. Classify discrepancies per the skill's deviation table: minor
+         (mechanics differ; correct silently in the brief) vs major (scope,
+         approach, interfaces, or a later step's assumptions affected).
+
+      Produce `implementation_brief`: the corrected, self-contained marching
+      orders for the implementer - plan tasks in order, handoff directives
+      applied, minor staleness corrections folded in, acceptance criteria
+      restated. The implementer sees ONLY the step plan plus your brief.
+    prompt: |
+      ## Step plan ({{step_plan_path}})
+      {{step_plan}}
+
+      ## Previous handoff ({{prev_handoff_path}})
+      {{prev_handoff}}
+
+      ## Rolling project notes
+      {{notes}}
+    tools:
+      - fs_cat
+      - fs_ls
+      - execute_command
+    max_iterations: 20
+    output_schema:
+      type: object
+      properties:
+        plan_summary:
+          type: string
+          description: 1-3 sentences summarizing what this step delivers
+        implementation_brief:
+          type: string
+          description: Corrected, self-contained instructions for the implementer
+        staleness_report:
+          type: string
+          description: Findings from checking plan assumptions against current code; "clean" if none
+        has_major_deviation:
+          type: boolean
+          description: True when a discrepancy changes scope, approach, or interfaces
+        deviation_summary:
+          type: string
+          description: Major deviations only, with the plan claim vs current reality. Empty when none
+      required: [plan_summary, implementation_brief, staleness_report, has_major_deviation, deviation_summary]
+    fallback: end_failure
+    next: route_staleness
+
+  route_staleness:
+    id: route_staleness
+    type: script
+    description: Major deviation -> user gate; otherwise straight to implement.
+    script: scripts/route_staleness.sh
+    timeout: 5
+    fallback: implement
+
+  gate_deviation:
+    id: gate_deviation
+    type: approval
+    description: Major deviations are never silently absorbed - the user decides.
+    question: |
+      Step {{step_number}} ({{step_title}}): the plan no longer matches the
+      codebase in a way that changes scope or approach.
+
+      {{deviation_summary}}
+
+      Staleness report:
+      {{staleness_report}}
+
+      Proceed with the corrected brief? (Answer with anything else to give
+      your own guidance to the implementer.)
+    options:
+      - "proceed"
+      - "abort"
+    routes:
+      "proceed": implement
+      "abort": end_rejected
+    on_other: implement
+    state_updates:
+      user_feedback: "{{choice}}"
+
+  implement:
+    id: implement
+    type: agent
+    description: |
+      Delegate implementation to the coder graph agent, which runs its own
+      plan -> implement -> build -> tests -> self-review fix-loop internally.
+    agent: coder
+    prompt: |
+      ## TASK
+      Execute step {{step_number}} ({{step_title}}) of a phased implementation
+      plan for the project at {{project_dir}}.
+
+      ## EXPECTED OUTCOME
+      Every task in the step plan below is implemented and its acceptance
+      criteria are met. Tests are derived from the Acceptance criteria
+      section (not from the implementation). Build and full test suite pass.
+
+      ## MUST DO
+      - Follow the Orientation brief below - it supersedes the raw plan where
+        they disagree (it folds in corrections from the staleness check).
+      - Match the patterns pasted in the step plan's Context section.
+      - Derive tests from the plan's Acceptance criteria.
+
+      ## MUST NOT DO
+      - Do not touch anything listed in the plan's Out of scope section.
+      - Do not modify files under {{plans_dir}}.
+      - Do not implement work belonging to other steps.
+
+      ## CONTEXT
+      ### Step plan
+      {{step_plan}}
+
+      ### Orientation brief (handoff directives + staleness corrections applied)
+      {{implementation_brief}}
+
+      ### User guidance (if any)
+      {{user_feedback}}
+
+      ### Fix loop status (empty on first attempt)
+      {{fix_instructions}}
+    timeout: 3600
+    state_updates:
+      coder_result: "{{output}}"
+    next: route_coder_result
+
+  route_coder_result:
+    id: route_coder_result
+    type: script
+    description: Route on the coder sentinel - COMPLETE verifies, REJECTED/FAILED terminate.
+    script: scripts/route_coder_result.sh
+    timeout: 5
+    fallback: end_failure
+
+  verify_format_lint:
+    id: verify_format_lint
+    type: script
+    description: |
+      Format BEFORE evidence collection (FORMAT_CMD override or per-type
+      heuristic), then lint (LINT_CMD, when configured). Lint failure routes
+      to the fix loop.
+    script: scripts/verify_format_lint.sh
+    timeout: 300
+    fallback: fix_loop_gate
+
+  verify_build:
+    id: verify_build
+    type: script
+    description: Step-level build/typecheck evidence, collected AFTER formatting.
+    script: scripts/verify_build.sh
+    timeout: 600
+    fallback: fix_loop_gate
+
+  verify_tests:
+    id: verify_tests
+    type: script
+    description: FULL test suite - regressions in untouched code fail the step too.
+    script: scripts/verify_tests.sh
+    timeout: 1200
+    fallback: fix_loop_gate
+
+  fix_loop_gate:
+    id: fix_loop_gate
+    type: script
+    description: |
+      Step-level fix budget (the coder already ran its own internal fix
+      loop). Loops to implement with fix_instructions, or ends as failure.
+    script: scripts/fix_loop_gate.sh
+    timeout: 5
+    fallback: end_failure
+
+  edge_case_sweep:
+    id: edge_case_sweep
+    type: llm
+    description: |
+      Post-implementation sweep: missed spots, edge cases, downstream plan
+      implications. May annotate downstream plans' Edge cases sections
+      (annotate vs propose per handoff-protocol). Also judges whether the
+      change warrants an independent review pass.
+    skills_enabled: true
+    enabled_skills:
+      - step-implementation
+      - handoff-protocol
+    instructions: |
+      The implementation for this step just passed build and tests. Load
+      `step-implementation` (edge-case sweep phase) and `handoff-protocol`
+      (annotate-vs-propose rules), then:
+
+      1. Read the changed code (the coder result below names the files).
+         Look for edge cases the plan missed: empty inputs, error paths,
+         concurrency, partial failure, compat.
+      2. For each edge case belonging to a LATER step: check that step's
+         plan under {{plans_dir}}/steps/. If its Edge cases section already
+         covers it, done. If not, append an entry to that section via
+         fs_patch - touch NOTHING else in the file.
+      3. NEVER edit a later plan's Objective, Tasks, Acceptance criteria,
+         or Out of scope. Scope-affecting changes become proposed diffs in
+         `downstream_updates` instead.
+      4. Set needs_independent_review=true when the change touched 5+ files
+         or crosses architectural boundaries (auth, public APIs, schema,
+         security-sensitive paths).
+
+      Be terse. Findings, not prose.
+    prompt: |
+      ## Coder result
+      {{coder_result}}
+
+      ## Step plan
+      {{step_plan}}
+
+      ## Staleness report from orientation
+      {{staleness_report}}
+    tools:
+      - fs_cat
+      - fs_ls
+      - fs_patch
+      - execute_command
+    max_iterations: 20
+    output_schema:
+      type: object
+      properties:
+        edge_case_report:
+          type: string
+          description: Edge cases discovered - both handled and punted, one per line. "none" if empty
+        downstream_updates:
+          type: string
+          description: Annotations made (plan file + section) and proposed diffs for scope-affecting changes. "none" if empty
+        needs_independent_review:
+          type: boolean
+      required: [edge_case_report, downstream_updates, needs_independent_review]
+    fallback: write_handoff
+    next: route_sweep
+
+  route_sweep:
+    id: route_sweep
+    type: script
+    description: Broad or boundary-crossing changes get an independent reviewer.
+    script: scripts/route_sweep.sh
+    timeout: 5
+    fallback: write_handoff
+
+  independent_review:
+    id: independent_review
+    type: agent
+    description: Independent review pass - the author's self-review cannot catch its own rationalizations.
+    agent: code-reviewer
+    prompt: |
+      Review the changes produced for step {{step_number}} ({{step_title}})
+      of a phased implementation plan in {{project_dir}}.
+
+      What the step was supposed to do:
+      {{plan_summary}}
+
+      Coder summary (names the modified/created files):
+      {{coder_result}}
+
+      Review the changed files against the step plan's acceptance criteria.
+      Preserve severity tags in your findings.
+    timeout: 1200
+    state_updates:
+      review_report: "{{output}}"
+    next: route_review
+
+  route_review:
+    id: route_review
+    type: script
+    description: Critical findings loop back to implement (bounded); otherwise proceed to handoff.
+    script: scripts/route_review.sh
+    timeout: 5
+    fallback: write_handoff
+
+  write_handoff:
+    id: write_handoff
+    type: llm
+    description: |
+      Write the evidence-backed handoff per handoff-protocol and append
+      durable facts to NOTES.md. The completion gate (check_handoff)
+      verifies the document afterward.
+    skills_enabled: true
+    enabled_skills:
+      - handoff-protocol
+      - ai-slop-remover
+    instructions: |
+      Load `handoff-protocol` and follow its writer schema EXACTLY: the
+      frontmatter (step, title, result) and all eight sections, writing
+      "None" rather than omitting a section.
+
+      Write the handoff to {{handoff_path}} with fs_write. Paste the
+      verification evidence below verbatim into the Evidence section -
+      commands, exit codes, decisive output lines. Deviations come from the
+      staleness report, gate decisions, and fix loop history. Downstream
+      plan updates come from the sweep results.
+
+      Then append durable, step-independent facts (if any) to {{notes_path}}
+      - create the file if missing, never rewrite existing entries.
+
+      If "Gate feedback" below is non-empty, a previous handoff attempt
+      failed validation - fix exactly what it lists.
+    prompt: |
+      ## Step
+      {{step_number}} ({{step_title}}) - plan at {{step_plan_path}}
+
+      ## Plan summary
+      {{plan_summary}}
+
+      ## Coder result
+      {{coder_result}}
+
+      ## Staleness report / deviations
+      {{staleness_report}}
+
+      Major deviation summary (if any): {{deviation_summary}}
+      User guidance given (if any): {{user_feedback}}
+      Fix loop attempts used: {{fix_attempts}} of {{max_fix_attempts}}
+
+      ## Edge cases discovered
+      {{edge_case_report}}
+
+      ## Downstream plan updates
+      {{downstream_updates}}
+
+      ## Independent review report (if any)
+      {{review_report}}
+
+      ## Verification evidence (paste verbatim)
+      ### Format
+      {{format_output}}
+      ### Lint
+      {{lint_output}}
+      ### Build
+      {{build_output}}
+      ### Tests
+      {{tests_output}}
+
+      ## Gate feedback
+      {{handoff_fix}}
+    tools:
+      - fs_cat
+      - fs_ls
+      - fs_write
+      - fs_patch
+    max_iterations: 15
+    output_schema:
+      type: object
+      properties:
+        step_summary:
+          type: string
+          description: 3-6 sentence summary of the step for the user's approval decision - what was done, deviations, anything needing their attention
+      required: [step_summary]
+    fallback: end_failure
+    next: check_handoff
+
+  check_handoff:
+    id: check_handoff
+    type: script
+    description: |
+      Deterministic completion gate - handoff exists with frontmatter and all
+      required sections. On success, marks the step plan status complete.
+      One retry back to write_handoff, then failure.
+    script: scripts/check_handoff.sh
+    timeout: 10
+    fallback: end_failure
+
+  gate_user_review:
+    id: gate_user_review
+    type: approval
+    description: The hard stop - the next step never starts without explicit approval.
+    question: |
+      ## Step {{step_number}} ({{step_title}}) - ready for review
+
+      {{step_summary}}
+
+      Handoff: {{handoff_path}}
+      Build: {{build_ok}} | Tests: {{tests_ok}} | Fix attempts: {{fix_attempts}}/{{max_fix_attempts}}
+
+      Approve this step? (Answer with anything else to send revision
+      instructions straight to the implementer.)
+    options:
+      - "approve"
+      - "revise"
+    routes:
+      "approve": end_success
+      "revise": get_revision
+    on_other: revise_from_choice
+    state_updates:
+      user_feedback: "{{choice}}"
+
+  get_revision:
+    id: get_revision
+    type: input
+    description: Collect revision instructions, then loop back through implement -> verify -> handoff.
+    question: "What should change? Your comments go to the implementer verbatim."
+    validation: "len(input) > 0"
+    state_updates:
+      fix_instructions: "{{input}}"
+    next: implement
+
+  revise_from_choice:
+    id: revise_from_choice
+    type: script
+    description: Free-form approval answers are treated as revision instructions.
+    script: scripts/revise_from_choice.sh
+    timeout: 5
+    fallback: get_revision
+
+  end_success:
+    id: end_success
+    type: end
+    output: |
+      STEP_COMPLETE
+      Step: {{step_number}} ({{step_title}})
+      Plan: {{step_plan_path}}
+      Handoff: {{handoff_path}}
+      Build: passed | Tests: passed | Fix attempts: {{fix_attempts}}/{{max_fix_attempts}}
+
+      {{step_summary}}
+
+      Downstream plan updates:
+      {{downstream_updates}}
+
+  end_blocked:
+    id: end_blocked
+    type: end
+    output: |
+      STEP_BLOCKED
+      Step: {{step_number}} ({{step_title}})
+      Reason:
+      {{blocking_reason}}
+
+  end_rejected:
+    id: end_rejected
+    type: end
+    output: |
+      STEP_REJECTED
+      Step: {{step_number}} ({{step_title}})
+      Rejected at: deviation gate or coder approval gate.
+      Deviation summary:
+      {{deviation_summary}}
+      Coder result (if it ran):
+      {{coder_result}}
+
+  end_failure:
+    id: end_failure
+    type: end
+    output: |
+      STEP_FAILED
+      Step: {{step_number}} ({{step_title}})
+      Fix attempts: {{fix_attempts}}/{{max_fix_attempts}}
+      Blocking reason (if resolution failed): {{blocking_reason}}
+
+      Coder result:
+      {{coder_result}}
+
+      Last build output:
+      {{build_output}}
+
+      Last tests output:
+      {{tests_output}}
