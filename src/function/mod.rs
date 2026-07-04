@@ -1692,6 +1692,33 @@ mod tests {
     }
 
     #[test]
+    fn bundled_bash_tools_generate_declarations() {
+        let tools_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/functions/tools");
+        let mut checked = Vec::new();
+        for entry in std::fs::read_dir(&tools_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(OsStr::to_str) != Some("sh") {
+                continue;
+            }
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            let declarations = Functions::generate_declarations(&path)
+                .unwrap_or_else(|e| panic!("bundled tool '{name}' failed to parse: {e}"));
+            assert!(
+                !declarations.is_empty(),
+                "bundled tool '{name}' produced no function declaration"
+            );
+            checked.push(name);
+        }
+        for expected in ["fs_grep", "ast_grep", "execute_command"] {
+            assert!(
+                checked.iter().any(|n| n == expected),
+                "expected bundled tool '{expected}' to be checked; found {checked:?}"
+            );
+        }
+    }
+
+    #[test]
     fn functions_append_todo_adds_declarations() {
         let mut f = Functions::default();
         f.append_todo_functions();
