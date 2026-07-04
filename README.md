@@ -62,6 +62,11 @@ Coyote requires the following tools to be installed on your system:
 * [iwe](https://github.com/iwe-org/iwe) (`iwec`, for the built-in `iwe` MCP server that navigates large markdown knowledgebases)
     * **Homebrew:** `brew tap iwe-org/iwe && brew install iwe`
     * **Cargo:** `cargo install iwec`
+* [ast-grep](https://ast-grep.github.io/) (for the built-in `ast_grep` structural code search tool, used by the `explore` agent)
+    * **Homebrew:** `brew install ast-grep`
+    * **Cargo:** `cargo install ast-grep --locked`
+    * **npm:** `npm i -g @ast-grep/cli`
+    * Optional: if `ast-grep` is not installed, the `ast_grep` tool reports it and agents fall back to `fs_grep`
 
 These tools are used to provide various functionalities within Coyote, such as document processing, JSON manipulation,
 etc., and they are used within agents and tools.
