@@ -483,7 +483,7 @@ pub async fn prepare_gcloud_access_token(
         let expires_at = Utc::now()
             + Duration::try_seconds(expires_in)
                 .ok_or_else(|| anyhow!("Failed to parse expires_in of access_token"))?;
-        set_access_token(client_name, token, expires_at.timestamp())
+        set_access_token(client_name, token, expires_at.timestamp(), None)
     }
     Ok(())
 }

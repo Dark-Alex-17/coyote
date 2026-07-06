@@ -57,6 +57,14 @@ pub trait OAuthProvider: Send + Sync {
     fn fixed_redirect_uri(&self) -> Option<String> {
         None
     }
+
+    fn extract_account_id(&self, _response: &Value) -> Option<String> {
+        None
+    }
+
+    fn include_state_in_token_exchange(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +72,8 @@ pub struct OAuthTokens {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: i64,
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> Result<()> {
@@ -137,18 +147,17 @@ pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> 
     }
 
     let client = ReqwestClient::new();
-    let request = build_token_request(
-        &client,
-        provider,
-        &[
-            ("grant_type", "authorization_code"),
-            ("client_id", provider.client_id()),
-            ("code", &code),
-            ("code_verifier", &code_verifier),
-            ("redirect_uri", &redirect_uri),
-            ("state", &state),
-        ],
-    );
+    let mut token_params = vec![
+        ("grant_type", "authorization_code"),
+        ("client_id", provider.client_id()),
+        ("code", code.as_str()),
+        ("code_verifier", code_verifier.as_str()),
+        ("redirect_uri", redirect_uri.as_str()),
+    ];
+    if provider.include_state_in_token_exchange() {
+        token_params.push(("state", state.as_str()));
+    }
+    let request = build_token_request(&client, provider, &token_params);
 
     let response: Value = request.send().await?.json().await?;
 
@@ -166,10 +175,13 @@ pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> 
 
     let expires_at = Utc::now().timestamp() + expires_in;
 
+    let account_id = provider.extract_account_id(&response);
+
     let tokens = OAuthTokens {
         access_token,
         refresh_token,
         expires_at,
+        account_id,
     };
 
     save_oauth_tokens(client_name, &tokens)?;
@@ -231,10 +243,15 @@ pub async fn refresh_oauth_token(
 
     let expires_at = Utc::now().timestamp() + expires_in;
 
+    let account_id = provider
+        .extract_account_id(&response)
+        .or_else(|| tokens.account_id.clone());
+
     let new_tokens = OAuthTokens {
         access_token,
         refresh_token,
         expires_at,
+        account_id,
     };
 
     save_oauth_tokens(client_name, &new_tokens)?;
@@ -262,7 +279,12 @@ pub async fn prepare_oauth_access_token(
         tokens
     };
 
-    set_access_token(client_name, tokens.access_token.clone(), tokens.expires_at);
+    set_access_token(
+        client_name,
+        tokens.access_token.clone(),
+        tokens.expires_at,
+        tokens.account_id.clone(),
+    );
 
     Ok(true)
 }
@@ -371,6 +393,7 @@ pub fn get_oauth_provider(provider_type: &str) -> Option<Box<dyn OAuthProvider>>
     match provider_type {
         "claude" => Some(Box::new(super::claude_oauth::ClaudeOAuthProvider)),
         "gemini" => Some(Box::new(super::gemini_oauth::GeminiOAuthProvider)),
+        "openai" => Some(Box::new(super::openai_oauth::OpenAIOAuthProvider)),
         _ => None,
     }
 }
@@ -409,7 +432,11 @@ fn client_config_info(client_config: &ClientConfig) -> (&str, &'static str, Opti
             "claude",
             c.auth.as_deref(),
         ),
-        ClientConfig::OpenAIConfig(c) => (c.name.as_deref().unwrap_or("openai"), "openai", None),
+        ClientConfig::OpenAIConfig(c) => (
+            c.name.as_deref().unwrap_or("openai"),
+            "openai",
+            c.auth.as_deref(),
+        ),
         ClientConfig::OpenAICompatibleConfig(c) => (
             c.name.as_deref().unwrap_or("openai-compatible"),
             "openai-compatible",

@@ -1,13 +1,17 @@
+use super::access_token::{get_access_token, get_access_token_account_id};
+use super::oauth::{self, OAuthProvider};
+use super::openai_oauth::OpenAIOAuthProvider;
 use super::*;
 
 use crate::utils::strip_think_tag;
 
 use anyhow::{Context, Result, bail};
-use reqwest::RequestBuilder;
+use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 const API_BASE: &str = "https://api.openai.com/v1";
+const CODEX_API_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct OpenAIConfig {
@@ -15,6 +19,7 @@ pub struct OpenAIConfig {
     pub api_key: Option<String>,
     pub api_base: Option<String>,
     pub organization_id: Option<String>,
+    pub auth: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
@@ -25,36 +30,131 @@ impl OpenAIClient {
     config_get_fn!(api_key, get_api_key);
     config_get_fn!(api_base, get_api_base);
 
-    create_client_config!([("api_key", "API Key", None, true)]);
+    create_oauth_supported_client_config!();
 }
 
-impl_client_trait!(
-    OpenAIClient,
-    (
-        prepare_chat_completions,
-        openai_chat_completions,
-        openai_chat_completions_streaming
-    ),
-    (prepare_embeddings, openai_embeddings),
-    (noop_prepare_rerank, noop_rerank),
-);
+#[async_trait::async_trait]
+impl Client for OpenAIClient {
+    client_common_fns!();
 
-fn prepare_chat_completions(
+    fn supports_oauth(&self) -> bool {
+        self.config.auth.as_deref() == Some("oauth")
+    }
+
+    async fn chat_completions_inner(
+        &self,
+        client: &ReqwestClient,
+        data: ChatCompletionsData,
+    ) -> Result<ChatCompletionsOutput> {
+        let uses_codex =
+            self.config.auth.as_deref() == Some("oauth") && self.get_api_base().is_err();
+        let request_data = prepare_chat_completions(self, client, data).await?;
+        let builder = self.request_builder(client, request_data);
+        if uses_codex {
+            openai_responses_chat_completions(builder, self.model()).await
+        } else {
+            openai_chat_completions(builder, self.model()).await
+        }
+    }
+
+    async fn chat_completions_streaming_inner(
+        &self,
+        client: &ReqwestClient,
+        handler: &mut SseHandler,
+        data: ChatCompletionsData,
+    ) -> Result<()> {
+        let uses_codex =
+            self.config.auth.as_deref() == Some("oauth") && self.get_api_base().is_err();
+        let request_data = prepare_chat_completions(self, client, data).await?;
+        let builder = self.request_builder(client, request_data);
+
+        if uses_codex {
+            openai_responses_streaming(builder, handler).await
+        } else {
+            openai_chat_completions_streaming(builder, handler, self.model()).await
+        }
+    }
+
+    async fn embeddings_inner(
+        &self,
+        client: &ReqwestClient,
+        data: &EmbeddingsData,
+    ) -> Result<EmbeddingsOutput> {
+        let request_data = prepare_embeddings(self, client, data).await?;
+        let builder = self.request_builder(client, request_data);
+        openai_embeddings(builder, self.model()).await
+    }
+
+    async fn rerank_inner(
+        &self,
+        client: &ReqwestClient,
+        data: &RerankData,
+    ) -> Result<RerankOutput> {
+        let request_data = noop_prepare_rerank(self, data)?;
+        let builder = self.request_builder(client, request_data);
+        noop_rerank(builder, self.model()).await
+    }
+}
+
+async fn prepare_chat_completions(
     self_: &OpenAIClient,
+    client: &ReqwestClient,
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
-    let api_key = self_.get_api_key()?;
-    let api_base = self_
-        .get_api_base()
-        .unwrap_or_else(|_| API_BASE.to_string());
+    let uses_oauth = self_.config.auth.as_deref() == Some("oauth");
+    let has_custom_base = self_.get_api_base().is_ok();
 
-    let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
+    let uses_codex = uses_oauth && !has_custom_base;
 
-    let body = openai_build_chat_completions_body(data, &self_.model);
+    let url = if uses_codex {
+        CODEX_API_ENDPOINT.to_string()
+    } else {
+        let api_base = self_
+            .get_api_base()
+            .unwrap_or_else(|_| API_BASE.to_string());
+        format!("{}/chat/completions", api_base.trim_end_matches('/'))
+    };
+
+    let body = if uses_codex {
+        openai_build_responses_body(data, &self_.model)
+    } else {
+        openai_build_chat_completions_body(data, &self_.model)
+    };
 
     let mut request_data = RequestData::new(url, body);
 
-    request_data.bearer_auth(api_key);
+    if uses_oauth {
+        let provider = OpenAIOAuthProvider;
+        let ready = oauth::prepare_oauth_access_token(client, &provider, self_.name()).await?;
+
+        if !ready {
+            bail!(
+                "OAuth configured but no tokens found for '{}'. Run: 'coyote --authenticate {}' or '.authenticate' in the REPL",
+                self_.name(),
+                self_.name()
+            );
+        }
+
+        let token = get_access_token(self_.name())?;
+        request_data.bearer_auth(token);
+
+        if let Some(account_id) = get_access_token_account_id(self_.name()) {
+            request_data.header("ChatGPT-Account-Id", account_id);
+        }
+
+        for (key, value) in provider.extra_request_headers() {
+            request_data.header(key, value);
+        }
+    } else if let Ok(api_key) = self_.get_api_key() {
+        request_data.bearer_auth(api_key);
+    } else {
+        bail!(
+            "No authentication configured for '{}'. Set `api_key` or use `auth: oauth` with `coyote --authenticate {}`.",
+            self_.name(),
+            self_.name()
+        );
+    }
+
     if let Some(organization_id) = &self_.config.organization_id {
         request_data.header("OpenAI-Organization", organization_id);
     }
@@ -62,8 +162,11 @@ fn prepare_chat_completions(
     Ok(request_data)
 }
 
-fn prepare_embeddings(self_: &OpenAIClient, data: &EmbeddingsData) -> Result<RequestData> {
-    let api_key = self_.get_api_key()?;
+async fn prepare_embeddings(
+    self_: &OpenAIClient,
+    client: &ReqwestClient,
+    data: &EmbeddingsData,
+) -> Result<RequestData> {
     let api_base = self_
         .get_api_base()
         .unwrap_or_else(|_| API_BASE.to_string());
@@ -74,7 +177,30 @@ fn prepare_embeddings(self_: &OpenAIClient, data: &EmbeddingsData) -> Result<Req
 
     let mut request_data = RequestData::new(url, body);
 
-    request_data.bearer_auth(api_key);
+    if self_.config.auth.as_deref() == Some("oauth") {
+        let provider = OpenAIOAuthProvider;
+        let ready = oauth::prepare_oauth_access_token(client, &provider, self_.name()).await?;
+
+        if !ready {
+            bail!(
+                "OAuth configured but no tokens found for '{}'. Run: 'coyote --authenticate {}' or '.authenticate' in the REPL",
+                self_.name(),
+                self_.name()
+            );
+        }
+
+        let token = get_access_token(self_.name())?;
+        request_data.bearer_auth(token);
+    } else if let Ok(api_key) = self_.get_api_key() {
+        request_data.bearer_auth(api_key);
+    } else {
+        bail!(
+            "No authentication configured for '{}'. Set `api_key` or use `auth: oauth` with `coyote --authenticate {}`.",
+            self_.name(),
+            self_.name()
+        );
+    }
+
     if let Some(organization_id) = &self_.config.organization_id {
         request_data.header("OpenAI-Organization", organization_id);
     }
@@ -401,4 +527,189 @@ fn normalize_function_id(value: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> Value {
+    let ChatCompletionsData {
+        messages,
+        temperature,
+        top_p,
+        functions,
+        stream,
+    } = data;
+
+    let messages_len = messages.len();
+    let input: Vec<Value> = messages
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, message)| {
+            let Message { role, content } = message;
+            match content {
+                MessageContent::ToolCalls(MessageContentToolCalls {
+                    tool_results,
+                    text: _,
+                    sequence: _,
+                }) => tool_results
+                    .into_iter()
+                    .flat_map(|tool_result| {
+                        vec![
+                            json!({
+                                "type": "function_call",
+                                "call_id": tool_result.call.id,
+                                "name": tool_result.call.name,
+                                "arguments": tool_result.call.arguments.to_string(),
+                            }),
+                            json!({
+                                "type": "function_call_output",
+                                "call_id": tool_result.call.id,
+                                "output": tool_result.output.to_string(),
+                            }),
+                        ]
+                    })
+                    .collect(),
+                MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
+                    vec![json!({ "role": role, "content": strip_think_tag(&text) })]
+                }
+                _ => vec![json!({ "role": role, "content": content })],
+            }
+        })
+        .collect();
+
+    let mut body = json!({
+        "model": &model.real_name(),
+        "input": input,
+        "store": false,
+    });
+
+    if let Some(v) = model.max_tokens_param() {
+        body["max_output_tokens"] = v.into();
+    }
+    if let Some(v) = temperature {
+        body["temperature"] = v.into();
+    }
+    if let Some(v) = top_p {
+        body["top_p"] = v.into();
+    }
+    if stream {
+        body["stream"] = true.into();
+    }
+    if let Some(functions) = functions {
+        body["tools"] = functions
+            .iter()
+            .map(|v| {
+                let mut tool = serde_json::to_value(v).unwrap_or_default();
+                tool["type"] = "function".into();
+                tool
+            })
+            .collect();
+    }
+    body
+}
+
+pub async fn openai_responses_chat_completions(
+    builder: RequestBuilder,
+    _model: &Model,
+) -> Result<ChatCompletionsOutput> {
+    let res = builder.send().await?;
+    let status = res.status();
+    let data: Value = res.json().await?;
+
+    if !status.is_success() {
+        catch_error(&data, status.as_u16())?;
+    }
+
+    debug!("non-stream-data: {data}");
+    openai_extract_responses(&data)
+}
+
+pub fn openai_extract_responses(data: &Value) -> Result<ChatCompletionsOutput> {
+    let mut text = String::new();
+    let mut tool_calls = vec![];
+
+    if let Some(output) = data["output"].as_array() {
+        for item in output {
+            match item["type"].as_str() {
+                Some("message") => {
+                    if let Some(content) = item["content"].as_array() {
+                        for part in content {
+                            if part["type"].as_str() == Some("output_text")
+                                && let Some(t) = part["text"].as_str()
+                            {
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    if let (Some(name), Some(arguments_str), Some(call_id)) = (
+                        item["name"].as_str(),
+                        item["arguments"].as_str(),
+                        item["call_id"].as_str(),
+                    ) {
+                        let arguments: Value = arguments_str.parse().with_context(|| {
+                            format!("Tool call '{name}' has non-JSON arguments '{arguments_str}'")
+                        })?;
+                        tool_calls.push(ToolCall::new(
+                            name.to_string(),
+                            arguments,
+                            Some(call_id.to_string()),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if text.is_empty() && tool_calls.is_empty() {
+        bail!("Invalid response data: {data}");
+    }
+    Ok(ChatCompletionsOutput { text, tool_calls })
+}
+
+pub async fn openai_responses_streaming(
+    builder: RequestBuilder,
+    handler: &mut SseHandler,
+) -> Result<()> {
+    let handle = |message: SseMessage| -> Result<bool> {
+        if message.data == "[DONE]" {
+            return Ok(true);
+        }
+        let data: Value = serde_json::from_str(&message.data)?;
+        debug!("stream-data: {data}");
+
+        match data["type"].as_str() {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = data["delta"].as_str().filter(|v| !v.is_empty()) {
+                    handler.text(delta)?;
+                }
+            }
+            Some("response.output_item.done") => {
+                let item = &data["item"];
+                if item["type"].as_str() == Some("function_call")
+                    && let (Some(name), Some(arguments_str), Some(call_id)) = (
+                        item["name"].as_str(),
+                        item["arguments"].as_str(),
+                        item["call_id"].as_str(),
+                    )
+                {
+                    let arguments: Value = arguments_str.parse().with_context(|| {
+                        format!("Tool call '{name}' has non-JSON arguments '{arguments_str}'")
+                    })?;
+                    handler.tool_call(ToolCall::new(
+                        name.to_string(),
+                        arguments,
+                        Some(call_id.to_string()),
+                    ))?;
+                }
+            }
+            Some("response.completed") => {
+                return Ok(true);
+            }
+            _ => {}
+        }
+        Ok(false)
+    };
+
+    sse_stream(builder, handle).await
 }

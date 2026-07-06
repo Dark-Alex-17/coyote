@@ -232,8 +232,8 @@ where
         .map(|value| value.to_string());
     let is_event_stream = content_type
         .as_deref()
-        .map(|ct| ct.starts_with("text/event-stream"))
-        .unwrap_or(false);
+        .map(|ct| ct.is_empty() || ct.starts_with("text/event-stream"))
+        .unwrap_or(true);
     if !is_event_stream {
         let header_value = content_type.unwrap_or_default();
         let text = res.text().await?;
