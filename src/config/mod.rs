@@ -445,9 +445,10 @@ fn confirm_asset_overwrite(category: AssetCategory, label: &str, target: &Path) 
     }
     let body = match category {
         AssetCategory::McpConfig => format!(
-            "This replaces your MCP server configuration at {} with this \
-             build's bundled template. Your configured MCP servers (and any \
-             custom secret references they contain) will be lost.",
+            "This merges the bundled MCP server template into your configuration \
+             at {}. New servers from the bundled template will be added; any \
+             MCP servers you have already configured (including custom secret \
+             references) are left untouched.",
             target.display()
         ),
         _ => format!(

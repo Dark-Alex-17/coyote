@@ -14,7 +14,7 @@ use crate::config::ensure_parent_exists;
 use crate::config::paths;
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
-    MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+    MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpServersConfig,
 };
 use crate::parsers::{bash, python, typescript};
 use anyhow::{Context, Result, anyhow, bail};
@@ -266,14 +266,42 @@ impl Functions {
         let file_path = paths::mcp_config_file();
         let embedded = FunctionAssets::get("mcp.json")
             .ok_or_else(|| anyhow!("Failed to load embedded mcp.json"))?;
-        let content = unsafe { std::str::from_utf8_unchecked(&embedded.data) };
+        let bundled_content = unsafe { std::str::from_utf8_unchecked(&embedded.data) };
+        let bundled: McpServersConfig =
+            serde_json::from_str(bundled_content).context("failed to parse embedded mcp.json")?;
 
         ensure_parent_exists(&file_path)?;
 
-        info!("Reinstalling MCP config file: {}", file_path.display());
+        let mut merged = if file_path.exists() {
+            let existing =
+                fs::read_to_string(&file_path).context("failed to read existing mcp.json")?;
+            serde_json::from_str::<McpServersConfig>(&existing)
+                .context("failed to parse existing mcp.json")?
+        } else {
+            McpServersConfig {
+                mcp_servers: IndexMap::new(),
+            }
+        };
 
-        let mut config_file = File::create(&file_path)?;
-        config_file.write_all(content.as_bytes())?;
+        let mut added = Vec::new();
+        for (name, server) in bundled.mcp_servers {
+            if !merged.mcp_servers.contains_key(&name) {
+                merged.mcp_servers.insert(name.clone(), server);
+                added.push(name);
+            }
+        }
+
+        info!("Merging bundled MCP config into: {}", file_path.display());
+
+        let serialized =
+            serde_json::to_string_pretty(&merged).context("failed to serialize merged mcp.json")?;
+        let tmp = file_path.with_extension("json.tmp");
+        fs::write(&tmp, &serialized).context("failed to write temporary mcp.json")?;
+        fs::rename(&tmp, &file_path).context("failed to finalize mcp.json")?;
+
+        if !added.is_empty() {
+            println!("  + new MCP servers: {}", added.join(", "));
+        }
 
         Ok(())
     }

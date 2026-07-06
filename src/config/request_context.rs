@@ -5175,19 +5175,26 @@ mod tests {
 
     #[test]
     #[serial]
-    fn install_mcp_config_overwrites_existing() {
+    fn install_mcp_config_merges_existing() {
         let _guard = TestConfigDirGuard::new();
 
         Functions::install_mcp_config().unwrap();
         let mcp = paths::mcp_config_file();
         assert!(mcp.exists(), "install_mcp_config should create mcp.json");
 
-        write(&mcp, "USER_MCP_CONFIG").unwrap();
+        let custom_json =
+            r#"{"mcpServers":{"my-custom-server":{"type":"stdio","command":"custom-cmd"}}}"#;
+        write(&mcp, custom_json).unwrap();
         Functions::install_mcp_config().unwrap();
-        assert_ne!(
-            read_to_string(&mcp).unwrap(),
-            "USER_MCP_CONFIG",
-            "install_mcp_config must overwrite the existing mcp.json"
+
+        let result = read_to_string(&mcp).unwrap();
+        assert!(
+            result.contains("my-custom-server"),
+            "install_mcp_config must preserve user-added MCP servers"
+        );
+        assert!(
+            result.contains("github"),
+            "install_mcp_config must add new bundled servers"
         );
     }
 }
