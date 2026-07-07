@@ -6,6 +6,7 @@ use crate::config::paths;
 use crate::utils::{AbortSignal, abortable_run_with_spinner};
 use crate::vault::Vault;
 use crate::vault::interpolate_secrets;
+use anyhow::Error;
 use anyhow::{Context, Result, anyhow};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use http::{HeaderName, HeaderValue};
@@ -286,7 +287,8 @@ impl McpRegistry {
             Err(e) if is_auth_required_error(&e) => {
                 warn!(
                     "MCP server '{id}' requires OAuth authentication. \
-                     Run `.mcp auth {id}` in the REPL to authenticate, then restart Coyote."
+                     Run `coyote --auth-mcp {id}` or `.mcp auth {id}` in the REPL to authenticate, \
+                     then restart Coyote."
                 );
                 return Ok(None);
             }
@@ -407,8 +409,9 @@ fn merge_bearer_token(
     }
 }
 
-fn is_auth_required_error(e: &anyhow::Error) -> bool {
-    e.to_string().contains("Auth required")
+fn is_auth_required_error(e: &Error) -> bool {
+    e.chain()
+        .any(|cause| cause.to_string().contains("Auth required"))
 }
 
 async fn spawn_http_mcp_server(
