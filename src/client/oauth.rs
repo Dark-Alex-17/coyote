@@ -70,7 +70,8 @@ pub trait OAuthProvider: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthTokens {
     pub access_token: String,
-    pub refresh_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
     pub expires_at: i64,
     #[serde(default)]
     pub account_id: Option<String>,
@@ -165,10 +166,7 @@ pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> 
         .as_str()
         .ok_or_else(|| anyhow!("Missing access_token in response: {response}"))?
         .to_string();
-    let refresh_token = response["refresh_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Missing refresh_token in response: {response}"))?
-        .to_string();
+    let refresh_token = response["refresh_token"].as_str().map(|s| s.to_string());
     let expires_in = response["expires_in"]
         .as_i64()
         .ok_or_else(|| anyhow!("Missing expires_in in response: {response}"))?;
@@ -217,13 +215,19 @@ pub async fn refresh_oauth_token(
     client_name: &str,
     tokens: &OAuthTokens,
 ) -> Result<OAuthTokens> {
+    let refresh_token_val = tokens.refresh_token.as_deref().ok_or_else(|| {
+        anyhow!(
+            "No refresh token available for '{}'. Please re-authenticate.",
+            client_name
+        )
+    })?;
     let request = build_token_request(
         client,
         provider,
         &[
             ("grant_type", "refresh_token"),
             ("client_id", provider.client_id()),
-            ("refresh_token", &tokens.refresh_token),
+            ("refresh_token", refresh_token_val),
         ],
     );
 
@@ -236,7 +240,7 @@ pub async fn refresh_oauth_token(
     let refresh_token = response["refresh_token"]
         .as_str()
         .map(|s| s.to_string())
-        .unwrap_or_else(|| tokens.refresh_token.clone());
+        .or_else(|| tokens.refresh_token.clone());
     let expires_in = response["expires_in"]
         .as_i64()
         .ok_or_else(|| anyhow!("Missing expires_in in refresh response: {response}"))?;
