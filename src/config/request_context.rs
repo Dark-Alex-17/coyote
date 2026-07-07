@@ -3698,7 +3698,7 @@ mod tests {
                         cwd: None,
                         url: None,
                         headers: None,
-                        oauth_client_id: None,
+                        oauth: None,
                     },
                 );
             }

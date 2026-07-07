@@ -58,6 +58,14 @@ pub(crate) struct McpServersConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct McpOAuthConfig {
+    #[serde(rename = "clientId", skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(rename = "callbackPort", skip_serializing_if = "Option::is_none")]
+    pub callback_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpServer {
     #[serde(rename = "type")]
@@ -75,7 +83,7 @@ pub(crate) struct McpServer {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<IndexMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub oauth_client_id: Option<String>,
+    pub oauth: Option<McpOAuthConfig>,
 }
 
 impl McpServer {
@@ -110,10 +118,10 @@ impl McpServer {
                     "MCP server '{name}' is missing a \"command\" field (required for stdio transport)"
                 ));
             }
-            if self.url.is_some() || self.headers.is_some() || self.oauth_client_id.is_some() {
+            if self.url.is_some() || self.headers.is_some() || self.oauth.is_some() {
                 return Err(anyhow!(
                     "MCP server '{name}' has type \"stdio\" but also specifies remote fields \
-                     (url/headers/oauth_client_id). Remove the remote fields or change the type to \"http\" or \"sse\"."
+                     (url/headers/oauth). Remove the remote fields or change the type to \"http\" or \"sse\"."
                 ));
             }
         }
@@ -511,7 +519,7 @@ mod tests {
             cwd: None,
             url: None,
             headers: None,
-            oauth_client_id: None,
+            oauth: None,
         }
     }
 
@@ -524,7 +532,7 @@ mod tests {
             cwd: None,
             url: Some(url.to_string()),
             headers: None,
-            oauth_client_id: None,
+            oauth: None,
         }
     }
 
@@ -537,7 +545,7 @@ mod tests {
             cwd: None,
             url: Some(url.to_string()),
             headers: None,
-            oauth_client_id: None,
+            oauth: None,
         }
     }
 
@@ -569,7 +577,7 @@ mod tests {
             cwd: None,
             url: None,
             headers: None,
-            oauth_client_id: None,
+            oauth: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -587,7 +595,7 @@ mod tests {
             cwd: None,
             url: Some("http://localhost".into()),
             headers: None,
-            oauth_client_id: None,
+            oauth: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -607,7 +615,7 @@ mod tests {
             cwd: None,
             url: None,
             headers: Some(headers),
-            oauth_client_id: None,
+            oauth: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -632,7 +640,7 @@ mod tests {
             cwd: None,
             url: None,
             headers: None,
-            oauth_client_id: None,
+            oauth: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -650,7 +658,7 @@ mod tests {
             cwd: None,
             url: Some("http://localhost".into()),
             headers: None,
-            oauth_client_id: None,
+            oauth: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -668,7 +676,7 @@ mod tests {
             cwd: None,
             url: Some("http://localhost".into()),
             headers: None,
-            oauth_client_id: None,
+            oauth: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -686,7 +694,7 @@ mod tests {
             cwd: Some("/tmp".into()),
             url: Some("http://localhost".into()),
             headers: None,
-            oauth_client_id: None,
+            oauth: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -711,7 +719,7 @@ mod tests {
             cwd: None,
             url: None,
             headers: None,
-            oauth_client_id: None,
+            oauth: None,
         };
 
         let err = spec.validate("test").unwrap_err();

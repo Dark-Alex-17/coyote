@@ -132,7 +132,7 @@ mod tests {
             cwd: None,
             url: None,
             headers: None,
-            oauth_client_id: None,
+            oauth: None,
         }
     }
 
@@ -149,7 +149,7 @@ mod tests {
             cwd: None,
             url: Some(url.to_string()),
             headers,
-            oauth_client_id: None,
+            oauth: None,
         }
     }
 

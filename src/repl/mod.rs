@@ -640,9 +640,19 @@ pub async fn run_repl_command(
                                             .url
                                             .as_deref()
                                             .expect("validated: remote spec has url");
-                                        let client_id = spec.oauth_client_id.as_deref();
-                                        mcp::oauth::run_mcp_oauth_flow(server_name, url, client_id)
-                                            .await?;
+                                        let client_id = spec
+                                            .oauth
+                                            .as_ref()
+                                            .and_then(|o| o.client_id.as_deref());
+                                        let callback_port =
+                                            spec.oauth.as_ref().and_then(|o| o.callback_port);
+                                        mcp::oauth::run_mcp_oauth_flow(
+                                            server_name,
+                                            url,
+                                            client_id,
+                                            callback_port,
+                                        )
+                                        .await?;
                                         println!(
                                             "Authentication saved. \
                                              Restart Coyote to connect to '{server_name}'."

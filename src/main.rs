@@ -158,7 +158,13 @@ async fn main() -> Result<()> {
         }
 
         let url = spec.url.as_deref().expect("validated: remote spec has url");
-        mcp::oauth::run_mcp_oauth_flow(server_name, url, spec.oauth_client_id.as_deref()).await?;
+        mcp::oauth::run_mcp_oauth_flow(
+            server_name,
+            url,
+            spec.oauth.as_ref().and_then(|o| o.client_id.as_deref()),
+            spec.oauth.as_ref().and_then(|o| o.callback_port),
+        )
+        .await?;
         println!("Authentication saved. '{server_name}' is now available for use.");
 
         return Ok(());
