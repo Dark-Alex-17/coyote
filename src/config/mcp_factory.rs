@@ -1,8 +1,9 @@
 use crate::mcp::{
-    ConnectedServer, JsonField, McpServer, McpTransportType, oauth, spawn_mcp_server,
+    ConnectedServer, JsonField, McpServer, McpTransportType, is_auth_required_error, oauth,
+    spawn_mcp_server,
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::Path;
@@ -106,7 +107,18 @@ impl McpFactory {
         } else {
             None
         };
-        let handle = spawn_mcp_server(spec, log_path, bearer_token).await?;
+        let handle = spawn_mcp_server(spec, log_path, bearer_token)
+            .await
+            .map_err(|e| {
+                if is_auth_required_error(&e) {
+                    anyhow!(
+                        "MCP server '{name}' requires OAuth authentication. \
+                         Run `coyote --auth-mcp {name}` or `.mcp auth {name}` in the REPL to authenticate."
+                    )
+                } else {
+                    e
+                }
+            })?;
         self.insert_active(key, &handle);
         Ok(handle)
     }

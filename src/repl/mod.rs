@@ -653,10 +653,7 @@ pub async fn run_repl_command(
                                             callback_port,
                                         )
                                         .await?;
-                                        println!(
-                                            "Authentication saved. \
-                                             Restart Coyote to connect to '{server_name}'."
-                                        );
+                                        println!("Authentication saved.");
                                     }
                                 }
                             }

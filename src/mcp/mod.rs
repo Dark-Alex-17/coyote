@@ -287,8 +287,7 @@ impl McpRegistry {
             Err(e) if is_auth_required_error(&e) => {
                 warn!(
                     "MCP server '{id}' requires OAuth authentication. \
-                     Run `coyote --auth-mcp {id}` or `.mcp auth {id}` in the REPL to authenticate, \
-                     then restart Coyote."
+                     Run `coyote --auth-mcp {id}` or `.mcp auth {id}` in the REPL to authenticate."
                 );
                 return Ok(None);
             }
@@ -409,7 +408,7 @@ fn merge_bearer_token(
     }
 }
 
-fn is_auth_required_error(e: &Error) -> bool {
+pub(crate) fn is_auth_required_error(e: &Error) -> bool {
     e.chain()
         .any(|cause| cause.to_string().contains("Auth required"))
 }
