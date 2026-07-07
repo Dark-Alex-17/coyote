@@ -88,7 +88,7 @@ pub async fn run_mcp_oauth_flow(
     let listener = TcpListener::bind(&bind_addr)?;
     let port = listener.local_addr()?.port();
     drop(listener);
-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+    let redirect_uri = format!("http://localhost:{port}/callback");
 
     let client_id = if let Some(id) = configured_client_id {
         id.to_string()
