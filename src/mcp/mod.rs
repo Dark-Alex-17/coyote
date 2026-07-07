@@ -64,6 +64,8 @@ pub(crate) struct McpOAuthConfig {
     pub client_id: Option<String>,
     #[serde(rename = "callbackPort", skip_serializing_if = "Option::is_none")]
     pub callback_port: Option<u16>,
+    #[serde(rename = "redirectHost", skip_serializing_if = "Option::is_none")]
+    pub redirect_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

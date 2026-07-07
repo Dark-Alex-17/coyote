@@ -646,11 +646,16 @@ pub async fn run_repl_command(
                                             .and_then(|o| o.client_id.as_deref());
                                         let callback_port =
                                             spec.oauth.as_ref().and_then(|o| o.callback_port);
+                                        let redirect_host = spec
+                                            .oauth
+                                            .as_ref()
+                                            .and_then(|o| o.redirect_host.as_deref());
                                         mcp::oauth::run_mcp_oauth_flow(
                                             server_name,
                                             url,
                                             client_id,
                                             callback_port,
+                                            redirect_host,
                                         )
                                         .await?;
                                         println!("Authentication saved.");

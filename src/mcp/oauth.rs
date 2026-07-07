@@ -81,14 +81,16 @@ pub async fn run_mcp_oauth_flow(
     server_url: &str,
     configured_client_id: Option<&str>,
     callback_port: Option<u16>,
+    redirect_host: Option<&str>,
 ) -> Result<()> {
     let metadata = discover_oauth_metadata(server_url).await?;
 
+    let host = redirect_host.unwrap_or("127.0.0.1");
     let bind_addr = format!("127.0.0.1:{}", callback_port.unwrap_or(0));
     let listener = TcpListener::bind(&bind_addr)?;
     let port = listener.local_addr()?.port();
     drop(listener);
-    let redirect_uri = format!("http://localhost:{port}/callback");
+    let redirect_uri = format!("http://{host}:{port}/callback");
 
     let client_id = if let Some(id) = configured_client_id {
         id.to_string()

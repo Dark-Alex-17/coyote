@@ -163,6 +163,7 @@ async fn main() -> Result<()> {
             url,
             spec.oauth.as_ref().and_then(|o| o.client_id.as_deref()),
             spec.oauth.as_ref().and_then(|o| o.callback_port),
+            spec.oauth.as_ref().and_then(|o| o.redirect_host.as_deref()),
         )
         .await?;
         println!("Authentication saved. '{server_name}' is now available for use.");
