@@ -56,6 +56,12 @@ async fn main() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
 
+    if cli.dangerously_skip_permissions {
+        unsafe {
+            env::set_var("AUTO_CONFIRM", "true");
+        }
+    }
+
     if let Some(shell) = cli.completions {
         let mut cmd = Cli::command();
         shell.generate_completions(&mut cmd);

@@ -91,6 +91,9 @@ pub struct Cli {
     /// Disable memory for this invocation
     #[arg(long)]
     pub no_memory: bool,
+    /// Skip permission prompts by setting AUTO_CONFIRM for all tools (dangerous!)
+    #[arg(long)]
+    pub dangerously_skip_permissions: bool,
     /// Bootstrap a memory marker so coyote begins loading memory next run
     #[arg(long, value_name = "SCOPE", value_enum)]
     pub init_memory: Option<MemoryScope>,
@@ -422,6 +425,18 @@ mod tests {
     fn parse_build_tools_flag() {
         let cli = parse(&["--build-tools"]);
         assert!(cli.build_tools);
+    }
+
+    #[test]
+    fn parse_dangerously_skip_permissions_flag() {
+        let cli = parse(&["--dangerously-skip-permissions"]);
+        assert!(cli.dangerously_skip_permissions);
+    }
+
+    #[test]
+    fn parse_dangerously_skip_permissions_default_off() {
+        let cli = parse(&[]);
+        assert!(!cli.dangerously_skip_permissions);
     }
 
     #[test]
