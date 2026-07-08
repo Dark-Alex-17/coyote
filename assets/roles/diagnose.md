@@ -1,6 +1,5 @@
 ---
 name: diagnose
-temperature: 0.2
 enabled_tools:
   - execute_command
   - fs_cat
