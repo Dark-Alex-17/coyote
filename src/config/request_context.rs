@@ -16,7 +16,7 @@ use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
     FunctionDeclaration, Functions, ToolCallTracker, ToolResult, skill::SKILL_FUNCTION_PREFIX,
-    user_interaction::USER_FUNCTION_PREFIX,
+    todo::TODO_FUNCTION_PREFIX, user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
@@ -1466,7 +1466,9 @@ impl RequestContext {
                     .filter(|v| {
                         (v.name.starts_with(USER_FUNCTION_PREFIX)
                             || (!matches!(role.skills_enabled(), Some(false))
-                                && v.name.starts_with(SKILL_FUNCTION_PREFIX)))
+                                && v.name.starts_with(SKILL_FUNCTION_PREFIX))
+                            || (self.auto_continue_config().enabled
+                                && v.name.starts_with(TODO_FUNCTION_PREFIX)))
                             && !existing.contains(&v.name)
                     })
                     .cloned()
@@ -2682,9 +2684,9 @@ impl RequestContext {
             None
         };
 
+        self.use_role_obj(role)?;
         self.rebuild_tool_scope(app, mcp_servers, abort_signal)
-            .await?;
-        self.use_role_obj(role)
+            .await
     }
 
     pub async fn use_session(
