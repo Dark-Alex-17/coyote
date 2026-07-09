@@ -92,6 +92,9 @@ conversation_starters:          # Optional conversation starters for the agent
   - What is the best way to exercise?
   - How do I manage my time effectively?
 documents:                     # Optional documents to load for the agent
+                               # To enable graph-based RAG (entity/relationship extraction + knowledge graph retrieval),
+                               # set `rag_extractor_model` in your global config.yaml.
+                               # See https://github.com/Dark-Alex-17/coyote/wiki/RAG#graph-based-rag
   - git:/some/repo             # Explicitly tell Coyote to use the 'git' document loader using an absolute path
   - pdf:some-pdf-file.pdf      # Explicitly tell Coyote to use the 'pdf' document loader using a relative path
   - https://some-website.com/some-page

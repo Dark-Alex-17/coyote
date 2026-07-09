@@ -353,6 +353,15 @@ pub struct RagNode {
     pub batch_size: Option<usize>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extractor_model: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extractor_prompt: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_hops: Option<usize>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_updates: Option<HashMap<String, String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]

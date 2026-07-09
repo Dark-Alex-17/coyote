@@ -250,6 +250,9 @@ pub struct Config {
     pub rag_chunk_size: Option<usize>,
     pub rag_chunk_overlap: Option<usize>,
     pub rag_template: Option<String>,
+    pub rag_extractor_model: Option<String>,
+    pub rag_extractor_prompt: Option<String>,
+    pub rag_graph_hops: usize,
 
     #[serde(default)]
     pub document_loaders: HashMap<String, String>,
@@ -322,6 +325,9 @@ impl Default for Config {
             rag_chunk_size: None,
             rag_chunk_overlap: None,
             rag_template: None,
+            rag_extractor_model: None,
+            rag_extractor_prompt: None,
+            rag_graph_hops: 1,
 
             document_loaders: Default::default(),
 

@@ -4,8 +4,11 @@ use crate::client::*;
 use crate::config::*;
 use crate::utils::*;
 
+mod graph;
 mod serde_vectors;
 mod splitter;
+
+use self::graph::{KnowledgeGraph, extract_entities};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bm25::{Language, SearchEngine, SearchEngineBuilder};
@@ -13,6 +16,7 @@ use hnsw_rs::prelude::*;
 use indexmap::{IndexMap, IndexSet};
 use inquire::{Confirm, Select, Text, required, validator::Validation};
 use parking_lot::RwLock;
+use petgraph::graph::NodeIndex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -54,6 +58,7 @@ pub struct Rag {
     bm25: SearchEngine<DocumentId>,
     data: RagData,
     last_sources: RwLock<Option<String>>,
+    node_to_docs: IndexMap<u32, Vec<DocumentId>>,
 }
 
 impl Debug for Rag {
@@ -76,6 +81,7 @@ impl Clone for Rag {
             embedding_model: self.embedding_model.clone(),
             hnsw: self.data.build_hnsw(),
             bm25: self.data.build_bm25(),
+            node_to_docs: self.data.knowledge_graph.build_node_to_docs(),
             data: self.data.clone(),
             last_sources: RwLock::new(None),
         }
@@ -90,6 +96,16 @@ pub struct RagInitConfig {
     pub reranker_model: Option<String>,
     pub top_k: Option<usize>,
     pub batch_size: Option<usize>,
+    pub extractor_model: Option<String>,
+    pub extractor_prompt: Option<String>,
+    pub graph_hops: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GraphRagConfig {
+    pub extractor_model: Option<String>,
+    pub extractor_prompt: Option<String>,
+    pub graph_hops: Option<usize>,
 }
 
 impl Rag {
@@ -199,6 +215,17 @@ impl Rag {
             reranker_model,
             top_k,
             batch_size,
+            GraphRagConfig {
+                extractor_model: config
+                    .extractor_model
+                    .clone()
+                    .or_else(|| app.rag_extractor_model.clone()),
+                extractor_prompt: config
+                    .extractor_prompt
+                    .clone()
+                    .or_else(|| app.rag_extractor_prompt.clone()),
+                graph_hops: Some(config.graph_hops.unwrap_or(app.rag_graph_hops)),
+            },
         ))
     }
 
@@ -216,6 +243,16 @@ impl Rag {
         let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(app)?;
         let reranker_model = app.rag_reranker_model.clone();
         let top_k = app.rag_top_k;
+        let extractor_model = match app.rag_extractor_model.clone() {
+            Some(model) => Some(model),
+            None => select_extractor_model(app)?,
+        };
+        let graph_hops = if extractor_model.is_some() {
+            set_graph_hops(app.rag_graph_hops)?
+        } else {
+            app.rag_graph_hops
+        };
+        let extractor_prompt = app.rag_extractor_prompt.clone();
         let data = RagData::new(
             embedding_model.id(),
             chunk_size,
@@ -223,6 +260,11 @@ impl Rag {
             reranker_model,
             top_k,
             embedding_model.max_batch_size(),
+            GraphRagConfig {
+                extractor_model,
+                extractor_prompt,
+                graph_hops: Some(graph_hops),
+            },
         );
         let mut rag = Self::create(app, name, save_path, data)?;
         let mut paths = doc_paths.to_vec();
@@ -253,6 +295,7 @@ impl Rag {
     pub fn create(app: &AppConfig, name: &str, path: &Path, data: RagData) -> Result<Self> {
         let hnsw = data.build_hnsw();
         let bm25 = data.build_bm25();
+        let node_to_docs = data.knowledge_graph.build_node_to_docs();
         let embedding_model =
             Model::retrieve_model(app, &data.embedding_model, ModelType::Embedding)?;
         let rag = Rag {
@@ -263,6 +306,7 @@ impl Rag {
             embedding_model,
             hnsw,
             bm25,
+            node_to_docs,
             last_sources: RwLock::new(None),
         };
         Ok(rag)
@@ -413,6 +457,9 @@ impl Rag {
             "chunk_size": self.data.chunk_size,
             "chunk_overlap": self.data.chunk_overlap,
             "reranker_model": self.data.reranker_model,
+            "extractor_model": self.data.extractor_model,
+            "extractor_prompt": self.data.extractor_prompt,
+            "graph_hops": self.data.graph_hops.unwrap_or(1),
             "top_k": self.data.top_k,
             "batch_size": self.data.batch_size,
             "document_paths": self.data.document_paths,
@@ -673,13 +720,18 @@ impl Rag {
         let mut files = vec![];
         let mut document_ids = vec![];
         let mut embeddings = vec![];
+        let mut new_doc_contents: Vec<(DocumentId, String)> = vec![];
 
         if !rag_files.is_empty() {
             let mut texts = vec![];
             for file in rag_files.into_iter() {
                 for (document_index, document) in file.documents.iter().enumerate() {
-                    document_ids.push(DocumentId::new(next_file_id, document_index));
-                    texts.push(document.page_content.clone())
+                    let doc_id = DocumentId::new(next_file_id, document_index);
+                    document_ids.push(doc_id);
+                    texts.push(document.page_content.clone());
+                    if self.data.extractor_model.is_some() {
+                        new_doc_contents.push((doc_id, document.page_content.clone()));
+                    }
                 }
                 files.push((next_file_id, file));
                 next_file_id += 1;
@@ -700,9 +752,43 @@ impl Rag {
             bail!("No RAG files");
         }
 
+        if self.data.extractor_model.is_some()
+            && !new_doc_contents.is_empty()
+            && let Some(extractor_model_id) = self.data.extractor_model.clone()
+        {
+            match Model::retrieve_model(&self.app_config, &extractor_model_id, ModelType::Chat) {
+                Ok(model) => match self.create_embeddings_client(model) {
+                    Ok(client) => {
+                        let total = new_doc_contents.len();
+                        for (i, (doc_id, content)) in new_doc_contents.into_iter().enumerate() {
+                            progress(
+                                &spinner,
+                                format!("Extracting entities [{}/{}]", i + 1, total),
+                            );
+                            match extract_entities(
+                                client.as_ref(),
+                                &content,
+                                self.data.extractor_prompt.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(result) => self.data.knowledge_graph.merge(doc_id, result),
+                                Err(e) => {
+                                    debug!("Entity extraction failed for doc {doc_id:?}: {e}")
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => debug!("Failed to create extractor client: {e}"),
+                },
+                Err(e) => debug!("Extractor model not found: {e}"),
+            }
+        }
+
         progress(&spinner, "Building store".into());
         self.hnsw = self.data.build_hnsw();
         self.bm25 = self.data.build_bm25();
+        self.node_to_docs = self.data.knowledge_graph.build_node_to_docs();
 
         Ok(())
     }
@@ -755,11 +841,21 @@ impl Rag {
                 ids
             }
             None => {
-                let ids = reciprocal_rank_fusion(
-                    vec![vector_search_ids, keyword_search_ids],
-                    vec![1.125, 1.0],
-                    top_k,
-                );
+                let ids = if self.data.extractor_model.is_some() {
+                    let graph_ids = self.graph_search(query, top_k);
+                    debug!("graph_search_ids: {graph_ids:?}");
+                    reciprocal_rank_fusion(
+                        vec![vector_search_ids, keyword_search_ids, graph_ids],
+                        vec![1.125, 1.0, 0.9],
+                        top_k,
+                    )
+                } else {
+                    reciprocal_rank_fusion(
+                        vec![vector_search_ids, keyword_search_ids],
+                        vec![1.125, 1.0],
+                        top_k,
+                    )
+                };
                 debug!("rrf_ids: {ids:?}");
                 ids
             }
@@ -827,6 +923,93 @@ impl Rag {
             })
             .collect();
         Ok(output)
+    }
+
+    fn graph_search(&self, query: &str, top_k: usize) -> Vec<DocumentId> {
+        let kg = &self.data.knowledge_graph;
+        if kg.entity_index.is_empty() {
+            return vec![];
+        }
+        let query_lower = query.to_lowercase();
+
+        let mut seed_nodes: Vec<u32> = kg
+            .entity_index
+            .iter()
+            .filter(|(name, _)| {
+                let name_str = name.as_str();
+                if name_str.contains(' ') {
+                    query_lower.contains(name_str)
+                } else {
+                    // whole-word match: prevents "go" from seeding on every query containing "Django"
+                    query_lower
+                        .split_whitespace()
+                        .any(|token| token.trim_matches(|c: char| !c.is_alphanumeric()) == name_str)
+                }
+            })
+            .map(|(_, &raw)| raw)
+            .collect();
+
+        if seed_nodes.is_empty() {
+            let bm25_results = self.bm25.search(query, top_k * 2);
+            'outer: for result in bm25_results {
+                if let Some(node_raws) = kg.document_entities.get(&result.document.id.0) {
+                    seed_nodes.extend(node_raws.iter().copied());
+                    if seed_nodes.len() >= top_k {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        if seed_nodes.is_empty() {
+            return vec![];
+        }
+
+        let hops = self.data.graph_hops.unwrap_or(1);
+        let expanded = kg.expand_neighbors(&seed_nodes, hops);
+
+        let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
+        let token_count = query_tokens.len().max(1);
+        let mut scored: Vec<(u32, f32)> = expanded
+            .into_iter()
+            .map(|raw| {
+                let idx = NodeIndex::new(raw as usize);
+                let score = if kg.graph.contains_node(idx) {
+                    let entity = &kg.graph[idx];
+                    let combined = format!(
+                        "{} {}",
+                        entity.name,
+                        entity.description.as_deref().unwrap_or("")
+                    )
+                    .to_lowercase();
+                    query_tokens
+                        .iter()
+                        .filter(|t| combined.contains(*t))
+                        .count() as f32
+                        / token_count as f32
+                } else {
+                    0.0
+                };
+                (raw, score)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+        let mut result_ids: IndexSet<DocumentId> = IndexSet::new();
+        for (raw, _) in scored {
+            if let Some(doc_ids) = self.node_to_docs.get(&raw) {
+                for &doc_id in doc_ids {
+                    result_ids.insert(doc_id);
+                    if result_ids.len() >= top_k {
+                        break;
+                    }
+                }
+            }
+            if result_ids.len() >= top_k {
+                break;
+            }
+        }
+        result_ids.into_iter().collect()
     }
 
     async fn create_embeddings(
@@ -902,6 +1085,14 @@ pub struct RagData {
     pub files: IndexMap<FileId, RagFile>,
     #[serde(with = "serde_vectors")]
     pub vectors: IndexMap<DocumentId, Vec<f32>>,
+    #[serde(default)]
+    pub extractor_model: Option<String>,
+    #[serde(default)]
+    pub extractor_prompt: Option<String>,
+    #[serde(default)]
+    pub graph_hops: Option<usize>,
+    #[serde(default)]
+    pub knowledge_graph: KnowledgeGraph,
 }
 
 impl Debug for RagData {
@@ -916,6 +1107,9 @@ impl Debug for RagData {
             .field("next_file_id", &self.next_file_id)
             .field("document_paths", &self.document_paths)
             .field("files", &self.files)
+            .field("extractor_model", &self.extractor_model)
+            .field("extractor_prompt", &self.extractor_prompt)
+            .field("graph_hops", &self.graph_hops)
             .finish()
     }
 }
@@ -928,6 +1122,7 @@ impl RagData {
         reranker_model: Option<String>,
         top_k: usize,
         batch_size: Option<usize>,
+        graph: GraphRagConfig,
     ) -> Self {
         Self {
             embedding_model,
@@ -940,6 +1135,10 @@ impl RagData {
             document_paths: Default::default(),
             files: Default::default(),
             vectors: Default::default(),
+            extractor_model: graph.extractor_model,
+            extractor_prompt: graph.extractor_prompt,
+            graph_hops: graph.graph_hops,
+            knowledge_graph: KnowledgeGraph::default(),
         }
     }
 
@@ -951,14 +1150,17 @@ impl RagData {
     }
 
     pub fn del(&mut self, file_ids: Vec<FileId>) {
+        let mut graph_doc_ids = vec![];
         for file_id in file_ids {
             if let Some(file) = self.files.swap_remove(&file_id) {
                 for (document_index, _) in file.documents.iter().enumerate() {
                     let document_id = DocumentId::new(file_id, document_index);
                     self.vectors.swap_remove(&document_id);
+                    graph_doc_ids.push(document_id);
                 }
             }
         }
+        self.knowledge_graph.remove_documents(&graph_doc_ids);
     }
 
     pub fn add(
@@ -1055,29 +1257,70 @@ impl DocumentId {
 }
 
 fn select_embedding_model(models: &[&Model]) -> Result<String> {
+    let max_width = models.iter().map(|v| v.id().len()).max().unwrap_or(0);
     let models: Vec<_> = models
         .iter()
-        .map(|v| SelectOption::new(v.id(), v.description()))
+        .map(|v| SelectOption::new(v.id(), v.description(), max_width))
         .collect();
-    let result = Select::new("Select embedding model:", models).prompt()?;
+    let result = Select::new("Select embedding model:", models)
+        .with_formatter(&|opt| opt.value.value.clone())
+        .prompt()?;
     Ok(result.value)
+}
+
+const EXTRACTOR_SKIP: &str = "Skip";
+
+fn select_extractor_model(app: &AppConfig) -> Result<Option<String>> {
+    let models = list_models(app, ModelType::Chat);
+    if models.is_empty() {
+        return Ok(None);
+    }
+    let pad = models
+        .iter()
+        .map(|v| v.id().len())
+        .max()
+        .unwrap_or(0)
+        .max(EXTRACTOR_SKIP.len());
+    let mut options = vec![SelectOption::new(
+        EXTRACTOR_SKIP.to_string(),
+        "vector + full text search only (no graph)".to_string(),
+        pad,
+    )];
+    options.extend(
+        models
+            .iter()
+            .map(|v| SelectOption::new(v.id(), v.description(), pad)),
+    );
+    let result = Select::new("Extractor model for graph-based RAG (optional):", options)
+        .with_formatter(&|opt| opt.value.value.clone())
+        .prompt()?;
+    Ok(if result.value == EXTRACTOR_SKIP {
+        None
+    } else {
+        Some(result.value)
+    })
 }
 
 #[derive(Debug)]
 struct SelectOption {
     pub value: String,
-    pub description: String,
+    pub display: String,
 }
 
 impl SelectOption {
-    pub fn new(value: String, description: String) -> Self {
-        Self { value, description }
+    pub fn new(value: String, description: String, pad: usize) -> Self {
+        let display = if description.is_empty() {
+            format!("{value:<pad$}")
+        } else {
+            format!("{value:<pad$} ({description})")
+        };
+        Self { value, display }
     }
 }
 
 impl fmt::Display for SelectOption {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({})", self.value, self.description)
+        write!(f, "{}", self.display)
     }
 }
 
@@ -1101,6 +1344,21 @@ fn set_chunk_size(model: &Model) -> Result<usize> {
     }
     let value = text.prompt()?;
     value.parse().map_err(|_| anyhow!("Invalid chunk_size"))
+}
+
+fn set_graph_hops(default_value: usize) -> Result<usize> {
+    let value = Text::new("Set graph expansion hops:")
+        .with_default(&default_value.to_string())
+        .with_help_message("Number of hops to expand from matched entities (1 = direct neighbors, 2 = neighbors of neighbors)")
+        .with_validator(move |text: &str| {
+            let out = match text.parse::<usize>() {
+                Ok(v) if v >= 1 => Validation::Valid,
+                _ => Validation::Invalid("Must be an integer >= 1".into()),
+            };
+            Ok(out)
+        })
+        .prompt()?;
+    value.parse().map_err(|_| anyhow!("Invalid graph_hops"))
 }
 
 fn set_chunk_overlay(default_value: usize) -> Result<usize> {
@@ -1277,7 +1535,15 @@ mod tests {
 
     #[test]
     fn rag_data_new_defaults() {
-        let data = RagData::new("model".into(), 1000, 20, None, 5, None);
+        let data = RagData::new(
+            "model".into(),
+            1000,
+            20,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
         assert_eq!(data.embedding_model, "model");
         assert_eq!(data.chunk_size, 1000);
         assert_eq!(data.chunk_overlap, 20);
@@ -1291,7 +1557,15 @@ mod tests {
 
     #[test]
     fn rag_data_get_returns_document() {
-        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let mut data = RagData::new(
+            "m".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
         let file = RagFile {
             hash: "abc".into(),
             path: "test.txt".into(),
@@ -1308,13 +1582,29 @@ mod tests {
 
     #[test]
     fn rag_data_get_returns_none_for_missing_file() {
-        let data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let data = RagData::new(
+            "m".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
         assert!(data.get(DocumentId::new(99, 0)).is_none());
     }
 
     #[test]
     fn rag_data_get_returns_none_for_missing_document() {
-        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let mut data = RagData::new(
+            "m".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
         let file = RagFile {
             hash: "abc".into(),
             path: "test.txt".into(),
@@ -1326,7 +1616,15 @@ mod tests {
 
     #[test]
     fn rag_data_del_removes_files_and_vectors() {
-        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let mut data = RagData::new(
+            "m".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
         let file = RagFile {
             hash: "abc".into(),
             path: "test.txt".into(),
@@ -1347,14 +1645,30 @@ mod tests {
 
     #[test]
     fn rag_data_del_nonexistent_is_noop() {
-        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let mut data = RagData::new(
+            "m".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
         data.del(vec![99]);
         assert!(data.files.is_empty());
     }
 
     #[test]
     fn rag_data_add_inserts_files_and_vectors() {
-        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let mut data = RagData::new(
+            "m".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
         let file = RagFile {
             hash: "xyz".into(),
             path: "new.txt".into(),
@@ -1414,7 +1728,15 @@ mod tests {
 
     #[test]
     fn rag_data_build_bm25_empty() {
-        let data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let data = RagData::new(
+            "m".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
         let engine = data.build_bm25();
         let results = engine.search("anything", 5);
         assert!(results.is_empty());
@@ -1422,7 +1744,15 @@ mod tests {
 
     #[test]
     fn rag_data_build_bm25_finds_documents() {
-        let mut data = RagData::new("m".into(), 100, 10, None, 5, None);
+        let mut data = RagData::new(
+            "m".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
         let file = RagFile {
             hash: "h".into(),
             path: "test.txt".into(),

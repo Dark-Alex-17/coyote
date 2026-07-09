@@ -74,6 +74,9 @@ pub struct AppConfig {
     pub rag_chunk_size: Option<usize>,
     pub rag_chunk_overlap: Option<usize>,
     pub rag_template: Option<String>,
+    pub rag_extractor_model: Option<String>,
+    pub rag_extractor_prompt: Option<String>,
+    pub rag_graph_hops: usize,
 
     #[serde(default)]
     pub document_loaders: HashMap<String, String>,
@@ -146,6 +149,9 @@ impl Default for AppConfig {
             rag_chunk_size: None,
             rag_chunk_overlap: None,
             rag_template: None,
+            rag_extractor_model: None,
+            rag_extractor_prompt: None,
+            rag_graph_hops: 1,
 
             document_loaders: Default::default(),
 
@@ -219,6 +225,9 @@ impl AppConfig {
             rag_chunk_size: config.rag_chunk_size,
             rag_chunk_overlap: config.rag_chunk_overlap,
             rag_template: config.rag_template,
+            rag_extractor_model: config.rag_extractor_model,
+            rag_extractor_prompt: config.rag_extractor_prompt,
+            rag_graph_hops: config.rag_graph_hops,
 
             document_loaders: config.document_loaders,
 
@@ -511,6 +520,15 @@ impl AppConfig {
         }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("rag_template")) {
             self.rag_template = v;
+        }
+        if let Some(v) = super::read_env_value::<String>(&get_env_name("rag_extractor_model")) {
+            self.rag_extractor_model = v;
+        }
+        if let Some(v) = super::read_env_value::<String>(&get_env_name("rag_extractor_prompt")) {
+            self.rag_extractor_prompt = v;
+        }
+        if let Some(v) = super::read_env_value::<usize>(&get_env_name("rag_graph_hops")) {
+            self.rag_graph_hops = v.unwrap_or(1);
         }
 
         if let Ok(v) = env::var(get_env_name("document_loaders"))

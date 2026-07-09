@@ -921,6 +921,9 @@ async fn init_graph_rags(
                 reranker_model: rag_node.reranker_model.clone(),
                 top_k: rag_node.top_k,
                 batch_size: rag_node.batch_size,
+                extractor_model: rag_node.extractor_model.clone(),
+                extractor_prompt: rag_node.extractor_prompt.clone(),
+                graph_hops: rag_node.graph_hops,
             };
             let fully_specified = config.embedding_model.is_some()
                 && config.chunk_size.is_some()
