@@ -25,6 +25,8 @@ use std::{
 };
 use tokio::time::sleep;
 
+const BM25_SEED_SCORE: f32 = 0.5;
+
 const RAG_TEMPLATE: &str = r#"Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
 
 <context>
@@ -752,14 +754,14 @@ impl Rag {
             bail!("No RAG files");
         }
 
-        if self.data.extractor_model.is_some()
-            && !new_doc_contents.is_empty()
+        if !new_doc_contents.is_empty()
             && let Some(extractor_model_id) = self.data.extractor_model.clone()
         {
             match Model::retrieve_model(&self.app_config, &extractor_model_id, ModelType::Chat) {
                 Ok(model) => match self.create_embeddings_client(model) {
                     Ok(client) => {
                         let total = new_doc_contents.len();
+                        let mut failures = 0usize;
                         for (i, (doc_id, content)) in new_doc_contents.into_iter().enumerate() {
                             progress(
                                 &spinner,
@@ -774,14 +776,21 @@ impl Rag {
                             {
                                 Ok(result) => self.data.knowledge_graph.merge(doc_id, result),
                                 Err(e) => {
-                                    debug!("Entity extraction failed for doc {doc_id:?}: {e}")
+                                    warn!("Entity extraction failed for doc {doc_id:?}: {e}");
+                                    failures += 1;
                                 }
                             }
                         }
+                        if failures > 0 {
+                            progress(
+                                &spinner,
+                                format!("Entity extraction: {failures}/{total} chunks failed"),
+                            );
+                        }
                     }
-                    Err(e) => debug!("Failed to create extractor client: {e}"),
+                    Err(e) => warn!("Failed to create extractor client: {e}"),
                 },
-                Err(e) => debug!("Extractor model not found: {e}"),
+                Err(e) => warn!("Extractor model not found: {e}"),
             }
         }
 
@@ -930,10 +939,31 @@ impl Rag {
         if kg.entity_index.is_empty() {
             return vec![];
         }
-        
-        let query_lower = query.to_lowercase();
 
-        let mut seed_nodes: Vec<u32> = kg
+        let query_lower = query.to_lowercase();
+        let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
+        let token_count = query_tokens.len().max(1);
+
+        let score_node = |raw: u32| -> f32 {
+            let idx = NodeIndex::new(raw as usize);
+            if !kg.graph.contains_node(idx) {
+                return 0.0;
+            }
+            let entity = &kg.graph[idx];
+            let combined = format!(
+                "{} {}",
+                entity.name,
+                entity.description.as_deref().unwrap_or("")
+            )
+            .to_lowercase();
+            query_tokens
+                .iter()
+                .filter(|t| combined.contains(*t))
+                .count() as f32
+                / token_count as f32
+        };
+
+        let mut seed_scores: Vec<(u32, f32)> = kg
             .entity_index
             .iter()
             .filter(|(name, _)| {
@@ -947,52 +977,31 @@ impl Rag {
                         .any(|token| token.trim_matches(|c: char| !c.is_alphanumeric()) == name_str)
                 }
             })
-            .map(|(_, &raw)| raw)
+            .map(|(_, &raw)| (raw, score_node(raw).max(BM25_SEED_SCORE)))
             .collect();
 
-        if seed_nodes.is_empty() {
+        if seed_scores.is_empty() {
             let bm25_results = self.bm25.search(query, top_k * 2);
             'outer: for result in bm25_results {
                 if let Some(node_raws) = kg.document_entities.get(&result.document.id.0) {
-                    seed_nodes.extend(node_raws.iter().copied());
-                    if seed_nodes.len() >= top_k {
-                        break 'outer;
+                    for &raw in node_raws {
+                        seed_scores.push((raw, BM25_SEED_SCORE));
+                        if seed_scores.len() >= top_k {
+                            break 'outer;
+                        }
                     }
                 }
             }
         }
 
-        if seed_nodes.is_empty() {
+        if seed_scores.is_empty() {
             return vec![];
         }
 
         let hops = self.data.graph_hops.unwrap_or(1);
-        let expanded = kg.expand_neighbors(&seed_nodes, hops);
-
-        let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
-        let token_count = query_tokens.len().max(1);
-        let mut scored: Vec<(u32, f32)> = expanded
+        let mut scored: Vec<(u32, f32)> = kg
+            .expand_neighbors_scored(&seed_scores, hops)
             .into_iter()
-            .map(|raw| {
-                let idx = NodeIndex::new(raw as usize);
-                let score = if kg.graph.contains_node(idx) {
-                    let entity = &kg.graph[idx];
-                    let combined = format!(
-                        "{} {}",
-                        entity.name,
-                        entity.description.as_deref().unwrap_or("")
-                    )
-                    .to_lowercase();
-                    query_tokens
-                        .iter()
-                        .filter(|t| combined.contains(*t))
-                        .count() as f32
-                        / token_count as f32
-                } else {
-                    0.0
-                };
-                (raw, score)
-            })
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
@@ -1350,11 +1359,11 @@ fn set_chunk_size(model: &Model) -> Result<usize> {
 fn set_graph_hops(default_value: usize) -> Result<usize> {
     let value = Text::new("Set graph expansion hops:")
         .with_default(&default_value.to_string())
-        .with_help_message("Number of hops to expand from matched entities (1 = direct neighbors, 2 = neighbors of neighbors)")
+        .with_help_message("Number of hops to expand from matched entities (0 = seed nodes only, 1 = direct neighbors, 2 = neighbors of neighbors)")
         .with_validator(move |text: &str| {
             let out = match text.parse::<usize>() {
-                Ok(v) if v >= 1 => Validation::Valid,
-                _ => Validation::Invalid("Must be an integer >= 1".into()),
+                Ok(_) => Validation::Valid,
+                _ => Validation::Invalid("Must be a non-negative integer".into()),
             };
             Ok(out)
         })
