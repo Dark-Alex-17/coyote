@@ -5,7 +5,7 @@
 #   sbx cp $HOME/.config/coyote/ testing:/home/agent/.config/
 #   sbx cp $HOME/.coyote_password testing:/home/agent/
 #   sbx run testing --kit ./sbx-kit/
-schemaVersion: "1"
+schemaVersion: '1'
 kind: sandbox
 name: coyote
 displayName: Coyote
@@ -14,10 +14,10 @@ description: >
   CLI & REPL mode, RAG, AI tools & agents, MCP servers, skills, and macros.
 
 sandbox:
-  image: "docker/sandbox-templates:shell-docker"
+  image: 'docker/sandbox-templates:shell-docker'
   aiFilename: COYOTE.md
   entrypoint:
-    run: ["bash", "-lc", "exec /home/agent/.cargo/bin/coyote"]
+    run: ['bash', '-lc', 'exec /home/agent/.cargo/bin/coyote']
 
 network:
   # Proxy-managed LLM providers: the proxy substitutes `proxy-managed` for
@@ -50,96 +50,96 @@ network:
   serviceAuth:
     openai:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     anthropic:
       headerName: x-api-key
-      valueFormat: "%s"
+      valueFormat: '%s'
     gemini:
       headerName: x-goog-api-key
-      valueFormat: "%s"
+      valueFormat: '%s'
     cohere:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     groq:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     openrouter:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     ai21:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     cloudflare:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     deepinfra:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     deepseek:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     mistral:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     perplexity:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     voyageai:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     xai:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     jina:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     ernie:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     hunyuan:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     minimax:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     moonshot:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     qianwen:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
     zhipuai:
       headerName: Authorization
-      valueFormat: "Bearer %s"
+      valueFormat: 'Bearer %s'
   allowedDomains:
     # Coyote release + self-update + model-registry sync
-    - "github.com:443"
-    - "api.github.com:443"
-    - "raw.githubusercontent.com:443"
-    - "objects.githubusercontent.com:443"
-    - "*.githubusercontent.com:443"
+    - 'github.com:443'
+    - 'api.github.com:443'
+    - 'raw.githubusercontent.com:443'
+    - 'objects.githubusercontent.com:443'
+    - '*.githubusercontent.com:443'
     # Coyote install paths (cargo install + uv + rustup + Python tool deps at runtime)
-    - "crates.io:443"
-    - "static.crates.io:443"
-    - "pypi.org:443"
-    - "files.pythonhosted.org:443"
-    - "astral.sh:443"
-    - "sh.rustup.rs:443"
-    - "static.rust-lang.org:443"
+    - 'crates.io:443'
+    - 'static.crates.io:443'
+    - 'pypi.org:443'
+    - 'files.pythonhosted.org:443'
+    - 'astral.sh:443'
+    - 'sh.rustup.rs:443'
+    - 'static.rust-lang.org:443'
 
     # LLM model OAuth + API endpoints
-    - "claude.ai:443"
-    - "console.anthropic.com:443"
-    - "accounts.google.com:443"
+    - 'claude.ai:443'
+    - 'console.anthropic.com:443'
+    - 'accounts.google.com:443'
     # *.googleapis.com covers oauth2 + userinfo + VertexAI regional endpoints
     # (*-aiplatform.googleapis.com). Do not narrow without re-checking VertexAI.
-    - "*.googleapis.com:443"
+    - '*.googleapis.com:443'
 
     # Bedrock and GitHub Models use signed / GitHub-PAT auth that the proxy
     # cannot rewrite. Domains are allow-listed; credentials must be injected
     # separately (see README "Extending").
-    - "*.amazonaws.com:443"
-    - "models.inference.ai.azure.com:443"
+    - '*.amazonaws.com:443'
+    - 'models.inference.ai.azure.com:443'
 
 credentials:
   sources:
@@ -210,9 +210,10 @@ credentials:
 
 environment:
   variables:
-    IS_SANDBOX: "1"
+    IS_SANDBOX: '1'
     COYOTE_LOG_LEVEL: INFO
     COYOTE_CONFIG_DIR: /home/agent/.config/coyote
+    EDITOR: nano
   proxyManaged:
     - OPENAI_API_KEY
     - ANTHROPIC_API_KEY
@@ -249,8 +250,9 @@ commands:
           musl-tools \
           libssl-dev \
           pandoc \
-          bzip2
-      user: "1000"
+          bzip2 \
+          nano
+      user: '1000'
       description: Install system prerequisites (including pandoc for fetch_url_via_curl)
     - command: |
         curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -258,7 +260,7 @@ commands:
           printf '#!/bin/sh\nexec uv tool run "$@"\n' > "$HOME/.local/bin/uvx"
           chmod +x "$HOME/.local/bin/uvx"
         fi
-      user: "1000"
+      user: '1000'
       description: Install uv and write a uvx shell wrapper (the installer may place a macOS binary at this path on Docker-for-Mac hosts, which the Linux container cannot execute)
     - command: |
         set -euo pipefail
@@ -274,7 +276,7 @@ commands:
         curl -fsSL --retry 3 "https://github.com/xo/usql/releases/download/v${USQL_VERSION}/usql_static-${USQL_VERSION}-linux-${USQL_ARCH}.tar.bz2" -o "$TMPDIR/usql.tar.bz2"
         tar -xjf "$TMPDIR/usql.tar.bz2" -C "$TMPDIR"
         sudo install -m 0755 "$TMPDIR/usql_static" /usr/local/bin/usql
-      user: "1000"
+      user: '1000'
       description: Install the usql universal SQL CLI (used by the built-in sql agent and execute_sql_code tool)
     - command: |
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -284,27 +286,27 @@ commands:
           --target x86_64-unknown-linux-musl
         . "$HOME/.cargo/env"
         cargo install --locked coyote-ai
-      user: "1000"
+      user: '1000'
       description: Install Coyote AI CLI via Rust's Cargo
     - command: |
         . "$HOME/.cargo/env"
         cargo install --locked iwec
-      user: "1000"
+      user: '1000'
       description: Install the IWE MCP server binary (iwec) used by the built-in iwe MCP server and iwe-knowledge-base skill
     - command: |
         . "$HOME/.cargo/env"
         cargo install --locked ast-grep
-      user: "1000"
+      user: '1000'
       description: Install ast-grep, used by the built-in ast_grep structural code search tool (and the explore agent)
 
   startup:
     - command:
         [
-          "sh",
-          "-c",
+          'sh',
+          '-c',
           'test -f "$HOME/.config/coyote/config.yaml" || coyote --info >/dev/null 2>&1 || true',
         ]
-      user: "1000"
+      user: '1000'
       background: false
       description: Bootstrap Coyote config directory on first sandbox start
 
