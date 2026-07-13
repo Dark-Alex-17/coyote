@@ -43,6 +43,10 @@ use std::io::{Read, stdin};
 	),
 )]
 pub struct Cli {
+    /// Input text
+    #[arg(trailing_var_arg = true)]
+    text: Vec<String>,
+
     /// Select a LLM model
     #[arg(short, long, add = ArgValueCompleter::new(model_completer))]
     pub model: Option<String>,
@@ -52,30 +56,6 @@ pub struct Cli {
     /// Select a role
     #[arg(short, long, add = ArgValueCompleter::new(role_completer))]
     pub role: Option<String>,
-    /// Start or join a session
-    #[arg(short = 's', long, add = ArgValueCompleter::new(session_completer))]
-    pub session: Option<Option<String>>,
-    /// Ensure the session is empty
-    #[arg(long)]
-    pub empty_session: bool,
-    /// Ensure the new conversation is saved to the session
-    #[arg(long)]
-    pub save_session: bool,
-    /// Start an agent
-    #[arg(short = 'a', long, add = ArgValueCompleter::new(agent_completer))]
-    pub agent: Option<String>,
-    /// Set agent variables
-    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2)]
-    pub agent_variable: Vec<String>,
-    /// Start a RAG
-    #[arg(long, add = ArgValueCompleter::new(rag_completer))]
-    pub rag: Option<String>,
-    /// Rebuild the RAG to sync document changes
-    #[arg(long)]
-    pub rebuild_rag: bool,
-    /// Execute a macro
-    #[arg(long = "macro", value_name = "MACRO", add = ArgValueCompleter::new(macro_completer))]
-    pub macro_name: Option<String>,
     /// Execute commands in natural language
     #[arg(short = 'e', long)]
     pub execute: bool,
@@ -88,116 +68,176 @@ pub struct Cli {
     /// Turn off stream mode
     #[arg(short = 'S', long)]
     pub no_stream: bool,
+    /// Display the message without sending it
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Disable loading workspace MCP servers from .coyote/mcp.json
+    #[arg(long)]
+    pub no_workspace_mcp: bool,
     /// Disable memory for this invocation
     #[arg(long)]
     pub no_memory: bool,
     /// Skip permission prompts by setting AUTO_CONFIRM for all tools (dangerous!)
     #[arg(long)]
     pub dangerously_skip_permissions: bool,
+
+    /// Start or join a session
+    #[arg(short = 's', long, help_heading = "Session & Memory", add = ArgValueCompleter::new(session_completer))]
+    pub session: Option<Option<String>>,
+    /// Ensure the session is empty
+    #[arg(long, help_heading = "Session & Memory")]
+    pub empty_session: bool,
+    /// Ensure the new conversation is saved to the session
+    #[arg(long, help_heading = "Session & Memory")]
+    pub save_session: bool,
     /// Bootstrap a memory marker so coyote begins loading memory next run
-    #[arg(long, value_name = "SCOPE", value_enum)]
+    #[arg(
+        long,
+        value_name = "SCOPE",
+        value_enum,
+        help_heading = "Session & Memory"
+    )]
     pub init_memory: Option<MemoryScope>,
-    /// Display the message without sending it
-    #[arg(long)]
-    pub dry_run: bool,
-    /// Display information
-    #[arg(long)]
-    pub info: bool,
-    /// Build all configured Bash tool scripts
-    #[arg(long)]
-    pub build_tools: bool,
-    /// Reinstall bundled assets, overwriting any local changes
-    #[arg(long, value_name = "CATEGORY", value_enum)]
-    pub install: Option<AssetCategory>,
-    /// Install assets from a remote git repository (URL may be suffixed with #<ref>)
-    #[arg(long, value_name = "GIT_URL")]
-    pub install_from: Option<String>,
-    /// Restrict --install-from to a single asset category
-    #[arg(long, value_name = "CATEGORY", value_enum, requires = "install_from")]
-    pub filter: Option<InstallFilter>,
-    /// Overwrite all conflicts without prompting (used with --install-from)
-    #[arg(long, requires = "install_from")]
-    pub install_force: bool,
-    /// Sync models updates
-    #[arg(long)]
-    pub sync_models: bool,
-    /// List all available chat models
-    #[arg(long)]
-    pub list_models: bool,
-    /// List all roles
-    #[arg(long)]
-    pub list_roles: bool,
-    /// List all sessions
-    #[arg(long)]
-    pub list_sessions: bool,
-    /// List all agents
-    #[arg(long)]
-    pub list_agents: bool,
-    /// List all RAGs
-    #[arg(long)]
-    pub list_rags: bool,
-    /// List all macros
-    #[arg(long)]
-    pub list_macros: bool,
-    /// List all installed skills
-    #[arg(long)]
-    pub list_skills: bool,
     /// Pre-load an existing skill into the session (repeatable). If a single
     /// `--skill <NAME>` is given and the skill doesn't exist, opens $EDITOR
     /// with a scaffold to create it.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", help_heading = "Session & Memory")]
     pub skill: Vec<String>,
-    /// Input text
-    #[arg(trailing_var_arg = true)]
-    text: Vec<String>,
-    /// Tail logs
-    #[arg(long)]
-    pub tail_logs: bool,
-    /// Disable colored log output
-    #[arg(long, requires = "tail_logs")]
-    pub disable_log_colors: bool,
-    /// Add a secret to the Coyote vault
-    #[arg(long, value_name = "SECRET_NAME", exclusive = true)]
-    pub add_secret: Option<String>,
-    /// Decrypt a secret from the Coyote vault and print the plaintext
-    #[arg(long, value_name = "SECRET_NAME", exclusive = true, add = ArgValueCompleter::new(secrets_completer))]
-    pub get_secret: Option<String>,
-    /// Update an existing secret in the Coyote vault
-    #[arg(long, value_name = "SECRET_NAME", exclusive = true, add = ArgValueCompleter::new(secrets_completer))]
-    pub update_secret: Option<String>,
-    /// Delete a secret from the Coyote vault
-    #[arg(long, value_name = "SECRET_NAME", exclusive = true, add = ArgValueCompleter::new(secrets_completer))]
-    pub delete_secret: Option<String>,
-    /// List all secrets stored in the Coyote vault
-    #[arg(long, exclusive = true)]
-    pub list_secrets: bool,
-    /// Authenticate with an LLM provider using OAuth (e.g., --authenticate client_name)
-    #[arg(long, exclusive = true, value_name = "CLIENT_NAME")]
-    pub authenticate: Option<Option<String>>,
-    /// Authenticate with an OAuth-protected remote MCP server (e.g., --auth-mcp server_name)
-    #[arg(long, exclusive = true, value_name = "SERVER_NAME", add = ArgValueCompleter::new(mcp_server_completer))]
-    pub auth_mcp: Option<String>,
-    /// Generate static shell completion scripts
-    #[arg(long, value_name = "SHELL", value_enum)]
-    pub completions: Option<ShellCompletion>,
+
+    /// Start an agent
+    #[arg(short = 'a', long, help_heading = "Agents, RAG & Macros", add = ArgValueCompleter::new(agent_completer))]
+    pub agent: Option<String>,
+    /// Set agent variables
+    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, help_heading = "Agents, RAG & Macros")]
+    pub agent_variable: Vec<String>,
+    /// Start a RAG
+    #[arg(long, help_heading = "Agents, RAG & Macros", add = ArgValueCompleter::new(rag_completer))]
+    pub rag: Option<String>,
+    /// Rebuild the RAG to sync document changes
+    #[arg(long, help_heading = "Agents, RAG & Macros")]
+    pub rebuild_rag: bool,
+    /// Execute a macro
+    #[arg(long = "macro", value_name = "MACRO", help_heading = "Agents, RAG & Macros", add = ArgValueCompleter::new(macro_completer))]
+    pub macro_name: Option<String>,
+
+    /// List all available chat models
+    #[arg(long, help_heading = "List & Discovery")]
+    pub list_models: bool,
+    /// List all roles
+    #[arg(long, help_heading = "List & Discovery")]
+    pub list_roles: bool,
+    /// List all sessions
+    #[arg(long, help_heading = "List & Discovery")]
+    pub list_sessions: bool,
+    /// List all agents
+    #[arg(long, help_heading = "List & Discovery")]
+    pub list_agents: bool,
+    /// List all RAGs
+    #[arg(long, help_heading = "List & Discovery")]
+    pub list_rags: bool,
+    /// List all macros
+    #[arg(long, help_heading = "List & Discovery")]
+    pub list_macros: bool,
+    /// List all installed skills
+    #[arg(long, help_heading = "List & Discovery")]
+    pub list_skills: bool,
+
+    /// Reinstall bundled assets, overwriting any local changes
+    #[arg(
+        long,
+        value_name = "CATEGORY",
+        value_enum,
+        help_heading = "Installation & Updates"
+    )]
+    pub install: Option<AssetCategory>,
+    /// Install assets from a remote git repository (URL may be suffixed with #<ref>)
+    #[arg(long, value_name = "GIT_URL", help_heading = "Installation & Updates")]
+    pub install_from: Option<String>,
+    /// Restrict --install-from to a single asset category
+    #[arg(
+        long,
+        value_name = "CATEGORY",
+        value_enum,
+        requires = "install_from",
+        help_heading = "Installation & Updates"
+    )]
+    pub filter: Option<InstallFilter>,
+    /// Overwrite all conflicts without prompting (used with --install-from)
+    #[arg(
+        long,
+        requires = "install_from",
+        help_heading = "Installation & Updates"
+    )]
+    pub install_force: bool,
+    /// Sync models updates
+    #[arg(long, help_heading = "Installation & Updates")]
+    pub sync_models: bool,
     /// Update Coyote to the latest release, or to a specific version
-    #[arg(long, value_name = "VERSION")]
+    #[arg(long, value_name = "VERSION", help_heading = "Installation & Updates")]
     pub update: Option<Option<String>>,
     /// With --update, update even if Coyote was installed via a package manager
-    #[arg(long, requires = "update")]
+    #[arg(long, requires = "update", help_heading = "Installation & Updates")]
     pub force: bool,
+
+    /// Add a secret to the Coyote vault
+    #[arg(
+        long,
+        value_name = "SECRET_NAME",
+        exclusive = true,
+        help_heading = "Vault & Secrets"
+    )]
+    pub add_secret: Option<String>,
+    /// Decrypt a secret from the Coyote vault and print the plaintext
+    #[arg(long, value_name = "SECRET_NAME", exclusive = true, help_heading = "Vault & Secrets", add = ArgValueCompleter::new(secrets_completer))]
+    pub get_secret: Option<String>,
+    /// Update an existing secret in the Coyote vault
+    #[arg(long, value_name = "SECRET_NAME", exclusive = true, help_heading = "Vault & Secrets", add = ArgValueCompleter::new(secrets_completer))]
+    pub update_secret: Option<String>,
+    /// Delete a secret from the Coyote vault
+    #[arg(long, value_name = "SECRET_NAME", exclusive = true, help_heading = "Vault & Secrets", add = ArgValueCompleter::new(secrets_completer))]
+    pub delete_secret: Option<String>,
+    /// List all secrets stored in the Coyote vault
+    #[arg(long, exclusive = true, help_heading = "Vault & Secrets")]
+    pub list_secrets: bool,
+
+    /// Authenticate with an LLM provider using OAuth (e.g., --authenticate client_name)
+    #[arg(
+        long,
+        exclusive = true,
+        value_name = "CLIENT_NAME",
+        help_heading = "Authentication"
+    )]
+    pub authenticate: Option<Option<String>>,
+    /// Authenticate with an OAuth-protected remote MCP server (e.g., --auth-mcp server_name)
+    #[arg(long, exclusive = true, value_name = "SERVER_NAME", help_heading = "Authentication", add = ArgValueCompleter::new(mcp_server_completer))]
+    pub auth_mcp: Option<String>,
+
     /// Launch Coyote inside a Docker sandbox (via `sbx`); name defaults to current directory basename
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", help_heading = "Sandbox")]
     pub sandbox: Option<Option<String>>,
     /// Create the sandbox without bootstrapping the host config or vault password file
-    #[arg(long, requires = "sandbox")]
+    #[arg(long, requires = "sandbox", help_heading = "Sandbox")]
     pub fresh: bool,
     /// Skip discovery and application of all sbx mixins (user and built-in)
-    #[arg(long, requires = "sandbox")]
+    #[arg(long, requires = "sandbox", help_heading = "Sandbox")]
     pub no_mixins: bool,
-    /// Disable loading workspace MCP servers from .coyote/mcp.json
-    #[arg(long)]
-    pub no_workspace_mcp: bool,
+
+    /// Display information
+    #[arg(long, help_heading = "Diagnostics & Tools")]
+    pub info: bool,
+    /// Build all configured Bash tool scripts
+    #[arg(long, help_heading = "Diagnostics & Tools")]
+    pub build_tools: bool,
+    /// Tail logs
+    #[arg(long, help_heading = "Diagnostics & Tools")]
+    pub tail_logs: bool,
+    /// Disable colored log output
+    #[arg(long, requires = "tail_logs", help_heading = "Diagnostics & Tools")]
+    pub disable_log_colors: bool,
+
+    /// Generate static shell completion scripts
+    #[arg(long, value_name = "SHELL", value_enum, help_heading = "Shell")]
+    pub completions: Option<ShellCompletion>,
 }
 
 impl Cli {
