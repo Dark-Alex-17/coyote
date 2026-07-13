@@ -147,10 +147,10 @@ pub async fn eval_tool_calls(
     let mut is_all_null = true;
     for call in calls {
         if let Some(msg) = ctx.tool_scope.tool_tracker.check_loop(&call.clone()) {
-            let dup_msg = format!("{{\"tool_call_loop_alert\":{}}}", &msg.trim());
+            let dup_msg = format!("{{\"tool_call_loop_alert\":{}}}", msg.trim());
             println!(
                 "{}",
-                warning_text(format!("{}: ⚠️ Tool-call loop detected! ⚠️", &call.name).as_str())
+                warning_text(format!("{}: ⚠️ Tool-call loop detected! ⚠️", call.name).as_str())
             );
             let val = json!(dup_msg);
             output.push(ToolResult::new(call, val));
@@ -870,7 +870,7 @@ impl Functions {
                 let root_dir = paths::functions_dir();
                 let tool_path = format!(
                     "{}/{binary_name}",
-                    &paths::global_tools_dir().to_string_lossy()
+                    paths::global_tools_dir().to_string_lossy()
                 );
                 content_template
                     .replace("{function_name}", binary_name)
@@ -881,7 +881,7 @@ impl Functions {
                 let root_dir = paths::agent_data_dir(agent_name);
                 let tool_path = format!(
                     "{}/{binary_name}",
-                    &paths::global_tools_dir().to_string_lossy()
+                    paths::global_tools_dir().to_string_lossy()
                 );
                 content_template
                     .replace("{function_name}", binary_name)

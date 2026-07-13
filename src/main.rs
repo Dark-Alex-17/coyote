@@ -563,7 +563,7 @@ async fn shell_execute(
 
             match answer_char {
                 'e' => {
-                    debug!("{} {:?}", shell.cmd, &[&shell.arg, &eval_str]);
+                    debug!("{} {:?}", shell.cmd, [&shell.arg, &eval_str]);
                     let code = run_command(&shell.cmd, &[&shell.arg, &eval_str], None)?;
                     if code == 0 && app.save_shell_history {
                         let _ = append_to_shell_history(&shell.name, &eval_str, code);
