@@ -134,6 +134,10 @@ enabled_mcp_servers: null        # Which MCP servers to enable by default.
                                  #     - slack
                                  # Example (comma-separated form):
                                  #   enabled_mcp_servers: github,slack,ddg-search
+no_workspace_mcp: false          # Disable loading workspace-local MCP servers from .coyote/mcp.json (default: false).
+                                 # When false (the default), Coyote merges .coyote/mcp.json from the current directory
+                                 # into the global MCP registry at startup. Workspace entries shadow global ones on
+                                 # name collision. Set to true (or pass --no-workspace-mcp) to skip this entirely.
 
 # ---- Skills ----
 # Skills are modular knowledge or capability packs the LLM can load and unload mid-conversation.
