@@ -227,7 +227,7 @@ nodes:
     reranker_model: null       # Optional reranker for hybrid-search results
     extractor_model: null      # Optional chat model for graph-based entity/relationship extraction; enables graph RAG signal when set
     extractor_prompt: null     # Optional custom extraction prompt; must contain __CHUNK__ placeholder; uses built-in prompt when null
-    graph_hops: 1              # Graph expansion depth at query time (1 = direct neighbors; increase for denser knowledge graphs)
+    graph_hops: 1              # Graph expansion depth at query time (0 = seed nodes only; 1 = direct neighbors; increase for denser knowledge graphs)
     batch_size: 100            # Optional embedding-request batch size
     state_updates:             # {{output}} = { context: <str>, sources: [<path>, ...] }
       context: "{{output.context}}"   # writes `context` -> `reducers.context = concat`

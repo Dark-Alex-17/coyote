@@ -199,7 +199,7 @@ rag_chunk_size: null             # Defines the size of chunks for document proce
 rag_chunk_overlap: null          # Defines the overlap between chunks
 rag_extractor_model: null        # LLM model for graph-based entity/relationship extraction; when set, enables a graph RAG signal alongside vector and BM25
 rag_extractor_prompt: null       # Custom extraction prompt template; must contain __CHUNK__ placeholder; defaults to built-in prompt when null
-rag_graph_hops: 1                # Number of hops to expand from matched entities at query time (1 = direct neighbors; increase for denser graphs)
+rag_graph_hops: 1                # Number of hops to expand from matched entities at query time (0 = seed nodes only; 1 = direct neighbors; increase for denser graphs)
 # Defines the query structure using variables like __CONTEXT__, __SOURCES__, and __INPUT__ to tailor searches to specific needs
 rag_template: |
   Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
