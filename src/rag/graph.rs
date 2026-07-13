@@ -71,9 +71,9 @@ pub struct ExtractedRelationship {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeGraph {
     pub graph: StableGraph<Entity, Relationship>,
-    /// Lowercased entity name → raw node index
+    /// Lowercased entity name -> raw node index
     pub entity_index: IndexMap<String, u32>,
-    /// DocumentId inner value → raw node indices for entities in that chunk
+    /// DocumentId inner value -> raw node indices for entities in that chunk
     pub document_entities: IndexMap<usize, Vec<u32>>,
 }
 
@@ -176,6 +176,7 @@ impl KnowledgeGraph {
                 map.entry(node_raw).or_default().push(doc_id);
             }
         }
+
         map
     }
 
@@ -236,7 +237,6 @@ pub async fn extract_entities(
         .context("Entity extraction LLM call failed")?;
 
     let text = output.text.trim();
-    // Strip markdown code fences if the model wraps in ```json ... ```
     let json: String = if text.starts_with("```") {
         text.lines()
             .skip(1)

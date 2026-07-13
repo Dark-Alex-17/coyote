@@ -930,6 +930,7 @@ impl Rag {
         if kg.entity_index.is_empty() {
             return vec![];
         }
+        
         let query_lower = query.to_lowercase();
 
         let mut seed_nodes: Vec<u32> = kg
