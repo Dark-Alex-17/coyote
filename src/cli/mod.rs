@@ -195,6 +195,9 @@ pub struct Cli {
     /// Skip discovery and application of all sbx mixins (user and built-in)
     #[arg(long, requires = "sandbox")]
     pub no_mixins: bool,
+    /// Disable loading workspace MCP servers from .coyote/mcp.json
+    #[arg(long)]
+    pub no_workspace_mcp: bool,
 }
 
 impl Cli {

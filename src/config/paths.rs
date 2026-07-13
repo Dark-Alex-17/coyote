@@ -5,7 +5,7 @@ use super::{
     GLOBAL_TOOLS_UTILS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, MEMORY_DIR_NAME,
     MEMORY_INDEX_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME, SBX_KIT_DIR_NAME,
     SBX_KIT_HASH_FILE, SBX_MIXIN_FILE_NAME, SBX_MIXIN_KITS_DIR_NAME, SBX_VAULT_MIXINS_DIR_NAME,
-    SKILLS_DIR_NAME, WORKSPACE_MEMORY_DIR_NAME,
+    SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
 };
 use crate::client::ProviderModels;
 use crate::config::REPL_HISTORY_DIR_NAME;
@@ -118,7 +118,7 @@ pub fn global_tools_sbx_mixin_file() -> PathBuf {
 pub fn find_workspace_sbx_mixin(start: &Path) -> Option<PathBuf> {
     for dir in start.ancestors() {
         let candidate = dir
-            .join(WORKSPACE_MEMORY_DIR_NAME)
+            .join(WORKSPACE_COYOTE_DIR_NAME)
             .join(SBX_MIXIN_FILE_NAME);
         if candidate.exists() {
             return Some(candidate);
@@ -191,6 +191,24 @@ pub fn skill_dir(name: &str) -> PathBuf {
 
 pub fn skill_file(name: &str) -> PathBuf {
     skill_dir(name).join("SKILL.md")
+}
+
+pub fn workspace_skills_dir() -> PathBuf {
+    env::current_dir()
+        .unwrap_or_default()
+        .join(WORKSPACE_COYOTE_DIR_NAME)
+        .join(SKILLS_DIR_NAME)
+}
+
+pub fn workspace_skill_file(name: &str) -> PathBuf {
+    workspace_skills_dir().join(name).join("SKILL.md")
+}
+
+pub fn workspace_mcp_config_file() -> PathBuf {
+    env::current_dir()
+        .unwrap_or_default()
+        .join(WORKSPACE_COYOTE_DIR_NAME)
+        .join(MCP_FILE_NAME)
 }
 
 pub fn validate_skill_name(name: &str) -> Result<()> {
@@ -318,7 +336,7 @@ pub fn global_memory_index_path() -> PathBuf {
 
 pub fn workspace_memory_dir_for(workspace_root: &Path) -> PathBuf {
     workspace_root
-        .join(WORKSPACE_MEMORY_DIR_NAME)
+        .join(WORKSPACE_COYOTE_DIR_NAME)
         .join(MEMORY_DIR_NAME)
 }
 
@@ -405,15 +423,21 @@ pub fn has_macro(name: &str) -> bool {
 
 pub fn list_skills() -> Vec<String> {
     let mut names = Vec::new();
-    if let Ok(rd) = read_dir(skills_dir()) {
-        for entry in rd.flatten() {
-            if let Ok(file_type) = entry.file_type()
-                && file_type.is_dir()
-                && let Some(name) = entry.file_name().to_str()
-                && entry.path().join("SKILL.md").is_file()
-                && validate_skill_name(name).is_ok()
-            {
-                names.push(name.to_string());
+    let mut seen = HashSet::new();
+
+    for dir in [workspace_skills_dir(), skills_dir()] {
+        if let Ok(rd) = read_dir(dir) {
+            for entry in rd.flatten() {
+                if let Ok(file_type) = entry.file_type()
+                    && file_type.is_dir()
+                    && let Some(name) = entry.file_name().to_str()
+                    && !seen.contains(name)
+                    && entry.path().join("SKILL.md").is_file()
+                    && validate_skill_name(name).is_ok()
+                {
+                    seen.insert(name.to_string());
+                    names.push(name.to_string());
+                }
             }
         }
     }
@@ -423,7 +447,7 @@ pub fn list_skills() -> Vec<String> {
 }
 
 pub fn has_skill(name: &str) -> bool {
-    skill_file(name).is_file()
+    workspace_skill_file(name).is_file() || skill_file(name).is_file()
 }
 
 pub fn local_models_override() -> Result<Vec<ProviderModels>> {

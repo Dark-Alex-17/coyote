@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     GIT_DIR_NAME, GITIGNORE_FILE_NAME, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME,
-    WORKSPACE_MEMORY_DIR_NAME, WORKSPACE_MEMORY_FILE_NAME, paths,
+    WORKSPACE_COYOTE_DIR_NAME, WORKSPACE_MEMORY_FILE_NAME, paths,
 };
 
 pub const DEFAULT_MEMORY_CAP_WITH_TOOLS: usize = 6_000;
@@ -27,7 +27,7 @@ pub enum WorkspaceMemory {
 
 pub fn discover_workspace_memory(start: &Path) -> Option<WorkspaceMemory> {
     for dir in start.ancestors() {
-        let structured = dir.join(WORKSPACE_MEMORY_DIR_NAME).join(MEMORY_DIR_NAME);
+        let structured = dir.join(WORKSPACE_COYOTE_DIR_NAME).join(MEMORY_DIR_NAME);
         if structured.join(MEMORY_INDEX_FILE_NAME).exists() {
             return Some(WorkspaceMemory::Structured {
                 workspace_root: dir.to_path_buf(),
@@ -84,8 +84,8 @@ pub fn bootstrap_workspace_memory(git_root: &Path) -> Result<PathBuf> {
 
 fn append_gitignore_entry(git_root: &Path) -> Result<bool> {
     let gitignore = git_root.join(GITIGNORE_FILE_NAME);
-    let entry = format!("{WORKSPACE_MEMORY_DIR_NAME}/{MEMORY_DIR_NAME}/");
-    let entry_no_slash = format!("{WORKSPACE_MEMORY_DIR_NAME}/{MEMORY_DIR_NAME}");
+    let entry = format!("{WORKSPACE_COYOTE_DIR_NAME}/{MEMORY_DIR_NAME}/");
+    let entry_no_slash = format!("{WORKSPACE_COYOTE_DIR_NAME}/{MEMORY_DIR_NAME}");
 
     let existing = fs::read_to_string(&gitignore).unwrap_or_default();
     let already_present = existing.lines().any(|line| {
@@ -347,7 +347,7 @@ mod tests {
         let root = temp_root("phase1");
         let workspace = root.join("workspace");
         let workspace_memory_dir = workspace
-            .join(WORKSPACE_MEMORY_DIR_NAME)
+            .join(WORKSPACE_COYOTE_DIR_NAME)
             .join(MEMORY_DIR_NAME);
         fs::create_dir_all(&workspace_memory_dir).unwrap();
         fs::write(
@@ -382,7 +382,7 @@ mod tests {
         let root = temp_root("prefer");
         let workspace = root.join("ws");
         let structured = workspace
-            .join(WORKSPACE_MEMORY_DIR_NAME)
+            .join(WORKSPACE_COYOTE_DIR_NAME)
             .join(MEMORY_DIR_NAME);
         fs::create_dir_all(&structured).unwrap();
         fs::write(structured.join(MEMORY_INDEX_FILE_NAME), "s").unwrap();
@@ -415,7 +415,7 @@ mod tests {
         let root = temp_root("indexes_only");
         let workspace = root.join("ws");
         let structured = workspace
-            .join(WORKSPACE_MEMORY_DIR_NAME)
+            .join(WORKSPACE_COYOTE_DIR_NAME)
             .join(MEMORY_DIR_NAME);
         fs::create_dir_all(&structured).unwrap();
         fs::write(
@@ -450,7 +450,7 @@ mod tests {
         let root = temp_root("drill_bodies");
         let workspace = root.join("ws");
         let structured = workspace
-            .join(WORKSPACE_MEMORY_DIR_NAME)
+            .join(WORKSPACE_COYOTE_DIR_NAME)
             .join(MEMORY_DIR_NAME);
         fs::create_dir_all(&structured).unwrap();
         fs::write(structured.join(MEMORY_INDEX_FILE_NAME), "idx").unwrap();
@@ -485,7 +485,7 @@ mod tests {
         let root = temp_root("cap");
         let workspace = root.join("ws");
         let structured = workspace
-            .join(WORKSPACE_MEMORY_DIR_NAME)
+            .join(WORKSPACE_COYOTE_DIR_NAME)
             .join(MEMORY_DIR_NAME);
         fs::create_dir_all(&structured).unwrap();
         fs::write(structured.join(MEMORY_INDEX_FILE_NAME), "idx").unwrap();
@@ -575,7 +575,7 @@ mod tests {
         let root = temp_root("walk_up");
         let workspace = root.join("ws");
         let mem_dir = workspace
-            .join(WORKSPACE_MEMORY_DIR_NAME)
+            .join(WORKSPACE_COYOTE_DIR_NAME)
             .join(MEMORY_DIR_NAME);
         fs::create_dir_all(&mem_dir).unwrap();
         fs::write(mem_dir.join(MEMORY_INDEX_FILE_NAME), "idx").unwrap();

@@ -187,7 +187,11 @@ async fn main() -> Result<()> {
     let abort_signal = create_abort_signal();
     let start_mcp_servers = cli.agent.is_none() && cli.role.is_none();
     let cfg = Config::load_with_interpolation(info_flag).await?;
-    let app_config: Arc<AppConfig> = Arc::new(AppConfig::from_config(cfg)?);
+    let mut app_config = AppConfig::from_config(cfg)?;
+    if cli.no_workspace_mcp {
+        app_config.no_workspace_mcp = true;
+    }
+    let app_config: Arc<AppConfig> = Arc::new(app_config);
     let app_state: Arc<AppState> = Arc::new(
         AppState::init(
             app_config,

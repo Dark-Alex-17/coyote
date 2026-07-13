@@ -117,7 +117,11 @@ impl Skill {
 
     pub fn load(name: &str) -> Result<Self> {
         paths::validate_skill_name(name)?;
-        let path = paths::skill_file(name);
+        let path = if paths::workspace_skill_file(name).is_file() {
+            paths::workspace_skill_file(name)
+        } else {
+            paths::skill_file(name)
+        };
         let content = read_to_string(&path)
             .with_context(|| format!("Failed to read skill '{name}' at {}", path.display()))?;
         Ok(Skill::new(name, &content))

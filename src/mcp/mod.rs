@@ -214,7 +214,53 @@ impl McpRegistry {
             spec.validate(name)?;
         }
 
-        registry.config = Some(mcp_servers_config);
+        let mut merged = mcp_servers_config;
+        if !app_config.no_workspace_mcp {
+            let ws_path = paths::workspace_mcp_config_file();
+            if ws_path.try_exists().unwrap_or(false) {
+                match tokio::fs::read_to_string(&ws_path).await {
+                    Ok(ws_content) if !ws_content.trim().is_empty() => {
+                        match interpolate_secrets(&ws_content, vault) {
+                            Ok((parsed, missing)) if missing.is_empty() => {
+                                match serde_json::from_str::<McpServersConfig>(&parsed) {
+                                    Ok(ws_config) => {
+                                        let mut loaded = Vec::new();
+                                        for (name, spec) in ws_config.mcp_servers {
+                                            match spec.validate(&name) {
+                                                Ok(_) => {
+                                                    loaded.push(name.clone());
+                                                    merged.mcp_servers.insert(name, spec);
+                                                }
+                                                Err(e) => warn!(
+                                                    "Invalid workspace MCP server '{name}': {e}. Skipping."
+                                                ),
+                                            }
+                                        }
+                                        if !loaded.is_empty() {
+                                            eprintln!(
+                                                "Loading workspace MCP servers: {}",
+                                                loaded.join(", ")
+                                            );
+                                        }
+                                    }
+                                    Err(e) => warn!(
+                                        "Failed to parse workspace MCP config: {e}. Skipping."
+                                    ),
+                                }
+                            }
+                            Ok((_, missing)) => warn!(
+                                "Workspace MCP config references missing vault secrets: {missing:?}. Skipping."
+                            ),
+                            Err(e) => {
+                                warn!("Failed to process workspace MCP config: {e}. Skipping.")
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        registry.config = Some(merged);
 
         if start_mcp_servers && app_config.mcp_server_support {
             abortable_run_with_spinner(
