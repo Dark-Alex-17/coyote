@@ -8,8 +8,8 @@ set -e
 # Use the grep tool to find specific content before reading, then read with offset to target the relevant section.
 
 # @option --path! The absolute path to the file or directory to read
-# @option --offset The line number to start reading from (1-indexed, default: 1)
-# @option --limit The maximum number of lines to read (default: 2000)
+# @option --offset <INT> The line number to start reading from (1-indexed, default: 1)
+# @option --limit <INT> The maximum number of lines to read (default: 2000)
 
 # @env LLM_OUTPUT=/dev/stdout The output path
 
@@ -33,8 +33,19 @@ main() {
     fi
 
     local total_lines file_bytes
-    total_lines=$(wc -l < "$target" 2>/dev/null || echo 0)
+    # awk counts a final line that lacks a trailing newline; wc -l would undercount it by one.
+    total_lines=$(awk 'END { print NR }' "$target" 2>/dev/null || echo 0)
     file_bytes=$(wc -c < "$target" 2>/dev/null || echo 0)
+
+    if [[ "$total_lines" -eq 0 ]]; then
+        echo "(file is empty: $target)" >> "$LLM_OUTPUT"
+        return 0
+    fi
+
+    if [[ "$offset" -gt "$total_lines" ]]; then
+        echo "(offset $offset is past the end of the file, which has $total_lines lines)" >> "$LLM_OUTPUT"
+        return 0
+    fi
 
     if [[ "$file_bytes" -gt "$MAX_BYTES" ]] && [[ "$offset" -eq 1 ]] && [[ "$limit" -ge 2000 ]]; then
         {
@@ -48,7 +59,8 @@ main() {
 
     sed -n "${offset},${end_line}p" "$target" 2>/dev/null | {
         local line_num=$offset
-        while IFS= read -r line; do
+        # `|| [[ -n "$line" ]]` keeps the final line when the file has no trailing newline.
+        while IFS= read -r line || [[ -n "$line" ]]; do
             if [[ ${#line} -gt $MAX_LINE_LENGTH ]]; then
                 line="${line:0:$MAX_LINE_LENGTH}... (truncated)"
             fi
