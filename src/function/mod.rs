@@ -730,7 +730,7 @@ impl Functions {
                 let root_dir = paths::functions_dir();
                 let tool_path = format!(
                     "{}/{binary_name}",
-                    &paths::global_tools_dir().to_string_lossy()
+                    paths::global_tools_dir().to_string_lossy()
                 );
                 content_template
                     .replace("{function_name}", binary_name)
@@ -741,7 +741,7 @@ impl Functions {
                 let root_dir = paths::agent_data_dir(agent_name);
                 let tool_path = format!(
                     "{}/{binary_name}",
-                    &paths::global_tools_dir().to_string_lossy()
+                    paths::global_tools_dir().to_string_lossy()
                 );
                 content_template
                     .replace("{function_name}", binary_name)

@@ -358,17 +358,16 @@ mod tests {
     use super::*;
     use crate::function::JsonSchema;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static PARSE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn parse_source(
         source: &str,
         file_name: &str,
         parent: &Path,
     ) -> Result<Vec<FunctionDeclaration>> {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time went backwards")
-            .as_nanos();
+        let unique = PARSE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("coyote_python_parser_{file_name}_{unique}.py"));
         fs::write(&path, source).expect("failed to write temp python source");
