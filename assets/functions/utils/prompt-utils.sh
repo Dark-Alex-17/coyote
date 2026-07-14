@@ -552,7 +552,7 @@ patch_file() {
           continue
         }
 
-        if (line ~ /^@@ /) {
+        if (line ~ /^@@/) {
           mode = "hunk"
           hunkIndex++
           patchLineIndex++
@@ -585,6 +585,10 @@ patch_file() {
 
       if (hunkIndex == 0) {
         print "error: no patch" > "/dev/stderr"
+        print "" > "/dev/stderr"
+        print "No hunk header was found. Each hunk must start with a line beginning \"@@\"" > "/dev/stderr"
+        print "(for example \"@@ ... @@\" or \"@@ -1,4 +1,4 @@\"). Inside a hunk, context lines" > "/dev/stderr"
+        print "start with a single space, removed lines with \"-\", and added lines with \"+\"." > "/dev/stderr"
         exit 1
       }
 
