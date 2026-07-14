@@ -17,8 +17,8 @@ main() {
     local search_path="${argc_path:-.}"
 
     if [[ ! -d "$search_path" ]]; then
-        echo "Error: directory not found: $search_path" >> "$LLM_OUTPUT"
-        return 1
+        echo "Error: directory not found: $search_path" >&2
+        exit 1
     fi
 
     local results

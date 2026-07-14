@@ -9,5 +9,18 @@ set -e
 
 main() {
     # shellcheck disable=SC2154
-    ls -1 "$argc_path" >> "$LLM_OUTPUT" 2>&1 || echo "No such path: $argc_path" >> "$LLM_OUTPUT"
+    local path="$argc_path"
+    local output
+
+    if ! output=$(ls -1 "$path" 2>&1); then
+        echo "$output" >> "$LLM_OUTPUT"
+        return 0
+    fi
+
+    # An empty result is shown to the model as the opaque literal "DONE"; emit a note instead.
+    if [[ -z "$output" ]]; then
+        echo "(empty directory: $path)" >> "$LLM_OUTPUT"
+    else
+        echo "$output" >> "$LLM_OUTPUT"
+    fi
 }

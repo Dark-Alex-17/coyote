@@ -23,8 +23,8 @@ main() {
     local limit="${argc_limit:-2000}"
 
     if [[ ! -e "$target" ]]; then
-        echo "Error: path not found: $target" >> "$LLM_OUTPUT"
-        return 1
+        echo "Error: path not found: $target" >&2
+        exit 1
     fi
 
     if [[ -d "$target" ]]; then

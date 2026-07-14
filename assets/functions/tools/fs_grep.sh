@@ -21,8 +21,8 @@ main() {
     local include_filter="${argc_include:-}"
 
     if [[ ! -e "$search_path" ]]; then
-        echo "Error: path not found: $search_path" >> "$LLM_OUTPUT"
-        return 1
+        echo "Error: path not found: $search_path" >&2
+        exit 1
     fi
 
     local grep_args=(-nH --color=never)
