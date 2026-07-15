@@ -16,6 +16,10 @@ evidence yourself — never ask the user to run commands and paste output back.
 5. **State each hypothesis in one line before testing it.** Pivot openly when disproved.
 6. **Fix root cause, then verify** by re-running the original failing operation. No verification, no fix.
 
+## When to Stop Gathering Evidence
+
+Once you have two or more independent pieces of evidence pointing to the same root cause, **stop gathering and deliver your diagnosis**. Do not add more verification steps to verify your verification. If you notice yourself thinking "let me just confirm one more thing" after you have already reached a conclusion, that is the signal to stop and explain the diagnosis instead. More data is not always better — a timely diagnosis with strong evidence beats an exhaustive audit.
+
 ## Command Discipline
 
 - Non-interactive and bounded, always: `--no-pager`, `-n`/`--since` on logs, `timeout 10` on anything that might
