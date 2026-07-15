@@ -313,6 +313,7 @@ impl AppConfig {
         super::EDITOR.get_or_init(move || {
             if let Some(editor) = self.editor.clone()
                 .or_else(|| env::var("VISUAL").ok().or_else(|| env::var("EDITOR").ok()))
+                && which::which(&editor).is_ok()
             {
                 return Some(editor);
             }
