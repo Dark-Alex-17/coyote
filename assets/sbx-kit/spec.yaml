@@ -14,7 +14,7 @@ description: >
   CLI & REPL mode, RAG, AI tools & agents, MCP servers, skills, and macros.
 
 sandbox:
-  image: 'docker/sandbox-templates:shell-docker'
+  image: 'darkalex17/coyote:v0.7.4'
   aiFilename: COYOTE.md
   entrypoint:
     run: ['bash', '-lc', 'exec /home/agent/.cargo/bin/coyote']
@@ -118,7 +118,7 @@ network:
     - 'raw.githubusercontent.com:443'
     - 'objects.githubusercontent.com:443'
     - '*.githubusercontent.com:443'
-    # Coyote install paths (cargo install + uv + rustup + Python tool deps at runtime)
+    # Package managers and developer tools (cargo, uv, pip — useful at runtime for user installs)
     - 'crates.io:443'
     - 'static.crates.io:443'
     - 'pypi.org:443'
@@ -239,66 +239,6 @@ environment:
     - ZHIPUAI_API_KEY
 
 commands:
-  install:
-    - command: |
-        sudo apt-get update &&
-        sudo apt-get install -y \
-          jq curl git \
-          build-essential pkg-config \
-          cmake \
-          clang libclang-dev \
-          musl-tools \
-          libssl-dev \
-          pandoc \
-          bzip2 \
-          nano
-      user: '1000'
-      description: Install system prerequisites (including pandoc for fetch_url_via_curl)
-    - command: |
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        if [ -f "$HOME/.local/bin/uv" ]; then
-          printf '#!/bin/sh\nexec uv tool run "$@"\n' > "$HOME/.local/bin/uvx"
-          chmod +x "$HOME/.local/bin/uvx"
-        fi
-      user: '1000'
-      description: Install uv and write a uvx shell wrapper (the installer may place a macOS binary at this path on Docker-for-Mac hosts, which the Linux container cannot execute)
-    - command: |
-        set -euo pipefail
-        USQL_VERSION=0.21.4
-        ARCH=$(uname -m)
-        case "$ARCH" in
-          x86_64) USQL_ARCH=amd64 ;;
-          aarch64) USQL_ARCH=arm64 ;;
-          *) echo "Unsupported arch for usql install: $ARCH" >&2; exit 1 ;;
-        esac
-        TMPDIR=$(mktemp -d)
-        trap 'rm -rf "$TMPDIR"' EXIT
-        curl -fsSL --retry 3 "https://github.com/xo/usql/releases/download/v${USQL_VERSION}/usql_static-${USQL_VERSION}-linux-${USQL_ARCH}.tar.bz2" -o "$TMPDIR/usql.tar.bz2"
-        tar -xjf "$TMPDIR/usql.tar.bz2" -C "$TMPDIR"
-        sudo install -m 0755 "$TMPDIR/usql_static" /usr/local/bin/usql
-      user: '1000'
-      description: Install the usql universal SQL CLI (used by the built-in sql agent and execute_sql_code tool)
-    - command: |
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-          sh -s -- -y \
-          --default-toolchain stable \
-          --profile minimal \
-          --target x86_64-unknown-linux-musl
-        . "$HOME/.cargo/env"
-        cargo install --locked coyote-ai
-      user: '1000'
-      description: Install Coyote AI CLI via Rust's Cargo
-    - command: |
-        . "$HOME/.cargo/env"
-        cargo install --locked iwec
-      user: '1000'
-      description: Install the IWE MCP server binary (iwec) used by the built-in iwe MCP server and iwe-knowledge-base skill
-    - command: |
-        . "$HOME/.cargo/env"
-        cargo install --locked ast-grep
-      user: '1000'
-      description: Install ast-grep, used by the built-in ast_grep structural code search tool (and the explore agent)
-
   startup:
     - command:
         [
