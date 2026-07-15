@@ -732,6 +732,15 @@ impl Session {
         self.update_tokens();
     }
 
+    pub fn pop_last_exchange(&mut self) -> Option<String> {
+        let user_idx = self.messages.iter().rposition(|m| m.role.is_user())?;
+        let user_text = self.messages[user_idx].content.as_text()?.to_string();
+        self.messages.truncate(user_idx);
+        self.dirty = true;
+        self.update_tokens();
+        Some(user_text)
+    }
+
     pub fn echo_messages(&self, input: &Input) -> String {
         let messages = self.build_messages(input);
         serde_yaml::to_string(&messages).unwrap_or_else(|_| "Unable to echo message".into())

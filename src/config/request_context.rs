@@ -124,6 +124,7 @@ pub struct RequestContext {
     pub todo_list: TodoList,
     pub skill_registry: SkillRegistry,
     pub last_continuation_response: Option<String>,
+    pub pending_prefill: Option<String>,
 
     pub render_mode: RenderMode,
 }
@@ -154,6 +155,7 @@ impl RequestContext {
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
+            pending_prefill: None,
             render_mode: RenderMode::default(),
         }
     }
@@ -210,6 +212,7 @@ impl RequestContext {
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
+            pending_prefill: None,
             render_mode: RenderMode::default(),
         })
     }
@@ -253,6 +256,7 @@ impl RequestContext {
             todo_list: self.todo_list.clone(),
             skill_registry: self.skill_registry.clone(),
             last_continuation_response: None,
+            pending_prefill: None,
             render_mode: self.render_mode,
         }
     }
@@ -294,6 +298,7 @@ impl RequestContext {
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
+            pending_prefill: None,
             render_mode: parent.render_mode,
         }
     }
@@ -605,6 +610,21 @@ impl RequestContext {
         }
         self.discontinuous_last_message();
         Ok(())
+    }
+
+    pub fn undo_last_exchange(&mut self) -> Result<()> {
+        let text = match self.session.as_mut() {
+            Some(session) => session.pop_last_exchange(),
+            None => bail!("No session"),
+        };
+        match text {
+            Some(text) => {
+                self.pending_prefill = Some(text);
+                self.discontinuous_last_message();
+                Ok(())
+            }
+            None => bail!("Nothing to undo"),
+        }
     }
 
     pub fn set_save_session_this_time(&mut self) -> Result<()> {

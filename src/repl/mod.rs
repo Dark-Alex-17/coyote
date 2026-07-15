@@ -52,7 +52,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 50]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 51]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -123,6 +123,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 50]> = LazyLock::new(|| {
         ReplCommand::new(
             ".empty session",
             "Clear session messages",
+            AssertState::True(StateFlags::SESSION),
+        ),
+        ReplCommand::new(
+            ".undo",
+            "Undo the last exchange and restore the prompt",
             AssertState::True(StateFlags::SESSION),
         ),
         ReplCommand::new(
@@ -389,6 +394,10 @@ Type ".help" for additional help.
                         Ok(exit) => {
                             if exit {
                                 break;
+                            }
+                            if let Some(text) = self.ctx.write().pending_prefill.take() {
+                                self.editor
+                                    .run_edit_commands(&[EditCommand::InsertString(text)]);
                             }
                         }
                         Err(err) => {
@@ -966,6 +975,9 @@ pub async fn run_repl_command(
                     println!(r#"Usage: .empty session"#)
                 }
             },
+            ".undo" => {
+                ctx.undo_last_exchange()?;
+            }
             ".rebuild" => match args {
                 Some("rag") => {
                     ctx.rebuild_rag(abort_signal.clone()).await?;
