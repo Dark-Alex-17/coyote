@@ -100,6 +100,32 @@ To upgrade `coyote` using Homebrew:
 brew upgrade coyote
 ```
 
+### Docker
+Coyote is available as a Docker image on Docker Hub (`darkalex17/coyote`) for Linux amd64 and arm64.
+Useful for CI, ephemeral environments, or anywhere you prefer not to install it natively.
+
+```bash
+docker pull darkalex17/coyote
+docker run --rm -it darkalex17/coyote
+```
+
+To persist your configuration across container runs, mount your existing config directory:
+
+```bash
+docker run --rm -it \
+  -v ~/.config/coyote:/home/agent/.config/coyote \
+  darkalex17/coyote
+```
+
+If you use the local vault provider and want your vault credentials available in the container, also mount the password file:
+
+```bash
+docker run --rm -it \
+  -v ~/.config/coyote:/home/agent/.config/coyote \
+  -v ~/.coyote_password:/home/agent/.coyote_password:ro \
+  darkalex17/coyote
+```
+
 ### Scripts
 #### Linux/MacOS (`bash`)
 You can use the following command to run a bash script that downloads and installs the latest version of `coyote` for your

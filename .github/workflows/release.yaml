@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       bump_type:
-        description: "Specify the type of version bump"
+        description: 'Specify the type of version bump'
         required: true
-        default: "patch"
+        default: 'patch'
         type: choice
         options:
           - patch
@@ -46,7 +46,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.10"
+          python-version: '3.10'
 
       - name: Install Commitizen
         run: |
@@ -163,28 +163,28 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             use-cross: true
-            cargo-flags: ""
+            cargo-flags: ''
           - target: aarch64-apple-darwin
             os: macos-latest
             use-cross: true
-            cargo-flags: ""
+            cargo-flags: ''
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             use-cross: true
-            cargo-flags: ""
+            cargo-flags: ''
           - target: x86_64-apple-darwin
             os: macos-latest
-            cargo-flags: ""
+            cargo-flags: ''
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            cargo-flags: ""
+            cargo-flags: ''
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             use-cross: true
-            cargo-flags: ""
+            cargo-flags: ''
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            cargo-flags: ""
+            cargo-flags: ''
 
     steps:
       - name: Check if actor is repository owner
@@ -338,7 +338,7 @@ jobs:
             ${{ steps.package.outputs.archive }} 
             ${{ steps.package.outputs.sha }}
           tag_name: v${{ env.RELEASE_VERSION }}
-          name: "v${{ env.RELEASE_VERSION }}"
+          name: 'v${{ env.RELEASE_VERSION }}'
           body_path: artifacts/changelog.md
           prerelease: false
 
@@ -456,3 +456,63 @@ jobs:
         if: env.ACT != 'true'
         with:
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-sandbox-image:
+    needs: [publish-github-release]
+    name: Publish Sandbox Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if actor is repository owner
+        if: ${{ github.actor != github.repository_owner && env.ACT != 'true' }}
+        run: |
+          echo "You are not authorized to run this workflow."
+          exit 1
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Ensure repository is up-to-date
+        if: env.ACT != 'true'
+        run: |
+          git fetch --all
+          git pull
+
+      - name: Get release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Set version variable
+        run: |
+          version="$(cat artifacts/release-version)"
+          echo "version=$version" >> $GITHUB_ENV
+
+      - name: Validate release environment variables
+        run: |
+          echo "Release version: ${{ env.version }}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        if: env.ACT != 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Push to Docker Hub
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ env.ACT != 'true' }}
+          tags: darkalex17/coyote:latest, darkalex17/coyote:${{ env.version }}
+          build-args: COYOTE_VERSION=${{ env.version }}
