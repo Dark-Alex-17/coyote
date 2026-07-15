@@ -976,6 +976,12 @@ pub async fn run_repl_command(
                 }
             },
             ".undo" => {
+                if let Some(name) = graph::active_agent_graph_name(ctx) {
+                    bail!(
+                        "Graph-based agent '{name}' does not support .undo. \
+                         The graph manages its own state."
+                    );
+                }
                 ctx.undo_last_exchange()?;
             }
             ".rebuild" => match args {
