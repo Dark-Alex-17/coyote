@@ -311,16 +311,17 @@ impl AppConfig {
 
     pub fn editor(&self) -> Result<String> {
         super::EDITOR.get_or_init(move || {
-            let editor = self.editor.clone()
+            if let Some(editor) = self.editor.clone()
                 .or_else(|| env::var("VISUAL").ok().or_else(|| env::var("EDITOR").ok()))
-                .unwrap_or_else(|| {
-                    if cfg!(windows) {
-                        "notepad".to_string()
-                    } else {
-                        "nano".to_string()
-                    }
-                });
-            which::which(&editor).ok().map(|_| editor)
+            {
+                return Some(editor);
+            }
+            let default = if cfg!(windows) {
+                "notepad".to_string()
+            } else {
+                "nano".to_string()
+            };
+            which::which(&default).ok().map(|_| default)
         })
             .clone()
             .ok_or_else(|| anyhow!("Editor not found. Please add the `editor` configuration or set the $EDITOR or $VISUAL environment variable."))
