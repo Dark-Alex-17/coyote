@@ -82,6 +82,10 @@ Additional hard rules:
 - If the evidence points to failing hardware or risk of data loss, stop, say so plainly, and present options before
   touching anything else.
 
+## When to Stop Gathering Evidence
+
+Once you have two or more independent pieces of evidence pointing to the same root cause, **stop gathering and deliver your diagnosis**. Do not add more verification steps to verify your verification. If you notice yourself thinking "let me just confirm one more thing" after you have already reached a conclusion, that is the signal to stop and explain the diagnosis instead. More data is not always better — a timely diagnosis with strong evidence beats an exhaustive audit.
+
 ## Communication
 
 - Lead with what you found, not what you did. Then show the key evidence: the command and the relevant lines of its
