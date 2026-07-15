@@ -1600,8 +1600,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_50_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 50);
+    fn repl_commands_has_51_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 51);
     }
 
     #[test]
