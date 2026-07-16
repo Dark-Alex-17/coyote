@@ -31,6 +31,7 @@ impl Completer for ReplCompleter {
 
         let ctx = self.ctx.read();
         let state = ctx.state();
+        let model_has_reasoning = !ctx.current_model().reasoning_levels().is_empty();
 
         let command_filter = parts
             .iter()
@@ -44,6 +45,7 @@ impl Completer for ReplCompleter {
             .filter(|cmd| {
                 cmd.is_valid(state)
                     && (command_filter.len() == 1 || cmd.name.starts_with(&command_filter[..2]))
+                    && (cmd.name != ".reasoning" || model_has_reasoning)
             })
             .collect();
         let commands = fuzzy_filter(commands, |v| v.name, &command_filter);

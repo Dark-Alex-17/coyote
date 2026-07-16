@@ -2025,6 +2025,18 @@ impl RequestContext {
             }
             "reasoning_effort" => {
                 let value: Option<String> = super::parse_value(value)?;
+                if let Some(ref level) = value {
+                    let levels = self.current_model().reasoning_levels();
+                    if levels.is_empty() {
+                        bail!("The current model does not support reasoning effort configuration");
+                    }
+                    if !levels.iter().any(|l| l == level) {
+                        bail!(
+                            "Invalid reasoning effort '{level}'. Supported levels for this model: {}",
+                            levels.join(", ")
+                        );
+                    }
+                }
                 if !self.set_reasoning_effort_on_role_like(value.clone()) {
                     self.update_app_config(|app| app.reasoning_effort = value);
                 }
@@ -2342,7 +2354,6 @@ impl RequestContext {
                         "continuation_prompt",
                         "temperature",
                         "top_p",
-                        "reasoning_effort",
                         "enabled_tools",
                         "enabled_mcp_servers",
                         "inject_todo_instructions",
@@ -2363,6 +2374,9 @@ impl RequestContext {
                         "save",
                         "highlight",
                     ];
+                    if !self.current_model().reasoning_levels().is_empty() {
+                        values.push("reasoning_effort");
+                    }
                     values.sort_unstable();
                     values
                         .into_iter()
@@ -2733,6 +2747,22 @@ impl RequestContext {
             None
         };
 
+        if let Some(ref effort) = role.reasoning_effort() {
+            let levels = role.model().reasoning_levels();
+            if levels.is_empty() {
+                bail!(
+                    "Role has reasoning_effort '{}' configured but the model does not support reasoning effort",
+                    effort
+                );
+            }
+            if !levels.iter().any(|l| l == effort) {
+                bail!(
+                    "Role's reasoning_effort '{}' is not valid for the model. Supported levels: {}",
+                    effort,
+                    levels.join(", ")
+                );
+            }
+        }
         self.use_role_obj(role)?;
         self.rebuild_tool_scope(app, mcp_servers, abort_signal)
             .await
@@ -2788,6 +2818,23 @@ impl RequestContext {
                 None
             };
 
+            if let Some(ref effort) = session.reasoning_effort() {
+                let levels = session.model().reasoning_levels();
+                if levels.is_empty() {
+                    bail!(
+                        "Session has reasoning_effort '{}' configured but the model does not support reasoning effort",
+                        effort
+                    );
+                }
+                if !levels.iter().any(|l| l == effort) {
+                    bail!(
+                        "Session's reasoning_effort '{}' is not valid for the model. Supported levels: {}",
+                        effort,
+                        levels.join(", ")
+                    );
+                }
+            }
+
             self.rebuild_tool_scope(app, mcp_servers, abort_signal.clone())
                 .await?;
 
@@ -2841,6 +2888,23 @@ impl RequestContext {
             abort_signal.clone(),
         )
         .await?;
+
+        if let Some(ref effort) = agent.reasoning_effort() {
+            let levels = agent.model().reasoning_levels();
+            if levels.is_empty() {
+                bail!(
+                    "Agent has reasoning_effort '{}' configured but the model does not support reasoning effort",
+                    effort
+                );
+            }
+            if !levels.iter().any(|l| l == effort) {
+                bail!(
+                    "Agent's reasoning_effort '{}' is not valid for the model. Supported levels: {}",
+                    effort,
+                    levels.join(", ")
+                );
+            }
+        }
 
         let is_graph_agent = graph::agent_has_graph(agent_name);
         if is_graph_agent && session_name.is_some() {
