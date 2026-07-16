@@ -52,7 +52,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 51]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 52]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -259,6 +259,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 51]> = LazyLock::new(|| {
         ),
         ReplCommand::new(".copy", "Copy last response", AssertState::pass()),
         ReplCommand::new(".set", "Modify runtime settings", AssertState::pass()),
+        ReplCommand::new(
+            ".reasoning",
+            "Set the reasoning effort level for the current model",
+            AssertState::pass(),
+        ),
         ReplCommand::new(
             ".delete",
             "Delete roles, sessions, RAGs, or agents",
@@ -1070,6 +1075,15 @@ pub async fn run_repl_command(
                     println!("Usage: .set <key> <value>...")
                 }
             },
+            ".reasoning" => match args {
+                Some(level) => {
+                    let set_args = format!("reasoning_effort {level}");
+                    ctx.update(&set_args, abort_signal).await?;
+                }
+                None => {
+                    println!("Usage: .reasoning <level>")
+                }
+            },
             ".delete" => match args {
                 Some(args) => {
                     ctx.delete(args)?;
@@ -1600,8 +1614,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_50_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 50);
+    fn repl_commands_has_52_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 52);
     }
 
     #[test]

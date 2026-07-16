@@ -286,6 +286,7 @@ pub struct ChatCompletionsData {
     pub messages: Vec<Message>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub reasoning_effort: Option<String>,
     pub functions: Option<Vec<FunctionDeclaration>>,
     pub stream: bool,
 }

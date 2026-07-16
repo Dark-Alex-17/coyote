@@ -356,6 +356,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         messages,
         temperature,
         top_p,
+        reasoning_effort,
         functions,
         stream,
     } = data;
@@ -454,6 +455,9 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
     if let Some(v) = top_p {
         body["top_p"] = v.into();
     }
+    if let Some(v) = reasoning_effort {
+        body["reasoning_effort"] = v.into();
+    }
     if stream {
         body["stream"] = true.into();
     }
@@ -534,6 +538,7 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
         messages,
         temperature,
         top_p,
+        reasoning_effort,
         functions,
         stream,
     } = data;
@@ -589,6 +594,9 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
     }
     if let Some(v) = top_p {
         body["top_p"] = v.into();
+    }
+    if let Some(v) = reasoning_effort {
+        body["reasoning"] = json!({ "effort": v });
     }
     if stream {
         body["stream"] = true.into();

@@ -969,6 +969,16 @@ impl RequestContext {
         }
     }
 
+    pub fn set_reasoning_effort_on_role_like(&mut self, value: Option<String>) -> bool {
+        match self.role_like_mut() {
+            Some(role_like) => {
+                role_like.set_reasoning_effort(value);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn set_enabled_tools_on_role_like(&mut self, value: Option<Vec<String>>) -> bool {
         match self.role_like_mut() {
             Some(role_like) => {
@@ -1121,6 +1131,10 @@ impl RequestContext {
                 super::format_option_value(&role.temperature()),
             ),
             ("top_p", super::format_option_value(&role.top_p())),
+            (
+                "reasoning_effort",
+                super::format_option_value(&role.reasoning_effort()),
+            ),
             (
                 "enabled_tools",
                 super::format_option_value(&role.enabled_tools().map(|v| v.join(","))),
@@ -2009,6 +2023,12 @@ impl RequestContext {
                     self.update_app_config(|app| app.top_p = value);
                 }
             }
+            "reasoning_effort" => {
+                let value: Option<String> = super::parse_value(value)?;
+                if !self.set_reasoning_effort_on_role_like(value.clone()) {
+                    self.update_app_config(|app| app.reasoning_effort = value);
+                }
+            }
             "enabled_tools" => {
                 let raw: Option<String> = super::parse_value(value)?;
                 let parsed: Option<Vec<String>> = raw.map(|s| super::csv_to_vec(&s));
@@ -2303,6 +2323,10 @@ impl RequestContext {
                     super::map_completion_values(values)
                 }
                 ".macro" => super::map_completion_values(paths::list_macros()),
+                ".reasoning" => {
+                    let levels = self.current_model().reasoning_levels();
+                    levels.iter().map(|v| (v.clone(), None)).collect()
+                }
                 ".starter" => match &self.agent {
                     Some(agent) => agent
                         .conversation_starters()
@@ -2318,6 +2342,7 @@ impl RequestContext {
                         "continuation_prompt",
                         "temperature",
                         "top_p",
+                        "reasoning_effort",
                         "enabled_tools",
                         "enabled_mcp_servers",
                         "inject_todo_instructions",
@@ -2507,6 +2532,10 @@ impl RequestContext {
                 }
                 "skill_instructions" => vec!["null".to_string()],
                 "memory" => super::complete_bool(self.should_inject_memory()),
+                "reasoning_effort" => {
+                    let levels = self.current_model().reasoning_levels();
+                    levels.to_vec()
+                }
                 _ => vec![],
             };
             values = candidates.into_iter().map(|v| (v, None)).collect();

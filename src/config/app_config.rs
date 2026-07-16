@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub model_id: String,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub reasoning_effort: Option<String>,
 
     pub dry_run: bool,
     pub stream: bool,
@@ -100,6 +101,7 @@ impl Default for AppConfig {
             model_id: Default::default(),
             temperature: None,
             top_p: None,
+            reasoning_effort: None,
 
             dry_run: false,
             stream: true,
@@ -177,6 +179,7 @@ impl AppConfig {
             model_id: config.model_id,
             temperature: config.temperature,
             top_p: config.top_p,
+            reasoning_effort: None,
 
             dry_run: config.dry_run,
             stream: config.stream,
@@ -425,6 +428,9 @@ impl AppConfig {
         }
         if let Some(v) = super::read_env_value::<f64>(&get_env_name("top_p")) {
             self.top_p = v;
+        }
+        if let Some(v) = super::read_env_value::<String>(&get_env_name("reasoning_effort")) {
+            self.reasoning_effort = v;
         }
 
         if let Some(Some(v)) = super::read_env_bool(&get_env_name("dry_run")) {

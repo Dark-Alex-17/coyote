@@ -24,6 +24,8 @@ pub struct Session {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -401,6 +403,7 @@ impl Session {
         self.model_id = role.model().id();
         self.temperature = role.temperature();
         self.top_p = role.top_p();
+        self.reasoning_effort = role.reasoning_effort();
         self.enabled_tools = role.enabled_tools();
         self.enabled_mcp_servers = role.enabled_mcp_servers();
         self.model = role.model().clone();
@@ -792,6 +795,10 @@ impl RoleLike for Session {
         self.top_p
     }
 
+    fn reasoning_effort(&self) -> Option<String> {
+        self.reasoning_effort.clone()
+    }
+
     fn enabled_tools(&self) -> Option<Vec<String>> {
         self.enabled_tools.clone()
     }
@@ -819,6 +826,13 @@ impl RoleLike for Session {
     fn set_top_p(&mut self, value: Option<f64>) {
         if self.top_p != value {
             self.top_p = value;
+            self.dirty = true;
+        }
+    }
+
+    fn set_reasoning_effort(&mut self, value: Option<String>) {
+        if self.reasoning_effort != value {
+            self.reasoning_effort = value;
             self.dirty = true;
         }
     }

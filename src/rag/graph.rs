@@ -362,6 +362,7 @@ pub async fn extract_entities(
         messages,
         temperature: Some(0.0),
         top_p: None,
+        reasoning_effort: None,
         functions: None,
         stream: false,
     };

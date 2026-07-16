@@ -289,6 +289,14 @@ impl Model {
         }
         Ok(())
     }
+
+    pub fn reasoning_levels(&self) -> &[String] {
+        &self.data.reasoning_levels
+    }
+
+    pub fn default_reasoning_effort(&self) -> Option<&str> {
+        self.data.default_reasoning_effort.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -316,6 +324,10 @@ pub struct ModelData {
     pub supports_vision: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_function_calling: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_levels: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     no_stream: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

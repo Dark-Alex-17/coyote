@@ -10,6 +10,8 @@
       output_price: 30
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh, max]
+      default_reasoning_effort: medium
     - name: gpt-5.6-terra
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -17,6 +19,8 @@
       output_price: 30
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh, max]
+      default_reasoning_effort: medium
     - name: gpt-5.6-luna
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -24,6 +28,8 @@
       output_price: 30
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh, max]
+      default_reasoning_effort: medium
     - name: gpt-5.5
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -31,6 +37,8 @@
       output_price: 30
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh]
+      default_reasoning_effort: medium
     - name: gpt-5.5-pro
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -38,6 +46,8 @@
       output_price: 180
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [medium, high, xhigh]
+      default_reasoning_effort: high
     - name: gpt-5.4
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -45,6 +55,8 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh]
+      default_reasoning_effort: none
     - name: gpt-5.4-pro
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -52,6 +64,8 @@
       output_price: 180
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [medium, high, xhigh]
+      default_reasoning_effort: medium
     - name: gpt-5.4-mini
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -59,6 +73,8 @@
       output_price: 4.5
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh]
+      default_reasoning_effort: none
     - name: gpt-5.4-nano
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -66,6 +82,8 @@
       output_price: 1.25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh]
+      default_reasoning_effort: none
     - name: gpt-5.3-codex
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -73,6 +91,8 @@
       output_price: 14
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh]
+      default_reasoning_effort: medium
     - name: chat-latest
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -87,6 +107,17 @@
       output_price: 14
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh]
+      default_reasoning_effort: none
+    - name: gpt-5.2-pro
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      input_price: 21
+      output_price: 168
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [medium, high, xhigh]
+      default_reasoning_effort: medium
     - name: gpt-5.1
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -94,6 +125,8 @@
       output_price: 10
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high]
+      default_reasoning_effort: none
     - name: gpt-5.1-chat-latest
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -101,6 +134,8 @@
       output_price: 10
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high]
+      default_reasoning_effort: none
     - name: gpt-5
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -108,6 +143,8 @@
       output_price: 10
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: medium
     - name: gpt-5-chat-latest
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -115,6 +152,8 @@
       output_price: 10
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: medium
     - name: gpt-5-mini
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -172,6 +211,8 @@
       supports_vision: true
       supports_function_calling: true
       system_prompt_prefix: Formatting re-enabled
+      reasoning_levels: [low, medium, high]
+      default_reasoning_effort: medium
       patch:
         body:
           max_tokens: null
@@ -285,18 +326,24 @@
       input_price: 0.2
       output_price: 1.5
       supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: medium
     - name: gemini-3-flash-preview
       max_input_tokens: 1048576
       max_output_tokens: 65536
       input_price: 0.2
       output_price: 1.5
       supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: high
     - name: gemini-3.1-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65536
       input_price: 0.2
       output_price: 1.5
       supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: minimal
     - name: gemini-3.1-pro-preview
       max_input_tokens: 1048576
       max_output_tokens: 65535
@@ -304,6 +351,8 @@
       output_price: 2.5
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high]
+      default_reasoning_effort: high
     - name: gemini-2.5-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -311,6 +360,8 @@
       output_price: 0
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high]
+      default_reasoning_effort: low
     - name: gemini-2.5-pro
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -318,6 +369,8 @@
       output_price: 0
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high]
+      default_reasoning_effort: high
     - name: gemini-2.5-flash-lite
       max_input_tokens: 1000000
       max_output_tokens: 64000
@@ -329,10 +382,14 @@
       max_input_tokens: 1048576
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, high]
+      default_reasoning_level: high
     - name: gemini-3-flash-preview
       max_input_tokens: 1048576
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_level: high
     - name: gemma-3-27b-it
       max_input_tokens: 131072
       max_output_tokens: 8192
@@ -358,6 +415,8 @@
       output_price: 50
       supports_function_calling: true
       supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -366,6 +425,8 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: claude-opus-4-7
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -374,6 +435,8 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: claude-opus-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -382,6 +445,8 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, max]
+      default_reasoning_effort: high
     - name: claude-opus-4-6:thinking
       real_name: claude-opus-4-6
       max_input_tokens: 200000
@@ -406,6 +471,8 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: claude-sonnet-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -414,6 +481,8 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, max]
+      default_reasoning_effort: high
     - name: claude-sonnet-4-6:thinking
       real_name: claude-sonnet-4-6
       max_input_tokens: 200000
@@ -856,18 +925,24 @@
       input_price: 0.2
       output_price: 1.5
       supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: medium
     - name: gemini-3-flash-preview
       max_input_tokens: 1048576
       max_output_tokens: 65536
       input_price: 0.2
       output_price: 1.5
       supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: high
     - name: gemini-3.1-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65536
       input_price: 0.2
       output_price: 1.5
       supports_function_calling: true
+      reasoning_levels: [minimal, high]
+      default_reasoning_effort: minimal
     - name: gemini-3.1-pro-preview
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -875,6 +950,8 @@
       output_price: 12
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high]
+      default_reasoning_effort: high
     - name: gemini-2.5-flash
       max_input_tokens: 1048576
       max_output_tokens: 65535
@@ -882,6 +959,8 @@
       output_price: 2.5
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high]
+      default_reasoning_effort: medium
     - name: gemini-2.5-pro
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -889,6 +968,8 @@
       output_price: 10
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high]
+      default_reasoning_effort: high
     - name: gemini-2.5-flash-lite
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -900,10 +981,14 @@
       max_input_tokens: 1048576
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, high]
+      default_reasoning_effort: high
     - name: gemini-3-flash-preview
       max_input_tokens: 1048576
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: high
     - name: claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -912,6 +997,8 @@
       output_price: 50
       supports_function_calling: true
       supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -920,6 +1007,8 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: claude-opus-4-7
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -928,6 +1017,8 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: claude-opus-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -959,6 +1050,8 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: claude-sonnet-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -967,6 +1060,8 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, max]
+      default_reasoning_effort: high
     - name: claude-sonnet-4-6:thinking
       real_name: claude-sonnet-4-6
       max_input_tokens: 200000
@@ -1099,6 +1194,8 @@
       output_price: 50
       supports_function_calling: true
       supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: us.anthropic.claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1107,6 +1204,8 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: us.anthropic.claude-opus-4-7
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1115,6 +1214,8 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: us.anthropic.claude-opus-4-6-v1
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -1123,6 +1224,8 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, max]
+      default_reasoning_effort: high
     - name: us.anthropic.claude-opus-4-6-v1:thinking
       real_name: us.anthropic.claude-opus-4-6-v1
       max_input_tokens: 200000
@@ -1148,6 +1251,8 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: us.anthropic.claude-sonnet-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -1156,6 +1261,8 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, max]
+      default_reasoning_effort: high
     - name: us.anthropic.claude-sonnet-4-6:thinking
       real_name: us.anthropic.claude-sonnet-4-6
       max_input_tokens: 200000
@@ -1672,6 +1779,8 @@
       output_price: 30
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh, max]
+      default_reasoning_effort: medium
     - name: openai/gpt-5.6-terra
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -1679,6 +1788,8 @@
       output_price: 30
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh, max]
+      default_reasoning_effort: medium
     - name: openai/gpt-5.6-luna
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -1686,6 +1797,8 @@
       output_price: 30
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh, max]
+      default_reasoning_effort: medium
     - name: openai/gpt-5.5
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -1693,6 +1806,8 @@
       output_price: 30
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh]
+      default_reasoning_effort: medium
     - name: openai/gpt-5.5-pro
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -1700,6 +1815,8 @@
       output_price: 180
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [medium, high, xhigh]
+      default_reasoning_effort: high
     - name: openai/gpt-5.4
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -1707,6 +1824,8 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh]
+      default_reasoning_effort: none
     - name: openai/gpt-5.4-pro
       max_input_tokens: 1050000
       max_output_tokens: 128000
@@ -1714,6 +1833,8 @@
       output_price: 180
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [medium, high, xhigh]
+      default_reasoning_effort: medium
     - name: openai/gpt-5.4-mini
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -1721,6 +1842,8 @@
       output_price: 4.5
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh]
+      default_reasoning_effort: none
     - name: openai/gpt-5.4-nano
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -1728,6 +1851,8 @@
       output_price: 1.25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh]
+      default_reasoning_effort: none
     - name: openai/gpt-5.3-codex
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -1735,6 +1860,8 @@
       output_price: 14
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh]
+      default_reasoning_effort: medium
     - name: openai/gpt-5.2
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -1742,6 +1869,17 @@
       output_price: 14
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [none, low, medium, high, xhigh]
+      default_reasoning_effort: none
+    - name: openai/gpt-5.2-pro
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      input_price: 21
+      output_price: 168
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [medium, high, xhigh]
+      default_reasoning_effort: medium
     - name: openai/gpt-5
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -1749,6 +1887,8 @@
       output_price: 10
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: medium
     - name: openai/gpt-5-mini
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -1786,18 +1926,67 @@
       input_price: 0.04
       output_price: 0.16
       supports_function_calling: true
+    - name: google/gemini-3.5-flash
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.2
+      output_price: 1.5
+      supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: medium
+    - name: google/gemini-3-flash-preview
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.2
+      output_price: 1.5
+      supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: high
+    - name: google/gemini-3.1-flash-lite
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.2
+      output_price: 1.5
+      supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: minimal
+    - name: google/gemini-3.1-pro-preview
+      max_input_tokens: 1048576
+      max_output_tokens: 65535
+      input_price: 0.3
+      output_price: 2.5
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [low, medium, high]
+      default_reasoning_effort: high
+    - name: google/gemini-3-pro-preview
+      max_input_tokens: 1048576
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [low, high]
+      default_reasoning_level: high
+    - name: google/gemini-3-flash-preview
+      max_input_tokens: 1048576
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_level: high
     - name: google/gemini-2.5-flash
       max_input_tokens: 1048576
       input_price: 0.3
       output_price: 2.5
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high]
+      default_reasoning_effort: low
     - name: google/gemini-2.5-pro
       max_input_tokens: 1048576
       input_price: 1.25
       output_price: 10
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high]
+      default_reasoning_effort: high
     - name: google/gemini-2.5-flash-lite
       max_input_tokens: 1048576
       input_price: 0.3
@@ -1827,6 +2016,8 @@
       output_price: 50
       supports_function_calling: true
       supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: anthropic/claude-opus-4-8
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1835,6 +2026,8 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: anthropic/claude-opus-4-7
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1843,6 +2036,8 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: anthropic/claude-opus-4.6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -1851,6 +2046,8 @@
       output_price: 25
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, max]
+      default_reasoning_effort: high
     - name: anthropic/claude-sonnet-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1859,6 +2056,8 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: anthropic/claude-sonnet-4.6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -1867,6 +2066,8 @@
       output_price: 15
       supports_vision: true
       supports_function_calling: true
+      reasoning_levels: [low, medium, high, max]
+      default_reasoning_effort: high
     - name: anthropic/claude-opus-4.5
       max_input_tokens: 200000
       max_output_tokens: 8192

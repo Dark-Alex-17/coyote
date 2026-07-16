@@ -329,6 +329,9 @@ fn build_inline_role(
     if let Some(p) = node.top_p {
         role.set_top_p(Some(p));
     }
+    if let Some(v) = &node.reasoning_effort {
+        role.set_reasoning_effort(Some(v.clone()));
+    }
 
     if node.tools.as_deref().unwrap_or_default().is_empty() {
         role.set_enabled_tools(Some(Vec::new()));
@@ -499,6 +502,7 @@ mod tests {
             model: None,
             temperature: None,
             top_p: None,
+            reasoning_effort: None,
             fallback: None,
             max_attempts: 1,
             max_iterations: 10,

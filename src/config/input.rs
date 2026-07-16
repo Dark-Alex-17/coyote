@@ -253,6 +253,10 @@ impl Input {
         patch_messages(&mut messages, model);
         model.guard_max_input_tokens(&messages)?;
         let (temperature, top_p) = (self.role().temperature(), self.role().top_p());
+        let reasoning_effort = self
+            .role()
+            .reasoning_effort()
+            .or_else(|| model.default_reasoning_effort().map(|s| s.to_string()));
         let functions = if model.supports_function_calling() {
             let fns = self.functions.clone();
             if let Some(vec) = &fns {
@@ -268,6 +272,7 @@ impl Input {
             messages,
             temperature,
             top_p,
+            reasoning_effort,
             functions,
             stream,
         })

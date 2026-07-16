@@ -32,7 +32,9 @@ pub trait RoleLike {
     fn enabled_mcp_servers(&self) -> Option<Vec<String>>;
     fn set_model(&mut self, model: Model);
     fn set_temperature(&mut self, value: Option<f64>);
+    fn reasoning_effort(&self) -> Option<String>;
     fn set_top_p(&mut self, value: Option<f64>);
+    fn set_reasoning_effort(&mut self, value: Option<String>);
     fn set_enabled_tools(&mut self, value: Option<Vec<String>>);
     fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>);
 }
@@ -51,6 +53,8 @@ pub struct Role {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -116,6 +120,9 @@ impl Role {
                     "model" => role.model_id = value.as_str().map(|v| v.to_string()),
                     "temperature" => role.temperature = value.as_f64(),
                     "top_p" => role.top_p = value.as_f64(),
+                    "reasoning_effort" => {
+                        role.reasoning_effort = value.as_str().map(|v| v.to_string())
+                    }
                     "enabled_tools" => role.enabled_tools = parse_string_or_array(value),
                     "enabled_mcp_servers" => {
                         role.enabled_mcp_servers = parse_string_or_array(value)
@@ -169,6 +176,9 @@ impl Role {
         }
         if let Some(top_p) = self.top_p() {
             metadata.push(format!("top_p: {top_p}"));
+        }
+        if let Some(reasoning_effort) = self.reasoning_effort() {
+            metadata.push(format!("reasoning_effort: {reasoning_effort}"));
         }
         if let Some(enabled_tools) = &self.enabled_tools {
             let inline = serde_json::to_string(enabled_tools).unwrap_or_else(|_| "[]".to_string());
@@ -256,6 +266,9 @@ impl Role {
             enabled_tools,
             enabled_mcp_servers,
         );
+        if let Some(v) = role_like.reasoning_effort() {
+            self.set_reasoning_effort(Some(v));
+        }
     }
 
     pub fn batch_set(
@@ -410,6 +423,10 @@ impl RoleLike for Role {
         self.top_p
     }
 
+    fn reasoning_effort(&self) -> Option<String> {
+        self.reasoning_effort.clone()
+    }
+
     fn enabled_tools(&self) -> Option<Vec<String>> {
         self.enabled_tools.clone()
     }
@@ -431,6 +448,10 @@ impl RoleLike for Role {
 
     fn set_top_p(&mut self, value: Option<f64>) {
         self.top_p = value;
+    }
+
+    fn set_reasoning_effort(&mut self, value: Option<String>) {
+        self.reasoning_effort = value;
     }
 
     fn set_enabled_tools(&mut self, value: Option<Vec<String>>) {

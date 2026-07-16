@@ -575,6 +575,10 @@ impl RoleLike for Agent {
         self.config.top_p
     }
 
+    fn reasoning_effort(&self) -> Option<String> {
+        self.config.reasoning_effort.clone()
+    }
+
     fn enabled_tools(&self) -> Option<Vec<String>> {
         None
     }
@@ -594,6 +598,10 @@ impl RoleLike for Agent {
 
     fn set_top_p(&mut self, value: Option<f64>) {
         self.config.top_p = value;
+    }
+
+    fn set_reasoning_effort(&mut self, value: Option<String>) {
+        self.config.reasoning_effort = value;
     }
 
     fn set_enabled_tools(&mut self, value: Option<Vec<String>>) {
@@ -636,6 +644,8 @@ pub struct AgentConfig {
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<String>,
     #[serde(default)]
@@ -732,6 +742,7 @@ impl AgentConfig {
             model_id: graph.model.clone(),
             temperature: graph.temperature,
             top_p: graph.top_p,
+            reasoning_effort: graph.reasoning_effort.clone(),
             description: graph.description.clone(),
             global_tools: graph.global_tools.clone(),
             mcp_servers: graph.mcp_servers.clone(),
@@ -765,6 +776,9 @@ impl AgentConfig {
         }
         if let Some(v) = read_env_value::<f64>(&with_prefix("top_p")) {
             self.top_p = v;
+        }
+        if let Some(v) = read_env_value::<String>(&with_prefix("reasoning_effort")) {
+            self.reasoning_effort = v;
         }
         if let Ok(v) = env::var(with_prefix("global_tools"))
             && let Ok(v) = serde_json::from_str(&v)

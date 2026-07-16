@@ -25,6 +25,9 @@ pub struct Graph {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+
     #[serde(default)]
     pub global_tools: Vec<String>,
 
@@ -287,6 +290,9 @@ pub struct LlmNode {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,

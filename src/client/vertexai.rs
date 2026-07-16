@@ -334,6 +334,7 @@ pub fn gemini_build_chat_completions_body(
         mut messages,
         temperature,
         top_p,
+        reasoning_effort,
         functions,
         stream: _,
     } = data;
@@ -425,6 +426,9 @@ pub fn gemini_build_chat_completions_body(
     }
     if let Some(v) = top_p {
         body["generationConfig"]["topP"] = v.into();
+    }
+    if let Some(v) = reasoning_effort {
+        body["generation_config"]["thinking_level"] = v.into();
     }
 
     if let Some(functions) = functions {

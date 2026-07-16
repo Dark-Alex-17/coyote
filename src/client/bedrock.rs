@@ -325,6 +325,7 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
         mut messages,
         temperature,
         top_p,
+        reasoning_effort,
         functions,
         stream: _,
     } = data;
@@ -456,6 +457,9 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
     }
     if let Some(v) = top_p {
         body["inferenceConfig"]["topP"] = v.into();
+    }
+    if let Some(v) = reasoning_effort {
+        body["additionalModelRequestFields"] = json!({ "output_config": { "effort": v } });
     }
     if let Some(functions) = functions {
         let tools: Vec<_> = functions
