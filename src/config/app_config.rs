@@ -1,4 +1,4 @@
-use crate::client::{ClientConfig, list_models};
+use crate::client::{ClientConfig, Model, ModelType, list_models};
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, get_env_name};
 
@@ -256,6 +256,7 @@ impl AppConfig {
         app_config.setup_document_loaders();
         app_config.setup_user_agent();
         app_config.resolve_model()?;
+        app_config.validate_reasoning_effort()?;
         Ok(app_config)
     }
 
@@ -271,6 +272,31 @@ impl AppConfig {
             if !paths::has_skill(name) {
                 bail!("visible_skills references skill '{name}' which is not installed");
             }
+        }
+
+        Ok(())
+    }
+
+    fn validate_reasoning_effort(&self) -> Result<()> {
+        let Some(ref effort) = self.reasoning_effort else {
+            return Ok(());
+        };
+        let model = Model::retrieve_model(self, &self.model_id, ModelType::Chat)?;
+        let levels = model.reasoning_levels();
+
+        if levels.is_empty() {
+            bail!(
+                "reasoning_effort '{}' is configured but the model does not support reasoning effort",
+                effort
+            );
+        }
+
+        if !levels.iter().any(|l| l == effort) {
+            bail!(
+                "reasoning_effort '{}' is not valid for the model. Supported levels: {}",
+                effort,
+                levels.join(", ")
+            );
         }
 
         Ok(())
