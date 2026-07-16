@@ -2,7 +2,7 @@ use super::{MarkdownRender, SseEvent};
 
 use crate::utils::{AbortSignal, poll_abort_signal, spawn_spinner};
 
-use anyhow::{Error, Result};
+use anyhow::Result;
 use crossterm::{
     cursor, queue, style,
     terminal::{self, disable_raw_mode, enable_raw_mode},
@@ -74,6 +74,8 @@ async fn markdown_stream_inner(
     let mut buffer_rows = 1;
 
     let columns = terminal::size()?.0;
+    let mut last_col: u16 = 0;
+    let mut last_row: u16 = 0;
 
     let mut spinner = Some(spawn_spinner("Generating"));
 
@@ -94,9 +96,16 @@ async fn markdown_stream_inner(
                     let mut attempts = 0;
                     let (col, mut row) = loop {
                         match cursor::position() {
-                            Ok(pos) => break pos,
-                            Err(_) if attempts < 3 => attempts += 1,
-                            Err(e) => return Err(Error::from(e)),
+                            Ok(pos) => {
+                                last_col = pos.0;
+                                last_row = pos.1;
+                                break pos;
+                            }
+                            Err(_) if attempts < 5 => {
+                                attempts += 1;
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            Err(_) => break (last_col, last_row),
                         }
                     };
 
@@ -142,7 +151,6 @@ async fn markdown_stream_inner(
                         queue!(writer, style::Print(&output))?;
                         buffer_rows = need_rows(&output, columns);
                     }
-
                     writer.flush()?;
                 }
                 SseEvent::Done => {
