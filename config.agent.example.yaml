@@ -13,6 +13,8 @@
 model: openai:gpt-4o             # Specify the LLM to use
 temperature: null                # Set default temperature parameter, range (0, 1)
 top_p: null                      # Set default top-p parameter, with a range of (0, 1) or (0, 2) depending on the model
+reasoning_effort: null           # Reasoning effort level for models that support it (e.g. low, medium, high).
+                                 # Only valid when the agent's model declares reasoning_levels.
 agent_session: null              # Set a session to use when starting the agent. (e.g. temp, default); defaults to globally set agent_session
 name: <agent-name>               # Name of the agent, used in the UI and logs
 description: <description>       # Description of the agent, used in the UI

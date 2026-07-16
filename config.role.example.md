@@ -8,6 +8,8 @@ name: <role-name>                     # The name of the role
 model: openai:gpt-4o                  # The model to use for this role
 temperature: 0.2                      # The temperature to use for this role when querying the model
 top_p: 0                              # The top_p to use for this role when querying the model
+reasoning_effort: null                # Reasoning effort level for models that support it (e.g. low, medium, high).
+                                      # Only valid when the role's model declares reasoning_levels.
 enabled_tools:                        # Tools to enable for this role. Accepts a YAML list (preferred)
   - fs_ls                             # or a comma-separated string (e.g. `enabled_tools: fs_ls,fs_cat`).
   - fs_cat                            # Use `all` to enable every visible tool.

@@ -33,6 +33,8 @@ version: "1.0"                     # Graph schema version. Only "1.0" is accepte
 model: claude:claude-sonnet-4-6    # Default model for `llm` nodes that don't override it
 temperature: 0.0                   # Default sampling temperature for `llm` nodes
 top_p: null                        # Default sampling top-p for `llm` nodes
+reasoning_effort: null             # Default reasoning effort for `llm` nodes that don't override it.
+                                   # Only valid when the model declares reasoning_levels.
 
 global_tools:                      # Tool universe an `llm` node's `tools:` whitelist draws from
   - web_search_coyote.sh
@@ -394,6 +396,7 @@ nodes:
       - mcp:ddg-search         #   `mcp:<server>` includes that server's functions
     model: claude:claude-haiku-4-5  # Optional per-node model override
     temperature: 0.3           # Optional per-node sampling override
+    reasoning_effort: null     # Optional per-node reasoning effort override (e.g. low, medium, high)
     max_attempts: 2            # Retry count on transient errors only. Default 1.
     max_iterations: 10         # Tool-call-loop turn cap. Default 10.
     fallback: review           # Route here if all attempts fail
