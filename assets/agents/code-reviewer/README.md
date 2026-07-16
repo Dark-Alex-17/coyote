@@ -16,7 +16,7 @@ agents while handling coordination and final reporting.
 ## Pro-Tip: Use an IDE MCP Server for Improved Performance
 Many modern IDEs now include MCP servers that let LLMs perform operations within the IDE itself and use IDE tools. Using
 an IDE's MCP server dramatically improves the performance of coding agents. So if you have an IDE, try adding that MCP
-server to your config (see the [MCP Server docs](../../../docs/function-calling/MCP-SERVERS.md) to see how to configure
+server to your config (see the [MCP Server docs](https://github.com/Dark-Alex-17/coyote/wiki/MCP-Servers) to see how to configure
 them), and modify the agent definition to look like this:
 
 ```yaml
