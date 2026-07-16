@@ -1781,4 +1781,91 @@ mod tests {
         assert_eq!(file_idx, 0);
         assert_eq!(doc_idx, 0);
     }
+
+    #[test]
+    fn rag_data_del_removes_graph_entities() {
+        use super::graph::{ExtractedEntity, ExtractionResult};
+        let mut data = RagData::new(
+            "m".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+        let file = RagFile {
+            hash: "abc".into(),
+            path: "test.txt".into(),
+            documents: vec![RagDocument::new("Python is great")],
+        };
+        data.files.insert(0, file);
+        let doc_id = DocumentId::new(0, 0);
+        data.knowledge_graph.merge(
+            doc_id,
+            ExtractionResult {
+                entities: vec![ExtractedEntity {
+                    name: "Python".to_string(),
+                    entity_type: "TECHNOLOGY".to_string(),
+                    description: None,
+                }],
+                relationships: vec![],
+            },
+        );
+        assert!(
+            data.knowledge_graph.entity_index.contains_key("python"),
+            "entity should exist before del"
+        );
+        data.del(vec![0]);
+        assert!(
+            !data.knowledge_graph.entity_index.contains_key("python"),
+            "entity should be removed after del"
+        );
+    }
+
+    #[test]
+    fn reciprocal_rank_fusion_empty_lists() {
+        let result = super::reciprocal_rank_fusion(vec![], vec![], 5);
+        assert!(result.is_empty(), "empty input should produce empty output");
+    }
+
+    #[test]
+    fn reciprocal_rank_fusion_deduplicates_across_signals() {
+        let doc_a = DocumentId::new(0, 0);
+        let doc_b = DocumentId::new(0, 1);
+        let result = super::reciprocal_rank_fusion(
+            vec![vec![doc_a, doc_b], vec![doc_a, doc_b]],
+            vec![1.0, 1.0],
+            5,
+        );
+        let unique: std::collections::HashSet<_> = result.iter().collect();
+        assert_eq!(
+            unique.len(),
+            result.len(),
+            "each document should appear at most once"
+        );
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn reciprocal_rank_fusion_respects_top_k() {
+        let docs: Vec<DocumentId> = (0..10).map(|i| DocumentId::new(0, i)).collect();
+        let result = super::reciprocal_rank_fusion(vec![docs], vec![1.0], 3);
+        assert_eq!(result.len(), 3, "result should be capped at top_k=3");
+    }
+
+    #[test]
+    fn reciprocal_rank_fusion_weights_affect_ranking() {
+        let doc_a = DocumentId::new(0, 0);
+        let doc_b = DocumentId::new(0, 1);
+        let result = super::reciprocal_rank_fusion(
+            vec![vec![doc_a, doc_b], vec![doc_b, doc_a]],
+            vec![10.0, 1.0],
+            2,
+        );
+        assert_eq!(
+            result[0], doc_a,
+            "higher-weight signal's top doc should rank first"
+        );
+    }
 }

@@ -732,4 +732,143 @@ mod tests {
         assert!(docs.contains(&DocumentId(0)));
         assert!(docs.contains(&DocumentId(1)));
     }
+
+    #[test]
+    fn compact_preserves_edges_between_survivors() {
+        let mut kg = KnowledgeGraph::default();
+        kg.merge(doc(0), extraction(vec![entity("A", "CONCEPT")], vec![]));
+        kg.merge(
+            doc(1),
+            extraction(
+                vec![entity("B", "CONCEPT"), entity("C", "CONCEPT")],
+                vec![rel("B", "C", "linked", 0.8)],
+            ),
+        );
+        kg.remove_documents(&[doc(0)]);
+        let b_raw = kg.entity_index["b"];
+        let c_raw = kg.entity_index["c"];
+        let b_idx = NodeIndex::new(b_raw as usize);
+        let c_idx = NodeIndex::new(c_raw as usize);
+        assert_eq!(
+            kg.graph.edges_connecting(b_idx, c_idx).count(),
+            1,
+            "B→C edge should survive compaction"
+        );
+    }
+
+    #[test]
+    fn expand_two_hops_reaches_transitive_neighbor() {
+        let mut kg = KnowledgeGraph::default();
+        kg.merge(
+            doc(0),
+            extraction(
+                vec![
+                    entity("A", "CONCEPT"),
+                    entity("B", "CONCEPT"),
+                    entity("C", "CONCEPT"),
+                ],
+                vec![rel("A", "B", "uses", 1.0), rel("B", "C", "uses", 0.5)],
+            ),
+        );
+        let a_raw = kg.entity_index["a"];
+        let c_raw = kg.entity_index["c"];
+
+        let one_hop = kg.expand_neighbors_scored(&[(a_raw, 1.0)], 1);
+        assert!(
+            !one_hop.contains_key(&c_raw),
+            "C should not be reachable at 1 hop"
+        );
+
+        let two_hop = kg.expand_neighbors_scored(&[(a_raw, 1.0)], 2);
+        assert!(
+            two_hop.contains_key(&c_raw),
+            "C should be reachable at 2 hops"
+        );
+        let c_score = two_hop[&c_raw];
+        assert!(
+            (c_score - 0.5).abs() < 1e-6,
+            "C score should be 1.0 * 1.0 * 0.5 = 0.5, got {c_score}"
+        );
+    }
+
+    #[test]
+    fn merge_clamps_edge_weight_above_one() {
+        let mut kg = KnowledgeGraph::default();
+        kg.merge(
+            doc(0),
+            extraction(
+                vec![entity("A", "CONCEPT"), entity("B", "CONCEPT")],
+                vec![rel("A", "B", "uses", 1.5)],
+            ),
+        );
+        let a_raw = kg.entity_index["a"];
+        let b_raw = kg.entity_index["b"];
+        let result = kg.expand_neighbors_scored(&[(a_raw, 1.0)], 1);
+        let b_score = result[&b_raw];
+        assert!(
+            (b_score - 1.0).abs() < 1e-6,
+            "weight 1.5 clamped to 1.0: b_score should be 1.0, got {b_score}"
+        );
+    }
+
+    #[test]
+    fn merge_clamps_edge_weight_below_zero() {
+        let mut kg = KnowledgeGraph::default();
+        kg.merge(
+            doc(0),
+            extraction(
+                vec![entity("A", "CONCEPT"), entity("B", "CONCEPT")],
+                vec![rel("A", "B", "uses", -0.5)],
+            ),
+        );
+        let a_raw = kg.entity_index["a"];
+        let b_raw = kg.entity_index["b"];
+        let result = kg.expand_neighbors_scored(&[(a_raw, 1.0)], 1);
+        let b_score = result.get(&b_raw).copied().unwrap_or(0.0);
+        assert!(
+            b_score.abs() < 1e-6,
+            "weight -0.5 clamped to 0.0: b_score should be 0.0, got {b_score}"
+        );
+    }
+
+    #[test]
+    fn merge_fills_missing_description_from_later_chunk() {
+        let mut kg = KnowledgeGraph::default();
+        kg.merge(
+            doc(0),
+            extraction(vec![entity("Python", "TECHNOLOGY")], vec![]),
+        );
+        kg.merge(
+            doc(1),
+            ExtractionResult {
+                entities: vec![ExtractedEntity {
+                    name: "python".to_string(),
+                    entity_type: "TECHNOLOGY".to_string(),
+                    description: Some("A general-purpose language".to_string()),
+                }],
+                relationships: vec![],
+            },
+        );
+        let raw = kg.entity_index["python"];
+        let desc = &kg.graph[NodeIndex::new(raw as usize)].description;
+        assert_eq!(
+            desc.as_deref(),
+            Some("A general-purpose language"),
+            "description should be backfilled from later chunk"
+        );
+    }
+
+    #[test]
+    fn remove_all_documents_empties_graph() {
+        let mut kg = KnowledgeGraph::default();
+        kg.merge(doc(0), extraction(vec![entity("A", "CONCEPT")], vec![]));
+        kg.merge(doc(1), extraction(vec![entity("B", "CONCEPT")], vec![]));
+        kg.remove_documents(&[doc(0), doc(1)]);
+        assert_eq!(kg.graph.node_count(), 0, "all nodes should be removed");
+        assert_eq!(kg.entity_index.len(), 0, "entity index should be empty");
+        assert!(
+            kg.document_entities.is_empty(),
+            "document_entities should be empty"
+        );
+    }
 }
