@@ -777,6 +777,7 @@ impl RequestContext {
             let mut role = Role::default();
             role.batch_set(
                 &self.model,
+                app.reasoning_effort.clone(),
                 app.temperature,
                 app.top_p,
                 app.enabled_tools.clone(),

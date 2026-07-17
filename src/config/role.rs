@@ -255,31 +255,34 @@ impl Role {
 
     pub fn sync<T: RoleLike>(&mut self, role_like: &T) {
         let model = role_like.model();
+        let reasoning_effort = role_like.reasoning_effort();
         let temperature = role_like.temperature();
         let top_p = role_like.top_p();
         let enabled_tools = role_like.enabled_tools();
         let enabled_mcp_servers = role_like.enabled_mcp_servers();
         self.batch_set(
             model,
+            reasoning_effort,
             temperature,
             top_p,
             enabled_tools,
             enabled_mcp_servers,
         );
-        if let Some(v) = role_like.reasoning_effort() {
-            self.set_reasoning_effort(Some(v));
-        }
     }
 
     pub fn batch_set(
         &mut self,
         model: &Model,
+        reasoning_effort: Option<String>,
         temperature: Option<f64>,
         top_p: Option<f64>,
         enabled_tools: Option<Vec<String>>,
         enabled_mcp_servers: Option<Vec<String>>,
     ) {
         self.set_model(model.clone());
+        if reasoning_effort.is_some() {
+            self.set_reasoning_effort(reasoning_effort.clone());
+        }
         if temperature.is_some() {
             self.set_temperature(temperature);
         }
