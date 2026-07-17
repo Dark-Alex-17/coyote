@@ -144,7 +144,6 @@ pub async fn eval_tool_calls(
     if calls.is_empty() {
         bail!("The request was aborted because an infinite loop of function calls was detected.")
     }
-    let mut is_all_null = true;
     for call in calls {
         if let Some(msg) = ctx.tool_scope.tool_tracker.check_loop(&call.clone()) {
             let dup_msg = format!("{{\"tool_call_loop_alert\":{}}}", msg.trim());
@@ -154,19 +153,10 @@ pub async fn eval_tool_calls(
             );
             let val = json!(dup_msg);
             output.push(ToolResult::new(call, val));
-            is_all_null = false;
             continue;
         }
-        let mut result = call.eval(ctx).await?;
-        if result.is_null() {
-            result = json!("DONE");
-        } else {
-            is_all_null = false;
-        }
-        output.push(ToolResult::new(call, result));
-    }
-    if is_all_null {
-        output = vec![];
+        let result = call.eval(ctx).await?;
+        output.push(ToolResult::new(call, normalize_tool_result(result)));
     }
 
     if !output.is_empty() {
@@ -194,6 +184,19 @@ pub async fn eval_tool_calls(
     }
 
     Ok(output)
+}
+
+/// Tools that succeed silently (e.g. `mkdir -p` via execute_command) evaluate to
+/// `Null`. Substitute a concrete `"DONE"` marker so every call produces a
+/// `ToolResult`: agentic loops (graph llm nodes, spawned agents, the REPL) treat
+/// an empty `tool_results` as "the LLM concluded", so dropping silent results
+/// would prematurely terminate a turn that called only silent tools.
+fn normalize_tool_result(result: Value) -> Value {
+    if result.is_null() {
+        json!("DONE")
+    } else {
+        result
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1525,6 +1528,21 @@ mod tests {
 
     fn call_with_args(name: &str, args: Value) -> ToolCall {
         ToolCall::new(name.to_string(), args, Some("id1".to_string()))
+    }
+
+    #[test]
+    fn normalize_tool_result_substitutes_done_for_null() {
+        assert_eq!(normalize_tool_result(Value::Null), json!("DONE"));
+    }
+
+    #[test]
+    fn normalize_tool_result_preserves_non_null_values() {
+        assert_eq!(
+            normalize_tool_result(json!({"output": "hi"})),
+            json!({"output": "hi"})
+        );
+        assert_eq!(normalize_tool_result(json!("")), json!(""));
+        assert_eq!(normalize_tool_result(json!(false)), json!(false));
     }
 
     #[test]
