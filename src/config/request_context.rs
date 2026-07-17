@@ -1031,6 +1031,273 @@ impl RequestContext {
         }
     }
 
+    fn concrete_tool_names(&self) -> Vec<String> {
+        self.tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .filter(|v| {
+                !v.name.starts_with("user__")
+                    && !v.name.starts_with("mcp_")
+                    && !v.name.starts_with("todo__")
+                    && !v.name.starts_with("agent__")
+            })
+            .map(|v| v.name.clone())
+            .collect()
+    }
+
+    fn tool_list_covers(&self, list: &[String], name: &str) -> bool {
+        for item in list {
+            let item = item.trim();
+            if item == name {
+                return true;
+            }
+
+            if let Some(values) = self.app.config.mapping_tools.get(item)
+                && values.split(',').any(|v| v.trim() == name)
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn mcp_list_covers(&self, list: &[String], name: &str) -> bool {
+        for item in list {
+            let item = item.trim();
+            if item == name {
+                return true;
+            }
+
+            if let Some(values) = self.app.config.mapping_mcp_servers.get(item)
+                && values.split(',').any(|v| v.trim() == name)
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn write_layer_label(&self) -> &'static str {
+        if self.session.is_some() {
+            "session"
+        } else if self.agent.is_some() {
+            "agent"
+        } else if self.role.is_some() {
+            "role"
+        } else {
+            "global, in-memory"
+        }
+    }
+
+    pub fn toggle_tool(&mut self, action: &str, name: &str) -> Result<()> {
+        let name = name.trim();
+        let enable = match action {
+            "enable" => true,
+            "disable" => false,
+            _ => bail!("Unknown action '{action}'. Usage: .tool <enable|disable> <name>"),
+        };
+
+        if self.session.is_none() && self.agent.is_some() {
+            bail!(
+                "Cannot adjust tools for an agent outside a session; start a session first with `.session`"
+            );
+        }
+
+        let pool = self.concrete_tool_names();
+        let is_alias = self.app.config.mapping_tools.contains_key(name);
+        if !pool.iter().any(|v| v == name) && !is_alias {
+            bail!("Unknown tool '{name}'. Run `.list tools` to see what's available");
+        }
+
+        let current: Option<Vec<String>> = if let Some(session) = &self.session {
+            session.enabled_tools()
+        } else if let Some(role) = &self.role {
+            role.enabled_tools()
+        } else {
+            self.app.config.enabled_tools.clone()
+        };
+        let layer = self.write_layer_label();
+
+        let new_list: Vec<String> = if enable {
+            match current {
+                Some(list) if list.iter().any(|s| s.trim() == "all") => {
+                    println!("Tool '{name}' is already enabled ('all' is set).");
+                    return Ok(());
+                }
+                Some(list) if self.tool_list_covers(&list, name) => {
+                    println!("Tool '{name}' is already enabled.");
+                    return Ok(());
+                }
+                Some(mut list) => {
+                    list.push(name.to_string());
+                    list
+                }
+                None => vec![name.to_string()],
+            }
+        } else {
+            match current {
+                None => {
+                    println!("No tools are enabled in this context; nothing to disable.");
+                    return Ok(());
+                }
+                Some(list) if list.is_empty() => {
+                    println!("No tools are enabled in this context; nothing to disable.");
+                    return Ok(());
+                }
+                Some(list) if list.iter().any(|s| s.trim() == "all") => {
+                    let mut materialized = pool;
+                    materialized.retain(|v| v != name);
+                    println!(
+                        "Note: expanded 'all' into {} concrete tools.",
+                        materialized.len()
+                    );
+                    materialized
+                }
+                Some(mut list) => {
+                    if list.iter().any(|s| s.trim() == name) {
+                        list.retain(|s| s.trim() != name);
+                        list
+                    } else if self.tool_list_covers(&list, name) {
+                        bail!(
+                            "Tool '{name}' is enabled via an alias in 'mapping_tools'. \
+                             Disable the alias instead, or set the list explicitly with `.set enabled_tools`."
+                        );
+                    } else {
+                        println!("Tool '{name}' is not enabled; nothing to do.");
+                        return Ok(());
+                    }
+                }
+            }
+        };
+
+        let new_list = Some(new_list);
+
+        if !self.set_enabled_tools_on_role_like(new_list.clone()) {
+            self.update_app_config(|app| app.enabled_tools = new_list.clone());
+        }
+
+        let verb = if enable { "Enabled" } else { "Disabled" };
+        println!("✓ {verb} tool '{name}' ({layer}).");
+
+        Ok(())
+    }
+
+    pub async fn toggle_mcp_server(
+        &mut self,
+        action: &str,
+        name: &str,
+        abort_signal: AbortSignal,
+    ) -> Result<()> {
+        let name = name.trim();
+        let enable = match action {
+            "enable" => true,
+            "disable" => false,
+            _ => bail!("Unknown action '{action}'. Usage: .mcp <enable|disable> <server_name>"),
+        };
+
+        if self.agent.is_some() {
+            bail!(
+                "Agent MCP servers are defined by the agent's config ('mcp_servers'); \
+                 edit the agent config with `.edit agent-config` instead."
+            );
+        }
+
+        let configured_keys: Vec<String> = match &self.app.mcp_config {
+            Some(mcp_config) if !mcp_config.mcp_servers.is_empty() => {
+                mcp_config.mcp_servers.keys().cloned().collect()
+            }
+            _ => bail!("No MCP servers are configured. Please configure MCP servers first."),
+        };
+        let is_alias = self.app.config.mapping_mcp_servers.contains_key(name);
+        if !configured_keys.iter().any(|v| v == name) && !is_alias {
+            bail!(
+                "MCP server '{name}' is not configured. Run `.list mcp-servers` to see what's available"
+            );
+        }
+
+        let current: Option<Vec<String>> = if let Some(session) = &self.session {
+            session.enabled_mcp_servers()
+        } else if let Some(role) = &self.role {
+            role.enabled_mcp_servers()
+        } else {
+            self.app.config.enabled_mcp_servers.clone()
+        };
+        let layer = self.write_layer_label();
+
+        let new_list: Vec<String> = if enable {
+            match current {
+                Some(list) if list.iter().any(|s| s.trim() == "all") => {
+                    println!("MCP server '{name}' is already enabled ('all' is set).");
+                    return Ok(());
+                }
+                Some(list) if self.mcp_list_covers(&list, name) => {
+                    println!("MCP server '{name}' is already enabled.");
+                    return Ok(());
+                }
+                Some(mut list) => {
+                    list.push(name.to_string());
+                    list
+                }
+                None => vec![name.to_string()],
+            }
+        } else {
+            match current {
+                None => {
+                    println!("No MCP servers are enabled in this context; nothing to disable.");
+                    return Ok(());
+                }
+                Some(list) if list.is_empty() => {
+                    println!("No MCP servers are enabled in this context; nothing to disable.");
+                    return Ok(());
+                }
+                Some(list) if list.iter().any(|s| s.trim() == "all") => {
+                    let mut materialized = configured_keys;
+                    materialized.retain(|v| v != name);
+                    materialized
+                }
+                Some(mut list) => {
+                    if list.iter().any(|s| s.trim() == name) {
+                        list.retain(|s| s.trim() != name);
+                        list
+                    } else if self.mcp_list_covers(&list, name) {
+                        bail!(
+                            "MCP server '{name}' is enabled via an alias in 'mapping_mcp_servers'. \
+                             Disable the alias instead, or set the list explicitly with `.set enabled_mcp_servers`."
+                        );
+                    } else {
+                        println!("MCP server '{name}' is not enabled; nothing to do.");
+                        return Ok(());
+                    }
+                }
+            }
+        };
+
+        if !enable && self.skill_registry.loaded_mcp_servers().contains(name) {
+            println!(
+                "Note: '{name}' is granted by a loaded skill and will keep running until that skill is unloaded."
+            );
+        }
+
+        let new_list = Some(new_list);
+        if !self.set_enabled_mcp_servers_on_role_like(new_list.clone()) {
+            self.update_app_config(|app| app.enabled_mcp_servers = new_list.clone());
+        }
+
+        if self.app.config.mcp_server_support {
+            let app = Arc::clone(&self.app.config);
+            self.bootstrap_tools(app.as_ref(), true, abort_signal)
+                .await?;
+        }
+
+        let verb = if enable { "Enabled" } else { "Disabled" };
+        println!("✓ {verb} MCP server '{name}' ({layer}).");
+
+        Ok(())
+    }
+
     pub fn set_save_session_on_session(&mut self, value: Option<bool>) -> bool {
         match self.session.as_mut() {
             Some(session) => {
@@ -2021,8 +2288,45 @@ impl RequestContext {
 
                 Ok(())
             }
+            "tools" => {
+                let mut names: Vec<String> = self
+                    .tool_scope
+                    .functions
+                    .declarations()
+                    .iter()
+                    .filter(|v| {
+                        !v.name.starts_with("user__")
+                            && !v.name.starts_with("mcp_")
+                            && !v.name.starts_with("todo__")
+                            && !v.name.starts_with("agent__")
+                    })
+                    .map(|v| v.name.clone())
+                    .collect();
+                names.extend(self.app.config.mapping_tools.keys().map(|v| v.to_string()));
+                names.sort_unstable();
+                names.dedup();
+
+                print_asset_names("tools", &names)
+            }
+            "mcp-servers" => {
+                let mut names: Vec<String> = vec![];
+                if let Some(mcp_config) = &self.app.mcp_config {
+                    names.extend(mcp_config.mcp_servers.keys().map(|v| v.to_string()));
+                }
+                names.extend(
+                    self.app
+                        .config
+                        .mapping_mcp_servers
+                        .keys()
+                        .map(|v| v.to_string()),
+                );
+                names.sort_unstable();
+                names.dedup();
+
+                print_asset_names("MCP servers", &names)
+            }
             _ => bail!(
-                "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills"
+                "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, tools, mcp-servers"
             ),
         }
     }
@@ -2517,7 +2821,14 @@ impl RequestContext {
                     "agent-data",
                 ]),
                 ".list" => super::map_completion_values(vec![
-                    "roles", "sessions", "agents", "rags", "macros", "skills",
+                    "roles",
+                    "sessions",
+                    "agents",
+                    "rags",
+                    "macros",
+                    "skills",
+                    "tools",
+                    "mcp-servers",
                 ]),
                 ".vault" => {
                     let mut values = vec!["add", "get", "update", "delete", "list"];
@@ -2540,6 +2851,85 @@ impl RequestContext {
                         .collect(),
                 );
             }
+        } else if cmd == ".mcp"
+            && (args.first() == Some(&"enable") || args.first() == Some(&"disable"))
+            && args.len() == 2
+        {
+            let current = if let Some(session) = &self.session {
+                session.enabled_mcp_servers()
+            } else if let Some(role) = &self.role {
+                role.enabled_mcp_servers()
+            } else {
+                self.app.config.enabled_mcp_servers.clone()
+            }
+            .unwrap_or_default();
+            let has_all = current.iter().any(|s| s.trim() == "all");
+
+            let candidates: Vec<String> = if args.first() == Some(&"enable") {
+                if has_all {
+                    vec![]
+                } else {
+                    let mut candidates: Vec<String> = vec![];
+                    if let Some(mcp_config) = &self.app.mcp_config {
+                        candidates.extend(mcp_config.mcp_servers.keys().cloned());
+                    }
+                    candidates.extend(self.app.config.mapping_mcp_servers.keys().cloned());
+                    candidates.sort_unstable();
+                    candidates.dedup();
+                    candidates.retain(|v| !self.mcp_list_covers(&current, v));
+
+                    candidates
+                }
+            } else if has_all {
+                self.app
+                    .mcp_config
+                    .as_ref()
+                    .map(|c| c.mcp_servers.keys().cloned().collect())
+                    .unwrap_or_default()
+            } else {
+                current
+                    .iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| s != "all" && !s.is_empty())
+                    .collect()
+            };
+            values = super::map_completion_values(candidates);
+        } else if cmd == ".tool"
+            && (args.first() == Some(&"enable") || args.first() == Some(&"disable"))
+            && args.len() == 2
+        {
+            let current = if let Some(session) = &self.session {
+                session.enabled_tools()
+            } else if let Some(role) = &self.role {
+                role.enabled_tools()
+            } else {
+                self.app.config.enabled_tools.clone()
+            }
+            .unwrap_or_default();
+            let has_all = current.iter().any(|s| s.trim() == "all");
+
+            let candidates: Vec<String> = if args.first() == Some(&"enable") {
+                if has_all {
+                    vec![]
+                } else {
+                    let mut candidates = self.concrete_tool_names();
+                    candidates.extend(self.app.config.mapping_tools.keys().cloned());
+                    candidates.sort_unstable();
+                    candidates.dedup();
+                    candidates.retain(|v| !self.tool_list_covers(&current, v));
+
+                    candidates
+                }
+            } else if has_all {
+                self.concrete_tool_names()
+            } else {
+                current
+                    .iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| s != "all" && !s.is_empty())
+                    .collect()
+            };
+            values = super::map_completion_values(candidates);
         } else if (cmd == ".edit" && args.first() == Some(&"skill") && args.len() == 2)
             || (cmd == ".skill" && args.first() == Some(&"load") && args.len() == 2)
         {

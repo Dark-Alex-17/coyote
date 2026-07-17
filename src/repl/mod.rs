@@ -52,7 +52,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 53]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 57]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -70,6 +70,26 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 53]> = LazyLock::new(|| {
             ".mcp auth",
             "Authenticate with an MCP server via OAuth",
             AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mcp enable",
+            "Enable a single MCP server in the current context",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mcp disable",
+            "Disable a single MCP server in the current context",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".tool enable",
+            "Enable a single tool in the current context",
+            AssertState::True(StateFlags::FUNCTION_CALLING),
+        ),
+        ReplCommand::new(
+            ".tool disable",
+            "Disable a single tool in the current context",
+            AssertState::True(StateFlags::FUNCTION_CALLING),
         ),
         ReplCommand::new(
             ".edit config",
@@ -271,7 +291,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 53]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".list",
-            "List roles, sessions, agents, RAGs, macros, or skills",
+            "List roles, sessions, agents, RAGs, macros, skills, tools, or MCP servers",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -682,10 +702,45 @@ pub async fn run_repl_command(
                                 }
                             }
                         }
+                        "enable" | "disable" => {
+                            if rest.is_empty() {
+                                println!("Usage: .mcp {sub} <server_name>");
+                            } else {
+                                ctx.toggle_mcp_server(sub, rest, abort_signal.clone())
+                                    .await?;
+                            }
+                        }
                         _ => unknown_command()?,
                     }
                 }
-                None => println!("Usage: .mcp auth <server_name>"),
+                None => println!(
+                    r#"Usage:
+    .mcp auth <server_name>         # Authenticate with an MCP server via OAuth
+    .mcp enable <server_name>       # Enable a single MCP server in the current context
+    .mcp disable <server_name>      # Disable a single MCP server in the current context"#
+                ),
+            },
+            ".tool" => match args {
+                Some(args) => {
+                    let mut parts = args.splitn(2, char::is_whitespace);
+                    let sub = parts.next().unwrap_or("").trim();
+                    let rest = parts.next().map(str::trim).unwrap_or("");
+                    match sub {
+                        "enable" | "disable" => {
+                            if rest.is_empty() {
+                                println!("Usage: .tool {sub} <name>");
+                            } else {
+                                ctx.toggle_tool(sub, rest)?;
+                            }
+                        }
+                        _ => unknown_command()?,
+                    }
+                }
+                None => println!(
+                    r#"Usage:
+    .tool enable <name>             # Enable a single tool in the current context
+    .tool disable <name>            # Disable a single tool in the current context"#
+                ),
             },
             ".prompt" => match args {
                 Some(text) => {
@@ -1102,7 +1157,9 @@ pub async fn run_repl_command(
                     ctx.list_assets(args.trim())?;
                 }
                 _ => {
-                    println!("Usage: .list <roles|sessions|agents|rags|macros|skills>")
+                    println!(
+                        "Usage: .list <roles|sessions|agents|rags|macros|skills|tools|mcp-servers>"
+                    )
                 }
             },
             ".copy" => {
@@ -1627,8 +1684,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_53_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 53);
+    fn repl_commands_has_57_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 57);
     }
 
     #[test]
