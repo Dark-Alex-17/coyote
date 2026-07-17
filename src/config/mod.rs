@@ -140,6 +140,7 @@ const GLOBAL_TOOLS_DIR_NAME: &str = "tools";
 const GLOBAL_TOOLS_UTILS_DIR_NAME: &str = "utils";
 const BASH_PROMPT_UTILS_FILE_NAME: &str = "prompt-utils.sh";
 const MCP_FILE_NAME: &str = "mcp.json";
+const HIDDEN_MCP_FILE_NAME: &str = ".mcp.json";
 const MEMORY_DIR_NAME: &str = "memory";
 const MEMORY_INDEX_FILE_NAME: &str = "MEMORY.md";
 const WORKSPACE_MEMORY_FILE_NAME: &str = "COYOTE.md";

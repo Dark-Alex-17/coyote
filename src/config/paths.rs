@@ -2,10 +2,10 @@ use super::role::Role;
 use super::{
     AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME,
     ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME, GLOBAL_TOOLS_DIR_NAME,
-    GLOBAL_TOOLS_UTILS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, MEMORY_DIR_NAME,
-    MEMORY_INDEX_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME, SBX_KIT_DIR_NAME,
-    SBX_KIT_HASH_FILE, SBX_MIXIN_FILE_NAME, SBX_MIXIN_KITS_DIR_NAME, SBX_VAULT_MIXINS_DIR_NAME,
-    SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
+    GLOBAL_TOOLS_UTILS_DIR_NAME, HIDDEN_MCP_FILE_NAME, MACROS_DIR_NAME, MCP_FILE_NAME,
+    MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME,
+    SBX_KIT_DIR_NAME, SBX_KIT_HASH_FILE, SBX_MIXIN_FILE_NAME, SBX_MIXIN_KITS_DIR_NAME,
+    SBX_VAULT_MIXINS_DIR_NAME, SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
 };
 use crate::client::ProviderModels;
 use crate::config::REPL_HISTORY_DIR_NAME;
@@ -212,10 +212,12 @@ pub fn workspace_skill_file(name: &str) -> PathBuf {
     workspace_skills_dir().join(name).join("SKILL.md")
 }
 
-pub fn workspace_mcp_config_file() -> PathBuf {
-    workspace_config_dir()
-        .join(WORKSPACE_COYOTE_DIR_NAME)
-        .join(MCP_FILE_NAME)
+pub fn workspace_mcp_config_file() -> Option<PathBuf> {
+    let dir = workspace_config_dir();
+    [MCP_FILE_NAME, HIDDEN_MCP_FILE_NAME]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 pub fn validate_skill_name(name: &str) -> Result<()> {
@@ -685,6 +687,69 @@ mod tests {
             with_sandbox(|| {
                 let p = Path::new("C:\\Users\\agent\\.coyote_password");
                 assert_eq!(translate_sandboxed_home_path(p), None);
+            });
+        }
+    }
+
+    mod workspace_mcp_resolution {
+        use super::*;
+        use serial_test::serial;
+
+        fn with_workspace_dir<F: FnOnce(&Path)>(f: F) {
+            let unique = time::SystemTime::now()
+                .duration_since(time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = env::temp_dir().join(format!("coyote-workspace-mcp-test-{unique}"));
+            fs::create_dir_all(&root).unwrap();
+            let env_name = get_env_name("workspace_config_dir");
+            let prev = env::var_os(&env_name);
+            unsafe {
+                env::set_var(&env_name, &root);
+            }
+            f(&root);
+            unsafe {
+                match prev {
+                    Some(v) => env::set_var(&env_name, v),
+                    None => env::remove_var(&env_name),
+                }
+            }
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        #[serial]
+        fn returns_none_when_no_config_exists() {
+            with_workspace_dir(|_| {
+                assert_eq!(workspace_mcp_config_file(), None);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn finds_mcp_json() {
+            with_workspace_dir(|root| {
+                fs::write(root.join("mcp.json"), "{}").unwrap();
+                assert_eq!(workspace_mcp_config_file(), Some(root.join("mcp.json")));
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn falls_back_to_claude_style_hidden_mcp_json() {
+            with_workspace_dir(|root| {
+                fs::write(root.join(".mcp.json"), "{}").unwrap();
+                assert_eq!(workspace_mcp_config_file(), Some(root.join(".mcp.json")));
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn prefers_mcp_json_when_both_exist() {
+            with_workspace_dir(|root| {
+                fs::write(root.join("mcp.json"), "{}").unwrap();
+                fs::write(root.join(".mcp.json"), "{}").unwrap();
+                assert_eq!(workspace_mcp_config_file(), Some(root.join("mcp.json")));
             });
         }
     }
