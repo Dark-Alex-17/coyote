@@ -533,7 +533,7 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     } else {
         text.to_string()
     };
-    let output = ChatCompletionsOutput { text, tool_calls };
+    let output = ChatCompletionsOutput { text, tool_calls, ..Default::default() };
     Ok(output)
 }
 
@@ -696,7 +696,7 @@ pub fn openai_extract_responses(data: &Value) -> Result<ChatCompletionsOutput> {
     if text.is_empty() && tool_calls.is_empty() {
         bail!("Invalid response data: {data}");
     }
-    Ok(ChatCompletionsOutput { text, tool_calls })
+    Ok(ChatCompletionsOutput { text, tool_calls, ..Default::default() })
 }
 
 pub async fn openai_responses_streaming(

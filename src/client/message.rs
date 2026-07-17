@@ -188,6 +188,17 @@ pub struct ImageUrl {
     pub url: String,
 }
 
+/// An extended-thinking block returned by Anthropic-protocol models.
+/// Serialized to match the API wire format (`type: thinking` / `type: redacted_thinking`)
+/// so blocks can be replayed verbatim, signature intact, in subsequent
+/// tool-loop rounds as the API requires.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingBlock {
+    Thinking { thinking: String, signature: String },
+    RedactedThinking { data: String },
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessageContentToolCalls {
     pub tool_results: Vec<ToolResult>,

@@ -529,7 +529,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         bail!("Invalid response data: {data}");
     }
 
-    let output = ChatCompletionsOutput { text, tool_calls };
+    let output = ChatCompletionsOutput { text, tool_calls, ..Default::default() };
     Ok(output)
 }
 

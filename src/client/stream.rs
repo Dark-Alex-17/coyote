@@ -1,4 +1,4 @@
-use super::{ToolCall, catch_error};
+use super::{ThinkingBlock, ToolCall, catch_error};
 use crate::utils::AbortSignal;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,6 +13,7 @@ pub struct SseHandler {
     abort_signal: AbortSignal,
     buffer: String,
     tool_calls: Vec<ToolCall>,
+    thinking: Vec<ThinkingBlock>,
     last_tool_calls: Vec<ToolCall>,
     max_call_repeats: usize,
     call_repeat_chain_len: usize,
@@ -26,6 +27,7 @@ impl SseHandler {
             abort_signal,
             buffer: String::new(),
             tool_calls: Vec::new(),
+            thinking: Vec::new(),
             last_tool_calls: Vec::new(),
             max_call_repeats: 2,
             call_repeat_chain_len: 3,
@@ -170,6 +172,10 @@ impl SseHandler {
         message
     }
 
+    pub fn thinking_block(&mut self, block: ThinkingBlock) {
+        self.thinking.push(block);
+    }
+
     pub fn abort(&self) -> AbortSignal {
         self.abort_signal.clone()
     }
@@ -179,11 +185,14 @@ impl SseHandler {
         &self.last_tool_calls
     }
 
-    pub fn take(self) -> (String, Vec<ToolCall>) {
+    pub fn take(self) -> (String, Vec<ToolCall>, Vec<ThinkingBlock>) {
         let Self {
-            buffer, tool_calls, ..
+            buffer,
+            tool_calls,
+            thinking,
+            ..
         } = self;
-        (buffer, tool_calls)
+        (buffer, tool_calls, thinking)
     }
 }
 

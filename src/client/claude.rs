@@ -168,12 +168,22 @@ pub async fn claude_chat_completions_streaming(
     let mut function_arguments = String::new();
     let mut function_id = String::new();
     let mut reasoning_state = 0;
+    let mut thinking_text = String::new();
+    let mut thinking_signature = String::new();
     let handle = |message: SseMessage| -> Result<bool> {
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
         if let Some(typ) = data["type"].as_str() {
             match typ {
                 "content_block_start" => {
+                    if let (Some("redacted_thinking"), Some(redacted_data)) = (
+                        data["content_block"]["type"].as_str(),
+                        data["content_block"]["data"].as_str(),
+                    ) {
+                        handler.thinking_block(ThinkingBlock::RedactedThinking {
+                            data: redacted_data.to_string(),
+                        });
+                    }
                     if let (Some("tool_use"), Some(name), Some(id)) = (
                         data["content_block"]["type"].as_str(),
                         data["content_block"]["name"].as_str(),
@@ -206,7 +216,10 @@ pub async fn claude_chat_completions_streaming(
                             handler.text("<think>\n")?;
                             reasoning_state = 1;
                         }
+                        thinking_text.push_str(text);
                         handler.text(text)?;
+                    } else if let Some(signature) = data["delta"]["signature"].as_str() {
+                        thinking_signature.push_str(signature);
                     } else if let (true, Some(partial_json)) = (
                         !function_name.is_empty(),
                         data["delta"]["partial_json"].as_str(),
@@ -218,6 +231,10 @@ pub async fn claude_chat_completions_streaming(
                     if reasoning_state == 1 {
                         handler.text("\n</think>\n\n")?;
                         reasoning_state = 0;
+                        handler.thinking_block(ThinkingBlock::Thinking {
+                            thinking: std::mem::take(&mut thinking_text),
+                            signature: std::mem::take(&mut thinking_signature),
+                        });
                     }
                     if !function_name.is_empty() {
                         let arguments: Value = if function_arguments.is_empty() {
@@ -313,18 +330,24 @@ pub fn claude_build_chat_completions_body(
                 }) => {
                     let mut assistant_parts = vec![];
                     let mut user_parts = vec![];
-                    if !text.is_empty() {
-                        assistant_parts.push(json!({
-                            "type": "text",
-                            "text": text,
-                        }))
-                    }
-                    for tool_result in tool_results {
-                        if let Some(round_text) = &tool_result.text {
-                            assistant_parts.push(json!({
-                                "type": "text",
-                                "text": round_text,
-                            }))
+                    for (index, tool_result) in tool_results.iter().enumerate() {
+                        for block in &tool_result.thinking {
+                            assistant_parts.push(json!(block));
+                        }
+                        let round_text = if index == 0 && !text.is_empty() {
+                            Some(text.as_str())
+                        } else {
+                            tool_result.text.as_deref()
+                        };
+                        if let Some(round_text) = round_text {
+                            let round_text = strip_think_tag(round_text);
+                            let round_text = round_text.trim();
+                            if !round_text.is_empty() {
+                                assistant_parts.push(json!({
+                                    "type": "text",
+                                    "text": round_text,
+                                }))
+                            }
                         }
                         assistant_parts.push(json!({
                             "type": "tool_use",
@@ -409,12 +432,24 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     let mut text = String::new();
     let mut reasoning = None;
     let mut tool_calls = vec![];
+    let mut thinking = vec![];
     if let Some(list) = data["content"].as_array() {
         for item in list {
             match item["type"].as_str() {
                 Some("thinking") => {
                     if let Some(v) = item["thinking"].as_str() {
                         reasoning = Some(v.to_string());
+                        thinking.push(ThinkingBlock::Thinking {
+                            thinking: v.to_string(),
+                            signature: item["signature"].as_str().unwrap_or_default().to_string(),
+                        });
+                    }
+                }
+                Some("redacted_thinking") => {
+                    if let Some(v) = item["data"].as_str() {
+                        thinking.push(ThinkingBlock::RedactedThinking {
+                            data: v.to_string(),
+                        });
                     }
                 }
                 Some("text") => {
@@ -453,6 +488,7 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     let output = ChatCompletionsOutput {
         text: text.to_string(),
         tool_calls,
+        thinking,
     };
     Ok(output)
 }

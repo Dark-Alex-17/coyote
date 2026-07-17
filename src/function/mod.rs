@@ -5,6 +5,7 @@ pub(crate) mod todo;
 pub(crate) mod user_interaction;
 
 use crate::{
+    client::ThinkingBlock,
     config::{Agent, RequestContext},
     graph,
     utils::*,
@@ -205,6 +206,8 @@ pub struct ToolResult {
     pub output: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking: Vec<ThinkingBlock>,
 }
 
 impl ToolResult {
@@ -213,6 +216,7 @@ impl ToolResult {
             call,
             output,
             text: None,
+            thinking: vec![],
         }
     }
 }
@@ -1913,5 +1917,34 @@ mod tests {
         let result = ToolResult::new(tc.clone(), json!({"result": "ok"}));
         assert_eq!(result.call.name, "my_tool");
         assert_eq!(result.output, json!({"result": "ok"}));
+    }
+
+    #[test]
+    fn thinking_block_matches_anthropic_wire_format() {
+        let block = ThinkingBlock::Thinking {
+            thinking: "chain of thought".to_string(),
+            signature: "sig123".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&block).unwrap(),
+            json!({"type": "thinking", "thinking": "chain of thought", "signature": "sig123"})
+        );
+
+        let redacted = ThinkingBlock::RedactedThinking {
+            data: "opaque".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&redacted).unwrap(),
+            json!({"type": "redacted_thinking", "data": "opaque"})
+        );
+    }
+
+    #[test]
+    fn tool_result_deserializes_without_text_and_thinking() {
+        let yaml = "call:\n  name: my_tool\n  arguments: {}\noutput: ok\n";
+        let result: ToolResult = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(result.call.name, "my_tool");
+        assert!(result.text.is_none());
+        assert!(result.thinking.is_empty());
     }
 }

@@ -322,7 +322,7 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
             bail!("Invalid response data: {data}");
         }
     }
-    let output = ChatCompletionsOutput { text, tool_calls };
+    let output = ChatCompletionsOutput { text, tool_calls, ..Default::default() };
     Ok(output)
 }
 

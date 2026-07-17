@@ -295,6 +295,7 @@ pub struct ChatCompletionsData {
 pub struct ChatCompletionsOutput {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    pub thinking: Vec<ThinkingBlock>,
 }
 
 impl ChatCompletionsOutput {
@@ -435,6 +436,7 @@ pub async fn call_chat_completions(
             let ChatCompletionsOutput {
                 mut text,
                 tool_calls,
+                thinking,
                 ..
             } = ret;
             if !text.is_empty() {
@@ -445,7 +447,10 @@ pub async fn call_chat_completions(
                     ctx.app.config.print_markdown(&text)?;
                 }
             }
-            let tool_results = eval_tool_calls(ctx, tool_calls).await?;
+            let mut tool_results = eval_tool_calls(ctx, tool_calls).await?;
+            if let Some(first) = tool_results.first_mut() {
+                first.thinking = thinking;
+            }
             tool_results
                 .iter()
                 .for_each(|res| ctx.tool_scope.tool_tracker.record_call(res.call.clone()));
@@ -479,13 +484,16 @@ pub async fn call_chat_completions_streaming(
 
     render_ret?;
 
-    let (text, tool_calls) = handler.take();
+    let (text, tool_calls, thinking) = handler.take();
     match send_ret {
         Ok(_) => {
             if !text.is_empty() && !text.ends_with('\n') {
                 println!();
             }
-            let tool_results = eval_tool_calls(ctx, tool_calls).await?;
+            let mut tool_results = eval_tool_calls(ctx, tool_calls).await?;
+            if let Some(first) = tool_results.first_mut() {
+                first.thinking = thinking;
+            }
             tool_results
                 .iter()
                 .for_each(|res| ctx.tool_scope.tool_tracker.record_call(res.call.clone()));

@@ -244,6 +244,6 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     if text.is_empty() && tool_calls.is_empty() {
         bail!("Invalid response data: {data}");
     }
-    let output = ChatCompletionsOutput { text, tool_calls };
+    let output = ChatCompletionsOutput { text, tool_calls, ..Default::default() };
     Ok(output)
 }
