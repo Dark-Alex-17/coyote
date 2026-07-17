@@ -21,7 +21,7 @@ use crate::function::{
 };
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
-    MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+    MCP_SEARCH_META_FUNCTION_NAME_PREFIX, is_auth_required_error,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -3161,18 +3161,25 @@ impl RequestContext {
                 let app_ref = &self.app;
                 let acquire_all = async {
                     let mut handles = Vec::new();
+                    let mut auth_required = Vec::new();
                     for id in &server_ids {
                         if let Some(spec) = mcp_config.mcp_servers.get(id) {
-                            let handle = app_ref
+                            match app_ref
                                 .mcp_factory
                                 .acquire(id, spec, app_ref.mcp_log_path.as_deref())
-                                .await?;
-                            handles.push((id.clone(), handle));
+                                .await
+                            {
+                                Ok(handle) => handles.push((id.clone(), handle)),
+                                Err(e) if is_auth_required_error(&e) => {
+                                    auth_required.push(id.clone())
+                                }
+                                Err(e) => return Err(e),
+                            }
                         }
                     }
-                    Ok::<_, Error>(handles)
+                    Ok::<_, Error>((handles, auth_required))
                 };
-                let handles = abortable_run_with_spinner(
+                let (handles, auth_required) = abortable_run_with_spinner(
                     acquire_all,
                     "Loading MCP servers",
                     abort_signal.clone(),
@@ -3180,6 +3187,12 @@ impl RequestContext {
                 .await?;
                 for (id, handle) in handles {
                     mcp_runtime.insert(id, handle);
+                }
+                for id in auth_required {
+                    eprintln!(
+                        "Warning: MCP server '{id}' requires OAuth authentication and was not started. \
+                         Run `.mcp auth {id}` (or `coyote --auth-mcp {id}`) to authenticate and attach it."
+                    );
                 }
             }
         }
@@ -3281,9 +3294,18 @@ impl RequestContext {
                 );
             }
         }
+        let prev_role = self.role.clone();
+        let prev_session = self.session.clone();
         self.use_role_obj(role)?;
-        self.rebuild_tool_scope(app, mcp_servers, abort_signal)
+        if let Err(e) = self
+            .rebuild_tool_scope(app, mcp_servers, abort_signal)
             .await
+        {
+            self.role = prev_role;
+            self.session = prev_session;
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub async fn use_session(
@@ -4311,6 +4333,14 @@ mod tests {
     }
 
     fn app_state_with_mcp_config(mcp_server_support: bool, server_names: &[&str]) -> Arc<AppState> {
+        app_state_with_mcp_command(mcp_server_support, server_names, "echo")
+    }
+
+    fn app_state_with_mcp_command(
+        mcp_server_support: bool,
+        server_names: &[&str],
+        command: &str,
+    ) -> Arc<AppState> {
         let app_config = AppConfig {
             mcp_server_support,
             ..AppConfig::default()
@@ -4325,7 +4355,7 @@ mod tests {
                     name.to_string(),
                     McpServer {
                         transport_type: McpTransportType::Stdio,
-                        command: Some("echo".to_string()),
+                        command: Some(command.to_string()),
                         args: None,
                         env: None,
                         cwd: None,
@@ -4372,6 +4402,33 @@ mod tests {
         run_async(ctx.rebuild_tool_scope(&app, Some(vec!["all".to_string()]), abort)).unwrap();
 
         assert!(ctx.tool_scope.mcp_runtime.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn use_role_rolls_back_when_mcp_startup_fails() {
+        let _guard = TestConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        write(
+            roles_dir.join("broken_mcp.md"),
+            "---\nenabled_mcp_servers: failing\n---\nYou use MCP servers.",
+        )
+        .unwrap();
+
+        let app_state =
+            app_state_with_mcp_command(true, &["failing"], "/nonexistent/coyote-test-mcp-binary");
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        let result = run_async(ctx.use_role(&app, "broken_mcp", abort));
+
+        assert!(result.is_err());
+        assert!(
+            ctx.role.is_none(),
+            "role must be rolled back when MCP startup fails"
+        );
     }
 
     #[test]

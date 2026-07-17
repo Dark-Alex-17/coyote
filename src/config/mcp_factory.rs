@@ -3,7 +3,7 @@ use crate::mcp::{
     spawn_mcp_server,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::Path;
@@ -111,10 +111,10 @@ impl McpFactory {
             .await
             .map_err(|e| {
                 if is_auth_required_error(&e) {
-                    anyhow!(
+                    e.context(format!(
                         "MCP server '{name}' requires OAuth authentication. \
                          Run `coyote --auth-mcp {name}` or `.mcp auth {name}` in the REPL to authenticate."
-                    )
+                    ))
                 } else {
                     e
                 }

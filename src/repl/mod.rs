@@ -698,6 +698,26 @@ pub async fn run_repl_command(
                                         )
                                         .await?;
                                         println!("Authentication saved.");
+                                        if ctx.app.config.mcp_server_support {
+                                            let app = Arc::clone(&ctx.app.config);
+                                            ctx.bootstrap_tools(
+                                                app.as_ref(),
+                                                true,
+                                                abort_signal.clone(),
+                                            )
+                                            .await?;
+                                            if ctx.tool_scope.mcp_runtime.get(server_name).is_some()
+                                            {
+                                                println!(
+                                                    "✓ MCP server '{server_name}' started and attached to the current context."
+                                                );
+                                            } else {
+                                                println!(
+                                                    "MCP server '{server_name}' is not enabled in the current context. \
+                                                     Run `.mcp enable {server_name}` to attach it."
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }

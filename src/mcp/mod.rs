@@ -1061,4 +1061,14 @@ mod tests {
 
         assert!(!is_auth_required_error(&e));
     }
+
+    #[test]
+    fn is_auth_required_error_survives_context_wrapping() {
+        let e = anyhow!("Auth required, when send initialize request").context(
+            "MCP server 'github' requires OAuth authentication. \
+             Run `coyote --auth-mcp github` or `.mcp auth github` in the REPL to authenticate.",
+        );
+
+        assert!(is_auth_required_error(&e));
+    }
 }
