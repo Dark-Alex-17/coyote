@@ -5,6 +5,7 @@
 ![Release](https://img.shields.io/github/v/release/Dark-Alex-17/coyote?color=%23c694ff)
 ![Crate.io downloads](https://img.shields.io/crates/d/coyote-ai?label=Crate%20downloads)
 [![GitHub Downloads](https://img.shields.io/github/downloads/Dark-Alex-17/coyote/total.svg?label=GitHub%20downloads)](https://github.com/Dark-Alex-17/coyote/releases)
+![Docker pulls](https://img.shields.io/docker/pulls/darkalex17/coyote?label=Docker%20downloads)
 
 Coyote is an all-in-one, batteries-included, LLM CLI tool featuring Shell Assistant, CLI & REPL Mode, RAG, AI Tools & 
 Agents, and More.
