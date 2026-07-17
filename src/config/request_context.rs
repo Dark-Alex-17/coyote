@@ -1699,7 +1699,12 @@ impl RequestContext {
                 .unwrap_or_default()
                 .to_string(),
         );
-        if let Some(effort) = role.reasoning_effort() {
+        let reasoning_effort = role.reasoning_effort().or_else(|| {
+            role.model()
+                .default_reasoning_effort()
+                .map(|s| s.to_string())
+        });
+        if let Some(effort) = reasoning_effort {
             output.insert("reasoning_effort", effort.to_string());
         }
 
