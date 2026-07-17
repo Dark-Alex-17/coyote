@@ -947,6 +947,46 @@ pub async fn run_repl_command(
                     let app = Arc::clone(&ctx.app.config);
                     ctx.use_agent(app.as_ref(), agent_name, session_name, abort_signal.clone())
                         .await?;
+                    if let Some(session) = &ctx.session {
+                        let messages_snapshot: Vec<Message> = session
+                            .messages()
+                            .iter()
+                            .filter(|m| !m.role.is_system())
+                            .cloned()
+                            .collect();
+                        let compressed_count = session.compressed_messages().len();
+                        if !messages_snapshot.is_empty() || compressed_count > 0 {
+                            if compressed_count > 0 {
+                                println!(
+                                    "{}",
+                                    dimmed_text(&format!(
+                                        "({compressed_count} earlier messages not shown — compressed for context)"
+                                    ))
+                                );
+                                println!();
+                            }
+                            for message in &messages_snapshot {
+                                match message.role {
+                                    MessageRole::User => {
+                                        if let Some(text) = message.content.as_text() {
+                                            println!("{}", dimmed_text("You:"));
+                                            println!("{text}");
+                                            println!();
+                                        }
+                                    }
+                                    MessageRole::Assistant => {
+                                        if let Some(text) = message.content.as_text() {
+                                            app.print_markdown(text)?;
+                                            println!();
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            println!("{}", dimmed_text("─── ↑ previous conversation ↑ ───"));
+                            println!();
+                        }
+                    }
                 }
                 None => {
                     println!(r#"Usage: .agent <agent-name> [session-name] [key=value]..."#)
