@@ -52,7 +52,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 52]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 53]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -267,6 +267,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 52]> = LazyLock::new(|| {
         ReplCommand::new(
             ".delete",
             "Delete roles, sessions, RAGs, or agents",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".list",
+            "List roles, sessions, agents, RAGs, macros, or skills",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -1092,6 +1097,14 @@ pub async fn run_repl_command(
                     println!("Usage: .delete <role|session|rag|macro|skill|agent-data>")
                 }
             },
+            ".list" => match args {
+                Some(args) => {
+                    ctx.list_assets(args.trim())?;
+                }
+                _ => {
+                    println!("Usage: .list <roles|sessions|agents|rags|macros|skills>")
+                }
+            },
             ".copy" => {
                 let output = match ctx
                     .last_message
@@ -1614,8 +1627,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_52_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 52);
+    fn repl_commands_has_53_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 53);
     }
 
     #[test]

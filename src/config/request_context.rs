@@ -1,3 +1,4 @@
+use super::agent::AgentConfig;
 use super::rag_cache::{RagCache, RagKey};
 use super::session::Session;
 use super::skill::{SKILL_SCAFFOLD, Skill};
@@ -85,6 +86,37 @@ impl MemoryConfig {
 /// `mcp_server_support`), so an empty set means the hint has nothing to point at.
 pub fn should_inject_skill_instructions(app: &AppConfig, policy: &SkillPolicy) -> bool {
     app.function_calling_support && policy.skills_enabled && !policy.compatible_enabled.is_empty()
+}
+
+fn print_asset_names(kind: &str, names: &[String]) -> Result<()> {
+    if names.is_empty() {
+        println!("No {kind} found.");
+        return Ok(());
+    }
+
+    let mut header: Vec<char> = kind.chars().collect();
+    header[0] = header[0].to_ascii_uppercase();
+    let header: String = header.into_iter().collect();
+
+    println!("{header}:");
+    for name in names {
+        println!("  • {name}");
+    }
+
+    Ok(())
+}
+
+fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<String>)> {
+    names
+        .into_iter()
+        .map(|name| {
+            let description = Skill::load(&name)
+                .ok()
+                .map(|s| s.description().to_string())
+                .filter(|d| !d.is_empty());
+            (name, description)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1911,6 +1943,90 @@ impl RequestContext {
         Ok(())
     }
 
+    pub fn list_assets(&self, kind: &str) -> Result<()> {
+        match kind {
+            "roles" => print_asset_names("roles", &paths::list_roles(true)),
+            "sessions" => print_asset_names("sessions", &self.list_sessions()),
+            "rags" => print_asset_names("RAGs", &paths::list_rags()),
+            "macros" => print_asset_names("macros", &paths::list_macros()),
+            "agents" => {
+                let names = list_agents();
+                if names.is_empty() {
+                    println!("No agents found.");
+                    return Ok(());
+                }
+
+                println!("Agents:");
+                for name in names {
+                    let description = AgentConfig::load(&paths::agent_config_file(&name))
+                        .ok()
+                        .map(|c| c.description)
+                        .filter(|d| !d.is_empty());
+                    match description {
+                        Some(description) => println!("  • {name} — {description}"),
+                        None => println!("  • {name}"),
+                    }
+                }
+
+                Ok(())
+            }
+            "skills" => {
+                let policy = SkillPolicy::effective(
+                    &self.app.config,
+                    self.role.as_ref(),
+                    self.agent.as_ref(),
+                    self.session.as_ref(),
+                )?;
+
+                if !policy.skills_enabled {
+                    bail!("Skills are disabled in this context");
+                }
+
+                let visible_names: Vec<String> = match self.app.config.visible_skills.as_deref() {
+                    Some(list) => list.to_vec(),
+                    None => paths::list_skills(),
+                };
+
+                let mut entries = Vec::new();
+                for name in visible_names {
+                    if !policy.compatible_enabled.contains(&name) {
+                        continue;
+                    }
+                    let skill = match Skill::load(&name) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("Failed to open skill '{name}' for listing: {e}");
+                            continue;
+                        }
+                    };
+
+                    let loaded = self.skill_registry.is_loaded(skill.name());
+                    entries.push((
+                        skill.name().to_string(),
+                        skill.description().to_string(),
+                        loaded,
+                    ));
+                }
+
+                if entries.is_empty() {
+                    println!("No skills found.");
+                    return Ok(());
+                }
+
+                println!("Skills:");
+                for (name, description, loaded) in entries {
+                    let marker = if loaded { " (loaded)" } else { "" };
+                    println!("  • {name}{marker} — {description}");
+                }
+
+                Ok(())
+            }
+            _ => bail!(
+                "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills"
+            ),
+        }
+    }
+
     pub fn delete(&self, kind: &str) -> Result<()> {
         let (dir, file_ext) = match kind {
             "role" => (paths::roles_dir(), Some(".md")),
@@ -2327,7 +2443,16 @@ impl RequestContext {
                     }
                 }
                 ".rag" => super::map_completion_values(paths::list_rags()),
-                ".agent" => super::map_completion_values(list_agents()),
+                ".agent" => list_agents()
+                    .into_iter()
+                    .map(|name| {
+                        let description = AgentConfig::load(&paths::agent_config_file(&name))
+                            .ok()
+                            .map(|c| c.description)
+                            .filter(|d| !d.is_empty());
+                        (name, description)
+                    })
+                    .collect(),
                 ".install" => {
                     let mut values: Vec<String> =
                         AssetCategory::NAMES.iter().map(|s| s.to_string()).collect();
@@ -2391,6 +2516,9 @@ impl RequestContext {
                     "skill",
                     "agent-data",
                 ]),
+                ".list" => super::map_completion_values(vec![
+                    "roles", "sessions", "agents", "rags", "macros", "skills",
+                ]),
                 ".vault" => {
                     let mut values = vec!["add", "get", "update", "delete", "list"];
                     values.sort_unstable();
@@ -2415,9 +2543,9 @@ impl RequestContext {
         } else if (cmd == ".edit" && args.first() == Some(&"skill") && args.len() == 2)
             || (cmd == ".skill" && args.first() == Some(&"load") && args.len() == 2)
         {
-            values = super::map_completion_values(paths::list_skills());
+            values = complete_skills_with_descriptions(paths::list_skills());
         } else if cmd == ".skill" && args.first() == Some(&"unload") && args.len() == 2 {
-            values = super::map_completion_values(self.skill_registry.loaded_names());
+            values = complete_skills_with_descriptions(self.skill_registry.loaded_names());
         } else if cmd == ".install" && args.first() == Some(&"remote") && args.len() >= 2 {
             let prev = args.get(args.len() - 2).copied().unwrap_or("");
             if prev == "--filter" {
