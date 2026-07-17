@@ -397,6 +397,11 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                         }))
                     }
                     for tool_result in tool_results {
+                        if let Some(round_text) = &tool_result.text {
+                            assistant_parts.push(json!({
+                                "text": round_text,
+                            }))
+                        }
                         assistant_parts.push(json!({
                             "toolUse": {
                                 "toolUseId": tool_result.call.id,

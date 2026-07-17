@@ -118,6 +118,9 @@ impl MessageContent {
                     lines.push(text.clone())
                 }
                 for tool_result in tool_results {
+                    if let Some(round_text) = &tool_result.text {
+                        lines.push(round_text.clone())
+                    }
                     let mut parts = vec!["Call".to_string()];
                     if let Some((agent_name, functions)) = agent_info
                         && functions.contains(&tool_result.call.name)
@@ -201,9 +204,13 @@ impl MessageContentToolCalls {
         }
     }
 
-    pub fn merge(&mut self, tool_results: Vec<ToolResult>, _text: String) {
+    pub fn merge(&mut self, mut tool_results: Vec<ToolResult>, text: String) {
+        if !text.is_empty()
+            && let Some(first) = tool_results.first_mut()
+        {
+            first.text = Some(text);
+        }
         self.tool_results.extend(tool_results);
-        self.text.clear();
         self.sequence = true;
     }
 }

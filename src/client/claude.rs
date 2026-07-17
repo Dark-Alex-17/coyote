@@ -320,6 +320,12 @@ pub fn claude_build_chat_completions_body(
                         }))
                     }
                     for tool_result in tool_results {
+                        if let Some(round_text) = &tool_result.text {
+                            assistant_parts.push(json!({
+                                "type": "text",
+                                "text": round_text,
+                            }))
+                        }
                         assistant_parts.push(json!({
                             "type": "tool_use",
                             "id": tool_result.call.id,

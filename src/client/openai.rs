@@ -370,7 +370,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
             match content {
                 MessageContent::ToolCalls(MessageContentToolCalls {
                     tool_results,
-                    text: _,
+                    text,
                     sequence,
                 }) => {
                     if !sequence {
@@ -387,9 +387,12 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                                 })
                             })
                             .collect();
-                        let mut messages = vec![
-                            json!({ "role": MessageRole::Assistant, "tool_calls": tool_calls }),
-                        ];
+                        let mut assistant_message =
+                            json!({ "role": MessageRole::Assistant, "tool_calls": tool_calls });
+                        if !text.is_empty() {
+                            assistant_message["content"] = strip_think_tag(&text).into();
+                        }
+                        let mut messages = vec![assistant_message];
                         for tool_result in tool_results {
                             messages.push(json!({
                                 "role": "tool",
@@ -399,21 +402,30 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                         }
                         messages
                     } else {
-                        tool_results.into_iter().flat_map(|tool_result| {
+                        tool_results.into_iter().enumerate().flat_map(|(index, tool_result)| {
+                            let round_text = if index == 0 && !text.is_empty() {
+                                Some(text.clone())
+                            } else {
+                                tool_result.text.clone()
+                            };
+                            let mut assistant_message = json!({
+                                "role": MessageRole::Assistant,
+                                "tool_calls": [
+                                    {
+                                        "id": tool_result.call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_result.call.name,
+                                            "arguments": tool_result.call.arguments.to_string(),
+                                        },
+                                    }
+                                ]
+                            });
+                            if let Some(round_text) = round_text {
+                                assistant_message["content"] = strip_think_tag(&round_text).into();
+                            }
                             vec![
-                                json!({
-                                    "role": MessageRole::Assistant,
-                                    "tool_calls": [
-                                        {
-                                            "id": tool_result.call.id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": tool_result.call.name,
-                                                "arguments": tool_result.call.arguments.to_string(),
-                                            },
-                                        }
-                                    ]
-                                }),
+                                assistant_message,
                                 json!({
                                     "role": "tool",
                                     "content": tool_result.output.to_string(),
@@ -552,24 +564,36 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
             match content {
                 MessageContent::ToolCalls(MessageContentToolCalls {
                     tool_results,
-                    text: _,
+                    text,
                     sequence: _,
                 }) => tool_results
                     .into_iter()
-                    .flat_map(|tool_result| {
-                        vec![
-                            json!({
-                                "type": "function_call",
-                                "call_id": tool_result.call.id,
-                                "name": tool_result.call.name,
-                                "arguments": tool_result.call.arguments.to_string(),
-                            }),
-                            json!({
-                                "type": "function_call_output",
-                                "call_id": tool_result.call.id,
-                                "output": tool_result.output.to_string(),
-                            }),
-                        ]
+                    .enumerate()
+                    .flat_map(|(index, tool_result)| {
+                        let round_text = if index == 0 && !text.is_empty() {
+                            Some(text.clone())
+                        } else {
+                            tool_result.text.clone()
+                        };
+                        let mut items = vec![];
+                        if let Some(round_text) = round_text {
+                            items.push(json!({
+                                "role": MessageRole::Assistant,
+                                "content": strip_think_tag(&round_text),
+                            }));
+                        }
+                        items.push(json!({
+                            "type": "function_call",
+                            "call_id": tool_result.call.id,
+                            "name": tool_result.call.name,
+                            "arguments": tool_result.call.arguments.to_string(),
+                        }));
+                        items.push(json!({
+                            "type": "function_call_output",
+                            "call_id": tool_result.call.id,
+                            "output": tool_result.output.to_string(),
+                        }));
+                        items
                     })
                     .collect(),
                 MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {

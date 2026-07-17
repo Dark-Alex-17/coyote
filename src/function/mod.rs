@@ -203,11 +203,17 @@ fn normalize_tool_result(result: Value) -> Value {
 pub struct ToolResult {
     pub call: ToolCall,
     pub output: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 impl ToolResult {
     pub fn new(call: ToolCall, output: Value) -> Self {
-        Self { call, output }
+        Self {
+            call,
+            output,
+            text: None,
+        }
     }
 }
 

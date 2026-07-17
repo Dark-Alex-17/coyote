@@ -372,8 +372,15 @@ pub fn gemini_build_chat_completions_body(
                             .collect();
                         vec![json!({ "role": role, "parts": parts })]
                     },
-                    MessageContent::ToolCalls(MessageContentToolCalls { tool_results, .. }) => {
-                        let model_parts: Vec<Value> = tool_results.iter().map(|tool_result| {
+                    MessageContent::ToolCalls(MessageContentToolCalls { tool_results, text, .. }) => {
+                        let mut model_parts: Vec<Value> = vec![];
+                        if !text.is_empty() {
+                            model_parts.push(json!({ "text": text }));
+                        }
+                        for tool_result in tool_results.iter() {
+                            if let Some(round_text) = &tool_result.text {
+                                model_parts.push(json!({ "text": round_text }));
+                            }
                             let mut part = json!({
                                 "functionCall": {
                                     "name": tool_result.call.name,
@@ -383,8 +390,8 @@ pub fn gemini_build_chat_completions_body(
                             if let Some(sig) = &tool_result.call.thought_signature {
                                 part["thoughtSignature"] = json!(sig);
                             }
-                            part
-                        }).collect();
+                            model_parts.push(part);
+                        }
                         let function_parts: Vec<Value> = tool_results.into_iter().map(|tool_result| {
                             json!({
                                 "functionResponse": {
