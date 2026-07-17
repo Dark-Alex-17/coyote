@@ -208,7 +208,7 @@ memory_cap_without_tools: null   # Char cap when function calling is unavailable
 # repeatable --workspace-instructions-file flags.
 workspace_instructions: null     # null/true = inject when an instructions file exists; false = never inject
 workspace_instructions_files: null # File name chain to search, in priority order.
-                                   # Default: [COYOTE.md, AGENTS.md, CLAUDE.md]
+                                   # Default: [COYOTE.md, AGENTS.md, CLAUDE.md, GEMINI.md]
                                    # Set to a custom list to reorder or drop fallbacks, e.g.:
                                    #   workspace_instructions_files: [COYOTE.md]
 

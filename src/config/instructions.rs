@@ -4,8 +4,12 @@ use std::path::{Path, PathBuf};
 use log::warn;
 
 pub const WORKSPACE_INSTRUCTIONS_FILE_NAME: &str = "COYOTE.md";
-pub const DEFAULT_WORKSPACE_INSTRUCTIONS_FILES: [&str; 3] =
-    [WORKSPACE_INSTRUCTIONS_FILE_NAME, "AGENTS.md", "CLAUDE.md"];
+pub const DEFAULT_WORKSPACE_INSTRUCTIONS_FILES: [&str; 4] = [
+    WORKSPACE_INSTRUCTIONS_FILE_NAME,
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+];
 const INSTRUCTIONS_SIZE_WARN_THRESHOLD: usize = 24_000;
 
 #[derive(Debug, Clone)]
@@ -108,10 +112,14 @@ mod tests {
     }
 
     #[test]
-    fn discovery_falls_back_to_agents_md_then_claude_md() {
+    fn discovery_falls_back_through_chain_in_order() {
         let root = temp_root("fallback");
-        fs::write(root.join("CLAUDE.md"), "claude instructions").unwrap();
+        fs::write(root.join("GEMINI.md"), "gemini instructions").unwrap();
 
+        let found = discover_workspace_instructions(&root, &defaults()).unwrap();
+        assert_eq!(found.path, root.join("GEMINI.md"));
+
+        fs::write(root.join("CLAUDE.md"), "claude instructions").unwrap();
         let found = discover_workspace_instructions(&root, &defaults()).unwrap();
         assert_eq!(found.path, root.join("CLAUDE.md"));
 

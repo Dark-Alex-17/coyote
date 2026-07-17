@@ -38,7 +38,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [RAG](https://github.com/Dark-Alex-17/coyote/wiki/RAG): Retrieval-Augmented Generation for enhanced information retrieval and generation.
 * [Sessions](https://github.com/Dark-Alex-17/coyote/wiki/Sessions): Manage and persist conversational contexts and settings across multiple interactions.
 * [Memory](https://github.com/Dark-Alex-17/coyote/wiki/Memory): Persistent file-based memory that survives across sessions. Bootstrap with `coyote --init-memory [global|workspace]`.
-* [Workspace Instructions](https://github.com/Dark-Alex-17/coyote/wiki/Workspace-Instructions): Human-curated project instructions (`COYOTE.md`) injected into every prompt, with `AGENTS.md`/`CLAUDE.md` fallbacks for cross-tool compatibility. Scaffold with `coyote --init-instructions`.
+* [Workspace Instructions](https://github.com/Dark-Alex-17/coyote/wiki/Workspace-Instructions): Human-curated project instructions (`COYOTE.md`) injected into every prompt, with `AGENTS.md`/`CLAUDE.md`/`GEMINI.md` fallbacks for cross-tool compatibility. Scaffold with `coyote --init-instructions`.
 * [Roles](https://github.com/Dark-Alex-17/coyote/wiki/Roles): Customize model behavior for specific tasks or domains.
 * [Skills](https://github.com/Dark-Alex-17/coyote/wiki/Skills): Modular knowledge or capability packs the LLM can load and unload mid-conversation. Multiple skills compose; instructions stack, tools and MCPs union.
 * [Agents](https://github.com/Dark-Alex-17/coyote/wiki/Agents): Leverage AI agents to perform complex tasks and workflows, including sub-agent spawning, teammate messaging, and user interaction tools.

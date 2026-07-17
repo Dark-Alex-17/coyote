@@ -11,7 +11,7 @@ Use IWE tools when the task involves a corpus of markdown documents: plan reposi
 Do NOT use IWE tools for:
 
 - **Agent memory** (`.coyote/memory/`) — use the `memory__*` tools; they own the index conventions there.
-- **Workspace instructions** (`COYOTE.md`, `AGENTS.md`, `CLAUDE.md`) — human-curated and read-only; never edit them with IWE write tools.
+- **Workspace instructions** (`COYOTE.md`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`) — human-curated and read-only; never edit them with IWE write tools.
 - **Semantic/similarity search over documents** — that is RAG's job. IWE search is fuzzy title/key matching plus structural traversal, not embeddings.
 - **Source code** — IWE only understands markdown.
 
