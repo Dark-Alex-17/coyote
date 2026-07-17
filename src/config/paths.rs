@@ -193,11 +193,19 @@ pub fn skill_file(name: &str) -> PathBuf {
     skill_dir(name).join("SKILL.md")
 }
 
-pub fn workspace_skills_dir() -> PathBuf {
+pub fn workspace_config_dir() -> PathBuf {
+    let workspace_dir_name = match env::var(get_env_name("workspace_config_dir")) {
+        Ok(value) => value,
+        Err(_) => WORKSPACE_COYOTE_DIR_NAME.to_string(),
+    };
+
     env::current_dir()
         .unwrap_or_default()
-        .join(WORKSPACE_COYOTE_DIR_NAME)
-        .join(SKILLS_DIR_NAME)
+        .join(workspace_dir_name)
+}
+
+pub fn workspace_skills_dir() -> PathBuf {
+    workspace_config_dir().join(SKILLS_DIR_NAME)
 }
 
 pub fn workspace_skill_file(name: &str) -> PathBuf {
@@ -205,8 +213,7 @@ pub fn workspace_skill_file(name: &str) -> PathBuf {
 }
 
 pub fn workspace_mcp_config_file() -> PathBuf {
-    env::current_dir()
-        .unwrap_or_default()
+    workspace_config_dir()
         .join(WORKSPACE_COYOTE_DIR_NAME)
         .join(MCP_FILE_NAME)
 }
