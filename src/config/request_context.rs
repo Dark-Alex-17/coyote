@@ -16,7 +16,8 @@ use super::{
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
-    FunctionDeclaration, Functions, ToolCallTracker, ToolResult, skill::SKILL_FUNCTION_PREFIX,
+    FunctionDeclaration, Functions, ToolCallTracker, ToolResult, memory::MEMORY_FUNCTION_PREFIX,
+    skill::SKILL_FUNCTION_PREFIX, supervisor::SUPERVISOR_FUNCTION_PREFIX,
     todo::TODO_FUNCTION_PREFIX, user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::mcp::{
@@ -1047,15 +1048,19 @@ impl RequestContext {
     }
 
     fn concrete_tool_names(&self) -> Vec<String> {
-        self.tool_scope
-            .functions
-            .declarations()
+        let declarations = match &self.agent {
+            Some(agent) => agent.functions().declarations(),
+            None => self.tool_scope.functions.declarations(),
+        };
+        declarations
             .iter()
             .filter(|v| {
                 !v.name.starts_with("user__")
                     && !v.name.starts_with("mcp_")
                     && !v.name.starts_with("todo__")
                     && !v.name.starts_with("agent__")
+                    && !v.name.starts_with("memory__")
+                    && !v.name.starts_with("skill__")
             })
             .map(|v| v.name.clone())
             .collect()
@@ -1115,20 +1120,32 @@ impl RequestContext {
             _ => bail!("Unknown action '{action}'. Usage: .tool <enable|disable> <name>"),
         };
 
-        if self.session.is_none() && self.agent.is_some() {
+        if self.agent.as_ref().is_some_and(|a| a.is_graph()) {
             bail!(
-                "Cannot adjust tools for an agent outside a session; start a session first with `.session`"
+                "Graph agents define tools per-node via `tools:` in graph.yaml; agent-level enabled_tools has no effect"
             );
         }
 
         let pool = self.concrete_tool_names();
-        let is_alias = self.app.config.mapping_tools.contains_key(name);
+        let is_alias = self
+            .app
+            .config
+            .mapping_tools
+            .get(name)
+            .is_some_and(|values| {
+                values
+                    .split(',')
+                    .map(str::trim)
+                    .any(|v| pool.iter().any(|p| p.as_str() == v))
+            });
         if !pool.iter().any(|v| v == name) && !is_alias {
             bail!("Unknown tool '{name}'. Run `.list tools` to see what's available");
         }
 
         let current: Option<Vec<String>> = if let Some(session) = &self.session {
             session.enabled_tools()
+        } else if let Some(agent) = &self.agent {
+            agent.enabled_tools()
         } else if let Some(role) = &self.role {
             role.enabled_tools()
         } else {
@@ -1150,13 +1167,32 @@ impl RequestContext {
                     list.push(name.to_string());
                     list
                 }
-                None => vec![name.to_string()],
+                None => {
+                    if self.agent.is_some() {
+                        println!(
+                            "Tool '{name}' is already enabled (no filter is set; the agent's full tool pool is active)."
+                        );
+                        return Ok(());
+                    }
+                    vec![name.to_string()]
+                }
             }
         } else {
             match current {
                 None => {
-                    println!("No tools are enabled in this context; nothing to disable.");
-                    return Ok(());
+                    if self.agent.is_some() {
+                        let mut materialized = pool;
+                        materialized.retain(|v| v != name);
+                        println!(
+                            "Note: no filter was set; materialized the agent's pool into {} concrete tools.",
+                            materialized.len()
+                        );
+
+                        materialized
+                    } else {
+                        println!("No tools are enabled in this context; nothing to disable.");
+                        return Ok(());
+                    }
                 }
                 Some(list) if list.is_empty() => {
                     println!("No tools are enabled in this context; nothing to disable.");
@@ -1169,6 +1205,7 @@ impl RequestContext {
                         "Note: expanded 'all' into {} concrete tools.",
                         materialized.len()
                     );
+
                     materialized
                 }
                 Some(mut list) => {
@@ -1861,6 +1898,9 @@ impl RequestContext {
                             || (!matches!(agent.skills_enabled(), Some(false))
                                 && v.name.starts_with(SKILL_FUNCTION_PREFIX))
                             || v.name.starts_with(USER_FUNCTION_PREFIX)
+                            || v.name.starts_with(TODO_FUNCTION_PREFIX)
+                            || v.name.starts_with(SUPERVISOR_FUNCTION_PREFIX)
+                            || v.name.starts_with(MEMORY_FUNCTION_PREFIX)
                     });
                 }
 
@@ -2495,6 +2535,11 @@ impl RequestContext {
                 }
             }
             "enabled_tools" => {
+                if self.agent.as_ref().is_some_and(|a| a.is_graph()) {
+                    bail!(
+                        "Graph agents define tools per-node via `tools:` in graph.yaml; agent-level enabled_tools has no effect"
+                    );
+                }
                 let raw: Option<String> = super::parse_value(value)?;
                 let parsed: Option<Vec<String>> = raw.map(|s| super::csv_to_vec(&s));
                 if !self.set_enabled_tools_on_role_like(parsed.clone()) {
@@ -2933,20 +2978,36 @@ impl RequestContext {
         {
             let current = if let Some(session) = &self.session {
                 session.enabled_tools()
+            } else if let Some(agent) = &self.agent {
+                agent.enabled_tools()
             } else if let Some(role) = &self.role {
                 role.enabled_tools()
             } else {
                 self.app.config.enabled_tools.clone()
-            }
-            .unwrap_or_default();
-            let has_all = current.iter().any(|s| s.trim() == "all");
+            };
+            let agent_unfiltered = self.agent.is_some() && current.is_none();
+            let current = current.unwrap_or_default();
+            let has_all = agent_unfiltered || current.iter().any(|s| s.trim() == "all");
 
             let candidates: Vec<String> = if args.first() == Some(&"enable") {
                 if has_all {
                     vec![]
                 } else {
-                    let mut candidates = self.concrete_tool_names();
-                    candidates.extend(self.app.config.mapping_tools.keys().cloned());
+                    let pool = self.concrete_tool_names();
+                    let mut candidates = pool.clone();
+                    candidates.extend(
+                        self.app
+                            .config
+                            .mapping_tools
+                            .iter()
+                            .filter(|(_, expansion)| {
+                                expansion
+                                    .split(',')
+                                    .map(str::trim)
+                                    .any(|v| pool.iter().any(|p| p.as_str() == v))
+                            })
+                            .map(|(k, _)| k.clone()),
+                    );
                     candidates.sort_unstable();
                     candidates.dedup();
                     candidates.retain(|v| !self.tool_list_covers(&current, v));
@@ -4752,6 +4813,55 @@ mod tests {
         assert!(names.contains(&"skill__list"));
         assert!(names.contains(&"skill__load"));
         assert!(names.contains(&"skill__unload"));
+    }
+
+    #[test]
+    #[serial]
+    fn select_functions_preserves_infra_tools_under_agent_filter() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_infra_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!(
+                "name: {agent_name}\ninstructions: hi\nauto_continue: true\ncan_spawn_agents: true\n"
+            ),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            names.contains(&"todo__init"),
+            "todo__ tools must survive an agent tool filter, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"agent__spawn"),
+            "agent__ tools must survive an agent tool filter, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"agent__send_message"),
+            "teammate tools must survive an agent tool filter, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"user__ask"),
+            "user__ tools must survive an agent tool filter, got: {names:?}"
+        );
     }
 
     #[test]

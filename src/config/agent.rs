@@ -43,6 +43,8 @@ pub struct Agent {
     graph_rags: HashMap<String, Arc<Rag>>,
     model: Model,
     vault: GlobalVault,
+    is_graph: bool,
+    enabled_tools: Option<Vec<String>>,
 }
 
 impl Agent {
@@ -243,6 +245,8 @@ impl Agent {
             graph_rags,
             model,
             vault: app_state.vault.clone(),
+            is_graph: graph_for_rag.is_some(),
+            enabled_tools: None,
         })
     }
 
@@ -337,6 +341,10 @@ impl Agent {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn is_graph(&self) -> bool {
+        self.is_graph
     }
 
     pub fn functions(&self) -> &Functions {
@@ -580,7 +588,7 @@ impl RoleLike for Agent {
     }
 
     fn enabled_tools(&self) -> Option<Vec<String>> {
-        None
+        self.enabled_tools.clone()
     }
 
     fn enabled_mcp_servers(&self) -> Option<Vec<String>> {
@@ -605,18 +613,13 @@ impl RoleLike for Agent {
     }
 
     fn set_enabled_tools(&mut self, value: Option<Vec<String>>) {
-        match value {
-            Some(tools) => {
-                self.config.global_tools = tools
-                    .into_iter()
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
-                    .collect::<Vec<_>>();
-            }
-            None => {
-                self.config.global_tools.clear();
-            }
-        }
+        self.enabled_tools = value.map(|tools| {
+            tools
+                .into_iter()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>()
+        });
     }
 
     fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>) {
