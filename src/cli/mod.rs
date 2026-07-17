@@ -71,7 +71,7 @@ pub struct Cli {
     /// Display the message without sending it
     #[arg(long)]
     pub dry_run: bool,
-    /// Disable loading workspace MCP servers from .coyote/mcp.json (or .coyote/.mcp.json)
+    /// Disable loading workspace MCP servers from .coyote/mcp.json, .coyote/.mcp.json, or .mcp.json
     #[arg(long)]
     pub no_workspace_mcp: bool,
     /// Disable memory for this invocation

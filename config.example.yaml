@@ -136,11 +136,13 @@ enabled_mcp_servers: null        # Which MCP servers to enable by default.
                                  #     - slack
                                  # Example (comma-separated form):
                                  #   enabled_mcp_servers: github,slack,ddg-search
-no_workspace_mcp: false          # Disable loading workspace-local MCP servers from .coyote/mcp.json (default: false).
-                                 # When false (the default), Coyote merges .coyote/mcp.json from the current directory
-                                 # into the global MCP registry at startup. If mcp.json is absent, Coyote falls back
-                                 # to .coyote/.mcp.json (leading dot) for compatibility with Claude-style
-                                 # configurations. Workspace entries shadow global ones on name collision.
+no_workspace_mcp: false          # Disable loading workspace-local MCP servers (default: false).
+                                 # When false (the default), Coyote merges the first workspace MCP config it finds
+                                 # into the global MCP registry at startup, checking in order:
+                                 #   1. .coyote/mcp.json
+                                 #   2. .coyote/.mcp.json  (Claude-style file name)
+                                 #   3. .mcp.json          (project root; Claude Code convention)
+                                 # Workspace entries shadow global ones on name collision.
                                  # Set to true (or pass --no-workspace-mcp) to skip this entirely.
 
 # ---- Skills ----

@@ -213,11 +213,18 @@ pub fn workspace_skill_file(name: &str) -> PathBuf {
 }
 
 pub fn workspace_mcp_config_file() -> Option<PathBuf> {
+    workspace_mcp_config_file_in(&env::current_dir().unwrap_or_default())
+}
+
+fn workspace_mcp_config_file_in(workspace_root: &Path) -> Option<PathBuf> {
     let dir = workspace_config_dir();
-    [MCP_FILE_NAME, HIDDEN_MCP_FILE_NAME]
-        .into_iter()
-        .map(|name| dir.join(name))
-        .find(|candidate| candidate.is_file())
+    [
+        dir.join(MCP_FILE_NAME),
+        dir.join(HIDDEN_MCP_FILE_NAME),
+        workspace_root.join(HIDDEN_MCP_FILE_NAME),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
 }
 
 pub fn validate_skill_name(name: &str) -> Result<()> {
@@ -695,19 +702,20 @@ mod tests {
         use super::*;
         use serial_test::serial;
 
-        fn with_workspace_dir<F: FnOnce(&Path)>(f: F) {
+        fn with_workspace_dir<F: FnOnce(&Path, &Path)>(f: F) {
             let unique = time::SystemTime::now()
                 .duration_since(time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let root = env::temp_dir().join(format!("coyote-workspace-mcp-test-{unique}"));
-            fs::create_dir_all(&root).unwrap();
+            let ws_dir = root.join(WORKSPACE_COYOTE_DIR_NAME);
+            fs::create_dir_all(&ws_dir).unwrap();
             let env_name = get_env_name("workspace_config_dir");
             let prev = env::var_os(&env_name);
             unsafe {
-                env::set_var(&env_name, &root);
+                env::set_var(&env_name, &ws_dir);
             }
-            f(&root);
+            f(&root, &ws_dir);
             unsafe {
                 match prev {
                     Some(v) => env::set_var(&env_name, v),
@@ -720,36 +728,70 @@ mod tests {
         #[test]
         #[serial]
         fn returns_none_when_no_config_exists() {
-            with_workspace_dir(|_| {
-                assert_eq!(workspace_mcp_config_file(), None);
+            with_workspace_dir(|root, _| {
+                assert_eq!(workspace_mcp_config_file_in(root), None);
             });
         }
 
         #[test]
         #[serial]
         fn finds_mcp_json() {
-            with_workspace_dir(|root| {
-                fs::write(root.join("mcp.json"), "{}").unwrap();
-                assert_eq!(workspace_mcp_config_file(), Some(root.join("mcp.json")));
+            with_workspace_dir(|root, ws_dir| {
+                fs::write(ws_dir.join("mcp.json"), "{}").unwrap();
+                assert_eq!(
+                    workspace_mcp_config_file_in(root),
+                    Some(ws_dir.join("mcp.json"))
+                );
             });
         }
 
         #[test]
         #[serial]
         fn falls_back_to_claude_style_hidden_mcp_json() {
-            with_workspace_dir(|root| {
-                fs::write(root.join(".mcp.json"), "{}").unwrap();
-                assert_eq!(workspace_mcp_config_file(), Some(root.join(".mcp.json")));
+            with_workspace_dir(|root, ws_dir| {
+                fs::write(ws_dir.join(".mcp.json"), "{}").unwrap();
+                assert_eq!(
+                    workspace_mcp_config_file_in(root),
+                    Some(ws_dir.join(".mcp.json"))
+                );
             });
         }
 
         #[test]
         #[serial]
         fn prefers_mcp_json_when_both_exist() {
-            with_workspace_dir(|root| {
-                fs::write(root.join("mcp.json"), "{}").unwrap();
+            with_workspace_dir(|root, ws_dir| {
+                fs::write(ws_dir.join("mcp.json"), "{}").unwrap();
+                fs::write(ws_dir.join(".mcp.json"), "{}").unwrap();
+                assert_eq!(
+                    workspace_mcp_config_file_in(root),
+                    Some(ws_dir.join("mcp.json"))
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn falls_back_to_project_root_hidden_mcp_json() {
+            with_workspace_dir(|root, _| {
                 fs::write(root.join(".mcp.json"), "{}").unwrap();
-                assert_eq!(workspace_mcp_config_file(), Some(root.join("mcp.json")));
+                assert_eq!(
+                    workspace_mcp_config_file_in(root),
+                    Some(root.join(".mcp.json"))
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn prefers_workspace_dir_config_over_project_root() {
+            with_workspace_dir(|root, ws_dir| {
+                fs::write(ws_dir.join(".mcp.json"), "{}").unwrap();
+                fs::write(root.join(".mcp.json"), "{}").unwrap();
+                assert_eq!(
+                    workspace_mcp_config_file_in(root),
+                    Some(ws_dir.join(".mcp.json"))
+                );
             });
         }
     }
