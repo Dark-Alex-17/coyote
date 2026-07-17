@@ -2362,20 +2362,21 @@ impl RequestContext {
                 Ok(())
             }
             "tools" => {
-                let mut names: Vec<String> = self
-                    .tool_scope
-                    .functions
-                    .declarations()
+                let mut names = self.concrete_tool_names();
+                let aliases: Vec<String> = self
+                    .app
+                    .config
+                    .mapping_tools
                     .iter()
-                    .filter(|v| {
-                        !v.name.starts_with("user__")
-                            && !v.name.starts_with("mcp_")
-                            && !v.name.starts_with("todo__")
-                            && !v.name.starts_with("agent__")
+                    .filter(|(_, expansion)| {
+                        expansion
+                            .split(',')
+                            .map(str::trim)
+                            .any(|v| names.iter().any(|p| p.as_str() == v))
                     })
-                    .map(|v| v.name.clone())
+                    .map(|(k, _)| k.clone())
                     .collect();
-                names.extend(self.app.config.mapping_tools.keys().map(|v| v.to_string()));
+                names.extend(aliases);
                 names.sort_unstable();
                 names.dedup();
 
