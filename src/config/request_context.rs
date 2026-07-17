@@ -1699,6 +1699,10 @@ impl RequestContext {
                 .unwrap_or_default()
                 .to_string(),
         );
+        if let Some(effort) = role.reasoning_effort() {
+            output.insert("reasoning_effort", effort.to_string());
+        }
+
         if let Some(temperature) = role.temperature()
             && temperature != 0.0
         {

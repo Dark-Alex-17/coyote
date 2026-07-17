@@ -33,7 +33,7 @@ sync_models_url: >               # URL to sync model changes from
 left_prompt:
   '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
 right_prompt:
-  '{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
+  '{color.cyan}{?reasoning_effort [{reasoning_effort}] }{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
 
 # ---- Vault ----
 # See the [Vault documentation](https://github.com/Dark-Alex-17/coyote/wiki/Vault) for more information on the Coyote vault.
