@@ -474,7 +474,7 @@ fn rename_memory(store: &MemoryStore, cwd: &Path, args: &Value) -> Result<Value>
     let description = renamed.frontmatter.description.clone().unwrap_or_default();
     ensure_index_entry(&index_path, &new_name, &description)?;
 
-    // Other indexes (other scope's MEMORY.md, lite COYOTE.md): rewrite wikilinks only.
+    // Other indexes (other scope's MEMORY.md): rewrite wikilinks only.
     for other_index in other_index_paths(store, &target_dir) {
         if let Ok(existing) = fs::read_to_string(&other_index)
             && existing.contains(&needle)
@@ -539,17 +539,11 @@ fn other_index_paths(store: &MemoryStore, own_dir: &Path) -> Vec<PathBuf> {
         out.push(global_index);
     }
 
-    match &store.workspace {
-        Some(WorkspaceMemory::Structured { dir, .. }) => {
-            let index = dir.join("MEMORY.md");
-            if dir.as_path() != own_dir && index.exists() {
-                out.push(index);
-            }
+    if let Some(ws) = &store.workspace {
+        let index = ws.dir.join("MEMORY.md");
+        if ws.dir.as_path() != own_dir && index.exists() {
+            out.push(index);
         }
-        Some(WorkspaceMemory::Lite { file, .. }) if file.exists() => {
-            out.push(file.clone());
-        }
-        _ => {}
     }
 
     out
@@ -637,10 +631,7 @@ fn find_file(store: &MemoryStore, name: &str) -> Result<Option<MemoryFile>> {
 
 fn workspace_write_dir(store: &MemoryStore, cwd: &Path) -> Result<PathBuf> {
     match &store.workspace {
-        Some(WorkspaceMemory::Structured { dir, .. }) => Ok(dir.clone()),
-        Some(WorkspaceMemory::Lite { workspace_root, .. }) => {
-            Ok(paths::workspace_memory_dir_for(workspace_root))
-        }
+        Some(ws) => Ok(ws.dir.clone()),
         None => match find_git_root(cwd) {
             Some(git_root) => bootstrap_workspace_memory(&git_root),
             None => bail!(
@@ -652,20 +643,10 @@ fn workspace_write_dir(store: &MemoryStore, cwd: &Path) -> Result<PathBuf> {
 }
 
 fn workspace_label(w: &WorkspaceMemory) -> Value {
-    match w {
-        WorkspaceMemory::Structured { workspace_root, .. } => json!({
-            "mode": "structured",
-            "root": workspace_root.display().to_string(),
-        }),
-        WorkspaceMemory::Lite {
-            workspace_root,
-            file,
-        } => json!({
-            "mode": "lite",
-            "root": workspace_root.display().to_string(),
-            "file": file.display().to_string(),
-        }),
-    }
+    json!({
+        "root": w.workspace_root.display().to_string(),
+        "dir": w.dir.display().to_string(),
+    })
 }
 
 fn lint_memory(store: &MemoryStore) -> Result<Value> {
@@ -872,19 +853,24 @@ mod tests {
     }
 
     #[test]
-    fn workspace_write_dir_promotes_lite_to_structured_subdir() {
-        let root = temp_root("ws_lite_promote");
+    fn workspace_write_dir_treats_root_instructions_file_as_no_memory() {
+        let root = temp_root("ws_instructions_only");
         let workspace = root.join("ws");
-        fs::create_dir_all(&workspace).unwrap();
-        fs::write(workspace.join("COYOTE.md"), "lite").unwrap();
+        fs::create_dir_all(workspace.join(".git")).unwrap();
+        fs::write(workspace.join("COYOTE.md"), "instructions, not memory").unwrap();
 
         let store = MemoryStore {
             global_dir: root.join("g"),
             workspace: discover_workspace_memory(&workspace),
         };
+        assert!(store.workspace.is_none(), "COYOTE.md must not be memory");
 
         let dir = workspace_write_dir(&store, &workspace).unwrap();
         assert_eq!(dir, workspace.join(".coyote").join("memory"));
+        assert!(
+            dir.join("MEMORY.md").exists(),
+            "bootstrap must create index"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

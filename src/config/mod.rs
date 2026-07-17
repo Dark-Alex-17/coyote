@@ -3,6 +3,7 @@ mod app_config;
 mod app_state;
 mod input;
 mod install_remote;
+pub(crate) mod instructions;
 mod macros;
 mod mcp_factory;
 pub(crate) mod memory;
@@ -143,7 +144,6 @@ const MCP_FILE_NAME: &str = "mcp.json";
 const HIDDEN_MCP_FILE_NAME: &str = ".mcp.json";
 const MEMORY_DIR_NAME: &str = "memory";
 const MEMORY_INDEX_FILE_NAME: &str = "MEMORY.md";
-const WORKSPACE_MEMORY_FILE_NAME: &str = "COYOTE.md";
 const WORKSPACE_COYOTE_DIR_NAME: &str = ".coyote";
 const SBX_KIT_DIR_NAME: &str = "sbx-kit";
 const SBX_KIT_HASH_FILE: &str = "kit.sha256";
@@ -245,6 +245,9 @@ pub struct Config {
     pub memory_cap_with_tools: Option<usize>,
     pub memory_cap_without_tools: Option<usize>,
 
+    pub workspace_instructions: Option<bool>,
+    pub workspace_instructions_files: Option<Vec<String>>,
+
     pub rag_embedding_model: Option<String>,
     pub rag_reranker_model: Option<String>,
     pub rag_top_k: usize,
@@ -319,6 +322,9 @@ impl Default for Config {
             memory: None,
             memory_cap_with_tools: None,
             memory_cap_without_tools: None,
+
+            workspace_instructions: None,
+            workspace_instructions_files: None,
 
             rag_embedding_model: None,
             rag_reranker_model: None,

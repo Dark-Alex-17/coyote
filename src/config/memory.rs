@@ -7,39 +7,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     GIT_DIR_NAME, GITIGNORE_FILE_NAME, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME,
-    WORKSPACE_COYOTE_DIR_NAME, WORKSPACE_MEMORY_FILE_NAME, paths,
+    WORKSPACE_COYOTE_DIR_NAME, paths,
 };
 
 pub const DEFAULT_MEMORY_CAP_WITH_TOOLS: usize = 6_000;
 pub const DEFAULT_MEMORY_CAP_WITHOUT_TOOLS: usize = 12_000;
 
 #[derive(Debug, Clone)]
-pub enum WorkspaceMemory {
-    Structured {
-        workspace_root: PathBuf,
-        dir: PathBuf,
-    },
-    Lite {
-        workspace_root: PathBuf,
-        file: PathBuf,
-    },
+pub struct WorkspaceMemory {
+    pub workspace_root: PathBuf,
+    pub dir: PathBuf,
 }
 
 pub fn discover_workspace_memory(start: &Path) -> Option<WorkspaceMemory> {
     for dir in start.ancestors() {
         let structured = dir.join(WORKSPACE_COYOTE_DIR_NAME).join(MEMORY_DIR_NAME);
         if structured.join(MEMORY_INDEX_FILE_NAME).exists() {
-            return Some(WorkspaceMemory::Structured {
+            return Some(WorkspaceMemory {
                 workspace_root: dir.to_path_buf(),
                 dir: structured,
-            });
-        }
-
-        let lite = dir.join(WORKSPACE_MEMORY_FILE_NAME);
-        if lite.exists() {
-            return Some(WorkspaceMemory::Lite {
-                workspace_root: dir.to_path_buf(),
-                file: lite,
             });
         }
     }
@@ -82,7 +68,7 @@ pub fn bootstrap_workspace_memory(git_root: &Path) -> Result<PathBuf> {
     Ok(mem_dir)
 }
 
-fn append_gitignore_entry(git_root: &Path) -> Result<bool> {
+pub fn append_gitignore_entry(git_root: &Path) -> Result<bool> {
     let gitignore = git_root.join(GITIGNORE_FILE_NAME);
     let entry = format!("{WORKSPACE_COYOTE_DIR_NAME}/{MEMORY_DIR_NAME}/");
     let entry_no_slash = format!("{WORKSPACE_COYOTE_DIR_NAME}/{MEMORY_DIR_NAME}");
@@ -212,9 +198,8 @@ impl MemoryStore {
     pub fn load_workspace_index(&self) -> Result<Option<String>> {
         match &self.workspace {
             None => Ok(None),
-            Some(WorkspaceMemory::Lite { file, .. }) => Ok(Some(fs::read_to_string(file)?)),
-            Some(WorkspaceMemory::Structured { dir, .. }) => {
-                let index = dir.join(MEMORY_INDEX_FILE_NAME);
+            Some(ws) => {
+                let index = ws.dir.join(MEMORY_INDEX_FILE_NAME);
                 if index.exists() {
                     Ok(Some(fs::read_to_string(index)?))
                 } else {
@@ -231,8 +216,8 @@ impl MemoryStore {
             collect_md_files(&self.global_dir, &mut out)?;
         }
 
-        if let Some(WorkspaceMemory::Structured { dir, .. }) = &self.workspace {
-            collect_md_files(dir, &mut out)?;
+        if let Some(ws) = &self.workspace {
+            collect_md_files(&ws.dir, &mut out)?;
         }
 
         Ok(out)
@@ -378,18 +363,13 @@ mod tests {
     }
 
     #[test]
-    fn workspace_discovery_prefers_structured_over_lite() {
-        let root = temp_root("prefer");
+    fn workspace_discovery_ignores_root_instructions_file() {
+        let root = temp_root("no_lite");
         let workspace = root.join("ws");
-        let structured = workspace
-            .join(WORKSPACE_COYOTE_DIR_NAME)
-            .join(MEMORY_DIR_NAME);
-        fs::create_dir_all(&structured).unwrap();
-        fs::write(structured.join(MEMORY_INDEX_FILE_NAME), "s").unwrap();
-        fs::write(workspace.join(WORKSPACE_MEMORY_FILE_NAME), "l").unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("COYOTE.md"), "instructions, not memory").unwrap();
 
-        let found = discover_workspace_memory(&workspace);
-        assert!(matches!(found, Some(WorkspaceMemory::Structured { .. })));
+        assert!(discover_workspace_memory(&workspace).is_none());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -582,8 +562,8 @@ mod tests {
         let nested = workspace.join("src").join("deep").join("path");
         fs::create_dir_all(&nested).unwrap();
 
-        let found = discover_workspace_memory(&nested);
-        assert!(matches!(found, Some(WorkspaceMemory::Structured { .. })));
+        let found = discover_workspace_memory(&nested).expect("workspace memory should be found");
+        assert_eq!(found.dir, mem_dir);
 
         let _ = fs::remove_dir_all(&root);
     }

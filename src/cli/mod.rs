@@ -77,6 +77,12 @@ pub struct Cli {
     /// Disable memory for this invocation
     #[arg(long)]
     pub no_memory: bool,
+    /// Disable loading workspace instructions (COYOTE.md/AGENTS.md/CLAUDE.md/etc.) for this invocation
+    #[arg(long)]
+    pub no_workspace_instructions: bool,
+    /// Override the workspace instructions file chain for this invocation (repeatable, priority order)
+    #[arg(long, value_name = "NAME")]
+    pub workspace_instructions_file: Vec<String>,
     /// Skip permission prompts by setting AUTO_CONFIRM for all tools (dangerous!)
     #[arg(long)]
     pub dangerously_skip_permissions: bool,
@@ -98,6 +104,9 @@ pub struct Cli {
         help_heading = "Session & Memory"
     )]
     pub init_memory: Option<MemoryScope>,
+    /// Scaffold a COYOTE.md workspace instructions file in the current directory
+    #[arg(long, help_heading = "Session & Memory")]
+    pub init_instructions: bool,
     /// Pre-load an existing skill into the session (repeatable). If a single
     /// `--skill <NAME>` is given and the skill doesn't exist, opens $EDITOR
     /// with a scaffold to create it.

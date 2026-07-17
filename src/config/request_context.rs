@@ -32,6 +32,7 @@ use crate::utils::{
     list_file_names, now, render_prompt, temp_file,
 };
 
+use super::instructions;
 use super::memory::{
     DEFAULT_MEMORY_CAP_WITH_TOOLS, DEFAULT_MEMORY_CAP_WITHOUT_TOOLS, MemoryStore, WorkspaceMemory,
 };
@@ -797,6 +798,20 @@ impl RequestContext {
             self.session.as_ref(),
         )?;
 
+        if app.workspace_instructions.unwrap_or(true)
+            && let Ok(cwd) = env::current_dir()
+        {
+            let file_names = app
+                .workspace_instructions_files
+                .clone()
+                .unwrap_or_else(instructions::default_workspace_instructions_files);
+            if let Some(found) = instructions::discover_workspace_instructions(&cwd, &file_names) {
+                let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
+                role.append_to_prompt(separator);
+                role.append_to_prompt(&instructions::build_instructions_section(&found));
+            }
+        }
+
         if should_inject_skill_instructions(app, &policy) {
             let config = self.skill_instructions_config();
 
@@ -1469,6 +1484,24 @@ impl RequestContext {
             (
                 "memory_cap_without_tools",
                 super::format_option_value(&app.memory_cap_without_tools),
+            ),
+            (
+                "workspace_instructions",
+                super::format_option_value(&app.workspace_instructions),
+            ),
+            (
+                "workspace_instructions_file",
+                env::current_dir()
+                    .ok()
+                    .and_then(|cwd| {
+                        let file_names = app
+                            .workspace_instructions_files
+                            .clone()
+                            .unwrap_or_else(instructions::default_workspace_instructions_files);
+                        instructions::discover_workspace_instructions(&cwd, &file_names)
+                    })
+                    .map(|i| i.path.display().to_string())
+                    .unwrap_or_else(|| "null".into()),
             ),
             (
                 "rag_reranker_model",

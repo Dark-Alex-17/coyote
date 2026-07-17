@@ -189,8 +189,8 @@ summary_context_prompt: >        # The text prompt used for including the summar
 
 # ---- Memory ----
 # See the [Memory documentation](https://github.com/Dark-Alex-17/coyote/wiki/Memory) for more information.
-# Memory is opt-in by workspace presence (a `COYOTE.md` or `.coyote/memory/MEMORY.md`)
-# and global presence (`<config_dir>/memory/MEMORY.md`). Set `memory: false` to disable
+# Memory is opt-in by workspace presence (`.coyote/memory/MEMORY.md`) and global
+# presence (`<config_dir>/memory/MEMORY.md`). Set `memory: false` to disable
 # even when memory files exist. The cascade is: agent > session > role > app.
 # Bootstrap with `coyote --init-memory [global|workspace]` to create the marker file
 # the LLM needs before it will write any memory.
@@ -199,6 +199,18 @@ memory_cap_with_tools: null      # Char cap for injected memory when function ca
                                  # Only MEMORY.md indexes are injected; the LLM uses memory__read to fetch drill files.
 memory_cap_without_tools: null   # Char cap when function calling is unavailable (default: 12000).
                                  # Indexes plus drill file bodies are injected up to this cap.
+
+# ---- Workspace Instructions ----
+# Human-curated project instructions injected read-only into the system prompt, in full.
+# Coyote walks up from the current directory and injects the first match from the file
+# chain below (per directory, in order). Scaffold with `coyote --init-instructions`.
+# Disable per-invocation with --no-workspace-instructions, or override the chain with
+# repeatable --workspace-instructions-file flags.
+workspace_instructions: null     # null/true = inject when an instructions file exists; false = never inject
+workspace_instructions_files: null # File name chain to search, in priority order.
+                                   # Default: [COYOTE.md, AGENTS.md, CLAUDE.md]
+                                   # Set to a custom list to reorder or drop fallbacks, e.g.:
+                                   #   workspace_instructions_files: [COYOTE.md]
 
 # ---- RAG ----
 # See the [RAG Docs](https://github.com/Dark-Alex-17/coyote/wiki/RAG) for more details.

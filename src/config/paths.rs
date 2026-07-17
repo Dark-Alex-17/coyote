@@ -356,6 +356,10 @@ pub fn workspace_memory_dir_for(workspace_root: &Path) -> PathBuf {
         .join(MEMORY_DIR_NAME)
 }
 
+pub fn workspace_memory_index_path_for(workspace_root: &Path) -> PathBuf {
+    workspace_memory_dir_for(workspace_root).join(MEMORY_INDEX_FILE_NAME)
+}
+
 pub fn repl_history_dir() -> PathBuf {
     cache_path().join(REPL_HISTORY_DIR_NAME)
 }

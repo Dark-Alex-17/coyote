@@ -21,12 +21,13 @@ use crate::cli::Cli;
 use crate::client::{
     ModelType, call_chat_completions, call_chat_completions_streaming, list_models, oauth,
 };
-use crate::config::paths;
+use crate::config::instructions::WORKSPACE_INSTRUCTIONS_FILE_NAME;
 use crate::config::{
     Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, MemoryScope,
     RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
     install_builtins, list_agents, load_env_file, macro_execute, sync_models,
 };
+use crate::config::{memory, paths};
 use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
 use crate::mcp::McpServersConfig;
 use crate::render::{prompt_theme, render_error};
@@ -369,6 +370,15 @@ async fn run(
     if cli.no_memory {
         update_app_config(&mut ctx, |app| app.memory = Some(false));
     }
+    if cli.no_workspace_instructions {
+        update_app_config(&mut ctx, |app| app.workspace_instructions = Some(false));
+    }
+    if !cli.workspace_instructions_file.is_empty() {
+        let files = cli.workspace_instructions_file.clone();
+        update_app_config(&mut ctx, |app| {
+            app.workspace_instructions_files = Some(files);
+        });
+    }
     if cli.empty_session {
         ctx.empty_session()?;
     }
@@ -381,10 +391,14 @@ async fn run(
                 paths::global_memory_index_path(),
                 "# Global Memory\n\n<!-- Universal facts about you go here. The LLM uses this as always-on context. -->\n<!-- Drill files (when created) are listed below. -->\n",
             ),
-            MemoryScope::Workspace => (
-                env::current_dir()?.join("COYOTE.md"),
-                "# Workspace Memory\n\n<!-- Facts about this project go here. The LLM uses this as always-on context. -->\n",
-            ),
+            MemoryScope::Workspace => {
+                let cwd = env::current_dir()?;
+                let root = memory::find_git_root(&cwd).unwrap_or(cwd);
+                (
+                    paths::workspace_memory_index_path_for(&root),
+                    "# Workspace Memory Index\n\n<!-- Facts about this project go here. The LLM uses this as always-on context. -->\n<!-- Drill files (when created) are listed below. -->\n",
+                )
+            }
         };
 
         if path.exists() {
@@ -397,7 +411,32 @@ async fn run(
         }
 
         fs::write(&path, content)?;
+        if scope == MemoryScope::Workspace
+            && let Some(git_root) = memory::find_git_root(&path)
+        {
+            memory::append_gitignore_entry(&git_root)?;
+        }
         println!("✓ Created memory marker at '{}'.", path.display());
+        return Ok(());
+    }
+    if cli.init_instructions {
+        let path = env::current_dir()?.join(WORKSPACE_INSTRUCTIONS_FILE_NAME);
+
+        if path.exists() {
+            eprintln!(
+                "Workspace instructions already exist at '{}'.",
+                path.display()
+            );
+
+            return Ok(());
+        }
+
+        fs::write(
+            &path,
+            "# Project Instructions\n\n<!-- Human-curated instructions for AI agents working in this repo. -->\n<!-- Coyote injects this file into the system prompt read-only, in full. -->\n",
+        )?;
+        println!("✓ Created workspace instructions at '{}'.", path.display());
+
         return Ok(());
     }
     if cli.info {

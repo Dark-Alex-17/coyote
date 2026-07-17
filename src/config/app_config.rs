@@ -69,6 +69,9 @@ pub struct AppConfig {
     pub memory_cap_with_tools: Option<usize>,
     pub memory_cap_without_tools: Option<usize>,
 
+    pub workspace_instructions: Option<bool>,
+    pub workspace_instructions_files: Option<Vec<String>>,
+
     pub rag_embedding_model: Option<String>,
     pub rag_reranker_model: Option<String>,
     pub rag_top_k: usize,
@@ -145,6 +148,9 @@ impl Default for AppConfig {
             memory: None,
             memory_cap_with_tools: None,
             memory_cap_without_tools: None,
+
+            workspace_instructions: None,
+            workspace_instructions_files: None,
 
             rag_embedding_model: None,
             rag_reranker_model: None,
@@ -223,6 +229,9 @@ impl AppConfig {
             memory: config.memory,
             memory_cap_with_tools: config.memory_cap_with_tools,
             memory_cap_without_tools: config.memory_cap_without_tools,
+
+            workspace_instructions: config.workspace_instructions,
+            workspace_instructions_files: config.workspace_instructions_files,
 
             rag_embedding_model: config.rag_embedding_model,
             rag_reranker_model: config.rag_reranker_model,
