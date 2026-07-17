@@ -33,7 +33,7 @@ async fn extract_via_extractor(
     parent_ctx: &mut RequestContext,
     is_repair: bool,
 ) -> Result<Value> {
-    let role = build_extractor_role()?;
+    let role = build_extractor_role(parent_ctx);
     let prompt = build_extractor_prompt(raw, schema, is_repair);
 
     let saved_role = parent_ctx.role.clone();
@@ -53,11 +53,12 @@ async fn extract_via_extractor(
     }
 }
 
-fn build_extractor_role() -> Result<Role> {
+fn build_extractor_role(ctx: &RequestContext) -> Role {
     let mut role = Role::new(EXTRACTOR_ROLE_NAME, EXTRACTOR_ROLE_PROMPT);
+    role.set_model(ctx.current_model().clone());
     role.set_enabled_tools(Some(Vec::new()));
     role.set_enabled_mcp_servers(Some(Vec::new()));
-    Ok(role)
+    role
 }
 
 fn build_extractor_prompt(raw: &str, schema: &Value, is_repair: bool) -> String {
@@ -107,7 +108,13 @@ fn strip_code_fences(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::Model;
+    use crate::config::{AppState, WorkingMode};
     use serde_json::json;
+
+    fn make_ctx() -> RequestContext {
+        RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
+    }
 
     #[test]
     fn try_parse_json_accepts_plain_object() {
@@ -181,9 +188,23 @@ mod tests {
 
     #[test]
     fn build_extractor_role_disables_tools_and_mcp() {
-        let role = build_extractor_role().expect("builtin role must exist");
+        let ctx = make_ctx();
+
+        let role = build_extractor_role(&ctx);
 
         assert_eq!(role.enabled_tools().as_deref(), Some([].as_slice()));
         assert_eq!(role.enabled_mcp_servers().as_deref(), Some([].as_slice()));
+    }
+
+    #[test]
+    fn build_extractor_role_uses_parent_context_model() {
+        let mut ctx = make_ctx();
+        let mut parent_role = Role::new("parent", "parent prompt");
+        parent_role.set_model(Model::new("client-x", "model-y"));
+        ctx.role = Some(parent_role);
+
+        let role = build_extractor_role(&ctx);
+
+        assert_eq!(role.model().id(), "client-x:model-y");
     }
 }
