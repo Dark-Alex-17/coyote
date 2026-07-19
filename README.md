@@ -62,7 +62,7 @@ Coyote requires the following tools to be installed on your system:
 * [uv](https://docs.astral.sh/uv/getting-started/installation/)
     * `curl -LsSf https://astral.sh/uv/install.sh | sh`
 * [iwe](https://github.com/iwe-org/iwe) (`iwec`, for the built-in `iwe` MCP server that navigates large markdown knowledgebases)
-    * **Homebrew:** `brew tap iwe-org/iwe && brew install iwe`
+    * **Homebrew:** `brew tap iwe-org/iwe && brew trust --formula iwe-org/iwe/iwe && brew install iwe`
     * **Cargo:** `cargo install iwec`
 * [ast-grep](https://ast-grep.github.io/) (for the built-in `ast_grep` structural code search tool, used by the `explore` agent)
     * **Homebrew:** `brew install ast-grep`
