@@ -403,9 +403,24 @@ pub async fn create_openai_compatible_client_config(
     };
     config["api_base"] = api_base.into();
 
-    let api_key = prompt_input_string("API Key", false, None)?;
-    if !api_key.is_empty() {
-        config["api_key"] = api_key.into();
+    let has_bundled_oauth = ALL_PROVIDER_MODELS
+        .iter()
+        .any(|p| p.provider == client && p.oauth.is_some());
+
+    let use_oauth = if has_bundled_oauth {
+        let choice = Select::new("Authentication method:", vec!["API Key", "OAuth"]).prompt()?;
+        choice == "OAuth"
+    } else {
+        false
+    };
+
+    if use_oauth {
+        config["auth"] = "oauth".into();
+    } else {
+        let api_key = prompt_input_string("API Key", false, None)?;
+        if !api_key.is_empty() {
+            config["api_key"] = api_key.into();
+        }
     }
 
     let model = set_client_models_config(&mut config, &name).await?;
