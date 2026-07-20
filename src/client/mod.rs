@@ -4,6 +4,7 @@ mod common;
 mod gemini_oauth;
 mod message;
 pub mod oauth;
+mod openai_compatible_oauth;
 mod openai_oauth;
 #[macro_use]
 mod macros;

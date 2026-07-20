@@ -61,8 +61,8 @@ impl OAuthProvider for McpOAuthProvider {
         ""
     }
 
-    fn scopes(&self) -> &str {
-        &self.scopes
+    fn scopes(&self) -> String {
+        self.scopes.clone()
     }
 
     fn token_request_format(&self) -> TokenRequestFormat {

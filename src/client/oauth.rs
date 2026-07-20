@@ -118,7 +118,7 @@ pub trait OAuthProvider: Send + Sync {
     fn authorize_url(&self) -> &str;
     fn token_url(&self) -> &str;
     fn redirect_uri(&self) -> &str;
-    fn scopes(&self) -> &str;
+    fn scopes(&self) -> String;
 
     fn client_secret(&self) -> Option<&str> {
         None
@@ -204,7 +204,8 @@ async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Resul
         (provider.redirect_uri().to_string(), false)
     };
 
-    let encoded_scopes = urlencoding::encode(provider.scopes());
+    let scopes = provider.scopes();
+    let encoded_scopes = urlencoding::encode(&scopes);
     let encoded_redirect = urlencoding::encode(&redirect_uri);
 
     let mut authorize_url = format!(
@@ -313,7 +314,7 @@ async fn run_client_credentials_flow(
         ("client_id", provider.client_id()),
     ];
     if !scopes.is_empty() {
-        params.push(("scope", scopes));
+        params.push(("scope", scopes.as_str()));
     }
 
     let request = build_token_request(&client, provider, &params);

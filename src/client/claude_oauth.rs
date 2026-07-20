@@ -25,8 +25,8 @@ impl OAuthProvider for ClaudeOAuthProvider {
         "https://console.anthropic.com/oauth/code/callback"
     }
 
-    fn scopes(&self) -> &str {
-        "org:create_api_key user:profile user:inference"
+    fn scopes(&self) -> String {
+        "org:create_api_key user:profile user:inference".to_string()
     }
 
     fn extra_authorize_params(&self) -> Vec<(&str, &str)> {

@@ -26,8 +26,8 @@ impl OAuthProvider for OpenAIOAuthProvider {
         "http://localhost:1455/auth/callback"
     }
 
-    fn scopes(&self) -> &str {
-        "openid profile email offline_access"
+    fn scopes(&self) -> String {
+        "openid profile email offline_access".to_string()
     }
 
     fn token_request_format(&self) -> TokenRequestFormat {

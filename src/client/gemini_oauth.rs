@@ -27,8 +27,8 @@ impl OAuthProvider for GeminiOAuthProvider {
         ""
     }
 
-    fn scopes(&self) -> &str {
-        "https://www.googleapis.com/auth/generative-language.peruserquota https://www.googleapis.com/auth/generative-language.retriever https://www.googleapis.com/auth/userinfo.email"
+    fn scopes(&self) -> String {
+        "https://www.googleapis.com/auth/generative-language.peruserquota https://www.googleapis.com/auth/generative-language.retriever https://www.googleapis.com/auth/userinfo.email".to_string()
     }
 
     fn client_secret(&self) -> Option<&str> {
