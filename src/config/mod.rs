@@ -63,7 +63,7 @@ use indoc::formatdoc;
 use inquire::{Confirm, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::{
     env,
@@ -596,7 +596,7 @@ impl Config {
             })
             .with_context(|| "Failed to load config from str")?;
 
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for cc in &config.clients {
             let (name, _, _) = oauth::client_config_info(cc);
             if !seen.insert(name.to_string()) {

@@ -1,5 +1,6 @@
-use super::ClientConfig;
 use super::access_token::{is_valid_access_token, set_access_token};
+use super::openai_compatible_oauth::OpenAICompatibleOAuthProvider;
+use super::{ClientConfig, ProviderModels};
 use crate::config::paths;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
@@ -33,11 +34,6 @@ pub enum OAuthFlow {
     ClientCredentials,
 }
 
-/// Runtime OAuth configuration merged from `models.yaml` provider defaults
-/// and user config `clients[i].oauth` overrides.
-///
-/// Every field except `client_id`, `token_url`, and `flow` is optional so that
-/// user config can override individual fields without restating the entire block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthConfig {
     pub client_id: String,
@@ -69,9 +65,6 @@ fn default_true() -> bool {
 }
 
 impl OAuthConfig {
-    /// Merge a user override into `self` field-by-field. User values win.
-    /// Uses `json_patch::merge`-like semantics (see `common.rs:apply_patch`) —
-    /// `None` in override means "keep base"; explicit values replace.
     pub fn merge(mut self, override_cfg: OAuthConfig) -> Self {
         self.client_id = override_cfg.client_id;
         self.token_url = override_cfg.token_url;
@@ -106,8 +99,10 @@ impl OAuthConfig {
             self.extra_request_headers
                 .extend(override_cfg.extra_request_headers);
         }
+
         self.echo_pkce_in_token_exchange = override_cfg.echo_pkce_in_token_exchange;
         self.include_state_in_token_exchange = override_cfg.include_state_in_token_exchange;
+
         self
     }
 }
@@ -341,6 +336,7 @@ async fn run_client_credentials_flow(
         client_name,
         provider.provider_name()
     );
+
     Ok(())
 }
 
@@ -502,7 +498,7 @@ fn listen_for_oauth_callback(redirect_uri: &str) -> Result<(String, String)> {
 
     println!("Waiting for OAuth callback on {redirect_uri} ...");
     println!(
-        "(If the browser shows a 'paste this code' page, ignore it — Coyote captures the callback automatically.)\n"
+        "(If the browser shows a 'paste this code' page, ignore it. Coyote captures the callback automatically.)\n"
     );
 
     let listener = TcpListener::bind(format!("{host}:{port}"))?;
@@ -570,13 +566,9 @@ pub fn get_oauth_provider(provider_type: &str) -> Option<Box<dyn OAuthProvider>>
     }
 }
 
-/// Build an OAuthProvider for a given client, resolving config-driven providers
-/// (openai-compatible) from a merged `models.yaml` + user-config OAuthConfig.
-///
-/// For first-class providers (claude/gemini/openai), delegates to `get_oauth_provider`.
 pub fn get_oauth_provider_for_client(
     client_config: &ClientConfig,
-    all_provider_models: &[super::ProviderModels],
+    all_provider_models: &[ProviderModels],
 ) -> Option<Box<dyn OAuthProvider>> {
     let (client_name, provider_type, auth) = client_config_info(client_config);
     if auth != Some("oauth") {
@@ -596,12 +588,10 @@ pub fn get_oauth_provider_for_client(
                 (None, Some(u)) => u,
                 (Some(b), Some(u)) => b.merge(u),
             };
-            Some(Box::new(
-                super::openai_compatible_oauth::OpenAICompatibleOAuthProvider {
-                    config: merged,
-                    client_name: client_name.to_string(),
-                },
-            ))
+            Some(Box::new(OpenAICompatibleOAuthProvider {
+                config: merged,
+                client_name: client_name.to_string(),
+            }))
         }
         _ => get_oauth_provider(provider_type),
     }
@@ -778,7 +768,9 @@ extra_authorize_params:
   referrer: coyote
 echo_pkce_in_token_exchange: true
 "#;
+
         let cfg: OAuthConfig = serde_yaml::from_str(yaml).unwrap();
+
         assert_eq!(cfg.client_id, "xai-client");
         assert_eq!(cfg.token_url, "https://auth.x.ai/oauth2/token");
         assert_eq!(cfg.scopes.len(), 3);
@@ -799,14 +791,18 @@ echo_pkce_in_token_exchange: true
     #[test]
     fn oauth_flow_defaults_to_pkce_when_missing() {
         let yaml = "client_id: x\ntoken_url: y";
+
         let cfg: OAuthConfig = serde_yaml::from_str(yaml).unwrap();
+
         assert!(matches!(cfg.flow, OAuthFlow::Pkce));
     }
 
     #[test]
     fn oauth_flow_client_credentials_parses() {
         let yaml = "client_id: x\ntoken_url: y\nflow: client_credentials";
+
         let cfg: OAuthConfig = serde_yaml::from_str(yaml).unwrap();
+
         assert!(matches!(cfg.flow, OAuthFlow::ClientCredentials));
     }
 
@@ -844,6 +840,7 @@ echo_pkce_in_token_exchange: true
         let cc = make_openai_compat_client("acme", Some("oauth"), Some(user));
 
         let provider = get_oauth_provider_for_client(&cc, &models).unwrap();
+
         assert_eq!(provider.client_id(), "user-id");
         assert_eq!(provider.token_url(), "https://user.example/token");
         assert!(provider.echo_pkce_in_token_exchange());
@@ -860,6 +857,7 @@ echo_pkce_in_token_exchange: true
         let cc = make_openai_compat_client("bundled-only", Some("oauth"), None);
 
         let provider = get_oauth_provider_for_client(&cc, &models).unwrap();
+
         assert_eq!(provider.client_id(), "base-id");
         assert_eq!(provider.token_url(), "https://base.example/token");
     }
@@ -874,12 +872,14 @@ echo_pkce_in_token_exchange: true
         let cc = make_openai_compat_client("inline-only", Some("oauth"), Some(user));
 
         let provider = get_oauth_provider_for_client(&cc, &[]).unwrap();
+
         assert_eq!(provider.client_id(), "inline-id");
     }
 
     #[test]
     fn get_oauth_provider_for_client_returns_none_when_no_config_anywhere() {
         let cc = make_openai_compat_client("nothing", Some("oauth"), None);
+
         assert!(get_oauth_provider_for_client(&cc, &[]).is_none());
     }
 
@@ -887,7 +887,9 @@ echo_pkce_in_token_exchange: true
     fn get_oauth_provider_for_client_returns_none_when_auth_not_oauth() {
         let base = base_config();
         let models = vec![make_provider_models("api-key-client", Some(base))];
+
         let cc = make_openai_compat_client("api-key-client", None, None);
+
         assert!(get_oauth_provider_for_client(&cc, &models).is_none());
     }
 
@@ -895,10 +897,12 @@ echo_pkce_in_token_exchange: true
     fn openai_compatible_provider_joins_scopes_with_spaces() {
         let mut cfg = base_config();
         cfg.scopes = vec!["one".into(), "two".into(), "three".into()];
-        let provider = super::super::openai_compatible_oauth::OpenAICompatibleOAuthProvider {
+
+        let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
         };
+
         assert_eq!(provider.scopes(), "one two three");
     }
 
@@ -907,10 +911,12 @@ echo_pkce_in_token_exchange: true
         let mut cfg = base_config();
         cfg.redirect_uri = Some("https://custom.example/cb".into());
         cfg.redirect_port = Some(9999);
-        let provider = super::super::openai_compatible_oauth::OpenAICompatibleOAuthProvider {
+
+        let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
         };
+
         assert_eq!(
             provider.fixed_redirect_uri().as_deref(),
             Some("https://custom.example/cb")
@@ -922,10 +928,12 @@ echo_pkce_in_token_exchange: true
         let mut cfg = base_config();
         cfg.redirect_uri = None;
         cfg.redirect_port = None;
-        let provider = super::super::openai_compatible_oauth::OpenAICompatibleOAuthProvider {
+
+        let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
         };
+
         assert!(provider.uses_localhost_redirect());
         assert!(provider.fixed_redirect_uri().is_none());
     }

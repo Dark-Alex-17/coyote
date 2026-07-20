@@ -785,8 +785,8 @@ fn resolve_oauth_client(
             0 => bail!("No OAuth-capable clients configured."),
             1 => find_by_name(&candidates[0]).unwrap(),
             _ => {
-                let choice = Select::new("Select a client to authenticate:", candidates.clone())
-                    .prompt()?;
+                let choice =
+                    Select::new("Select a client to authenticate:", candidates.clone()).prompt()?;
                 find_by_name(&choice)
                     .ok_or_else(|| anyhow!("Selected client '{choice}' not found"))?
             }
@@ -800,5 +800,6 @@ fn resolve_oauth_client(
                 "Could not build OAuth provider for '{name}' (no oauth config in models.yaml or user config)"
             )
         })?;
+
     Ok((name, provider))
 }

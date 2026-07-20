@@ -52,16 +52,6 @@ impl OAuthProvider for OpenAICompatibleOAuthProvider {
         self.config.redirect_uri.is_none() && self.config.redirect_port.is_none()
     }
 
-    fn fixed_redirect_uri(&self) -> Option<String> {
-        if let Some(uri) = &self.config.redirect_uri {
-            return Some(uri.clone());
-        }
-        if let Some(port) = self.config.redirect_port {
-            return Some(format!("http://127.0.0.1:{port}/callback"));
-        }
-        None
-    }
-
     fn extra_token_headers(&self) -> Vec<(&str, &str)> {
         self.config
             .extra_token_headers
@@ -78,15 +68,25 @@ impl OAuthProvider for OpenAICompatibleOAuthProvider {
             .collect()
     }
 
+    fn fixed_redirect_uri(&self) -> Option<String> {
+        if let Some(uri) = &self.config.redirect_uri {
+            return Some(uri.clone());
+        }
+        if let Some(port) = self.config.redirect_port {
+            return Some(format!("http://127.0.0.1:{port}/callback"));
+        }
+        None
+    }
+
+    fn include_state_in_token_exchange(&self) -> bool {
+        self.config.include_state_in_token_exchange
+    }
+
     fn flow(&self) -> OAuthFlow {
         self.config.flow
     }
 
     fn echo_pkce_in_token_exchange(&self) -> bool {
         self.config.echo_pkce_in_token_exchange
-    }
-
-    fn include_state_in_token_exchange(&self) -> bool {
-        self.config.include_state_in_token_exchange
     }
 }

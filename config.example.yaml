@@ -348,13 +348,14 @@ clients:
     api_base: https://api.mistral.ai/v1
     api_key: '{{MISTRAL_API_KEY}}'                      # You can either hard-code or inject secrets from the Coyote vault
 
-  # See https://docs.x.ai/docs — OAuth via SuperGrok / X Premium+ subscription
+  # See https://docs.x.ai/docs - OAuth via SuperGrok / X Premium+ subscription
   - type: openai-compatible
     name: xai
     api_base: https://api.x.ai/v1
     api_key: '{{XAI_API_KEY}}'                          # You can either hard-code or inject secrets from the Coyote vault
-    # auth: oauth                                       # OR: OAuth (requires SuperGrok/X Premium+); endpoints from models.yaml
-    # After enabling `auth: oauth`, run: coyote --authenticate xai
+    auth: null                                          # When set to 'oauth', Coyote will use OAuth instead of an API key
+                                                        # Authenticate with `coyote --authenticate` or `.authenticate` in the REPL
+                                                        # Note: Oauth requires SuperGrok/X Premium+ subscription
 
   # Example: private OpenAI-compatible gateway with client_credentials OAuth
   # - type: openai-compatible

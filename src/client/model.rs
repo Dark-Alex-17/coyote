@@ -6,6 +6,7 @@ use super::{
 use crate::config::AppConfig;
 use crate::utils::{estimate_token_length, strip_think_tag};
 
+use super::oauth::OAuthConfig;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -358,7 +359,7 @@ impl ModelData {
 pub struct ProviderModels {
     pub provider: String,
     #[serde(default)]
-    pub oauth: Option<super::oauth::OAuthConfig>,
+    pub oauth: Option<OAuthConfig>,
     pub models: Vec<ModelData>,
 }
 

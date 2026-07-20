@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use oauth::OAuthConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpenAICompatibleConfig {
@@ -14,7 +15,7 @@ pub struct OpenAICompatibleConfig {
     pub api_base: Option<String>,
     pub api_key: Option<String>,
     pub auth: Option<String>,
-    pub oauth: Option<Box<super::oauth::OAuthConfig>>,
+    pub oauth: Option<Box<OAuthConfig>>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
@@ -43,6 +44,7 @@ impl Client for OpenAICompatibleClient {
     ) -> Result<ChatCompletionsOutput> {
         let request_data = prepare_chat_completions(self, client, data).await?;
         let builder = self.request_builder(client, request_data);
+        
         openai_chat_completions(builder, self.model()).await
     }
 
@@ -54,6 +56,7 @@ impl Client for OpenAICompatibleClient {
     ) -> Result<()> {
         let request_data = prepare_chat_completions(self, client, data).await?;
         let builder = self.request_builder(client, request_data);
+        
         openai_chat_completions_streaming(builder, handler, self.model()).await
     }
 
@@ -64,6 +67,7 @@ impl Client for OpenAICompatibleClient {
     ) -> Result<EmbeddingsOutput> {
         let request_data = prepare_embeddings(self, client, data).await?;
         let builder = self.request_builder(client, request_data);
+        
         openai_embeddings(builder, self.model()).await
     }
 
@@ -74,6 +78,7 @@ impl Client for OpenAICompatibleClient {
     ) -> Result<RerankOutput> {
         let request_data = prepare_rerank(self, client, data).await?;
         let builder = self.request_builder(client, request_data);
+        
         generic_rerank(builder, self.model()).await
     }
 }
@@ -87,7 +92,9 @@ async fn prepare_chat_completions(
     let url = format!("{api_base}/chat/completions");
     let body = openai_build_chat_completions_body(data, &self_.model);
     let mut request_data = RequestData::new(url, body);
+    
     apply_auth(self_, client, &mut request_data).await?;
+    
     Ok(request_data)
 }
 
@@ -100,7 +107,9 @@ async fn prepare_embeddings(
     let url = format!("{api_base}/embeddings");
     let body = openai_build_embeddings_body(data, &self_.model);
     let mut request_data = RequestData::new(url, body);
+    
     apply_auth(self_, client, &mut request_data).await?;
+    
     Ok(request_data)
 }
 
@@ -117,7 +126,9 @@ async fn prepare_rerank(
     };
     let body = generic_build_rerank_body(data, &self_.model);
     let mut request_data = RequestData::new(url, body);
+    
     apply_auth(self_, client, &mut request_data).await?;
+    
     Ok(request_data)
 }
 
@@ -149,6 +160,7 @@ async fn apply_auth(
                     client_name
                 )
             })?;
+        
         let ready = oauth::prepare_oauth_access_token(client, &*provider, client_name).await?;
         if !ready {
             bail!(
@@ -157,8 +169,10 @@ async fn apply_auth(
                 client_name
             );
         }
+        
         let token = get_access_token(client_name)?;
         request_data.bearer_auth(token);
+        
         for (key, value) in provider.extra_request_headers() {
             request_data.header(key, value);
         }
