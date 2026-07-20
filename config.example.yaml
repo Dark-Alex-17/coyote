@@ -369,6 +369,18 @@ clients:
   #     scopes: [openai.chat]
   #     flow: client_credentials
 
+  # Example: OAuth via Device Authorization Grant (RFC 8628 — for CLIs like Moonshot's kimi-code, MiniMax mmx, etc.)
+  # - type: openai-compatible
+  #   name: moonshot
+  #   api_base: https://api.kimi.com/coding/v1
+  #   auth: oauth
+  #   oauth:
+  #     client_id: '{{MOONSHOT_CLIENT_ID}}'
+  #     device_authorization_url: https://auth.kimi.com/api/oauth/device_authorization
+  #     token_url: https://auth.kimi.com/api/oauth/token
+  #     flow: device_code
+  #     # use_pkce_in_device_flow: true    # enable if your provider requires PKCE with device flow
+
   # See https://docs.ai21.com/docs/overview
   - type: openai-compatible
     name: ai12
