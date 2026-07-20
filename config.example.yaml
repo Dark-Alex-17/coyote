@@ -348,11 +348,25 @@ clients:
     api_base: https://api.mistral.ai/v1
     api_key: '{{MISTRAL_API_KEY}}'                      # You can either hard-code or inject secrets from the Coyote vault
 
-  # See https://docs.x.ai/docs
+  # See https://docs.x.ai/docs — OAuth via SuperGrok / X Premium+ subscription
   - type: openai-compatible
     name: xai
     api_base: https://api.x.ai/v1
     api_key: '{{XAI_API_KEY}}'                          # You can either hard-code or inject secrets from the Coyote vault
+    # auth: oauth                                       # OR: OAuth (requires SuperGrok/X Premium+); endpoints from models.yaml
+    # After enabling `auth: oauth`, run: coyote --authenticate xai
+
+  # Example: private OpenAI-compatible gateway with client_credentials OAuth
+  # - type: openai-compatible
+  #   name: acme-gateway
+  #   api_base: https://gateway.acme.com/v1
+  #   auth: oauth
+  #   oauth:
+  #     client_id: '{{ACME_CLIENT_ID}}'
+  #     client_secret: '{{ACME_CLIENT_SECRET}}'
+  #     token_url: https://auth.acme.com/oauth/token
+  #     scopes: [openai.chat]
+  #     flow: client_credentials
 
   # See https://docs.ai21.com/docs/overview
   - type: openai-compatible
