@@ -1695,6 +1695,30 @@
 #  - https://platform.moonshot.cn/docs/api/chat#%E5%85%AC%E5%BC%80%E7%9A%84%E6%9C%8D%E5%8A%A1%E5%9C%B0%E5%9D%80
 - provider: moonshot
   models:
+    - name: kimi-k3
+      max_input_tokens: 1048576
+      input_price: 3
+      output_price: 15
+      supports_vision: true
+      supports_function_calling: true
+    - name: kimi-k2.7-code
+      max_input_tokens: 262144
+      input_price: 0.95
+      output_price: 4
+      supports_vision: true
+      supports_function_calling: true
+    - name: kimi-k2.7-code-highspeed
+      max_input_tokens: 262144
+      input_price: 1.9
+      output_price: 8
+      supports_vision: true
+      supports_function_calling: true
+    - name: kimi-k2.6
+      max_input_tokens: 262144
+      input_price: 0.95
+      output_price: 4
+      supports_vision: true
+      supports_function_calling: true
     - name: kimi-k2.5
       max_input_tokens: 262144
       input_price: 0.56
@@ -1797,6 +1821,16 @@
 # - https://platform.minimaxi.com/document/ChatCompletion%20v2
 - provider: minimax
   models:
+    - name: minimax-m3
+      max_input_tokens: 1000000
+      input_price: 4.2
+      output_price: 16.8
+      supports_function_calling: true
+    - name: minimax-m2.7
+      max_input_tokens: 204800
+      input_price: 0.294
+      output_price: 1.176
+      supports_function_calling: true
     - name: minimax-m2.5
       max_input_tokens: 204800
       input_price: 0.294
