@@ -1,8 +1,10 @@
+use super::access_token::get_access_token;
+use super::oauth;
 use super::openai::*;
 use super::*;
 
-use anyhow::{Context, Result};
-use reqwest::RequestBuilder;
+use anyhow::{Context, Result, anyhow, bail};
+use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -26,76 +28,144 @@ impl OpenAICompatibleClient {
     create_client_config!([]);
 }
 
-impl_client_trait!(
-    OpenAICompatibleClient,
-    (
-        prepare_chat_completions,
-        openai_chat_completions,
-        openai_chat_completions_streaming
-    ),
-    (prepare_embeddings, openai_embeddings),
-    (prepare_rerank, generic_rerank),
-);
+#[async_trait::async_trait]
+impl Client for OpenAICompatibleClient {
+    client_common_fns!();
 
-fn prepare_chat_completions(
+    fn supports_oauth(&self) -> bool {
+        self.config.auth.as_deref() == Some("oauth")
+    }
+
+    async fn chat_completions_inner(
+        &self,
+        client: &ReqwestClient,
+        data: ChatCompletionsData,
+    ) -> Result<ChatCompletionsOutput> {
+        let request_data = prepare_chat_completions(self, client, data).await?;
+        let builder = self.request_builder(client, request_data);
+        openai_chat_completions(builder, self.model()).await
+    }
+
+    async fn chat_completions_streaming_inner(
+        &self,
+        client: &ReqwestClient,
+        handler: &mut SseHandler,
+        data: ChatCompletionsData,
+    ) -> Result<()> {
+        let request_data = prepare_chat_completions(self, client, data).await?;
+        let builder = self.request_builder(client, request_data);
+        openai_chat_completions_streaming(builder, handler, self.model()).await
+    }
+
+    async fn embeddings_inner(
+        &self,
+        client: &ReqwestClient,
+        data: &EmbeddingsData,
+    ) -> Result<EmbeddingsOutput> {
+        let request_data = prepare_embeddings(self, client, data).await?;
+        let builder = self.request_builder(client, request_data);
+        openai_embeddings(builder, self.model()).await
+    }
+
+    async fn rerank_inner(
+        &self,
+        client: &ReqwestClient,
+        data: &RerankData,
+    ) -> Result<RerankOutput> {
+        let request_data = prepare_rerank(self, client, data).await?;
+        let builder = self.request_builder(client, request_data);
+        generic_rerank(builder, self.model()).await
+    }
+}
+
+async fn prepare_chat_completions(
     self_: &OpenAICompatibleClient,
+    client: &ReqwestClient,
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
-    let api_key = self_.get_api_key().ok();
     let api_base = get_api_base_ext(self_)?;
-
     let url = format!("{api_base}/chat/completions");
-
     let body = openai_build_chat_completions_body(data, &self_.model);
-
     let mut request_data = RequestData::new(url, body);
-
-    if let Some(api_key) = api_key {
-        request_data.bearer_auth(api_key);
-    }
-
+    apply_auth(self_, client, &mut request_data).await?;
     Ok(request_data)
 }
 
-fn prepare_embeddings(
+async fn prepare_embeddings(
     self_: &OpenAICompatibleClient,
+    client: &ReqwestClient,
     data: &EmbeddingsData,
 ) -> Result<RequestData> {
-    let api_key = self_.get_api_key().ok();
     let api_base = get_api_base_ext(self_)?;
-
     let url = format!("{api_base}/embeddings");
-
     let body = openai_build_embeddings_body(data, &self_.model);
-
     let mut request_data = RequestData::new(url, body);
-
-    if let Some(api_key) = api_key {
-        request_data.bearer_auth(api_key);
-    }
-
+    apply_auth(self_, client, &mut request_data).await?;
     Ok(request_data)
 }
 
-fn prepare_rerank(self_: &OpenAICompatibleClient, data: &RerankData) -> Result<RequestData> {
-    let api_key = self_.get_api_key().ok();
+async fn prepare_rerank(
+    self_: &OpenAICompatibleClient,
+    client: &ReqwestClient,
+    data: &RerankData,
+) -> Result<RequestData> {
     let api_base = get_api_base_ext(self_)?;
-
     let url = if self_.name().starts_with("ernie") {
         format!("{api_base}/rerankers")
     } else {
         format!("{api_base}/rerank")
     };
-
     let body = generic_build_rerank_body(data, &self_.model);
-
     let mut request_data = RequestData::new(url, body);
+    apply_auth(self_, client, &mut request_data).await?;
+    Ok(request_data)
+}
 
-    if let Some(api_key) = api_key {
+async fn apply_auth(
+    self_: &OpenAICompatibleClient,
+    client: &ReqwestClient,
+    request_data: &mut RequestData,
+) -> Result<()> {
+    if self_.config.auth.as_deref() == Some("oauth") {
+        let client_name = self_.name();
+        let app_config = self_.app_config();
+        let cc = app_config
+            .clients
+            .iter()
+            .find(|cc| {
+                matches!(
+                    cc,
+                    ClientConfig::OpenAICompatibleConfig(c)
+                    if c.name.as_deref().unwrap_or("openai-compatible") == client_name
+                )
+            })
+            .ok_or_else(|| {
+                anyhow!("Could not locate ClientConfig entry for '{}'", client_name)
+            })?;
+        let provider = oauth::get_oauth_provider_for_client(cc, &ALL_PROVIDER_MODELS)
+            .ok_or_else(|| {
+                anyhow!(
+                    "OAuth configured for '{}' but no oauth block resolved (missing from both models.yaml and user config)",
+                    client_name
+                )
+            })?;
+        let ready = oauth::prepare_oauth_access_token(client, &*provider, client_name).await?;
+        if !ready {
+            bail!(
+                "OAuth configured for '{}' but no tokens found. Run: 'coyote --authenticate {}' or '.authenticate' in the REPL",
+                client_name,
+                client_name
+            );
+        }
+        let token = get_access_token(client_name)?;
+        request_data.bearer_auth(token);
+        for (key, value) in provider.extra_request_headers() {
+            request_data.header(key, value);
+        }
+    } else if let Ok(api_key) = self_.get_api_key() {
         request_data.bearer_auth(api_key);
     }
-
-    Ok(request_data)
+    Ok(())
 }
 
 fn get_api_base_ext(self_: &OpenAICompatibleClient) -> Result<String> {

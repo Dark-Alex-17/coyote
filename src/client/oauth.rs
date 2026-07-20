@@ -364,7 +364,7 @@ fn save_oauth_tokens(client_name: &str, tokens: &OAuthTokens) -> Result<()> {
 
 pub async fn refresh_oauth_token(
     client: &ReqwestClient,
-    provider: &impl OAuthProvider,
+    provider: &dyn OAuthProvider,
     client_name: &str,
     tokens: &OAuthTokens,
 ) -> Result<OAuthTokens> {
@@ -418,7 +418,7 @@ pub async fn refresh_oauth_token(
 
 pub async fn prepare_oauth_access_token(
     client: &ReqwestClient,
-    provider: &impl OAuthProvider,
+    provider: &dyn OAuthProvider,
     client_name: &str,
 ) -> Result<bool> {
     if is_valid_access_token(client_name) {
