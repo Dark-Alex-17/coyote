@@ -563,6 +563,43 @@ pub fn get_oauth_provider(provider_type: &str) -> Option<Box<dyn OAuthProvider>>
     }
 }
 
+/// Build an OAuthProvider for a given client, resolving config-driven providers
+/// (openai-compatible) from a merged `models.yaml` + user-config OAuthConfig.
+///
+/// For first-class providers (claude/gemini/openai), delegates to `get_oauth_provider`.
+pub fn get_oauth_provider_for_client(
+    client_config: &ClientConfig,
+    all_provider_models: &[super::ProviderModels],
+) -> Option<Box<dyn OAuthProvider>> {
+    let (client_name, provider_type, auth) = client_config_info(client_config);
+    if auth != Some("oauth") {
+        return None;
+    }
+
+    match client_config {
+        ClientConfig::OpenAICompatibleConfig(c) => {
+            let base = all_provider_models
+                .iter()
+                .find(|p| p.provider == client_name)
+                .and_then(|p| p.oauth.clone());
+            let user_oauth = c.oauth.clone().map(|b| *b);
+            let merged = match (base, user_oauth) {
+                (None, None) => return None,
+                (Some(b), None) => b,
+                (None, Some(u)) => u,
+                (Some(b), Some(u)) => b.merge(u),
+            };
+            Some(Box::new(
+                super::openai_compatible_oauth::OpenAICompatibleOAuthProvider {
+                    config: merged,
+                    client_name: client_name.to_string(),
+                },
+            ))
+        }
+        _ => get_oauth_provider(provider_type),
+    }
+}
+
 pub fn resolve_provider_type(client_name: &str, clients: &[ClientConfig]) -> Option<&'static str> {
     for client_config in clients {
         let (config_name, provider_type, auth) = client_config_info(client_config);
@@ -605,7 +642,7 @@ fn client_config_info(client_config: &ClientConfig) -> (&str, &'static str, Opti
         ClientConfig::OpenAICompatibleConfig(c) => (
             c.name.as_deref().unwrap_or("openai-compatible"),
             "openai-compatible",
-            None,
+            c.auth.as_deref(),
         ),
         ClientConfig::GeminiConfig(c) => (
             c.name.as_deref().unwrap_or("gemini"),
