@@ -1126,4 +1126,133 @@ echo_pkce_in_token_exchange: true
         assert!(provider.uses_localhost_redirect());
         assert!(provider.fixed_redirect_uri().is_none());
     }
+
+    #[test]
+    fn oauth_flow_device_code_parses() {
+        let yaml = "client_id: x\ntoken_url: y\nflow: device_code";
+
+        let cfg: OAuthConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(matches!(cfg.flow, OAuthFlow::DeviceCode));
+    }
+
+    #[test]
+    fn oauth_config_merge_preserves_device_authorization_url_when_user_omits() {
+        let mut base = base_config();
+        base.device_authorization_url = Some("https://base.example/device".into());
+        let user = empty_user_override("user-id", "https://user.example/token");
+
+        let merged = base.merge(user);
+
+        assert_eq!(
+            merged.device_authorization_url.as_deref(),
+            Some("https://base.example/device")
+        );
+    }
+
+    #[test]
+    fn oauth_config_merge_user_device_authorization_url_wins() {
+        let mut base = base_config();
+        base.device_authorization_url = Some("https://base.example/device".into());
+        let mut user = empty_user_override("user-id", "https://user.example/token");
+        user.device_authorization_url = Some("https://user.example/device".into());
+
+        let merged = base.merge(user);
+
+        assert_eq!(
+            merged.device_authorization_url.as_deref(),
+            Some("https://user.example/device")
+        );
+    }
+
+    #[test]
+    fn oauth_config_merge_user_pkce_in_device_flow_wins() {
+        let base = base_config();
+        let mut user = empty_user_override("user-id", "https://user.example/token");
+        user.use_pkce_in_device_flow = true;
+
+        let merged = base.merge(user);
+
+        assert!(merged.use_pkce_in_device_flow);
+    }
+
+    #[test]
+    fn openai_compatible_provider_exposes_device_authorization_url() {
+        let mut cfg = base_config();
+        cfg.device_authorization_url = Some("https://example/device".into());
+
+        let provider = OpenAICompatibleOAuthProvider {
+            config: cfg,
+            client_name: "test".into(),
+        };
+
+        assert_eq!(
+            provider.device_authorization_url(),
+            Some("https://example/device")
+        );
+    }
+
+    #[test]
+    fn openai_compatible_provider_device_authorization_url_none_when_unset() {
+        let provider = OpenAICompatibleOAuthProvider {
+            config: base_config(),
+            client_name: "test".into(),
+        };
+
+        assert!(provider.device_authorization_url().is_none());
+    }
+
+    #[test]
+    fn openai_compatible_provider_use_pkce_in_device_flow_defaults_false() {
+        let provider = OpenAICompatibleOAuthProvider {
+            config: base_config(),
+            client_name: "test".into(),
+        };
+
+        assert!(!provider.use_pkce_in_device_flow());
+    }
+
+    #[test]
+    fn openai_compatible_provider_use_pkce_in_device_flow_returns_true_when_set() {
+        let mut cfg = base_config();
+        cfg.use_pkce_in_device_flow = true;
+
+        let provider = OpenAICompatibleOAuthProvider {
+            config: cfg,
+            client_name: "test".into(),
+        };
+
+        assert!(provider.use_pkce_in_device_flow());
+    }
+
+    #[test]
+    fn oauth_config_serde_roundtrip_device_code_yaml() {
+        let yaml = r#"
+client_id: my-client
+token_url: https://auth.example/oauth/token
+device_authorization_url: https://auth.example/oauth/device_authorization
+flow: device_code
+token_request_format: form_url_encoded
+use_pkce_in_device_flow: true
+scopes:
+  - read
+  - write
+"#;
+
+        let cfg: OAuthConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(cfg.client_id, "my-client");
+        assert_eq!(cfg.token_url, "https://auth.example/oauth/token");
+        assert_eq!(
+            cfg.device_authorization_url.as_deref(),
+            Some("https://auth.example/oauth/device_authorization")
+        );
+        assert!(matches!(cfg.flow, OAuthFlow::DeviceCode));
+        assert!(matches!(
+            cfg.token_request_format,
+            Some(TokenRequestFormat::FormUrlEncoded)
+        ));
+        assert!(cfg.use_pkce_in_device_flow);
+        assert_eq!(cfg.scopes, vec!["read", "write"]);
+    }
 }
