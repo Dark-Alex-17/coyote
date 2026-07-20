@@ -11,6 +11,8 @@ pub struct OpenAICompatibleConfig {
     pub name: Option<String>,
     pub api_base: Option<String>,
     pub api_key: Option<String>,
+    pub auth: Option<String>,
+    pub oauth: Option<Box<super::oauth::OAuthConfig>>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
