@@ -806,6 +806,24 @@
 #  - https://docs.x.ai/docs/models
 #  - https://docs.x.ai/docs/api-reference#chat-completions
 - provider: xai
+  oauth:
+    client_id: b1a00492-073a-47ea-816f-4c329264a828
+    authorize_url: https://auth.x.ai/oauth2/authorize
+    token_url: https://auth.x.ai/oauth2/token
+    scopes:
+      - openid
+      - profile
+      - email
+      - offline_access
+      - grok-cli:access
+      - api:access
+    redirect_port: 56121
+    flow: pkce
+    token_request_format: form_url_encoded
+    extra_authorize_params:
+      plan: generic
+      referrer: coyote
+    echo_pkce_in_token_exchange: true
   models:
     - name: grok-4.5
       input_price: 2
