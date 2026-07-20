@@ -500,7 +500,10 @@ fn listen_for_oauth_callback(redirect_uri: &str) -> Result<(String, String)> {
         .ok_or_else(|| anyhow!("No port in redirect URI"))?;
     let path = url.path();
 
-    println!("Waiting for OAuth callback on {redirect_uri} ...\n");
+    println!("Waiting for OAuth callback on {redirect_uri} ...");
+    println!(
+        "(If the browser shows a 'paste this code' page, ignore it — Coyote captures the callback automatically.)\n"
+    );
 
     let listener = TcpListener::bind(format!("{host}:{port}"))?;
 
