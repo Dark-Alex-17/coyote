@@ -32,6 +32,7 @@ pub enum OAuthFlow {
     #[default]
     Pkce,
     ClientCredentials,
+    DeviceCode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +46,7 @@ pub struct OAuthConfig {
     pub authorize_url: Option<String>,
     pub redirect_uri: Option<String>,
     pub redirect_port: Option<u16>,
+    pub device_authorization_url: Option<String>,
     #[serde(default)]
     pub scopes: Vec<String>,
     pub token_request_format: Option<TokenRequestFormat>,
@@ -56,6 +58,8 @@ pub struct OAuthConfig {
     pub extra_request_headers: IndexMap<String, String>,
     #[serde(default)]
     pub echo_pkce_in_token_exchange: bool,
+    #[serde(default)]
+    pub use_pkce_in_device_flow: bool,
     #[serde(default = "default_true")]
     pub include_state_in_token_exchange: bool,
 }
@@ -81,6 +85,9 @@ impl OAuthConfig {
         if override_cfg.redirect_port.is_some() {
             self.redirect_port = override_cfg.redirect_port;
         }
+        if override_cfg.device_authorization_url.is_some() {
+            self.device_authorization_url = override_cfg.device_authorization_url;
+        }
         if !override_cfg.scopes.is_empty() {
             self.scopes = override_cfg.scopes;
         }
@@ -101,6 +108,7 @@ impl OAuthConfig {
         }
 
         self.echo_pkce_in_token_exchange = override_cfg.echo_pkce_in_token_exchange;
+        self.use_pkce_in_device_flow = override_cfg.use_pkce_in_device_flow;
         self.include_state_in_token_exchange = override_cfg.include_state_in_token_exchange;
 
         self
@@ -158,6 +166,14 @@ pub trait OAuthProvider: Send + Sync {
     fn echo_pkce_in_token_exchange(&self) -> bool {
         false
     }
+
+    fn device_authorization_url(&self) -> Option<&str> {
+        None
+    }
+
+    fn use_pkce_in_device_flow(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +190,7 @@ pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> 
     match provider.flow() {
         OAuthFlow::Pkce => run_pkce_flow(provider, client_name).await,
         OAuthFlow::ClientCredentials => run_client_credentials_flow(provider, client_name).await,
+        OAuthFlow::DeviceCode => run_device_code_flow(provider, client_name).await,
     }
 }
 
@@ -340,6 +357,172 @@ async fn run_client_credentials_flow(
     Ok(())
 }
 
+async fn run_device_code_flow(
+    provider: &dyn OAuthProvider,
+    client_name: &str,
+) -> Result<()> {
+    let device_auth_url = provider.device_authorization_url().ok_or_else(|| {
+        anyhow!(
+            "Provider '{}' is configured with flow: device_code but has no device_authorization_url. \
+             Set `oauth.device_authorization_url` in your config.",
+            provider.provider_name()
+        )
+    })?;
+
+    let client = ReqwestClient::new();
+
+    let pkce = if provider.use_pkce_in_device_flow() {
+        let random_bytes: [u8; 32] = rand::random::<[u8; 32]>();
+        let verifier = URL_SAFE_NO_PAD.encode(random_bytes);
+        let mut hasher = Sha256::new();
+        hasher.update(verifier.as_bytes());
+        let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
+        Some((verifier, challenge))
+    } else {
+        None
+    };
+
+    let scopes = provider.scopes();
+    let mut device_params: Vec<(&str, &str)> = vec![("client_id", provider.client_id())];
+    if !scopes.is_empty() {
+        device_params.push(("scope", scopes.as_str()));
+    }
+    if let Some((_, ref challenge)) = pkce {
+        device_params.push(("code_challenge", challenge.as_str()));
+        device_params.push(("code_challenge_method", "S256"));
+    }
+    let form: HashMap<&str, &str> = device_params.iter().copied().collect();
+
+    let mut device_request = client.post(device_auth_url).form(&form);
+    for (key, value) in provider.extra_token_headers() {
+        device_request = device_request.header(key, value);
+    }
+    let device_response: Value = device_request.send().await?.json().await?;
+
+    let device_code = device_response["device_code"]
+        .as_str()
+        .ok_or_else(|| {
+            anyhow!("Missing device_code in device authorization response: {device_response}")
+        })?
+        .to_string();
+    let user_code = device_response["user_code"]
+        .as_str()
+        .ok_or_else(|| {
+            anyhow!("Missing user_code in device authorization response: {device_response}")
+        })?
+        .to_string();
+    let verification_uri = device_response["verification_uri"]
+        .as_str()
+        .ok_or_else(|| {
+            anyhow!("Missing verification_uri in device authorization response: {device_response}")
+        })?
+        .to_string();
+    let verification_uri_complete = device_response["verification_uri_complete"]
+        .as_str()
+        .map(|s| s.to_string());
+    let expires_in = device_response["expires_in"].as_i64().unwrap_or(1800);
+    let mut interval = device_response["interval"].as_u64().unwrap_or(5);
+    let deadline = Utc::now().timestamp() + expires_in;
+
+    println!(
+        "\nAuthenticate with {} (client '{}'):",
+        provider.provider_name(),
+        client_name
+    );
+    println!("  1. Open: {verification_uri}");
+    println!("  2. Enter code: {user_code}\n");
+    if let Some(complete) = &verification_uri_complete {
+        println!("  (Or open the pre-filled URL: {complete})\n");
+    }
+    let url_to_open = verification_uri_complete
+        .as_deref()
+        .unwrap_or(&verification_uri);
+
+    if std::env::var(crate::sandbox::SANDBOX_ENV_FLAG).is_ok()
+        && let Ok(qr) = qrcode::QrCode::new(url_to_open)
+    {
+        let rendered = qr
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .quiet_zone(true)
+            .build();
+        println!("{rendered}\n");
+    }
+
+    let _ = open::that(url_to_open);
+
+    println!("Waiting for authorization (polling every {interval}s)...\n");
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+
+        if Utc::now().timestamp() >= deadline {
+            bail!(
+                "Device code expired before user approval. Run `coyote --authenticate {}` to try again.",
+                client_name
+            );
+        }
+
+        let mut token_params: Vec<(&str, &str)> = vec![
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", device_code.as_str()),
+            ("client_id", provider.client_id()),
+        ];
+        if let Some((verifier, _)) = pkce.as_ref() {
+            token_params.push(("code_verifier", verifier.as_str()));
+        }
+        let token_response: Value = build_token_request(&client, provider, &token_params)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        if let Some(access_token) = token_response["access_token"].as_str() {
+            let refresh_token = token_response["refresh_token"].as_str().map(str::to_string);
+            let expires_in_secs = token_response["expires_in"].as_i64().ok_or_else(|| {
+                anyhow!("Missing expires_in in device_code token response: {token_response}")
+            })?;
+            let expires_at = Utc::now().timestamp() + expires_in_secs;
+            let account_id = provider.extract_account_id(&token_response);
+
+            let tokens = OAuthTokens {
+                access_token: access_token.to_string(),
+                refresh_token,
+                expires_at,
+                account_id,
+            };
+            save_oauth_tokens(client_name, &tokens)?;
+            println!(
+                "Successfully authenticated client '{}' with {} via OAuth (device_code). Tokens saved.",
+                client_name,
+                provider.provider_name()
+            );
+            return Ok(());
+        }
+
+        let error_code = token_response["error"].as_str().unwrap_or("");
+        match error_code {
+            "authorization_pending" => continue,
+            "slow_down" => {
+                interval += 5;
+                println!("Server requested slower polling; increasing interval to {interval}s.");
+                continue;
+            }
+            "expired_token" => bail!(
+                "Device code expired. Run `coyote --authenticate {}` to try again.",
+                client_name
+            ),
+            "access_denied" => bail!("Authorization was denied by the user."),
+            other => bail!(
+                "Device code polling failed: {} — {}",
+                other,
+                token_response["error_description"]
+                    .as_str()
+                    .unwrap_or("no description")
+            ),
+        }
+    }
+}
+
 pub fn load_oauth_tokens(client_name: &str) -> Option<OAuthTokens> {
     let path = paths::token_file(client_name);
     let content = fs::read_to_string(path).ok()?;
@@ -426,7 +609,9 @@ pub async fn prepare_oauth_access_token(
 
     let tokens = if Utc::now().timestamp() >= tokens.expires_at {
         match provider.flow() {
-            OAuthFlow::Pkce => refresh_oauth_token(client, provider, client_name, &tokens).await?,
+            OAuthFlow::Pkce | OAuthFlow::DeviceCode => {
+                refresh_oauth_token(client, provider, client_name, &tokens).await?
+            }
             OAuthFlow::ClientCredentials => {
                 run_client_credentials_flow(provider, client_name).await?;
                 load_oauth_tokens(client_name)
@@ -664,12 +849,14 @@ mod tests {
             authorize_url: Some("https://base.example/authorize".into()),
             redirect_uri: None,
             redirect_port: Some(1234),
+            device_authorization_url: None,
             scopes: vec!["a".into(), "b".into()],
             token_request_format: Some(TokenRequestFormat::FormUrlEncoded),
             extra_authorize_params: IndexMap::from([("plan".into(), "base".into())]),
             extra_token_headers: IndexMap::new(),
             extra_request_headers: IndexMap::new(),
             echo_pkce_in_token_exchange: false,
+            use_pkce_in_device_flow: false,
             include_state_in_token_exchange: true,
         }
     }
@@ -683,12 +870,14 @@ mod tests {
             authorize_url: None,
             redirect_uri: None,
             redirect_port: None,
+            device_authorization_url: None,
             scopes: vec![],
             token_request_format: None,
             extra_authorize_params: IndexMap::new(),
             extra_token_headers: IndexMap::new(),
             extra_request_headers: IndexMap::new(),
             echo_pkce_in_token_exchange: false,
+            use_pkce_in_device_flow: false,
             include_state_in_token_exchange: true,
         }
     }

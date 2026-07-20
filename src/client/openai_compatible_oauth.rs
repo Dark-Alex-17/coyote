@@ -89,4 +89,12 @@ impl OAuthProvider for OpenAICompatibleOAuthProvider {
     fn echo_pkce_in_token_exchange(&self) -> bool {
         self.config.echo_pkce_in_token_exchange
     }
+
+    fn device_authorization_url(&self) -> Option<&str> {
+        self.config.device_authorization_url.as_deref()
+    }
+
+    fn use_pkce_in_device_flow(&self) -> bool {
+        self.config.use_pkce_in_device_flow
+    }
 }
