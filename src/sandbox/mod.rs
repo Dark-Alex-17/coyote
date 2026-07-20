@@ -388,6 +388,26 @@ fn copy_host_files(name: &str) -> Result<()> {
         );
     }
 
+    let oauth_tokens_dir = paths::oauth_tokens_path();
+    if oauth_tokens_dir.exists() {
+        let sandbox_oauth_dir = "/home/agent/.cache/coyote/oauth";
+        ensure_sandbox_dir(name, sandbox_oauth_dir)?;
+        let dest = format!("{name}:{sandbox_oauth_dir}/");
+        for entry in fs::read_dir(&oauth_tokens_dir)
+            .with_context(|| format!("Failed to read {}", oauth_tokens_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            sbx_cp(&path.display().to_string(), &dest)?;
+        }
+        chown_agent_recursive(name, sandbox_oauth_dir)?;
+    } else {
+        debug!(
+            "Skipping OAuth token copy: {} does not exist",
+            oauth_tokens_dir.display()
+        );
+    }
+
     match resolve_vault_password_file() {
         Some(password_file) if password_file.exists() => {
             let dest_path = host_to_sandbox_path(&password_file, &home_dir, cfg!(windows))?;
