@@ -5,6 +5,7 @@ use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
+use indexmap::IndexMap;
 use inquire::Text;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::{Deserialize, Serialize};
@@ -17,9 +18,98 @@ use std::net::TcpListener;
 use url::Url;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TokenRequestFormat {
     Json,
     FormUrlEncoded,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthFlow {
+    #[default]
+    Pkce,
+    ClientCredentials,
+}
+
+/// Runtime OAuth configuration merged from `models.yaml` provider defaults
+/// and user config `clients[i].oauth` overrides.
+///
+/// Every field except `client_id`, `token_url`, and `flow` is optional so that
+/// user config can override individual fields without restating the entire block.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OAuthConfig {
+    pub client_id: String,
+    pub token_url: String,
+    #[serde(default)]
+    pub flow: OAuthFlow,
+
+    pub client_secret: Option<String>,
+    pub authorize_url: Option<String>,
+    pub redirect_uri: Option<String>,
+    pub redirect_port: Option<u16>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub token_request_format: Option<TokenRequestFormat>,
+    #[serde(default)]
+    pub extra_authorize_params: IndexMap<String, String>,
+    #[serde(default)]
+    pub extra_token_headers: IndexMap<String, String>,
+    #[serde(default)]
+    pub extra_request_headers: IndexMap<String, String>,
+    #[serde(default)]
+    pub echo_pkce_in_token_exchange: bool,
+    #[serde(default = "default_true")]
+    pub include_state_in_token_exchange: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl OAuthConfig {
+    /// Merge a user override into `self` field-by-field. User values win.
+    /// Uses `json_patch::merge`-like semantics (see `common.rs:apply_patch`) —
+    /// `None` in override means "keep base"; explicit values replace.
+    pub fn merge(mut self, override_cfg: OAuthConfig) -> Self {
+        self.client_id = override_cfg.client_id;
+        self.token_url = override_cfg.token_url;
+        self.flow = override_cfg.flow;
+        if override_cfg.client_secret.is_some() {
+            self.client_secret = override_cfg.client_secret;
+        }
+        if override_cfg.authorize_url.is_some() {
+            self.authorize_url = override_cfg.authorize_url;
+        }
+        if override_cfg.redirect_uri.is_some() {
+            self.redirect_uri = override_cfg.redirect_uri;
+        }
+        if override_cfg.redirect_port.is_some() {
+            self.redirect_port = override_cfg.redirect_port;
+        }
+        if !override_cfg.scopes.is_empty() {
+            self.scopes = override_cfg.scopes;
+        }
+        if override_cfg.token_request_format.is_some() {
+            self.token_request_format = override_cfg.token_request_format;
+        }
+        if !override_cfg.extra_authorize_params.is_empty() {
+            self.extra_authorize_params
+                .extend(override_cfg.extra_authorize_params);
+        }
+        if !override_cfg.extra_token_headers.is_empty() {
+            self.extra_token_headers
+                .extend(override_cfg.extra_token_headers);
+        }
+        if !override_cfg.extra_request_headers.is_empty() {
+            self.extra_request_headers
+                .extend(override_cfg.extra_request_headers);
+        }
+        self.echo_pkce_in_token_exchange = override_cfg.echo_pkce_in_token_exchange;
+        self.include_state_in_token_exchange = override_cfg.include_state_in_token_exchange;
+        self
+    }
 }
 
 pub trait OAuthProvider: Send + Sync {
@@ -64,6 +154,14 @@ pub trait OAuthProvider: Send + Sync {
 
     fn include_state_in_token_exchange(&self) -> bool {
         true
+    }
+
+    fn flow(&self) -> OAuthFlow {
+        OAuthFlow::Pkce
+    }
+
+    fn echo_pkce_in_token_exchange(&self) -> bool {
+        false
     }
 }
 
