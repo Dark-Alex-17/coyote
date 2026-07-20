@@ -430,16 +430,24 @@ pub async fn prepare_oauth_access_token(
     };
 
     let tokens = if Utc::now().timestamp() >= tokens.expires_at {
-        refresh_oauth_token(client, provider, client_name, &tokens).await?
+        match provider.flow() {
+            OAuthFlow::Pkce => refresh_oauth_token(client, provider, client_name, &tokens).await?,
+            OAuthFlow::ClientCredentials => {
+                run_client_credentials_flow(provider, client_name).await?;
+                load_oauth_tokens(client_name).ok_or_else(|| {
+                    anyhow!("Token file missing after client_credentials refresh")
+                })?
+            }
+        }
     } else {
         tokens
     };
 
     set_access_token(
         client_name,
-        tokens.access_token.clone(),
+        tokens.access_token,
         tokens.expires_at,
-        tokens.account_id.clone(),
+        tokens.account_id,
     );
 
     Ok(true)
