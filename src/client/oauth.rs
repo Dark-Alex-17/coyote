@@ -176,6 +176,13 @@ pub struct OAuthTokens {
 }
 
 pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> Result<()> {
+    match provider.flow() {
+        OAuthFlow::Pkce => run_pkce_flow(provider, client_name).await,
+        OAuthFlow::ClientCredentials => run_client_credentials_flow(provider, client_name).await,
+    }
+}
+
+async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Result<()> {
     let random_bytes: [u8; 32] = rand::random::<[u8; 32]>();
     let code_verifier = URL_SAFE_NO_PAD.encode(random_bytes);
 
@@ -256,6 +263,10 @@ pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> 
     if provider.include_state_in_token_exchange() {
         token_params.push(("state", state.as_str()));
     }
+    if provider.echo_pkce_in_token_exchange() {
+        token_params.push(("code_challenge", code_challenge.as_str()));
+        token_params.push(("code_challenge_method", "S256"));
+    }
     let request = build_token_request(&client, provider, &token_params);
 
     let response: Value = request.send().await?.json().await?;
@@ -288,6 +299,49 @@ pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> 
         provider.provider_name()
     );
 
+    Ok(())
+}
+
+async fn run_client_credentials_flow(
+    provider: &dyn OAuthProvider,
+    client_name: &str,
+) -> Result<()> {
+    let client = ReqwestClient::new();
+    let scopes = provider.scopes();
+    let mut params: Vec<(&str, &str)> = vec![
+        ("grant_type", "client_credentials"),
+        ("client_id", provider.client_id()),
+    ];
+    if !scopes.is_empty() {
+        params.push(("scope", scopes));
+    }
+
+    let request = build_token_request(&client, provider, &params);
+    let response: Value = request.send().await?.json().await?;
+
+    let access_token = response["access_token"]
+        .as_str()
+        .ok_or_else(|| {
+            anyhow!("Missing access_token in client_credentials response: {response}")
+        })?
+        .to_string();
+    let expires_in = response["expires_in"]
+        .as_i64()
+        .ok_or_else(|| anyhow!("Missing expires_in in client_credentials response: {response}"))?;
+    let expires_at = Utc::now().timestamp() + expires_in;
+
+    let tokens = OAuthTokens {
+        access_token,
+        refresh_token: None,
+        expires_at,
+        account_id: provider.extract_account_id(&response),
+    };
+    save_oauth_tokens(client_name, &tokens)?;
+    println!(
+        "Successfully authenticated client '{}' with {} via OAuth (client_credentials). Tokens saved.",
+        client_name,
+        provider.provider_name()
+    );
     Ok(())
 }
 
