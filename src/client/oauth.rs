@@ -18,14 +18,14 @@ use std::net::TcpListener;
 use url::Url;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenRequestFormat {
     Json,
     FormUrlEncoded,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthFlow {
     #[default]
@@ -38,7 +38,7 @@ pub enum OAuthFlow {
 ///
 /// Every field except `client_id`, `token_url`, and `flow` is optional so that
 /// user config can override individual fields without restating the entire block.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthConfig {
     pub client_id: String,
     pub token_url: String,
