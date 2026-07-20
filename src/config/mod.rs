@@ -44,7 +44,7 @@ pub use self::skill_registry::SkillRegistry;
 pub use self::update::run_self_update;
 use crate::client::{
     ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
-    ProviderModels, create_client_config, list_client_types,
+    ProviderModels, create_client_config, list_client_types, oauth,
 };
 use crate::function::{FunctionDeclaration, Functions};
 use crate::rag::Rag;
@@ -595,6 +595,18 @@ impl Config {
                 anyhow!("{err_msg}")
             })
             .with_context(|| "Failed to load config from str")?;
+
+        let mut seen = std::collections::HashSet::new();
+        for cc in &config.clients {
+            let (name, _, _) = oauth::client_config_info(cc);
+            if !seen.insert(name.to_string()) {
+                bail!(
+                    "Duplicate client name '{name}' in config.yaml. \
+                     Client names must be unique across all `clients[]` entries \
+                     to avoid OAuth token collisions."
+                );
+            }
+        }
 
         Ok(config)
     }
