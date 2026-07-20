@@ -769,28 +769,36 @@ fn resolve_oauth_client(
     explicit: Option<&str>,
     clients: &[ClientConfig],
 ) -> Result<(String, Box<dyn OAuthProvider>)> {
-    if let Some(name) = explicit {
-        let provider_type = oauth::resolve_provider_type(name, clients)
-            .ok_or_else(|| anyhow!("Client '{name}' not found or doesn't support OAuth"))?;
-        let provider = oauth::get_oauth_provider(provider_type).unwrap();
-        return Ok((name.to_string(), provider));
-    }
+    let find_by_name = |name: &str| -> Option<&ClientConfig> {
+        clients.iter().find(|cc| {
+            let (n, _, auth) = oauth::client_config_info(cc);
+            n == name && auth == Some("oauth")
+        })
+    };
 
-    let candidates = oauth::list_oauth_capable_clients(clients);
-    match candidates.len() {
-        0 => bail!("No OAuth-capable clients configured."),
-        1 => {
-            let name = &candidates[0];
-            let provider_type = oauth::resolve_provider_type(name, clients).unwrap();
-            let provider = oauth::get_oauth_provider(provider_type).unwrap();
-            Ok((name.clone(), provider))
+    let target = if let Some(name) = explicit {
+        find_by_name(name)
+            .ok_or_else(|| anyhow!("Client '{name}' not found or doesn't support OAuth"))?
+    } else {
+        let candidates = oauth::list_oauth_capable_clients(clients);
+        match candidates.len() {
+            0 => bail!("No OAuth-capable clients configured."),
+            1 => find_by_name(&candidates[0]).unwrap(),
+            _ => {
+                let choice = Select::new("Select a client to authenticate:", candidates.clone())
+                    .prompt()?;
+                find_by_name(&choice)
+                    .ok_or_else(|| anyhow!("Selected client '{choice}' not found"))?
+            }
         }
-        _ => {
-            let choice =
-                Select::new("Select a client to authenticate:", candidates.clone()).prompt()?;
-            let provider_type = oauth::resolve_provider_type(&choice, clients).unwrap();
-            let provider = oauth::get_oauth_provider(provider_type).unwrap();
-            Ok((choice, provider))
-        }
-    }
+    };
+
+    let name = oauth::client_config_info(target).0.to_string();
+    let provider = oauth::get_oauth_provider_for_client(target, &client::ALL_PROVIDER_MODELS)
+        .ok_or_else(|| {
+            anyhow!(
+                "Could not build OAuth provider for '{name}' (no oauth config in models.yaml or user config)"
+            )
+        })?;
+    Ok((name, provider))
 }

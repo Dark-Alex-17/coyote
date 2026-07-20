@@ -600,25 +600,12 @@ pub fn get_oauth_provider_for_client(
     }
 }
 
-pub fn resolve_provider_type(client_name: &str, clients: &[ClientConfig]) -> Option<&'static str> {
-    for client_config in clients {
-        let (config_name, provider_type, auth) = client_config_info(client_config);
-        if config_name == client_name {
-            if auth == Some("oauth") && get_oauth_provider(provider_type).is_some() {
-                return Some(provider_type);
-            }
-            return None;
-        }
-    }
-    None
-}
-
 pub fn list_oauth_capable_clients(clients: &[ClientConfig]) -> Vec<String> {
     clients
         .iter()
         .filter_map(|client_config| {
-            let (name, provider_type, auth) = client_config_info(client_config);
-            if auth == Some("oauth") && get_oauth_provider(provider_type).is_some() {
+            let (name, _, auth) = client_config_info(client_config);
+            if auth == Some("oauth") {
                 Some(name.to_string())
             } else {
                 None
@@ -627,7 +614,9 @@ pub fn list_oauth_capable_clients(clients: &[ClientConfig]) -> Vec<String> {
         .collect()
 }
 
-fn client_config_info(client_config: &ClientConfig) -> (&str, &'static str, Option<&str>) {
+pub(crate) fn client_config_info(
+    client_config: &ClientConfig,
+) -> (&str, &'static str, Option<&str>) {
     match client_config {
         ClientConfig::ClaudeConfig(c) => (
             c.name.as_deref().unwrap_or("claude"),
