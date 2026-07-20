@@ -107,6 +107,7 @@ self_update = { version = "0.44", default-features = false, features = [
   "archive-zip",
   "compression-zip-deflate",
 ] }
+qrcode = "0.14"
 
 [dependencies.reqwest]
 version = "0.13.3"
