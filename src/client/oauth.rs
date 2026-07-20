@@ -322,9 +322,7 @@ async fn run_client_credentials_flow(
 
     let access_token = response["access_token"]
         .as_str()
-        .ok_or_else(|| {
-            anyhow!("Missing access_token in client_credentials response: {response}")
-        })?
+        .ok_or_else(|| anyhow!("Missing access_token in client_credentials response: {response}"))?
         .to_string();
     let expires_in = response["expires_in"]
         .as_i64()
@@ -435,9 +433,8 @@ pub async fn prepare_oauth_access_token(
             OAuthFlow::Pkce => refresh_oauth_token(client, provider, client_name, &tokens).await?,
             OAuthFlow::ClientCredentials => {
                 run_client_credentials_flow(provider, client_name).await?;
-                load_oauth_tokens(client_name).ok_or_else(|| {
-                    anyhow!("Token file missing after client_credentials refresh")
-                })?
+                load_oauth_tokens(client_name)
+                    .ok_or_else(|| anyhow!("Token file missing after client_credentials refresh"))?
             }
         }
     } else {
@@ -506,52 +503,59 @@ fn listen_for_oauth_callback(redirect_uri: &str) -> Result<(String, String)> {
     println!("Waiting for OAuth callback on {redirect_uri} ...\n");
 
     let listener = TcpListener::bind(format!("{host}:{port}"))?;
-    let (mut stream, _) = listener.accept()?;
 
-    let mut reader = BufReader::new(&stream);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    loop {
+        let (mut stream, _) = listener.accept()?;
+        let mut reader = BufReader::new(&stream);
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).is_err() || request_line.trim().is_empty() {
+            continue;
+        }
 
-    let request_path = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("Malformed HTTP request from OAuth callback"))?;
+        let Some(request_path) = request_line.split_whitespace().nth(1) else {
+            continue;
+        };
 
-    let full_url = format!("http://{host}:{port}{request_path}");
-    let parsed: Url = full_url.parse()?;
+        let Ok(parsed) = format!("http://{host}:{port}{request_path}").parse::<Url>() else {
+            continue;
+        };
 
-    if !parsed.path().starts_with(path) {
-        bail!("Unexpected callback path: {}", parsed.path());
+        if !parsed.path().starts_with(path) {
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            continue;
+        }
+
+        let code = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.to_string())
+            .ok_or_else(|| {
+                let error = parsed
+                    .query_pairs()
+                    .find(|(k, _)| k == "error")
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                anyhow!("OAuth callback returned error: {error}")
+            })?;
+
+        let returned_state = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.to_string())
+            .ok_or_else(|| anyhow!("Missing state parameter in OAuth callback"))?;
+
+        let response_body = "<html><body><h2>Authentication successful!</h2><p>You can close this tab and return to your terminal.</p></body></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream.write_all(response.as_bytes())?;
+
+        return Ok((code, returned_state));
     }
-
-    let code = parsed
-        .query_pairs()
-        .find(|(k, _)| k == "code")
-        .map(|(_, v)| v.to_string())
-        .ok_or_else(|| {
-            let error = parsed
-                .query_pairs()
-                .find(|(k, _)| k == "error")
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            anyhow!("OAuth callback returned error: {error}")
-        })?;
-
-    let returned_state = parsed
-        .query_pairs()
-        .find(|(k, _)| k == "state")
-        .map(|(_, v)| v.to_string())
-        .ok_or_else(|| anyhow!("Missing state parameter in OAuth callback"))?;
-
-    let response_body = "<html><body><h2>Authentication successful!</h2><p>You can close this tab and return to your terminal.</p></body></html>";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        response_body.len(),
-        response_body
-    );
-    stream.write_all(response.as_bytes())?;
-
-    Ok((code, returned_state))
 }
 
 pub fn get_oauth_provider(provider_type: &str) -> Option<Box<dyn OAuthProvider>> {
@@ -655,8 +659,8 @@ pub(crate) fn client_config_info(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{ModelData, ProviderModels};
     use crate::client::openai_compatible::OpenAICompatibleConfig;
+    use crate::client::{ModelData, ProviderModels};
 
     fn base_config() -> OAuthConfig {
         OAuthConfig {
@@ -709,10 +713,19 @@ mod tests {
         assert_eq!(merged.client_id, "user-id");
         assert_eq!(merged.token_url, "https://user.example/token");
         assert_eq!(merged.client_secret.as_deref(), Some("user-secret"));
-        assert_eq!(merged.authorize_url.as_deref(), Some("https://base.example/authorize"));
+        assert_eq!(
+            merged.authorize_url.as_deref(),
+            Some("https://base.example/authorize")
+        );
         assert_eq!(merged.redirect_port, Some(1234));
         assert_eq!(merged.scopes, vec!["c"]);
-        assert_eq!(merged.extra_authorize_params.get("plan").map(String::as_str), Some("user"));
+        assert_eq!(
+            merged
+                .extra_authorize_params
+                .get("plan")
+                .map(String::as_str),
+            Some("user")
+        );
     }
 
     #[test]
@@ -725,11 +738,23 @@ mod tests {
         assert_eq!(merged.client_id, "user-id");
         assert_eq!(merged.token_url, "https://user.example/token");
         assert_eq!(merged.client_secret.as_deref(), Some("base-secret"));
-        assert_eq!(merged.authorize_url.as_deref(), Some("https://base.example/authorize"));
+        assert_eq!(
+            merged.authorize_url.as_deref(),
+            Some("https://base.example/authorize")
+        );
         assert_eq!(merged.redirect_port, Some(1234));
         assert_eq!(merged.scopes, vec!["a", "b"]);
-        assert!(matches!(merged.token_request_format, Some(TokenRequestFormat::FormUrlEncoded)));
-        assert_eq!(merged.extra_authorize_params.get("plan").map(String::as_str), Some("base"));
+        assert!(matches!(
+            merged.token_request_format,
+            Some(TokenRequestFormat::FormUrlEncoded)
+        ));
+        assert_eq!(
+            merged
+                .extra_authorize_params
+                .get("plan")
+                .map(String::as_str),
+            Some("base")
+        );
     }
 
     #[test]
@@ -756,10 +781,16 @@ echo_pkce_in_token_exchange: true
         assert_eq!(cfg.scopes.len(), 3);
         assert_eq!(cfg.redirect_port, Some(56121));
         assert!(matches!(cfg.flow, OAuthFlow::Pkce));
-        assert!(matches!(cfg.token_request_format, Some(TokenRequestFormat::FormUrlEncoded)));
+        assert!(matches!(
+            cfg.token_request_format,
+            Some(TokenRequestFormat::FormUrlEncoded)
+        ));
         assert!(cfg.echo_pkce_in_token_exchange);
         assert!(cfg.include_state_in_token_exchange);
-        assert_eq!(cfg.extra_authorize_params.get("plan").map(String::as_str), Some("generic"));
+        assert_eq!(
+            cfg.extra_authorize_params.get("plan").map(String::as_str),
+            Some("generic")
+        );
     }
 
     #[test]
