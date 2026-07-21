@@ -1,3 +1,5 @@
+use url::Url;
+
 use super::oauth::{OAuthConfig, OAuthFlow, OAuthProvider, TokenRequestFormat};
 
 pub struct OpenAICompatibleOAuthProvider {
@@ -6,7 +8,7 @@ pub struct OpenAICompatibleOAuthProvider {
 }
 
 fn is_loopback_uri(uri: &str) -> bool {
-    url::Url::parse(uri)
+    Url::parse(uri)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
         .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1"))

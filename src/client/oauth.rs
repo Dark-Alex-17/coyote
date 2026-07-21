@@ -684,8 +684,8 @@ fn parse_paste_input(input: &str) -> Result<(String, Option<String>)> {
     }
 
     if input.starts_with("http://") || input.starts_with("https://") {
-        let parsed = Url::parse(input)
-            .with_context(|| format!("Failed to parse pasted URL: {input}"))?;
+        let parsed =
+            Url::parse(input).with_context(|| format!("Failed to parse pasted URL: {input}"))?;
         let code = parsed
             .query_pairs()
             .find(|(k, _)| k == "code")
@@ -1294,10 +1294,7 @@ echo_pkce_in_token_exchange: true
     fn parse_paste_input_url_missing_code_fails() {
         let err =
             parse_paste_input("https://provider.example/oauth/callback?state=xyz").unwrap_err();
-        assert!(
-            err.to_string().contains("code"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("code"), "unexpected error: {err}");
     }
 
     #[test]
