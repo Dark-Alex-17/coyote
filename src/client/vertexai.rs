@@ -322,7 +322,11 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
             bail!("Invalid response data: {data}");
         }
     }
-    let output = ChatCompletionsOutput { text, tool_calls, ..Default::default() };
+    let output = ChatCompletionsOutput {
+        text,
+        tool_calls,
+        ..Default::default()
+    };
     Ok(output)
 }
 
@@ -435,7 +439,7 @@ pub fn gemini_build_chat_completions_body(
         body["generationConfig"]["topP"] = v.into();
     }
     if let Some(v) = reasoning_effort {
-        body["generation_config"]["thinking_level"] = v.into();
+        body["generationConfig"]["thinking_config"] = json!({"thinking_level": v});
     }
 
     if let Some(functions) = functions {
