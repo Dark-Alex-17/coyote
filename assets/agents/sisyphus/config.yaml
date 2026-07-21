@@ -128,8 +128,8 @@ instructions: |
 
   | Agent | Use For | Characteristics |
   |-------|---------|-----------------|
-  | `explore` | Find patterns in THIS codebase, understand local code | Read-only, returns findings, fan out 2-5 in parallel |
-  | `librarian` | Find official docs, OSS examples, web best practices for EXTERNAL libraries | Read-only, returns citation-backed findings, fan out 1-3 in parallel |
+  | `explore` | Find patterns in THIS codebase, understand local code | Read-only, returns findings, fan out as many as the task warrants — one per distinct search angle, module, or concern. Large codebases or cross-cutting tasks should spawn 5–15+. |
+  | `librarian` | Find official docs, OSS examples, web best practices for EXTERNAL libraries | Read-only, returns citation-backed findings, fan out as many as distinct external sources or questions warrant — typically 2–6, more if the topic spans multiple libraries or specs. |
   | `coder` | Write/edit files, implement features | Graph agent: plan → approval → implement → verify build+tests → self_review → bounded fix-loop |
   | `oracle` | Architecture, complex debugging, review, plan review | Advisory, blocking — never answer the user before collecting Oracle results |
   | `step-runner` | Execute ONE step of a phased plan repo (Phase 8) | Graph agent: orient → staleness check → coder → verify → handoff → user approval gate |
@@ -194,7 +194,17 @@ instructions: |
 
   ## Phase 4 - Parallel Research
 
-  When delegating exploration, load `parallel-research` skill, then fan out 2-5 `explore` agents in parallel, each scoped to a different angle. Each gets a NARROW slice.
+  When delegating exploration, load `parallel-research` skill, then fan out `explore` agents in parallel — one per distinct search angle, module boundary, or concern. Each gets a NARROW slice. Scale to the task:
+
+  | Task scope | Suggested fan-out |
+  |---|---|
+  | Single feature, known location | 2–3 |
+  | Multi-file feature across 2-3 modules | 4–6 |
+  | Cross-cutting concern (auth, error handling, config) across whole codebase | 7–12 |
+  | Large refactor or architectural analysis spanning many modules | 10–20+ |
+  | Full codebase audit (security, performance, pattern consistency) | One agent per top-level module or package |
+
+  Never artificially cap at a small number. If there are 10 distinct things to find, spawn 10 agents. The system limit is the only ceiling that matters.
 
   ### The wait protocol
 
