@@ -177,6 +177,14 @@ impl Session {
         &self.name
     }
 
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+
+    pub fn clear_autoname(&mut self) {
+        self.autoname = None;
+    }
+
     pub fn role_name(&self) -> Option<&str> {
         self.role_name.as_deref()
     }
@@ -1045,5 +1053,14 @@ mod tests {
         let mut session = Session::default();
         session.set_autonaming(true);
         assert!(!session.need_autoname());
+    }
+
+    #[test]
+    fn session_set_name_updates_name() {
+        let mut session = Session::default();
+
+        session.set_name("my-fork".to_string());
+
+        assert_eq!(session.name(), "my-fork");
     }
 }

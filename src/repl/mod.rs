@@ -52,7 +52,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 57]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 58]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -174,6 +174,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 57]> = LazyLock::new(|| {
             ".exit session",
             "Exit active session",
             AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
+        ),
+        ReplCommand::new(
+            ".fork",
+            "Fork the active session into a new named copy",
+            AssertState::True(StateFlags::SESSION),
         ),
         ReplCommand::new(".agent", "Use an agent", AssertState::bare()),
         ReplCommand::new(
@@ -1018,6 +1023,9 @@ pub async fn run_repl_command(
                     ctx.app.config.print_markdown(&banner)?;
                 }
             },
+            ".fork" => {
+                ctx.fork_session(args)?;
+            }
             ".save" => match split_first_arg(args) {
                 Some(("role", name)) => {
                     ctx.save_role(name)?;
@@ -1744,8 +1752,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_57_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 57);
+    fn repl_commands_has_58_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 58);
     }
 
     #[test]

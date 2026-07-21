@@ -633,6 +633,43 @@ impl RequestContext {
         Ok(())
     }
 
+    pub fn fork_session(&mut self, fork_name: Option<&str>) -> Result<()> {
+        let current_name = match &self.session {
+            Some(s) => s.name().to_string(),
+            None => bail!("No active session to fork"),
+        };
+
+        let fork_name: String = match fork_name {
+            Some(name) => name.to_string(),
+            None => {
+                let base = fork_base_name(&current_name);
+                let sessions_dir = self.sessions_dir();
+                (1_u32..)
+                    .map(|n| format!("{base}-fork-{n}"))
+                    .find(|name| !sessions_dir.join(format!("{name}.yaml")).exists())
+                    .unwrap()
+            }
+        };
+
+        let fork_path = self.session_file(&fork_name);
+        if fork_path.exists() {
+            bail!("Session '{}' already exists", fork_name);
+        }
+
+        self.save_session(None)?;
+
+        let session = self.session.as_ref().unwrap();
+        let mut fork = session.clone();
+        fork.set_name(fork_name.clone());
+        fork.clear_autoname();
+        fork.save(&fork_name, &fork_path, self.working_mode.is_repl())?;
+
+        self.session = Some(fork);
+        println!("Forked '{current_name}' → '{fork_name}'");
+
+        Ok(())
+    }
+
     pub fn empty_session(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
             if let Some(agent) = self.agent.as_ref() {
@@ -4053,6 +4090,17 @@ impl RequestContext {
     }
 }
 
+fn fork_base_name(name: &str) -> &str {
+    if let Some(pos) = name.rfind("-fork-") {
+        let suffix = &name[pos + 6..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return &name[..pos];
+        }
+    }
+
+    name
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::mcp_factory::McpFactory;
@@ -5454,6 +5502,32 @@ mod tests {
         let ctx = RequestContext::new(default_app_state(), WorkingMode::Repl);
         assert!(ctx.working_mode.is_repl());
         assert!(!ctx.working_mode.is_cmd());
+    }
+
+    #[test]
+    fn fork_base_name_strips_fork_suffix() {
+        assert_eq!(fork_base_name("my-session-fork-1"), "my-session");
+        assert_eq!(fork_base_name("my-session-fork-42"), "my-session");
+    }
+
+    #[test]
+    fn fork_base_name_leaves_plain_names_unchanged() {
+        assert_eq!(fork_base_name("my-session"), "my-session");
+        assert_eq!(fork_base_name("research"), "research");
+    }
+
+    #[test]
+    fn fork_base_name_ignores_non_numeric_suffix() {
+        assert_eq!(fork_base_name("my-session-fork-abc"), "my-session-fork-abc");
+        assert_eq!(fork_base_name("my-session-fork-"), "my-session-fork-");
+    }
+
+    #[test]
+    fn fork_base_name_flattens_nested_forks() {
+        assert_eq!(
+            fork_base_name("my-session-fork-1-fork-2"),
+            "my-session-fork-1"
+        );
     }
 
     #[test]
