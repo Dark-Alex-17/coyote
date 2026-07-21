@@ -2,7 +2,7 @@ use super::access_token::{is_valid_access_token, set_access_token};
 use super::openai_compatible_oauth::OpenAICompatibleOAuthProvider;
 use super::{ClientConfig, ProviderModels};
 use crate::config::paths;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
@@ -248,20 +248,24 @@ async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Resul
     let _ = open::that(&authorize_url);
 
     let (code, returned_state) = if use_callback_listener {
-        listen_for_oauth_callback(&redirect_uri)?
+        let (code, state) = listen_for_oauth_callback(&redirect_uri)?;
+        (code, Some(state))
     } else {
-        let input = Text::new("Paste the authorization code:").prompt()?;
-        let parts: Vec<&str> = input.splitn(2, '#').collect();
-        if parts.len() != 2 {
-            bail!("Invalid authorization code format. Expected format: <code>#<state>");
-        }
-        (parts[0].to_string(), parts[1].to_string())
+        let input = Text::new("Paste the authorization code or callback URL:").prompt()?;
+        parse_paste_input(input.trim())?
     };
 
-    if returned_state != state {
-        bail!(
-            "OAuth state mismatch: expected '{state}', got '{returned_state}'. \
-             This may indicate a CSRF attack or a stale authorization attempt."
+    if let Some(returned) = returned_state.as_deref() {
+        if returned != state {
+            bail!(
+                "OAuth state mismatch: expected '{state}', got '{returned}'. \
+                 This may indicate a CSRF attack or a stale authorization attempt."
+            );
+        }
+    } else {
+        eprintln!(
+            "Warning: no state returned in the paste; skipping CSRF check. \
+             If your provider's callback page shows a URL or code#state string, paste that instead."
         );
     }
 
@@ -672,6 +676,35 @@ fn build_token_request(
     }
 
     request
+}
+
+fn parse_paste_input(input: &str) -> Result<(String, Option<String>)> {
+    if input.is_empty() {
+        bail!("Empty input; paste the code, code#state, or callback URL from your browser.");
+    }
+
+    if input.starts_with("http://") || input.starts_with("https://") {
+        let parsed = Url::parse(input)
+            .with_context(|| format!("Failed to parse pasted URL: {input}"))?;
+        let code = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.to_string())
+            .ok_or_else(|| {
+                anyhow!("Pasted URL is missing the ?code= parameter. Paste the URL you were redirected to after approving.")
+            })?;
+        let state = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.to_string());
+        return Ok((code, state));
+    }
+
+    if let Some((code, state)) = input.split_once('#') {
+        return Ok((code.to_string(), Some(state.to_string())));
+    }
+
+    Ok((input.to_string(), None))
 }
 
 fn listen_for_oauth_callback(redirect_uri: &str) -> Result<(String, String)> {
@@ -1099,7 +1132,7 @@ echo_pkce_in_token_exchange: true
     #[test]
     fn openai_compatible_provider_prefers_redirect_uri_over_port() {
         let mut cfg = base_config();
-        cfg.redirect_uri = Some("https://custom.example/cb".into());
+        cfg.redirect_uri = Some("http://127.0.0.1:9000/cb".into());
         cfg.redirect_port = Some(9999);
 
         let provider = OpenAICompatibleOAuthProvider {
@@ -1109,7 +1142,7 @@ echo_pkce_in_token_exchange: true
 
         assert_eq!(
             provider.fixed_redirect_uri().as_deref(),
-            Some("https://custom.example/cb")
+            Some("http://127.0.0.1:9000/cb")
         );
     }
 
@@ -1224,6 +1257,101 @@ echo_pkce_in_token_exchange: true
         };
 
         assert!(provider.use_pkce_in_device_flow());
+    }
+
+    #[test]
+    fn parse_paste_input_full_callback_url() {
+        let (code, state) =
+            parse_paste_input("https://provider.example/oauth/callback?code=abc123&state=xyz")
+                .unwrap();
+        assert_eq!(code, "abc123");
+        assert_eq!(state.as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn parse_paste_input_url_without_state() {
+        let (code, state) =
+            parse_paste_input("https://provider.example/oauth/callback?code=abc123").unwrap();
+        assert_eq!(code, "abc123");
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn parse_paste_input_code_state_fragment() {
+        let (code, state) = parse_paste_input("abc123#xyz").unwrap();
+        assert_eq!(code, "abc123");
+        assert_eq!(state.as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn parse_paste_input_bare_code() {
+        let (code, state) = parse_paste_input("abc123").unwrap();
+        assert_eq!(code, "abc123");
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn parse_paste_input_url_missing_code_fails() {
+        let err =
+            parse_paste_input("https://provider.example/oauth/callback?state=xyz").unwrap_err();
+        assert!(
+            err.to_string().contains("code"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_paste_input_empty_fails() {
+        let err = parse_paste_input("").unwrap_err();
+        assert!(err.to_string().contains("Empty"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn openai_compatible_provider_fixed_redirect_uri_none_for_public_url() {
+        let mut cfg = base_config();
+        cfg.redirect_uri = Some("https://provider.example.com/callback".into());
+        cfg.redirect_port = None;
+
+        let provider = OpenAICompatibleOAuthProvider {
+            config: cfg,
+            client_name: "test".into(),
+        };
+
+        assert!(provider.fixed_redirect_uri().is_none());
+    }
+
+    #[test]
+    fn openai_compatible_provider_fixed_redirect_uri_some_for_localhost() {
+        let mut cfg = base_config();
+        cfg.redirect_uri = Some("http://127.0.0.1:9999/cb".into());
+        cfg.redirect_port = None;
+
+        let provider = OpenAICompatibleOAuthProvider {
+            config: cfg,
+            client_name: "test".into(),
+        };
+
+        assert_eq!(
+            provider.fixed_redirect_uri().as_deref(),
+            Some("http://127.0.0.1:9999/cb")
+        );
+    }
+
+    #[test]
+    fn openai_compatible_provider_fixed_redirect_uri_some_for_localhost_hostname() {
+        let mut cfg = base_config();
+        cfg.redirect_uri = Some("http://localhost:9999/cb".into());
+        cfg.redirect_port = None;
+
+        let provider = OpenAICompatibleOAuthProvider {
+            config: cfg,
+            client_name: "test".into(),
+        };
+
+        assert_eq!(
+            provider.fixed_redirect_uri().as_deref(),
+            Some("http://localhost:9999/cb")
+        );
     }
 
     #[test]

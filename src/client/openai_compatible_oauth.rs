@@ -5,6 +5,13 @@ pub struct OpenAICompatibleOAuthProvider {
     pub client_name: String,
 }
 
+fn is_loopback_uri(uri: &str) -> bool {
+    url::Url::parse(uri)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1"))
+}
+
 impl OAuthProvider for OpenAICompatibleOAuthProvider {
     fn provider_name(&self) -> &str {
         &self.client_name
@@ -70,7 +77,11 @@ impl OAuthProvider for OpenAICompatibleOAuthProvider {
 
     fn fixed_redirect_uri(&self) -> Option<String> {
         if let Some(uri) = &self.config.redirect_uri {
-            return Some(uri.clone());
+            return if is_loopback_uri(uri) {
+                Some(uri.clone())
+            } else {
+                None
+            };
         }
         if let Some(port) = self.config.redirect_port {
             return Some(format!("http://127.0.0.1:{port}/callback"));
