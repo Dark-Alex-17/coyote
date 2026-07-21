@@ -390,7 +390,10 @@ async fn run_device_code_flow(provider: &dyn OAuthProvider, client_name: &str) -
     }
     let form: HashMap<&str, &str> = device_params.iter().copied().collect();
 
-    let mut device_request = client.post(device_auth_url).form(&form);
+    let mut device_request = client
+        .post(device_auth_url)
+        .header("Accept", "application/json")
+        .form(&form);
     for (key, value) in provider.extra_token_headers() {
         device_request = device_request.header(key, value);
     }
@@ -468,6 +471,7 @@ async fn run_device_code_flow(provider: &dyn OAuthProvider, client_name: &str) -
             token_params.push(("code_verifier", verifier.as_str()));
         }
         let token_response: Value = build_token_request(&client, provider, &token_params)
+            .header("Accept", "application/json")
             .send()
             .await?
             .json()
