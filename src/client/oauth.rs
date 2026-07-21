@@ -357,10 +357,7 @@ async fn run_client_credentials_flow(
     Ok(())
 }
 
-async fn run_device_code_flow(
-    provider: &dyn OAuthProvider,
-    client_name: &str,
-) -> Result<()> {
+async fn run_device_code_flow(provider: &dyn OAuthProvider, client_name: &str) -> Result<()> {
     let device_auth_url = provider.device_authorization_url().ok_or_else(|| {
         anyhow!(
             "Provider '{}' is configured with flow: device_code but has no device_authorization_url. \

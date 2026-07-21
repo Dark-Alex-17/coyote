@@ -30,11 +30,11 @@ pub fn config_dir() -> PathBuf {
     }
 }
 
-pub fn local_path(name: &str) -> PathBuf {
+pub fn local_dir(name: &str) -> PathBuf {
     config_dir().join(name)
 }
 
-pub fn cache_path() -> PathBuf {
+pub fn cache_dir() -> PathBuf {
     if let Ok(v) = env::var(get_env_name("cache_dir")) {
         PathBuf::from(v)
     } else if let Ok(v) = env::var("XDG_CACHE_HOME") {
@@ -49,7 +49,7 @@ pub fn sandbox_kit_override() -> Option<PathBuf> {
     env::var_os(get_env_name("sandbox_kit")).map(PathBuf::from)
 }
 
-pub fn translate_sandboxed_home_path(path: &Path) -> Option<PathBuf> {
+pub fn translate_sandboxed_home_dir(path: &Path) -> Option<PathBuf> {
     env::var_os("IS_SANDBOX")?;
 
     let s = path.to_str()?;
@@ -62,7 +62,7 @@ pub fn translate_sandboxed_home_path(path: &Path) -> Option<PathBuf> {
         return Some(translated);
     }
 
-    translate_windows_users_path(s)
+    translate_windows_users_dir(s)
 }
 
 fn translate_unix_home_style(s: &str, prefix: &str) -> Option<PathBuf> {
@@ -83,7 +83,7 @@ fn translate_unix_home_style(s: &str, prefix: &str) -> Option<PathBuf> {
     })
 }
 
-fn translate_windows_users_path(s: &str) -> Option<PathBuf> {
+fn translate_windows_users_dir(s: &str) -> Option<PathBuf> {
     let bytes = s.as_bytes();
     if bytes.len() < 4 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
         return None;
@@ -128,20 +128,20 @@ pub fn find_workspace_sbx_mixin(start: &Path) -> Option<PathBuf> {
     None
 }
 
-pub fn oauth_tokens_path() -> PathBuf {
-    cache_path().join("oauth")
+pub fn oauth_tokens_dir() -> PathBuf {
+    cache_dir().join("oauth")
 }
 
 pub fn token_file(client_name: &str) -> PathBuf {
-    oauth_tokens_path().join(format!("{client_name}_oauth_tokens.json"))
+    oauth_tokens_dir().join(format!("{client_name}_oauth_tokens.json"))
 }
 
-pub fn log_path() -> PathBuf {
-    cache_path().join(format!("{}.log", env!("CARGO_CRATE_NAME")))
+pub fn log_file() -> PathBuf {
+    cache_dir().join(format!("{}.log", env!("CARGO_CRATE_NAME")))
 }
 
 pub fn sbx_kit_dir() -> PathBuf {
-    cache_path().join(SBX_KIT_DIR_NAME)
+    cache_dir().join(SBX_KIT_DIR_NAME)
 }
 
 pub fn sbx_kit_hash_file() -> PathBuf {
@@ -149,7 +149,7 @@ pub fn sbx_kit_hash_file() -> PathBuf {
 }
 
 pub fn sbx_vault_mixins_dir() -> PathBuf {
-    cache_path().join(SBX_VAULT_MIXINS_DIR_NAME)
+    cache_dir().join(SBX_VAULT_MIXINS_DIR_NAME)
 }
 
 pub fn sbx_vault_mixins_hash_file() -> PathBuf {
@@ -157,20 +157,20 @@ pub fn sbx_vault_mixins_hash_file() -> PathBuf {
 }
 
 pub fn sbx_mixin_kits_dir() -> PathBuf {
-    cache_path().join(SBX_MIXIN_KITS_DIR_NAME)
+    cache_dir().join(SBX_MIXIN_KITS_DIR_NAME)
 }
 
 pub fn config_file() -> PathBuf {
     match env::var(get_env_name("config_file")) {
         Ok(value) => PathBuf::from(value),
-        Err(_) => local_path(CONFIG_FILE_NAME),
+        Err(_) => local_dir(CONFIG_FILE_NAME),
     }
 }
 
 pub fn roles_dir() -> PathBuf {
     match env::var(get_env_name("roles_dir")) {
         Ok(value) => PathBuf::from(value),
-        Err(_) => local_path(ROLES_DIR_NAME),
+        Err(_) => local_dir(ROLES_DIR_NAME),
     }
 }
 
@@ -181,7 +181,7 @@ pub fn role_file(name: &str) -> PathBuf {
 pub fn skills_dir() -> PathBuf {
     match env::var(get_env_name("skills_dir")) {
         Ok(value) => PathBuf::from(value),
-        Err(_) => local_path(SKILLS_DIR_NAME),
+        Err(_) => local_dir(SKILLS_DIR_NAME),
     }
 }
 
@@ -243,7 +243,7 @@ pub fn validate_skill_name(name: &str) -> Result<()> {
 pub fn macros_dir() -> PathBuf {
     match env::var(get_env_name("macros_dir")) {
         Ok(value) => PathBuf::from(value),
-        Err(_) => local_path(MACROS_DIR_NAME),
+        Err(_) => local_dir(MACROS_DIR_NAME),
     }
 }
 
@@ -254,21 +254,21 @@ pub fn macro_file(name: &str) -> PathBuf {
 pub fn env_file() -> PathBuf {
     match env::var(get_env_name("env_file")) {
         Ok(value) => PathBuf::from(value),
-        Err(_) => local_path(ENV_FILE_NAME),
+        Err(_) => local_dir(ENV_FILE_NAME),
     }
 }
 
 pub fn rags_dir() -> PathBuf {
     match env::var(get_env_name("rags_dir")) {
         Ok(value) => PathBuf::from(value),
-        Err(_) => local_path(RAGS_DIR_NAME),
+        Err(_) => local_dir(RAGS_DIR_NAME),
     }
 }
 
 pub fn functions_dir() -> PathBuf {
     match env::var(get_env_name("functions_dir")) {
         Ok(value) => PathBuf::from(value),
-        Err(_) => local_path(FUNCTIONS_DIR_NAME),
+        Err(_) => local_dir(FUNCTIONS_DIR_NAME),
     }
 }
 
@@ -293,7 +293,7 @@ pub fn bash_prompt_utils_file() -> PathBuf {
 }
 
 pub fn agents_data_dir() -> PathBuf {
-    local_path(AGENTS_DIR_NAME)
+    local_dir(AGENTS_DIR_NAME)
 }
 
 pub fn agent_data_dir(name: &str) -> PathBuf {
@@ -339,14 +339,14 @@ pub fn agent_functions_file(name: &str) -> Result<PathBuf> {
 }
 
 pub fn models_override_file() -> PathBuf {
-    local_path("models-override.yaml")
+    local_dir("models-override.yaml")
 }
 
 pub fn global_memory_dir() -> PathBuf {
     config_dir().join(MEMORY_DIR_NAME)
 }
 
-pub fn global_memory_index_path() -> PathBuf {
+pub fn global_memory_index_file() -> PathBuf {
     global_memory_dir().join(MEMORY_INDEX_FILE_NAME)
 }
 
@@ -356,12 +356,12 @@ pub fn workspace_memory_dir_for(workspace_root: &Path) -> PathBuf {
         .join(MEMORY_DIR_NAME)
 }
 
-pub fn workspace_memory_index_path_for(workspace_root: &Path) -> PathBuf {
+pub fn workspace_memory_index_file_for(workspace_root: &Path) -> PathBuf {
     workspace_memory_dir_for(workspace_root).join(MEMORY_INDEX_FILE_NAME)
 }
 
 pub fn repl_history_dir() -> PathBuf {
-    cache_path().join(REPL_HISTORY_DIR_NAME)
+    cache_dir().join(REPL_HISTORY_DIR_NAME)
 }
 
 pub fn repl_history_file(session: &Option<Session>) -> PathBuf {
@@ -384,7 +384,7 @@ pub fn log_config() -> Result<(LevelFilter, Option<PathBuf>)> {
         });
     let resolved_log_path = match env::var(get_env_name("log_path")) {
         Ok(v) => Some(PathBuf::from(v)),
-        Err(_) => Some(log_path()),
+        Err(_) => Some(log_file()),
     };
     Ok((log_level, resolved_log_path))
 }
@@ -571,7 +571,7 @@ mod tests {
         fn returns_none_when_not_in_sandbox() {
             without_sandbox(|| {
                 let p = Path::new("/home/atusa/.coyote_password");
-                assert_eq!(translate_sandboxed_home_path(p), None);
+                assert_eq!(translate_sandboxed_home_dir(p), None);
             });
         }
 
@@ -581,7 +581,7 @@ mod tests {
             with_sandbox(|| {
                 let p = Path::new("/home/atusa/.coyote_password");
                 assert_eq!(
-                    translate_sandboxed_home_path(p),
+                    translate_sandboxed_home_dir(p),
                     Some(PathBuf::from("/home/agent/.coyote_password"))
                 );
             });
@@ -589,11 +589,11 @@ mod tests {
 
         #[test]
         #[serial]
-        fn translates_nested_host_home_path() {
+        fn translates_nested_host_home_dir() {
             with_sandbox(|| {
                 let p = Path::new("/home/atusa/.config/coyote/.password");
                 assert_eq!(
-                    translate_sandboxed_home_path(p),
+                    translate_sandboxed_home_dir(p),
                     Some(PathBuf::from("/home/agent/.config/coyote/.password"))
                 );
             });
@@ -604,7 +604,7 @@ mod tests {
         fn returns_none_when_path_already_targets_agent_home() {
             with_sandbox(|| {
                 let p = Path::new("/home/agent/.coyote_password");
-                assert_eq!(translate_sandboxed_home_path(p), None);
+                assert_eq!(translate_sandboxed_home_dir(p), None);
             });
         }
 
@@ -613,7 +613,7 @@ mod tests {
         fn returns_none_when_path_is_outside_home() {
             with_sandbox(|| {
                 let p = Path::new("/etc/coyote/.coyote_password");
-                assert_eq!(translate_sandboxed_home_path(p), None);
+                assert_eq!(translate_sandboxed_home_dir(p), None);
             });
         }
 
@@ -622,7 +622,7 @@ mod tests {
         fn returns_none_for_relative_path() {
             with_sandbox(|| {
                 let p = Path::new(".coyote_password");
-                assert_eq!(translate_sandboxed_home_path(p), None);
+                assert_eq!(translate_sandboxed_home_dir(p), None);
             });
         }
 
@@ -631,17 +631,17 @@ mod tests {
         fn returns_none_for_first_segment_not_home() {
             with_sandbox(|| {
                 let p = Path::new("/opt/atusa/.coyote_password");
-                assert_eq!(translate_sandboxed_home_path(p), None);
+                assert_eq!(translate_sandboxed_home_dir(p), None);
             });
         }
 
         #[test]
         #[serial]
-        fn translates_macos_users_path() {
+        fn translates_macos_users_dir() {
             with_sandbox(|| {
                 let p = Path::new("/Users/atusa/.coyote_password");
                 assert_eq!(
-                    translate_sandboxed_home_path(p),
+                    translate_sandboxed_home_dir(p),
                     Some(PathBuf::from("/home/agent/.coyote_password"))
                 );
             });
@@ -649,11 +649,11 @@ mod tests {
 
         #[test]
         #[serial]
-        fn translates_macos_nested_path() {
+        fn translates_macos_nested_dir() {
             with_sandbox(|| {
                 let p = Path::new("/Users/atusa/.config/coyote/.password");
                 assert_eq!(
-                    translate_sandboxed_home_path(p),
+                    translate_sandboxed_home_dir(p),
                     Some(PathBuf::from("/home/agent/.config/coyote/.password"))
                 );
             });
@@ -661,10 +661,10 @@ mod tests {
 
         #[test]
         #[serial]
-        fn returns_none_when_macos_path_already_targets_agent() {
+        fn returns_none_when_macos_dir_already_targets_agent() {
             with_sandbox(|| {
                 let p = Path::new("/Users/agent/.coyote_password");
-                assert_eq!(translate_sandboxed_home_path(p), None);
+                assert_eq!(translate_sandboxed_home_dir(p), None);
             });
         }
 
@@ -674,7 +674,7 @@ mod tests {
             with_sandbox(|| {
                 let p = Path::new("C:\\Users\\atusa\\.coyote_password");
                 assert_eq!(
-                    translate_sandboxed_home_path(p),
+                    translate_sandboxed_home_dir(p),
                     Some(PathBuf::from("/home/agent/.coyote_password"))
                 );
             });
@@ -686,7 +686,7 @@ mod tests {
             with_sandbox(|| {
                 let p = Path::new("D:\\Users\\atusa\\.config\\coyote\\.password");
                 assert_eq!(
-                    translate_sandboxed_home_path(p),
+                    translate_sandboxed_home_dir(p),
                     Some(PathBuf::from("/home/agent/.config/coyote/.password"))
                 );
             });
@@ -697,7 +697,7 @@ mod tests {
         fn returns_none_when_windows_path_already_targets_agent() {
             with_sandbox(|| {
                 let p = Path::new("C:\\Users\\agent\\.coyote_password");
-                assert_eq!(translate_sandboxed_home_path(p), None);
+                assert_eq!(translate_sandboxed_home_dir(p), None);
             });
         }
     }

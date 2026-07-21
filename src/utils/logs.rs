@@ -9,7 +9,7 @@ use tokio::time::sleep;
 
 pub async fn tail_logs(no_color: bool) {
     let re = Regex::new(r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+<(?P<opid>[^\s>]+)>\s+\[(?P<level>[A-Z]+)\]\s+(?P<logger>[^:]+):(?P<line>\d+)\s+-\s+(?P<message>.*)$").unwrap();
-    let file_path = paths::log_path();
+    let file_path = paths::log_file();
     let file = File::open(&file_path).expect("Cannot open file");
     let mut reader = BufReader::new(file);
 

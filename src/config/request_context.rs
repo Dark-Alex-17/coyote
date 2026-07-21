@@ -440,9 +440,9 @@ impl RequestContext {
         match &self.agent {
             None => match env::var(get_env_name("messages_file")) {
                 Ok(value) => PathBuf::from(value),
-                Err(_) => paths::cache_path().join(MESSAGES_FILE_NAME),
+                Err(_) => paths::cache_dir().join(MESSAGES_FILE_NAME),
             },
-            Some(agent) => paths::cache_path()
+            Some(agent) => paths::cache_dir()
                 .join(AGENTS_DIR_NAME)
                 .join(agent.name())
                 .join(MESSAGES_FILE_NAME),
@@ -453,7 +453,7 @@ impl RequestContext {
         match &self.agent {
             None => match env::var(get_env_name("sessions_dir")) {
                 Ok(value) => PathBuf::from(value),
-                Err(_) => paths::local_path(SESSIONS_DIR_NAME),
+                Err(_) => paths::local_dir(SESSIONS_DIR_NAME),
             },
             Some(agent) => paths::agent_data_dir(agent.name()).join(SESSIONS_DIR_NAME),
         }
@@ -927,7 +927,7 @@ impl RequestContext {
         let store = cwd.as_deref().map(MemoryStore::new);
         let workspace = store.as_ref().and_then(|s| s.workspace.clone());
 
-        let global_exists = paths::global_memory_index_path().exists();
+        let global_exists = paths::global_memory_index_file().exists();
         let workspace_exists = workspace.is_some();
 
         if !global_exists && !workspace_exists {
@@ -5609,7 +5609,7 @@ mod tests {
     #[serial]
     fn use_session_creates_temp_session() {
         let _guard = TestConfigDirGuard::new();
-        let sessions_dir = paths::local_path("sessions");
+        let sessions_dir = paths::local_dir("sessions");
         create_dir_all(&sessions_dir).unwrap();
 
         let mut ctx = create_test_ctx();
@@ -5625,7 +5625,7 @@ mod tests {
     #[serial]
     fn use_session_creates_named_session() {
         let _guard = TestConfigDirGuard::new();
-        let sessions_dir = paths::local_path("sessions");
+        let sessions_dir = paths::local_dir("sessions");
         create_dir_all(&sessions_dir).unwrap();
 
         let mut ctx = create_test_ctx();
@@ -5641,7 +5641,7 @@ mod tests {
     #[serial]
     fn exit_session_roundtrip() {
         let _guard = TestConfigDirGuard::new();
-        let sessions_dir = paths::local_path("sessions");
+        let sessions_dir = paths::local_dir("sessions");
         create_dir_all(&sessions_dir).unwrap();
 
         let mut ctx = create_test_ctx();

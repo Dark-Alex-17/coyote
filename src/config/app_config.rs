@@ -329,7 +329,7 @@ impl AppConfig {
                     return path.clone();
                 }
 
-                if let Some(translated) = paths::translate_sandboxed_home_path(path)
+                if let Some(translated) = paths::translate_sandboxed_home_dir(path)
                     && translated.exists()
                 {
                     info!(
@@ -380,7 +380,7 @@ impl AppConfig {
         let theme = if self.highlight {
             let theme_mode = if self.light_theme() { "light" } else { "dark" };
             let theme_filename = format!("{theme_mode}.tmTheme");
-            let theme_path = paths::local_path(&theme_filename);
+            let theme_path = paths::local_dir(&theme_filename);
             if theme_path.exists() {
                 let theme = ThemeSet::get_theme(&theme_path)
                     .with_context(|| format!("Invalid theme at '{}'", theme_path.display()))?;

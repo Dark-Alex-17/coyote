@@ -221,7 +221,7 @@ impl Agent {
             && !matches!(agent_config.memory, Some(false))
             && !matches!(app.memory, Some(false))
         {
-            let memory_exists = paths::global_memory_index_path().exists()
+            let memory_exists = paths::global_memory_index_file().exists()
                 || env::current_dir()
                     .ok()
                     .and_then(|cwd| memory::discover_workspace_memory(&cwd))

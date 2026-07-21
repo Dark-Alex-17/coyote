@@ -142,7 +142,7 @@ fn mcp_token_key(server_name: &str) -> String {
 }
 
 fn load_registered_client_id(server_name: &str) -> Option<String> {
-    let path = paths::oauth_tokens_path().join(format!("mcp_{server_name}_registration.json"));
+    let path = paths::oauth_tokens_dir().join(format!("mcp_{server_name}_registration.json"));
     let content = fs::read_to_string(path).ok()?;
     let reg: McpRegistration = serde_json::from_str(&content).ok()?;
 
@@ -150,7 +150,7 @@ fn load_registered_client_id(server_name: &str) -> Option<String> {
 }
 
 fn save_registered_client_id(server_name: &str, client_id: &str) -> Result<()> {
-    let dir = paths::oauth_tokens_path();
+    let dir = paths::oauth_tokens_dir();
     fs::create_dir_all(&dir)?;
 
     let path = dir.join(format!("mcp_{server_name}_registration.json"));

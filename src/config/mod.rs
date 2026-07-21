@@ -481,7 +481,7 @@ fn confirm_asset_overwrite(category: AssetCategory, label: &str, target: &Path) 
 pub fn default_sessions_dir() -> PathBuf {
     match env::var(get_env_name("sessions_dir")) {
         Ok(value) => PathBuf::from(value),
-        Err(_) => paths::local_path(SESSIONS_DIR_NAME),
+        Err(_) => paths::local_dir(SESSIONS_DIR_NAME),
     }
 }
 

@@ -388,14 +388,14 @@ async fn run(
     if let Some(scope) = cli.init_memory {
         let (path, content) = match scope {
             MemoryScope::Global => (
-                paths::global_memory_index_path(),
+                paths::global_memory_index_file(),
                 "# Global Memory\n\n<!-- Universal facts about you go here. The LLM uses this as always-on context. -->\n<!-- Drill files (when created) are listed below. -->\n",
             ),
             MemoryScope::Workspace => {
                 let cwd = env::current_dir()?;
                 let root = memory::find_git_root(&cwd).unwrap_or(cwd);
                 (
-                    paths::workspace_memory_index_path_for(&root),
+                    paths::workspace_memory_index_file_for(&root),
                     "# Workspace Memory Index\n\n<!-- Facts about this project go here. The LLM uses this as always-on context. -->\n<!-- Drill files (when created) are listed below. -->\n",
                 )
             }

@@ -321,7 +321,7 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
 
             Ok(json!({
                 "files": entries,
-                "global_index_exists": paths::global_memory_index_path().exists(),
+                "global_index_exists": paths::global_memory_index_file().exists(),
                 "workspace": store.workspace.as_ref().map(workspace_label),
             }))
         }

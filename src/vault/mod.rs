@@ -34,7 +34,7 @@ fn apply_sandboxed_home_translation(provider_def: &mut LocalProvider) {
         return;
     }
 
-    let Some(translated) = paths::translate_sandboxed_home_path(pf) else {
+    let Some(translated) = paths::translate_sandboxed_home_dir(pf) else {
         return;
     };
 
