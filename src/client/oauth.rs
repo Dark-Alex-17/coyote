@@ -479,10 +479,10 @@ async fn run_device_code_flow(provider: &dyn OAuthProvider, client_name: &str) -
 
         if let Some(access_token) = token_response["access_token"].as_str() {
             let refresh_token = token_response["refresh_token"].as_str().map(str::to_string);
-            let expires_in_secs = token_response["expires_in"].as_i64().ok_or_else(|| {
-                anyhow!("Missing expires_in in device_code token response: {token_response}")
-            })?;
-            let expires_at = Utc::now().timestamp() + expires_in_secs;
+            let expires_at = match token_response["expires_in"].as_i64() {
+                Some(secs) => Utc::now().timestamp() + secs,
+                None => i64::MAX,
+            };
             let account_id = provider.extract_account_id(&token_response);
 
             let tokens = OAuthTokens {
