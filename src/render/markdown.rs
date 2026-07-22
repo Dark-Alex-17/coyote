@@ -159,17 +159,40 @@ fn style_inline_code(content: &str, styles: &MarkdownStyles) -> String {
     }
 }
 
-fn render_markdown_line(line: &str, kind: LineKind, styles: &MarkdownStyles) -> String {
+fn render_markdown_line(
+    line: &str,
+    kind: LineKind,
+    styles: &MarkdownStyles,
+    wrap_width: Option<u16>,
+) -> String {
     match kind {
         LineKind::Heading(level) => render_heading(line, level, styles),
-        LineKind::Blockquote => render_blockquote(line, styles),
-        LineKind::BulletItem => render_bullet(line, styles),
-        LineKind::NumberedItem => render_numbered(line, styles),
-        LineKind::TaskItem(checked) => render_task(line, checked, styles),
+        LineKind::Blockquote => render_blockquote(line, styles, wrap_width),
+        LineKind::BulletItem => render_bullet(line, styles, wrap_width),
+        LineKind::NumberedItem => render_numbered(line, styles, wrap_width),
+        LineKind::TaskItem(checked) => render_task(line, checked, styles, wrap_width),
         LineKind::HorizontalRule => render_hrule(styles),
         LineKind::TableRow | LineKind::TableSeparator => apply_inline(line, styles),
         LineKind::Paragraph => apply_inline(line, styles),
     }
+}
+
+fn kind_pre_wraps(kind: LineKind) -> bool {
+    matches!(
+        kind,
+        LineKind::BulletItem
+            | LineKind::NumberedItem
+            | LineKind::TaskItem(_)
+            | LineKind::Blockquote
+    )
+}
+
+fn wrap_plain_content(content: &str, effective_width: usize) -> Vec<String> {
+    let effective_width = effective_width.max(1);
+    textwrap::wrap(content, effective_width)
+        .into_iter()
+        .map(|c| c.into_owned())
+        .collect()
 }
 
 fn split_indent(line: &str) -> (&str, &str) {
@@ -194,46 +217,153 @@ fn render_heading(line: &str, level: u8, styles: &MarkdownStyles) -> String {
     format!("{indent}{}", body.with(color).bold())
 }
 
-fn render_blockquote(line: &str, styles: &MarkdownStyles) -> String {
+fn render_blockquote(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -> String {
     let (indent, rest) = split_indent(line);
     let content = rest.trim_start_matches('>').trim_start();
     let prefix = "│ ".with(styles.blockquote).to_string();
-    let styled_content = apply_inline(content, styles)
-        .with(styles.blockquote)
-        .to_string();
-    format!("{indent}{prefix}{styled_content}")
+
+    let render_one = |c: &str| apply_inline(c, styles).with(styles.blockquote).to_string();
+
+    let Some(wrap_width) = wrap_width else {
+        return format!("{indent}{prefix}{}", render_one(content));
+    };
+
+    let prefix_width = 2;
+    let leading_width = indent.chars().count();
+    let effective_width = (wrap_width as usize)
+        .saturating_sub(leading_width + prefix_width);
+    let wrapped = wrap_plain_content(content, effective_width);
+    if wrapped.is_empty() {
+        return format!("{indent}{prefix}");
+    }
+
+    let mut out = String::new();
+    for (i, chunk) in wrapped.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("{indent}{prefix}{}", render_one(chunk)));
+    }
+    out
 }
 
-fn render_bullet(line: &str, styles: &MarkdownStyles) -> String {
+fn render_bullet(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -> String {
     let (indent, rest) = split_indent(line);
     let content = rest.get(2..).unwrap_or("");
     let bullet = "•".with(styles.list_bullet).to_string();
-    let styled_content = apply_inline(content, styles);
-    format!("{indent}{bullet} {styled_content}")
-}
 
-fn render_numbered(line: &str, styles: &MarkdownStyles) -> String {
-    let (indent, rest) = split_indent(line);
-    match rest.find('.') {
-        Some(dot_pos) => {
-            let number = &rest[..dot_pos];
-            let after = rest[dot_pos + 1..].trim_start();
-            let styled_dot = ".".with(styles.list_bullet).to_string();
-            let content = apply_inline(after, styles);
-            format!("{indent}{number}{styled_dot} {content}")
-        }
-        None => format!("{indent}{}", apply_inline(rest, styles)),
+    let Some(wrap_width) = wrap_width else {
+        return format!("{indent}{bullet} {}", apply_inline(content, styles));
+    };
+
+    let prefix_width = 2;
+    let leading_width = indent.chars().count();
+    let effective_width = (wrap_width as usize)
+        .saturating_sub(leading_width + prefix_width);
+    let wrapped = wrap_plain_content(content, effective_width);
+    if wrapped.is_empty() {
+        return format!("{indent}{bullet} ");
     }
+
+    let subseq = " ".repeat(prefix_width);
+    let mut out = String::new();
+    for (i, chunk) in wrapped.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let styled = apply_inline(chunk, styles);
+        if i == 0 {
+            out.push_str(&format!("{indent}{bullet} {styled}"));
+        } else {
+            out.push_str(&format!("{indent}{subseq}{styled}"));
+        }
+    }
+    out
 }
 
-fn render_task(line: &str, checked: bool, styles: &MarkdownStyles) -> String {
+fn render_numbered(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -> String {
+    let (indent, rest) = split_indent(line);
+    let Some(dot_pos) = rest.find('.') else {
+        return format!("{indent}{}", apply_inline(rest, styles));
+    };
+    let number = &rest[..dot_pos];
+    let after = rest[dot_pos + 1..].trim_start();
+    let styled_dot = ".".with(styles.list_bullet).to_string();
+
+    let Some(wrap_width) = wrap_width else {
+        return format!(
+            "{indent}{number}{styled_dot} {}",
+            apply_inline(after, styles)
+        );
+    };
+
+    let prefix_width = number.chars().count() + 2;
+    let leading_width = indent.chars().count();
+    let effective_width = (wrap_width as usize)
+        .saturating_sub(leading_width + prefix_width);
+    let wrapped = wrap_plain_content(after, effective_width);
+    if wrapped.is_empty() {
+        return format!("{indent}{number}{styled_dot} ");
+    }
+
+    let subseq = " ".repeat(prefix_width);
+    let mut out = String::new();
+    for (i, chunk) in wrapped.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let styled = apply_inline(chunk, styles);
+        if i == 0 {
+            out.push_str(&format!("{indent}{number}{styled_dot} {styled}"));
+        } else {
+            out.push_str(&format!("{indent}{subseq}{styled}"));
+        }
+    }
+    out
+}
+
+fn render_task(
+    line: &str,
+    checked: bool,
+    styles: &MarkdownStyles,
+    wrap_width: Option<u16>,
+) -> String {
     let (indent, rest) = split_indent(line);
     let after_bullet = rest.get(2..).unwrap_or("");
     let after_brackets = after_bullet.get(3..).map(str::trim_start).unwrap_or("");
     let glyph = if checked { "[✓]" } else { "[ ]" };
     let styled_brackets = glyph.with(styles.list_bullet).to_string();
-    let styled_content = apply_inline(after_brackets, styles);
-    format!("{indent}{styled_brackets} {styled_content}")
+
+    let Some(wrap_width) = wrap_width else {
+        return format!(
+            "{indent}{styled_brackets} {}",
+            apply_inline(after_brackets, styles)
+        );
+    };
+
+    let prefix_width = 4;
+    let leading_width = indent.chars().count();
+    let effective_width = (wrap_width as usize)
+        .saturating_sub(leading_width + prefix_width);
+    let wrapped = wrap_plain_content(after_brackets, effective_width);
+    if wrapped.is_empty() {
+        return format!("{indent}{styled_brackets} ");
+    }
+
+    let subseq = " ".repeat(prefix_width);
+    let mut out = String::new();
+    for (i, chunk) in wrapped.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let styled = apply_inline(chunk, styles);
+        if i == 0 {
+            out.push_str(&format!("{indent}{styled_brackets} {styled}"));
+        } else {
+            out.push_str(&format!("{indent}{subseq}{styled}"));
+        }
+    }
+    out
 }
 
 fn render_hrule(styles: &MarkdownStyles) -> String {
@@ -530,8 +660,12 @@ impl MarkdownRender {
     }
 
     fn render_rich_markdown_line(&self, line: &str, kind: LineKind) -> String {
-        let styled = render_markdown_line(line, kind, &self.styles);
-        self.wrap_line(styled, false)
+        let styled = render_markdown_line(line, kind, &self.styles, self.wrap_width);
+        if kind_pre_wraps(kind) {
+            styled
+        } else {
+            self.wrap_line(styled, false)
+        }
     }
 
     fn render_table(
@@ -1584,6 +1718,110 @@ std::error::Error>> {
         );
     }
 
+    #[test]
+    fn bullet_wraps_with_two_space_hanging_indent() {
+        let styles = test_styles();
+        let line = "- text that is long enough to wrap onto continuation lines";
+        let output = render_markdown_line(line, LineKind::BulletItem, &styles, Some(20));
+        assert!(output.contains('\n'), "wrapped output: {output:?}");
+        let lines: Vec<&str> = output.split('\n').collect();
+        assert!(lines.len() >= 2);
+        for cont in &lines[1..] {
+            assert!(
+                cont.starts_with("  ") && !cont.starts_with("  •"),
+                "continuation has 2-space indent (no bullet): {cont:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn numbered_wraps_with_digit_width_hanging_indent() {
+        let styles = test_styles();
+        let line = "42. text that is long enough to wrap onto continuation lines";
+        let output = render_markdown_line(line, LineKind::NumberedItem, &styles, Some(22));
+        assert!(output.contains('\n'), "wrapped output: {output:?}");
+        let lines: Vec<&str> = output.split('\n').collect();
+        for cont in &lines[1..] {
+            assert!(cont.starts_with("    "), "4-space indent for `42. `: {cont:?}");
+        }
+    }
+
+    #[test]
+    fn numbered_wraps_with_three_digit_hanging_indent() {
+        let styles = test_styles();
+        let line = "100. text that is long enough to wrap onto continuation lines";
+        let output = render_markdown_line(line, LineKind::NumberedItem, &styles, Some(22));
+        assert!(output.contains('\n'));
+        let lines: Vec<&str> = output.split('\n').collect();
+        for cont in &lines[1..] {
+            assert!(
+                cont.starts_with("     "),
+                "5-space indent for `100. `: {cont:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn task_wraps_with_four_space_hanging_indent() {
+        let styles = test_styles();
+        let line = "- [ ] task text that is long enough to wrap around";
+        let output = render_markdown_line(line, LineKind::TaskItem(false), &styles, Some(22));
+        assert!(output.contains('\n'), "wrapped output: {output:?}");
+        let lines: Vec<&str> = output.split('\n').collect();
+        for cont in &lines[1..] {
+            assert!(cont.starts_with("    "), "4-space indent for `[ ] `: {cont:?}");
+        }
+    }
+
+    #[test]
+    fn blockquote_wraps_with_pipe_prefix_on_every_line() {
+        let styles = test_styles();
+        let line = "> quoted text that is long enough to wrap onto multiple continuation lines";
+        let output = render_markdown_line(line, LineKind::Blockquote, &styles, Some(24));
+        assert!(output.contains('\n'), "wrapped output: {output:?}");
+        for wrapped in output.split('\n') {
+            assert!(
+                wrapped.contains("│ "),
+                "pipe prefix present on line: {wrapped:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn bullet_preserves_leading_indent_when_wrapping() {
+        let styles = test_styles();
+        let line = "  - nested bullet text that wraps around a few times";
+        let output = render_markdown_line(line, LineKind::BulletItem, &styles, Some(22));
+        assert!(output.contains('\n'), "wrapped output: {output:?}");
+        for wrapped in output.split('\n') {
+            assert!(
+                wrapped.starts_with("  "),
+                "leading indent preserved: {wrapped:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn block_renderers_produce_single_line_when_wrap_width_none() {
+        let styles = test_styles();
+        let long_line =
+            "- very long bullet text that would definitely wrap if a narrow wrap_width were set";
+        let output = render_markdown_line(long_line, LineKind::BulletItem, &styles, None);
+        assert!(!output.contains('\n'), "no wrapping with None: {output:?}");
+    }
+
+    #[test]
+    fn bullet_wraps_with_inline_markdown_intact() {
+        let styles = test_styles();
+        let line = "- **bold** text with `code` that will wrap onto several lines";
+        let output = render_markdown_line(line, LineKind::BulletItem, &styles, Some(22));
+        assert!(output.contains('\n'), "wrapped output: {output:?}");
+        assert!(!output.contains("**bold**"), "asterisks stripped: {output:?}");
+        assert!(!output.contains("`code`"), "backticks stripped: {output:?}");
+        assert!(output.contains("bold"));
+        assert!(output.contains("code"));
+    }
+
     fn test_styles() -> MarkdownStyles {
         MarkdownStyles {
             heading: (Color::Yellow, true),
@@ -1732,7 +1970,7 @@ std::error::Error>> {
     #[test]
     fn render_heading_level_1_pads_content() {
         let styles = test_styles();
-        let result = render_markdown_line("# Big", LineKind::Heading(1), &styles);
+        let result = render_markdown_line("# Big", LineKind::Heading(1), &styles, None);
         assert!(result.contains(" Big "), "H1 padded content: {result:?}");
         assert!(!result.contains('#'), "H1 hashes removed: {result:?}");
         assert!(result.contains("\x1b[1m"), "bold applied: {result:?}");
@@ -1744,7 +1982,7 @@ std::error::Error>> {
         for level in 2u8..=6 {
             let hashes = "#".repeat(level as usize);
             let line = format!("{hashes} Title");
-            let result = render_markdown_line(&line, LineKind::Heading(level), &styles);
+            let result = render_markdown_line(&line, LineKind::Heading(level), &styles, None);
             assert!(result.contains(&hashes), "H{level} keeps hashes: {result:?}");
             assert!(result.contains("Title"));
             assert!(result.contains("\x1b[1m"), "H{level} bold: {result:?}");
@@ -1754,14 +1992,14 @@ std::error::Error>> {
     #[test]
     fn render_heading_preserves_leading_indent() {
         let styles = test_styles();
-        let result = render_markdown_line("  ## Nested", LineKind::Heading(2), &styles);
+        let result = render_markdown_line("  ## Nested", LineKind::Heading(2), &styles, None);
         assert!(result.starts_with("  "), "indent preserved: {result:?}");
     }
 
     #[test]
     fn render_blockquote_uses_pipe_prefix() {
         let styles = test_styles();
-        let result = render_markdown_line("> quoted", LineKind::Blockquote, &styles);
+        let result = render_markdown_line("> quoted", LineKind::Blockquote, &styles, None);
         assert!(result.contains("│ "), "pipe prefix: {result:?}");
         assert!(!result.contains('>'), "gt removed: {result:?}");
         assert!(result.contains("quoted"));
@@ -1770,7 +2008,7 @@ std::error::Error>> {
     #[test]
     fn render_blockquote_preserves_indent() {
         let styles = test_styles();
-        let result = render_markdown_line("  > deep", LineKind::Blockquote, &styles);
+        let result = render_markdown_line("  > deep", LineKind::Blockquote, &styles, None);
         assert!(result.starts_with("  "));
         assert!(result.contains("│ "));
     }
@@ -1778,7 +2016,7 @@ std::error::Error>> {
     #[test]
     fn render_bullet_uses_bullet_char() {
         let styles = test_styles();
-        let result = render_markdown_line("- item", LineKind::BulletItem, &styles);
+        let result = render_markdown_line("- item", LineKind::BulletItem, &styles, None);
         assert!(result.contains("•"), "bullet glyph: {result:?}");
         assert!(!result.contains("- "), "dash removed: {result:?}");
         assert!(result.contains("item"));
@@ -1787,8 +2025,8 @@ std::error::Error>> {
     #[test]
     fn render_bullet_supports_star_and_plus() {
         let styles = test_styles();
-        let star = render_markdown_line("* one", LineKind::BulletItem, &styles);
-        let plus = render_markdown_line("+ two", LineKind::BulletItem, &styles);
+        let star = render_markdown_line("* one", LineKind::BulletItem, &styles, None);
+        let plus = render_markdown_line("+ two", LineKind::BulletItem, &styles, None);
         assert!(star.contains("•") && star.contains("one"));
         assert!(plus.contains("•") && plus.contains("two"));
     }
@@ -1796,7 +2034,7 @@ std::error::Error>> {
     #[test]
     fn render_bullet_preserves_nested_indent() {
         let styles = test_styles();
-        let result = render_markdown_line("    - nested", LineKind::BulletItem, &styles);
+        let result = render_markdown_line("    - nested", LineKind::BulletItem, &styles, None);
         assert!(result.starts_with("    "), "indent kept: {result:?}");
         assert!(result.contains("•"));
     }
@@ -1804,7 +2042,7 @@ std::error::Error>> {
     #[test]
     fn render_numbered_preserves_number_and_styles_dot() {
         let styles = test_styles();
-        let result = render_markdown_line("42. answer", LineKind::NumberedItem, &styles);
+        let result = render_markdown_line("42. answer", LineKind::NumberedItem, &styles, None);
         assert!(result.contains("42"), "number kept: {result:?}");
         assert!(result.contains("answer"));
         assert!(result.contains('.'), "dot present");
@@ -1813,7 +2051,7 @@ std::error::Error>> {
     #[test]
     fn render_task_unchecked() {
         let styles = test_styles();
-        let result = render_markdown_line("- [ ] todo", LineKind::TaskItem(false), &styles);
+        let result = render_markdown_line("- [ ] todo", LineKind::TaskItem(false), &styles, None);
         assert!(result.contains("[ ]"), "unchecked glyph: {result:?}");
         assert!(!result.contains("- "), "no dash prefix: {result:?}");
         assert!(result.contains("todo"));
@@ -1822,7 +2060,7 @@ std::error::Error>> {
     #[test]
     fn render_task_checked_uses_check_glyph() {
         let styles = test_styles();
-        let result = render_markdown_line("- [x] done", LineKind::TaskItem(true), &styles);
+        let result = render_markdown_line("- [x] done", LineKind::TaskItem(true), &styles, None);
         assert!(result.contains("[✓]"), "checked glyph: {result:?}");
         assert!(!result.contains("[x]"), "raw x removed: {result:?}");
         assert!(result.contains("done"));
@@ -1831,7 +2069,7 @@ std::error::Error>> {
     #[test]
     fn render_hrule_emits_box_drawing() {
         let styles = test_styles();
-        let result = render_markdown_line("---", LineKind::HorizontalRule, &styles);
+        let result = render_markdown_line("---", LineKind::HorizontalRule, &styles, None);
         assert!(result.contains("────"), "box drawing chars: {result:?}");
         assert!(!result.contains("---"), "raw dashes removed: {result:?}");
     }
@@ -1840,7 +2078,7 @@ std::error::Error>> {
     fn render_paragraph_delegates_to_inline() {
         let styles = test_styles();
         let result =
-            render_markdown_line("hello **world**", LineKind::Paragraph, &styles);
+            render_markdown_line("hello **world**", LineKind::Paragraph, &styles, None);
         assert!(!result.contains("**"), "bold markers stripped: {result:?}");
         assert!(result.contains("world"));
         assert!(result.contains("\x1b[1m"), "bold applied via inline: {result:?}");
@@ -1850,7 +2088,7 @@ std::error::Error>> {
     fn render_bullet_runs_inline_on_content() {
         let styles = test_styles();
         let result =
-            render_markdown_line("- see `code`", LineKind::BulletItem, &styles);
+            render_markdown_line("- see `code`", LineKind::BulletItem, &styles, None);
         assert!(result.contains("•"));
         assert!(!result.contains('`'), "backticks stripped: {result:?}");
         assert!(result.contains("see "));
@@ -1861,7 +2099,7 @@ std::error::Error>> {
     fn render_blockquote_runs_inline_on_content() {
         let styles = test_styles();
         let result =
-            render_markdown_line("> visit [here](https://example.com)", LineKind::Blockquote, &styles);
+            render_markdown_line("> visit [here](https://example.com)", LineKind::Blockquote, &styles, None);
         assert!(result.contains("│ "));
         assert!(result.contains("here"));
         assert!(result.contains("https://example.com"));
@@ -1872,7 +2110,7 @@ std::error::Error>> {
     fn heading_can_contain_bold_inline() {
         let styles = test_styles();
         let result =
-            render_markdown_line("## Announce **now**", LineKind::Heading(2), &styles);
+            render_markdown_line("## Announce **now**", LineKind::Heading(2), &styles, None);
         assert!(!result.contains("**"), "bold markers stripped: {result:?}");
         assert!(result.contains("now"));
         assert!(result.contains("Announce"));
