@@ -33,6 +33,27 @@ static NUMBERED_ITEM_RE: LazyLock<Regex> =
 static HRULE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(-{3,}|_{3,}|\*{3,})\s*$").unwrap());
 
+static INLINE_CODE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"`([^`\n]+)`").unwrap());
+static IMAGE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").unwrap());
+static LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
+static BOLD_AST_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\*\*([^*\n]+)\*\*").unwrap());
+static BOLD_US_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"__([^_\n]+)__").unwrap());
+static ITALIC_AST_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?<![*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)").unwrap()
+});
+static ITALIC_US_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?<![_\w])_(?!\s)([^_\n]+?)(?<!\s)_(?!_)").unwrap()
+});
+static STRIKETHROUGH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"~~([^~\n]+)~~").unwrap());
+static CODE_PLACEHOLDER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x00C(\d+)\x00").unwrap());
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
@@ -72,6 +93,97 @@ fn detect_line_kind(line: &str) -> LineKind {
         return LineKind::NumberedItem;
     }
     LineKind::Paragraph
+}
+
+fn regex_replace<F>(text: &str, re: &Regex, mut f: F) -> String
+where
+    F: FnMut(&fancy_regex::Captures) -> String,
+{
+    let mut out = String::new();
+    let mut last_end = 0;
+    for caps_result in re.captures_iter(text) {
+        let Ok(caps) = caps_result else { continue };
+        let Some(whole) = caps.get(0) else { continue };
+        out.push_str(&text[last_end..whole.start()]);
+        out.push_str(&f(&caps));
+        last_end = whole.end();
+    }
+    out.push_str(&text[last_end..]);
+    out
+}
+
+fn wrap_osc8(url: &str, visible: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{visible}\x1b]8;;\x1b\\")
+}
+
+fn style_inline_code(content: &str, styles: &MarkdownStyles) -> String {
+    let styled = content.with(styles.inline_code_fg);
+    match styles.inline_code_bg {
+        Some(bg) => styled.on(bg).to_string(),
+        None => styled.to_string(),
+    }
+}
+
+#[allow(dead_code)]
+fn apply_inline(text: &str, styles: &MarkdownStyles) -> String {
+    let mut code_bank: Vec<String> = Vec::new();
+    let masked = regex_replace(text, &INLINE_CODE_RE, |caps| {
+        let content = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let idx = code_bank.len();
+        code_bank.push(style_inline_code(content, styles));
+        format!("\x00C{idx}\x00")
+    });
+
+    let with_images = regex_replace(&masked, &IMAGE_RE, |caps| {
+        let alt = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let url = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let visible = format!("Image: {alt} → {url}")
+            .with(styles.link_url)
+            .to_string();
+        wrap_osc8(url, &visible)
+    });
+
+    let with_links = regex_replace(&with_images, &LINK_RE, |caps| {
+        let label = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let url = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let styled_label = label.with(styles.link_text).to_string();
+        let styled_url = url.with(styles.link_url).to_string();
+        wrap_osc8(url, &format!("{styled_label} {styled_url}"))
+    });
+
+    let with_bold = regex_replace(&with_links, &BOLD_AST_RE, |caps| {
+        let content = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        content.with(styles.bold).bold().to_string()
+    });
+    let with_bold = regex_replace(&with_bold, &BOLD_US_RE, |caps| {
+        let content = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        content.with(styles.bold).bold().to_string()
+    });
+
+    let with_italic = regex_replace(&with_bold, &ITALIC_AST_RE, |caps| {
+        let content = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        content.with(styles.italic).italic().to_string()
+    });
+    let with_italic = regex_replace(&with_italic, &ITALIC_US_RE, |caps| {
+        let content = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        content.with(styles.italic).italic().to_string()
+    });
+
+    let with_strike = regex_replace(&with_italic, &STRIKETHROUGH_RE, |caps| {
+        let content = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        content.with(styles.strikethrough).crossed_out().to_string()
+    });
+
+    regex_replace(&with_strike, &CODE_PLACEHOLDER_RE, |caps| {
+        let idx: usize = caps
+            .get(1)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        code_bank
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| caps.get(0).unwrap().as_str().to_string())
+    })
 }
 
 pub struct MarkdownRender {
@@ -815,6 +927,150 @@ std::error::Error>> {
         assert_eq!(detect_line_kind("just text"), LineKind::Paragraph);
         assert_eq!(detect_line_kind(""), LineKind::Paragraph);
         assert_eq!(detect_line_kind("   "), LineKind::Paragraph);
+    }
+
+    fn test_styles() -> MarkdownStyles {
+        MarkdownStyles {
+            heading: (Color::Yellow, true),
+            bold: Color::Red,
+            italic: Color::Green,
+            inline_code_fg: Color::Cyan,
+            inline_code_bg: None,
+            blockquote: Color::DarkGrey,
+            list_bullet: Color::Reset,
+            link_text: Color::Blue,
+            link_url: Color::Magenta,
+            strikethrough: Color::DarkGrey,
+            hrule: Color::DarkGrey,
+        }
+    }
+
+    #[test]
+    fn inline_code_strips_backticks() {
+        let styles = test_styles();
+        let result = apply_inline("hello `world` foo", &styles);
+        assert!(!result.contains('`'), "backticks stripped: {result:?}");
+        assert!(result.contains("world"));
+        assert!(result.contains("hello "));
+        assert!(result.contains(" foo"));
+    }
+
+    #[test]
+    fn bold_asterisk_applied() {
+        let styles = test_styles();
+        let result = apply_inline("**loud**", &styles);
+        assert!(!result.contains("**"), "markers stripped: {result:?}");
+        assert!(result.contains("loud"));
+        assert!(result.contains("\x1b[1m"), "bold SGR present: {result:?}");
+    }
+
+    #[test]
+    fn bold_underscore_applied() {
+        let styles = test_styles();
+        let result = apply_inline("__loud__", &styles);
+        assert!(!result.contains("__"), "markers stripped: {result:?}");
+        assert!(result.contains("loud"));
+        assert!(result.contains("\x1b[1m"));
+    }
+
+    #[test]
+    fn italic_asterisk_applied() {
+        let styles = test_styles();
+        let result = apply_inline("*soft*", &styles);
+        assert!(result.contains("soft"));
+        assert!(result.contains("\x1b[3m"), "italic SGR present: {result:?}");
+    }
+
+    #[test]
+    fn italic_underscore_applied() {
+        let styles = test_styles();
+        let result = apply_inline("_soft_", &styles);
+        assert!(result.contains("soft"));
+        assert!(result.contains("\x1b[3m"));
+    }
+
+    #[test]
+    fn strikethrough_applied() {
+        let styles = test_styles();
+        let result = apply_inline("~~gone~~", &styles);
+        assert!(!result.contains("~~"), "markers stripped");
+        assert!(result.contains("gone"));
+        assert!(result.contains("\x1b[9m"), "strikethrough SGR: {result:?}");
+    }
+
+    #[test]
+    fn bold_wraps_inline_code() {
+        let styles = test_styles();
+        let result = apply_inline("**foo `bar` baz**", &styles);
+        assert!(!result.contains('`'));
+        assert!(!result.contains("**"));
+        assert!(result.contains("foo"));
+        assert!(result.contains("bar"));
+        assert!(result.contains("baz"));
+        assert!(result.contains("\x1b[1m"), "bold applied around code: {result:?}");
+    }
+
+    #[test]
+    fn partial_bold_stays_raw() {
+        let styles = test_styles();
+        let result = apply_inline("**unclosed", &styles);
+        assert_eq!(result, "**unclosed");
+    }
+
+    #[test]
+    fn partial_italic_stays_raw() {
+        let styles = test_styles();
+        assert_eq!(apply_inline("*unclosed", &styles), "*unclosed");
+        assert_eq!(apply_inline("_unclosed", &styles), "_unclosed");
+    }
+
+    #[test]
+    fn italic_ignores_word_internal_underscores() {
+        let styles = test_styles();
+        assert_eq!(apply_inline("some_var_name", &styles), "some_var_name");
+    }
+
+    #[test]
+    fn italic_ignores_math_like_spaces() {
+        let styles = test_styles();
+        assert_eq!(apply_inline("a * b * c", &styles), "a * b * c");
+    }
+
+    #[test]
+    fn links_emit_osc8_and_visible_parts() {
+        let styles = test_styles();
+        let result = apply_inline("[label](https://example.com)", &styles);
+        assert!(
+            result.contains("\x1b]8;;https://example.com\x1b\\"),
+            "OSC 8 open present: {result:?}"
+        );
+        assert!(result.contains("\x1b]8;;\x1b\\"), "OSC 8 close present");
+        assert!(result.contains("label"));
+        assert!(result.contains("https://example.com"));
+    }
+
+    #[test]
+    fn images_emit_labeled_link() {
+        let styles = test_styles();
+        let result = apply_inline("![alt text](https://img.example/x.png)", &styles);
+        assert!(!result.contains("!["), "raw image marker removed: {result:?}");
+        assert!(result.contains("Image: alt text"));
+        assert!(result.contains("https://img.example/x.png"));
+        assert!(result.contains("\x1b]8;;https://img.example/x.png\x1b\\"));
+    }
+
+    #[test]
+    fn image_processed_before_link() {
+        let styles = test_styles();
+        let result = apply_inline("![alt](https://example.com)", &styles);
+        assert!(!result.starts_with('!'), "no stray ! left behind: {result:?}");
+        assert!(result.contains("Image:"));
+    }
+
+    #[test]
+    fn plain_text_unchanged() {
+        let styles = test_styles();
+        assert_eq!(apply_inline("just plain text", &styles), "just plain text");
     }
 
     #[test]
