@@ -35,7 +35,7 @@ pub use self::request_context::{RenderMode, RequestContext, should_inject_skill_
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
-use self::session::Session;
+pub use self::session::Session;
 #[allow(unused_imports)]
 pub use self::skill::Skill;
 #[allow(unused_imports)]

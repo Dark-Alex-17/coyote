@@ -1,15 +1,13 @@
 mod completer;
 mod highlighter;
 mod prompt;
+mod replay;
 
 use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
-use crate::client::{
-    Message, MessageRole, call_chat_completions, call_chat_completions_streaming, init_client,
-    oauth,
-};
+use crate::client::{call_chat_completions, call_chat_completions_streaming, init_client, oauth};
 use crate::config::{
     AgentVariables, AppConfig, AssertState, Input, LastMessage, RequestContext, StateFlags,
     macro_execute,
@@ -362,54 +360,16 @@ Type ".help" for additional help.
         }
 
         {
-            let (messages_snapshot, compressed_count) = {
+            let (compressed, active) = {
                 let ctx = self.ctx.read();
-                if let Some(session) = &ctx.session {
-                    let msgs: Vec<Message> = session
-                        .messages()
-                        .iter()
-                        .filter(|m| !m.role.is_system())
-                        .cloned()
-                        .collect();
-                    let compressed = session.compressed_messages().len();
-                    (msgs, compressed)
-                } else {
-                    (vec![], 0)
+                match &ctx.session {
+                    Some(session) => replay::snapshot(session),
+                    None => (Vec::new(), Vec::new()),
                 }
             };
-
-            if !messages_snapshot.is_empty() || compressed_count > 0 {
+            if !compressed.is_empty() || !active.is_empty() {
                 let app = Arc::clone(&self.ctx.read().app.config);
-                if compressed_count > 0 {
-                    println!(
-                        "{}",
-                        dimmed_text(&format!(
-                            "({compressed_count} earlier messages not shown; compressed for context)"
-                        ))
-                    );
-                    println!();
-                }
-
-                for message in &messages_snapshot {
-                    match message.role {
-                        MessageRole::User => {
-                            if let Some(text) = message.content.as_text() {
-                                println!("{}", dimmed_text("You:"));
-                                println!("{text}");
-                                println!();
-                            }
-                        }
-                        MessageRole::Assistant => {
-                            if let Some(text) = message.content.as_text() {
-                                app.print_markdown(text)?;
-                                println!();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                println!("{}", dimmed_text("─── ↑ previous conversation ↑ ───"));
-                println!();
+                replay::render(app.as_ref(), &compressed, &active)?;
             }
         }
 
@@ -859,44 +819,8 @@ pub async fn run_repl_command(
                     }
                 }
                 if let Some(session) = &ctx.session {
-                    let messages_snapshot: Vec<Message> = session
-                        .messages()
-                        .iter()
-                        .filter(|m| !m.role.is_system())
-                        .cloned()
-                        .collect();
-                    let compressed_count = session.compressed_messages().len();
-                    if !messages_snapshot.is_empty() || compressed_count > 0 {
-                        if compressed_count > 0 {
-                            println!(
-                                "{}",
-                                dimmed_text(&format!(
-                                    "({compressed_count} earlier messages not shown — compressed for context)"
-                                ))
-                            );
-                            println!();
-                        }
-                        for message in &messages_snapshot {
-                            match message.role {
-                                MessageRole::User => {
-                                    if let Some(text) = message.content.as_text() {
-                                        println!("{}", dimmed_text("You:"));
-                                        println!("{text}");
-                                        println!();
-                                    }
-                                }
-                                MessageRole::Assistant => {
-                                    if let Some(text) = message.content.as_text() {
-                                        app.print_markdown(text)?;
-                                        println!();
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        println!("{}", dimmed_text("─── ↑ previous conversation ↑ ───"));
-                        println!();
-                    }
+                    let (compressed, active) = replay::snapshot(session);
+                    replay::render(app.as_ref(), &compressed, &active)?;
                 }
             }
             ".install" => {
@@ -953,44 +877,8 @@ pub async fn run_repl_command(
                     ctx.use_agent(app.as_ref(), agent_name, session_name, abort_signal.clone())
                         .await?;
                     if let Some(session) = &ctx.session {
-                        let messages_snapshot: Vec<Message> = session
-                            .messages()
-                            .iter()
-                            .filter(|m| !m.role.is_system())
-                            .cloned()
-                            .collect();
-                        let compressed_count = session.compressed_messages().len();
-                        if !messages_snapshot.is_empty() || compressed_count > 0 {
-                            if compressed_count > 0 {
-                                println!(
-                                    "{}",
-                                    dimmed_text(&format!(
-                                        "({compressed_count} earlier messages not shown — compressed for context)"
-                                    ))
-                                );
-                                println!();
-                            }
-                            for message in &messages_snapshot {
-                                match message.role {
-                                    MessageRole::User => {
-                                        if let Some(text) = message.content.as_text() {
-                                            println!("{}", dimmed_text("You:"));
-                                            println!("{text}");
-                                            println!();
-                                        }
-                                    }
-                                    MessageRole::Assistant => {
-                                        if let Some(text) = message.content.as_text() {
-                                            app.print_markdown(text)?;
-                                            println!();
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            println!("{}", dimmed_text("─── ↑ previous conversation ↑ ───"));
-                            println!();
-                        }
+                        let (compressed, active) = replay::snapshot(session);
+                        replay::render(app.as_ref(), &compressed, &active)?;
                     }
                 }
                 None => {
