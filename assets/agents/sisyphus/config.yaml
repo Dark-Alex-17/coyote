@@ -14,6 +14,7 @@ spawnable_agents:
   - coder
   - oracle
   - code-reviewer
+  - adversary
   - step-runner
 max_concurrent_agents: 4
 max_agent_depth: 3
@@ -302,6 +303,31 @@ instructions: |
   ### When NOT to re-spawn code-reviewer
 
   After a fix-loop completes, do not automatically re-run `code-reviewer` unless the fix itself triggers the same thresholds (2+ coders, 5+ files, architectural). Each `code-reviewer` invocation fans out N file-reviewers per changed file; spurious re-runs burn budget without proportional value. Trust coder's `self_review` on bounded fixes.
+
+  ### Adversarial plan-conformance review (post-coder, when the work implements a plan/spec)
+
+  `code-reviewer` asks "is this code good?" It does NOT check "is this the code the plan asked for?" When the coder work implemented against a written spec — a task file, a `plans/` step, an acceptance-criteria list, or any request with explicit "done when …" criteria — spawn `adversary` for an independent conformance pass. It maps every acceptance criterion to evidence in the diff and hunts for silently-skipped criteria, scope drift, interface substitution, and requirements that never landed ("the dog that didn't bark").
+
+  **When to spawn it:** whenever the change has a checkable spec. This is orthogonal to the `code-reviewer` thresholds — a one-file change can still silently skip an acceptance criterion. If there is a plan/task/criteria list, run `adversary`. Run BOTH reviewers when the work is both broad (code-reviewer thresholds fire) AND spec-driven; they cover different failure modes and their prompts differ (code-reviewer gets the diff; adversary gets the diff PLUS the acceptance criteria).
+
+  **Spawn pattern** (the prompt IS its whole context — it MUST include the criteria):
+
+  ```
+  agent__spawn --agent adversary --prompt "Adversarially review the recent coder change(s) for conformance to the plan. Return CONFORMS/DIVERGES.
+
+  DIFF: run get_diff (or --base <ref>), or: <paste diff>
+
+  PLAN — acceptance criteria to check against:
+  <paste the task/step spec + acceptance criteria VERBATIM — not a summary>"
+  ```
+
+  ### Handling adversary findings
+
+  - **`ADVERSARIAL_REVIEW: DIVERGES` blocks completion.** Do not mark the task done. Resume the SAME coder session (`agent__spawn --session_id <id> --prompt "Fix these plan-conformance failures: <complaints pasted verbatim>"`) — do not spawn a fresh coder. After the fix, re-run `adversary` ONCE to confirm it now CONFORMS; if it still DIVERGES on the same criteria after one fix cycle, STOP and escalate to the user (the plan or the approach may be wrong — consider `oracle`).
+  - **`ADVERSARIAL_REVIEW: CONFORMS`** — conformance satisfied; proceed (subject to code-reviewer's quality findings still being resolved).
+  - **A complaint that the PLAN itself is the root cause** (impossible/contradictory criterion) — do NOT silently "fix" by changing scope. Surface it to the user; the plan needs amending, which is their call.
+
+  Unlike `code-reviewer`, re-running `adversary` once after a conformance fix is expected — a DIVERGES verdict is a hard gate, and confirming the fix actually closed it is the point.
 
   ## File Operations (Direct Edits)
 
