@@ -1822,6 +1822,90 @@ std::error::Error>> {
         assert!(output.contains("code"));
     }
 
+    #[test]
+    fn mixed_content_renders_all_kinds() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let text = "# Heading\n\n\
+                    Some paragraph.\n\n\
+                    - bullet one\n\
+                    - bullet two\n\n\
+                    > a quote\n\n\
+                    | A | B |\n\
+                    |---|---|\n\
+                    | 1 | 2 |\n\n\
+                    Trailing prose.\n";
+        let body = render.render(text);
+        let tail = render.finalize();
+        let output = format!("{body}{tail}");
+
+        assert!(output.contains("Heading"), "heading rendered");
+        assert!(output.contains("Some paragraph."));
+        assert!(output.contains("•"), "bullet glyph rendered");
+        assert!(output.contains("│"), "blockquote pipe rendered");
+        assert!(output.contains("A") && output.contains("1"), "table cells rendered");
+        assert!(
+            output.chars().any(|c| matches!(c, '\u{2500}'..='\u{257F}')),
+            "table borders rendered",
+        );
+        assert!(output.contains("Trailing prose."));
+    }
+
+    #[test]
+    fn table_renders_without_theme() {
+        let options = RenderOptions {
+            theme: None,
+            ..Default::default()
+        };
+        let mut render = MarkdownRender::init(options).unwrap();
+        let header = vec!["A".into()];
+        let alignments = vec![CellAlignment::Left];
+        let output = render.render_table(header, alignments, vec![vec!["1".into()]]);
+        assert!(output.contains("A"));
+        assert!(output.contains("1"));
+        assert!(
+            output.chars().any(|c| matches!(c, '\u{2500}'..='\u{257F}')),
+            "borders present without theme: {output:?}",
+        );
+    }
+
+    #[test]
+    fn table_borders_pick_up_theme_color() {
+        let theme = minimal_root_scope_theme();
+        let styles = MarkdownStyles::from_theme(Some(&theme), true);
+        assert_eq!(styles.table_border, rgb(0x77, 0x77, 0x77));
+
+        let options = RenderOptions {
+            theme: Some(theme),
+            ..Default::default()
+        };
+        let render = MarkdownRender::init(options).unwrap();
+        let header = vec!["A".into()];
+        let alignments = vec![CellAlignment::Left];
+        let output = render.render_table(header, alignments, vec![vec!["1".into()]]);
+        assert!(
+            output.starts_with("\x1b["),
+            "border color SGR at start: {output:?}",
+        );
+    }
+
+    #[test]
+    fn table_tolerates_column_count_mismatch() {
+        let options = RenderOptions::default();
+        let render = MarkdownRender::init(options).unwrap();
+        let header = vec!["A".into(), "B".into(), "C".into()];
+        let alignments = vec![
+            CellAlignment::Left,
+            CellAlignment::Left,
+            CellAlignment::Left,
+        ];
+        let rows = vec![vec!["1".into(), "2".into()]];
+        let output = render.render_table(header, alignments, rows);
+        for cell in ["A", "B", "C", "1", "2"] {
+            assert!(output.contains(cell), "cell {cell:?} present: {output:?}");
+        }
+    }
+
     fn test_styles() -> MarkdownStyles {
         MarkdownStyles {
             heading: (Color::Yellow, true),
