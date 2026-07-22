@@ -1303,6 +1303,72 @@ std::error::Error>> {
     }
 
     #[test]
+    fn heading_can_contain_bold_inline() {
+        let styles = test_styles();
+        let result =
+            render_markdown_line("## Announce **now**", LineKind::Heading(2), &styles);
+        assert!(!result.contains("**"), "bold markers stripped: {result:?}");
+        assert!(result.contains("now"));
+        assert!(result.contains("Announce"));
+        assert!(result.contains("\x1b[1m"), "bold present: {result:?}");
+    }
+
+    #[test]
+    fn streaming_partial_bold_stays_raw() {
+        let options = RenderOptions::default();
+        let render = MarkdownRender::init(options).unwrap();
+        let partial = render.render_line("**bo");
+        assert!(partial.contains("**bo"), "unclosed bold preserved: {partial:?}");
+    }
+
+    #[test]
+    fn streaming_partial_link_stays_raw() {
+        let options = RenderOptions::default();
+        let render = MarkdownRender::init(options).unwrap();
+        let partial = render.render_line("[label](https://exa");
+        assert!(partial.contains("[label]"), "unclosed link preserved: {partial:?}");
+    }
+
+    #[test]
+    fn rich_render_strips_syntax_without_theme() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let output = render.render("# Heading\n\n> quoted\n\n- item\n");
+        assert!(!output.contains("# Heading"), "hash removed: {output:?}");
+        assert!(output.contains("Heading"));
+        assert!(!output.contains("> quoted"), "gt removed");
+        assert!(output.contains("│ "), "pipe prefix present");
+        assert!(!output.contains("- item"), "dash removed");
+        assert!(output.contains("•"), "bullet glyph present");
+        assert!(output.contains("item"));
+    }
+
+    #[test]
+    fn rich_and_raw_paths_diverge() {
+        let raw_opts = RenderOptions {
+            raw_markdown: true,
+            ..Default::default()
+        };
+        let rich_opts = RenderOptions::default();
+        let mut raw_render = MarkdownRender::init(raw_opts).unwrap();
+        let mut rich_render = MarkdownRender::init(rich_opts).unwrap();
+        let text = "# Heading\n\n**bold** text\n";
+        let raw = raw_render.render(text);
+        let rich = rich_render.render(text);
+        assert_eq!(raw, text, "raw path preserves input");
+        assert_ne!(rich, text, "rich path transforms input");
+    }
+
+    #[test]
+    fn code_block_content_still_routes_to_syntect() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let text = "```rust\nfn main() {}\n```\n";
+        let output = render.render(text);
+        assert!(output.contains("fn main()"), "code content preserved: {output:?}");
+    }
+
+    #[test]
     fn markdown_styles_fall_back_to_root_scopes() {
         let theme = minimal_root_scope_theme();
         let styles = MarkdownStyles::from_theme(Some(&theme), true);
