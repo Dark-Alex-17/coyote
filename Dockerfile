@@ -42,6 +42,8 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     printf '#!/bin/sh\nexec uv tool run "$@"\n' > "$HOME/.local/bin/uvx" && \
     chmod +x "$HOME/.local/bin/uvx"
 
+RUN mkdir -p /usr/local/share/npm-global/lib
+
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
       sh -s -- -y --default-toolchain stable --profile minimal && \
     . "$HOME/.cargo/env" && \
