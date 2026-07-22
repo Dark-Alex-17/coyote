@@ -22,6 +22,7 @@ mod update;
 
 pub use self::agent::{
     Agent, AgentVariable, AgentVariables, complete_agent_variables, list_agents,
+    list_agents_with_descriptions,
 };
 #[allow(unused_imports)]
 pub use self::app_config::AppConfig;

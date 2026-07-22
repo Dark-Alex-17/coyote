@@ -22,40 +22,29 @@ static LANG_MAPS: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
     m
 });
 
-static HEADING_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(#{1,6}) +.+").unwrap());
+static HEADING_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(#{1,6}) +.+").unwrap());
 static BLOCKQUOTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*>").unwrap());
 static TASK_ITEM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*[-*+] \[([ xX])\] +.+").unwrap());
-static BULLET_ITEM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*[-*+] +.+").unwrap());
-static NUMBERED_ITEM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*\d+\. +.+").unwrap());
+static BULLET_ITEM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*[-*+] +.+").unwrap());
+static NUMBERED_ITEM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*\d+\. +.+").unwrap());
 static HRULE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(-{3,}|_{3,}|\*{3,})\s*$").unwrap());
 static TABLE_SEPARATOR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*\|(\s*:?-+:?\s*\|)+\s*$").unwrap());
-static TABLE_ROW_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*\|.*\|\s*$").unwrap());
+static TABLE_ROW_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*\|.*\|\s*$").unwrap());
 
-static INLINE_CODE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"`([^`\n]+)`").unwrap());
+static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\n]+)`").unwrap());
 static IMAGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").unwrap());
-static LINK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
-static BOLD_AST_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\*\*([^*\n]+)\*\*").unwrap());
-static BOLD_US_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"__([^_\n]+)__").unwrap());
-static ITALIC_AST_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?<![*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)").unwrap()
-});
-static ITALIC_US_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?<![_\w])_(?!\s)([^_\n]+?)(?<!\s)_(?!_)").unwrap()
-});
-static STRIKETHROUGH_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"~~([^~\n]+)~~").unwrap());
+static LINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
+static BOLD_AST_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*\*([^*\n]+)\*\*").unwrap());
+static BOLD_US_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"__([^_\n]+)__").unwrap());
+static ITALIC_AST_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?<![*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)").unwrap());
+static ITALIC_US_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?<![_\w])_(?!\s)([^_\n]+?)(?<!\s)_(?!_)").unwrap());
+static STRIKETHROUGH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"~~([^~\n]+)~~").unwrap());
 static CODE_PLACEHOLDER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x00C(\d+)\x00").unwrap());
 
@@ -107,10 +96,7 @@ fn detect_line_kind(line: &str) -> LineKind {
 }
 
 fn parse_table_row(line: &str) -> Vec<String> {
-    let inner = line
-        .trim()
-        .trim_start_matches('|')
-        .trim_end_matches('|');
+    let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
     inner.split('|').map(|c| c.trim().to_string()).collect()
 }
 
@@ -230,8 +216,7 @@ fn render_blockquote(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16
 
     let prefix_width = 2;
     let leading_width = indent.chars().count();
-    let effective_width = (wrap_width as usize)
-        .saturating_sub(leading_width + prefix_width);
+    let effective_width = (wrap_width as usize).saturating_sub(leading_width + prefix_width);
     let wrapped = wrap_plain_content(content, effective_width);
     if wrapped.is_empty() {
         return format!("{indent}{prefix}");
@@ -258,8 +243,7 @@ fn render_bullet(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -
 
     let prefix_width = 2;
     let leading_width = indent.chars().count();
-    let effective_width = (wrap_width as usize)
-        .saturating_sub(leading_width + prefix_width);
+    let effective_width = (wrap_width as usize).saturating_sub(leading_width + prefix_width);
     let wrapped = wrap_plain_content(content, effective_width);
     if wrapped.is_empty() {
         return format!("{indent}{bullet} ");
@@ -299,8 +283,7 @@ fn render_numbered(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>)
 
     let prefix_width = number.chars().count() + 2;
     let leading_width = indent.chars().count();
-    let effective_width = (wrap_width as usize)
-        .saturating_sub(leading_width + prefix_width);
+    let effective_width = (wrap_width as usize).saturating_sub(leading_width + prefix_width);
     let wrapped = wrap_plain_content(after, effective_width);
     if wrapped.is_empty() {
         return format!("{indent}{number}{styled_dot} ");
@@ -343,8 +326,7 @@ fn render_task(
 
     let prefix_width = 4;
     let leading_width = indent.chars().count();
-    let effective_width = (wrap_width as usize)
-        .saturating_sub(leading_width + prefix_width);
+    let effective_width = (wrap_width as usize).saturating_sub(leading_width + prefix_width);
     let wrapped = wrap_plain_content(after_brackets, effective_width);
     if wrapped.is_empty() {
         return format!("{indent}{styled_brackets} ");
@@ -706,20 +688,15 @@ impl MarkdownRender {
         }
 
         for row in rows {
-            let styled_row: Vec<String> = row
-                .iter()
-                .map(|c| apply_inline(c, &self.styles))
-                .collect();
+            let styled_row: Vec<String> =
+                row.iter().map(|c| apply_inline(c, &self.styles)).collect();
             table.add_row(styled_row);
         }
 
         colorize_box_chars(&table.to_string(), self.styles.table_border)
     }
 
-    fn check_line(
-        &self,
-        line: &str,
-    ) -> (LineType, LineKind, Option<SyntaxReference>, bool) {
+    fn check_line(&self, line: &str) -> (LineType, LineKind, Option<SyntaxReference>, bool) {
         let mut line_type = self.prev_line_type;
         let mut code_syntax = self.code_syntax.clone();
         let mut is_code = false;
@@ -1034,8 +1011,7 @@ impl MarkdownStyles {
             &["string.other.link", "constant"],
             truecolor,
         );
-        let strikethrough =
-            resolve_scope_style(theme, "markup.deleted", &["invalid"], truecolor);
+        let strikethrough = resolve_scope_style(theme, "markup.deleted", &["invalid"], truecolor);
         let hrule = resolve_scope_style(theme, "comment", &["punctuation"], truecolor);
         let table_border = resolve_scope_style(
             theme,
@@ -1201,26 +1177,18 @@ std::error::Error>> {
 
     fn minimal_root_scope_theme() -> Theme {
         let mut theme = Theme::default();
-        theme.scopes.push(theme_item(
-            "string",
-            syntect_rgb(0xff, 0xdd, 0x00),
-            None,
-        ));
-        theme.scopes.push(theme_item(
-            "comment",
-            syntect_rgb(0x88, 0x88, 0x88),
-            None,
-        ));
-        theme.scopes.push(theme_item(
-            "keyword",
-            syntect_rgb(0xaa, 0x00, 0xff),
-            None,
-        ));
-        theme.scopes.push(theme_item(
-            "constant",
-            syntect_rgb(0x00, 0xcc, 0xff),
-            None,
-        ));
+        theme
+            .scopes
+            .push(theme_item("string", syntect_rgb(0xff, 0xdd, 0x00), None));
+        theme
+            .scopes
+            .push(theme_item("comment", syntect_rgb(0x88, 0x88, 0x88), None));
+        theme
+            .scopes
+            .push(theme_item("keyword", syntect_rgb(0xaa, 0x00, 0xff), None));
+        theme
+            .scopes
+            .push(theme_item("constant", syntect_rgb(0x00, 0xcc, 0xff), None));
         theme.scopes.push(theme_item(
             "entity.name.tag",
             syntect_rgb(0x11, 0x22, 0x33),
@@ -1236,11 +1204,9 @@ std::error::Error>> {
             syntect_rgb(0xde, 0xad, 0xbe),
             Some(FontStyle::BOLD),
         ));
-        theme.scopes.push(theme_item(
-            "invalid",
-            syntect_rgb(0xff, 0x00, 0x00),
-            None,
-        ));
+        theme
+            .scopes
+            .push(theme_item("invalid", syntect_rgb(0xff, 0x00, 0x00), None));
         theme.scopes.push(theme_item(
             "punctuation",
             syntect_rgb(0x77, 0x77, 0x77),
@@ -1269,13 +1235,10 @@ std::error::Error>> {
     #[test]
     fn resolve_scope_style_falls_back_when_primary_missing() {
         let mut theme = Theme::default();
-        theme.scopes.push(theme_item(
-            "comment",
-            syntect_rgb(0x33, 0x44, 0x55),
-            None,
-        ));
-        let resolved =
-            resolve_scope_style(&theme, "markup.italic", &["nope", "comment"], true);
+        theme
+            .scopes
+            .push(theme_item("comment", syntect_rgb(0x33, 0x44, 0x55), None));
+        let resolved = resolve_scope_style(&theme, "markup.italic", &["nope", "comment"], true);
         assert_eq!(resolved.fg, Some(rgb(0x33, 0x44, 0x55)));
     }
 
@@ -1417,10 +1380,7 @@ std::error::Error>> {
 
     #[test]
     fn detect_line_kind_non_table_pipe_line_stays_paragraph() {
-        assert_eq!(
-            detect_line_kind("use `a | b` for or"),
-            LineKind::Paragraph,
-        );
+        assert_eq!(detect_line_kind("use `a | b` for or"), LineKind::Paragraph,);
         assert_eq!(detect_line_kind("| trailing"), LineKind::Paragraph);
         assert_eq!(detect_line_kind("no closer |"), LineKind::Paragraph);
     }
@@ -1492,7 +1452,10 @@ std::error::Error>> {
     fn colorize_box_chars_wraps_border_runs() {
         let input = "┌─┐\nabc\n└─┘";
         let output = colorize_box_chars(input, Color::Red);
-        assert!(output.starts_with("\x1b["), "border run starts with SGR: {output:?}");
+        assert!(
+            output.starts_with("\x1b["),
+            "border run starts with SGR: {output:?}"
+        );
         assert!(output.contains("abc"), "non-border content preserved");
         assert!(output.contains("┌"));
         assert!(output.contains("└"));
@@ -1520,12 +1483,13 @@ std::error::Error>> {
         ];
         let output = render.render_table(header, alignments, rows);
         for expected in ["A", "B", "C", "1", "2", "3", "4", "5", "6"] {
-            assert!(output.contains(expected), "cell {expected:?} in output: {output:?}");
+            assert!(
+                output.contains(expected),
+                "cell {expected:?} in output: {output:?}"
+            );
         }
         assert!(
-            output
-                .chars()
-                .any(|c| matches!(c, '\u{2500}'..='\u{257F}')),
+            output.chars().any(|c| matches!(c, '\u{2500}'..='\u{257F}')),
             "table has box-drawing chars: {output:?}",
         );
     }
@@ -1610,9 +1574,7 @@ std::error::Error>> {
             assert!(output.contains(cell), "cell {cell:?} rendered: {output:?}");
         }
         assert!(
-            output
-                .chars()
-                .any(|c| matches!(c, '\u{2500}'..='\u{257F}')),
+            output.chars().any(|c| matches!(c, '\u{2500}'..='\u{257F}')),
             "output has box-drawing chars: {output:?}",
         );
         assert!(output.contains("after"), "trailing paragraph preserved");
@@ -1684,8 +1646,7 @@ std::error::Error>> {
     fn multiple_tables_in_one_input() {
         let options = RenderOptions::default();
         let mut render = MarkdownRender::init(options).unwrap();
-        let text =
-            "| A |\n|---|\n| 1 |\n\n| B |\n|---|\n| 2 |\n";
+        let text = "| A |\n|---|\n| 1 |\n\n| B |\n|---|\n| 2 |\n";
         let output = render.render(text);
         let tail = render.finalize();
         let combined = format!("{output}{tail}");
@@ -1718,10 +1679,7 @@ std::error::Error>> {
             output.contains("| A | B |"),
             "raw pipes preserved: {output:?}",
         );
-        assert!(
-            render.table_state.is_none(),
-            "no state entered in raw mode",
-        );
+        assert!(render.table_state.is_none(), "no state entered in raw mode",);
     }
 
     #[test]
@@ -1748,7 +1706,10 @@ std::error::Error>> {
         assert!(output.contains('\n'), "wrapped output: {output:?}");
         let lines: Vec<&str> = output.split('\n').collect();
         for cont in &lines[1..] {
-            assert!(cont.starts_with("    "), "4-space indent for `42. `: {cont:?}");
+            assert!(
+                cont.starts_with("    "),
+                "4-space indent for `42. `: {cont:?}"
+            );
         }
     }
 
@@ -1775,7 +1736,10 @@ std::error::Error>> {
         assert!(output.contains('\n'), "wrapped output: {output:?}");
         let lines: Vec<&str> = output.split('\n').collect();
         for cont in &lines[1..] {
-            assert!(cont.starts_with("    "), "4-space indent for `[ ] `: {cont:?}");
+            assert!(
+                cont.starts_with("    "),
+                "4-space indent for `[ ] `: {cont:?}"
+            );
         }
     }
 
@@ -1822,7 +1786,10 @@ std::error::Error>> {
         let line = "- **bold** text with `code` that will wrap onto several lines";
         let output = render_markdown_line(line, LineKind::BulletItem, &styles, Some(22));
         assert!(output.contains('\n'), "wrapped output: {output:?}");
-        assert!(!output.contains("**bold**"), "asterisks stripped: {output:?}");
+        assert!(
+            !output.contains("**bold**"),
+            "asterisks stripped: {output:?}"
+        );
         assert!(!output.contains("`code`"), "backticks stripped: {output:?}");
         assert!(output.contains("bold"));
         assert!(output.contains("code"));
@@ -1849,7 +1816,10 @@ std::error::Error>> {
         assert!(output.contains("Some paragraph."));
         assert!(output.contains("•"), "bullet glyph rendered");
         assert!(output.contains("│"), "blockquote pipe rendered");
-        assert!(output.contains("A") && output.contains("1"), "table cells rendered");
+        assert!(
+            output.contains("A") && output.contains("1"),
+            "table cells rendered"
+        );
         assert!(
             output.chars().any(|c| matches!(c, '\u{2500}'..='\u{257F}')),
             "table borders rendered",
@@ -2023,7 +1993,10 @@ std::error::Error>> {
         assert!(result.contains("foo"));
         assert!(result.contains("bar"));
         assert!(result.contains("baz"));
-        assert!(result.contains("\x1b[1m"), "bold applied around code: {result:?}");
+        assert!(
+            result.contains("\x1b[1m"),
+            "bold applied around code: {result:?}"
+        );
     }
 
     #[test]
@@ -2069,7 +2042,10 @@ std::error::Error>> {
     fn images_emit_labeled_link() {
         let styles = test_styles();
         let result = apply_inline("![alt text](https://img.example/x.png)", &styles);
-        assert!(!result.contains("!["), "raw image marker removed: {result:?}");
+        assert!(
+            !result.contains("!["),
+            "raw image marker removed: {result:?}"
+        );
         assert!(result.contains("Image: alt text"));
         assert!(result.contains("https://img.example/x.png"));
         assert!(result.contains("\x1b]8;;https://img.example/x.png\x1b\\"));
@@ -2079,7 +2055,10 @@ std::error::Error>> {
     fn image_processed_before_link() {
         let styles = test_styles();
         let result = apply_inline("![alt](https://example.com)", &styles);
-        assert!(!result.starts_with('!'), "no stray ! left behind: {result:?}");
+        assert!(
+            !result.starts_with('!'),
+            "no stray ! left behind: {result:?}"
+        );
         assert!(result.contains("Image:"));
     }
 
@@ -2105,7 +2084,10 @@ std::error::Error>> {
             let hashes = "#".repeat(level as usize);
             let line = format!("{hashes} Title");
             let result = render_markdown_line(&line, LineKind::Heading(level), &styles, None);
-            assert!(result.contains(&hashes), "H{level} keeps hashes: {result:?}");
+            assert!(
+                result.contains(&hashes),
+                "H{level} keeps hashes: {result:?}"
+            );
             assert!(result.contains("Title"));
             assert!(result.contains("\x1b[1m"), "H{level} bold: {result:?}");
         }
@@ -2199,18 +2181,19 @@ std::error::Error>> {
     #[test]
     fn render_paragraph_delegates_to_inline() {
         let styles = test_styles();
-        let result =
-            render_markdown_line("hello **world**", LineKind::Paragraph, &styles, None);
+        let result = render_markdown_line("hello **world**", LineKind::Paragraph, &styles, None);
         assert!(!result.contains("**"), "bold markers stripped: {result:?}");
         assert!(result.contains("world"));
-        assert!(result.contains("\x1b[1m"), "bold applied via inline: {result:?}");
+        assert!(
+            result.contains("\x1b[1m"),
+            "bold applied via inline: {result:?}"
+        );
     }
 
     #[test]
     fn render_bullet_runs_inline_on_content() {
         let styles = test_styles();
-        let result =
-            render_markdown_line("- see `code`", LineKind::BulletItem, &styles, None);
+        let result = render_markdown_line("- see `code`", LineKind::BulletItem, &styles, None);
         assert!(result.contains("•"));
         assert!(!result.contains('`'), "backticks stripped: {result:?}");
         assert!(result.contains("see "));
@@ -2220,8 +2203,12 @@ std::error::Error>> {
     #[test]
     fn render_blockquote_runs_inline_on_content() {
         let styles = test_styles();
-        let result =
-            render_markdown_line("> visit [here](https://example.com)", LineKind::Blockquote, &styles, None);
+        let result = render_markdown_line(
+            "> visit [here](https://example.com)",
+            LineKind::Blockquote,
+            &styles,
+            None,
+        );
         assert!(result.contains("│ "));
         assert!(result.contains("here"));
         assert!(result.contains("https://example.com"));
@@ -2244,7 +2231,10 @@ std::error::Error>> {
         let options = RenderOptions::default();
         let render = MarkdownRender::init(options).unwrap();
         let partial = render.render_line("**bo");
-        assert!(partial.contains("**bo"), "unclosed bold preserved: {partial:?}");
+        assert!(
+            partial.contains("**bo"),
+            "unclosed bold preserved: {partial:?}"
+        );
     }
 
     #[test]
@@ -2252,7 +2242,10 @@ std::error::Error>> {
         let options = RenderOptions::default();
         let render = MarkdownRender::init(options).unwrap();
         let partial = render.render_line("[label](https://exa");
-        assert!(partial.contains("[label]"), "unclosed link preserved: {partial:?}");
+        assert!(
+            partial.contains("[label]"),
+            "unclosed link preserved: {partial:?}"
+        );
     }
 
     #[test]
@@ -2291,7 +2284,10 @@ std::error::Error>> {
         let mut render = MarkdownRender::init(options).unwrap();
         let text = "```rust\nfn main() {}\n```\n";
         let output = render.render(text);
-        assert!(output.contains("fn main()"), "code content preserved: {output:?}");
+        assert!(
+            output.contains("fn main()"),
+            "code content preserved: {output:?}"
+        );
     }
 
     #[test]

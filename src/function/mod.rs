@@ -1793,7 +1793,8 @@ mod tests {
         assert!(f.contains("agent__spawn"));
         assert!(f.contains("agent__check"));
         assert!(f.contains("agent__collect"));
-        assert!(f.contains("agent__list"));
+        assert!(f.contains("agent__list_running"));
+        assert!(f.contains("agent__list_available"));
         assert!(f.contains("agent__cancel"));
         assert!(f.contains("agent__reply_escalation"));
     }

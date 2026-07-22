@@ -1,6 +1,8 @@
 use super::{FunctionDeclaration, JsonSchema};
 use crate::client::{Model, ModelType, call_chat_completions};
-use crate::config::{Agent, AppState, Input, RequestContext, Role, RoleLike};
+use crate::config::{
+    Agent, AppState, Input, RequestContext, Role, RoleLike, list_agents_with_descriptions,
+};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor};
 use crate::utils::{AbortSignal, create_abort_signal, wait_abort_signal};
@@ -193,8 +195,18 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}list"),
-            description: "List all currently running subagents and their status.".to_string(),
+            name: format!("{SUPERVISOR_FUNCTION_PREFIX}list_running"),
+            description: "List all subagents YOU have spawned that are still tracked by the supervisor, with their status. Use this to see which of your background agents are still active. To discover which agent types you can spawn in the first place, use `agent__list_available` instead.".to_string(),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
+                properties: Some(IndexMap::new()),
+                ..Default::default()
+            },
+            agent: false,
+        },
+        FunctionDeclaration {
+            name: format!("{SUPERVISOR_FUNCTION_PREFIX}list_available"),
+            description: "List all agent types installed and available to spawn (name + description). Use this to discover what specialists exist before calling `agent__spawn` — especially when you're unsure which agent to delegate to. This is the discovery counterpart to `agent__list_running` (which reports agents you have already spawned).".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::new()),
@@ -384,7 +396,8 @@ pub async fn handle_supervisor_tool(
         "spawn" => handle_spawn(ctx, args).await,
         "check" => handle_check(ctx, args).await,
         "collect" => handle_collect(ctx, args).await,
-        "list" => handle_list(ctx),
+        "list_running" => handle_list_running(ctx),
+        "list_available" => handle_list_available(),
         "cancel" => handle_cancel(ctx, args).await,
         "send_message" => handle_send_message(ctx, args),
         "check_inbox" => handle_check_inbox(ctx),
@@ -920,7 +933,7 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
     }
 }
 
-fn handle_list(ctx: &mut RequestContext) -> Result<Value> {
+fn handle_list_running(ctx: &mut RequestContext) -> Result<Value> {
     let supervisor = ctx
         .supervisor
         .as_ref()
@@ -944,6 +957,26 @@ fn handle_list(ctx: &mut RequestContext) -> Result<Value> {
     Ok(json!({
         "active_count": sup.active_count(),
         "max_concurrent": sup.max_concurrent(),
+        "agents": agents,
+    }))
+}
+
+fn handle_list_available() -> Result<Value> {
+    let entries = list_agents_with_descriptions();
+    let count = entries.len();
+    let agents: Vec<Value> = entries
+        .into_iter()
+        .map(|(name, description)| {
+            if description.is_empty() {
+                json!({ "name": name })
+            } else {
+                json!({ "name": name, "description": description })
+            }
+        })
+        .collect();
+
+    Ok(json!({
+        "count": count,
         "agents": agents,
     }))
 }
@@ -1434,30 +1467,37 @@ mod tests {
     }
 
     #[test]
-    fn handle_list_empty_supervisor() {
+    fn handle_list_running_empty_supervisor() {
         let mut ctx = ctx_with_supervisor(4, 3);
-        let result = handle_list(&mut ctx).unwrap();
+        let result = handle_list_running(&mut ctx).unwrap();
         assert_eq!(result["active_count"], 0);
         assert_eq!(result["max_concurrent"], 4);
         assert!(result["agents"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn handle_list_with_agents() {
+    fn handle_list_running_with_agents() {
         let mut ctx = ctx_with_supervisor(4, 3);
         register_fake_agent(&mut ctx, "a1", "explore");
         register_fake_agent(&mut ctx, "a2", "coder");
-        let result = handle_list(&mut ctx).unwrap();
+        let result = handle_list_running(&mut ctx).unwrap();
         assert_eq!(result["active_count"], 2);
         let agents = result["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 2);
     }
 
     #[test]
-    fn handle_list_no_supervisor_errors() {
+    fn handle_list_running_no_supervisor_errors() {
         let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
-        let result = handle_list(&mut ctx);
+        let result = handle_list_running(&mut ctx);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_list_available_returns_shape() {
+        let result = handle_list_available().unwrap();
+        assert!(result["count"].is_number());
+        assert!(result["agents"].is_array());
     }
 
     #[test]
@@ -1753,11 +1793,28 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_routes_list() {
+    fn dispatch_routes_list_running() {
         let mut ctx = ctx_with_supervisor(4, 3);
-        let result =
-            run_async(handle_supervisor_tool(&mut ctx, "agent__list", &json!({}))).unwrap();
+        let result = run_async(handle_supervisor_tool(
+            &mut ctx,
+            "agent__list_running",
+            &json!({}),
+        ))
+        .unwrap();
         assert!(result["active_count"].is_number());
+    }
+
+    #[test]
+    fn dispatch_routes_list_available() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let result = run_async(handle_supervisor_tool(
+            &mut ctx,
+            "agent__list_available",
+            &json!({}),
+        ))
+        .unwrap();
+        assert!(result["count"].is_number());
+        assert!(result["agents"].is_array());
     }
 
     #[test]

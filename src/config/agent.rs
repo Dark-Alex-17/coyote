@@ -1016,6 +1016,19 @@ pub fn list_agents() -> Vec<String> {
     agents
 }
 
+pub fn list_agents_with_descriptions() -> Vec<(String, String)> {
+    list_agents()
+        .into_iter()
+        .map(|name| {
+            let description = AgentConfig::load(&paths::agent_config_file(&name))
+                .ok()
+                .map(|c| c.description)
+                .unwrap_or_default();
+            (name, description)
+        })
+        .collect()
+}
+
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
     let config_path = paths::agent_config_file(agent_name);
     if !config_path.exists() {
