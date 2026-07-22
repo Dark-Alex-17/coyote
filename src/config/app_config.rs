@@ -86,6 +86,7 @@ pub struct AppConfig {
     pub document_loaders: HashMap<String, String>,
 
     pub highlight: bool,
+    pub raw_markdown: bool,
     pub theme: Option<String>,
     pub left_prompt: Option<String>,
     pub right_prompt: Option<String>,
@@ -165,6 +166,7 @@ impl Default for AppConfig {
             document_loaders: Default::default(),
 
             highlight: true,
+            raw_markdown: false,
             theme: None,
             left_prompt: None,
             right_prompt: None,
@@ -246,6 +248,7 @@ impl AppConfig {
             document_loaders: config.document_loaders,
 
             highlight: config.highlight,
+            raw_markdown: config.raw_markdown,
             theme: config.theme,
             left_prompt: config.left_prompt,
             right_prompt: config.right_prompt,
@@ -405,7 +408,13 @@ impl AppConfig {
             env::var("COLORTERM").as_ref().map(|v| v.as_str()),
             Ok("truecolor")
         );
-        Ok(RenderOptions::new(theme, wrap, self.wrap_code, truecolor))
+        Ok(RenderOptions::new(
+            theme,
+            wrap,
+            self.wrap_code,
+            self.raw_markdown,
+            truecolor,
+        ))
     }
 
     pub fn print_markdown(&self, text: &str) -> Result<()> {
@@ -588,6 +597,9 @@ impl AppConfig {
         }
         if *NO_COLOR {
             self.highlight = false;
+        }
+        if let Some(Some(v)) = super::read_env_bool(&get_env_name("raw_markdown")) {
+            self.raw_markdown = v;
         }
         if self.highlight && self.theme.is_none() {
             if let Some(v) = super::read_env_value::<String>(&get_env_name("theme")) {

@@ -367,6 +367,9 @@ async fn run(
     if cli.no_stream {
         update_app_config(&mut ctx, |app| app.stream = false);
     }
+    if cli.raw_markdown {
+        update_app_config(&mut ctx, |app| app.raw_markdown = true);
+    }
     if cli.no_memory {
         update_app_config(&mut ctx, |app| app.memory = Some(false));
     }

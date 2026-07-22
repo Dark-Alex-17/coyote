@@ -1598,6 +1598,7 @@ impl RequestContext {
             ("wrap", wrap),
             ("wrap_code", app.wrap_code.to_string()),
             ("highlight", app.highlight.to_string()),
+            ("raw_markdown", app.raw_markdown.to_string()),
             ("theme", super::format_option_value(&app.theme)),
             ("config_file", display_path(&paths::config_file())),
             ("env_file", display_path(&paths::env_file())),
@@ -2724,6 +2725,10 @@ impl RequestContext {
                 let value = value.parse().with_context(|| "Invalid value")?;
                 self.update_app_config(|app| app.highlight = value);
             }
+            "raw_markdown" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                self.update_app_config(|app| app.raw_markdown = value);
+            }
             "auto_continue" => {
                 let value: bool = value.parse().with_context(|| "Invalid value")?;
                 if value && !self.app.config.function_calling_support {
@@ -2928,6 +2933,7 @@ impl RequestContext {
                         "stream",
                         "save",
                         "highlight",
+                        "raw_markdown",
                     ];
                     if !self.current_model().reasoning_levels().is_empty() {
                         values.push("reasoning_effort");
@@ -3187,6 +3193,7 @@ impl RequestContext {
                     .map(|v| v.id())
                     .collect(),
                 "highlight" => super::complete_bool(app.highlight),
+                "raw_markdown" => super::complete_bool(app.raw_markdown),
                 "auto_continue" => {
                     let config = self.auto_continue_config();
                     super::complete_bool(config.enabled)

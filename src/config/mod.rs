@@ -262,6 +262,7 @@ pub struct Config {
     pub document_loaders: HashMap<String, String>,
 
     pub highlight: bool,
+    pub raw_markdown: bool,
     pub theme: Option<String>,
     pub left_prompt: Option<String>,
     pub right_prompt: Option<String>,
@@ -339,6 +340,7 @@ impl Default for Config {
             document_loaders: Default::default(),
 
             highlight: true,
+            raw_markdown: false,
             theme: None,
             left_prompt: None,
             right_prompt: None,

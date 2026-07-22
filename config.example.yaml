@@ -20,6 +20,7 @@ agent_session: null              # Set a session to use when starting an agent (
 
 # ---- Appearance ----
 highlight: true                  # Controls syntax highlighting
+raw_markdown: false              # When true, render markdown as raw text with syntax highlighting only. When false (default), transforms markdown syntax (headings, bold, lists, etc.) into styled terminal output
 light_theme: false               # Activates a light color theme when true. env: COYOTE_LIGHT_THEME
 
 # ---- Miscellaneous ----

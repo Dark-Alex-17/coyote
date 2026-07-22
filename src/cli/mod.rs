@@ -68,6 +68,9 @@ pub struct Cli {
     /// Turn off stream mode
     #[arg(short = 'S', long)]
     pub no_stream: bool,
+    /// Render markdown as raw text with syntax highlighting only (skip the rich markdown renderer)
+    #[arg(long)]
+    pub raw_markdown: bool,
     /// Display the message without sending it
     #[arg(long)]
     pub dry_run: bool,

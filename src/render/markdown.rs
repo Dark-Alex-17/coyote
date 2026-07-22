@@ -202,6 +202,8 @@ pub struct RenderOptions {
     pub theme: Option<Theme>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
+    #[allow(dead_code)]
+    pub raw_markdown: bool,
     pub truecolor: bool,
 }
 
@@ -210,12 +212,14 @@ impl RenderOptions {
         theme: Option<Theme>,
         wrap: Option<String>,
         wrap_code: bool,
+        raw_markdown: bool,
         truecolor: bool,
     ) -> Self {
         Self {
             theme,
             wrap,
             wrap_code,
+            raw_markdown,
             truecolor,
         }
     }
