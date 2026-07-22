@@ -47,6 +47,7 @@ variables:
 mcp_servers:
   - ddg-search
 global_tools:
+  - ast_grep.sh
   - fs_read.sh
   - fs_grep.sh
   - fs_glob.sh

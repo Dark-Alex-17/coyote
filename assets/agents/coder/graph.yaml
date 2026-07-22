@@ -2,9 +2,9 @@ name: coder
 description: |
   Implementation agent. Plans, implements, and runs build + tests in a
   bounded fix-loop until verified. Designed to be delegated to by sisyphus.
-version: "1.0"
-
+version: '1.0'
 global_tools:
+  - ast_grep.sh
   - fs_cat.sh
   - fs_ls.sh
   - fs_write.sh
@@ -25,7 +25,7 @@ variables:
       Absolute path to the project directory. Defaults to "." which is the
       directory you invoked `coyote` from. Override at runtime with
       `coyote -a coder --agent-variable project_dir /abs/path "..."`.
-    default: "."
+    default: '.'
 
 settings:
   max_loop_iterations: 20
@@ -34,14 +34,14 @@ settings:
   timeout: 1800
 
 initial_state:
-  project_dir: ""
+  project_dir: ''
   fix_attempts: 0
   max_fix_attempts: 3
-  fix_instructions: ""
-  build_output: ""
-  tests_output: ""
-  last_node_output: ""
-  plan_summary: ""
+  fix_instructions: ''
+  build_output: ''
+  tests_output: ''
+  last_node_output: ''
+  plan_summary: ''
   files_to_modify: []
   files_to_create: []
   risks: []
@@ -49,7 +49,7 @@ initial_state:
   review_attempts: 0
   max_review_attempts: 1
   review_clean: true
-  review_notes: ""
+  review_notes: ''
 
 start: resolve_paths
 
@@ -88,7 +88,7 @@ nodes:
       etc. Empty list is fine.
 
       Project directory: {{project_dir}}
-    prompt: "{{initial_prompt}}"
+    prompt: '{{initial_prompt}}'
     tools: []
     output_schema:
       type: object
@@ -98,20 +98,27 @@ nodes:
           description: 1-3 sentences summarizing what will be done
         files_to_modify:
           type: array
-          items: {type: string}
+          items: { type: string }
         files_to_create:
           type: array
-          items: {type: string}
+          items: { type: string }
         complexity_score:
           type: integer
           minimum: 1
           maximum: 10
         risks:
           type: array
-          items: {type: string}
-      required: [plan_summary, files_to_modify, files_to_create, complexity_score, risks]
+          items: { type: string }
+      required:
+        [
+          plan_summary,
+          files_to_modify,
+          files_to_create,
+          complexity_score,
+          risks,
+        ]
     state_updates:
-      last_node_output: "{{output}}"
+      last_node_output: '{{output}}'
     fallback: end_failure
     next: route_complexity
 
@@ -144,11 +151,11 @@ nodes:
 
       Approve this plan?
     options:
-      - "yes"
-      - "no"
+      - 'yes'
+      - 'no'
     routes:
-      "yes": implement
-      "no": end_rejected
+      'yes': implement
+      'no': end_rejected
     on_other: end_rejected
 
   implement:
@@ -243,7 +250,7 @@ nodes:
       - execute_command
     max_iterations: 30
     state_updates:
-      last_node_output: "{{output}}"
+      last_node_output: '{{output}}'
     fallback: end_failure
     next: verify_build
 
@@ -326,7 +333,7 @@ nodes:
           description: Concrete issues found, one per line as file:line - description. Empty when review_clean is true.
       required: [review_clean, review_notes]
     state_updates:
-      last_node_output: "{{output}}"
+      last_node_output: '{{output}}'
     fallback: end_success
     next: route_review_result
 

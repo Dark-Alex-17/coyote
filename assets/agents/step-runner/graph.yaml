@@ -5,9 +5,9 @@ description: |
   implement (coder) -> verify -> edge-case sweep -> optional independent
   review -> evidence-backed handoff -> user approval gate. Designed to be
   delegated to by sisyphus.
-version: "1.0"
-
+version: '1.0'
 global_tools:
+  - ast_grep.sh
   - fs_cat.sh
   - fs_ls.sh
   - fs_write.sh
@@ -28,18 +28,18 @@ variables:
       coyote was invoked from). The coder sub-agent resolves its own
       project_dir the same way, so invoke step-runner FROM the project root
       unless you override this for both.
-    default: "."
+    default: '.'
   - name: plans_dir
     description: |
       Path to the plan repo. Relative paths resolve against project_dir.
       Expected layout: <plans_dir>/steps/NN-<slug>.md,
       <plans_dir>/handoffs/, <plans_dir>/NOTES.md.
-    default: "plans"
+    default: 'plans'
   - name: step
     description: |
       Which step to execute: a step number, or "next" to pick the first
       in-progress (resume) or pending step plan.
-    default: "next"
+    default: 'next'
 
 settings:
   max_loop_iterations: 20
@@ -48,45 +48,45 @@ settings:
   timeout: 7200
 
 initial_state:
-  project_dir: ""
-  plans_dir: ""
+  project_dir: ''
+  plans_dir: ''
   step_number: 0
-  step_slug: ""
-  step_title: ""
-  step_plan_path: ""
-  step_plan: ""
-  prev_handoff_path: "(none)"
-  prev_handoff: "(none - this is the first step)"
-  notes_path: ""
-  notes: "(none)"
-  handoff_path: ""
-  blocking_reason: ""
-  plan_summary: ""
-  implementation_brief: ""
-  staleness_report: ""
+  step_slug: ''
+  step_title: ''
+  step_plan_path: ''
+  step_plan: ''
+  prev_handoff_path: '(none)'
+  prev_handoff: '(none - this is the first step)'
+  notes_path: ''
+  notes: '(none)'
+  handoff_path: ''
+  blocking_reason: ''
+  plan_summary: ''
+  implementation_brief: ''
+  staleness_report: ''
   has_major_deviation: false
-  deviation_summary: ""
-  user_feedback: ""
-  fix_instructions: ""
+  deviation_summary: ''
+  user_feedback: ''
+  fix_instructions: ''
   fix_attempts: 0
   max_fix_attempts: 2
-  coder_result: ""
-  format_output: ""
+  coder_result: ''
+  format_output: ''
   lint_ok: true
-  lint_output: ""
+  lint_output: ''
   build_ok: true
-  build_output: ""
+  build_output: ''
   tests_ok: true
-  tests_output: ""
-  edge_case_report: ""
-  downstream_updates: ""
+  tests_output: ''
+  edge_case_report: ''
+  downstream_updates: ''
   needs_independent_review: false
-  review_report: ""
+  review_report: ''
   review_attempts: 0
   max_review_attempts: 1
   handoff_attempts: 0
-  handoff_fix: ""
-  step_summary: ""
+  handoff_fix: ''
+  step_summary: ''
 
 start: resolve_step
 
@@ -114,11 +114,11 @@ nodes:
 
       Proceed anyway?
     options:
-      - "yes"
-      - "no"
+      - 'yes'
+      - 'no'
     routes:
-      "yes": orient
-      "no": end_blocked
+      'yes': orient
+      'no': end_blocked
     on_other: end_blocked
 
   orient:
@@ -183,7 +183,14 @@ nodes:
         deviation_summary:
           type: string
           description: Major deviations only, with the plan claim vs current reality. Empty when none
-      required: [plan_summary, implementation_brief, staleness_report, has_major_deviation, deviation_summary]
+      required:
+        [
+          plan_summary,
+          implementation_brief,
+          staleness_report,
+          has_major_deviation,
+          deviation_summary,
+        ]
     fallback: end_failure
     next: route_staleness
 
@@ -211,14 +218,14 @@ nodes:
       Proceed with the corrected brief? (Answer with anything else to give
       your own guidance to the implementer.)
     options:
-      - "proceed"
-      - "abort"
+      - 'proceed'
+      - 'abort'
     routes:
-      "proceed": implement
-      "abort": end_rejected
+      'proceed': implement
+      'abort': end_rejected
     on_other: implement
     state_updates:
-      user_feedback: "{{choice}}"
+      user_feedback: '{{choice}}'
 
   implement:
     id: implement
@@ -262,7 +269,7 @@ nodes:
       {{fix_instructions}}
     timeout: 3600
     state_updates:
-      coder_result: "{{output}}"
+      coder_result: '{{output}}'
     next: route_coder_result
 
   route_coder_result:
@@ -399,7 +406,7 @@ nodes:
       Preserve severity tags in your findings.
     timeout: 1200
     state_updates:
-      review_report: "{{output}}"
+      review_report: '{{output}}'
     next: route_review
 
   route_review:
@@ -517,23 +524,23 @@ nodes:
       Approve this step? (Answer with anything else to send revision
       instructions straight to the implementer.)
     options:
-      - "approve"
-      - "revise"
+      - 'approve'
+      - 'revise'
     routes:
-      "approve": end_success
-      "revise": get_revision
+      'approve': end_success
+      'revise': get_revision
     on_other: revise_from_choice
     state_updates:
-      user_feedback: "{{choice}}"
+      user_feedback: '{{choice}}'
 
   get_revision:
     id: get_revision
     type: input
     description: Collect revision instructions, then loop back through implement -> verify -> handoff.
-    question: "What should change? Your comments go to the implementer verbatim."
-    validation: "len(input) > 0"
+    question: 'What should change? Your comments go to the implementer verbatim.'
+    validation: 'len(input) > 0'
     state_updates:
-      fix_instructions: "{{input}}"
+      fix_instructions: '{{input}}'
     next: implement
 
   revise_from_choice:
