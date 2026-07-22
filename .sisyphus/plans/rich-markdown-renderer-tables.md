@@ -576,7 +576,7 @@ Append-only. One entry per commit or session.
 - Updated all 17 existing test call sites of `render_markdown_line` (via ast-grep) to pass `None` — Phase 1 behavior preserved end-to-end.
 - 8 new tests: bullet 2-space indent, numbered 4-space (`42. `) and 5-space (`100. `) indent, task 4-space indent, blockquote pipe-on-every-line, nested-bullet leading indent, `None` single-line short-circuit, inline markdown intact after wrap.
 
-### 2026-07-22 — Phase 2.7 complete (commit `336b374`)
+### 2026-07-22 — Phase 2.7 complete (commit `e82e5ab`)
 - 4 integration/edge-case tests: mixed-content document (heading + paragraph + list + blockquote + table + trailing prose), table renders without theme, table borders pick up custom theme color, column-count mismatch tolerated by comfy-table.
 - Full test suite: 1246 pass, 0 fail. `cargo check` clean.
 - Manual REPL verification deferred (requires interactive terminal); test coverage validates rendering pipeline end-to-end.
