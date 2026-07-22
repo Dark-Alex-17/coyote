@@ -421,7 +421,13 @@ impl AppConfig {
         if *IS_STDOUT_TERMINAL {
             let render_options = self.render_options()?;
             let mut markdown_render = MarkdownRender::init(render_options)?;
-            println!("{}", markdown_render.render(text));
+            let body = markdown_render.render(text);
+            let tail = markdown_render.finalize();
+            if tail.is_empty() {
+                println!("{body}");
+            } else {
+                println!("{body}\n{tail}");
+            }
         } else {
             println!("{text}");
         }

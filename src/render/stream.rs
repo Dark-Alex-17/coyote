@@ -154,6 +154,11 @@ async fn markdown_stream_inner(
                     writer.flush()?;
                 }
                 SseEvent::Done => {
+                    let tail = render.finalize();
+                    if !tail.is_empty() {
+                        queue!(writer, style::Print("\n"), style::Print(&tail))?;
+                        writer.flush()?;
+                    }
                     break 'outer;
                 }
             }

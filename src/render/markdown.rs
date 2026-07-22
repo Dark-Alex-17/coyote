@@ -106,7 +106,6 @@ fn detect_line_kind(line: &str) -> LineKind {
     LineKind::Paragraph
 }
 
-#[allow(dead_code)]
 fn parse_table_row(line: &str) -> Vec<String> {
     let inner = line
         .trim()
@@ -115,7 +114,6 @@ fn parse_table_row(line: &str) -> Vec<String> {
     inner.split('|').map(|c| c.trim().to_string()).collect()
 }
 
-#[allow(dead_code)]
 fn parse_alignments(separator_row: &str) -> Vec<CellAlignment> {
     parse_table_row(separator_row)
         .iter()
@@ -242,7 +240,6 @@ fn render_hrule(styles: &MarkdownStyles) -> String {
     "────────".with(styles.hrule).to_string()
 }
 
-#[allow(dead_code)]
 fn colorize_box_chars(text: &str, color: Color) -> String {
     let sample = "X".with(color).to_string();
     let paint_idx = match sample.find('X') {
@@ -335,7 +332,6 @@ fn apply_inline(text: &str, styles: &MarkdownStyles) -> String {
     })
 }
 
-#[allow(dead_code)]
 enum TableState {
     PendingHeader(String),
     Active {
@@ -343,6 +339,12 @@ enum TableState {
         alignments: Vec<CellAlignment>,
         rows: Vec<Vec<String>>,
     },
+}
+
+enum TableAction {
+    Consumed(String),
+    FlushAndContinue(String),
+    Passthrough,
 }
 
 pub struct MarkdownRender {
@@ -354,7 +356,6 @@ pub struct MarkdownRender {
     prev_line_type: LineType,
     wrap_width: Option<u16>,
     styles: MarkdownStyles,
-    #[allow(dead_code)]
     table_state: Option<TableState>,
 }
 
@@ -419,6 +420,26 @@ impl MarkdownRender {
 
     fn render_line_mut(&mut self, line: &str) -> String {
         let (line_type, line_kind, code_syntax, is_code) = self.check_line(line);
+
+        let table_prefix = if self.options.raw_markdown {
+            None
+        } else {
+            let effective_kind = if is_code {
+                LineKind::Paragraph
+            } else {
+                line_kind
+            };
+            match self.handle_table_state(line, effective_kind) {
+                TableAction::Consumed(s) => {
+                    self.prev_line_type = line_type;
+                    self.code_syntax = code_syntax;
+                    return s;
+                }
+                TableAction::FlushAndContinue(s) => Some(s),
+                TableAction::Passthrough => None,
+            }
+        };
+
         let output = if is_code {
             self.highlight_code_line(line, &code_syntax)
         } else if self.options.raw_markdown {
@@ -428,7 +449,84 @@ impl MarkdownRender {
         };
         self.prev_line_type = line_type;
         self.code_syntax = code_syntax;
-        output
+
+        match table_prefix {
+            Some(prefix) => format!("{prefix}\n{output}"),
+            None => output,
+        }
+    }
+
+    fn render_as_paragraph(&self, line: &str) -> String {
+        self.render_rich_markdown_line(line, LineKind::Paragraph)
+    }
+
+    fn handle_table_state(&mut self, line: &str, kind: LineKind) -> TableAction {
+        match (self.table_state.take(), kind) {
+            (None, LineKind::TableRow) => {
+                self.table_state = Some(TableState::PendingHeader(line.to_string()));
+                TableAction::Consumed(String::new())
+            }
+            (None, LineKind::TableSeparator) => TableAction::Passthrough,
+            (None, _) => TableAction::Passthrough,
+            (Some(TableState::PendingHeader(header_line)), LineKind::TableSeparator) => {
+                let header = parse_table_row(&header_line);
+                let alignments = parse_alignments(line);
+                self.table_state = Some(TableState::Active {
+                    header,
+                    alignments,
+                    rows: Vec::new(),
+                });
+                TableAction::Consumed(String::new())
+            }
+            (Some(TableState::PendingHeader(header_line)), LineKind::TableRow) => {
+                let a = self.render_as_paragraph(&header_line);
+                let b = self.render_as_paragraph(line);
+                TableAction::Consumed(format!("{a}\n{b}"))
+            }
+            (Some(TableState::PendingHeader(header_line)), _) => {
+                let flushed = self.render_as_paragraph(&header_line);
+                TableAction::FlushAndContinue(flushed)
+            }
+            (
+                Some(TableState::Active {
+                    header,
+                    alignments,
+                    mut rows,
+                }),
+                LineKind::TableRow,
+            ) => {
+                rows.push(parse_table_row(line));
+                self.table_state = Some(TableState::Active {
+                    header,
+                    alignments,
+                    rows,
+                });
+                TableAction::Consumed(String::new())
+            }
+            (
+                Some(TableState::Active {
+                    header,
+                    alignments,
+                    rows,
+                }),
+                _,
+            ) => {
+                let rendered = self.render_table(header, alignments, rows);
+                TableAction::FlushAndContinue(rendered)
+            }
+        }
+    }
+
+    pub fn finalize(&mut self) -> String {
+        match self.table_state.take() {
+            None => String::new(),
+            Some(TableState::PendingHeader(line)) => self.render_as_paragraph(&line),
+            Some(TableState::Active {
+                header,
+                alignments,
+                rows,
+            }) => self.render_table(header, alignments, rows),
+        }
     }
 
     fn render_rich_markdown_line(&self, line: &str, kind: LineKind) -> String {
@@ -436,7 +534,6 @@ impl MarkdownRender {
         self.wrap_line(styled, false)
     }
 
-    #[allow(dead_code)]
     fn render_table(
         &self,
         header: Vec<String>,
@@ -749,7 +846,6 @@ pub struct MarkdownStyles {
     link_url: Color,
     strikethrough: Color,
     hrule: Color,
-    #[allow(dead_code)]
     table_border: Color,
 }
 
@@ -1361,6 +1457,130 @@ std::error::Error>> {
         assert!(
             output.starts_with("\x1b["),
             "output starts with border color SGR: {output:?}",
+        );
+    }
+
+    #[test]
+    fn state_machine_renders_full_table_and_flushes_on_paragraph() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let text = "| A | B |\n|---|---|\n| 1 | 2 |\n\nafter\n";
+        let output = render.render(text);
+        for cell in ["A", "B", "1", "2"] {
+            assert!(output.contains(cell), "cell {cell:?} rendered: {output:?}");
+        }
+        assert!(
+            output
+                .chars()
+                .any(|c| matches!(c, '\u{2500}'..='\u{257F}')),
+            "output has box-drawing chars: {output:?}",
+        );
+        assert!(output.contains("after"), "trailing paragraph preserved");
+    }
+
+    #[test]
+    fn state_machine_defers_output_until_flush() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let header = render.render_line_mut("| A | B |");
+        assert!(header.is_empty(), "header row silently buffered");
+        let sep = render.render_line_mut("|---|---|");
+        assert!(sep.is_empty(), "separator silently buffered");
+        let data = render.render_line_mut("| 1 | 2 |");
+        assert!(data.is_empty(), "data row silently buffered");
+    }
+
+    #[test]
+    fn finalize_emits_pending_active_table() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        render.render_line_mut("| A | B |");
+        render.render_line_mut("|---|---|");
+        render.render_line_mut("| 1 | 2 |");
+        let tail = render.finalize();
+        assert!(tail.contains("A"));
+        assert!(tail.contains("1"));
+        assert!(tail.contains("2"));
+        assert!(tail.chars().any(|c| matches!(c, '\u{2500}'..='\u{257F}')));
+    }
+
+    #[test]
+    fn finalize_flushes_pending_header_as_paragraph() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        render.render_line_mut("| A | B |");
+        let tail = render.finalize();
+        assert!(tail.contains("A"));
+        assert!(tail.contains("B"));
+        assert!(tail.contains("|"), "raw pipes preserved: {tail:?}");
+    }
+
+    #[test]
+    fn finalize_is_empty_when_no_pending_table() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        render.render_line_mut("plain text");
+        assert!(render.finalize().is_empty());
+    }
+
+    #[test]
+    fn pipe_row_without_separator_flushes_as_paragraphs() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let text = "| A | B |\n| C | D |\nafter\n";
+        let output = render.render(text);
+        assert!(
+            output.contains("| A | B |"),
+            "raw pipes preserved for first: {output:?}",
+        );
+        assert!(
+            output.contains("| C | D |"),
+            "raw pipes preserved for second: {output:?}",
+        );
+        assert!(output.contains("after"));
+    }
+
+    #[test]
+    fn multiple_tables_in_one_input() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let text =
+            "| A |\n|---|\n| 1 |\n\n| B |\n|---|\n| 2 |\n";
+        let output = render.render(text);
+        let tail = render.finalize();
+        let combined = format!("{output}{tail}");
+        for cell in ["A", "B", "1", "2"] {
+            assert!(combined.contains(cell), "cell {cell:?}: {combined:?}");
+        }
+    }
+
+    #[test]
+    fn render_line_immutable_does_not_mutate_table_state() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let _ = render.render_line("| foo | ba");
+        assert!(
+            render.table_state.is_none(),
+            "render_line is immutable; state stays clean",
+        );
+    }
+
+    #[test]
+    fn raw_markdown_mode_bypasses_table_rendering() {
+        let options = RenderOptions {
+            raw_markdown: true,
+            ..Default::default()
+        };
+        let mut render = MarkdownRender::init(options).unwrap();
+        let text = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let output = render.render(text);
+        assert!(
+            output.contains("| A | B |"),
+            "raw pipes preserved: {output:?}",
+        );
+        assert!(
+            render.table_state.is_none(),
+            "no state entered in raw mode",
         );
     }
 

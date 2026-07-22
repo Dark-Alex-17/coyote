@@ -368,14 +368,24 @@ impl Session {
             for message in &self.messages {
                 match message.role {
                     MessageRole::System => {
-                        lines.push(
-                            render
-                                .render(&message.content.render_input(resolve_url_fn, agent_info)),
-                        );
+                        let body = render
+                            .render(&message.content.render_input(resolve_url_fn, agent_info));
+                        let tail = render.finalize();
+                        if tail.is_empty() {
+                            lines.push(body);
+                        } else {
+                            lines.push(format!("{body}\n{tail}"));
+                        }
                     }
                     MessageRole::Assistant => {
                         if let MessageContent::Text(text) = &message.content {
-                            lines.push(render.render(text));
+                            let body = render.render(text);
+                            let tail = render.finalize();
+                            if tail.is_empty() {
+                                lines.push(body);
+                            } else {
+                                lines.push(format!("{body}\n{tail}"));
+                            }
                         }
                         lines.push("".into());
                     }
