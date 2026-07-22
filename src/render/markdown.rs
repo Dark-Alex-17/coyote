@@ -54,7 +54,6 @@ static STRIKETHROUGH_RE: LazyLock<Regex> =
 static CODE_PLACEHOLDER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x00C(\d+)\x00").unwrap());
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
     Heading(u8),
@@ -66,7 +65,6 @@ pub enum LineKind {
     Paragraph,
 }
 
-#[allow(dead_code)]
 fn detect_line_kind(line: &str) -> LineKind {
     if HRULE_RE.is_match(line).unwrap_or(false) {
         return LineKind::HorizontalRule;
@@ -124,7 +122,6 @@ fn style_inline_code(content: &str, styles: &MarkdownStyles) -> String {
     }
 }
 
-#[allow(dead_code)]
 fn render_markdown_line(line: &str, kind: LineKind, styles: &MarkdownStyles) -> String {
     match kind {
         LineKind::Heading(level) => render_heading(line, level, styles),
@@ -205,7 +202,6 @@ fn render_hrule(styles: &MarkdownStyles) -> String {
     "────────".with(styles.hrule).to_string()
 }
 
-#[allow(dead_code)]
 fn apply_inline(text: &str, styles: &MarkdownStyles) -> String {
     let mut code_bank: Vec<String> = Vec::new();
     let masked = regex_replace(text, &INLINE_CODE_RE, |caps| {
@@ -275,7 +271,6 @@ pub struct MarkdownRender {
     code_syntax: Option<SyntaxReference>,
     prev_line_type: LineType,
     wrap_width: Option<u16>,
-    #[allow(dead_code)]
     styles: MarkdownStyles,
 }
 
@@ -327,24 +322,33 @@ impl MarkdownRender {
     }
 
     pub fn render_line(&self, line: &str) -> String {
-        let (_, _, code_syntax, is_code) = self.check_line(line);
+        let (_, line_kind, code_syntax, is_code) = self.check_line(line);
         if is_code {
             self.highlight_code_line(line, &code_syntax)
-        } else {
+        } else if self.options.raw_markdown {
             self.highlight_line(line, &self.md_syntax, false)
+        } else {
+            self.render_rich_markdown_line(line, line_kind)
         }
     }
 
     fn render_line_mut(&mut self, line: &str) -> String {
-        let (line_type, _, code_syntax, is_code) = self.check_line(line);
+        let (line_type, line_kind, code_syntax, is_code) = self.check_line(line);
         let output = if is_code {
             self.highlight_code_line(line, &code_syntax)
-        } else {
+        } else if self.options.raw_markdown {
             self.highlight_line(line, &self.md_syntax, false)
+        } else {
+            self.render_rich_markdown_line(line, line_kind)
         };
         self.prev_line_type = line_type;
         self.code_syntax = code_syntax;
         output
+    }
+
+    fn render_rich_markdown_line(&self, line: &str, kind: LineKind) -> String {
+        let styled = render_markdown_line(line, kind, &self.styles);
+        self.wrap_line(styled, false)
     }
 
     fn check_line(
@@ -461,7 +465,6 @@ pub struct RenderOptions {
     pub theme: Option<Theme>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
-    #[allow(dead_code)]
     pub raw_markdown: bool,
     pub truecolor: bool,
 }
@@ -605,7 +608,6 @@ fn resolve_scope_style(
     ResolvedStyle::default()
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MarkdownStyles {
     heading: (Color, bool),
@@ -756,7 +758,10 @@ std::error::Error>> {
 
     #[test]
     fn no_theme() {
-        let options = RenderOptions::default();
+        let options = RenderOptions {
+            raw_markdown: true,
+            ..Default::default()
+        };
         let mut render = MarkdownRender::init(options).unwrap();
         let output = render.render(TEXT);
         assert_eq!(TEXT, output);
@@ -764,7 +769,10 @@ std::error::Error>> {
 
     #[test]
     fn no_wrap_code() {
-        let options = RenderOptions::default();
+        let options = RenderOptions {
+            raw_markdown: true,
+            ..Default::default()
+        };
         let mut render = MarkdownRender::init(options).unwrap();
         render.wrap_width = Some(80);
         let output = render.render(TEXT);
@@ -775,6 +783,7 @@ std::error::Error>> {
     fn wrap_all() {
         let options = RenderOptions {
             wrap_code: true,
+            raw_markdown: true,
             ..Default::default()
         };
         let mut render = MarkdownRender::init(options).unwrap();
