@@ -2,6 +2,7 @@ use crate::utils::decode_bin;
 
 use ansi_colours::AsRGB;
 use anyhow::{Context, Result, anyhow};
+use comfy_table::CellAlignment;
 use crossterm::style::{Color, Stylize};
 use crossterm::terminal;
 use fancy_regex::Regex;
@@ -103,6 +104,32 @@ fn detect_line_kind(line: &str) -> LineKind {
         return LineKind::TableRow;
     }
     LineKind::Paragraph
+}
+
+#[allow(dead_code)]
+fn parse_table_row(line: &str) -> Vec<String> {
+    let inner = line
+        .trim()
+        .trim_start_matches('|')
+        .trim_end_matches('|');
+    inner.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+#[allow(dead_code)]
+fn parse_alignments(separator_row: &str) -> Vec<CellAlignment> {
+    parse_table_row(separator_row)
+        .iter()
+        .map(|c| {
+            let trimmed = c.trim();
+            let starts = trimmed.starts_with(':');
+            let ends = trimmed.ends_with(':');
+            match (starts, ends) {
+                (true, true) => CellAlignment::Center,
+                (false, true) => CellAlignment::Right,
+                _ => CellAlignment::Left,
+            }
+        })
+        .collect()
 }
 
 fn regex_replace<F>(text: &str, re: &Regex, mut f: F) -> String
@@ -1078,6 +1105,63 @@ std::error::Error>> {
     fn detect_line_kind_prefers_separator_over_row() {
         assert_eq!(detect_line_kind("|---|---|"), LineKind::TableSeparator);
         assert_ne!(detect_line_kind("|---|---|"), LineKind::TableRow);
+    }
+
+    #[test]
+    fn parse_table_row_splits_cells() {
+        assert_eq!(parse_table_row("| a | b | c |"), vec!["a", "b", "c"]);
+        assert_eq!(parse_table_row("|a|b|c|"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parse_table_row_handles_empty_cells() {
+        assert_eq!(parse_table_row("| a | | c |"), vec!["a", "", "c"]);
+        assert_eq!(parse_table_row("| | | |"), vec!["", "", ""]);
+    }
+
+    #[test]
+    fn parse_table_row_trims_whitespace() {
+        assert_eq!(
+            parse_table_row("  |   foo   |   bar   |  "),
+            vec!["foo", "bar"],
+        );
+    }
+
+    #[test]
+    fn parse_alignments_reads_colons() {
+        assert_eq!(
+            parse_alignments("|:---|---:|:---:|---|"),
+            vec![
+                CellAlignment::Left,
+                CellAlignment::Right,
+                CellAlignment::Center,
+                CellAlignment::Left,
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_alignments_short_dashes() {
+        assert_eq!(
+            parse_alignments("|:--|--:|:-:|"),
+            vec![
+                CellAlignment::Left,
+                CellAlignment::Right,
+                CellAlignment::Center,
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_alignments_defaults_to_left() {
+        assert_eq!(
+            parse_alignments("|---|---|---|"),
+            vec![
+                CellAlignment::Left,
+                CellAlignment::Left,
+                CellAlignment::Left,
+            ],
+        );
     }
 
     fn test_styles() -> MarkdownStyles {
