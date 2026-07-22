@@ -473,6 +473,7 @@ enum TableState {
 
 enum TableAction {
     Consumed(String),
+    ConsumedSilent,
     FlushAndContinue(String),
     Passthrough,
 }
@@ -532,7 +533,7 @@ impl MarkdownRender {
 
     pub fn render(&mut self, text: &str) -> String {
         text.split('\n')
-            .map(|line| self.render_line_mut(line))
+            .filter_map(|line| self.render_line_mut(line))
             .collect::<Vec<String>>()
             .join("\n")
     }
@@ -548,7 +549,7 @@ impl MarkdownRender {
         }
     }
 
-    fn render_line_mut(&mut self, line: &str) -> String {
+    fn render_line_mut(&mut self, line: &str) -> Option<String> {
         let (line_type, line_kind, code_syntax, is_code) = self.check_line(line);
 
         let table_prefix = if self.options.raw_markdown {
@@ -563,7 +564,12 @@ impl MarkdownRender {
                 TableAction::Consumed(s) => {
                     self.prev_line_type = line_type;
                     self.code_syntax = code_syntax;
-                    return s;
+                    return Some(s);
+                }
+                TableAction::ConsumedSilent => {
+                    self.prev_line_type = line_type;
+                    self.code_syntax = code_syntax;
+                    return None;
                 }
                 TableAction::FlushAndContinue(s) => Some(s),
                 TableAction::Passthrough => None,
@@ -580,10 +586,10 @@ impl MarkdownRender {
         self.prev_line_type = line_type;
         self.code_syntax = code_syntax;
 
-        match table_prefix {
+        Some(match table_prefix {
             Some(prefix) => format!("{prefix}\n{output}"),
             None => output,
-        }
+        })
     }
 
     fn render_as_paragraph(&self, line: &str) -> String {
@@ -594,7 +600,7 @@ impl MarkdownRender {
         match (self.table_state.take(), kind) {
             (None, LineKind::TableRow) => {
                 self.table_state = Some(TableState::PendingHeader(line.to_string()));
-                TableAction::Consumed(String::new())
+                TableAction::ConsumedSilent
             }
             (None, LineKind::TableSeparator) => TableAction::Passthrough,
             (None, _) => TableAction::Passthrough,
@@ -606,7 +612,7 @@ impl MarkdownRender {
                     alignments,
                     rows: Vec::new(),
                 });
-                TableAction::Consumed(String::new())
+                TableAction::ConsumedSilent
             }
             (Some(TableState::PendingHeader(header_line)), LineKind::TableRow) => {
                 let a = self.render_as_paragraph(&header_line);
@@ -631,7 +637,7 @@ impl MarkdownRender {
                     alignments,
                     rows,
                 });
-                TableAction::Consumed(String::new())
+                TableAction::ConsumedSilent
             }
             (
                 Some(TableState::Active {
@@ -1617,11 +1623,11 @@ std::error::Error>> {
         let options = RenderOptions::default();
         let mut render = MarkdownRender::init(options).unwrap();
         let header = render.render_line_mut("| A | B |");
-        assert!(header.is_empty(), "header row silently buffered");
+        assert!(header.is_none(), "header row silently consumed");
         let sep = render.render_line_mut("|---|---|");
-        assert!(sep.is_empty(), "separator silently buffered");
+        assert!(sep.is_none(), "separator silently consumed");
         let data = render.render_line_mut("| 1 | 2 |");
-        assert!(data.is_empty(), "data row silently buffered");
+        assert!(data.is_none(), "data row silently consumed");
     }
 
     #[test]
@@ -1886,6 +1892,38 @@ std::error::Error>> {
         assert!(
             output.starts_with("\x1b["),
             "border color SGR at start: {output:?}",
+        );
+    }
+
+    #[test]
+    fn table_render_does_not_emit_blank_lines_from_silent_accumulation() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let text = "## Head\n\n\
+                    | A | B |\n\
+                    |---|---|\n\
+                    | 1 | 2 |\n\
+                    | 3 | 4 |\n\
+                    | 5 | 6 |\n\
+                    | 7 | 8 |\n\
+                    | 9 | 10 |\n\n\
+                    trailing\n";
+        let output = render.render(text);
+        let tail = render.finalize();
+        let combined = format!("{output}{tail}");
+        let mut consecutive_blank = 0usize;
+        let mut max_consecutive_blank = 0usize;
+        for line in combined.split('\n') {
+            if line.is_empty() {
+                consecutive_blank += 1;
+                max_consecutive_blank = max_consecutive_blank.max(consecutive_blank);
+            } else {
+                consecutive_blank = 0;
+            }
+        }
+        assert!(
+            max_consecutive_blank <= 1,
+            "at most one blank line between blocks, got {max_consecutive_blank}: {combined:?}",
         );
     }
 
