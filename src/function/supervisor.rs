@@ -196,7 +196,9 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{SUPERVISOR_FUNCTION_PREFIX}list_running"),
-            description: "List all subagents YOU have spawned that are still tracked by the supervisor, with their status. Use this to see which of your background agents are still active. To discover which agent types you can spawn in the first place, use `agent__list_available` instead.".to_string(),
+            description: "List all subagents YOU have spawned that are still tracked by the supervisor, with their \
+                          status. Use this to see which of your background agents are still active. To discover which \
+                          agent types you can spawn in the first place, use `agent__list_available` instead.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::new()),
@@ -206,7 +208,10 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{SUPERVISOR_FUNCTION_PREFIX}list_available"),
-            description: "List all agent types installed and available to spawn (name + description). Use this to discover what specialists exist before calling `agent__spawn` — especially when you're unsure which agent to delegate to. This is the discovery counterpart to `agent__list_running` (which reports agents you have already spawned).".to_string(),
+            description: "List all agent types installed and available to spawn (name + description). Use this to \
+                          discover what specialists exist before calling `agent__spawn` — especially when you're unsure \
+                          which agent to delegate to. This is the discovery counterpart to `agent__list_running` \
+                          (which reports agents you have already spawned).".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::new()),

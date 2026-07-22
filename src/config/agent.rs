@@ -1036,11 +1036,13 @@ fn load_agent_description(name: &str) -> String {
     if let Ok(config) = AgentConfig::load(&paths::agent_config_file(name)) {
         return config.description;
     }
+
     if let Ok(contents) = read_to_string(paths::agent_graph_file(name))
         && let Ok(meta) = serde_yaml::from_str::<AgentMetadataStub>(&contents)
     {
         return meta.description;
     }
+
     String::new()
 }
 
@@ -1243,7 +1245,9 @@ version: "1.0"
 start: triage
 nodes: {}
 "#;
+
         let meta: AgentMetadataStub = serde_yaml::from_str(yaml).unwrap();
+
         assert_eq!(meta.description, "External-reference research agent.");
     }
 
@@ -1256,7 +1260,9 @@ description: |
   bounded fix-loop until verified.
 version: "1.0"
 "#;
+
         let meta: AgentMetadataStub = serde_yaml::from_str(yaml).unwrap();
+
         assert!(meta.description.starts_with("Implementation agent."));
         assert!(meta.description.contains("bounded fix-loop"));
     }
@@ -1264,7 +1270,9 @@ version: "1.0"
     #[test]
     fn agent_metadata_stub_defaults_when_description_missing() {
         let yaml = "name: nameless\nversion: \"1.0\"\n";
+
         let meta: AgentMetadataStub = serde_yaml::from_str(yaml).unwrap();
+
         assert_eq!(meta.description, "");
     }
 }

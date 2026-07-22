@@ -5,8 +5,9 @@ use anyhow::{Context, Result, anyhow};
 use comfy_table::{CellAlignment, ContentArrangement, Table, presets::UTF8_FULL};
 use crossterm::style::{Color, Stylize};
 use crossterm::terminal;
-use fancy_regex::Regex;
+use fancy_regex::{Captures, Regex};
 use std::collections::HashMap;
+use std::iter;
 use std::sync::LazyLock;
 use syntect::highlighting::{Color as SyntectColor, FontStyle, Style, Theme, ThemeItem};
 use syntect::parsing::SyntaxSet;
@@ -92,6 +93,7 @@ fn detect_line_kind(line: &str) -> LineKind {
     if TABLE_ROW_RE.is_match(line).unwrap_or(false) {
         return LineKind::TableRow;
     }
+
     LineKind::Paragraph
 }
 
@@ -118,7 +120,7 @@ fn parse_alignments(separator_row: &str) -> Vec<CellAlignment> {
 
 fn regex_replace<F>(text: &str, re: &Regex, mut f: F) -> String
 where
-    F: FnMut(&fancy_regex::Captures) -> String,
+    F: FnMut(&Captures) -> String,
 {
     let mut out = String::new();
     let mut last_end = 0;
@@ -129,6 +131,7 @@ where
         out.push_str(&f(&caps));
         last_end = whole.end();
     }
+
     out.push_str(&text[last_end..]);
     out
 }
@@ -195,11 +198,13 @@ fn render_heading(line: &str, level: u8, styles: &MarkdownStyles) -> String {
     let content = rest.trim_start_matches('#').trim_start();
     let inline = apply_inline(content, styles);
     let (color, _force_bold) = styles.heading;
+
     let body = if level == 1 {
         format!(" {inline} ")
     } else {
         format!("{} {inline}", "#".repeat(level as usize))
     };
+
     format!("{indent}{}", body.with(color).bold())
 }
 
@@ -229,6 +234,7 @@ fn render_blockquote(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16
         }
         out.push_str(&format!("{indent}{prefix}{}", render_one(chunk)));
     }
+
     out
 }
 
@@ -262,6 +268,7 @@ fn render_bullet(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -
             out.push_str(&format!("{indent}{subseq}{styled}"));
         }
     }
+
     out
 }
 
@@ -302,6 +309,7 @@ fn render_numbered(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>)
             out.push_str(&format!("{indent}{subseq}{styled}"));
         }
     }
+
     out
 }
 
@@ -345,6 +353,7 @@ fn render_task(
             out.push_str(&format!("{indent}{subseq}{styled}"));
         }
     }
+
     out
 }
 
@@ -377,9 +386,11 @@ fn colorize_box_chars(text: &str, color: Color) -> String {
         }
         out.push(c);
     }
+
     if in_border {
         out.push_str(suffix);
     }
+
     out
 }
 
@@ -740,6 +751,7 @@ impl MarkdownRender {
         } else {
             detect_line_kind(line)
         };
+
         (line_type, line_kind, code_syntax, is_code)
     }
 
@@ -934,7 +946,7 @@ fn resolve_scope_style(
     fallbacks: &[&str],
     truecolor: bool,
 ) -> ResolvedStyle {
-    for scope_name in std::iter::once(primary).chain(fallbacks.iter().copied()) {
+    for scope_name in iter::once(primary).chain(fallbacks.iter().copied()) {
         let Some(item) = find_theme_scope(theme, scope_name) else {
             continue;
         };
@@ -943,10 +955,12 @@ fn resolve_scope_style(
             bg: item.style.background.map(|c| convert_color(c, truecolor)),
             font_style: item.style.font_style.unwrap_or_default(),
         };
+
         if resolved.fg.is_some() || resolved.bg.is_some() || !resolved.font_style.is_empty() {
             return resolved;
         }
     }
+
     ResolvedStyle::default()
 }
 
@@ -1227,7 +1241,9 @@ std::error::Error>> {
             syntect_rgb(0xaa, 0xbb, 0xcc),
             Some(FontStyle::BOLD),
         ));
+
         let resolved = resolve_scope_style(&theme, "markup.bold", &["fallback"], true);
+
         assert_eq!(resolved.fg, Some(rgb(0xaa, 0xbb, 0xcc)));
         assert!(resolved.font_style.contains(FontStyle::BOLD));
     }
@@ -1238,14 +1254,18 @@ std::error::Error>> {
         theme
             .scopes
             .push(theme_item("comment", syntect_rgb(0x33, 0x44, 0x55), None));
+
         let resolved = resolve_scope_style(&theme, "markup.italic", &["nope", "comment"], true);
+
         assert_eq!(resolved.fg, Some(rgb(0x33, 0x44, 0x55)));
     }
 
     #[test]
     fn resolve_scope_style_returns_default_when_nothing_matches() {
         let theme = Theme::default();
+
         let resolved = resolve_scope_style(&theme, "markup.italic", &["comment"], true);
+
         assert!(resolved.fg.is_none());
         assert!(resolved.bg.is_none());
         assert!(resolved.font_style.is_empty());
@@ -1254,6 +1274,7 @@ std::error::Error>> {
     #[test]
     fn markdown_styles_none_when_theme_absent() {
         let styles = MarkdownStyles::from_theme(None, true);
+
         assert_eq!(styles.heading, (Color::Reset, false));
         assert_eq!(styles.bold, Color::Reset);
         assert_eq!(styles.italic, Color::Reset);
@@ -1451,7 +1472,9 @@ std::error::Error>> {
     #[test]
     fn colorize_box_chars_wraps_border_runs() {
         let input = "┌─┐\nabc\n└─┘";
+
         let output = colorize_box_chars(input, Color::Red);
+
         assert!(
             output.starts_with("\x1b["),
             "border run starts with SGR: {output:?}"
@@ -1464,6 +1487,7 @@ std::error::Error>> {
     #[test]
     fn colorize_box_chars_leaves_reset_color_untouched() {
         let output = colorize_box_chars("no borders here", Color::Red);
+
         assert_eq!(output, "no borders here");
     }
 
@@ -1481,7 +1505,9 @@ std::error::Error>> {
             vec!["1".into(), "2".into(), "3".into()],
             vec!["4".into(), "5".into(), "6".into()],
         ];
+
         let output = render.render_table(header, alignments, rows);
+
         for expected in ["A", "B", "C", "1", "2", "3", "4", "5", "6"] {
             assert!(
                 output.contains(expected),
@@ -1500,7 +1526,9 @@ std::error::Error>> {
         let render = MarkdownRender::init(options).unwrap();
         let header = vec!["Header".into()];
         let alignments = vec![CellAlignment::Left];
+
         let output = render.render_table(header, alignments, vec![]);
+
         assert!(output.contains("\x1b[1m"), "bold SGR present: {output:?}");
         assert!(output.contains("Header"));
     }
@@ -1512,7 +1540,9 @@ std::error::Error>> {
         let header = vec!["H".into()];
         let alignments = vec![CellAlignment::Left];
         let rows = vec![vec!["**bold**".into()]];
+
         let output = render.render_table(header, alignments, rows);
+
         assert!(
             !output.contains("**bold**"),
             "asterisks stripped from cell: {output:?}",
@@ -1532,7 +1562,9 @@ std::error::Error>> {
             CellAlignment::Center,
         ];
         let rows = vec![vec!["a".into(), "b".into(), "c".into()]];
+
         let output = render.render_table(header, alignments, rows);
+
         for expected in ["L", "R", "C", "a", "b", "c"] {
             assert!(output.contains(expected), "cell {expected:?} present");
         }
@@ -1545,7 +1577,9 @@ std::error::Error>> {
         let header = vec!["Name".into()];
         let alignments = vec![CellAlignment::Left];
         let rows = vec![vec!["🎉".into()], vec!["日本".into()]];
+
         let output = render.render_table(header, alignments, rows);
+
         assert!(output.contains("🎉"));
         assert!(output.contains("日本"));
         assert!(output.lines().count() > 4, "multi-line output: {output:?}");
@@ -1557,7 +1591,9 @@ std::error::Error>> {
         let render = MarkdownRender::init(options).unwrap();
         let header = vec!["a".into()];
         let alignments = vec![CellAlignment::Left];
+
         let output = render.render_table(header, alignments, vec![vec!["b".into()]]);
+
         assert!(
             output.starts_with("\x1b["),
             "output starts with border color SGR: {output:?}",
@@ -1569,7 +1605,9 @@ std::error::Error>> {
         let options = RenderOptions::default();
         let mut render = MarkdownRender::init(options).unwrap();
         let text = "| A | B |\n|---|---|\n| 1 | 2 |\n\nafter\n";
+
         let output = render.render(text);
+
         for cell in ["A", "B", "1", "2"] {
             assert!(output.contains(cell), "cell {cell:?} rendered: {output:?}");
         }
@@ -1583,7 +1621,9 @@ std::error::Error>> {
     #[test]
     fn state_machine_defers_output_until_flush() {
         let options = RenderOptions::default();
+
         let mut render = MarkdownRender::init(options).unwrap();
+
         let header = render.render_line_mut("| A | B |");
         assert!(header.is_none(), "header row silently consumed");
         let sep = render.render_line_mut("|---|---|");
@@ -1599,7 +1639,9 @@ std::error::Error>> {
         render.render_line_mut("| A | B |");
         render.render_line_mut("|---|---|");
         render.render_line_mut("| 1 | 2 |");
+
         let tail = render.finalize();
+
         assert!(tail.contains("A"));
         assert!(tail.contains("1"));
         assert!(tail.contains("2"));
@@ -1611,7 +1653,9 @@ std::error::Error>> {
         let options = RenderOptions::default();
         let mut render = MarkdownRender::init(options).unwrap();
         render.render_line_mut("| A | B |");
+
         let tail = render.finalize();
+
         assert!(tail.contains("A"));
         assert!(tail.contains("B"));
         assert!(tail.contains("|"), "raw pipes preserved: {tail:?}");
@@ -1630,7 +1674,9 @@ std::error::Error>> {
         let options = RenderOptions::default();
         let mut render = MarkdownRender::init(options).unwrap();
         let text = "| A | B |\n| C | D |\nafter\n";
+
         let output = render.render(text);
+
         assert!(
             output.contains("| A | B |"),
             "raw pipes preserved for first: {output:?}",
@@ -1649,7 +1695,9 @@ std::error::Error>> {
         let text = "| A |\n|---|\n| 1 |\n\n| B |\n|---|\n| 2 |\n";
         let output = render.render(text);
         let tail = render.finalize();
+
         let combined = format!("{output}{tail}");
+
         for cell in ["A", "B", "1", "2"] {
             assert!(combined.contains(cell), "cell {cell:?}: {combined:?}");
         }
@@ -1659,7 +1707,9 @@ std::error::Error>> {
     fn render_line_immutable_does_not_mutate_table_state() {
         let options = RenderOptions::default();
         let mut render = MarkdownRender::init(options).unwrap();
+
         let _ = render.render_line("| foo | ba");
+
         assert!(
             render.table_state.is_none(),
             "render_line is immutable; state stays clean",
@@ -1674,7 +1724,9 @@ std::error::Error>> {
         };
         let mut render = MarkdownRender::init(options).unwrap();
         let text = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+
         let output = render.render(text);
+
         assert!(
             output.contains("| A | B |"),
             "raw pipes preserved: {output:?}",
@@ -1686,7 +1738,9 @@ std::error::Error>> {
     fn bullet_wraps_with_two_space_hanging_indent() {
         let styles = test_styles();
         let line = "- text that is long enough to wrap onto continuation lines";
+
         let output = render_markdown_line(line, LineKind::BulletItem, &styles, Some(20));
+
         assert!(output.contains('\n'), "wrapped output: {output:?}");
         let lines: Vec<&str> = output.split('\n').collect();
         assert!(lines.len() >= 2);
@@ -1702,7 +1756,9 @@ std::error::Error>> {
     fn numbered_wraps_with_digit_width_hanging_indent() {
         let styles = test_styles();
         let line = "42. text that is long enough to wrap onto continuation lines";
+
         let output = render_markdown_line(line, LineKind::NumberedItem, &styles, Some(22));
+
         assert!(output.contains('\n'), "wrapped output: {output:?}");
         let lines: Vec<&str> = output.split('\n').collect();
         for cont in &lines[1..] {
@@ -1717,7 +1773,9 @@ std::error::Error>> {
     fn numbered_wraps_with_three_digit_hanging_indent() {
         let styles = test_styles();
         let line = "100. text that is long enough to wrap onto continuation lines";
+
         let output = render_markdown_line(line, LineKind::NumberedItem, &styles, Some(22));
+
         assert!(output.contains('\n'));
         let lines: Vec<&str> = output.split('\n').collect();
         for cont in &lines[1..] {
@@ -1732,7 +1790,9 @@ std::error::Error>> {
     fn task_wraps_with_four_space_hanging_indent() {
         let styles = test_styles();
         let line = "- [ ] task text that is long enough to wrap around";
+
         let output = render_markdown_line(line, LineKind::TaskItem(false), &styles, Some(22));
+
         assert!(output.contains('\n'), "wrapped output: {output:?}");
         let lines: Vec<&str> = output.split('\n').collect();
         for cont in &lines[1..] {
@@ -1748,7 +1808,9 @@ std::error::Error>> {
         let styles = test_styles();
         let line = "> quoted text that is long enough to wrap onto multiple continuation lines";
         let output = render_markdown_line(line, LineKind::Blockquote, &styles, Some(24));
+
         assert!(output.contains('\n'), "wrapped output: {output:?}");
+
         for wrapped in output.split('\n') {
             assert!(
                 wrapped.contains("│ "),
@@ -1761,7 +1823,9 @@ std::error::Error>> {
     fn bullet_preserves_leading_indent_when_wrapping() {
         let styles = test_styles();
         let line = "  - nested bullet text that wraps around a few times";
+
         let output = render_markdown_line(line, LineKind::BulletItem, &styles, Some(22));
+
         assert!(output.contains('\n'), "wrapped output: {output:?}");
         for wrapped in output.split('\n') {
             assert!(
@@ -1776,7 +1840,9 @@ std::error::Error>> {
         let styles = test_styles();
         let long_line =
             "- very long bullet text that would definitely wrap if a narrow wrap_width were set";
+
         let output = render_markdown_line(long_line, LineKind::BulletItem, &styles, None);
+
         assert!(!output.contains('\n'), "no wrapping with None: {output:?}");
     }
 
@@ -1784,7 +1850,9 @@ std::error::Error>> {
     fn bullet_wraps_with_inline_markdown_intact() {
         let styles = test_styles();
         let line = "- **bold** text with `code` that will wrap onto several lines";
+
         let output = render_markdown_line(line, LineKind::BulletItem, &styles, Some(22));
+
         assert!(output.contains('\n'), "wrapped output: {output:?}");
         assert!(
             !output.contains("**bold**"),
@@ -1810,6 +1878,7 @@ std::error::Error>> {
                     Trailing prose.\n";
         let body = render.render(text);
         let tail = render.finalize();
+
         let output = format!("{body}{tail}");
 
         assert!(output.contains("Heading"), "heading rendered");
@@ -1836,7 +1905,9 @@ std::error::Error>> {
         let mut render = MarkdownRender::init(options).unwrap();
         let header = vec!["A".into()];
         let alignments = vec![CellAlignment::Left];
+
         let output = render.render_table(header, alignments, vec![vec!["1".into()]]);
+
         assert!(output.contains("A"));
         assert!(output.contains("1"));
         assert!(
@@ -1908,7 +1979,9 @@ std::error::Error>> {
             CellAlignment::Left,
         ];
         let rows = vec![vec!["1".into(), "2".into()]];
+
         let output = render.render_table(header, alignments, rows);
+
         for cell in ["A", "B", "C", "1", "2"] {
             assert!(output.contains(cell), "cell {cell:?} present: {output:?}");
         }
@@ -1934,7 +2007,9 @@ std::error::Error>> {
     #[test]
     fn inline_code_strips_backticks() {
         let styles = test_styles();
+
         let result = apply_inline("hello `world` foo", &styles);
+
         assert!(!result.contains('`'), "backticks stripped: {result:?}");
         assert!(result.contains("world"));
         assert!(result.contains("hello "));
@@ -1944,7 +2019,9 @@ std::error::Error>> {
     #[test]
     fn bold_asterisk_applied() {
         let styles = test_styles();
+
         let result = apply_inline("**loud**", &styles);
+
         assert!(!result.contains("**"), "markers stripped: {result:?}");
         assert!(result.contains("loud"));
         assert!(result.contains("\x1b[1m"), "bold SGR present: {result:?}");
@@ -1953,7 +2030,9 @@ std::error::Error>> {
     #[test]
     fn bold_underscore_applied() {
         let styles = test_styles();
+
         let result = apply_inline("__loud__", &styles);
+
         assert!(!result.contains("__"), "markers stripped: {result:?}");
         assert!(result.contains("loud"));
         assert!(result.contains("\x1b[1m"));
@@ -1962,7 +2041,9 @@ std::error::Error>> {
     #[test]
     fn italic_asterisk_applied() {
         let styles = test_styles();
+
         let result = apply_inline("*soft*", &styles);
+
         assert!(result.contains("soft"));
         assert!(result.contains("\x1b[3m"), "italic SGR present: {result:?}");
     }
@@ -1970,7 +2051,9 @@ std::error::Error>> {
     #[test]
     fn italic_underscore_applied() {
         let styles = test_styles();
+
         let result = apply_inline("_soft_", &styles);
+
         assert!(result.contains("soft"));
         assert!(result.contains("\x1b[3m"));
     }
@@ -1978,7 +2061,9 @@ std::error::Error>> {
     #[test]
     fn strikethrough_applied() {
         let styles = test_styles();
+
         let result = apply_inline("~~gone~~", &styles);
+
         assert!(!result.contains("~~"), "markers stripped");
         assert!(result.contains("gone"));
         assert!(result.contains("\x1b[9m"), "strikethrough SGR: {result:?}");
@@ -1987,7 +2072,9 @@ std::error::Error>> {
     #[test]
     fn bold_wraps_inline_code() {
         let styles = test_styles();
+
         let result = apply_inline("**foo `bar` baz**", &styles);
+
         assert!(!result.contains('`'));
         assert!(!result.contains("**"));
         assert!(result.contains("foo"));
@@ -2002,13 +2089,16 @@ std::error::Error>> {
     #[test]
     fn partial_bold_stays_raw() {
         let styles = test_styles();
+
         let result = apply_inline("**unclosed", &styles);
+
         assert_eq!(result, "**unclosed");
     }
 
     #[test]
     fn partial_italic_stays_raw() {
         let styles = test_styles();
+
         assert_eq!(apply_inline("*unclosed", &styles), "*unclosed");
         assert_eq!(apply_inline("_unclosed", &styles), "_unclosed");
     }
@@ -2016,19 +2106,23 @@ std::error::Error>> {
     #[test]
     fn italic_ignores_word_internal_underscores() {
         let styles = test_styles();
+
         assert_eq!(apply_inline("some_var_name", &styles), "some_var_name");
     }
 
     #[test]
     fn italic_ignores_math_like_spaces() {
         let styles = test_styles();
+
         assert_eq!(apply_inline("a * b * c", &styles), "a * b * c");
     }
 
     #[test]
     fn links_emit_osc8_and_visible_parts() {
         let styles = test_styles();
+
         let result = apply_inline("[label](https://example.com)", &styles);
+
         assert!(
             result.contains("\x1b]8;;https://example.com\x1b\\"),
             "OSC 8 open present: {result:?}"
@@ -2041,7 +2135,9 @@ std::error::Error>> {
     #[test]
     fn images_emit_labeled_link() {
         let styles = test_styles();
+
         let result = apply_inline("![alt text](https://img.example/x.png)", &styles);
+
         assert!(
             !result.contains("!["),
             "raw image marker removed: {result:?}"
@@ -2054,7 +2150,9 @@ std::error::Error>> {
     #[test]
     fn image_processed_before_link() {
         let styles = test_styles();
+
         let result = apply_inline("![alt](https://example.com)", &styles);
+
         assert!(
             !result.starts_with('!'),
             "no stray ! left behind: {result:?}"
@@ -2065,13 +2163,16 @@ std::error::Error>> {
     #[test]
     fn plain_text_unchanged() {
         let styles = test_styles();
+
         assert_eq!(apply_inline("just plain text", &styles), "just plain text");
     }
 
     #[test]
     fn render_heading_level_1_pads_content() {
         let styles = test_styles();
+
         let result = render_markdown_line("# Big", LineKind::Heading(1), &styles, None);
+
         assert!(result.contains(" Big "), "H1 padded content: {result:?}");
         assert!(!result.contains('#'), "H1 hashes removed: {result:?}");
         assert!(result.contains("\x1b[1m"), "bold applied: {result:?}");
@@ -2080,6 +2181,7 @@ std::error::Error>> {
     #[test]
     fn render_heading_level_2_through_6_keeps_hash_prefix() {
         let styles = test_styles();
+
         for level in 2u8..=6 {
             let hashes = "#".repeat(level as usize);
             let line = format!("{hashes} Title");
@@ -2096,14 +2198,18 @@ std::error::Error>> {
     #[test]
     fn render_heading_preserves_leading_indent() {
         let styles = test_styles();
+
         let result = render_markdown_line("  ## Nested", LineKind::Heading(2), &styles, None);
+
         assert!(result.starts_with("  "), "indent preserved: {result:?}");
     }
 
     #[test]
     fn render_blockquote_uses_pipe_prefix() {
         let styles = test_styles();
+
         let result = render_markdown_line("> quoted", LineKind::Blockquote, &styles, None);
+
         assert!(result.contains("│ "), "pipe prefix: {result:?}");
         assert!(!result.contains('>'), "gt removed: {result:?}");
         assert!(result.contains("quoted"));
@@ -2112,7 +2218,9 @@ std::error::Error>> {
     #[test]
     fn render_blockquote_preserves_indent() {
         let styles = test_styles();
+
         let result = render_markdown_line("  > deep", LineKind::Blockquote, &styles, None);
+
         assert!(result.starts_with("  "));
         assert!(result.contains("│ "));
     }
@@ -2120,7 +2228,9 @@ std::error::Error>> {
     #[test]
     fn render_bullet_uses_bullet_char() {
         let styles = test_styles();
+
         let result = render_markdown_line("- item", LineKind::BulletItem, &styles, None);
+
         assert!(result.contains("•"), "bullet glyph: {result:?}");
         assert!(!result.contains("- "), "dash removed: {result:?}");
         assert!(result.contains("item"));
@@ -2129,8 +2239,10 @@ std::error::Error>> {
     #[test]
     fn render_bullet_supports_star_and_plus() {
         let styles = test_styles();
+
         let star = render_markdown_line("* one", LineKind::BulletItem, &styles, None);
         let plus = render_markdown_line("+ two", LineKind::BulletItem, &styles, None);
+
         assert!(star.contains("•") && star.contains("one"));
         assert!(plus.contains("•") && plus.contains("two"));
     }
@@ -2138,7 +2250,9 @@ std::error::Error>> {
     #[test]
     fn render_bullet_preserves_nested_indent() {
         let styles = test_styles();
+
         let result = render_markdown_line("    - nested", LineKind::BulletItem, &styles, None);
+
         assert!(result.starts_with("    "), "indent kept: {result:?}");
         assert!(result.contains("•"));
     }
@@ -2146,7 +2260,9 @@ std::error::Error>> {
     #[test]
     fn render_numbered_preserves_number_and_styles_dot() {
         let styles = test_styles();
+
         let result = render_markdown_line("42. answer", LineKind::NumberedItem, &styles, None);
+
         assert!(result.contains("42"), "number kept: {result:?}");
         assert!(result.contains("answer"));
         assert!(result.contains('.'), "dot present");
@@ -2155,7 +2271,9 @@ std::error::Error>> {
     #[test]
     fn render_task_unchecked() {
         let styles = test_styles();
+
         let result = render_markdown_line("- [ ] todo", LineKind::TaskItem(false), &styles, None);
+
         assert!(result.contains("[ ]"), "unchecked glyph: {result:?}");
         assert!(!result.contains("- "), "no dash prefix: {result:?}");
         assert!(result.contains("todo"));
@@ -2164,7 +2282,9 @@ std::error::Error>> {
     #[test]
     fn render_task_checked_uses_check_glyph() {
         let styles = test_styles();
+
         let result = render_markdown_line("- [x] done", LineKind::TaskItem(true), &styles, None);
+
         assert!(result.contains("[✓]"), "checked glyph: {result:?}");
         assert!(!result.contains("[x]"), "raw x removed: {result:?}");
         assert!(result.contains("done"));
@@ -2173,7 +2293,9 @@ std::error::Error>> {
     #[test]
     fn render_hrule_emits_box_drawing() {
         let styles = test_styles();
+
         let result = render_markdown_line("---", LineKind::HorizontalRule, &styles, None);
+
         assert!(result.contains("────"), "box drawing chars: {result:?}");
         assert!(!result.contains("---"), "raw dashes removed: {result:?}");
     }
@@ -2181,7 +2303,9 @@ std::error::Error>> {
     #[test]
     fn render_paragraph_delegates_to_inline() {
         let styles = test_styles();
+
         let result = render_markdown_line("hello **world**", LineKind::Paragraph, &styles, None);
+
         assert!(!result.contains("**"), "bold markers stripped: {result:?}");
         assert!(result.contains("world"));
         assert!(
@@ -2193,7 +2317,9 @@ std::error::Error>> {
     #[test]
     fn render_bullet_runs_inline_on_content() {
         let styles = test_styles();
+
         let result = render_markdown_line("- see `code`", LineKind::BulletItem, &styles, None);
+
         assert!(result.contains("•"));
         assert!(!result.contains('`'), "backticks stripped: {result:?}");
         assert!(result.contains("see "));
@@ -2203,12 +2329,14 @@ std::error::Error>> {
     #[test]
     fn render_blockquote_runs_inline_on_content() {
         let styles = test_styles();
+
         let result = render_markdown_line(
             "> visit [here](https://example.com)",
             LineKind::Blockquote,
             &styles,
             None,
         );
+
         assert!(result.contains("│ "));
         assert!(result.contains("here"));
         assert!(result.contains("https://example.com"));
@@ -2218,8 +2346,10 @@ std::error::Error>> {
     #[test]
     fn heading_can_contain_bold_inline() {
         let styles = test_styles();
+
         let result =
             render_markdown_line("## Announce **now**", LineKind::Heading(2), &styles, None);
+
         assert!(!result.contains("**"), "bold markers stripped: {result:?}");
         assert!(result.contains("now"));
         assert!(result.contains("Announce"));
@@ -2230,7 +2360,9 @@ std::error::Error>> {
     fn streaming_partial_bold_stays_raw() {
         let options = RenderOptions::default();
         let render = MarkdownRender::init(options).unwrap();
+
         let partial = render.render_line("**bo");
+
         assert!(
             partial.contains("**bo"),
             "unclosed bold preserved: {partial:?}"
@@ -2241,7 +2373,9 @@ std::error::Error>> {
     fn streaming_partial_link_stays_raw() {
         let options = RenderOptions::default();
         let render = MarkdownRender::init(options).unwrap();
+
         let partial = render.render_line("[label](https://exa");
+
         assert!(
             partial.contains("[label]"),
             "unclosed link preserved: {partial:?}"
@@ -2252,7 +2386,9 @@ std::error::Error>> {
     fn rich_render_strips_syntax_without_theme() {
         let options = RenderOptions::default();
         let mut render = MarkdownRender::init(options).unwrap();
+
         let output = render.render("# Heading\n\n> quoted\n\n- item\n");
+
         assert!(!output.contains("# Heading"), "hash removed: {output:?}");
         assert!(output.contains("Heading"));
         assert!(!output.contains("> quoted"), "gt removed");
@@ -2272,8 +2408,10 @@ std::error::Error>> {
         let mut raw_render = MarkdownRender::init(raw_opts).unwrap();
         let mut rich_render = MarkdownRender::init(rich_opts).unwrap();
         let text = "# Heading\n\n**bold** text\n";
+
         let raw = raw_render.render(text);
         let rich = rich_render.render(text);
+
         assert_eq!(raw, text, "raw path preserves input");
         assert_ne!(rich, text, "rich path transforms input");
     }
@@ -2283,7 +2421,9 @@ std::error::Error>> {
         let options = RenderOptions::default();
         let mut render = MarkdownRender::init(options).unwrap();
         let text = "```rust\nfn main() {}\n```\n";
+
         let output = render.render(text);
+
         assert!(
             output.contains("fn main()"),
             "code content preserved: {output:?}"
@@ -2293,6 +2433,7 @@ std::error::Error>> {
     #[test]
     fn markdown_styles_fall_back_to_root_scopes() {
         let theme = minimal_root_scope_theme();
+
         let styles = MarkdownStyles::from_theme(Some(&theme), true);
 
         assert_eq!(styles.heading.0, rgb(0xde, 0xad, 0xbe));

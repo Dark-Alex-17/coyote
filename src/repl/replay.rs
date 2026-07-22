@@ -54,5 +54,6 @@ fn render_messages(app: &AppConfig, messages: &[Message]) -> Result<()> {
             _ => {}
         }
     }
+
     Ok(())
 }
