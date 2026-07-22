@@ -621,6 +621,8 @@ pub struct MarkdownStyles {
     link_url: Color,
     strikethrough: Color,
     hrule: Color,
+    #[allow(dead_code)]
+    table_border: Color,
 }
 
 impl MarkdownStyles {
@@ -671,6 +673,12 @@ impl MarkdownStyles {
         let strikethrough =
             resolve_scope_style(theme, "markup.deleted", &["invalid"], truecolor);
         let hrule = resolve_scope_style(theme, "comment", &["punctuation"], truecolor);
+        let table_border = resolve_scope_style(
+            theme,
+            "punctuation.definition.table.markdown",
+            &["punctuation", "meta.separator"],
+            truecolor,
+        );
 
         Self {
             heading: (
@@ -687,6 +695,7 @@ impl MarkdownStyles {
             link_url: link_url.fg.unwrap_or(Color::Blue),
             strikethrough: strikethrough.fg.unwrap_or(Color::DarkGrey),
             hrule: hrule.fg.unwrap_or(Color::DarkGrey),
+            table_border: table_border.fg.unwrap_or(Color::DarkGrey),
         }
     }
 
@@ -703,6 +712,7 @@ impl MarkdownStyles {
             link_url: Color::Reset,
             strikethrough: Color::Reset,
             hrule: Color::Reset,
+            table_border: Color::Reset,
         }
     }
 }
@@ -928,6 +938,7 @@ std::error::Error>> {
         assert_eq!(styles.link_url, Color::Reset);
         assert_eq!(styles.strikethrough, Color::Reset);
         assert_eq!(styles.hrule, Color::Reset);
+        assert_eq!(styles.table_border, Color::Reset);
     }
 
     #[test]
@@ -945,6 +956,7 @@ std::error::Error>> {
         assert_ne!(styles.link_url, Color::Reset);
         assert_ne!(styles.strikethrough, Color::Reset);
         assert_ne!(styles.hrule, Color::Reset);
+        assert_ne!(styles.table_border, Color::Reset);
     }
 
     #[test]
@@ -1032,6 +1044,7 @@ std::error::Error>> {
             link_url: Color::Magenta,
             strikethrough: Color::DarkGrey,
             hrule: Color::DarkGrey,
+            table_border: Color::DarkGrey,
         }
     }
 
@@ -1385,5 +1398,6 @@ std::error::Error>> {
         assert_eq!(styles.link_url, rgb(0x00, 0xcc, 0xff));
         assert_eq!(styles.strikethrough, rgb(0xff, 0x00, 0x00));
         assert_eq!(styles.hrule, rgb(0x88, 0x88, 0x88));
+        assert_eq!(styles.table_border, rgb(0x77, 0x77, 0x77));
     }
 }
