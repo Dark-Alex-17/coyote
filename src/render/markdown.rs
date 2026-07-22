@@ -6,7 +6,7 @@ use crossterm::style::{Color, Stylize};
 use crossterm::terminal;
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use syntect::highlighting::{Color as SyntectColor, FontStyle, Style, Theme};
+use syntect::highlighting::{Color as SyntectColor, FontStyle, Style, Theme, ThemeItem};
 use syntect::parsing::SyntaxSet;
 use syntect::{easy::HighlightLines, parsing::SyntaxReference};
 
@@ -28,6 +28,8 @@ pub struct MarkdownRender {
     code_syntax: Option<SyntaxReference>,
     prev_line_type: LineType,
     wrap_width: Option<u16>,
+    #[allow(dead_code)]
+    styles: MarkdownStyles,
 }
 
 impl MarkdownRender {
@@ -57,6 +59,7 @@ impl MarkdownRender {
                 Err(_) => None,
             },
         };
+        let styles = MarkdownStyles::from_theme(options.theme.as_ref(), options.truecolor);
         Ok(Self {
             syntax_set,
             code_color,
@@ -64,6 +67,7 @@ impl MarkdownRender {
             code_syntax: None,
             prev_line_type: line_type,
             wrap_width,
+            styles,
             options,
         })
     }
@@ -308,6 +312,144 @@ fn get_code_color(theme: &Theme, truecolor: bool) -> Color {
         .map_or_else(|| Color::Yellow, |c| convert_color(c, truecolor))
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ResolvedStyle {
+    fg: Option<Color>,
+    bg: Option<Color>,
+    font_style: FontStyle,
+}
+
+fn find_theme_scope<'a>(theme: &'a Theme, name: &str) -> Option<&'a ThemeItem> {
+    theme.scopes.iter().find(|item| {
+        item.scope
+            .selectors
+            .iter()
+            .any(|sel| sel.path.scopes.iter().any(|s| s.to_string() == name))
+    })
+}
+
+fn resolve_scope_style(
+    theme: &Theme,
+    primary: &str,
+    fallbacks: &[&str],
+    truecolor: bool,
+) -> ResolvedStyle {
+    for scope_name in std::iter::once(primary).chain(fallbacks.iter().copied()) {
+        let Some(item) = find_theme_scope(theme, scope_name) else {
+            continue;
+        };
+        let resolved = ResolvedStyle {
+            fg: item.style.foreground.map(|c| convert_color(c, truecolor)),
+            bg: item.style.background.map(|c| convert_color(c, truecolor)),
+            font_style: item.style.font_style.unwrap_or_default(),
+        };
+        if resolved.fg.is_some() || resolved.bg.is_some() || !resolved.font_style.is_empty() {
+            return resolved;
+        }
+    }
+    ResolvedStyle::default()
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct MarkdownStyles {
+    heading: (Color, bool),
+    bold: Color,
+    italic: Color,
+    inline_code_fg: Color,
+    inline_code_bg: Option<Color>,
+    blockquote: Color,
+    list_bullet: Color,
+    link_text: Color,
+    link_url: Color,
+    strikethrough: Color,
+    hrule: Color,
+}
+
+impl MarkdownStyles {
+    fn from_theme(theme: Option<&Theme>, truecolor: bool) -> Self {
+        let Some(theme) = theme else {
+            return Self::none();
+        };
+
+        let heading = resolve_scope_style(
+            theme,
+            "markup.heading",
+            &["markup.bold", "entity.name.section"],
+            truecolor,
+        );
+        let bold = resolve_scope_style(
+            theme,
+            "markup.bold",
+            &["entity.other.attribute-name"],
+            truecolor,
+        );
+        let italic = resolve_scope_style(theme, "markup.italic", &["comment"], truecolor);
+        let inline_code = resolve_scope_style(
+            theme,
+            "markup.raw.inline",
+            &["markup.raw", "string"],
+            truecolor,
+        );
+        let blockquote =
+            resolve_scope_style(theme, "markup.quote", &["comment", "string"], truecolor);
+        let list_bullet = resolve_scope_style(
+            theme,
+            "markup.list",
+            &["punctuation.definition.list", "keyword"],
+            truecolor,
+        );
+        let link_text = resolve_scope_style(
+            theme,
+            "markup.link",
+            &["string.other.link", "entity.name.tag"],
+            truecolor,
+        );
+        let link_url = resolve_scope_style(
+            theme,
+            "markup.underline.link",
+            &["string.other.link", "constant"],
+            truecolor,
+        );
+        let strikethrough =
+            resolve_scope_style(theme, "markup.deleted", &["invalid"], truecolor);
+        let hrule = resolve_scope_style(theme, "comment", &["punctuation"], truecolor);
+
+        Self {
+            heading: (
+                heading.fg.unwrap_or(Color::Yellow),
+                heading.font_style.contains(FontStyle::BOLD),
+            ),
+            bold: bold.fg.unwrap_or(Color::Reset),
+            italic: italic.fg.unwrap_or(Color::Reset),
+            inline_code_fg: inline_code.fg.unwrap_or(Color::Yellow),
+            inline_code_bg: inline_code.bg,
+            blockquote: blockquote.fg.unwrap_or(Color::DarkGrey),
+            list_bullet: list_bullet.fg.unwrap_or(Color::Reset),
+            link_text: link_text.fg.unwrap_or(Color::Cyan),
+            link_url: link_url.fg.unwrap_or(Color::Blue),
+            strikethrough: strikethrough.fg.unwrap_or(Color::DarkGrey),
+            hrule: hrule.fg.unwrap_or(Color::DarkGrey),
+        }
+    }
+
+    fn none() -> Self {
+        Self {
+            heading: (Color::Reset, false),
+            bold: Color::Reset,
+            italic: Color::Reset,
+            inline_code_fg: Color::Reset,
+            inline_code_bg: None,
+            blockquote: Color::Reset,
+            list_bullet: Color::Reset,
+            link_text: Color::Reset,
+            link_url: Color::Reset,
+            strikethrough: Color::Reset,
+            hrule: Color::Reset,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +535,170 @@ std::error::Error>> {
         assert_eq!(detect_code_block("  ```rust"), Some("rust".into()));
         assert_eq!(detect_code_block("```"), Some("".into()));
         assert_eq!(detect_code_block("``rust"), None);
+    }
+
+    use std::str::FromStr;
+    use syntect::highlighting::{ScopeSelectors, StyleModifier, ThemeItem};
+
+    const DARK_THEME_BYTES: &[u8] = include_bytes!("../../assets/monokai-extended.theme.bin");
+
+    fn load_dark_theme() -> Theme {
+        decode_bin(DARK_THEME_BYTES).expect("built-in dark theme should decode")
+    }
+
+    fn syntect_rgb(r: u8, g: u8, b: u8) -> SyntectColor {
+        SyntectColor { r, g, b, a: 255 }
+    }
+
+    fn theme_item(scope: &str, fg: SyntectColor, font_style: Option<FontStyle>) -> ThemeItem {
+        ThemeItem {
+            scope: ScopeSelectors::from_str(scope).expect("valid scope selector"),
+            style: StyleModifier {
+                foreground: Some(fg),
+                background: None,
+                font_style,
+            },
+        }
+    }
+
+    fn minimal_root_scope_theme() -> Theme {
+        let mut theme = Theme::default();
+        theme.scopes.push(theme_item(
+            "string",
+            syntect_rgb(0xff, 0xdd, 0x00),
+            None,
+        ));
+        theme.scopes.push(theme_item(
+            "comment",
+            syntect_rgb(0x88, 0x88, 0x88),
+            None,
+        ));
+        theme.scopes.push(theme_item(
+            "keyword",
+            syntect_rgb(0xaa, 0x00, 0xff),
+            None,
+        ));
+        theme.scopes.push(theme_item(
+            "constant",
+            syntect_rgb(0x00, 0xcc, 0xff),
+            None,
+        ));
+        theme.scopes.push(theme_item(
+            "entity.name.tag",
+            syntect_rgb(0x11, 0x22, 0x33),
+            None,
+        ));
+        theme.scopes.push(theme_item(
+            "entity.other.attribute-name",
+            syntect_rgb(0x44, 0x55, 0x66),
+            Some(FontStyle::BOLD),
+        ));
+        theme.scopes.push(theme_item(
+            "entity.name.section",
+            syntect_rgb(0xde, 0xad, 0xbe),
+            Some(FontStyle::BOLD),
+        ));
+        theme.scopes.push(theme_item(
+            "invalid",
+            syntect_rgb(0xff, 0x00, 0x00),
+            None,
+        ));
+        theme.scopes.push(theme_item(
+            "punctuation",
+            syntect_rgb(0x77, 0x77, 0x77),
+            None,
+        ));
+        theme
+    }
+
+    fn rgb(r: u8, g: u8, b: u8) -> Color {
+        Color::Rgb { r, g, b }
+    }
+
+    #[test]
+    fn resolve_scope_style_uses_primary() {
+        let mut theme = Theme::default();
+        theme.scopes.push(theme_item(
+            "markup.bold",
+            syntect_rgb(0xaa, 0xbb, 0xcc),
+            Some(FontStyle::BOLD),
+        ));
+        let resolved = resolve_scope_style(&theme, "markup.bold", &["fallback"], true);
+        assert_eq!(resolved.fg, Some(rgb(0xaa, 0xbb, 0xcc)));
+        assert!(resolved.font_style.contains(FontStyle::BOLD));
+    }
+
+    #[test]
+    fn resolve_scope_style_falls_back_when_primary_missing() {
+        let mut theme = Theme::default();
+        theme.scopes.push(theme_item(
+            "comment",
+            syntect_rgb(0x33, 0x44, 0x55),
+            None,
+        ));
+        let resolved =
+            resolve_scope_style(&theme, "markup.italic", &["nope", "comment"], true);
+        assert_eq!(resolved.fg, Some(rgb(0x33, 0x44, 0x55)));
+    }
+
+    #[test]
+    fn resolve_scope_style_returns_default_when_nothing_matches() {
+        let theme = Theme::default();
+        let resolved = resolve_scope_style(&theme, "markup.italic", &["comment"], true);
+        assert!(resolved.fg.is_none());
+        assert!(resolved.bg.is_none());
+        assert!(resolved.font_style.is_empty());
+    }
+
+    #[test]
+    fn markdown_styles_none_when_theme_absent() {
+        let styles = MarkdownStyles::from_theme(None, true);
+        assert_eq!(styles.heading, (Color::Reset, false));
+        assert_eq!(styles.bold, Color::Reset);
+        assert_eq!(styles.italic, Color::Reset);
+        assert_eq!(styles.inline_code_fg, Color::Reset);
+        assert_eq!(styles.inline_code_bg, None);
+        assert_eq!(styles.blockquote, Color::Reset);
+        assert_eq!(styles.list_bullet, Color::Reset);
+        assert_eq!(styles.link_text, Color::Reset);
+        assert_eq!(styles.link_url, Color::Reset);
+        assert_eq!(styles.strikethrough, Color::Reset);
+        assert_eq!(styles.hrule, Color::Reset);
+    }
+
+    #[test]
+    fn markdown_styles_resolve_with_builtin_dark_theme() {
+        let theme = load_dark_theme();
+        let styles = MarkdownStyles::from_theme(Some(&theme), true);
+
+        assert_ne!(styles.heading.0, Color::Reset);
+        assert_ne!(styles.bold, Color::Reset);
+        assert_ne!(styles.italic, Color::Reset);
+        assert_ne!(styles.inline_code_fg, Color::Reset);
+        assert_ne!(styles.blockquote, Color::Reset);
+        assert_ne!(styles.list_bullet, Color::Reset);
+        assert_ne!(styles.link_text, Color::Reset);
+        assert_ne!(styles.link_url, Color::Reset);
+        assert_ne!(styles.strikethrough, Color::Reset);
+        assert_ne!(styles.hrule, Color::Reset);
+    }
+
+    #[test]
+    fn markdown_styles_fall_back_to_root_scopes() {
+        let theme = minimal_root_scope_theme();
+        let styles = MarkdownStyles::from_theme(Some(&theme), true);
+
+        assert_eq!(styles.heading.0, rgb(0xde, 0xad, 0xbe));
+        assert!(styles.heading.1);
+        assert_eq!(styles.bold, rgb(0x44, 0x55, 0x66));
+        assert_eq!(styles.italic, rgb(0x88, 0x88, 0x88));
+        assert_eq!(styles.inline_code_fg, rgb(0xff, 0xdd, 0x00));
+        assert_eq!(styles.inline_code_bg, None);
+        assert_eq!(styles.blockquote, rgb(0x88, 0x88, 0x88));
+        assert_eq!(styles.list_bullet, rgb(0xaa, 0x00, 0xff));
+        assert_eq!(styles.link_text, rgb(0x11, 0x22, 0x33));
+        assert_eq!(styles.link_url, rgb(0x00, 0xcc, 0xff));
+        assert_eq!(styles.strikethrough, rgb(0xff, 0x00, 0x00));
+        assert_eq!(styles.hrule, rgb(0x88, 0x88, 0x88));
     }
 }
