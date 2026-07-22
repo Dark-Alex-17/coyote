@@ -4,6 +4,7 @@ use ansi_colours::AsRGB;
 use anyhow::{Context, Result, anyhow};
 use crossterm::style::{Color, Stylize};
 use crossterm::terminal;
+use fancy_regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use syntect::highlighting::{Color as SyntectColor, FontStyle, Style, Theme, ThemeItem};
@@ -19,6 +20,59 @@ static LANG_MAPS: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
     m.insert("php".into(), "PHP Source".into());
     m
 });
+
+static HEADING_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(#{1,6}) +.+").unwrap());
+static BLOCKQUOTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*>").unwrap());
+static TASK_ITEM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*[-*+] \[([ xX])\] +.+").unwrap());
+static BULLET_ITEM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*[-*+] +.+").unwrap());
+static NUMBERED_ITEM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*\d+\. +.+").unwrap());
+static HRULE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(-{3,}|_{3,}|\*{3,})\s*$").unwrap());
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    Heading(u8),
+    Blockquote,
+    TaskItem(bool),
+    BulletItem,
+    NumberedItem,
+    HorizontalRule,
+    Paragraph,
+}
+
+#[allow(dead_code)]
+fn detect_line_kind(line: &str) -> LineKind {
+    if HRULE_RE.is_match(line).unwrap_or(false) {
+        return LineKind::HorizontalRule;
+    }
+    if let Ok(Some(caps)) = HEADING_RE.captures(line) {
+        let level = caps
+            .get(1)
+            .map(|m| m.as_str().len() as u8)
+            .unwrap_or(1)
+            .min(6);
+        return LineKind::Heading(level);
+    }
+    if BLOCKQUOTE_RE.is_match(line).unwrap_or(false) {
+        return LineKind::Blockquote;
+    }
+    if let Ok(Some(caps)) = TASK_ITEM_RE.captures(line) {
+        let checked = caps.get(1).map(|m| m.as_str() != " ").unwrap_or(false);
+        return LineKind::TaskItem(checked);
+    }
+    if BULLET_ITEM_RE.is_match(line).unwrap_or(false) {
+        return LineKind::BulletItem;
+    }
+    if NUMBERED_ITEM_RE.is_match(line).unwrap_or(false) {
+        return LineKind::NumberedItem;
+    }
+    LineKind::Paragraph
+}
 
 pub struct MarkdownRender {
     options: RenderOptions,
@@ -80,7 +134,7 @@ impl MarkdownRender {
     }
 
     pub fn render_line(&self, line: &str) -> String {
-        let (_, code_syntax, is_code) = self.check_line(line);
+        let (_, _, code_syntax, is_code) = self.check_line(line);
         if is_code {
             self.highlight_code_line(line, &code_syntax)
         } else {
@@ -89,7 +143,7 @@ impl MarkdownRender {
     }
 
     fn render_line_mut(&mut self, line: &str) -> String {
-        let (line_type, code_syntax, is_code) = self.check_line(line);
+        let (line_type, _, code_syntax, is_code) = self.check_line(line);
         let output = if is_code {
             self.highlight_code_line(line, &code_syntax)
         } else {
@@ -100,7 +154,10 @@ impl MarkdownRender {
         output
     }
 
-    fn check_line(&self, line: &str) -> (LineType, Option<SyntaxReference>, bool) {
+    fn check_line(
+        &self,
+        line: &str,
+    ) -> (LineType, LineKind, Option<SyntaxReference>, bool) {
         let mut line_type = self.prev_line_type;
         let mut code_syntax = self.code_syntax.clone();
         let mut is_code = false;
@@ -139,7 +196,12 @@ impl MarkdownRender {
                 }
             }
         }
-        (line_type, code_syntax, is_code)
+        let line_kind = if is_code {
+            LineKind::Paragraph
+        } else {
+            detect_line_kind(line)
+        };
+        (line_type, line_kind, code_syntax, is_code)
     }
 
     fn highlight_line(&self, line: &str, syntax: &SyntaxReference, is_code: bool) -> String {
@@ -681,6 +743,78 @@ std::error::Error>> {
         assert_ne!(styles.link_url, Color::Reset);
         assert_ne!(styles.strikethrough, Color::Reset);
         assert_ne!(styles.hrule, Color::Reset);
+    }
+
+    #[test]
+    fn detect_line_kind_heading_levels() {
+        assert_eq!(detect_line_kind("# H1"), LineKind::Heading(1));
+        assert_eq!(detect_line_kind("## H2"), LineKind::Heading(2));
+        assert_eq!(detect_line_kind("### H3"), LineKind::Heading(3));
+        assert_eq!(detect_line_kind("#### H4"), LineKind::Heading(4));
+        assert_eq!(detect_line_kind("##### H5"), LineKind::Heading(5));
+        assert_eq!(detect_line_kind("###### H6"), LineKind::Heading(6));
+        assert_eq!(detect_line_kind("  ## Indented"), LineKind::Heading(2));
+    }
+
+    #[test]
+    fn detect_line_kind_heading_requires_space_after_hashes() {
+        assert_eq!(detect_line_kind("##notheading"), LineKind::Paragraph);
+        assert_eq!(detect_line_kind("#"), LineKind::Paragraph);
+    }
+
+    #[test]
+    fn detect_line_kind_blockquote() {
+        assert_eq!(detect_line_kind("> quoted"), LineKind::Blockquote);
+        assert_eq!(detect_line_kind(">no space"), LineKind::Blockquote);
+        assert_eq!(detect_line_kind("  > indented"), LineKind::Blockquote);
+        assert_eq!(detect_line_kind(">"), LineKind::Blockquote);
+    }
+
+    #[test]
+    fn detect_line_kind_task_item() {
+        assert_eq!(detect_line_kind("- [ ] todo"), LineKind::TaskItem(false));
+        assert_eq!(detect_line_kind("- [x] done"), LineKind::TaskItem(true));
+        assert_eq!(detect_line_kind("- [X] done"), LineKind::TaskItem(true));
+        assert_eq!(detect_line_kind("* [ ] todo"), LineKind::TaskItem(false));
+        assert_eq!(
+            detect_line_kind("  - [x] indented"),
+            LineKind::TaskItem(true)
+        );
+    }
+
+    #[test]
+    fn detect_line_kind_bullet_item() {
+        assert_eq!(detect_line_kind("- item"), LineKind::BulletItem);
+        assert_eq!(detect_line_kind("* item"), LineKind::BulletItem);
+        assert_eq!(detect_line_kind("+ item"), LineKind::BulletItem);
+        assert_eq!(detect_line_kind("  - nested"), LineKind::BulletItem);
+        assert_eq!(detect_line_kind("-nospace"), LineKind::Paragraph);
+    }
+
+    #[test]
+    fn detect_line_kind_numbered_item() {
+        assert_eq!(detect_line_kind("1. first"), LineKind::NumberedItem);
+        assert_eq!(detect_line_kind("42. answer"), LineKind::NumberedItem);
+        assert_eq!(detect_line_kind("  3. nested"), LineKind::NumberedItem);
+        assert_eq!(detect_line_kind("1.nospace"), LineKind::Paragraph);
+    }
+
+    #[test]
+    fn detect_line_kind_horizontal_rule() {
+        assert_eq!(detect_line_kind("---"), LineKind::HorizontalRule);
+        assert_eq!(detect_line_kind("___"), LineKind::HorizontalRule);
+        assert_eq!(detect_line_kind("***"), LineKind::HorizontalRule);
+        assert_eq!(detect_line_kind("--------"), LineKind::HorizontalRule);
+        assert_eq!(detect_line_kind("  ---"), LineKind::HorizontalRule);
+        assert_eq!(detect_line_kind("---  "), LineKind::HorizontalRule);
+        assert_eq!(detect_line_kind("--"), LineKind::Paragraph);
+    }
+
+    #[test]
+    fn detect_line_kind_paragraph_default() {
+        assert_eq!(detect_line_kind("just text"), LineKind::Paragraph);
+        assert_eq!(detect_line_kind(""), LineKind::Paragraph);
+        assert_eq!(detect_line_kind("   "), LineKind::Paragraph);
     }
 
     #[test]
