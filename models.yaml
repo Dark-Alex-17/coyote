@@ -1759,6 +1759,18 @@
 #  - https://platform.deepseek.com/api-docs/api/create-chat-completion
 - provider: deepseek
   models:
+    - name: deepseek-v4-pro
+      max_input_tokens: 1000000
+      max_output_tokens: 384000
+      input_price: 0.435
+      output_price: 0.87
+      supports_function_calling: true
+    - name: deepseek-v4-flash
+      max_input_tokens: 1000000
+      max_output_tokens: 384000
+      input_price: 0.14
+      output_price: 0.28
+      supports_function_calling: true
     - name: deepseek-chat
       max_input_tokens: 64000
       max_output_tokens: 8192
