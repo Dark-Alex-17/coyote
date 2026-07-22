@@ -32,6 +32,10 @@ static NUMBERED_ITEM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*\d+\. +.+").unwrap());
 static HRULE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(-{3,}|_{3,}|\*{3,})\s*$").unwrap());
+static TABLE_SEPARATOR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*\|(\s*:?-+:?\s*\|)+\s*$").unwrap());
+static TABLE_ROW_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*\|.*\|\s*$").unwrap());
 
 static INLINE_CODE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"`([^`\n]+)`").unwrap());
@@ -62,6 +66,8 @@ pub enum LineKind {
     BulletItem,
     NumberedItem,
     HorizontalRule,
+    TableRow,
+    TableSeparator,
     Paragraph,
 }
 
@@ -89,6 +95,12 @@ fn detect_line_kind(line: &str) -> LineKind {
     }
     if NUMBERED_ITEM_RE.is_match(line).unwrap_or(false) {
         return LineKind::NumberedItem;
+    }
+    if TABLE_SEPARATOR_RE.is_match(line).unwrap_or(false) {
+        return LineKind::TableSeparator;
+    }
+    if TABLE_ROW_RE.is_match(line).unwrap_or(false) {
+        return LineKind::TableRow;
     }
     LineKind::Paragraph
 }
@@ -130,6 +142,7 @@ fn render_markdown_line(line: &str, kind: LineKind, styles: &MarkdownStyles) -> 
         LineKind::NumberedItem => render_numbered(line, styles),
         LineKind::TaskItem(checked) => render_task(line, checked, styles),
         LineKind::HorizontalRule => render_hrule(styles),
+        LineKind::TableRow | LineKind::TableSeparator => apply_inline(line, styles),
         LineKind::Paragraph => apply_inline(line, styles),
     }
 }
@@ -1029,6 +1042,42 @@ std::error::Error>> {
         assert_eq!(detect_line_kind("just text"), LineKind::Paragraph);
         assert_eq!(detect_line_kind(""), LineKind::Paragraph);
         assert_eq!(detect_line_kind("   "), LineKind::Paragraph);
+    }
+
+    #[test]
+    fn detect_line_kind_table_row() {
+        assert_eq!(detect_line_kind("| a | b |"), LineKind::TableRow);
+        assert_eq!(detect_line_kind("|a|b|c|"), LineKind::TableRow);
+        assert_eq!(detect_line_kind("  | a | b |  "), LineKind::TableRow);
+        assert_eq!(detect_line_kind("| | |"), LineKind::TableRow);
+    }
+
+    #[test]
+    fn detect_line_kind_table_separator() {
+        assert_eq!(detect_line_kind("|---|---|"), LineKind::TableSeparator);
+        assert_eq!(detect_line_kind("| --- | --- |"), LineKind::TableSeparator);
+        assert_eq!(
+            detect_line_kind("|:---|---:|:---:|---|"),
+            LineKind::TableSeparator,
+        );
+        assert_eq!(detect_line_kind("|:--|--:|:-:|"), LineKind::TableSeparator);
+        assert_eq!(detect_line_kind("  |---|---|  "), LineKind::TableSeparator);
+    }
+
+    #[test]
+    fn detect_line_kind_non_table_pipe_line_stays_paragraph() {
+        assert_eq!(
+            detect_line_kind("use `a | b` for or"),
+            LineKind::Paragraph,
+        );
+        assert_eq!(detect_line_kind("| trailing"), LineKind::Paragraph);
+        assert_eq!(detect_line_kind("no closer |"), LineKind::Paragraph);
+    }
+
+    #[test]
+    fn detect_line_kind_prefers_separator_over_row() {
+        assert_eq!(detect_line_kind("|---|---|"), LineKind::TableSeparator);
+        assert_ne!(detect_line_kind("|---|---|"), LineKind::TableRow);
     }
 
     fn test_styles() -> MarkdownStyles {
