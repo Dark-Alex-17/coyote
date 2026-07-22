@@ -7,6 +7,7 @@
 #   - <agent-name>_TOP_P
 #   - <agent-name>_GLOBAL_TOOLS (as a JSON string array)
 #   - <agent-name>_MCP_SERVERS (as a JSON string array)
+#   - <agent-name>_SPAWNABLE_AGENTS (as a JSON string array; see spawnable_agents below)
 #   - <agent-name>_AGENT_SESSION
 #   - <agent-name>_VARIABLES (as JSON array of key-value pairs; e.g. '[{"name": "username", "value": "alex"}]')
 
@@ -32,6 +33,12 @@ continuation_prompt: null        # Custom prompt used when auto-continuing (opti
 # Enable this agent to spawn and manage child agents in parallel.
 # See https://github.com/Dark-Alex-17/coyote/wiki/Agents for detailed documentation.
 can_spawn_agents: false          # Enable the agent to spawn child agents
+# spawnable_agents:              # Optional whitelist restricting which agents can be spawned via `agent__spawn`.
+#   - explore                    # If omitted (the default), ALL installed agents are spawnable. This is the unrestricted default.
+#   - coder                      # Provide a list to restrict. Match is exact and case-sensitive (use directory names).
+#   - oracle                     # An empty list ([]) means literally nothing spawnable.
+                                 # Also filters `agent__list_available` output so the LLM only sees what it can spawn.
+                                 # Graph agents (graph.yaml) ignore this; they declare spawn targets in agent nodes.
 max_concurrent_agents: 4         # Maximum number of agents that can run simultaneously
 max_agent_depth: 3               # Maximum nesting depth for sub-agents (prevents runaway spawning)
 inject_spawn_instructions: true  # Inject the default agent spawning instructions into the agent's system prompt

@@ -8,6 +8,13 @@ max_auto_continues: 25
 inject_todo_instructions: true
 
 can_spawn_agents: true
+spawnable_agents:
+  - explore
+  - librarian
+  - coder
+  - oracle
+  - code-reviewer
+  - step-runner
 max_concurrent_agents: 4
 max_agent_depth: 3
 inject_spawn_instructions: true

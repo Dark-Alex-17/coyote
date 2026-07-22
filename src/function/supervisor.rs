@@ -25,6 +25,13 @@ pub const SUPERVISOR_FUNCTION_PREFIX: &str = "agent__";
 
 pub const PENDING_AGENTS_GUARDRAIL_MAX: u32 = 3;
 
+fn agent_permitted(whitelist: Option<&[String]>, target: &str) -> bool {
+    match whitelist {
+        None => true,
+        Some(w) => w.iter().any(|a| a == target),
+    }
+}
+
 pub enum GuardrailAction {
     NoAction,
     Inject(String),
@@ -402,7 +409,7 @@ pub async fn handle_supervisor_tool(
         "check" => handle_check(ctx, args).await,
         "collect" => handle_collect(ctx, args).await,
         "list_running" => handle_list_running(ctx),
-        "list_available" => handle_list_available(),
+        "list_available" => handle_list_available(ctx),
         "cancel" => handle_cancel(ctx, args).await,
         "send_message" => handle_send_message(ctx, args),
         "check_inbox" => handle_check_inbox(ctx),
@@ -641,6 +648,18 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("'prompt' is required"))?
         .to_string();
     let _task_id = args.get("task_id").and_then(Value::as_str);
+
+    if let Some(parent) = ctx.agent.as_ref()
+        && !agent_permitted(parent.spawnable_agents(), &agent_name)
+    {
+        let whitelist = parent.spawnable_agents().unwrap_or_default();
+        return Ok(json!({
+            "status": "error",
+            "message": format!(
+                "Agent '{agent_name}' is not in this agent's `spawnable_agents` whitelist. Allowed: {whitelist:?}. Call `agent__list_available` to see what you can spawn."
+            ),
+        }));
+    }
 
     let short_uuid = &Uuid::new_v4().to_string()[..8];
     let agent_id = format!("agent_{agent_name}_{short_uuid}");
@@ -966,8 +985,17 @@ fn handle_list_running(ctx: &mut RequestContext) -> Result<Value> {
     }))
 }
 
-fn handle_list_available() -> Result<Value> {
-    let entries = list_agents_with_descriptions();
+fn handle_list_available(ctx: &RequestContext) -> Result<Value> {
+    let whitelist: Option<Vec<String>> = ctx
+        .agent
+        .as_ref()
+        .and_then(|a| a.spawnable_agents())
+        .map(<[String]>::to_vec);
+
+    let entries: Vec<(String, String)> = list_agents_with_descriptions()
+        .into_iter()
+        .filter(|(name, _)| agent_permitted(whitelist.as_deref(), name))
+        .collect();
     let count = entries.len();
     let agents: Vec<Value> = entries
         .into_iter()
@@ -1500,9 +1528,45 @@ mod tests {
 
     #[test]
     fn handle_list_available_returns_shape() {
-        let result = handle_list_available().unwrap();
+        let ctx = ctx_with_supervisor(4, 3);
+
+        let result = handle_list_available(&ctx).unwrap();
+
         assert!(result["count"].is_number());
         assert!(result["agents"].is_array());
+    }
+
+    #[test]
+    fn handle_list_available_unrestricted_when_no_whitelist() {
+        let ctx = ctx_with_supervisor(4, 3);
+        let result = handle_list_available(&ctx).unwrap();
+
+        let full_count = result["count"].as_u64().unwrap();
+
+        assert_eq!(full_count as usize, list_agents_with_descriptions().len());
+    }
+
+    #[test]
+    fn agent_permitted_none_whitelist_allows_all() {
+        assert!(agent_permitted(None, "explore"));
+        assert!(agent_permitted(None, "anything"));
+    }
+
+    #[test]
+    fn agent_permitted_empty_whitelist_denies_all() {
+        let empty: Vec<String> = vec![];
+
+        assert!(!agent_permitted(Some(&empty), "explore"));
+    }
+
+    #[test]
+    fn agent_permitted_named_whitelist_matches_exact() {
+        let allowed = vec!["explore".to_string(), "coder".to_string()];
+
+        assert!(agent_permitted(Some(&allowed), "explore"));
+        assert!(agent_permitted(Some(&allowed), "coder"));
+        assert!(!agent_permitted(Some(&allowed), "oracle"));
+        assert!(!agent_permitted(Some(&allowed), "Explore"));
     }
 
     #[test]

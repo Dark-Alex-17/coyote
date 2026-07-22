@@ -367,6 +367,10 @@ impl Agent {
         &self.config.mcp_servers
     }
 
+    pub fn spawnable_agents(&self) -> Option<&[String]> {
+        self.config.spawnable_agents.as_deref()
+    }
+
     pub fn skills_enabled(&self) -> Option<bool> {
         self.config.skills_enabled
     }
@@ -655,6 +659,8 @@ pub struct AgentConfig {
     pub auto_continue: bool,
     #[serde(default)]
     pub can_spawn_agents: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawnable_agents: Option<Vec<String>>,
     #[serde(default = "default_max_concurrent_agents")]
     pub max_concurrent_agents: usize,
     #[serde(default = "default_max_agent_depth")]
@@ -792,6 +798,11 @@ impl AgentConfig {
             && let Ok(v) = serde_json::from_str(&v)
         {
             self.mcp_servers = v;
+        }
+        if let Ok(v) = env::var(with_prefix("spawnable_agents"))
+            && let Ok(v) = serde_json::from_str(&v)
+        {
+            self.spawnable_agents = Some(v);
         }
         if let Some(v) = read_env_value::<String>(&with_prefix("agent_session")) {
             self.agent_session = v;
