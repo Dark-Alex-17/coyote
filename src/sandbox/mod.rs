@@ -390,7 +390,7 @@ fn copy_host_files(name: &str) -> Result<()> {
 
     let oauth_tokens_dir = paths::oauth_tokens_dir();
     if oauth_tokens_dir.exists() {
-        let sandbox_cache_dir = "/home/agent/.cache/coyote";
+        let sandbox_cache_dir = "/home/agent/.cache";
         let sandbox_oauth_dir = "/home/agent/.cache/coyote/oauth";
         ensure_sandbox_dir(name, sandbox_oauth_dir)?;
         let dest = format!("{name}:{sandbox_oauth_dir}/");
