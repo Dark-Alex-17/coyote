@@ -2,7 +2,7 @@ use crate::utils::decode_bin;
 
 use ansi_colours::AsRGB;
 use anyhow::{Context, Result, anyhow};
-use comfy_table::CellAlignment;
+use comfy_table::{CellAlignment, ContentArrangement, Table, presets::UTF8_FULL};
 use crossterm::style::{Color, Stylize};
 use crossterm::terminal;
 use fancy_regex::Regex;
@@ -242,6 +242,38 @@ fn render_hrule(styles: &MarkdownStyles) -> String {
     "────────".with(styles.hrule).to_string()
 }
 
+#[allow(dead_code)]
+fn colorize_box_chars(text: &str, color: Color) -> String {
+    let sample = "X".with(color).to_string();
+    let paint_idx = match sample.find('X') {
+        Some(i) => i,
+        None => return text.to_string(),
+    };
+    let prefix = &sample[..paint_idx];
+    let suffix = &sample[paint_idx + 1..];
+    if prefix.is_empty() && suffix.is_empty() {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len() + text.len() / 4);
+    let mut in_border = false;
+    for c in text.chars() {
+        let is_border = matches!(c, '\u{2500}'..='\u{257F}');
+        if is_border && !in_border {
+            out.push_str(prefix);
+            in_border = true;
+        } else if !is_border && in_border {
+            out.push_str(suffix);
+            in_border = false;
+        }
+        out.push(c);
+    }
+    if in_border {
+        out.push_str(suffix);
+    }
+    out
+}
+
 fn apply_inline(text: &str, styles: &MarkdownStyles) -> String {
     let mut code_bank: Vec<String> = Vec::new();
     let masked = regex_replace(text, &INLINE_CODE_RE, |caps| {
@@ -303,6 +335,16 @@ fn apply_inline(text: &str, styles: &MarkdownStyles) -> String {
     })
 }
 
+#[allow(dead_code)]
+enum TableState {
+    PendingHeader(String),
+    Active {
+        header: Vec<String>,
+        alignments: Vec<CellAlignment>,
+        rows: Vec<Vec<String>>,
+    },
+}
+
 pub struct MarkdownRender {
     options: RenderOptions,
     syntax_set: SyntaxSet,
@@ -312,6 +354,8 @@ pub struct MarkdownRender {
     prev_line_type: LineType,
     wrap_width: Option<u16>,
     styles: MarkdownStyles,
+    #[allow(dead_code)]
+    table_state: Option<TableState>,
 }
 
 impl MarkdownRender {
@@ -350,6 +394,7 @@ impl MarkdownRender {
             prev_line_type: line_type,
             wrap_width,
             styles,
+            table_state: None,
             options,
         })
     }
@@ -389,6 +434,49 @@ impl MarkdownRender {
     fn render_rich_markdown_line(&self, line: &str, kind: LineKind) -> String {
         let styled = render_markdown_line(line, kind, &self.styles);
         self.wrap_line(styled, false)
+    }
+
+    #[allow(dead_code)]
+    fn render_table(
+        &self,
+        header: Vec<String>,
+        alignments: Vec<CellAlignment>,
+        rows: Vec<Vec<String>>,
+    ) -> String {
+        let mut table = Table::new();
+        table.load_preset(UTF8_FULL);
+        table.set_content_arrangement(ContentArrangement::Dynamic);
+        if let Some(width) = self.wrap_width {
+            table.set_width(width);
+        }
+
+        let (heading_color, _) = self.styles.heading;
+        let styled_header: Vec<String> = header
+            .iter()
+            .map(|c| {
+                apply_inline(c, &self.styles)
+                    .with(heading_color)
+                    .bold()
+                    .to_string()
+            })
+            .collect();
+        table.set_header(styled_header);
+
+        for (i, align) in alignments.iter().enumerate() {
+            if let Some(col) = table.column_mut(i) {
+                col.set_cell_alignment(*align);
+            }
+        }
+
+        for row in rows {
+            let styled_row: Vec<String> = row
+                .iter()
+                .map(|c| apply_inline(c, &self.styles))
+                .collect();
+            table.add_row(styled_row);
+        }
+
+        colorize_box_chars(&table.to_string(), self.styles.table_border)
     }
 
     fn check_line(
@@ -1161,6 +1249,118 @@ std::error::Error>> {
                 CellAlignment::Left,
                 CellAlignment::Left,
             ],
+        );
+    }
+
+    #[test]
+    fn colorize_box_chars_wraps_border_runs() {
+        let input = "┌─┐\nabc\n└─┘";
+        let output = colorize_box_chars(input, Color::Red);
+        assert!(output.starts_with("\x1b["), "border run starts with SGR: {output:?}");
+        assert!(output.contains("abc"), "non-border content preserved");
+        assert!(output.contains("┌"));
+        assert!(output.contains("└"));
+    }
+
+    #[test]
+    fn colorize_box_chars_leaves_reset_color_untouched() {
+        let output = colorize_box_chars("no borders here", Color::Red);
+        assert_eq!(output, "no borders here");
+    }
+
+    #[test]
+    fn render_table_renders_headers_rows_and_borders() {
+        let options = RenderOptions::default();
+        let render = MarkdownRender::init(options).unwrap();
+        let header = vec!["A".into(), "B".into(), "C".into()];
+        let alignments = vec![
+            CellAlignment::Left,
+            CellAlignment::Left,
+            CellAlignment::Left,
+        ];
+        let rows = vec![
+            vec!["1".into(), "2".into(), "3".into()],
+            vec!["4".into(), "5".into(), "6".into()],
+        ];
+        let output = render.render_table(header, alignments, rows);
+        for expected in ["A", "B", "C", "1", "2", "3", "4", "5", "6"] {
+            assert!(output.contains(expected), "cell {expected:?} in output: {output:?}");
+        }
+        assert!(
+            output
+                .chars()
+                .any(|c| matches!(c, '\u{2500}'..='\u{257F}')),
+            "table has box-drawing chars: {output:?}",
+        );
+    }
+
+    #[test]
+    fn render_table_header_uses_bold() {
+        let options = RenderOptions::default();
+        let render = MarkdownRender::init(options).unwrap();
+        let header = vec!["Header".into()];
+        let alignments = vec![CellAlignment::Left];
+        let output = render.render_table(header, alignments, vec![]);
+        assert!(output.contains("\x1b[1m"), "bold SGR present: {output:?}");
+        assert!(output.contains("Header"));
+    }
+
+    #[test]
+    fn render_table_applies_inline_markdown_to_cells() {
+        let options = RenderOptions::default();
+        let render = MarkdownRender::init(options).unwrap();
+        let header = vec!["H".into()];
+        let alignments = vec![CellAlignment::Left];
+        let rows = vec![vec!["**bold**".into()]];
+        let output = render.render_table(header, alignments, rows);
+        assert!(
+            !output.contains("**bold**"),
+            "asterisks stripped from cell: {output:?}",
+        );
+        assert!(output.contains("bold"));
+        assert!(output.contains("\x1b[1m"), "bold SGR present: {output:?}");
+    }
+
+    #[test]
+    fn render_table_respects_alignment_specifiers() {
+        let options = RenderOptions::default();
+        let render = MarkdownRender::init(options).unwrap();
+        let header = vec!["L".into(), "R".into(), "C".into()];
+        let alignments = vec![
+            CellAlignment::Left,
+            CellAlignment::Right,
+            CellAlignment::Center,
+        ];
+        let rows = vec![vec!["a".into(), "b".into(), "c".into()]];
+        let output = render.render_table(header, alignments, rows);
+        for expected in ["L", "R", "C", "a", "b", "c"] {
+            assert!(output.contains(expected), "cell {expected:?} present");
+        }
+    }
+
+    #[test]
+    fn render_table_handles_wide_chars_and_emoji() {
+        let options = RenderOptions::default();
+        let render = MarkdownRender::init(options).unwrap();
+        let header = vec!["Name".into()];
+        let alignments = vec![CellAlignment::Left];
+        let rows = vec![vec!["🎉".into()], vec!["日本".into()]];
+        let output = render.render_table(header, alignments, rows);
+        assert!(output.contains("🎉"));
+        assert!(output.contains("日本"));
+        assert!(output.lines().count() > 4, "multi-line output: {output:?}");
+    }
+
+    #[test]
+    fn render_table_borders_wrapped_in_border_color() {
+        let options = RenderOptions::default();
+        let render = MarkdownRender::init(options).unwrap();
+        let header = vec!["a".into()];
+        let alignments = vec![CellAlignment::Left];
+        let output = render.render_table(header, alignments, vec![vec!["b".into()]]);
+        assert!(
+            output.starts_with("\x1b["),
+            "output starts with border color SGR: {output:?}",
         );
     }
 
