@@ -8,8 +8,6 @@ description: |
   sisyphus alongside explore when unfamiliar libraries/APIs/frameworks are
   involved.
 
-  Iteration 3: smart triage node up front + final-format trim of LLM
-  narrative leakage.
 version: "1.0"
 
 global_tools:

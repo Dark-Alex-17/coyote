@@ -1020,13 +1020,28 @@ pub fn list_agents_with_descriptions() -> Vec<(String, String)> {
     list_agents()
         .into_iter()
         .map(|name| {
-            let description = AgentConfig::load(&paths::agent_config_file(&name))
-                .ok()
-                .map(|c| c.description)
-                .unwrap_or_default();
+            let description = load_agent_description(&name);
             (name, description)
         })
         .collect()
+}
+
+#[derive(Deserialize)]
+struct AgentMetadataStub {
+    #[serde(default)]
+    description: String,
+}
+
+fn load_agent_description(name: &str) -> String {
+    if let Ok(config) = AgentConfig::load(&paths::agent_config_file(name)) {
+        return config.description;
+    }
+    if let Ok(contents) = read_to_string(paths::agent_graph_file(name))
+        && let Ok(meta) = serde_yaml::from_str::<AgentMetadataStub>(&contents)
+    {
+        return meta.description;
+    }
+    String::new()
 }
 
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
@@ -1217,5 +1232,39 @@ variables:
         );
         assert_eq!(config.max_agent_depth, default_max_agent_depth());
         assert_eq!(config.escalation_timeout, default_escalation_timeout());
+    }
+
+    #[test]
+    fn agent_metadata_stub_extracts_description_from_graph_yaml() {
+        let yaml = r#"
+name: librarian
+description: External-reference research agent.
+version: "1.0"
+start: triage
+nodes: {}
+"#;
+        let meta: AgentMetadataStub = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(meta.description, "External-reference research agent.");
+    }
+
+    #[test]
+    fn agent_metadata_stub_extracts_multiline_description() {
+        let yaml = r#"
+name: coder
+description: |
+  Implementation agent. Plans, implements, and runs build + tests in a
+  bounded fix-loop until verified.
+version: "1.0"
+"#;
+        let meta: AgentMetadataStub = serde_yaml::from_str(yaml).unwrap();
+        assert!(meta.description.starts_with("Implementation agent."));
+        assert!(meta.description.contains("bounded fix-loop"));
+    }
+
+    #[test]
+    fn agent_metadata_stub_defaults_when_description_missing() {
+        let yaml = "name: nameless\nversion: \"1.0\"\n";
+        let meta: AgentMetadataStub = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(meta.description, "");
     }
 }

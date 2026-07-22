@@ -10,8 +10,8 @@ use super::{
     AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
     Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, RIGHT_PROMPT, Role,
     RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
-    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents, memory,
-    paths,
+    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents,
+    list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
@@ -2338,21 +2338,18 @@ impl RequestContext {
             "rags" => print_asset_names("RAGs", &paths::list_rags()),
             "macros" => print_asset_names("macros", &paths::list_macros()),
             "agents" => {
-                let names = list_agents();
-                if names.is_empty() {
+                let entries = list_agents_with_descriptions();
+                if entries.is_empty() {
                     println!("No agents found.");
                     return Ok(());
                 }
 
                 println!("Agents:");
-                for name in names {
-                    let description = AgentConfig::load(&paths::agent_config_file(&name))
-                        .ok()
-                        .map(|c| c.description)
-                        .filter(|d| !d.is_empty());
-                    match description {
-                        Some(description) => println!("  • {name} — {description}"),
-                        None => println!("  • {name}"),
+                for (name, description) in entries {
+                    if description.is_empty() {
+                        println!("  • {name}");
+                    } else {
+                        println!("  • {name} — {description}");
                     }
                 }
 
