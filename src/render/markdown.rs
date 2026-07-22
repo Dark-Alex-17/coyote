@@ -1706,7 +1706,7 @@ std::error::Error>> {
     #[test]
     fn render_line_immutable_does_not_mutate_table_state() {
         let options = RenderOptions::default();
-        let mut render = MarkdownRender::init(options).unwrap();
+        let render = MarkdownRender::init(options).unwrap();
 
         let _ = render.render_line("| foo | ba");
 
@@ -1902,7 +1902,7 @@ std::error::Error>> {
             theme: None,
             ..Default::default()
         };
-        let mut render = MarkdownRender::init(options).unwrap();
+        let render = MarkdownRender::init(options).unwrap();
         let header = vec!["A".into()];
         let alignments = vec![CellAlignment::Left];
 
