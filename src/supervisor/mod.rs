@@ -58,6 +58,13 @@ impl Supervisor {
         self.handles.len()
     }
 
+    pub fn effective_active_count(&self) -> usize {
+        self.handles
+            .values()
+            .filter(|h| !h.join_handle.is_finished())
+            .count()
+    }
+
     pub fn max_concurrent(&self) -> usize {
         self.max_concurrent
     }
@@ -75,10 +82,10 @@ impl Supervisor {
     }
 
     pub fn register(&mut self, handle: AgentHandle) -> Result<()> {
-        if self.handles.len() >= self.max_concurrent {
+        if self.effective_active_count() >= self.max_concurrent {
             bail!(
                 "Cannot spawn agent: at capacity ({}/{})",
-                self.handles.len(),
+                self.effective_active_count(),
                 self.max_concurrent
             );
         }
@@ -188,8 +195,32 @@ mod tests {
 
     #[test]
     fn supervisor_register_rejects_at_capacity() {
+        // Keep the runtime alive in this scope so the spawned task is never
+        // polled (current_thread only polls inside block_on), keeping
+        // join_handle.is_finished() == false and the slot occupied.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let join_handle = rt.spawn(async {
+            Ok::<AgentResult, anyhow::Error>(AgentResult {
+                id: "done".into(),
+                agent_name: "test".into(),
+                output: "result".into(),
+                exit_status: AgentExitStatus::Completed,
+            })
+        });
+        let running_handle = AgentHandle {
+            id: "a1".to_string(),
+            agent_name: "explore".to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: create_abort_signal(),
+            join_handle,
+            child_supervisor: None,
+        };
         let mut sup = Supervisor::new(1, 3);
-        sup.register(make_handle("a1", "explore", 1)).unwrap();
+        sup.register(running_handle).unwrap();
         let result = sup.register(make_handle("a2", "coder", 1));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("at capacity"));

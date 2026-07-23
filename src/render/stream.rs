@@ -42,18 +42,21 @@ pub async fn raw_stream(
         if abort_signal.aborted() {
             break;
         }
-        if let Some(evt) = rx.recv().await {
-            if let Some(spinner) = spinner.take() {
-                spinner.stop();
-            }
-
-            match evt {
-                SseEvent::Text(text) => {
-                    print!("{text}");
-                    stdout().flush()?;
+        match rx.recv().await {
+            None => break,
+            Some(evt) => {
+                if let Some(spinner) = spinner.take() {
+                    spinner.stop();
                 }
-                SseEvent::Done => {
-                    break;
+
+                match evt {
+                    SseEvent::Text(text) => {
+                        print!("{text}");
+                        stdout().flush()?;
+                    }
+                    SseEvent::Done => {
+                        break;
+                    }
                 }
             }
         }

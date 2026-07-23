@@ -184,6 +184,20 @@ pub async fn eval_tool_calls(
         }
     }
 
+    {
+        let max_chars = ctx
+            .agent
+            .as_ref()
+            .and_then(|a| a.max_tool_result_chars())
+            .or_else(|| ctx.app.config.max_tool_result_chars);
+        if let Some(max_chars) = max_chars.filter(|&n| n > 0) {
+            output = output
+                .into_iter()
+                .map(|r| r.truncate_if_needed(max_chars))
+                .collect();
+        }
+    }
+
     Ok(output)
 }
 
@@ -218,6 +232,17 @@ impl ToolResult {
             text: None,
             thinking: vec![],
         }
+    }
+
+    pub fn truncate_if_needed(mut self, max_chars: usize) -> Self {
+        let s = self.output.to_string();
+        if s.len() > max_chars {
+            let prefix = s.get(..max_chars).unwrap_or(s.as_str());
+            self.output = json!(format!(
+                "[truncated: tool output exceeded {max_chars} chars]\n{prefix}"
+            ));
+        }
+        self
     }
 }
 

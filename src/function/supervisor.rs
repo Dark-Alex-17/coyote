@@ -1446,6 +1446,7 @@ mod tests {
     use crate::config::{AppState, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use serde_json::json;
+    use serial_test::serial;
 
     fn default_app_state() -> Arc<AppState> {
         Arc::new(AppState::test_default())
@@ -1537,6 +1538,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn handle_list_available_unrestricted_when_no_whitelist() {
         let ctx = ctx_with_supervisor(4, 3);
         let result = handle_list_available(&ctx).unwrap();

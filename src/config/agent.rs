@@ -531,6 +531,14 @@ impl Agent {
         self.config.compression_threshold
     }
 
+    pub fn max_tool_result_chars(&self) -> Option<usize> {
+        self.config.max_tool_result_chars
+    }
+
+    pub fn compression_keep_last(&self) -> Option<usize> {
+        self.config.compression_keep_last
+    }
+
     pub fn is_dynamic_instructions(&self) -> bool {
         self.config.dynamic_instructions
     }
@@ -679,6 +687,10 @@ pub struct AgentConfig {
     pub memory: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compression_threshold: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_result_chars: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_keep_last: Option<usize>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]

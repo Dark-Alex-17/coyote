@@ -570,7 +570,7 @@ impl Session {
         self.compressing = compressing;
     }
 
-    pub fn compress(&mut self, mut prompt: String) {
+    pub fn compress(&mut self, mut prompt: String, keep_last: usize) {
         if let Some(system_prompt) = self.messages.first().and_then(|v| {
             if MessageRole::System == v.role {
                 let content = v.content.to_text();
@@ -582,11 +582,17 @@ impl Session {
         }) {
             prompt = format!("{system_prompt}\n\n{prompt}",);
         }
+        let messages_to_keep = if keep_last > 0 && keep_last < self.messages.len() {
+            self.messages.split_off(self.messages.len() - keep_last)
+        } else {
+            vec![]
+        };
         self.compressed_messages.append(&mut self.messages);
         self.messages.push(Message::new(
             MessageRole::System,
             MessageContent::Text(prompt),
         ));
+        self.messages.extend(messages_to_keep);
         self.dirty = true;
         self.update_tokens();
     }
@@ -1032,7 +1038,7 @@ mod tests {
         assert_eq!(session.messages.len(), 2);
         assert!(session.compressed_messages.is_empty());
 
-        session.compress("Summary of conversation".to_string());
+        session.compress("Summary of conversation".to_string(), 0);
 
         assert!(!session.compressed_messages.is_empty());
         assert_eq!(session.messages.len(), 1);
@@ -1047,7 +1053,7 @@ mod tests {
             MessageContent::Text("hello".to_string()),
         ));
 
-        session.compress("Summary".to_string());
+        session.compress("Summary".to_string(), 0);
 
         assert!(!session.is_empty());
     }

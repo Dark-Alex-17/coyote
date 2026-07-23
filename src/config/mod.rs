@@ -239,8 +239,10 @@ pub struct Config {
 
     pub save_session: Option<bool>,
     pub compression_threshold: usize,
+    pub compression_keep_last: usize,
     pub summarization_prompt: Option<String>,
     pub summary_context_prompt: Option<String>,
+    pub max_tool_result_chars: Option<usize>,
 
     pub memory: Option<bool>,
     pub memory_cap_with_tools: Option<usize>,
@@ -318,8 +320,10 @@ impl Default for Config {
 
             save_session: None,
             compression_threshold: 4000,
+            compression_keep_last: 0,
             summarization_prompt: None,
             summary_context_prompt: None,
+            max_tool_result_chars: None,
 
             memory: None,
             memory_cap_with_tools: None,

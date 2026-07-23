@@ -3941,7 +3941,12 @@ impl RequestContext {
             .clone()
             .unwrap_or_else(|| SUMMARIZATION_PROMPT.into());
         let input = Input::from_str(self, &prompt, None)?;
-        let summary = input.fetch_chat_text().await?;
+        let summary = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            input.fetch_chat_text(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Compression LLM call timed out after 120 s"))??;
         let summary_context_prompt = self
             .app
             .config
@@ -3958,8 +3963,13 @@ impl RequestContext {
             String::new()
         };
 
+        let keep_last = self
+            .agent
+            .as_ref()
+            .and_then(|a| a.compression_keep_last())
+            .unwrap_or(self.app.config.compression_keep_last);
         if let Some(session) = self.session.as_mut() {
-            session.compress(format!("{todo_prefix}{summary_context_prompt}{summary}"));
+            session.compress(format!("{todo_prefix}{summary_context_prompt}{summary}"), keep_last);
         }
         self.discontinuous_last_message();
         Ok(())
