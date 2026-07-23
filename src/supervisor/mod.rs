@@ -153,12 +153,11 @@ impl Debug for Supervisor {
 mod tests {
     use super::*;
     use crate::utils::create_abort_signal;
+    use anyhow::Error;
+    use tokio::runtime::Builder;
 
     fn make_handle(id: &str, agent_name: &str, depth: usize) -> AgentHandle {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let join_handle = rt.spawn(async {
             Ok(AgentResult {
                 id: "done".into(),
@@ -198,12 +197,9 @@ mod tests {
         // Keep the runtime alive in this scope so the spawned task is never
         // polled (current_thread only polls inside block_on), keeping
         // join_handle.is_finished() == false and the slot occupied.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
         let join_handle = rt.spawn(async {
-            Ok::<AgentResult, anyhow::Error>(AgentResult {
+            Ok::<AgentResult, Error>(AgentResult {
                 id: "done".into(),
                 agent_name: "test".into(),
                 output: "result".into(),
