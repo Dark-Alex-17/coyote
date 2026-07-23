@@ -10,6 +10,9 @@ variables:
   - name: project_dir
     description: Project directory to explore
     default: '.'
+  - name: auto_confirm
+    description: Auto-confirm command execution
+    default: '1'
 
 mcp_servers:
   - ddg-search

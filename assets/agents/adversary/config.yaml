@@ -14,6 +14,9 @@ variables:
   - name: project_dir
     description: Project directory containing the changes under review
     default: '.'
+  - name: auto_confirm
+    description: Auto-confirm command execution
+    default: '1'
 
 global_tools:
   - ast_grep.sh

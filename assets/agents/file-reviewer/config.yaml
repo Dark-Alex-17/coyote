@@ -11,6 +11,9 @@ variables:
   - name: project_dir
     description: Project directory for context
     default: '.'
+  - name: auto_confirm
+    description: Auto-confirm command execution
+    default: '1'
 
 global_tools:
   - fs_read.sh
