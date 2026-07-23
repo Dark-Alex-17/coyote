@@ -187,6 +187,8 @@ summarization_prompt: >          # The text prompt used for creating a concise s
   'Summarize the discussion briefly in 200 words or less to use as a prompt for future context.'
 summary_context_prompt: >        # The text prompt used for including the summary of the entire session as context to the model
   'This is a summary of the chat history as a recap: '
+compression_keep_last: 0         # Number of most-recent messages to keep visible after compression (0 = compress all messages)
+max_tool_result_chars: null      # Cap on tool result characters forwarded to the model per call (null = no cap)
 
 # ---- Memory ----
 # See the [Memory documentation](https://github.com/Dark-Alex-17/coyote/wiki/Memory) for more information.
