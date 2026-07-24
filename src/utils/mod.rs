@@ -67,13 +67,13 @@ pub fn init_tool_colors(theme: &Theme) {
     if let Some(c) = resolve(theme, "comment") {
         let _ = TOOL_DIM_COLOR.set(c);
     }
-    if let Some(c) = resolve(theme, "string") {
+    if let Some(c) = resolve(theme, "support.function") {
         let _ = TOOL_FN_COLOR.set(c);
     }
     if let Some(c) = resolve(theme, "constant.numeric") {
         let _ = TOOL_KEY_COLOR.set(c);
     }
-    if let Some(c) = resolve(theme, "keyword") {
+    if let Some(c) = resolve(theme, "string") {
         let _ = TOOL_WARN_COLOR.set(c);
     }
 }
