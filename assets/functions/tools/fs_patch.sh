@@ -24,7 +24,7 @@ set -e
 # your changes).
 
 # @option --path! The path of the file to apply the patch to
-# @option --contents! The patch to apply to the file
+# @option --content! The patch to apply to the file
 
 # @env LLM_OUTPUT=/dev/stdout The output path
 
@@ -33,7 +33,7 @@ source "$LLM_PROMPT_UTILS_FILE"
 
 # shellcheck disable=SC2154
 main() {
-    argc_contents="$(jq -r '.contents' <<< "$LLM_TOOL_RAW_JSON")"
+    argc_contents="$(jq -r '.content' <<< "$LLM_TOOL_RAW_JSON")"
     argc_path="$(jq -r '.path' <<< "$LLM_TOOL_RAW_JSON")"
 
     if [[ ! -f "$argc_path" ]]; then

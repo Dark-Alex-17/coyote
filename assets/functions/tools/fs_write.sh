@@ -6,7 +6,7 @@ set -e
 # sending less data, and is less prone to accidental data loss.
 
 # @option --path! The path of the file to write to
-# @option --contents! The full contents to write to the file
+# @option --content! The full contents to write to the file
 
 # @env LLM_OUTPUT=/dev/stdout The output path
 
@@ -15,7 +15,7 @@ source "$LLM_PROMPT_UTILS_FILE"
 
 # shellcheck disable=SC2154
 main() {
-    argc_contents="$(jq -r '.contents' <<< "$LLM_TOOL_RAW_JSON")"
+    argc_contents="$(jq -r '.content' <<< "$LLM_TOOL_RAW_JSON")"
     argc_path="$(jq -r '.path' <<< "$LLM_TOOL_RAW_JSON")"
 
     if [[ -f "$argc_path" ]]; then
