@@ -5,10 +5,45 @@ project management similar to OpenCode, ClaudeCode, Codex, or Gemini CLI.
 
 _Inspired by the Sisyphus and Oracle agents of OpenCode._
 
-Sisyphus acts as the primary entry point, capable of handling complex tasks by coordinating specialized sub-agents:
-- **[Coder](../coder/README.md)**: For implementation and file modifications.
-- **[Explore](../explore/README.md)**: For codebase understanding and research.
-- **[Oracle](../oracle/README.md)**: For architecture and complex reasoning.
+Sisyphus acts as the primary entry point. Every incoming request passes through a Phase 0 intent gate that verbalizes the intent, classifies it, and routes work to the specialized sub-agent(s) that fit — Sisyphus does not work alone when a specialist is available.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    user([User request]) --> sisyphus["Sisyphus<br/>orchestrator"]
+    sisyphus --> classify{"Phase 0<br/>Intent gate"}
+
+    classify -->|"Trivial<br/>(single file, obvious)"| direct["Direct tools<br/>fs_read / fs_patch / execute_command"]
+    classify -->|"Find in code<br/>How does Y work?"| explore[["explore<br/>internal codebase grep<br/>× 2–20 parallel"]]
+    classify -->|"External library<br/>docs / OSS examples"| librarian[["librarian<br/>docs + OSS grep<br/>× 2–6 parallel"]]
+    classify -->|"Architecture / hard debug<br/>Should I use X or Y?"| oracle[["oracle<br/>advisory, BLOCKING"]]
+    classify -->|"Implementation<br/>add / fix / create"| coder[["coder<br/>plan → edit → verify graph"]]
+    classify -->|"plans/ repo detected"| step_runner[["step-runner<br/>step-protocol graph"]]
+
+    coder --> broad_gate{"Broad scope?<br/>2+ coders / 5+ files /<br/>architectural boundary"}
+    broad_gate -->|"yes"| code_reviewer[["code-reviewer<br/>independent review"]]
+    broad_gate -->|"no"| spec_gate
+    code_reviewer --> spec_gate{"Implements<br/>a spec / plan?"}
+    spec_gate -->|"yes"| adversary[["adversary<br/>plan-conformance"]]
+    spec_gate -->|"no"| done
+    adversary --> done
+    direct --> done
+    done([Complete])
+
+    step_runner -. "internally spawns" .-> coder
+    step_runner -. "internally spawns" .-> code_reviewer
+```
+
+Spawnable sub-agents (from `config.yaml`):
+
+- **[explore](../explore/README.md)** — internal codebase grep. Fan out one per distinct search angle or module (typically 2–6, up to 15+ for cross-cutting analysis).
+- **[librarian](../librarian/README.md)** — external grep for official docs and production OSS examples. Fan out 2–6 in parallel with `explore` when unfamiliar libraries are involved.
+- **[oracle](../oracle/README.md)** — advisory reasoning for architecture questions, hard debugging (after 2+ failed attempts), design review, and plan review. Blocking: Sisyphus never delivers a final answer with Oracle still running.
+- **[coder](../coder/README.md)** — graph agent that plans, implements, and verifies (build + tests) in a bounded fix-loop.
+- **[code-reviewer](../code-reviewer/README.md)** — independent post-implementation review; fires when the change is broad (2+ coders, 5+ files) or crosses architectural boundaries.
+- **[adversary](../adversary/README.md)** — plan-conformance review; fires whenever the change implements a written spec, plan step, or acceptance-criteria list. Orthogonal to `code-reviewer` — both can run.
+- **[step-runner](../step-runner/README.md)** — graph agent that executes one step of a phased plan repo. Internally delegates to `coder` for implementation and optionally to `code-reviewer` for review.
 
 ## Features
 
