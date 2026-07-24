@@ -10,22 +10,30 @@ implement-fix loop enforced as graph edges rather than prose.
 
 ## Workflow
 
-```
-analyze_request (llm + output_schema)   plan + complexity extraction
-        ↓
-route_complexity (script)               opt-out approval gate (complexity ≥ 7)
-        ↓
-gate_approval (approval, optional)
-        ↓
-implement (llm + fs tools)              actual file edits
-        ↓
-verify_build (script)
-        ↓
-verify_tests (script)
-        ↓
-fix_loop_gate (script)                  back-edge to implement (bounded)
-        ↓
-end_success / end_rejected / end_failure
+```mermaid
+flowchart TD
+    resolve_paths{"resolve_paths<br/>script"} --> analyze_request
+    analyze_request["analyze_request<br/>llm + output_schema"] --> route_complexity
+    route_complexity{"route_complexity<br/>script"}
+    route_complexity -->|"complexity ≥ 7"| gate_approval
+    route_complexity -->|else| implement
+    gate_approval{{"gate_approval<br/>approval"}}
+    gate_approval -->|yes| implement
+    gate_approval -->|no| end_rejected
+    implement["implement<br/>llm + fs tools"] --> verify_build
+    verify_build{"verify_build<br/>script"}
+    verify_build -->|pass| verify_tests
+    verify_build -->|fail| fix_loop_gate
+    verify_tests{"verify_tests<br/>script"}
+    verify_tests -->|pass| end_success
+    verify_tests -->|fail| fix_loop_gate
+    fix_loop_gate{"fix_loop_gate<br/>script"}
+    fix_loop_gate -->|"budget left"| implement
+    fix_loop_gate -->|"budget spent"| end_failure
+
+    end_success(["end_success<br/>CODER_COMPLETE"])
+    end_rejected(["end_rejected<br/>CODER_REJECTED"])
+    end_failure(["end_failure<br/>CODER_FAILED"])
 ```
 
 End nodes emit one of three sentinel outcomes for the caller:

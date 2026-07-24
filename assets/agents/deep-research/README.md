@@ -22,28 +22,43 @@ agent, this is the file to read alongside the
 
 ## Workflow
 
-17 nodes. `->` is the static route; a script node can also route
-dynamically via `_next`. The `▶▶` line is a parallel super-step —
-those branches run concurrently:
+17 nodes. Solid arrows are static `next` / `routes` edges declared in
+`graph.yaml`; script nodes can also route dynamically via `_next` (shown as
+labeled branches out of the diamond). Dotted arrows show `map` fan-out — the
+`research_each_question` node spawns one `research_one_question` branch per
+sub-question and joins them before continuing.
 
-```
-parse_request (script)              -> bootstrap_research   (or -> ask_topic if no topic)
-ask_topic (input)                   -> bootstrap_research
-bootstrap_research (script)         -> [plan, knowledge_lookup]   ▶▶ parallel
-plan (llm + output_schema)          -> research_each_question
-knowledge_lookup (rag)              -> research_each_question
-research_each_question (map)        -> combine_findings    (spawns one branch per question)
-  └─ research_one_question (llm)    (atomic; runs N×, joins at map)
-combine_findings (script)           -> vet_sources
-vet_sources (llm + custom tool)     -> critique
-critique (llm)                      -> reflexion_gate
-reflexion_gate (script)             -> synthesize  (or -> research_each_question: reflexion loop)
-synthesize (agent: report-writer)   -> verify_sources
-verify_sources (script)             -> approve
-approve (approval)                  -> end_accepted          ("accept")
-                                    -> end_rejected          ("reject")
-                                    -> incorporate_feedback   (any free-form answer)
-incorporate_feedback (script)       -> research_each_question (the human-feedback loop)
+```mermaid
+flowchart TD
+    parse_request{"parse_request<br/>script"}
+    parse_request -->|"topic given"| bootstrap_research
+    parse_request -->|"no topic"| ask_topic
+    ask_topic[/"ask_topic<br/>input"/] --> bootstrap_research
+    bootstrap_research{"bootstrap_research<br/>script"}
+    bootstrap_research --> plan
+    bootstrap_research --> knowledge_lookup
+    plan["plan<br/>llm + output_schema"] --> research_each_question
+    knowledge_lookup[("knowledge_lookup<br/>rag")] --> research_each_question
+    research_each_question[\research_each_question<br/>map/]
+    research_each_question -. "spawns × N" .-> research_one_question["research_one_question<br/>llm + web tools"]
+    research_each_question --> combine_findings
+    combine_findings{"combine_findings<br/>script"} --> vet_sources
+    vet_sources["vet_sources<br/>llm + classify_source"] --> critique
+    critique["critique<br/>llm"] --> reflexion_gate
+    reflexion_gate{"reflexion_gate<br/>script"}
+    reflexion_gate -->|"PASS"| synthesize
+    reflexion_gate -->|"REVISE (budget left)"| research_each_question
+    reflexion_gate -->|"REVISE (budget spent)"| synthesize
+    synthesize[["synthesize<br/>agent → report-writer"]] --> verify_sources
+    verify_sources{"verify_sources<br/>script"} --> approve
+    approve{{"approve<br/>approval"}}
+    approve -->|"accept"| end_accepted
+    approve -->|"reject"| end_rejected
+    approve -->|"other (free-form feedback)"| incorporate_feedback
+    incorporate_feedback{"incorporate_feedback<br/>script"} --> research_each_question
+
+    end_accepted(["end_accepted<br/>report"])
+    end_rejected(["end_rejected"])
 ```
 
 ### Node-type breakdown

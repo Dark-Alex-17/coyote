@@ -10,13 +10,25 @@ library, API, or framework is involved.
 
 ## Workflow
 
+```mermaid
+flowchart TD
+    triage["triage<br/>llm"] --> search
+    triage --> search_oss
+    search["search<br/>llm + ddg-search MCP"] --> synthesize
+    search_oss["search_oss<br/>llm + personal-github MCP"] --> synthesize
+    synthesize["synthesize<br/>llm + fetch_url_via_curl"] --> final_format
+    final_format{"final_format<br/>script"} --> end_success
+
+    end_success(["end_success<br/>LIBRARIAN_COMPLETE"])
+    end_failure(["end_failure<br/>LIBRARIAN_FAILED"])
 ```
-search (llm + ddg-search)         identify 3-5 authoritative sources
-   ↓
-synthesize (llm + fetch_url_via_curl)   fetch, extract, cite, synthesize
-   ↓
-end_success / end_failure         LIBRARIAN_COMPLETE / LIBRARIAN_FAILED
-```
+
+`triage` parses the prompt into language / doc-domain / query hints, then fans
+out to `search` (authoritative docs via `ddg-search`) and `search_oss`
+(production OSS examples via the `personal-github` MCP) in parallel. Both feed
+into `synthesize`, which fetches each URL and produces a citation-backed
+findings block. `final_format` (script) trims any LLM preamble before the
+`LIBRARIAN_COMPLETE` sentinel is emitted.
 
 Iteration 1 (this) is the happy-path MVP: single search pass, single synthesis
 pass, no quality-check loop. Future iterations may add:

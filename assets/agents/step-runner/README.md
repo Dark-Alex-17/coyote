@@ -18,32 +18,61 @@ plans/
 
 ## Workflow
 
-```
-resolve_step (script)         locate plan + previous handoff, check depends_on,
-        ↓                     mark plan in-progress   [→ gate_blocked if deps unsatisfied]
-orient (llm, read-only)       merge handoff directives + staleness-check the plan
-        ↓
-route_staleness (script)      major deviation → gate_deviation (approval)
-        ↓
-implement (agent → coder)     coder runs its own build/test/self-review fix-loop
-        ↓
-route_coder_result (script)   COMPLETE → verify | REJECTED / FAILED → end
-        ↓
-verify_format_lint (script)   format BEFORE evidence, then lint
-verify_build (script)         step-level build/typecheck
-verify_tests (script)         FULL test suite
-        ↓                     [failures → fix_loop_gate, back-edge to implement]
-edge_case_sweep (llm)         missed edge cases; annotate downstream plans
-        ↓                     (Edge cases sections ONLY - scope changes become proposals)
-route_sweep (script)          5+ files or architectural boundary → independent_review
-independent_review (agent)    code-reviewer; 🔴 findings loop back to implement (bounded)
-        ↓
-write_handoff (llm)           evidence-backed handoff per handoff-protocol + NOTES.md
-check_handoff (script)        deterministic schema gate; marks plan status complete
-        ↓
-gate_user_review (approval)   HARD STOP - approve, or send revision comments
-        ↓                     (revisions loop through implement → verify → handoff again)
-end_success / end_blocked / end_rejected / end_failure
+```mermaid
+flowchart TD
+    resolve_step{"resolve_step<br/>script"}
+    resolve_step -->|"deps satisfied"| orient
+    resolve_step -->|"deps unsatisfied"| gate_blocked
+    gate_blocked{{"gate_blocked<br/>approval"}}
+    gate_blocked -->|"yes"| orient
+    gate_blocked -->|"no"| end_blocked
+    orient["orient<br/>llm, read-only"] --> route_staleness
+    route_staleness{"route_staleness<br/>script"}
+    route_staleness -->|"major deviation"| gate_deviation
+    route_staleness -->|"else"| implement
+    gate_deviation{{"gate_deviation<br/>approval"}}
+    gate_deviation -->|"proceed"| implement
+    gate_deviation -->|"abort"| end_rejected
+    gate_deviation -->|"other (user guidance)"| implement
+    implement[["implement<br/>agent → coder"]] --> route_coder_result
+    route_coder_result{"route_coder_result<br/>script"}
+    route_coder_result -->|"CODER_COMPLETE"| verify_format_lint
+    route_coder_result -->|"REJECTED / FAILED"| end_failure
+    verify_format_lint{"verify_format_lint<br/>script"}
+    verify_format_lint -->|"pass"| verify_build
+    verify_format_lint -->|"fail"| fix_loop_gate
+    verify_build{"verify_build<br/>script"}
+    verify_build -->|"pass"| verify_tests
+    verify_build -->|"fail"| fix_loop_gate
+    verify_tests{"verify_tests<br/>script"}
+    verify_tests -->|"pass"| edge_case_sweep
+    verify_tests -->|"fail"| fix_loop_gate
+    fix_loop_gate{"fix_loop_gate<br/>script"}
+    fix_loop_gate -->|"budget left"| implement
+    fix_loop_gate -->|"budget spent"| end_failure
+    edge_case_sweep["edge_case_sweep<br/>llm"] --> route_sweep
+    route_sweep{"route_sweep<br/>script"}
+    route_sweep -->|"5+ files or boundary"| independent_review
+    route_sweep -->|"else"| write_handoff
+    independent_review[["independent_review<br/>agent → code-reviewer"]] --> route_review
+    route_review{"route_review<br/>script"}
+    route_review -->|"🔴 critical findings"| implement
+    route_review -->|"else"| write_handoff
+    write_handoff["write_handoff<br/>llm"] --> check_handoff
+    check_handoff{"check_handoff<br/>script"}
+    check_handoff -->|"schema valid"| gate_user_review
+    check_handoff -->|"one retry"| write_handoff
+    gate_user_review{{"gate_user_review<br/>approval"}}
+    gate_user_review -->|"approve"| end_success
+    gate_user_review -->|"revise"| get_revision
+    gate_user_review -->|"other (comments)"| revise_from_choice
+    get_revision[/"get_revision<br/>input"/] --> implement
+    revise_from_choice{"revise_from_choice<br/>script"} --> implement
+
+    end_success(["end_success<br/>STEP_COMPLETE"])
+    end_blocked(["end_blocked<br/>STEP_BLOCKED"])
+    end_rejected(["end_rejected<br/>STEP_REJECTED"])
+    end_failure(["end_failure<br/>STEP_FAILED"])
 ```
 
 End nodes emit sentinel outcomes for the caller:
