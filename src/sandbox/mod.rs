@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rust_embed::RustEmbed;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -46,8 +47,9 @@ pub fn launch(name: Option<String>) -> Result<()> {
         ..AppConfig::default()
     };
     let vault = Vault::init(&bootstrap)?;
-    inject_llm_secret(&config_content, &vault)?;
-    inject_mcp_secrets(&vault)?;
+    let registered = sbx_registered_services()?;
+    inject_llm_secret(&config_content, &vault, &registered)?;
+    inject_mcp_secrets(&vault, &registered)?;
 
     let discovered = mixins::discover()?;
 
@@ -197,7 +199,11 @@ fn compute_kit_hash() -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn inject_llm_secret(config_content: &str, vault: &Vault) -> Result<()> {
+fn inject_llm_secret(
+    config_content: &str,
+    vault: &Vault,
+    registered: &HashSet<String>,
+) -> Result<()> {
     let value: serde_yaml::Value = serde_yaml::from_str(config_content)
         .context("Failed to parse config for LLM secret injection")?;
 
@@ -218,6 +224,14 @@ fn inject_llm_secret(config_content: &str, vault: &Vault) -> Result<()> {
         let client_type = client.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let client_name = client.get("name").and_then(|v| v.as_str());
         let service = provider_to_sbx_service(client_type, client_name);
+
+        if registered.contains(&service) {
+            eprintln!(
+                "Secret for '{service}' already registered with sbx. \
+                 To update it, run: sbx secret set -g --force {service}"
+            );
+            continue;
+        }
 
         let secret_value = vault
             .get_secret(&secret_name, false)
@@ -242,7 +256,7 @@ fn find_secret_placeholder(value: &Value) -> Option<String> {
     }
 }
 
-fn inject_mcp_secrets(vault: &Vault) -> Result<()> {
+fn inject_mcp_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()> {
     let mcp_path = paths::mcp_config_file();
     if !mcp_path.exists() {
         return Ok(());
@@ -261,6 +275,14 @@ fn inject_mcp_secrets(vault: &Vault) -> Result<()> {
         let Some(secret_name) = find_secret_placeholder(server_config) else {
             continue;
         };
+
+        if registered.contains(server_name.as_str()) {
+            eprintln!(
+                "Secret for '{server_name}' already registered with sbx. \
+                 To update it, run: sbx secret set -g --force {server_name}"
+            );
+            continue;
+        }
 
         let secret_value = vault.get_secret(&secret_name, false).with_context(|| {
             format!(
@@ -285,17 +307,42 @@ fn provider_to_sbx_service(provider_type: &str, client_name: Option<&str>) -> St
     }
 }
 
+fn sbx_registered_services() -> Result<HashSet<String>> {
+    let (success, stdout, _) = run_command_with_output(SBX_BINARY, &["secret", "ls"], None)
+        .context("Failed to run `sbx secret ls`")?;
+
+    if !success {
+        return Ok(HashSet::new());
+    }
+
+    Ok(stdout
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let scope = parts.next()?;
+            let _kind = parts.next()?;
+            let name = parts.next()?;
+            if scope == "(global)" {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
 fn sbx_secret_set(service: &str, secret_value: &str) -> Result<()> {
     let mut child = Command::new(SBX_BINARY)
-        .args(["secret", "set", "-g", "--force", service])
+        .args(["secret", "set", "-g", service])
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .context("Failed to spawn `sbx secret set -g`")?;
 
-    if let Some(ref mut stdin) = child.stdin {
-        stdin
+    if let Some(mut stdin_handle) = child.stdin.take() {
+        stdin_handle
             .write_all(secret_value.as_bytes())
             .context("Failed to write secret to `sbx secret set -g` stdin")?;
     }
