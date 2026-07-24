@@ -28,4 +28,13 @@ While Coyote has since diverged significantly and is now developed as an
 independent project, its early foundation and inspiration came from the
 AIChat project.
 
-AIChat is licensed under the MIT License.
+AIChat is licensed under the MIT License. The MIT license text and its
+copyright notice are preserved in the [LICENSE-MIT](./LICENSE-MIT) file.
+
+## Licensing
+
+Coyote as a whole is licensed under the GNU Affero General Public License
+v3.0 only (AGPL-3.0-only); see [LICENSE](./LICENSE). Substantial portions
+derived from AIChat remain under the MIT License (Copyright (c) sigoden),
+preserved in [LICENSE-MIT](./LICENSE-MIT). See [NOTICE](./NOTICE) for the
+combined-licensing summary.

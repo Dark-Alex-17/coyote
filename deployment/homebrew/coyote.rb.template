@@ -14,7 +14,7 @@ class Coyote < Formula
     sha256 "$hash_linux"
   end
   version "$version"
-  license "MIT"
+  license "AGPL-3.0-only"
 
   def install
     bin.install "coyote"

@@ -6,6 +6,7 @@
 ![Crate.io downloads](https://img.shields.io/crates/d/coyote-ai?label=Crate%20downloads)
 [![GitHub Downloads](https://img.shields.io/github/downloads/Dark-Alex-17/coyote/total.svg?label=GitHub%20downloads)](https://github.com/Dark-Alex-17/coyote/releases)
 ![Docker pulls](https://img.shields.io/docker/pulls/darkalex17/coyote?label=Docker%20downloads)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](./LICENSE)
 
 Coyote is an all-in-one, batteries-included, LLM CLI tool featuring Shell Assistant, CLI & REPL Mode, RAG, AI Tools & 
 Agents, and More.
@@ -331,3 +332,16 @@ See [CREDITS.md](./CREDITS.md) for full attribution and background.
 
 ## Creator
 * [Alex Clarke](https://github.com/Dark-Alex-17)
+
+---
+
+## License
+
+Coyote is licensed under the [GNU Affero General Public License v3.0](./LICENSE)
+(AGPL-3.0-only).
+
+Coyote began as a fork of [AIChat](https://github.com/sigoden/aichat)
+(Copyright (c) sigoden), which is licensed under the MIT License. Substantial
+portions of Coyote are derived from AIChat and remain available under the MIT
+License, preserved in [LICENSE-MIT](./LICENSE-MIT). See [NOTICE](./NOTICE) and
+[CREDITS.md](./CREDITS.md) for details.

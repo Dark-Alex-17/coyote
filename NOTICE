@@ -1,0 +1,24 @@
+Coyote
+Copyright (c) 2025 Alexander J. Clarke
+
+This project as a whole is licensed under the GNU Affero General Public
+License, version 3.0 only (AGPL-3.0-only). The full text of that license is
+provided in the LICENSE file.
+
+--------------------------------------------------------------------------------
+Upstream / third-party notices
+--------------------------------------------------------------------------------
+
+Coyote began as a fork of AIChat (https://github.com/sigoden/aichat),
+Copyright (c) sigoden, which is distributed under the MIT License. Substantial
+portions of Coyote are derived from AIChat and remain available under the terms
+of the MIT License. The MIT License text and its required copyright and
+permission notices are preserved in the LICENSE-MIT file.
+
+As permitted by the MIT License, these portions have been incorporated into a
+larger work that is distributed under the AGPL-3.0-only license. When you
+receive Coyote as a combined work, your rights and obligations for the work as
+a whole are governed by the AGPL-3.0-only license; the MIT notice is retained
+to satisfy the attribution requirements of the MIT-licensed portions.
+
+See CREDITS.md for additional background and attribution.

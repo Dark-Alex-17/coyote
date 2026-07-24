@@ -9,7 +9,7 @@ homepage = "https://github.com/Dark-Alex-17/coyote"
 repository = "https://github.com/Dark-Alex-17/coyote"
 categories = ["command-line-utilities"]
 readme = "README.md"
-license = "MIT"
+license = "AGPL-3.0-only"
 rust-version = "1.95.0"
 exclude = [".github", "CONTRIBUTING.md"]
 
