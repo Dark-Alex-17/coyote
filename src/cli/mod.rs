@@ -600,5 +600,4 @@ mod tests {
     fn parse_sandbox_is_exclusive() {
         assert!(Cli::try_parse_from(["coyote", "--sandbox", "--agent", "foo"]).is_err());
     }
-
 }
