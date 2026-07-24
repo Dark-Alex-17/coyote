@@ -287,7 +287,7 @@ fn provider_to_sbx_service(provider_type: &str, client_name: Option<&str>) -> St
 
 fn sbx_secret_set(service: &str, secret_value: &str) -> Result<()> {
     let mut child = Command::new(SBX_BINARY)
-        .args(["secret", "set", service])
+        .args(["secret", "set", "-g", service])
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
