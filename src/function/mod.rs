@@ -1088,10 +1088,8 @@ impl ToolCall {
 
         cmd_args.push(json_data.to_string());
 
-        let prompt = format!("Call {cmd_name} {}", cmd_args.join(" "));
-
         if *IS_STDOUT_TERMINAL && current_depth == 0 {
-            println!("{}", dimmed_text(&prompt));
+            println!("{}", format_call_log(&cmd_name, &cmd_args, &json_data));
         }
 
         let output = match cmd_name.as_str() {
@@ -1550,6 +1548,47 @@ impl ToolCallTracker {
         }
         self.last_calls.push_back(call);
     }
+}
+
+fn format_call_log(cmd_name: &str, cmd_args: &[String], json_data: &serde_json::Value) -> String {
+    if *NO_COLOR {
+        return format!("Call {cmd_name} {}", cmd_args.join(" "));
+    }
+    let prefix_args = &cmd_args[..cmd_args.len().saturating_sub(1)];
+    let prefix = if prefix_args.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", dimmed_text(&prefix_args.join(" ")))
+    };
+    format!(
+        "{}{} {}{}",
+        dimmed_text("Call "),
+        cyan_bold_text(cmd_name),
+        prefix,
+        format_json_colored_keys(json_data),
+    )
+}
+
+fn format_json_colored_keys(value: &serde_json::Value) -> String {
+    let serde_json::Value::Object(map) = value else {
+        return dimmed_text(&value.to_string());
+    };
+    if map.is_empty() {
+        return dimmed_text("{}");
+    }
+    let pairs: Vec<String> = map
+        .iter()
+        .map(|(k, v)| {
+            let key = magenta_text(&format!("\"{k}\""));
+            format!("{}{}", key, dimmed_text(&format!(": {v}")))
+        })
+        .collect();
+    format!(
+        "{}{}{}",
+        dimmed_text("{"),
+        pairs.join(&dimmed_text(", ")),
+        dimmed_text("}")
+    )
 }
 
 #[cfg(test)]

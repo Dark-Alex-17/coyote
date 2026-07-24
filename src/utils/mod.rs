@@ -165,6 +165,21 @@ pub fn dimmed_text(input: &str) -> String {
     nu_ansi_term::Style::new().dimmed().paint(input).to_string()
 }
 
+pub fn cyan_bold_text(input: &str) -> String {
+    if *NO_COLOR {
+        return input.to_string();
+    }
+    nu_ansi_term::Style::new()
+        .fg(nu_ansi_term::Color::Cyan)
+        .bold()
+        .paint(input)
+        .to_string()
+}
+
+pub fn magenta_text(input: &str) -> String {
+    color_text(input, nu_ansi_term::Color::Magenta)
+}
+
 pub fn multiline_text(input: &str) -> String {
     input
         .split('\n')
