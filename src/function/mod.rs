@@ -1875,7 +1875,7 @@ mod tests {
     fn functions_append_user_interaction_adds_declarations() {
         let mut f = Functions::default();
         f.append_user_interaction_functions();
-        assert!(f.contains("user__ask"));
+        assert!(f.contains("user__select"));
         assert!(f.contains("user__confirm"));
         assert!(f.contains("user__input"));
         assert!(f.contains("user__checkbox"));

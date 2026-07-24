@@ -17,8 +17,11 @@ const CUSTOM_MULTI_CHOICE_ANSWER_OPTION: &str = "Other (custom)";
 pub fn user_interaction_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
         FunctionDeclaration {
-            name: format!("{USER_FUNCTION_PREFIX}ask"),
-            description: "Ask the user to select one option from a list. Returns the selected option. Indicate the recommended choice if there is one.".to_string(),
+            name: format!("{USER_FUNCTION_PREFIX}select"),
+            description: "Present a list of named options and ask the user to pick exactly one. \
+                          Indicate the recommended choice if there is one. \
+                          Use this — not `confirm` — whenever there are 2+ named options to choose \
+                          between. Returns the selected option.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([
@@ -50,7 +53,9 @@ pub fn user_interaction_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{USER_FUNCTION_PREFIX}confirm"),
-            description: "Ask the user a yes/no question. Returns \"yes\" or \"no\".".to_string(),
+            description: "Ask a genuinely binary yes/no question with no other choices. Do NOT \
+                          use for \"A or B?\" situations — use `select` instead. Returns \"yes\" \
+                          or \"no\".".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([(
@@ -68,7 +73,8 @@ pub fn user_interaction_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{USER_FUNCTION_PREFIX}input"),
-            description: "Ask the user for free-form text input. Returns the text entered.".to_string(),
+            description: "Collect free-form text from the user when no predefined options exist. \
+                          Returns the text entered.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([(
@@ -86,7 +92,9 @@ pub fn user_interaction_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{USER_FUNCTION_PREFIX}checkbox"),
-            description: "Ask the user to select one or more options from a list. Returns an array of selected options.".to_string(),
+            description: "Ask the user to pick one or more options from a list (multi-select). \
+                          Use when multiple answers are valid simultaneously. Returns an array \
+                          of selected options.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([
@@ -139,7 +147,7 @@ pub async fn handle_user_tool(
 
 fn handle_direct(action: &str, args: &Value) -> Result<Value> {
     match action {
-        "ask" => handle_direct_ask(args),
+        "select" => handle_direct_ask(args),
         "confirm" => handle_direct_confirm(args),
         "input" => handle_direct_input(args),
         "checkbox" => handle_direct_checkbox(args),

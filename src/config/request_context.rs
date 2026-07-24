@@ -4784,7 +4784,7 @@ mod tests {
         let fns = ctx.select_functions(&role).unwrap();
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains(&"todo__init"));
-        assert!(names.contains(&"user__ask"));
+        assert!(names.contains(&"user__select"));
     }
 
     #[test]
@@ -4848,7 +4848,7 @@ mod tests {
 
         let fns = ctx.select_functions(&role).unwrap();
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
-        assert!(names.contains(&"user__ask"));
+        assert!(names.contains(&"user__select"));
         assert!(!names.contains(&"skill__list"));
     }
 
@@ -4933,7 +4933,7 @@ mod tests {
             "teammate tools must survive an agent tool filter, got: {names:?}"
         );
         assert!(
-            names.contains(&"user__ask"),
+            names.contains(&"user__select"),
             "user__ tools must survive an agent tool filter, got: {names:?}"
         );
     }

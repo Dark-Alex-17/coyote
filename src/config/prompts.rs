@@ -207,7 +207,7 @@ pub(in crate::config) const DEFAULT_USER_INTERACTION_INSTRUCTIONS: &str = indoc!
     ## User Interaction
 
     You have built-in tools to interact with the user directly:
-        - `user__ask --question \"...\" --options [\"A\", \"B\", \"C\"]`: Present a selection prompt. Returns the chosen option.
+        - `user__select --question \"...\" --options [\"A\", \"B\", \"C\"]`: Present a single-select list of named options. Use this — not `user__confirm` — whenever there are 2+ named options. Returns the chosen option.
         - `user__confirm --question \"...\"`: Ask a yes/no question. Returns \"yes\" or \"no\".
         - `user__input --question \"...\"`: Request free-form text input from the user.
         - `user__checkbox --question \"...\" --options [\"A\", \"B\", \"C\"]`: Multi-select prompt. Returns an array of selected options.

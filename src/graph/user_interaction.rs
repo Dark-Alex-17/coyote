@@ -27,7 +27,7 @@ impl ApprovalNodeExecutor {
             &json!({ "question": question, "options": node.options }),
         )
         .await
-        .context("user__ask failed")?;
+        .context("user__select failed")?;
 
         if let Some(err) = response.get("error").and_then(Value::as_str) {
             bail!("Approval interaction failed: {err}");
