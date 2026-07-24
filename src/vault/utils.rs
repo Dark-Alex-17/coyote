@@ -1,4 +1,5 @@
 use crate::config::ensure_parent_exists;
+use crate::sandbox::SANDBOX_ENV_FLAG;
 use crate::vault::{SECRET_RE, Vault};
 use anyhow::Result;
 use anyhow::anyhow;
@@ -14,6 +15,7 @@ use indoc::formatdoc;
 use inquire::validator::Validation;
 use inquire::{Confirm, Password, PasswordDisplayMode, Select, Text, min_length, required};
 use log::debug;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -355,6 +357,9 @@ fn required_cli_preflight(label: &str, cli: &str, install_url: &str) {
 }
 
 pub fn interpolate_secrets(content: &str, vault: &Vault) -> Result<(String, Vec<String>)> {
+    if env::var_os(SANDBOX_ENV_FLAG).is_some() {
+        return Ok((content.to_string(), vec![]));
+    }
     interpolate_secrets_with(content, vault.auth_hint(), |name| {
         vault.get_secret(name, false)
     })
