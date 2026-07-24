@@ -413,6 +413,16 @@
 #  - https://docs.anthropic.com/en/api/messages
 - provider: claude
   models:
+    - name: claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_function_calling: true
+      supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1046,6 +1056,16 @@
       supports_function_calling: true
       reasoning_levels: [minimal, low, medium, high]
       default_reasoning_effort: high
+    - name: claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_function_calling: true
+      supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1243,6 +1263,16 @@
 #  - https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-call.html
 - provider: bedrock
   models:
+    - name: us.anthropic.claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_function_calling: true
+      supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: us.anthropic.claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -2111,6 +2141,16 @@
       max_input_tokens: 131072
       input_price: 0.1
       output_price: 0.2
+    - name: anthropic/claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_function_calling: true
+      supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: anthropic/claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
