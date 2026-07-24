@@ -210,7 +210,11 @@ async fn main() -> Result<()> {
     {
         let app = &*ctx.app.config;
         if app.highlight {
-            set_global_render_config(prompt_theme(app.render_options()?)?)
+            let render_opts = app.render_options()?;
+            if let Some(ref theme) = render_opts.theme {
+                utils::init_tool_colors(theme);
+            }
+            set_global_render_config(prompt_theme(render_opts)?)
         }
     }
 

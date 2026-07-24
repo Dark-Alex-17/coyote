@@ -31,9 +31,12 @@ use anyhow::{Context, Result};
 use fancy_regex::Regex;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use is_terminal::IsTerminal;
+use nu_ansi_term::Color;
 use std::borrow::Cow;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use std::{cmp, env, path::PathBuf, process};
+use syntect::highlighting::{Highlighter, Theme};
+use syntect::parsing::Scope;
 
 pub static CODE_BLOCK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?ms)```\w*(.*)```").unwrap());
@@ -47,6 +50,33 @@ pub static NO_COLOR: LazyLock<bool> = LazyLock::new(|| {
         .unwrap_or_default()
         || !*IS_STDOUT_TERMINAL
 });
+
+static TOOL_DIM_COLOR: OnceLock<Color> = OnceLock::new();
+static TOOL_FN_COLOR: OnceLock<Color> = OnceLock::new();
+static TOOL_KEY_COLOR: OnceLock<Color> = OnceLock::new();
+static TOOL_WARN_COLOR: OnceLock<Color> = OnceLock::new();
+
+pub fn init_tool_colors(theme: &Theme) {
+    fn resolve(theme: &Theme, scope_str: &str) -> Option<Color> {
+        let scope = Scope::new(scope_str).ok()?;
+        let style = Highlighter::new(theme).style_mod_for_stack(&[scope]);
+        let fg = style.foreground.or(theme.settings.foreground)?;
+        let mute = |ch: u8| -> u8 { ((ch as u16 + 128) / 2) as u8 };
+        Some(Color::Rgb(mute(fg.r), mute(fg.g), mute(fg.b)))
+    }
+    if let Some(c) = resolve(theme, "comment") {
+        let _ = TOOL_DIM_COLOR.set(c);
+    }
+    if let Some(c) = resolve(theme, "string") {
+        let _ = TOOL_FN_COLOR.set(c);
+    }
+    if let Some(c) = resolve(theme, "constant.numeric") {
+        let _ = TOOL_KEY_COLOR.set(c);
+    }
+    if let Some(c) = resolve(theme, "keyword") {
+        let _ = TOOL_WARN_COLOR.set(c);
+    }
+}
 
 pub fn now() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
@@ -141,18 +171,22 @@ pub fn indent_text<T: ToString>(s: T, size: usize) -> String {
 }
 
 pub fn error_text(input: &str) -> String {
-    color_text(input, nu_ansi_term::Color::Red)
+    color_text(input, Color::Red)
 }
 
 pub fn warning_text(input: &str) -> String {
-    color_text(input, nu_ansi_term::Color::Yellow)
+    color_text(input, Color::Yellow)
 }
 
 pub fn muted_warning_text(input: &str) -> String {
-    color_text(input, nu_ansi_term::Color::Fixed(136))
+    if *NO_COLOR {
+        return input.to_string();
+    }
+    let color = TOOL_WARN_COLOR.get().copied().unwrap_or(Color::Fixed(136));
+    color.paint(input).to_string()
 }
 
-pub fn color_text(input: &str, color: nu_ansi_term::Color) -> String {
+pub fn color_text(input: &str, color: Color) -> String {
     if *NO_COLOR {
         return input.to_string();
     }
@@ -166,22 +200,28 @@ pub fn dimmed_text(input: &str) -> String {
     if *NO_COLOR {
         return input.to_string();
     }
-    nu_ansi_term::Color::Fixed(243).paint(input).to_string()
+    let color = TOOL_DIM_COLOR.get().copied().unwrap_or(Color::Fixed(243));
+    color.paint(input).to_string()
 }
 
 pub fn cyan_bold_text(input: &str) -> String {
     if *NO_COLOR {
         return input.to_string();
     }
+    let color = TOOL_FN_COLOR.get().copied().unwrap_or(Color::Fixed(73));
     nu_ansi_term::Style::new()
-        .fg(nu_ansi_term::Color::Fixed(73))
+        .fg(color)
         .bold()
         .paint(input)
         .to_string()
 }
 
 pub fn magenta_text(input: &str) -> String {
-    color_text(input, nu_ansi_term::Color::Fixed(133))
+    if *NO_COLOR {
+        return input.to_string();
+    }
+    let color = TOOL_KEY_COLOR.get().copied().unwrap_or(Color::Fixed(133));
+    color.paint(input).to_string()
 }
 
 pub fn multiline_text(input: &str) -> String {
