@@ -14,6 +14,7 @@ library, API, or framework is involved.
 flowchart TD
     triage["triage<br/>llm"] --> search
     triage --> search_oss
+    triage -.->|"fallback"| end_failure
     search["search<br/>llm + ddg-search MCP"] --> synthesize
     search_oss["search_oss<br/>llm + personal-github MCP"] --> synthesize
     synthesize["synthesize<br/>llm + fetch_url_via_curl"] --> final_format
