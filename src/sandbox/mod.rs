@@ -1,19 +1,23 @@
 use anyhow::{Context, Result, anyhow, bail};
 use rust_embed::RustEmbed;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use which::which;
 
 mod mixins;
 
-use gman::providers::SupportedProvider;
-
+use crate::config::AppConfig;
+use crate::config::Config;
+use crate::config::VAULT_DATA_FILE_NAME;
 use crate::config::paths;
 use crate::sandbox::mixins::DiscoveredMixin;
 use crate::utils::run_command_with_output;
+use crate::vault::SECRET_RE;
 use crate::vault::Vault;
 
 const SBX_BINARY: &str = "sbx";
@@ -24,49 +28,35 @@ const SANDBOX_AGENT: &str = "coyote";
 #[folder = "assets/sbx-kit/"]
 struct EmbeddedKit;
 
-#[derive(RustEmbed)]
-#[folder = "assets/sbx-vault-mixins/"]
-struct EmbeddedVaultMixins;
-
-pub fn launch(name: Option<String>, fresh: bool, no_mixins: bool) -> Result<()> {
+pub fn launch(name: Option<String>) -> Result<()> {
     ensure_sbx_installed()?;
     bail_if_nested()?;
 
     let name = resolve_name(name)?;
     let kit_path = resolve_kit_path()?;
 
-    let discovered = if no_mixins {
-        Vec::new()
-    } else {
-        let mut all = mixins::discover()?;
-        if let Ok(vault) = Vault::init_bare()
-            && let Some(vault_mixin) = extract_vault_mixin(&vault.provider)?
-        {
-            all.insert(0, vault_mixin);
-        }
-        all
+    let config_path = paths::config_file();
+    if !config_path.exists() {
+        bail!("No Coyote config found. Run `coyote` on your host to complete setup first.");
+    }
+    let (config, config_content) = Config::load_from_file(&config_path)?;
+    let bootstrap = AppConfig {
+        vault_password_file: config.vault_password_file.clone(),
+        secrets_provider: config.secrets_provider.clone(),
+        ..AppConfig::default()
     };
+    let vault = Vault::init(&bootstrap)?;
+    inject_llm_secret(&config_content, &vault)?;
+    inject_mcp_secrets(&vault)?;
+
+    let discovered = mixins::discover()?;
 
     if sandbox_exists(&name)? {
         info!("Re-attaching to existing sandbox '{name}'");
-        if fresh {
-            debug!("--fresh ignored: re-attaching to existing sandbox '{name}'");
-        }
-        if no_mixins {
-            debug!("--no-mixins ignored: re-attaching to existing sandbox '{name}'");
-        }
     } else {
-        mixins::log_discovery(&discovered, no_mixins);
-
-        if fresh {
-            let msg = format!("Creating fresh sandbox '{name}' (no host config will be copied)");
-            info!("{msg}");
-            println!("{msg}");
-            create_sandbox(&name, &kit_path, &discovered)?;
-        } else {
-            create_sandbox(&name, &kit_path, &discovered)?;
-            copy_host_files(&name)?;
-        }
+        mixins::log_discovery(&discovered, false);
+        create_sandbox(&name, &kit_path, &discovered)?;
+        copy_host_files(&name)?;
     }
 
     exec_run(&name, &kit_path)
@@ -207,97 +197,118 @@ fn compute_kit_hash() -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn extract_vault_mixin(provider: &SupportedProvider) -> Result<Option<DiscoveredMixin>> {
-    let provider_dir = match provider {
-        SupportedProvider::Local { .. } => return Ok(None),
-        SupportedProvider::AwsSecretsManager { .. } => "aws_secrets_manager",
-        SupportedProvider::GcpSecretManager { .. } => "gcp_secret_manager",
-        SupportedProvider::AzureKeyVault { .. } => "azure_key_vault",
-        SupportedProvider::Gopass { .. } => "gopass",
-        SupportedProvider::OnePassword { .. } => "one_password",
+fn inject_llm_secret(config_content: &str, vault: &Vault) -> Result<()> {
+    let value: serde_yaml::Value = serde_yaml::from_str(config_content)
+        .context("Failed to parse config for LLM secret injection")?;
+
+    let Some(clients) = value.get("clients").and_then(|v| v.as_sequence()) else {
+        return Ok(());
     };
 
-    let cache_root = extract_vault_mixins_cache()?;
-    let provider_root = cache_root.join(provider_dir);
-    let spec_path = provider_root.join("spec.yaml");
+    for client in clients {
+        let Some(api_key) = client.get("api_key").and_then(|v| v.as_str()) else {
+            continue;
+        };
 
-    if !spec_path.exists() {
-        bail!(
-            "Embedded vault mixin for '{provider_dir}' is missing spec.yaml at {}",
-            spec_path.display()
-        );
+        let Some(caps) = SECRET_RE.captures(api_key)? else {
+            continue;
+        };
+        let secret_name = caps[1].to_string();
+
+        let client_type = client.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let client_name = client.get("name").and_then(|v| v.as_str());
+        let service = provider_to_sbx_service(client_type, client_name);
+
+        let secret_value = vault
+            .get_secret(&secret_name, false)
+            .with_context(|| format!("Failed to decrypt LLM api_key secret '{secret_name}'"))?;
+
+        sbx_secret_set(&service, &secret_value)?;
     }
 
-    let label = format!("<built-in: vault-{provider_dir}>");
-    let (install_count, domain_count) = mixins::summarize(&spec_path)?;
-
-    Ok(Some(DiscoveredMixin {
-        path: provider_root,
-        label,
-        install_count,
-        domain_count,
-    }))
+    Ok(())
 }
 
-fn extract_vault_mixins_cache() -> Result<PathBuf> {
-    let cache_root = paths::sbx_vault_mixins_dir();
-    let new_hash = compute_vault_mixins_hash()?;
-    let hash_file = paths::sbx_vault_mixins_hash_file();
-    if let Ok(existing) = fs::read_to_string(&hash_file)
-        && existing == new_hash
-    {
-        return Ok(cache_root);
+fn find_secret_placeholder(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => SECRET_RE
+            .captures(s)
+            .ok()
+            .flatten()
+            .map(|caps| caps[1].to_string()),
+        Value::Object(map) => map.values().find_map(find_secret_placeholder),
+        Value::Array(arr) => arr.iter().find_map(find_secret_placeholder),
+        _ => None,
+    }
+}
+
+fn inject_mcp_secrets(vault: &Vault) -> Result<()> {
+    let mcp_path = paths::mcp_config_file();
+    if !mcp_path.exists() {
+        return Ok(());
     }
 
-    if cache_root.exists() {
-        fs::remove_dir_all(&cache_root).with_context(|| {
+    let content = fs::read_to_string(&mcp_path)
+        .with_context(|| format!("Failed to read {}", mcp_path.display()))?;
+    let mcp: Value = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", mcp_path.display()))?;
+
+    let Some(servers) = mcp.get("mcpServers").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+
+    for (server_name, server_config) in servers {
+        let Some(secret_name) = find_secret_placeholder(server_config) else {
+            continue;
+        };
+
+        let secret_value = vault.get_secret(&secret_name, false).with_context(|| {
             format!(
-                "Failed to clear stale vault mixins at {}",
-                cache_root.display()
+                "Secret '{secret_name}' referenced by MCP server '{server_name}' not found \
+                 in vault. Add it with: coyote --add-secret {secret_name}"
             )
         })?;
-    }
-    fs::create_dir_all(&cache_root)
-        .with_context(|| format!("Failed to create {}", cache_root.display()))?;
 
-    for entry in EmbeddedVaultMixins::iter() {
-        let file = EmbeddedVaultMixins::get(&entry).ok_or_else(|| {
-            anyhow!("Embedded vault mixin file missing during extraction: {entry}")
-        })?;
-        let dest = cache_root.join(entry.as_ref());
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}", parent.display()))?;
-        }
-
-        fs::write(&dest, &file.data)
-            .with_context(|| format!("Failed to write {}", dest.display()))?;
+        sbx_secret_set(server_name, &secret_value)?;
     }
 
-    fs::write(&hash_file, &new_hash)
-        .with_context(|| format!("Failed to write {}", hash_file.display()))?;
-    debug!(
-        "Extracted embedded sbx-vault-mixins to {}",
-        cache_root.display()
-    );
-
-    Ok(cache_root)
+    Ok(())
 }
 
-fn compute_vault_mixins_hash() -> Result<String> {
-    let mut hasher = Sha256::new();
-    let mut entries: Vec<_> = EmbeddedVaultMixins::iter().collect();
-    entries.sort();
+fn provider_to_sbx_service(provider_type: &str, client_name: Option<&str>) -> String {
+    match provider_type {
+        "claude" => "anthropic".to_string(),
+        "openai" => "openai".to_string(),
+        "gemini" | "vertexai" => "google".to_string(),
+        "openai-compatible" => client_name.unwrap_or("openai-compatible").to_string(),
+        other => client_name.unwrap_or(other).to_string(),
+    }
+}
 
-    for entry in &entries {
-        let file = EmbeddedVaultMixins::get(entry)
-            .ok_or_else(|| anyhow!("Embedded vault mixin file missing during hash: {entry}"))?;
-        hasher.update(entry.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(&file.data);
+fn sbx_secret_set(service: &str, secret_value: &str) -> Result<()> {
+    let mut child = Command::new(SBX_BINARY)
+        .args(["secret", "set", "-g", service])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("Failed to spawn `sbx secret set -g`")?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        stdin
+            .write_all(secret_value.as_bytes())
+            .context("Failed to write secret to `sbx secret set -g` stdin")?;
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    let status = child
+        .wait()
+        .context("Failed to wait for `sbx secret set -g`")?;
+
+    if !status.success() {
+        bail!("`sbx secret set -g {service}` exited with {status}");
+    }
+
+    Ok(())
 }
 
 fn sandbox_exists(name: &str) -> Result<bool> {
@@ -367,7 +378,6 @@ fn build_create_args(
 
 fn copy_host_files(name: &str) -> Result<()> {
     let config_dir = paths::config_dir();
-    let home_dir = dirs::home_dir().context("Could not determine home directory")?;
 
     if config_dir.exists() {
         let sandbox_config_dir = "/home/agent/.config/coyote";
@@ -378,6 +388,9 @@ fn copy_host_files(name: &str) -> Result<()> {
         {
             let entry = entry?;
             let path = entry.path();
+            if path.file_name().is_some_and(|n| n == VAULT_DATA_FILE_NAME) {
+                continue;
+            }
             sbx_cp(&path.display().to_string(), &dest)?;
         }
         chown_agent_recursive(name, sandbox_config_dir)?;
@@ -409,84 +422,7 @@ fn copy_host_files(name: &str) -> Result<()> {
         );
     }
 
-    match resolve_vault_password_file() {
-        Some(password_file) if password_file.exists() => {
-            let dest_path = host_to_sandbox_path(&password_file, &home_dir, cfg!(windows))?;
-            if let Some(parent) = sandbox_path_parent(&dest_path)
-                && !parent.is_empty()
-            {
-                ensure_sandbox_dir(name, parent)?;
-            }
-            let dest = format!("{name}:{dest_path}");
-            sbx_cp(&password_file.display().to_string(), &dest)?;
-            chown_agent_recursive(name, &dest_path)?;
-        }
-        Some(password_file) => {
-            debug!(
-                "Skipping vault password copy: {} does not exist",
-                password_file.display()
-            );
-        }
-        None => {
-            debug!("Skipping vault password copy: no local vault provider configured");
-        }
-    }
-
     Ok(())
-}
-
-fn host_to_sandbox_path(
-    host_path: &Path,
-    home_dir: &Path,
-    is_windows_host: bool,
-) -> Result<String> {
-    let host_str = host_path.to_str().context("Host path is not valid UTF-8")?;
-    let home_str = home_dir
-        .to_str()
-        .context("Home directory is not valid UTF-8")?;
-
-    if let Some(rel) = strip_host_home(host_str, home_str) {
-        let unixified = rel.replace('\\', "/");
-        return Ok(format!("/home/agent/{unixified}"));
-    }
-
-    if is_windows_host {
-        bail!(
-            "Path '{host_str}' is outside your Windows user profile ({home_str}). \
-             Sandbox mode cannot copy files from outside %USERPROFILE% into a Linux \
-             sandbox. Move the file under your user profile and update your config \
-             accordingly."
-        );
-    }
-
-    Ok(host_str.to_string())
-}
-
-fn strip_host_home(path: &str, home: &str) -> Option<String> {
-    let path_norm: String = path
-        .chars()
-        .map(|c| if c == '\\' { '/' } else { c })
-        .collect();
-    let home_norm: String = home
-        .chars()
-        .map(|c| if c == '\\' { '/' } else { c })
-        .collect();
-    let home_norm = home_norm.trim_end_matches('/');
-
-    if home_norm.is_empty() || path_norm.len() <= home_norm.len() {
-        return None;
-    }
-
-    let (head, tail) = path_norm.split_at(home_norm.len());
-    if head != home_norm || !tail.starts_with('/') {
-        return None;
-    }
-
-    Some(tail[1..].to_string())
-}
-
-fn sandbox_path_parent(linux_path: &str) -> Option<&str> {
-    linux_path.rsplit_once('/').map(|(parent, _)| parent)
 }
 
 fn ensure_sandbox_dir(sandbox: &str, dir: &str) -> Result<()> {
@@ -508,10 +444,6 @@ fn ensure_sandbox_dir(sandbox: &str, dir: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn resolve_vault_password_file() -> Option<PathBuf> {
-    Vault::init_bare().ok()?.local_password_file().ok()
 }
 
 fn sbx_cp(src: &str, dest: &str) -> Result<()> {
@@ -706,280 +638,5 @@ mod tests {
                 ".".to_string(),
             ]
         );
-    }
-
-    mod vault_mixins {
-        use super::*;
-        use crate::utils::get_env_name;
-        use gman::providers::aws_secrets_manager::AwsSecretsManagerProvider;
-        use gman::providers::azure_key_vault::AzureKeyVaultProvider;
-        use gman::providers::gcp_secret_manager::GcpSecretManagerProvider;
-        use gman::providers::gopass::GopassProvider;
-        use gman::providers::local::LocalProvider;
-        use gman::providers::one_password::OnePasswordProvider;
-        use serial_test::serial;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        struct TestCacheDirGuard {
-            key: String,
-            previous: Option<std::ffi::OsString>,
-            path: PathBuf,
-        }
-
-        impl TestCacheDirGuard {
-            fn new() -> Self {
-                let key = get_env_name("cache_dir");
-                let previous = env::var_os(&key);
-                let unique = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos();
-                let path = env::temp_dir().join(format!("coyote-sandbox-vault-tests-{unique}"));
-                fs::create_dir_all(&path).unwrap();
-                unsafe {
-                    env::set_var(&key, &path);
-                }
-                Self {
-                    key,
-                    previous,
-                    path,
-                }
-            }
-        }
-
-        impl Drop for TestCacheDirGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.previous {
-                        Some(v) => env::set_var(&self.key, v),
-                        None => env::remove_var(&self.key),
-                    }
-                }
-                let _ = fs::remove_dir_all(&self.path);
-            }
-        }
-
-        #[test]
-        fn returns_none_for_local() {
-            let p = SupportedProvider::Local {
-                provider_def: LocalProvider::default(),
-            };
-            assert!(extract_vault_mixin(&p).unwrap().is_none());
-        }
-
-        #[test]
-        #[serial]
-        fn returns_some_for_aws() {
-            let _guard = TestCacheDirGuard::new();
-            let p = SupportedProvider::AwsSecretsManager {
-                provider_def: AwsSecretsManagerProvider {
-                    aws_profile: None,
-                    aws_region: None,
-                },
-            };
-            let m = extract_vault_mixin(&p)
-                .unwrap()
-                .expect("expected vault mixin");
-            assert!(m.path.join("spec.yaml").exists());
-            assert!(m.label.contains("aws_secrets_manager"));
-        }
-
-        #[test]
-        #[serial]
-        fn returns_some_for_gcp() {
-            let _guard = TestCacheDirGuard::new();
-            let p = SupportedProvider::GcpSecretManager {
-                provider_def: GcpSecretManagerProvider {
-                    gcp_project_id: None,
-                },
-            };
-            let m = extract_vault_mixin(&p)
-                .unwrap()
-                .expect("expected vault mixin");
-            assert!(m.path.join("spec.yaml").exists());
-            assert!(m.label.contains("gcp_secret_manager"));
-        }
-
-        #[test]
-        #[serial]
-        fn returns_some_for_one_password() {
-            let _guard = TestCacheDirGuard::new();
-            let p = SupportedProvider::OnePassword {
-                provider_def: OnePasswordProvider {
-                    vault: None,
-                    account: None,
-                },
-            };
-            let m = extract_vault_mixin(&p)
-                .unwrap()
-                .expect("expected vault mixin");
-            assert!(m.path.join("spec.yaml").exists());
-            assert!(m.label.contains("one_password"));
-        }
-
-        #[test]
-        #[serial]
-        fn returns_some_for_azure() {
-            let _guard = TestCacheDirGuard::new();
-            let p = SupportedProvider::AzureKeyVault {
-                provider_def: AzureKeyVaultProvider { vault_name: None },
-            };
-            let m = extract_vault_mixin(&p)
-                .unwrap()
-                .expect("expected vault mixin");
-            assert!(m.path.join("spec.yaml").exists());
-            assert!(m.label.contains("azure_key_vault"));
-        }
-
-        #[test]
-        #[serial]
-        fn returns_some_for_gopass() {
-            let _guard = TestCacheDirGuard::new();
-            let p = SupportedProvider::Gopass {
-                provider_def: GopassProvider { store: None },
-            };
-            let m = extract_vault_mixin(&p)
-                .unwrap()
-                .expect("expected vault mixin");
-            assert!(m.path.join("spec.yaml").exists());
-            assert!(m.label.contains("gopass"));
-        }
-
-        #[test]
-        fn hash_is_deterministic() {
-            let h1 = compute_vault_mixins_hash().unwrap();
-            let h2 = compute_vault_mixins_hash().unwrap();
-            assert_eq!(h1, h2);
-            assert_eq!(h1.len(), 64);
-        }
-    }
-
-    mod host_to_sandbox_path_tests {
-        use super::*;
-
-        #[test]
-        fn linux_under_home() {
-            let dest = host_to_sandbox_path(
-                Path::new("/home/atusa/.coyote_password"),
-                Path::new("/home/atusa"),
-                false,
-            )
-            .unwrap();
-
-            assert_eq!(dest, "/home/agent/.coyote_password");
-        }
-
-        #[test]
-        fn linux_nested_under_home() {
-            let dest = host_to_sandbox_path(
-                Path::new("/home/atusa/.config/coyote/.password"),
-                Path::new("/home/atusa"),
-                false,
-            )
-            .unwrap();
-
-            assert_eq!(dest, "/home/agent/.config/coyote/.password");
-        }
-
-        #[test]
-        fn linux_outside_home_returns_verbatim() {
-            let dest = host_to_sandbox_path(
-                Path::new("/etc/coyote/.password"),
-                Path::new("/home/atusa"),
-                false,
-            )
-            .unwrap();
-
-            assert_eq!(dest, "/etc/coyote/.password");
-        }
-
-        #[test]
-        fn macos_under_home_with_spaces() {
-            let dest = host_to_sandbox_path(
-                Path::new("/Users/atusa/Library/Application Support/coyote/.password"),
-                Path::new("/Users/atusa"),
-                false,
-            )
-            .unwrap();
-
-            assert_eq!(
-                dest,
-                "/home/agent/Library/Application Support/coyote/.password"
-            );
-        }
-
-        #[test]
-        fn windows_under_home_converts_backslashes() {
-            let dest = host_to_sandbox_path(
-                Path::new(r"C:\Users\atusa\.coyote_password"),
-                Path::new(r"C:\Users\atusa"),
-                true,
-            )
-            .unwrap();
-
-            assert_eq!(dest, "/home/agent/.coyote_password");
-        }
-
-        #[test]
-        fn windows_nested_under_home() {
-            let dest = host_to_sandbox_path(
-                Path::new(r"C:\Users\atusa\Documents\my\vault.txt"),
-                Path::new(r"C:\Users\atusa"),
-                true,
-            )
-            .unwrap();
-
-            assert_eq!(dest, "/home/agent/Documents/my/vault.txt");
-        }
-
-        #[test]
-        fn windows_outside_home_bails_with_clear_error() {
-            let err = host_to_sandbox_path(
-                Path::new(r"C:\Program Files\Coyote\vault.txt"),
-                Path::new(r"C:\Users\atusa"),
-                true,
-            )
-            .unwrap_err();
-
-            let msg = err.to_string();
-            assert!(
-                msg.contains("Program Files"),
-                "error should name the offending path: {msg}"
-            );
-            assert!(
-                msg.contains("user profile"),
-                "error should explain the limitation: {msg}"
-            );
-        }
-
-        #[test]
-        fn windows_tolerates_trailing_slash_in_home() {
-            let dest = host_to_sandbox_path(
-                Path::new(r"C:\Users\atusa\foo"),
-                Path::new(r"C:\Users\atusa\"),
-                true,
-            )
-            .unwrap();
-
-            assert_eq!(dest, "/home/agent/foo");
-        }
-
-        #[test]
-        fn sandbox_path_parent_extracts_parent_for_nested() {
-            assert_eq!(
-                sandbox_path_parent("/home/agent/.coyote_password"),
-                Some("/home/agent")
-            );
-            assert_eq!(
-                sandbox_path_parent("/etc/coyote/.password"),
-                Some("/etc/coyote")
-            );
-        }
-
-        #[test]
-        fn sandbox_path_parent_handles_edge_cases() {
-            assert_eq!(sandbox_path_parent("/file"), Some(""));
-            assert_eq!(sandbox_path_parent("noparent"), None);
-        }
     }
 }

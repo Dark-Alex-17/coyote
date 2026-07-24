@@ -5,7 +5,7 @@ use super::{
     GLOBAL_TOOLS_UTILS_DIR_NAME, HIDDEN_MCP_FILE_NAME, MACROS_DIR_NAME, MCP_FILE_NAME,
     MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME,
     SBX_KIT_DIR_NAME, SBX_KIT_HASH_FILE, SBX_MIXIN_FILE_NAME, SBX_MIXIN_KITS_DIR_NAME,
-    SBX_VAULT_MIXINS_DIR_NAME, SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
+    SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
 };
 use crate::client::ProviderModels;
 use crate::config::REPL_HISTORY_DIR_NAME;
@@ -146,14 +146,6 @@ pub fn sbx_kit_dir() -> PathBuf {
 
 pub fn sbx_kit_hash_file() -> PathBuf {
     sbx_kit_dir().join(SBX_KIT_HASH_FILE)
-}
-
-pub fn sbx_vault_mixins_dir() -> PathBuf {
-    cache_dir().join(SBX_VAULT_MIXINS_DIR_NAME)
-}
-
-pub fn sbx_vault_mixins_hash_file() -> PathBuf {
-    sbx_vault_mixins_dir().join(SBX_KIT_HASH_FILE)
 }
 
 pub fn sbx_mixin_kits_dir() -> PathBuf {

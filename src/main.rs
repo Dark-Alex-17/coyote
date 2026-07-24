@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
     }
 
     if let Some(name) = &cli.sandbox {
-        return sandbox::launch(name.clone(), cli.fresh, cli.no_mixins);
+        return sandbox::launch(name.clone());
     }
 
     install_builtins()?;

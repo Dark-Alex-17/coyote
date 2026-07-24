@@ -49,6 +49,7 @@ use crate::client::{
 };
 use crate::function::{FunctionDeclaration, Functions};
 use crate::rag::Rag;
+use crate::sandbox::SANDBOX_ENV_FLAG;
 use crate::utils::*;
 pub use macros::macro_execute;
 
@@ -149,7 +150,7 @@ const WORKSPACE_COYOTE_DIR_NAME: &str = ".coyote";
 const SBX_KIT_DIR_NAME: &str = "sbx-kit";
 const SBX_KIT_HASH_FILE: &str = "kit.sha256";
 const SBX_MIXIN_FILE_NAME: &str = "sbx-mixin.yaml";
-const SBX_VAULT_MIXINS_DIR_NAME: &str = "sbx-vault-mixins";
+pub(crate) const VAULT_DATA_FILE_NAME: &str = "vault.yml";
 const SBX_MIXIN_KITS_DIR_NAME: &str = "sbx-mixin-kits";
 const GIT_DIR_NAME: &str = ".git";
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
@@ -521,6 +522,12 @@ pub async fn sync_models(url: &str, abort_signal: AbortSignal) -> Result<()> {
 impl Config {
     pub async fn load_with_interpolation(info_flag: bool) -> Result<Self> {
         let config_path = paths::config_file();
+
+        if env::var_os(SANDBOX_ENV_FLAG).is_some() {
+            let (config, _) = Self::load_from_file(&config_path)?;
+            return Ok(config);
+        }
+
         let (mut config, content) = if !config_path.exists() {
             match env::var(get_env_name("provider"))
                 .ok()
@@ -754,9 +761,7 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
     let provider_choice = prompt_provider_choice()?;
     let mut vault = match &provider_choice {
         None => Vault::default_local(),
-        Some(provider) => Vault {
-            provider: provider.clone(),
-        },
+        Some(provider) => Vault::from_provider(provider.clone()),
     };
     create_vault_password_file(&mut vault)?;
     if provider_choice.is_some() {
@@ -1107,5 +1112,58 @@ clients:
         assert!(!state.assert(StateFlags::ROLE));
         assert!(!state.assert(StateFlags::SESSION));
         assert!(!state.assert(StateFlags::empty()));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_config_load_no_interpolation() {
+        use std::fs;
+        use std::time;
+
+        let unique = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_dir = std::env::temp_dir().join(format!("coyote-sandbox-cfg-{unique}"));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.yaml");
+
+        fs::write(
+            &config_path,
+            "model: claude:claude-3-5-haiku\nclients:\n  - type: claude\n    api_key: '{{ANTHROPIC_API_KEY}}'\n",
+        )
+        .unwrap();
+
+        let config_env = get_env_name("config_file");
+        let prev_config = std::env::var_os(&config_env);
+        let prev_sandbox = std::env::var_os(crate::sandbox::SANDBOX_ENV_FLAG);
+
+        unsafe {
+            std::env::set_var(&config_env, &config_path);
+            std::env::set_var(crate::sandbox::SANDBOX_ENV_FLAG, "1");
+        }
+
+        let result = Config::load_with_interpolation(false).await;
+        let (_, raw) = Config::load_from_file(&config_path).unwrap();
+
+        unsafe {
+            match prev_config {
+                Some(v) => std::env::set_var(&config_env, v),
+                None => std::env::remove_var(&config_env),
+            }
+            match prev_sandbox {
+                Some(v) => std::env::set_var(crate::sandbox::SANDBOX_ENV_FLAG, v),
+                None => std::env::remove_var(crate::sandbox::SANDBOX_ENV_FLAG),
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        result.expect(
+            "load_with_interpolation should succeed in sandbox mode with placeholder values",
+        );
+        assert!(
+            raw.contains("{{ANTHROPIC_API_KEY}}"),
+            "placeholder should be preserved as a literal string in sandbox mode"
+        );
     }
 }

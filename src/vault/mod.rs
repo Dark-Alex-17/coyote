@@ -1,9 +1,11 @@
 mod utils;
 
+use std::env;
 use std::fs::read_to_string;
 use std::path::PathBuf;
 
 use crate::config::paths;
+use crate::sandbox::SANDBOX_ENV_FLAG;
 pub use utils::create_vault_password_file;
 pub use utils::interpolate_secrets;
 pub use utils::prompt_provider_choice;
@@ -17,7 +19,7 @@ use gman::providers::SecretProvider;
 use gman::providers::SupportedProvider;
 use gman::providers::local::LocalProvider;
 use inquire::{Password, PasswordDisplayMode, required};
-use log::{info, warn};
+use log::warn;
 use serde_yaml::Value;
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
@@ -25,34 +27,10 @@ use uuid::Uuid;
 
 pub static SECRET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{([^{}]+)}}").unwrap());
 
-fn apply_sandboxed_home_translation(provider_def: &mut LocalProvider) {
-    let Some(ref pf) = provider_def.password_file else {
-        return;
-    };
-
-    if pf.exists() {
-        return;
-    }
-
-    let Some(translated) = paths::translate_sandboxed_home_dir(pf) else {
-        return;
-    };
-
-    if !translated.exists() {
-        return;
-    }
-
-    info!(
-        "vault password file '{}' not found; resolved to sandboxed path '{}'",
-        pf.display(),
-        translated.display()
-    );
-    provider_def.password_file = Some(translated);
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct Vault {
     pub(crate) provider: SupportedProvider,
+    sandbox_mode: bool,
 }
 
 pub type GlobalVault = Arc<Vault>;
@@ -90,7 +68,10 @@ impl Vault {
             }
         };
 
-        Ok(Self { provider })
+        Ok(Self {
+            provider,
+            sandbox_mode: false,
+        })
     }
 
     pub fn default_local() -> Self {
@@ -102,10 +83,25 @@ impl Vault {
                     ..LocalProvider::default()
                 },
             },
+            sandbox_mode: false,
+        }
+    }
+
+    pub fn from_provider(provider: SupportedProvider) -> Self {
+        Self {
+            provider,
+            sandbox_mode: false,
         }
     }
 
     pub fn init(config: &AppConfig) -> Result<Self> {
+        if env::var_os(SANDBOX_ENV_FLAG).is_some() {
+            return Ok(Self {
+                sandbox_mode: true,
+                ..Self::default()
+            });
+        }
+
         let mut provider = match &config.secrets_provider {
             Some(p) => p.clone(),
             None => SupportedProvider::Local {
@@ -117,11 +113,13 @@ impl Vault {
         };
 
         if let SupportedProvider::Local { provider_def } = &mut provider {
-            apply_sandboxed_home_translation(provider_def);
             ensure_password_file_initialized(provider_def)?;
         }
 
-        Ok(Self { provider })
+        Ok(Self {
+            provider,
+            sandbox_mode: false,
+        })
     }
 
     pub fn local_password_file(&self) -> Result<PathBuf> {
@@ -148,6 +146,11 @@ impl Vault {
     }
 
     pub fn add_secret(&self, secret_name: &str) -> Result<()> {
+        if self.sandbox_mode {
+            bail!(
+                "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
+            );
+        }
         let secret_value = Password::new("Enter the secret value:")
             .with_validator(required!())
             .with_display_mode(PasswordDisplayMode::Masked)
@@ -164,6 +167,11 @@ impl Vault {
     }
 
     pub fn get_secret(&self, secret_name: &str, display_output: bool) -> Result<String> {
+        if self.sandbox_mode {
+            bail!(
+                "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
+            );
+        }
         let h = Handle::current();
         let secret = tokio::task::block_in_place(|| {
             h.block_on(self.provider_ref().get_secret(secret_name))
@@ -177,6 +185,11 @@ impl Vault {
     }
 
     pub fn update_secret(&self, secret_name: &str) -> Result<()> {
+        if self.sandbox_mode {
+            bail!(
+                "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
+            );
+        }
         let secret_value = Password::new("Enter the secret value:")
             .with_validator(required!())
             .with_display_mode(PasswordDisplayMode::Masked)
@@ -195,6 +208,11 @@ impl Vault {
     }
 
     pub fn delete_secret(&self, secret_name: &str) -> Result<()> {
+        if self.sandbox_mode {
+            bail!(
+                "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
+            );
+        }
         let h = Handle::current();
         tokio::task::block_in_place(|| h.block_on(self.provider_ref().delete_secret(secret_name)))?;
         println!("✓ Secret '{secret_name}' deleted from the vault.");
@@ -203,6 +221,11 @@ impl Vault {
     }
 
     pub fn list_secrets(&self, display_output: bool) -> Result<Vec<String>> {
+        if self.sandbox_mode {
+            bail!(
+                "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
+            );
+        }
         let h = Handle::current();
         let secrets =
             tokio::task::block_in_place(|| h.block_on(self.provider_ref().list_secrets()))?;
@@ -345,5 +368,36 @@ mod tests {
     fn vault_default_creates_instance() {
         let vault = Vault::default();
         assert!(vault.local_password_file().is_err());
+    }
+
+    #[test]
+    fn vault_disabled_in_sandbox() {
+        let prev = std::env::var_os("IS_SANDBOX");
+        unsafe {
+            std::env::set_var("IS_SANDBOX", "1");
+        }
+
+        let vault = Vault::init(&AppConfig::default()).unwrap();
+
+        let check = |err: anyhow::Error| {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Vault management is disabled in sandbox mode"),
+                "expected vault-disabled error, got: {msg}"
+            );
+        };
+
+        check(vault.add_secret("test").unwrap_err());
+        check(vault.get_secret("test", false).unwrap_err());
+        check(vault.update_secret("test").unwrap_err());
+        check(vault.delete_secret("test").unwrap_err());
+        check(vault.list_secrets(false).unwrap_err());
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("IS_SANDBOX", v),
+                None => std::env::remove_var("IS_SANDBOX"),
+            }
+        }
     }
 }
