@@ -3,7 +3,7 @@ use crate::utils::decode_bin;
 use ansi_colours::AsRGB;
 use anyhow::{Context, Result, anyhow};
 use comfy_table::{CellAlignment, ContentArrangement, Table, presets::UTF8_FULL};
-use crossterm::style::{Color, Stylize};
+use crossterm::style::{Color, SetForegroundColor, Stylize};
 use crossterm::terminal;
 use fancy_regex::{Captures, Regex};
 use std::collections::HashMap;
@@ -176,12 +176,166 @@ fn kind_pre_wraps(kind: LineKind) -> bool {
     )
 }
 
-fn wrap_plain_content(content: &str, effective_width: usize) -> Vec<String> {
+fn wrap_styled_content(styled: &str, effective_width: usize) -> Vec<String> {
     let effective_width = effective_width.max(1);
-    textwrap::wrap(content, effective_width)
+    let wrapped: Vec<String> = textwrap::wrap(styled, effective_width)
         .into_iter()
         .map(|c| c.into_owned())
-        .collect()
+        .collect();
+    reflow_ansi_state(wrapped)
+}
+
+fn apply_base_style(styled: &str, fg: Color, bold: bool) -> String {
+    let mut opener = String::new();
+    if fg != Color::Reset {
+        opener.push_str(&SetForegroundColor(fg).to_string());
+    }
+    if bold {
+        opener.push_str("\x1b[1m");
+    }
+    if opener.is_empty() {
+        return styled.to_string();
+    }
+    let restored = styled
+        .replace("\x1b[0m", &format!("\x1b[0m{opener}"))
+        .replace("\x1b[39m", &format!("\x1b[39m{opener}"));
+    format!("{opener}{restored}\x1b[0m")
+}
+
+#[derive(Default, Clone, PartialEq, Eq)]
+struct SgrState {
+    fg: Option<String>,
+    bold: bool,
+    italic: bool,
+    strike: bool,
+    underline: bool,
+}
+
+impl SgrState {
+    fn is_default(&self) -> bool {
+        self.fg.is_none() && !self.bold && !self.italic && !self.strike && !self.underline
+    }
+
+    fn as_opener(&self) -> String {
+        if self.is_default() {
+            return String::new();
+        }
+        let mut params: Vec<String> = Vec::new();
+        if let Some(fg) = &self.fg {
+            params.push(fg.clone());
+        }
+        if self.bold {
+            params.push("1".into());
+        }
+        if self.italic {
+            params.push("3".into());
+        }
+        if self.underline {
+            params.push("4".into());
+        }
+        if self.strike {
+            params.push("9".into());
+        }
+
+        format!("\x1b[{}m", params.join(";"))
+    }
+
+    fn apply(&mut self, params: &str) {
+        if params.is_empty() {
+            *self = Self::default();
+            return;
+        }
+        let parts: Vec<&str> = params.split(';').collect();
+        let mut i = 0;
+        while i < parts.len() {
+            let code = parts[i];
+            match code {
+                "0" | "" => *self = Self::default(),
+                "1" => self.bold = true,
+                "3" => self.italic = true,
+                "4" => self.underline = true,
+                "9" => self.strike = true,
+                "22" => self.bold = false,
+                "23" => self.italic = false,
+                "24" => self.underline = false,
+                "29" => self.strike = false,
+                "39" => self.fg = None,
+                "38" if i + 1 < parts.len() => match parts[i + 1] {
+                    "5" if i + 2 < parts.len() => {
+                        self.fg = Some(format!("38;5;{}", parts[i + 2]));
+                        i += 2;
+                    }
+                    "2" if i + 4 < parts.len() => {
+                        self.fg = Some(format!(
+                            "38;2;{};{};{}",
+                            parts[i + 2],
+                            parts[i + 3],
+                            parts[i + 4]
+                        ));
+                        i += 4;
+                    }
+                    _ => {}
+                },
+                _ => {
+                    if let Ok(n) = code.parse::<u8>()
+                        && ((30..=37).contains(&n) || (90..=97).contains(&n))
+                    {
+                        self.fg = Some(n.to_string());
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+fn parse_sgr_updates(line: &str, state: &mut SgrState) {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'm' {
+                if bytes[j] == 0x1b {
+                    break;
+                }
+                j += 1;
+            }
+
+            if j < bytes.len() && bytes[j] == b'm' {
+                let params = &line[i + 2..j];
+                state.apply(params);
+                i = j + 1;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+}
+
+fn reflow_ansi_state(lines: Vec<String>) -> Vec<String> {
+    let mut result = Vec::with_capacity(lines.len());
+    let mut open_state = SgrState::default();
+
+    for line in lines {
+        let opener = open_state.as_opener();
+        let mut end_state = open_state.clone();
+        parse_sgr_updates(&line, &mut end_state);
+
+        let mut full = if opener.is_empty() {
+            line
+        } else {
+            format!("{opener}{line}")
+        };
+        if !end_state.is_default() {
+            full.push_str("\x1b[0m");
+        }
+        open_state = end_state;
+        result.push(full);
+    }
+
+    result
 }
 
 fn split_indent(line: &str) -> (&str, &str) {
@@ -205,7 +359,7 @@ fn render_heading(line: &str, level: u8, styles: &MarkdownStyles) -> String {
         format!("{} {inline}", "#".repeat(level as usize))
     };
 
-    format!("{indent}{}", body.with(color).bold())
+    format!("{indent}{}", apply_base_style(&body, color, true))
 }
 
 fn render_blockquote(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -> String {
@@ -213,16 +367,16 @@ fn render_blockquote(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16
     let content = rest.trim_start_matches('>').trim_start();
     let prefix = "│ ".with(styles.blockquote).to_string();
 
-    let render_one = |c: &str| apply_inline(c, styles).with(styles.blockquote).to_string();
+    let styled = apply_base_style(&apply_inline(content, styles), styles.blockquote, false);
 
     let Some(wrap_width) = wrap_width else {
-        return format!("{indent}{prefix}{}", render_one(content));
+        return format!("{indent}{prefix}{styled}");
     };
 
     let prefix_width = 2;
     let leading_width = indent.chars().count();
     let effective_width = (wrap_width as usize).saturating_sub(leading_width + prefix_width);
-    let wrapped = wrap_plain_content(content, effective_width);
+    let wrapped = wrap_styled_content(&styled, effective_width);
     if wrapped.is_empty() {
         return format!("{indent}{prefix}");
     }
@@ -232,7 +386,7 @@ fn render_blockquote(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&format!("{indent}{prefix}{}", render_one(chunk)));
+        out.push_str(&format!("{indent}{prefix}{chunk}"));
     }
 
     out
@@ -250,7 +404,8 @@ fn render_bullet(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -
     let prefix_width = 2;
     let leading_width = indent.chars().count();
     let effective_width = (wrap_width as usize).saturating_sub(leading_width + prefix_width);
-    let wrapped = wrap_plain_content(content, effective_width);
+    let styled = apply_inline(content, styles);
+    let wrapped = wrap_styled_content(&styled, effective_width);
     if wrapped.is_empty() {
         return format!("{indent}{bullet} ");
     }
@@ -261,11 +416,10 @@ fn render_bullet(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>) -
         if i > 0 {
             out.push('\n');
         }
-        let styled = apply_inline(chunk, styles);
         if i == 0 {
-            out.push_str(&format!("{indent}{bullet} {styled}"));
+            out.push_str(&format!("{indent}{bullet} {chunk}"));
         } else {
-            out.push_str(&format!("{indent}{subseq}{styled}"));
+            out.push_str(&format!("{indent}{subseq}{chunk}"));
         }
     }
 
@@ -291,7 +445,8 @@ fn render_numbered(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>)
     let prefix_width = number.chars().count() + 2;
     let leading_width = indent.chars().count();
     let effective_width = (wrap_width as usize).saturating_sub(leading_width + prefix_width);
-    let wrapped = wrap_plain_content(after, effective_width);
+    let styled = apply_inline(after, styles);
+    let wrapped = wrap_styled_content(&styled, effective_width);
     if wrapped.is_empty() {
         return format!("{indent}{number}{styled_dot} ");
     }
@@ -302,11 +457,10 @@ fn render_numbered(line: &str, styles: &MarkdownStyles, wrap_width: Option<u16>)
         if i > 0 {
             out.push('\n');
         }
-        let styled = apply_inline(chunk, styles);
         if i == 0 {
-            out.push_str(&format!("{indent}{number}{styled_dot} {styled}"));
+            out.push_str(&format!("{indent}{number}{styled_dot} {chunk}"));
         } else {
-            out.push_str(&format!("{indent}{subseq}{styled}"));
+            out.push_str(&format!("{indent}{subseq}{chunk}"));
         }
     }
 
@@ -335,7 +489,8 @@ fn render_task(
     let prefix_width = 4;
     let leading_width = indent.chars().count();
     let effective_width = (wrap_width as usize).saturating_sub(leading_width + prefix_width);
-    let wrapped = wrap_plain_content(after_brackets, effective_width);
+    let styled = apply_inline(after_brackets, styles);
+    let wrapped = wrap_styled_content(&styled, effective_width);
     if wrapped.is_empty() {
         return format!("{indent}{styled_brackets} ");
     }
@@ -346,11 +501,10 @@ fn render_task(
         if i > 0 {
             out.push('\n');
         }
-        let styled = apply_inline(chunk, styles);
         if i == 0 {
-            out.push_str(&format!("{indent}{styled_brackets} {styled}"));
+            out.push_str(&format!("{indent}{styled_brackets} {chunk}"));
         } else {
-            out.push_str(&format!("{indent}{subseq}{styled}"));
+            out.push_str(&format!("{indent}{subseq}{chunk}"));
         }
     }
 
@@ -683,12 +837,7 @@ impl MarkdownRender {
         let (heading_color, _) = self.styles.heading;
         let styled_header: Vec<String> = header
             .iter()
-            .map(|c| {
-                apply_inline(c, &self.styles)
-                    .with(heading_color)
-                    .bold()
-                    .to_string()
-            })
+            .map(|c| apply_base_style(&apply_inline(c, &self.styles), heading_color, true))
             .collect();
         table.set_header(styled_header);
 
@@ -1861,6 +2010,127 @@ std::error::Error>> {
         assert!(!output.contains("`code`"), "backticks stripped: {output:?}");
         assert!(output.contains("bold"));
         assert!(output.contains("code"));
+    }
+
+    #[test]
+    fn bullet_wraps_bold_span_across_boundary() {
+        let styles = test_styles();
+        let line = "- **explain some code, `value`, using _this_**";
+
+        let output = render_markdown_line(line, LineKind::BulletItem, &styles, Some(30));
+
+        assert!(output.contains('\n'), "must wrap: {output:?}");
+        assert!(
+            !output.contains("**"),
+            "bold markers stripped even when span crosses wrap: {output:?}"
+        );
+        assert!(output.contains("\x1b[1m"), "bold SGR present: {output:?}");
+        assert!(output.contains("explain"));
+        assert!(output.contains("this"));
+    }
+
+    #[test]
+    fn blockquote_wraps_bold_span_across_boundary() {
+        let styles = test_styles();
+        let line = "> **explain some code, `value`, using _this_**";
+
+        let output = render_markdown_line(line, LineKind::Blockquote, &styles, Some(30));
+
+        assert!(output.contains('\n'), "must wrap: {output:?}");
+        assert!(!output.contains("**"), "bold markers stripped: {output:?}");
+        assert!(output.contains("\x1b[1m"), "bold SGR: {output:?}");
+    }
+
+    #[test]
+    fn blockquote_restores_base_color_after_inner_reset() {
+        let styles = test_styles();
+        let line = "> hello **bold** world after `code` more text";
+
+        let output = render_markdown_line(line, LineKind::Blockquote, &styles, None);
+
+        let base_open = SetForegroundColor(styles.blockquote).to_string();
+        let re_opens = output.matches(base_open.as_str()).count();
+        assert!(
+            re_opens >= 3,
+            "blockquote color re-opened after each inner reset (got {re_opens}): {output:?}"
+        );
+    }
+
+    #[test]
+    fn heading_restores_base_style_after_inner_reset() {
+        let styles = test_styles();
+        let line = "## title with **bold** and `code` trailing text";
+
+        let output = render_markdown_line(line, LineKind::Heading(2), &styles, None);
+
+        let (heading_color, _) = styles.heading;
+        let base_open = format!("{}\x1b[1m", SetForegroundColor(heading_color));
+        let re_opens = output.matches(base_open.as_str()).count();
+        assert!(
+            re_opens >= 3,
+            "heading color+bold re-opened after each inner reset (got {re_opens}): {output:?}"
+        );
+    }
+
+    #[test]
+    fn table_header_restores_base_style_after_inner_reset() {
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let table = "| col with **bold** inside | second |\n|---|---|\n| a | b |\n";
+        let output = render.render(table);
+
+        let header_row = output
+            .lines()
+            .find(|l| l.contains("col with"))
+            .expect("header row present");
+        let bold_opens = header_row.matches("\x1b[1m").count();
+        assert!(
+            bold_opens >= 3,
+            "table header bold re-opened after inner reset (got {bold_opens}): {header_row:?}"
+        );
+    }
+
+    #[test]
+    fn numbered_wraps_bold_span_across_boundary() {
+        let styles = test_styles();
+        let line = "1. **explain some code, `value`, using _this_**";
+
+        let output = render_markdown_line(line, LineKind::NumberedItem, &styles, Some(30));
+
+        assert!(output.contains('\n'), "must wrap: {output:?}");
+        assert!(!output.contains("**"), "bold markers stripped: {output:?}");
+        assert!(output.contains("\x1b[1m"), "bold SGR: {output:?}");
+    }
+
+    #[test]
+    fn task_wraps_bold_span_across_boundary() {
+        let styles = test_styles();
+        let line = "- [ ] **explain some code, `value`, using _this_**";
+
+        let output = render_markdown_line(line, LineKind::TaskItem(false), &styles, Some(32));
+
+        assert!(output.contains('\n'), "must wrap: {output:?}");
+        assert!(!output.contains("**"), "bold markers stripped: {output:?}");
+        assert!(output.contains("\x1b[1m"), "bold SGR: {output:?}");
+    }
+
+    #[test]
+    fn wrapped_bold_line_closes_and_reopens_ansi_across_lines() {
+        let styles = test_styles();
+        let line = "- **one two three four five six seven eight nine**";
+
+        let output = render_markdown_line(line, LineKind::BulletItem, &styles, Some(20));
+
+        assert!(output.contains('\n'), "must wrap: {output:?}");
+        assert!(!output.contains("**"), "bold markers stripped: {output:?}");
+        for wrapped_line in output.split('\n') {
+            if wrapped_line.contains("\x1b[1m") {
+                assert!(
+                    wrapped_line.contains("\x1b[0m"),
+                    "each bold line closes with reset: {wrapped_line:?}"
+                );
+            }
+        }
     }
 
     #[test]
