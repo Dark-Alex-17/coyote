@@ -45,7 +45,7 @@ pub use self::skill_registry::SkillRegistry;
 pub use self::update::run_self_update;
 use crate::client::{
     ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
-    ProviderModels, create_client_config, list_client_types, oauth,
+    ProviderModels, create_client_config, list_client_types, oauth, set_client_models_config,
 };
 use crate::function::{FunctionDeclaration, Functions};
 use crate::rag::Rag;
@@ -758,6 +758,10 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
         process::exit(0);
     }
 
+    if env::var_os(SANDBOX_ENV_FLAG).is_some() {
+        return create_config_file_sandbox(config_path).await;
+    }
+
     let provider_choice = prompt_provider_choice()?;
     let mut vault = match &provider_choice {
         None => Vault::default_local(),
@@ -796,6 +800,62 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
     config["highlight"] = json!(true);
     config["light_theme"] = json!(false);
     config[CLIENTS_FIELD] = clients_config;
+
+    let config_data = serde_yaml::to_string(&config).with_context(|| "Failed to create config")?;
+    let config_data = format!(
+        "# see https://github.com/Dark-Alex-17/coyote/blob/main/config.example.yaml\n\n{config_data}"
+    );
+
+    ensure_parent_exists(config_path)?;
+    std::fs::write(config_path, config_data)
+        .with_context(|| format!("Failed to write to '{}'", config_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::prelude::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(config_path, perms)?;
+    }
+
+    println!("✓ Saved the config file to '{}'.\n", config_path.display());
+
+    Ok(())
+}
+
+async fn create_config_file_sandbox(config_path: &Path) -> Result<()> {
+    let client = Select::new("API Provider (required):", list_client_types()).prompt()?;
+
+    println!(
+        "Running in sandbox mode — your API provider credentials are managed by your host Coyote configuration if configured."
+    );
+
+    let mut client_config = serde_json::json!({ "type": client });
+
+    if matches!(client, "claude" | "openai" | "gemini") {
+        let use_oauth = Confirm::new("Use OAuth authentication instead?")
+            .with_default(false)
+            .prompt()?;
+        if use_oauth {
+            client_config["auth"] = "oauth".into();
+        }
+    }
+
+    let model = set_client_models_config(&mut client_config, client).await?;
+
+    let mut config = serde_json::json!({});
+    config["model"] = model.into();
+    config["stream"] = serde_json::json!(true);
+    config["save"] = serde_json::json!(true);
+    config["keybindings"] = serde_json::json!("vi");
+    config["wrap"] = serde_json::json!("auto");
+    config["wrap_code"] = serde_json::json!(false);
+    config["function_calling_support"] = serde_json::json!(true);
+    config["enabled_tools"] = serde_json::json!(null);
+    config["visible_tools"] = serde_json::json!(DEFAULT_VISIBLE_TOOLS);
+    config["mcp_server_support"] = serde_json::json!(true);
+    config["enabled_mcp_servers"] = serde_json::json!(null);
+    config["highlight"] = serde_json::json!(true);
+    config["light_theme"] = serde_json::json!(false);
+    config[CLIENTS_FIELD] = serde_json::json!(vec![client_config]);
 
     let config_data = serde_yaml::to_string(&config).with_context(|| "Failed to create config")?;
     let config_data = format!(

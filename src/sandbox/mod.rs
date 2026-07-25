@@ -29,7 +29,7 @@ const SANDBOX_AGENT: &str = "coyote";
 #[folder = "assets/sbx-kit/"]
 struct EmbeddedKit;
 
-pub fn launch(name: Option<String>) -> Result<()> {
+pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
     ensure_sbx_installed()?;
     bail_if_nested()?;
 
@@ -49,7 +49,9 @@ pub fn launch(name: Option<String>) -> Result<()> {
     let vault = Vault::init(&bootstrap)?;
     let registered = sbx_registered_services()?;
     inject_llm_secret(&config_content, &vault, &registered)?;
-    inject_mcp_secrets(&vault, &registered)?;
+    if !fresh {
+        inject_mcp_secrets(&vault, &registered)?;
+    }
 
     let discovered = mixins::discover()?;
 
@@ -58,7 +60,9 @@ pub fn launch(name: Option<String>) -> Result<()> {
     } else {
         mixins::log_discovery(&discovered, false);
         create_sandbox(&name, &kit_path, &discovered)?;
-        copy_host_files(&name)?;
+        if !fresh {
+            copy_host_files(&name)?;
+        }
     }
 
     exec_run(&name, &kit_path)
