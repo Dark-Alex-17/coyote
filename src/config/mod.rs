@@ -44,7 +44,7 @@ pub use self::skill_policy::SkillPolicy;
 pub use self::skill_registry::SkillRegistry;
 pub use self::update::run_self_update;
 use crate::client::{
-    ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
+    self, ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
     ProviderModels, create_client_config, list_client_types, oauth, set_client_models_config,
 };
 use crate::function::{FunctionDeclaration, Functions};
@@ -830,7 +830,7 @@ async fn create_config_file_sandbox(config_path: &Path) -> Result<()> {
 
     let mut client_config = serde_json::json!({ "type": client });
 
-    if matches!(client, "claude" | "openai" | "gemini") {
+    if client::client_type_supports_oauth(client) {
         let use_oauth = Confirm::new("Use OAuth authentication instead?")
             .with_default(false)
             .prompt()?;

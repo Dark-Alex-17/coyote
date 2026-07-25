@@ -38,6 +38,15 @@ register_client!(
     (bedrock, "bedrock", BedrockConfig, BedrockClient),
 );
 
+pub fn client_type_supports_oauth(type_str: &str) -> bool {
+    matches!(
+        type_str,
+        ClaudeClient::NAME | OpenAIClient::NAME | GeminiClient::NAME
+    ) || ALL_PROVIDER_MODELS
+        .iter()
+        .any(|pm| pm.provider == type_str && pm.oauth.is_some())
+}
+
 pub const OPENAI_COMPATIBLE_PROVIDERS: [(&str, &str); 18] = [
     ("ai21", "https://api.ai21.com/studio/v1"),
     (
