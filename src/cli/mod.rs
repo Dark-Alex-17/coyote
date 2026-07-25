@@ -227,7 +227,7 @@ pub struct Cli {
     /// Launch Coyote inside a Docker sandbox (via `sbx`); name defaults to current directory basename
     #[arg(long, value_name = "NAME", help_heading = "Sandbox")]
     pub sandbox: Option<Option<String>>,
-    /// Start the sandbox with a clean slate — no copied config or tokens; LLM credentials injected via sbx proxy
+    /// Start the sandbox with a clean slate. No copied config or tokens; LLM credentials injected via sbx proxy
     #[arg(long, requires = "sandbox", help_heading = "Sandbox")]
     pub fresh: bool,
     /// Display information
