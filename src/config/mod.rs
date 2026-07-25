@@ -524,6 +524,10 @@ impl Config {
         let config_path = paths::config_file();
 
         if env::var_os(SANDBOX_ENV_FLAG).is_some() {
+            if !config_path.exists() {
+                create_config_file(&config_path).await?;
+            }
+
             let (config, _) = Self::load_from_file(&config_path)?;
             return Ok(config);
         }
