@@ -62,7 +62,7 @@ use fancy_regex::Regex;
 use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
 use indoc::formatdoc;
-use inquire::{Confirm, Select};
+use inquire::{Confirm, Select, Text};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -832,7 +832,27 @@ async fn create_config_file_sandbox(config_path: &Path) -> Result<()> {
         "Running in sandbox mode — your API provider credentials are managed by your host Coyote configuration if configured."
     );
 
-    let mut client_config = serde_json::json!({ "type": client });
+    let oai_api_base = client::OPENAI_COMPATIBLE_PROVIDERS
+        .iter()
+        .find(|(name, _)| *name == client)
+        .map(|(_, url)| *url);
+
+    let mut client_config = if let Some(api_base) = oai_api_base {
+        let api_base_str = if api_base.contains('{') {
+            Text::new("API Base:")
+                .with_placeholder(&format!("e.g. {api_base}"))
+                .prompt()?
+        } else {
+            api_base.to_string()
+        };
+        serde_json::json!({
+            "type": "openai-compatible",
+            "name": client,
+            "api_base": api_base_str,
+        })
+    } else {
+        serde_json::json!({ "type": client })
+    };
 
     if client::client_type_supports_oauth(client) {
         let use_oauth = Confirm::new("Use OAuth authentication instead?")
