@@ -1,3 +1,151 @@
+## v0.8.0 (2026-07-25)
+
+### Feat
+
+- Dynamically detect if a selected client in the sandbox first run wizard supports oauth
+- Add support for the --fresh flag again with host environment configuration injection
+- force overwrite global sbx secrets
+- add sbx secrets globally
+- only create secrets local to a sandbox
+- Improved credentials management for docker sandboxes
+- renamed --contents arg for fs_write/patch to --content since most models attempt that first and error otherwise
+- Used improved theme selections for tool call highlighting colors
+- Improved theme-derived syntax highlighting for LLM tool call logging
+- Improved coloring of LLM tool invocation outputs to make LLM output more readable and cohesive
+- renamed the user__ask to user__select and improved descriptions to improve model usage
+- Improved coloring/highlighting of tool calls to make LLM invocation logs easier to read
+- long-running session improvements
+- Made sisyphus suite of agents all auto-approved for tool usage
+- added ast_grep tool to Sisyphus suite agents
+- created the adversay agent and adversarial-review skill
+- new spawnable_agents field in agents to let users restrict what agents can be spawned by a parent agent
+- replay pre-compressed messages as well when resuming sessions for users to see
+- created a new builtin function for agents who can spawn other agents to list available agents via agent__list_available
+- **render**: hanging-indent line wrapping for lists and blockquotes
+- **render**: wire table state machine and finalize hook
+- **render**: render markdown tables with comfy-table
+- **render**: parse table cells and column alignments
+- **render**: detect markdown table rows and separators
+- **render**: add comfy-table dependency and table border style
+- **render**: activate rich markdown renderer as default
+- **render**: rich block-level markdown rendering (headings, quotes, lists, hr)
+- **render**: rich inline markdown rendering (bold, italic, code, links)
+- **render**: detect markdown block-level line types
+- **render**: precompute markdown scope styles for rich rendering
+- Created the raw_markdown configuration flag
+- added a .fork command to fork a new session from a running conversation
+- **oauth**: enable browser-paste PKCE flow for OpenAI-compatible providers
+- copy host OAuth tokens into sandbox at launch
+- implement OAuth 2.0 Device Authorization Grant (RFC 8628)
+- hint that browser 'paste code' pages can be ignored during callback capture
+- openai-compatible wizard offers OAuth when provider has bundled oauth defaults
+- validate unique client names at config load
+- bundle xAI OAuth defaults in models.yaml
+- OAuth branch in openai_compatible prepare_* fns
+- get_oauth_provider_for_client dispatcher + client_config_info update
+- OpenAICompatibleOAuthProvider (config-driven OAuthProvider impl)
+- add auth + oauth fields to OpenAICompatibleConfig
+- add oauth field to ProviderModels
+- add client_credentials support to prepare_oauth_access_token
+- add OAuthConfig + OAuthFlow types to oauth.rs
+- Added reasoning effort to the right prompt
+- Improved support for Anthropic's extended thinking
+- Also support GEMINI.md workspace instructions
+- Improved workspace instructions support
+- also detect .mcp.json configurations at workspace roots
+- Created new .tool enable/disable and .mcp enable/disable aliases to make REPL usage more egonomic
+- Created a new .list <kind> REPL command to make discoveribility easier in the REPL
+- Support claude-style hidden workspace MCP configuration files via .mcp.json
+- Allow users to customize the workspace-specific configuration directory name so they can use Coyote with other CLI clients like .claude
+- Add reasoning_effort validation for the main configuration file
+- Add validation for reasoning_effort settings to prevent users from specifying erroneous values
+- Added support for modifying the reasoning effort of reasoning models
+- Explicitly Prevent .undo usage in graph agents
+- Added an .undo command to the REPL to let users have more control over the conversation
+- Improve sandbox startup time by using the prebuilt Coyote image
+- Make coyote available as a docker image
+- Made fs_patch more flexible for different model preferences of patch formats
+- Installed nano into the sandbox so that users can edit config files in the sandbox directly
+- Support workspace-local skill definitions and MCP configurations
+- fully functional graph-based RAG
+- Implemented graph-based RAG
+- Added a --dangerously-skip-permissions flag to skip permission prompts for tool invocations
+- Remove the temperature hyperparameter from the diagnose role
+- Added a new oauth.redirectHost field to make it possible to further extend MCP support
+- Updated the REPL mcp auth path to use the prettified error messaging
+- Improved error messaging for failed MCP starts because of auth issues
+- Added support for specifying the oauth port and client ID in MCP server configs
+- Implemented OAuth support for OpenAI models via Codex endpoints
+- merge MCP config when installing bundled mcp config
+- Implemented durable state for sisyphus
+- Installed ast-grep for the explore agent to use for better code exploration
+- Created the step-runner graph agent for more deterministic coding workflows to produce even more reliable and higher-quality results
+- Improved oracle and sisyphus agents with skill integrations for the new skills
+- Created new sisyphus family skills to improve performance
+- Created new diagnostic role and skill for use in other contexts
+- Added new memory functions for deleting and renaming memory files, as well as new lints for memory expiration dates and staleness of memories to improve the memory system
+- Created a new iwe skill and installed the iwe MCP server for utilizing large knowledgebases
+- Session-specific, file-backed history in the REPL
+- Replay session output when a user re-enters a session so all output can be seen again
+- Added confirmation message after MCP Oauth succeeds when invoked from --auth-mcp
+- Created the --auth-mcp CLI flag to let users auth with remote MCP servers without needing to be in the REPL
+- add OAuth authentication support for remote MCP servers
+- Added mixin for sisyphus so the ddg MCP server can search arbitrary domains
+- added improved error messaging on MCP server initialization
+- prefer musl versions for linux when running --update/.update
+
+### Fix
+
+- fresh wizard openai-compatible support
+- config existence check for --fresh sandboxes
+- Improve coyote sandbox startup time
+- bypass forgotten sandbox mode check for MCP secret interpolation
+- properly wrap sub-style changes in markdown rendering
+- removed accidental duplicate ast_grep tool in explore agent
+- npm and npx need the /usr/local/share/npm-global/lib directory to exist to run properly so I've added it to the dockerfile
+- added executable bit to adversary agent tools script
+- fetch descriptions from graph agent configs as well when listing agents
+- **render**: suppress blank lines above rendered table
+- chown the full sandbox cache dir, not just the coyote subdir
+- chown the whole coyote cache dir not just the oauth dir in the sandbox
+- fix typo in Gemini's generation_config property to use camelCase exclusively
+- **oauth**: treat missing expires_in as non-expiring device_code token
+- **oauth**: send Accept: application/json in device flow requests
+- OAuth callback listener skips speculative/malformed browser connections
+- resolve reasoning effort for the prompt for global defaults as well
+- Account for default model reasoning_effort when supplying that value for the REPL prompts
+- model narration included in history and between tool calls to prevent repetition
+- Don't terminate agent loops early for null tool output
+- reduce code duplication by reusing the new concrete_tool_names function in .list tools
+- Agent tools can only be modified via .tool enable/disable using tools in the allowed whitelist in the agent
+- re-render agent sessions when entering agents with either pre-configured agent_session or when entering an agent directly into a session
+- Per RFC 9728, enable dynamic discovery of OAuth endpoints in MCP using path-aware discovery
+- hot-attach to MCP servers that require auth after running .mcp auth <name>
+- Correctly inherit graph-global model for extractor model if none is defined
+- no cursor timeout when user scrolls away from ongoing streaming output
+- default to the nano or notepad when a configured editor is not found
+- When EDITOR, VISUAL, or config.editor is defined, don't verify via which
+- Added a loop exit condition for the diagnostics skill
+- Added directness clause to the diganose role to improve prompt
+- fs tools now output better error handling to guide the model more effectively
+- Make fs_read more tolerant of various arg invocation formats.
+- todo functions are injected properly to roles when roles have auto_continue: true and the REPL is started directly into the role
+- updated the redirect URI for OAuth MCP to use localhost since that's what is whitelisted, not 127.0.0.1
+- allow MCP OAuth refresh_token to be absent from initial token exchanges
+- Overrode the default JSON content-type for MCP OAuth so its properly application/x-www-form-urlencoded
+- typo in mcp file name
+- Added uvx wrapper for macos-based sandboxes
+
+### Refactor
+
+- Standardized paths module function names to not use 'path' in the name and to just always be either 'dir' or 'file'
+- main.rs resolve_oauth_client uses new dispatcher
+- split run_oauth_flow into pkce + client_credentials dispatchers
+
+### Perf
+
+- updated the memory injection warning so it only logs once, rather than after each keystroke
+
 ## v0.7.4 (2026-07-02)
 
 ### Feat
