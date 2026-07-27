@@ -1,4 +1,3 @@
-use super::agent::AgentConfig;
 use super::rag_cache::{RagCache, RagKey};
 use super::session::Session;
 use super::skill::{SKILL_SCAFFOLD, Skill};
@@ -10,7 +9,7 @@ use super::{
     AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
     Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, RIGHT_PROMPT, Role,
     RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
-    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists, list_agents,
+    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
     list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
@@ -2876,15 +2875,9 @@ impl RequestContext {
                     }
                 }
                 ".rag" => super::map_completion_values(paths::list_rags()),
-                ".agent" => list_agents()
+                ".agent" => list_agents_with_descriptions()
                     .into_iter()
-                    .map(|name| {
-                        let description = AgentConfig::load(&paths::agent_config_file(&name))
-                            .ok()
-                            .map(|c| c.description)
-                            .filter(|d| !d.is_empty());
-                        (name, description)
-                    })
+                    .map(|(name, desc)| (name, if desc.is_empty() { None } else { Some(desc) }))
                     .collect(),
                 ".install" => {
                     let mut values: Vec<String> =

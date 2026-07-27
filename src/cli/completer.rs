@@ -1,6 +1,6 @@
 use crate::client::{ModelType, list_models};
 use crate::config::paths;
-use crate::config::{AppConfig, Config, list_agents, list_sessions};
+use crate::config::{AppConfig, Config, list_agents_with_descriptions, list_sessions};
 use crate::utils::list_file_names;
 use crate::vault::Vault;
 use clap_complete::{CompletionCandidate, Shell, generate};
@@ -73,10 +73,17 @@ pub(super) fn role_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
 pub(super) fn agent_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    list_agents()
+    list_agents_with_descriptions()
         .into_iter()
-        .filter(|a| a.starts_with(&*cur))
-        .map(CompletionCandidate::new)
+        .filter(|(a, _)| a.starts_with(&*cur))
+        .map(|(name, desc)| {
+            let help = if desc.is_empty() {
+                None
+            } else {
+                Some(desc.into())
+            };
+            CompletionCandidate::new(name).help(help)
+        })
         .collect()
 }
 
