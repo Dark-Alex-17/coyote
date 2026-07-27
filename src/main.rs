@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
     }
 
     let text = cli.text()?;
-    let working_mode = if text.is_none() && cli.file.is_empty() {
+    let working_mode = if !cli.acp_server && text.is_none() && cli.file.is_empty() {
         WorkingMode::Repl
     } else {
         WorkingMode::Cmd
@@ -109,10 +109,6 @@ async fn main() -> Result<()> {
         || cli.list_secrets;
 
     let log_path = setup_logger(cli.acp_server)?;
-
-    if cli.acp_server {
-        return acp::run_acp_server().await;
-    }
 
     if let Some(version) = &cli.update {
         let version = version.clone();
@@ -236,6 +232,10 @@ async fn main() -> Result<()> {
 
     if cli.headless {
         ctx.render_mode = RenderMode::Silent;
+    }
+
+    if cli.acp_server {
+        return acp::run_acp_server(ctx, abort_signal).await;
     }
 
     if let Err(err) = run(ctx, cli, text, abort_signal).await {

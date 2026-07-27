@@ -502,7 +502,7 @@ pub async fn call_chat_completions_streaming(
     let (text, tool_calls, thinking) = handler.take();
     match send_ret {
         Ok(_) => {
-            if !text.is_empty() && !text.ends_with('\n') {
+            if !silent && !text.is_empty() && !text.ends_with('\n') {
                 println!();
             }
             let mut tool_results = eval_tool_calls(ctx, tool_calls).await?;
@@ -515,7 +515,7 @@ pub async fn call_chat_completions_streaming(
             Ok((text, tool_results))
         }
         Err(err) => {
-            if !text.is_empty() {
+            if !silent && !text.is_empty() {
                 println!();
             }
             Err(err)

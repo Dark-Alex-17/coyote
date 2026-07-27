@@ -1,13 +1,47 @@
 use super::types::{METHOD_NOT_FOUND, PARSE_ERROR, Request, Response};
+use crate::client::call_chat_completions_streaming;
+use crate::config::{Input, RenderMode, RequestContext};
+use crate::utils::AbortSignal;
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{Value, json};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-pub async fn run_acp_server() -> Result<()> {
-    run_acp_server_on(tokio::io::stdin(), tokio::io::stdout()).await
+pub(crate) struct AcpServerState {
+    ctx: Option<RequestContext>,
+    abort: AbortSignal,
+    session_active: bool,
 }
 
-pub(crate) async fn run_acp_server_on<R, W>(reader: R, mut writer: W) -> Result<()>
+pub async fn run_acp_server(ctx: RequestContext, abort: AbortSignal) -> Result<()> {
+    let state = AcpServerState {
+        ctx: Some(ctx),
+        abort,
+        session_active: false,
+    };
+    run_acp_server_with_state(tokio::io::stdin(), tokio::io::stdout(), state).await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_acp_server_on<R, W>(reader: R, writer: W) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use crate::utils::create_abort_signal;
+    let state = AcpServerState {
+        ctx: None,
+        abort: create_abort_signal(),
+        session_active: false,
+    };
+    run_acp_server_with_state(reader, writer, state).await
+}
+
+async fn run_acp_server_with_state<R, W>(
+    reader: R,
+    mut writer: W,
+    mut state: AcpServerState,
+) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -20,7 +54,7 @@ where
         if line.is_empty() {
             continue;
         }
-        if let Some(response) = dispatch(&line) {
+        if let Some(response) = dispatch(&line, &mut state).await {
             emit(&mut writer, &response).await?;
         }
     }
@@ -28,7 +62,7 @@ where
     Ok(())
 }
 
-fn dispatch(raw: &str) -> Option<Response> {
+async fn dispatch(raw: &str, state: &mut AcpServerState) -> Option<Response> {
     let req: Request = match serde_json::from_str(raw) {
         Ok(r) => r,
         Err(_) => return Some(Response::err(None, PARSE_ERROR, "Parse error")),
@@ -38,6 +72,8 @@ fn dispatch(raw: &str) -> Option<Response> {
 
     Some(match req.method.as_str() {
         "initialize" => handle_initialize(req),
+        "session/new" => handle_session_new(req, state),
+        "session/prompt" => handle_session_prompt(req, state).await,
         _ => Response::err(
             req.id,
             METHOD_NOT_FOUND,
@@ -55,6 +91,64 @@ fn handle_initialize(req: Request) -> Response {
             "protocolVersion": "1",
         }),
     )
+}
+
+fn handle_session_new(req: Request, state: &mut AcpServerState) -> Response {
+    if state.session_active {
+        return Response::err(
+            req.id,
+            -32000,
+            "Session already active; this server supports one session per process",
+        );
+    }
+    state.session_active = true;
+    Response::ok(req.id, json!({ "sessionId": "default" }))
+}
+
+async fn handle_session_prompt(req: Request, state: &mut AcpServerState) -> Response {
+    if !state.session_active {
+        return Response::err(req.id, -32000, "No active session; call session/new first");
+    }
+
+    let text = match req
+        .params
+        .as_ref()
+        .and_then(|p| p.get("text"))
+        .and_then(Value::as_str)
+    {
+        Some(t) => t.to_string(),
+        None => return Response::err(req.id, -32602, "Missing params.text"),
+    };
+
+    let ctx = match state.ctx.as_mut() {
+        Some(c) => c,
+        None => return Response::err(req.id, -32000, "Server not configured with a context"),
+    };
+
+    let abort = state.abort.clone();
+    match run_prompt_turn(ctx, &text, abort).await {
+        Ok(output) => Response::ok(
+            req.id,
+            json!({ "output": output, "stopReason": "end_turn" }),
+        ),
+        Err(e) => Response::err(req.id, -32000, format!("Prompt failed: {e}")),
+    }
+}
+
+async fn run_prompt_turn(
+    ctx: &mut RequestContext,
+    text: &str,
+    abort: AbortSignal,
+) -> Result<String> {
+    ctx.render_mode = RenderMode::Silent;
+    let input = Input::from_str(ctx, text, None)?;
+    ctx.before_chat_completion(&input)?;
+    let client = input.create_client()?;
+    let (output, tool_results) =
+        call_chat_completions_streaming(&input, client.as_ref(), ctx, abort).await?;
+    let app = Arc::clone(&ctx.app.config);
+    ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
+    Ok(output)
 }
 
 async fn emit<W: AsyncWrite + Unpin>(writer: &mut W, response: &Response) -> Result<()> {
@@ -146,5 +240,85 @@ mod tests {
         assert_eq!(v["id"], 1);
         assert_eq!(v["result"]["name"], "coyote");
         assert!(v["result"]["version"].is_string());
+    }
+
+    #[tokio::test]
+    async fn session_new_returns_session_id() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":10,"method":"session/new","params":{}}"#,
+            "\n",
+        );
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        assert_eq!(v["id"], 10);
+        assert_eq!(v["result"]["sessionId"], "default");
+    }
+
+    #[tokio::test]
+    async fn session_new_twice_errors() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#,
+            "\n",
+        );
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let mut lines = s.lines().filter(|l| !l.is_empty());
+        let first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert!(first["result"]["sessionId"].is_string());
+        assert_eq!(second["error"]["code"], -32000);
+    }
+
+    #[tokio::test]
+    async fn session_prompt_without_session_errors() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"text":"hello"}}"#,
+            "\n",
+        );
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        assert_eq!(v["id"], 3);
+        assert_eq!(v["error"]["code"], -32000);
+    }
+
+    #[tokio::test]
+    async fn session_prompt_with_no_context_returns_error() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"text":"hello"}}"#,
+            "\n",
+        );
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let mut lines = s.lines().filter(|l| !l.is_empty());
+        let first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(first["result"]["sessionId"], "default");
+        assert_eq!(second["id"], 2);
+        assert!(
+            second["error"].is_object(),
+            "expected error response when no ctx"
+        );
     }
 }
