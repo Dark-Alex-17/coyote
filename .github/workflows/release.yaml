@@ -516,5 +516,5 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: ${{ env.ACT != 'true' }}
-          tags: darkalex17/coyote:latest, darkalex17/coyote:${{ env.version }}
+          tags: darkalex17/coyote:latest, darkalex17/coyote:v${{ env.version }}
           build-args: COYOTE_VERSION=${{ env.version }}
