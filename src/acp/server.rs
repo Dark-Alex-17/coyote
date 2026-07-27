@@ -68,11 +68,22 @@ async fn dispatch(raw: &str, state: &mut AcpServerState) -> Option<Response> {
         Err(_) => return Some(Response::err(None, PARSE_ERROR, "Parse error")),
     };
 
+    // session/cancel is a notification — handle it regardless of whether an id is present.
+    if req.method == "session/cancel" {
+        handle_session_cancel(state);
+        return if req.id.is_some() {
+            Some(Response::ok(req.id, json!({})))
+        } else {
+            None
+        };
+    }
+
     req.id.as_ref()?;
 
     Some(match req.method.as_str() {
         "initialize" => handle_initialize(req),
         "session/new" => handle_session_new(req, state),
+        "session/load" => handle_session_load(req, state).await,
         "session/prompt" => handle_session_prompt(req, state).await,
         _ => Response::err(
             req.id,
@@ -149,6 +160,45 @@ async fn run_prompt_turn(
     let app = Arc::clone(&ctx.app.config);
     ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
     Ok(output)
+}
+
+fn handle_session_cancel(state: &mut AcpServerState) {
+    state.abort.set_ctrlc();
+}
+
+async fn handle_session_load(req: Request, state: &mut AcpServerState) -> Response {
+    if state.session_active {
+        return Response::err(req.id, -32000, "Session already active");
+    }
+
+    let session_name = match req
+        .params
+        .as_ref()
+        .and_then(|p| p.get("sessionId"))
+        .and_then(Value::as_str)
+    {
+        Some(n) => n.to_string(),
+        None => return Response::err(req.id, -32602, "Missing params.sessionId"),
+    };
+
+    let ctx = match state.ctx.as_mut() {
+        Some(c) => c,
+        None => return Response::err(req.id, -32000, "Server not configured with a context"),
+    };
+
+    let app = Arc::clone(&ctx.app.config);
+    let abort = state.abort.clone();
+    match ctx
+        .use_session(app.as_ref(), Some(&session_name), abort)
+        .await
+    {
+        Ok(_) => {
+            state.session_active = true;
+            ctx.render_mode = RenderMode::Silent;
+            Response::ok(req.id, json!({ "sessionId": session_name }))
+        }
+        Err(e) => Response::err(req.id, -32000, format!("Failed to load session: {e}")),
+    }
 }
 
 async fn emit<W: AsyncWrite + Unpin>(writer: &mut W, response: &Response) -> Result<()> {
@@ -320,5 +370,87 @@ mod tests {
             second["error"].is_object(),
             "expected error response when no ctx"
         );
+    }
+
+    #[tokio::test]
+    async fn session_cancel_notification_produces_no_output() {
+        let input = concat!(r#"{"jsonrpc":"2.0","method":"session/cancel"}"#, "\n",);
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_cancel_request_returns_ok() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":99,"method":"session/cancel"}"#,
+            "\n",
+        );
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        assert_eq!(v["id"], 99);
+        assert!(v["result"].is_object());
+    }
+
+    #[tokio::test]
+    async fn session_load_missing_session_id_errors() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":5,"method":"session/load","params":{}}"#,
+            "\n",
+        );
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        assert_eq!(v["id"], 5);
+        assert_eq!(v["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn session_load_after_session_new_errors() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"abc"}}"#,
+            "\n",
+        );
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let mut lines = s.lines().filter(|l| !l.is_empty());
+        let _first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(second["id"], 2);
+        assert_eq!(second["error"]["code"], -32000);
+    }
+
+    #[tokio::test]
+    async fn session_load_with_no_context_returns_error() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":6,"method":"session/load","params":{"sessionId":"my-session"}}"#,
+            "\n",
+        );
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        assert_eq!(v["id"], 6);
+        assert!(v["error"].is_object());
     }
 }
