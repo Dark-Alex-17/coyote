@@ -3,7 +3,6 @@
 # Setup (paths use $HOME so commands work in bash/zsh/PowerShell/Git Bash):
 #   sbx create --kit ./sbx-kit/ coyote --name testing .
 #   sbx cp $HOME/.config/coyote/ testing:/home/agent/.config/
-#   sbx cp $HOME/.coyote_password testing:/home/agent/
 #   sbx run testing --kit ./sbx-kit/
 schemaVersion: '1'
 kind: sandbox
