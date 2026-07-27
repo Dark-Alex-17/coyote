@@ -1,5 +1,5 @@
 ARG COYOTE_VERSION
-FROM docker/sandbox-templates:shell-docker
+FROM docker/sandbox-templates:shell-docker AS build
 
 ARG COYOTE_VERSION
 ARG TARGETARCH
@@ -66,6 +66,29 @@ RUN set -euo pipefail; \
     install -m 0755 "$TMPDIR/coyote" /home/agent/.cargo/bin/coyote; \
     chown 1000:1000 /home/agent/.cargo/bin/coyote; \
     rm -rf "$TMPDIR"
+
+FROM scratch
+
+ARG COYOTE_VERSION
+
+COPY --from=build / /
+
+ENV PATH="/home/agent/.cargo/bin:/home/agent/.local/bin:/usr/local/share/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    NPM_CONFIG_PREFIX="/usr/local/share/npm-global" \
+    NO_PROXY="localhost,127.0.0.1,::1,172.17.0.0/16" \
+    no_proxy="localhost,127.0.0.1,::1,172.17.0.0/16" \
+    BASH_ENV="/etc/sandbox-persistent.sh"
+
+LABEL com.docker.sandboxes="templates" \
+      com.docker.sandboxes.base="ubuntu:questing" \
+      com.docker.sandboxes.flavor="shell-docker" \
+      com.docker.sandboxes.start-docker="true" \
+      org.opencontainers.image.title="coyote" \
+      org.opencontainers.image.description="An all-in-one, batteries-included LLM CLI tool: Shell Assistant, CLI & REPL mode, RAG, AI tools & agents, MCP servers, skills, and macros." \
+      org.opencontainers.image.source="https://github.com/Dark-Alex-17/coyote" \
+      org.opencontainers.image.version="${COYOTE_VERSION}"
+
+WORKDIR /home/agent/workspace
 
 USER 1000
 
