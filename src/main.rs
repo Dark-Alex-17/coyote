@@ -24,7 +24,7 @@ use crate::client::{
 use crate::config::instructions::WORKSPACE_INSTRUCTIONS_FILE_NAME;
 use crate::config::{
     Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, MemoryScope,
-    RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
+    RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
     install_builtins, list_agents, load_env_file, macro_execute, sync_models,
 };
 use crate::config::{memory, paths};
@@ -49,6 +49,7 @@ use log4rs::config::{Appender, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
 use oauth::OAuthProvider;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::{env, fs, process, sync::Arc};
 
 #[tokio::main]
@@ -80,6 +81,16 @@ async fn main() -> Result<()> {
     } else {
         WorkingMode::Cmd
     };
+
+    if cli.headless {
+        if text.is_none() && cli.file.is_empty() {
+            bail!("--headless requires a prompt argument; REPL mode is not supported");
+        }
+        unsafe {
+            env::set_var("AUTO_CONFIRM", "true");
+        }
+        HEADLESS.store(true, Ordering::SeqCst);
+    }
 
     let info_flag = cli.info
         || cli.sync_models
@@ -216,6 +227,10 @@ async fn main() -> Result<()> {
             }
             set_global_render_config(prompt_theme(render_opts)?)
         }
+    }
+
+    if cli.headless {
+        ctx.render_mode = RenderMode::Silent;
     }
 
     if let Err(err) = run(ctx, cli, text, abort_signal).await {

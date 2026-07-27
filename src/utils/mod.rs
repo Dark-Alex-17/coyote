@@ -33,6 +33,7 @@ use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use is_terminal::IsTerminal;
 use nu_ansi_term::Color;
 use std::borrow::Cow;
+use std::sync::atomic::AtomicBool;
 use std::sync::{LazyLock, OnceLock};
 use std::{cmp, env, path::PathBuf, process};
 use syntect::highlighting::{Highlighter, Theme};
@@ -43,6 +44,7 @@ pub static CODE_BLOCK_RE: LazyLock<Regex> =
 pub static THINK_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^\s*<think>.*?</think>(\s*|$)").unwrap());
 pub static IS_STDOUT_TERMINAL: LazyLock<bool> = LazyLock::new(|| std::io::stdout().is_terminal());
+pub static HEADLESS: AtomicBool = AtomicBool::new(false);
 pub static NO_COLOR: LazyLock<bool> = LazyLock::new(|| {
     env::var("NO_COLOR")
         .ok()

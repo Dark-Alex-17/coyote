@@ -1,11 +1,13 @@
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::RequestContext;
 use crate::supervisor::escalation::{EscalationRequest, new_escalation_id};
+use crate::utils::HEADLESS;
 
 use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
 use inquire::{Confirm, MultiSelect, Select, Text};
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -136,6 +138,10 @@ pub async fn handle_user_tool(
         .strip_prefix(USER_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
 
+    if HEADLESS.load(Ordering::SeqCst) {
+        return Ok(handle_headless(action, args));
+    }
+
     let depth = ctx.current_depth;
 
     if depth == 0 {
@@ -143,6 +149,22 @@ pub async fn handle_user_tool(
     } else {
         handle_escalated(ctx, action, args).await
     }
+}
+
+fn handle_headless(action: &str, args: &Value) -> Value {
+    let question = args.get("question").and_then(Value::as_str).unwrap_or("");
+    let options: Vec<Value> = args
+        .get("options")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    json!({
+        "needs_human": true,
+        "action": action,
+        "question": question,
+        "options": options,
+        "guidance": "No human is present. Apply a sensible default or abort the task.",
+    })
 }
 
 fn handle_direct(action: &str, args: &Value) -> Result<Value> {
@@ -268,6 +290,31 @@ async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> R
             ),
             "fallback": "Make your best judgment and proceed",
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn headless_select_returns_structured_json() {
+        let args = json!({"question": "pick one", "options": ["a", "b"]});
+        let v = handle_headless("select", &args);
+        assert_eq!(v["needs_human"], true);
+        assert_eq!(v["action"], "select");
+        assert_eq!(v["question"], "pick one");
+        assert_eq!(v["options"], json!(["a", "b"]));
+        assert!(v["guidance"].is_string());
+    }
+
+    #[test]
+    fn headless_confirm_returns_empty_options_when_absent() {
+        let args = json!({"question": "yes or no?"});
+        let v = handle_headless("confirm", &args);
+        assert_eq!(v["needs_human"], true);
+        assert_eq!(v["action"], "confirm");
+        assert_eq!(v["options"], json!([]));
     }
 }
 

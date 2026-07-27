@@ -230,6 +230,10 @@ pub struct Cli {
     /// Start the sandbox with a clean slate. No copied config or tokens; LLM credentials injected via sbx proxy
     #[arg(long, requires = "sandbox", help_heading = "Sandbox")]
     pub fresh: bool,
+    /// Declare that no human is present. All user-interaction tools return structured JSON instead of
+    /// prompting. Implies --dangerously-skip-permissions. Incompatible with REPL mode (requires a prompt).
+    #[arg(long, help_heading = "Sandbox")]
+    pub headless: bool,
     /// Display information
     #[arg(long, help_heading = "Diagnostics & Tools")]
     pub info: bool,
@@ -488,6 +492,17 @@ mod tests {
     fn parse_dangerously_skip_permissions_default_off() {
         let cli = parse(&[]);
         assert!(!cli.dangerously_skip_permissions);
+    }
+
+    #[test]
+    fn parse_headless_flag() {
+        let cli = parse(&["--headless", "do something"]);
+        assert!(cli.headless);
+    }
+
+    #[test]
+    fn parse_headless_default_off() {
+        assert!(!parse(&[]).headless);
     }
 
     #[test]
