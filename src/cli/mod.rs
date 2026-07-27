@@ -234,6 +234,10 @@ pub struct Cli {
     /// prompting. Implies --dangerously-skip-permissions. Incompatible with REPL mode (requires a prompt).
     #[arg(long, help_heading = "Sandbox")]
     pub headless: bool,
+    /// Run as an ACP agent server over stdio (JSON-RPC 2.0). Every stdout byte must be valid JSON-RPC.
+    /// Implies --headless. Single session per process.
+    #[arg(long, help_heading = "Sandbox")]
+    pub acp_server: bool,
     /// Display information
     #[arg(long, help_heading = "Diagnostics & Tools")]
     pub info: bool,
@@ -503,6 +507,17 @@ mod tests {
     #[test]
     fn parse_headless_default_off() {
         assert!(!parse(&[]).headless);
+    }
+
+    #[test]
+    fn parse_acp_server_flag() {
+        let cli = parse(&["--acp-server"]);
+        assert!(cli.acp_server);
+    }
+
+    #[test]
+    fn parse_acp_server_default_off() {
+        assert!(!parse(&[]).acp_server);
     }
 
     #[test]

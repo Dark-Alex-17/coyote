@@ -1,3 +1,4 @@
+mod acp;
 mod cli;
 mod client;
 mod config;
@@ -82,8 +83,8 @@ async fn main() -> Result<()> {
         WorkingMode::Cmd
     };
 
-    if cli.headless {
-        if text.is_none() && cli.file.is_empty() {
+    if cli.headless || cli.acp_server {
+        if cli.headless && !cli.acp_server && text.is_none() && cli.file.is_empty() {
             bail!("--headless requires a prompt argument; REPL mode is not supported");
         }
         unsafe {
@@ -107,7 +108,11 @@ async fn main() -> Result<()> {
         || cli.delete_secret.is_some()
         || cli.list_secrets;
 
-    let log_path = setup_logger()?;
+    let log_path = setup_logger(cli.acp_server)?;
+
+    if cli.acp_server {
+        return acp::run_acp_server().await;
+    }
 
     if let Some(version) = &cli.update {
         let version = version.clone();
@@ -694,7 +699,7 @@ async fn create_input(
     Ok(input)
 }
 
-fn setup_logger() -> Result<Option<PathBuf>> {
+fn setup_logger(acp_mode: bool) -> Result<Option<PathBuf>> {
     let (log_level, log_path) = paths::log_config()?;
     if log_level == LevelFilter::Off {
         return Ok(None);
@@ -705,7 +710,11 @@ fn setup_logger() -> Result<Option<PathBuf>> {
     let log_filter = env::var(get_env_name("log_filter")).ok();
     match log_path.clone() {
         None => {
-            let console_appender = ConsoleAppender::builder().encoder(encoder).build();
+            let mut builder = ConsoleAppender::builder().encoder(encoder);
+            if acp_mode {
+                builder = builder.target(log4rs::append::console::Target::Stderr);
+            }
+            let console_appender = builder.build();
             log4rs::init_config(init_console_logger(log_level, log_filter, console_appender))?;
         }
         Some(path) => {
