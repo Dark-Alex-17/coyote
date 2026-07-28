@@ -109,7 +109,7 @@ fn handle_initialize(req: Request) -> Response {
         json!({
             "name": "coyote",
             "version": env!("CARGO_PKG_VERSION"),
-            "protocolVersion": "1",
+            "protocolVersion": 1,
         }),
     )
 }
@@ -148,14 +148,33 @@ async fn handle_session_prompt(req: Request, state: &mut AcpServerState) -> Resp
         return Response::err(req.id, -32000, "No active session; call session/new first");
     }
 
-    let text = match req
-        .params
-        .as_ref()
+    let params = req.params.as_ref();
+    let from_content_blocks: Option<String> = params
+        .and_then(|p| p.get("prompt"))
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|s| !s.is_empty());
+    let from_text: Option<String> = params
         .and_then(|p| p.get("text"))
         .and_then(Value::as_str)
-    {
-        Some(t) => t.to_string(),
-        None => return Response::err(req.id, -32602, "Missing params.text"),
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let text = match from_content_blocks.or(from_text) {
+        Some(t) => t,
+        None => {
+            return Response::err(
+                req.id,
+                -32602,
+                "Missing params: expected prompt (ContentBlock array) or text",
+            );
+        }
     };
 
     let ctx = match state.ctx.as_mut() {
@@ -536,5 +555,98 @@ mod tests {
         assert_eq!(v["method"], "session/request_permission");
         assert!(v["params"]["action"].is_string());
         assert!(!v.as_object().unwrap().contains_key("id"));
+    }
+
+    #[tokio::test]
+    async fn initialize_protocol_version_is_number() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "\n",
+        );
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let v: Value = serde_json::from_str(s.trim()).unwrap();
+
+        assert!(
+            v["result"]["protocolVersion"].is_number(),
+            "protocolVersion must be a JSON number, got: {:?}",
+            v["result"]["protocolVersion"]
+        );
+        assert_eq!(v["result"]["protocolVersion"], 1);
+    }
+
+    #[tokio::test]
+    async fn session_prompt_spec_content_blocks_not_rejected() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"default","prompt":[{"type":"text","text":"hello"}]}}"#,
+            "\n",
+        );
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let mut lines = s.lines().filter(|l| !l.is_empty());
+        let _first: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let second: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+
+        assert_eq!(second["id"], 2);
+        let code = second["error"]["code"].as_i64().unwrap_or(0);
+        assert_ne!(
+            code, -32602,
+            "spec-shaped ContentBlock prompt must not get a params error"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_non_text_blocks_ignored() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"prompt":[{"type":"image","data":"abc"},{"type":"text","text":"hello"}]}}"#,
+            "\n",
+        );
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let mut lines = s.lines().filter(|l| !l.is_empty());
+        let _first: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let second: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+
+        assert_eq!(second["id"], 2);
+        let code = second["error"]["code"].as_i64().unwrap_or(0);
+        assert_ne!(code, -32602, "non-text blocks must be silently ignored");
+    }
+
+    #[tokio::test]
+    async fn session_prompt_missing_both_text_and_prompt_errors() {
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"default"}}"#,
+            "\n",
+        );
+        let mut output = Vec::new();
+        run_acp_server_on(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let mut lines = s.lines().filter(|l| !l.is_empty());
+        let _first: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let second: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+
+        assert_eq!(second["id"], 2);
+        assert_eq!(second["error"]["code"], -32602);
     }
 }
