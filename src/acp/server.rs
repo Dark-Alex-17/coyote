@@ -1,6 +1,7 @@
 use super::types::{METHOD_NOT_FOUND, PARSE_ERROR, Request, Response};
 use crate::client::call_chat_completions_streaming;
 use crate::config::{Input, RenderMode, RequestContext};
+use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
 use crate::utils;
 use crate::utils::AbortSignal;
 use anyhow::Result;
@@ -198,16 +199,33 @@ async fn run_prompt_turn(
     abort: AbortSignal,
 ) -> Result<String> {
     ctx.render_mode = RenderMode::Silent;
-    let input = Input::from_str(ctx, text, None)?;
-    ctx.before_chat_completion(&input)?;
-    let client = input.create_client()?;
-    let (output, tool_results) =
-        call_chat_completions_streaming(&input, client.as_ref(), ctx, abort).await?;
-    let app = Arc::clone(&ctx.app.config);
-
-    ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
-
-    Ok(output)
+    let mut input = Input::from_str(ctx, text, None)?;
+    loop {
+        ctx.before_chat_completion(&input)?;
+        let client = input.create_client()?;
+        let (output, tool_results) =
+            call_chat_completions_streaming(&input, client.as_ref(), ctx, abort.clone()).await?;
+        let app = Arc::clone(&ctx.app.config);
+        ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
+        if !tool_results.is_empty() {
+            input = input.merge_tool_results(output, tool_results);
+            continue;
+        }
+        match check_pending_agents_guardrail(ctx) {
+            GuardrailAction::Inject(prompt) => {
+                input = Input::from_str(ctx, &prompt, None)?;
+            }
+            GuardrailAction::ForceTerminate(ids) => {
+                warn!(
+                    "Pending-agent guardrail force-cancelled {} agent(s): {:?}",
+                    ids.len(),
+                    ids
+                );
+                return Ok(output);
+            }
+            GuardrailAction::NoAction => return Ok(output),
+        }
+    }
 }
 
 fn handle_session_cancel(state: &mut AcpServerState) {
