@@ -28,7 +28,8 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    use crate::utils::create_abort_signal;
+    use crate::utils::{create_abort_signal, drain_acp_permissions};
+    drain_acp_permissions();
     let state = AcpServerState {
         ctx: None,
         abort: create_abort_signal(),
@@ -55,6 +56,9 @@ where
             continue;
         }
         if let Some(response) = dispatch(&line, &mut state).await {
+            for params in crate::utils::drain_acp_permissions() {
+                emit_notification(&mut writer, "session/request_permission", params).await?;
+            }
             emit(&mut writer, &response).await?;
         }
     }
@@ -203,6 +207,23 @@ async fn handle_session_load(req: Request, state: &mut AcpServerState) -> Respon
 
 async fn emit<W: AsyncWrite + Unpin>(writer: &mut W, response: &Response) -> Result<()> {
     let mut line = serde_json::to_string(response)?;
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn emit_notification<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<()> {
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    });
+    let mut line = serde_json::to_string(&frame)?;
     line.push('\n');
     writer.write_all(line.as_bytes()).await?;
     writer.flush().await?;
@@ -452,5 +473,24 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
         assert_eq!(v["id"], 6);
         assert!(v["error"].is_object());
+    }
+
+    #[tokio::test]
+    async fn emit_notification_produces_valid_json_rpc_frame() {
+        let mut output = Vec::new();
+        emit_notification(
+            &mut output,
+            "session/request_permission",
+            serde_json::json!({"action": "confirm", "question": "Proceed?"}),
+        )
+        .await
+        .unwrap();
+
+        let s = String::from_utf8(output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["method"], "session/request_permission");
+        assert!(v["params"]["action"].is_string());
+        assert!(!v.as_object().unwrap().contains_key("id"));
     }
 }

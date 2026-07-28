@@ -1,7 +1,7 @@
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::RequestContext;
 use crate::supervisor::escalation::{EscalationRequest, new_escalation_id};
-use crate::utils::HEADLESS;
+use crate::utils::{ACP_SERVER, HEADLESS, queue_acp_permission};
 
 use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
@@ -137,6 +137,16 @@ pub async fn handle_user_tool(
     let action = cmd_name
         .strip_prefix(USER_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
+
+    if ACP_SERVER.load(Ordering::SeqCst) {
+        let result = handle_headless(action, args);
+        queue_acp_permission(json!({
+            "action": action,
+            "question": result["question"],
+            "options": result["options"],
+        }));
+        return Ok(result);
+    }
 
     if HEADLESS.load(Ordering::SeqCst) {
         return Ok(handle_headless(action, args));

@@ -91,6 +91,9 @@ async fn main() -> Result<()> {
             env::set_var("AUTO_CONFIRM", "true");
         }
         HEADLESS.store(true, Ordering::SeqCst);
+        if cli.acp_server {
+            ACP_SERVER.store(true, Ordering::SeqCst);
+        }
     }
 
     let info_flag = cli.info

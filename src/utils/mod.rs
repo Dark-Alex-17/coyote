@@ -33,8 +33,9 @@ use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use is_terminal::IsTerminal;
 use nu_ansi_term::Color;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::{cmp, env, path::PathBuf, process};
 use syntect::highlighting::{Highlighter, Theme};
 use syntect::parsing::Scope;
@@ -45,6 +46,22 @@ pub static THINK_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^\s*<think>.*?</think>(\s*|$)").unwrap());
 pub static IS_STDOUT_TERMINAL: LazyLock<bool> = LazyLock::new(|| std::io::stdout().is_terminal());
 pub static HEADLESS: AtomicBool = AtomicBool::new(false);
+pub static ACP_SERVER: AtomicBool = AtomicBool::new(false);
+
+static ACP_PERMISSION_QUEUE: Mutex<VecDeque<serde_json::Value>> = Mutex::new(VecDeque::new());
+
+pub fn queue_acp_permission(notification: serde_json::Value) {
+    if let Ok(mut q) = ACP_PERMISSION_QUEUE.lock() {
+        q.push_back(notification);
+    }
+}
+
+pub fn drain_acp_permissions() -> Vec<serde_json::Value> {
+    ACP_PERMISSION_QUEUE
+        .lock()
+        .map(|mut q| q.drain(..).collect())
+        .unwrap_or_default()
+}
 pub static NO_COLOR: LazyLock<bool> = LazyLock::new(|| {
     env::var("NO_COLOR")
         .ok()
