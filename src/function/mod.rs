@@ -30,6 +30,7 @@ use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::sync::atomic::Ordering;
 use std::{
     collections::{HashMap, HashSet},
     env, fs, io,
@@ -1090,7 +1091,7 @@ impl ToolCall {
 
         cmd_args.push(json_data.to_string());
 
-        if *IS_STDOUT_TERMINAL && current_depth == 0 {
+        if *IS_STDOUT_TERMINAL && current_depth == 0 && !HEADLESS.load(Ordering::SeqCst) {
             println!("{}", format_call_log(&cmd_name, &cmd_args, &json_data));
         }
 

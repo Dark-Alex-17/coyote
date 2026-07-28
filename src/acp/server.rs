@@ -92,7 +92,7 @@ async fn dispatch(raw: &str, state: &mut AcpServerState) -> Option<Response> {
 
     Some(match req.method.as_str() {
         "initialize" => handle_initialize(req),
-        "session/new" => handle_session_new(req, state),
+        "session/new" => handle_session_new(req, state).await,
         "session/load" => handle_session_load(req, state).await,
         "session/prompt" => handle_session_prompt(req, state).await,
         _ => Response::err(
@@ -114,7 +114,7 @@ fn handle_initialize(req: Request) -> Response {
     )
 }
 
-fn handle_session_new(req: Request, state: &mut AcpServerState) -> Response {
+async fn handle_session_new(req: Request, state: &mut AcpServerState) -> Response {
     if state.session_active {
         return Response::err(
             req.id,
@@ -122,9 +122,25 @@ fn handle_session_new(req: Request, state: &mut AcpServerState) -> Response {
             "Session already active; this server supports one session per process",
         );
     }
-    state.session_active = true;
 
-    Response::ok(req.id, json!({ "sessionId": "default" }))
+    let ctx = match state.ctx.as_mut() {
+        Some(c) => c,
+        None => {
+            state.session_active = true;
+            return Response::ok(req.id, json!({ "sessionId": "default" }));
+        }
+    };
+
+    let app = Arc::clone(&ctx.app.config);
+    let abort = state.abort.clone();
+    match ctx.use_session(app.as_ref(), None, abort).await {
+        Ok(_) => {
+            state.session_active = true;
+            ctx.render_mode = RenderMode::Silent;
+            Response::ok(req.id, json!({ "sessionId": "default" }))
+        }
+        Err(e) => Response::err(req.id, -32000, format!("Failed to create session: {e}")),
+    }
 }
 
 async fn handle_session_prompt(req: Request, state: &mut AcpServerState) -> Response {
