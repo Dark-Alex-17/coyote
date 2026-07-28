@@ -236,7 +236,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    if cli.headless || cli.acp_server {
+    if cli.acp_server {
         ctx.render_mode = RenderMode::Silent;
     }
 
