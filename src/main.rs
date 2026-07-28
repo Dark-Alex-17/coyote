@@ -236,34 +236,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    if cli.acp_server {
-        ctx.render_mode = RenderMode::Silent;
-
-        if let Some(agent) = &cli.agent {
-            if !cli.agent_variable.is_empty() {
-                ctx.agent_variables = Some(
-                    cli.agent_variable
-                        .chunks(2)
-                        .map(|v| (v[0].to_string(), v[1].to_string()))
-                        .collect(),
-                );
-            }
-            ctx.use_agent(app_config.as_ref(), agent, None, abort_signal.clone())
-                .await?;
-        } else if let Some(role) = &cli.role {
-            ctx.use_role(app_config.as_ref(), role, abort_signal.clone())
-                .await?;
-        }
-        if let Some(rag) = &cli.rag {
-            ctx.use_rag(Some(rag), abort_signal.clone()).await?;
-        }
-        if let Some(model_id) = &cli.model {
-            ctx.set_model_on_role_like(app_config.as_ref(), model_id)?;
-        }
-
-        return acp::run_acp_server(ctx, abort_signal).await;
-    }
-
     if let Err(err) = run(ctx, cli, text, abort_signal).await {
         render_error(err);
         process::exit(1);
@@ -523,6 +495,11 @@ async fn run(
 
     for name in &cli.skills() {
         ctx.load_skill_repl(name, abort_signal.clone()).await?;
+    }
+
+    if cli.acp_server {
+        ctx.render_mode = RenderMode::Silent;
+        return acp::run_acp_server(ctx, abort_signal).await;
     }
 
     match is_repl {
