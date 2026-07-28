@@ -305,6 +305,29 @@ async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> R
     }
 }
 
+fn parse_options(args: &Value) -> Result<Vec<String>> {
+    let raw = args
+        .get("options")
+        .ok_or_else(|| anyhow!("'options' is required and must be an array of strings"))?;
+
+    let arr: Vec<Value> = match raw {
+        Value::Array(arr) => arr.clone(),
+        Value::String(s) => serde_json::from_str::<Vec<Value>>(s).map_err(|_| {
+            anyhow!(
+                "'options' was a string but did not parse as a JSON array. \
+                 Pass options as a native JSON array, e.g. [\"yes\", \"no\"]."
+            )
+        })?,
+        _ => bail!("'options' is required and must be an array of strings"),
+    };
+
+    Ok(arr
+        .iter()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,27 +351,4 @@ mod tests {
         assert_eq!(v["action"], "confirm");
         assert_eq!(v["options"], json!([]));
     }
-}
-
-fn parse_options(args: &Value) -> Result<Vec<String>> {
-    let raw = args
-        .get("options")
-        .ok_or_else(|| anyhow!("'options' is required and must be an array of strings"))?;
-
-    let arr: Vec<Value> = match raw {
-        Value::Array(arr) => arr.clone(),
-        Value::String(s) => serde_json::from_str::<Vec<Value>>(s).map_err(|_| {
-            anyhow!(
-                "'options' was a string but did not parse as a JSON array. \
-                 Pass options as a native JSON array, e.g. [\"yes\", \"no\"]."
-            )
-        })?,
-        _ => bail!("'options' is required and must be an array of strings"),
-    };
-
-    Ok(arr
-        .iter()
-        .filter_map(Value::as_str)
-        .map(String::from)
-        .collect())
 }
