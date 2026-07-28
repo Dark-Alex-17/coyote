@@ -145,6 +145,7 @@ pub async fn handle_user_tool(
             "question": result["question"],
             "options": result["options"],
         }));
+
         return Ok(result);
     }
 
@@ -168,6 +169,7 @@ fn handle_headless(action: &str, args: &Value) -> Value {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+
     json!({
         "needs_human": true,
         "action": action,
