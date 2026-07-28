@@ -1,11 +1,12 @@
 use super::types::{METHOD_NOT_FOUND, PARSE_ERROR, Request, Response};
 use crate::client::call_chat_completions_streaming;
 use crate::config::{Input, RenderMode, RequestContext};
+use crate::utils;
 use crate::utils::AbortSignal;
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 pub(crate) struct AcpServerState {
     ctx: Option<RequestContext>,
@@ -19,22 +20,25 @@ pub async fn run_acp_server(ctx: RequestContext, abort: AbortSignal) -> Result<(
         abort,
         session_active: false,
     };
+
     run_acp_server_with_state(tokio::io::stdin(), tokio::io::stdout(), state).await
 }
 
 #[cfg(test)]
 pub(crate) async fn run_acp_server_on<R, W>(reader: R, writer: W) -> Result<()>
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     use crate::utils::{create_abort_signal, drain_acp_permissions};
+
     drain_acp_permissions();
     let state = AcpServerState {
         ctx: None,
         abort: create_abort_signal(),
         session_active: false,
     };
+
     run_acp_server_with_state(reader, writer, state).await
 }
 
@@ -44,7 +48,7 @@ async fn run_acp_server_with_state<R, W>(
     mut state: AcpServerState,
 ) -> Result<()>
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let reader = BufReader::new(reader);
@@ -55,10 +59,12 @@ where
         if line.is_empty() {
             continue;
         }
+
         if let Some(response) = dispatch(&line, &mut state).await {
-            for params in crate::utils::drain_acp_permissions() {
+            for params in utils::drain_acp_permissions() {
                 emit_notification(&mut writer, "session/request_permission", params).await?;
             }
+
             emit(&mut writer, &response).await?;
         }
     }
@@ -72,7 +78,7 @@ async fn dispatch(raw: &str, state: &mut AcpServerState) -> Option<Response> {
         Err(_) => return Some(Response::err(None, PARSE_ERROR, "Parse error")),
     };
 
-    // session/cancel is a notification — handle it regardless of whether an id is present.
+    // session/cancel is a notification. Handle it regardless of whether an id is present.
     if req.method == "session/cancel" {
         handle_session_cancel(state);
         return if req.id.is_some() {
@@ -117,6 +123,7 @@ fn handle_session_new(req: Request, state: &mut AcpServerState) -> Response {
         );
     }
     state.session_active = true;
+
     Response::ok(req.id, json!({ "sessionId": "default" }))
 }
 
@@ -162,7 +169,9 @@ async fn run_prompt_turn(
     let (output, tool_results) =
         call_chat_completions_streaming(&input, client.as_ref(), ctx, abort).await?;
     let app = Arc::clone(&ctx.app.config);
+
     ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
+
     Ok(output)
 }
 
@@ -210,15 +219,16 @@ async fn emit<W: AsyncWrite + Unpin>(writer: &mut W, response: &Response) -> Res
     line.push('\n');
     writer.write_all(line.as_bytes()).await?;
     writer.flush().await?;
+
     Ok(())
 }
 
 async fn emit_notification<W: AsyncWrite + Unpin>(
     writer: &mut W,
     method: &str,
-    params: serde_json::Value,
+    params: Value,
 ) -> Result<()> {
-    let frame = serde_json::json!({
+    let frame = json!({
         "jsonrpc": "2.0",
         "method": method,
         "params": params,
@@ -227,12 +237,14 @@ async fn emit_notification<W: AsyncWrite + Unpin>(
     line.push('\n');
     writer.write_all(line.as_bytes()).await?;
     writer.flush().await?;
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str;
 
     #[tokio::test]
     async fn all_stdout_is_valid_json_rpc() {
@@ -246,8 +258,8 @@ mod tests {
             .unwrap();
 
         for line in output.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
-            let s = std::str::from_utf8(line).expect("non-UTF8 in ACP stdout");
-            let _: serde_json::Value = serde_json::from_str(s)
+            let s = str::from_utf8(line).expect("non-UTF8 in ACP stdout");
+            let _: Value = serde_json::from_str(s)
                 .unwrap_or_else(|_| panic!("ACP stdout not valid JSON: {s}"));
         }
     }
@@ -264,7 +276,8 @@ mod tests {
             .unwrap();
 
         let s = String::from_utf8(output).unwrap();
-        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        let v: Value = serde_json::from_str(s.trim()).unwrap();
+
         assert_eq!(v["error"]["code"], METHOD_NOT_FOUND);
         assert_eq!(v["id"], 2);
     }
@@ -278,7 +291,8 @@ mod tests {
             .unwrap();
 
         let s = String::from_utf8(output).unwrap();
-        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        let v: Value = serde_json::from_str(s.trim()).unwrap();
+
         assert_eq!(v["error"]["code"], PARSE_ERROR);
     }
 
@@ -289,9 +303,11 @@ mod tests {
             "\n",
         );
         let mut output = Vec::new();
+
         run_acp_server_on(input.as_bytes(), &mut output)
             .await
             .unwrap();
+
         assert!(output.is_empty());
     }
 
@@ -307,7 +323,8 @@ mod tests {
             .unwrap();
 
         let s = String::from_utf8(output).unwrap();
-        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        let v: Value = serde_json::from_str(s.trim()).unwrap();
+
         assert_eq!(v["id"], 1);
         assert_eq!(v["result"]["name"], "coyote");
         assert!(v["result"]["version"].is_string());
@@ -325,7 +342,8 @@ mod tests {
             .unwrap();
 
         let s = String::from_utf8(output).unwrap();
-        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        let v: Value = serde_json::from_str(s.trim()).unwrap();
+
         assert_eq!(v["id"], 10);
         assert_eq!(v["result"]["sessionId"], "default");
     }
@@ -345,8 +363,9 @@ mod tests {
 
         let s = String::from_utf8(output).unwrap();
         let mut lines = s.lines().filter(|l| !l.is_empty());
-        let first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
-        let second: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+
+        let first: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let second: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert!(first["result"]["sessionId"].is_string());
         assert_eq!(second["error"]["code"], -32000);
     }
@@ -363,7 +382,8 @@ mod tests {
             .unwrap();
 
         let s = String::from_utf8(output).unwrap();
-        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        let v: Value = serde_json::from_str(s.trim()).unwrap();
+
         assert_eq!(v["id"], 3);
         assert_eq!(v["error"]["code"], -32000);
     }
@@ -383,8 +403,9 @@ mod tests {
 
         let s = String::from_utf8(output).unwrap();
         let mut lines = s.lines().filter(|l| !l.is_empty());
-        let first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
-        let second: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+
+        let first: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let second: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert_eq!(first["result"]["sessionId"], "default");
         assert_eq!(second["id"], 2);
         assert!(
@@ -397,9 +418,11 @@ mod tests {
     async fn session_cancel_notification_produces_no_output() {
         let input = concat!(r#"{"jsonrpc":"2.0","method":"session/cancel"}"#, "\n",);
         let mut output = Vec::new();
+
         run_acp_server_on(input.as_bytes(), &mut output)
             .await
             .unwrap();
+
         assert!(output.is_empty());
     }
 
@@ -415,7 +438,8 @@ mod tests {
             .unwrap();
 
         let s = String::from_utf8(output).unwrap();
-        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        let v: Value = serde_json::from_str(s.trim()).unwrap();
+
         assert_eq!(v["id"], 99);
         assert!(v["result"].is_object());
     }
@@ -432,7 +456,8 @@ mod tests {
             .unwrap();
 
         let s = String::from_utf8(output).unwrap();
-        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        let v: Value = serde_json::from_str(s.trim()).unwrap();
+
         assert_eq!(v["id"], 5);
         assert_eq!(v["error"]["code"], -32602);
     }
@@ -452,8 +477,9 @@ mod tests {
 
         let s = String::from_utf8(output).unwrap();
         let mut lines = s.lines().filter(|l| !l.is_empty());
-        let _first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
-        let second: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+
+        let _first: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let second: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert_eq!(second["id"], 2);
         assert_eq!(second["error"]["code"], -32000);
     }
@@ -470,7 +496,8 @@ mod tests {
             .unwrap();
 
         let s = String::from_utf8(output).unwrap();
-        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        let v: Value = serde_json::from_str(s.trim()).unwrap();
+
         assert_eq!(v["id"], 6);
         assert!(v["error"].is_object());
     }
@@ -481,13 +508,14 @@ mod tests {
         emit_notification(
             &mut output,
             "session/request_permission",
-            serde_json::json!({"action": "confirm", "question": "Proceed?"}),
+            json!({"action": "confirm", "question": "Proceed?"}),
         )
         .await
         .unwrap();
 
         let s = String::from_utf8(output).unwrap();
-        let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        let v: Value = serde_json::from_str(s.trim()).unwrap();
+
         assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["method"], "session/request_permission");
         assert!(v["params"]["action"].is_string());

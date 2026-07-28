@@ -32,6 +32,7 @@ use fancy_regex::Regex;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use is_terminal::IsTerminal;
 use nu_ansi_term::Color;
+use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
@@ -48,15 +49,15 @@ pub static IS_STDOUT_TERMINAL: LazyLock<bool> = LazyLock::new(|| std::io::stdout
 pub static HEADLESS: AtomicBool = AtomicBool::new(false);
 pub static ACP_SERVER: AtomicBool = AtomicBool::new(false);
 
-static ACP_PERMISSION_QUEUE: Mutex<VecDeque<serde_json::Value>> = Mutex::new(VecDeque::new());
+static ACP_PERMISSION_QUEUE: Mutex<VecDeque<Value>> = Mutex::new(VecDeque::new());
 
-pub fn queue_acp_permission(notification: serde_json::Value) {
+pub fn queue_acp_permission(notification: Value) {
     if let Ok(mut q) = ACP_PERMISSION_QUEUE.lock() {
         q.push_back(notification);
     }
 }
 
-pub fn drain_acp_permissions() -> Vec<serde_json::Value> {
+pub fn drain_acp_permissions() -> Vec<Value> {
     ACP_PERMISSION_QUEUE
         .lock()
         .map(|mut q| q.drain(..).collect())

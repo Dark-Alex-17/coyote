@@ -41,7 +41,7 @@ use clap_complete::CompleteEnv;
 use client::ClientConfig;
 use inquire::{Select, Text, set_global_render_config};
 use log::{LevelFilter, warn};
-use log4rs::append::console::ConsoleAppender;
+use log4rs::append::console::{ConsoleAppender, Target};
 use log4rs::append::rolling_file::RollingFileAppender;
 use log4rs::append::rolling_file::policy::compound::CompoundPolicy;
 use log4rs::append::rolling_file::policy::compound::roll::fixed_window::FixedWindowRoller;
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let text = cli.text()?;
+    let text = if cli.acp_server { None } else { cli.text()? };
     let working_mode = if !cli.acp_server && text.is_none() && cli.file.is_empty() {
         WorkingMode::Repl
     } else {
@@ -87,10 +87,13 @@ async fn main() -> Result<()> {
         if cli.headless && !cli.acp_server && text.is_none() && cli.file.is_empty() {
             bail!("--headless requires a prompt argument; REPL mode is not supported");
         }
+
         unsafe {
             env::set_var("AUTO_CONFIRM", "true");
         }
+
         HEADLESS.store(true, Ordering::SeqCst);
+
         if cli.acp_server {
             ACP_SERVER.store(true, Ordering::SeqCst);
         }
@@ -233,7 +236,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    if cli.headless {
+    if cli.headless || cli.acp_server {
         ctx.render_mode = RenderMode::Silent;
     }
 
@@ -715,7 +718,7 @@ fn setup_logger(acp_mode: bool) -> Result<Option<PathBuf>> {
         None => {
             let mut builder = ConsoleAppender::builder().encoder(encoder);
             if acp_mode {
-                builder = builder.target(log4rs::append::console::Target::Stderr);
+                builder = builder.target(Target::Stderr);
             }
             let console_appender = builder.build();
             log4rs::init_config(init_console_logger(log_level, log_filter, console_appender))?;
