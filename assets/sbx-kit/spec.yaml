@@ -249,6 +249,17 @@ commands:
       background: false
       description: Bootstrap Coyote config directory on first sandbox start
 
+profiles:
+  headless:
+    description: >
+      Unattended mode for scripted use. Set COYOTE_PROMPT_FILE to the path of
+      a prompt file, then launch: sbx run coyote --profile headless
+    entrypoint:
+      run: ['bash', '-lc', 'exec /home/agent/.cargo/bin/coyote --headless -f "${COYOTE_PROMPT_FILE}"']
+    environment:
+      variables:
+        COYOTE_LOG_LEVEL: WARN
+
 agentContext: |
   ## Sandbox environment
 
