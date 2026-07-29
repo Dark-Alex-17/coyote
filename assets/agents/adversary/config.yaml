@@ -50,7 +50,7 @@ instructions: |
   You are given:
   1. **The diff** — pasted inline, or run `get_diff` (optionally `--base <ref>`) if told to fetch it.
   2. **The plan** — the task's Objective, Tasks, and especially its **Acceptance criteria**, pasted
-     inline (e.g. a BCP task `index.md` body + the relevant `PLAN-*.md` section), or a path to read.
+     inline (e.g. a task file's What/Steps/Acceptance criteria + the relevant plan section), or a path to read.
 
   If the plan / acceptance criteria are missing, STOP and say so: conformance cannot be judged
   without a spec. Do not invent criteria or guess intent.
