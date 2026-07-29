@@ -19,6 +19,7 @@ use crate::mcp::{
 };
 use crate::parsers::{bash, python, typescript};
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::future;
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use memory::MEMORY_FUNCTION_PREFIX;
@@ -146,7 +147,9 @@ pub async fn eval_tool_calls(
     if calls.is_empty() {
         bail!("The request was aborted because an infinite loop of function calls was detected.")
     }
-    for call in calls {
+    let mut to_execute: Vec<(usize, ToolCall)> = Vec::with_capacity(calls.len());
+    let mut indexed_results: Vec<(usize, ToolResult)> = vec![];
+    for (idx, call) in calls.into_iter().enumerate() {
         if let Some(msg) = ctx.tool_scope.tool_tracker.check_loop(&call.clone()) {
             let dup_msg = format!("{{\"tool_call_loop_alert\":{}}}", msg.trim());
             println!(
@@ -155,13 +158,42 @@ pub async fn eval_tool_calls(
                     format!("{}: ⚠️ Tool-call loop detected! ⚠️", call.name).as_str()
                 )
             );
-            let val = json!(dup_msg);
-            output.push(ToolResult::new(call, val));
-            continue;
+            indexed_results.push((idx, ToolResult::new(call, json!(dup_msg))));
+        } else {
+            to_execute.push((idx, call));
         }
-        let result = call.eval(ctx).await?;
-        output.push(ToolResult::new(call, normalize_tool_result(result)));
     }
+
+    let (mcp_calls, sequential_calls): (Vec<_>, Vec<_>) =
+        to_execute.into_iter().partition(|(_, call)| {
+            call.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
+                || call.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
+                || call
+                    .name
+                    .starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
+        });
+
+    if !mcp_calls.is_empty() {
+        let ctx_ref: &RequestContext = ctx;
+        let futs: Vec<_> = mcp_calls
+            .into_iter()
+            .map(|(idx, call)| async move {
+                let result = call.eval_mcp(ctx_ref).await;
+                (idx, call, result)
+            })
+            .collect();
+        for (idx, call, result) in future::join_all(futs).await {
+            indexed_results.push((idx, ToolResult::new(call, normalize_tool_result(result?))));
+        }
+    }
+
+    for (idx, call) in sequential_calls {
+        let result = call.eval(ctx).await?;
+        indexed_results.push((idx, ToolResult::new(call, normalize_tool_result(result))));
+    }
+
+    indexed_results.sort_unstable_by_key(|(idx, _)| *idx);
+    output = indexed_results.into_iter().map(|(_, r)| r).collect();
 
     if !output.is_empty() {
         let (has_escalations, summary) = if ctx.current_depth == 0
@@ -1063,6 +1095,62 @@ impl ToolCall {
     pub fn with_thought_signature(mut self, thought_signature: Option<String>) -> Self {
         self.thought_signature = thought_signature;
         self
+    }
+
+    fn parse_arguments(&self) -> Result<Value> {
+        if self.arguments.is_object() {
+            Ok(self.arguments.clone())
+        } else if let Some(arguments) = self.arguments.as_str() {
+            serde_json::from_str(arguments).map_err(|_| {
+                anyhow!(
+                    "The call '{}' has invalid arguments: {arguments}",
+                    self.name
+                )
+            })
+        } else {
+            bail!(
+                "The call '{}' has invalid arguments: {}",
+                self.name,
+                self.arguments
+            )
+        }
+    }
+
+    async fn eval_mcp(&self, ctx: &RequestContext) -> Result<Value> {
+        let json_data = self.parse_arguments()?;
+        let cmd_name = self.name.as_str();
+        if *IS_STDOUT_TERMINAL && ctx.current_depth == 0 && !HEADLESS.load(Ordering::SeqCst) {
+            println!(
+                "{}",
+                format_call_log(cmd_name, &[json_data.to_string()], &json_data)
+            );
+        }
+        let result = if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) {
+            Self::search_mcp_tools(ctx, cmd_name, &json_data)
+                .await
+                .unwrap_or_else(|e| {
+                    let error_msg = format!("MCP search failed: {e}");
+                    eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    json!({"tool_call_error": error_msg})
+                })
+        } else if cmd_name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX) {
+            Self::describe_mcp_tool(ctx, cmd_name, json_data.clone())
+                .await
+                .unwrap_or_else(|e| {
+                    let error_msg = format!("MCP describe failed: {e}");
+                    eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    json!({"tool_call_error": error_msg})
+                })
+        } else {
+            Self::invoke_mcp_tool(ctx, cmd_name, &json_data)
+                .await
+                .unwrap_or_else(|e| {
+                    let error_msg = format!("MCP tool invocation failed: {e}");
+                    eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    json!({"tool_call_error": error_msg})
+                })
+        };
+        Ok(result)
     }
 
     pub async fn eval(&self, ctx: &mut RequestContext) -> Result<Value> {
@@ -2017,5 +2105,29 @@ mod tests {
         assert_eq!(result.call.name, "my_tool");
         assert!(result.text.is_none());
         assert!(result.thinking.is_empty());
+    }
+
+    #[test]
+    fn parse_arguments_passes_through_object() {
+        let tc = call_with_args("t", json!({"x": 1, "y": "hello"}));
+        assert_eq!(tc.parse_arguments().unwrap(), json!({"x": 1, "y": "hello"}));
+    }
+
+    #[test]
+    fn parse_arguments_deserializes_json_string() {
+        let tc = call_with_args("t", json!(r#"{"a": true}"#));
+        assert_eq!(tc.parse_arguments().unwrap(), json!({"a": true}));
+    }
+
+    #[test]
+    fn parse_arguments_returns_err_for_invalid_json_string() {
+        let tc = call_with_args("t", json!("not json {"));
+        assert!(tc.parse_arguments().is_err());
+    }
+
+    #[test]
+    fn parse_arguments_returns_err_for_non_object_non_string() {
+        let tc = call_with_args("t", json!(42));
+        assert!(tc.parse_arguments().is_err());
     }
 }
