@@ -33,7 +33,18 @@ main() {
             --exclude '.build' \
             2>/dev/null | head -n "$MAX_RESULTS") || true
     else
-        results=$(find "$search_path" -type f -name "$glob_pattern" \
+        local name_pattern dir_prefix effective_search
+        name_pattern="${glob_pattern##*/}"
+        [[ -z "$name_pattern" || "$name_pattern" == "**" ]] && name_pattern="*"
+        if [[ "$glob_pattern" == */* ]]; then
+            dir_prefix="${glob_pattern%%\**}"
+            dir_prefix="${dir_prefix%/}"
+            effective_search="${search_path}${dir_prefix:+/$dir_prefix}"
+        else
+            effective_search="$search_path"
+        fi
+        [[ -d "$effective_search" ]] || effective_search="$search_path"
+        results=$(find "$effective_search" -type f -name "$name_pattern" \
             -not -path '*/.git/*' \
             -not -path '*/node_modules/*' \
             -not -path '*/target/*' \
