@@ -6,7 +6,6 @@ description: |
   plan-conformance check, and finishes with ONE draft PR (CI checks watched to green) plus tracked
   follow-up tasks. Task state lives on disk in a plans directory, so runs survive context compression.
 version: 2.0.0
-
 agent_session: temp
 auto_continue: true
 max_auto_continues: 100
@@ -456,6 +455,6 @@ instructions: |
   - OS: {{__os__}}  Shell: {{__shell__}}  CWD: {{__cwd__}}  Now: {{__now__}}
 
 conversation_starters:
-  - 'Implement the design doc at docs/design/my-feature.md end to end'
+  - 'Implement the design doc at {{design_doc}} end to end'
   - 'Decompose this design doc into a plan and tasks, then drive them to completion'
-  - 'Run the full design-to-PR pipeline on <design-doc-path>'
+  - 'Run the full design-to-PR pipeline on {{design_doc}}'
