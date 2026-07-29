@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::client::{Message, MessageRole};
 use crate::config::{AppConfig, Session};
-use crate::utils::dimmed_text;
+use crate::utils::{dimmed_text, replay_label_text};
 
 pub fn snapshot(session: &Session) -> (Vec<Message>, Vec<Message>) {
     (
@@ -40,13 +40,14 @@ fn render_messages(app: &AppConfig, messages: &[Message]) -> Result<()> {
         match message.role {
             MessageRole::User => {
                 if let Some(text) = message.content.as_text() {
-                    println!("{}", dimmed_text("You:"));
+                    println!("{}", replay_label_text("You:"));
                     println!("{text}");
                     println!();
                 }
             }
             MessageRole::Assistant => {
                 if let Some(text) = message.content.as_text() {
+                    println!("{}", replay_label_text("Assistant:"));
                     app.print_markdown(text)?;
                     println!();
                 }

@@ -75,6 +75,7 @@ static TOOL_DIM_COLOR: OnceLock<Color> = OnceLock::new();
 static TOOL_FN_COLOR: OnceLock<Color> = OnceLock::new();
 static TOOL_KEY_COLOR: OnceLock<Color> = OnceLock::new();
 static TOOL_WARN_COLOR: OnceLock<Color> = OnceLock::new();
+static REPLAY_LABEL_COLOR: OnceLock<Color> = OnceLock::new();
 
 pub fn init_tool_colors(theme: &Theme) {
     fn resolve(theme: &Theme, scope_str: &str) -> Option<Color> {
@@ -95,6 +96,16 @@ pub fn init_tool_colors(theme: &Theme) {
     }
     if let Some(c) = resolve(theme, "string") {
         let _ = TOOL_WARN_COLOR.set(c);
+    }
+    let replay_color = Scope::new("entity.name")
+        .ok()
+        .and_then(|scope| {
+            let style = Highlighter::new(theme).style_mod_for_stack(&[scope]);
+            style.foreground.or(theme.settings.foreground)
+        })
+        .map(|fg| Color::Rgb(fg.r, fg.g, fg.b));
+    if let Some(c) = replay_color {
+        let _ = REPLAY_LABEL_COLOR.set(c);
     }
 }
 
@@ -229,6 +240,18 @@ pub fn cyan_bold_text(input: &str) -> String {
         return input.to_string();
     }
     let color = TOOL_FN_COLOR.get().copied().unwrap_or(Color::Fixed(73));
+    nu_ansi_term::Style::new()
+        .fg(color)
+        .bold()
+        .paint(input)
+        .to_string()
+}
+
+pub fn replay_label_text(input: &str) -> String {
+    if *NO_COLOR {
+        return input.to_string();
+    }
+    let color = REPLAY_LABEL_COLOR.get().copied().unwrap_or(Color::Green);
     nu_ansi_term::Style::new()
         .fg(color)
         .bold()
