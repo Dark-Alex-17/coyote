@@ -7,7 +7,10 @@ use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
-use crate::client::{call_chat_completions, call_chat_completions_streaming, init_client, oauth};
+use crate::client::{
+    Message, MessageRole, call_chat_completions, call_chat_completions_streaming, init_client,
+    oauth,
+};
 use crate::config::{
     AgentVariables, AppConfig, AssertState, Input, LastMessage, RequestContext, StateFlags,
     macro_execute,
@@ -370,6 +373,31 @@ Type ".help" for additional help.
             if !compressed.is_empty() || !active.is_empty() {
                 let app = Arc::clone(&self.ctx.read().app.config);
                 replay::render(app.as_ref(), &compressed, &active)?;
+                let last_msgs: &[Message] = if !active.is_empty() {
+                    &active
+                } else {
+                    &compressed
+                };
+                let assistant_text = last_msgs
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == MessageRole::Assistant)
+                    .and_then(|m| m.content.as_text())
+                    .map(str::to_string);
+                if let Some(output) = assistant_text {
+                    let user_text = last_msgs
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == MessageRole::User)
+                        .and_then(|m| m.content.as_text())
+                        .unwrap_or("")
+                        .to_string();
+                    let ctx = self.ctx.read();
+                    if let Ok(input) = Input::from_str(&ctx, &user_text, None) {
+                        drop(ctx);
+                        self.ctx.write().last_message = Some(LastMessage::new(input, output));
+                    }
+                }
             }
         }
 
@@ -1119,16 +1147,28 @@ pub async fn run_repl_command(
                 }
             },
             ".copy" => {
-                let output = match ctx
+                let output = ctx
                     .last_message
                     .as_ref()
                     .filter(|v| !v.output.is_empty())
                     .map(|v| v.output.clone())
-                {
-                    Some(v) => v,
-                    None => bail!("No chat response to copy"),
-                };
-                set_text(&output).context("Failed to copy the last chat response")?;
+                    .or_else(|| {
+                        ctx.session.as_ref().and_then(|s| {
+                            s.messages()
+                                .iter()
+                                .rev()
+                                .chain(s.compressed_messages().iter().rev())
+                                .find(|m| m.role == MessageRole::Assistant)
+                                .and_then(|m| m.content.as_text())
+                                .map(str::to_string)
+                        })
+                    });
+                match output {
+                    Some(v) if !v.is_empty() => {
+                        set_text(&v).context("Failed to copy the last chat response")?;
+                    }
+                    _ => bail!("No chat response to copy"),
+                }
             }
             ".exit" => match args {
                 Some("role") => {
