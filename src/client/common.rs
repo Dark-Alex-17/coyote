@@ -505,8 +505,17 @@ pub async fn call_chat_completions_streaming(
     let (text, tool_calls, thinking) = handler.take();
 
     if aborted_ctrlc {
-        if text.is_empty() || !ctx.working_mode.is_repl() || ctx.session.is_none() {
+        if !ctx.working_mode.is_repl() || ctx.session.is_none() {
             bail!("Aborted.");
+        }
+
+        if text.is_empty() {
+            if !silent && *IS_STDOUT_TERMINAL {
+                println!();
+                eprintln!("{}", error_text("Response interrupted"));
+            }
+
+            return Ok(("".to_string(), vec![]));
         }
 
         if !silent && *IS_STDOUT_TERMINAL {
