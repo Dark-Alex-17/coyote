@@ -1,3 +1,36 @@
+## v0.8.1 (2026-07-30)
+
+### Feat
+
+- ctrl-c interrupts ongoing prompt in a session, but lets the user inject more instructions mid-stream
+- improved function calling performance by allowing parallel tool calling
+- created the architect and gatekeeper agents for dramatically improved coding performance
+- Improved readability of session message exchange replays
+- apply --agent/--role/--rag/--model flags in --acp-server mode
+- add headless profile to sbx-kit spec
+- implement ACP user-interaction to request_permission bridge
+- implement ACP session/load and session/cancel
+- implement ACP session/prompt
+- add ACP server skeleton with stdout-purity test
+- add --headless flag for unattended operation
+
+### Fix
+
+- ctrl-c interruption doesn't discard session messages when throbber is showing
+- improper handling of fd-style globbing for directories in fs_glob
+- properly templated architect design doc path in starter commands
+- .copy works when sessions are resumed
+- ACP session/prompt now drives the full tool-execution loop
+- ACP spec conformance — ContentBlock prompt params and protocolVersion type
+- restore stdout output for standalone --headless mode
+- suppress tool-call display in headless mode; initialize session on session/new
+- skip stdin drain and set silent render mode when --acp-server is active
+- include graph-agent descriptions in .agent <TAB> completions
+
+### Refactor
+
+- move ACP server dispatch into run() for shared flag setup
+
 ## v0.8.0 (2026-07-25)
 
 ### Feat
