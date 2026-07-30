@@ -493,13 +493,30 @@ pub async fn call_chat_completions_streaming(
         render_stream(rx, client.app_config(), abort_signal.clone(), silent),
     );
 
-    if handler.abort().aborted() {
+    let aborted_ctrlc = handler.abort().aborted_ctrlc();
+    let aborted_ctrld = handler.abort().aborted_ctrld();
+
+    if aborted_ctrld {
         bail!("Aborted.");
     }
 
     render_ret?;
 
     let (text, tool_calls, thinking) = handler.take();
+
+    if aborted_ctrlc {
+        if text.is_empty() || !ctx.working_mode.is_repl() || ctx.session.is_none() {
+            bail!("Aborted.");
+        }
+
+        if !silent && *IS_STDOUT_TERMINAL {
+            println!();
+            eprintln!("{}", error_text("Response interrupted"));
+        }
+
+        return Ok((text, vec![]));
+    }
+
     match send_ret {
         Ok(_) => {
             if !silent && !text.is_empty() && !text.ends_with('\n') {
