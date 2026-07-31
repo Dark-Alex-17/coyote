@@ -1,3 +1,9 @@
+## v0.8.2 (2026-07-31)
+
+### Fix
+
+- sbx update doesn't allow undefined fields in sbx spec
+
 ## v0.8.1 (2026-07-30)
 
 ### Feat
