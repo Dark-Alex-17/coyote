@@ -1400,7 +1400,8 @@ async fn ask(
                 .is_some_and(|s| s.needs_compression(app.compression_threshold));
 
             if needs_compression {
-                let agent_can_continue_after_compress = should_continue(ctx);
+                let agent_can_continue_after_compress =
+                    should_continue(ctx) && !abort_signal.aborted_ctrlc();
 
                 if let Some(session) = ctx.session.as_mut() {
                     session.set_compressing(true);
