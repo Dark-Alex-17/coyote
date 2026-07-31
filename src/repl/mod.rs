@@ -1344,7 +1344,7 @@ async fn ask(
             }
             GuardrailAction::NoAction => {}
         }
-        let do_continue = should_continue(ctx);
+        let do_continue = should_continue(ctx) && !abort_signal.aborted_ctrlc();
 
         if do_continue {
             let full_prompt = {
