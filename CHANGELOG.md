@@ -1,3 +1,10 @@
+## v0.8.3 (2026-08-03)
+
+### Fix
+
+- infinite loop bug when attempting to interrupt a prompt exchange right before a session compression
+- ctrl-c inside of an auto-continue loop created an infinite loop
+
 ## v0.8.2 (2026-07-31)
 
 ### Fix
