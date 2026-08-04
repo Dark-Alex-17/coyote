@@ -53,7 +53,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 58]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 59]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -276,6 +276,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 58]> = LazyLock::new(|| {
         ReplCommand::new(
             ".continue",
             "Continue previous response",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".recover",
+            "Recover interrupted session after API error or Ctrl+C",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -1101,6 +1106,21 @@ pub async fn run_repl_command(
                 input.set_continue_output(&output);
                 ask(ctx, abort_signal.clone(), input, true).await?;
             }
+            ".recover" => {
+                let has_recoverable = ctx
+                    .last_message
+                    .as_ref()
+                    .map(|v| v.continuous && v.input.with_session())
+                    .unwrap_or(false);
+                if !has_recoverable {
+                    bail!("Unable to recover: no interrupted session response to recover from");
+                }
+                let recovery_text = args
+                    .unwrap_or("Please continue from where you left off.")
+                    .to_string();
+                let recovery_input = Input::from_str(ctx, &recovery_text, None)?;
+                ask(ctx, abort_signal.clone(), recovery_input, false).await?;
+            }
             ".regenerate" => {
                 let LastMessage { mut input, .. } =
                     match ctx.last_message.as_ref().filter(|v| v.continuous).cloned() {
@@ -1307,18 +1327,28 @@ async fn ask(
 
     let client = input.create_client()?;
     ctx.before_chat_completion(&input)?;
-    let (output, tool_results) = if input.stream() {
-        call_chat_completions_streaming(&input, client.as_ref(), ctx, abort_signal.clone()).await?
-    } else {
-        call_chat_completions(
-            &input,
-            true,
-            false,
-            client.as_ref(),
-            ctx,
-            abort_signal.clone(),
-        )
-        .await?
+    let (output, tool_results) = {
+        let result = if input.stream() {
+            call_chat_completions_streaming(&input, client.as_ref(), ctx, abort_signal.clone())
+                .await
+        } else {
+            call_chat_completions(
+                &input,
+                true,
+                false,
+                client.as_ref(),
+                ctx,
+                abort_signal.clone(),
+            )
+            .await
+        };
+        match result {
+            Ok(v) => v,
+            Err(err) => {
+                ctx.on_chat_completion_error(app.as_ref(), &input);
+                return Err(err);
+            }
+        }
     };
     ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
     if !tool_results.is_empty() {
@@ -1681,8 +1711,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_58_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 58);
+    fn repl_commands_has_59_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 59);
     }
 
     #[test]

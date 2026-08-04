@@ -728,6 +728,26 @@ impl RequestContext {
         Ok(())
     }
 
+    pub fn on_chat_completion_error(&mut self, app: &AppConfig, input: &Input) {
+        self.last_message = Some(LastMessage::new(input.clone(), String::new()));
+        if input.session(&self.session).is_none() {
+            if let Some(lm) = self.last_message.as_mut() {
+                lm.continuous = false;
+            }
+
+            return;
+        }
+
+        let mut i = input.clone();
+        i.clear_patch();
+        if let Some(session) = i.session_mut(&mut self.session) {
+            let _ = session.add_message(&i, "[Response interrupted due to error]");
+            if !app.dry_run && session.save_session() == Some(true) {
+                let _ = session.flush();
+            }
+        }
+    }
+
     pub fn discontinuous_last_message(&mut self) {
         if let Some(last_message) = self.last_message.as_mut() {
             last_message.continuous = false;
@@ -5422,6 +5442,54 @@ mod tests {
         let lm = ctx.last_message.as_ref().unwrap();
         assert_eq!(lm.output, "");
         assert!(lm.continuous);
+    }
+
+    #[test]
+    fn on_chat_completion_error_without_session_sets_last_message_discontinuous() {
+        let mut ctx = create_test_ctx();
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        ctx.on_chat_completion_error(app.as_ref(), &input);
+
+        let lm = ctx.last_message.as_ref().unwrap();
+        assert_eq!(lm.output, "");
+        assert!(!lm.continuous, "no session means recovery is not possible");
+    }
+
+    #[test]
+    fn on_chat_completion_error_with_session_sets_last_message_continuous() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                dry_run: true,
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        ctx.session = Some(Session::default());
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        ctx.on_chat_completion_error(app.as_ref(), &input);
+
+        let lm = ctx.last_message.as_ref().unwrap();
+        assert_eq!(lm.output, "");
+        assert!(lm.continuous, "session present means .recover is available");
+    }
+
+    #[test]
+    fn on_chat_completion_error_with_session_checkpoints_session_messages() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        assert!(ctx.session.as_ref().unwrap().is_empty());
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+        ctx.on_chat_completion_error(app.as_ref(), &input);
+        assert!(
+            !ctx.session.as_ref().unwrap().is_empty(),
+            "session should have the interrupted turn checkpointed"
+        );
     }
 
     #[test]

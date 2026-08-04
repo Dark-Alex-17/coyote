@@ -321,6 +321,10 @@ impl Input {
         }
     }
 
+    pub fn with_session(&self) -> bool {
+        self.with_session
+    }
+
     pub fn with_agent(&self) -> bool {
         self.with_agent
     }

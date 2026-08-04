@@ -699,6 +699,19 @@ impl Session {
         Ok(())
     }
 
+    pub fn flush(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+
+        if let Some(path) = self.path.clone() {
+            let name = self.name.clone();
+            self.save(&name, Path::new(&path), false)?;
+        }
+
+        Ok(())
+    }
+
     pub fn guard_empty(&self) -> Result<()> {
         if !self.is_empty() {
             bail!(
