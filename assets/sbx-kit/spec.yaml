@@ -238,6 +238,47 @@ environment:
     - ZHIPUAI_API_KEY
 
 commands:
+  initFiles:
+    - path: /home/agent/.config/git/ssh-signing-key-command
+      mode: '0755'
+      description: Resolve the forwarded SSH agent key for Git SSH signing
+      content: |
+        #!/bin/sh
+        set -e
+
+        if [ -z "$SSH_AUTH_SOCK" ]; then
+            echo "WARNING: [git-ssh-sign] no SSH agent - cannot sign commits" >&2
+        fi
+
+        key=$(ssh-add -L 2>/dev/null | head -n 1)
+        if [ -z "$key" ]; then
+            echo "WARNING: [git-ssh-sign] no keys in SSH agent - cannot sign commits" >&2
+        fi
+
+        config_dir="$GIT_SSH_SIGN_CONFIG_DIR"
+        if [ -z "$config_dir" ]; then
+            config_dir="/home/agent/.config/git"
+        fi
+        mkdir -p "$config_dir"
+
+        email=$(git config user.email 2>/dev/null || printf '%s' "agent@sandbox.local")
+        printf '%s %s\n' "$email" "$key" > "$config_dir/allowed_signers"
+        printf 'key::%s\n' "$key"
+
+  install:
+    - command: |
+        git config --system gpg.format ssh
+        git config --system --unset-all user.signingKey || true
+        git config --system commit.gpgSign true
+        git config --system tag.gpgSign true
+        git config --system gpg.ssh.defaultKeyCommand /home/agent/.config/git/ssh-signing-key-command
+        git config --system gpg.ssh.allowedSignersFile /home/agent/.config/git/allowed_signers
+        if [ "$(git config --system --get core.hooksPath || true)" = "/home/agent/.config/git/hooks" ]; then
+            git config --system --unset-all core.hooksPath
+        fi
+      user: '0'
+      description: Configure SSH commit signing with a dynamic key command
+
   startup:
     - command:
         [
