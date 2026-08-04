@@ -827,7 +827,12 @@ impl RequestContext {
         let mut role = if let Some(session) = self.session.as_ref() {
             session.to_role()
         } else if let Some(agent) = self.agent.as_ref() {
-            agent.to_role()
+            let mut role = agent.to_role();
+            if role.reasoning_effort().is_none() {
+                role.set_reasoning_effort(app.reasoning_effort.clone());
+            }
+
+            role
         } else if let Some(role) = self.role.as_ref() {
             role.clone()
         } else {
