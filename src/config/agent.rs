@@ -573,6 +573,25 @@ impl Agent {
             _ => bail!("No return value from '_instructions' function"),
         }
     }
+
+    #[cfg(test)]
+    pub fn test_new(config: AgentConfig) -> Self {
+        Self {
+            name: config.name.clone(),
+            config,
+            shared_variables: Default::default(),
+            session_variables: None,
+            shared_dynamic_instructions: None,
+            session_dynamic_instructions: None,
+            functions: Functions::default(),
+            rag: None,
+            graph_rags: Default::default(),
+            model: Model::default(),
+            vault: std::sync::Arc::new(Vault::default()),
+            is_graph: false,
+            enabled_tools: None,
+        }
+    }
 }
 
 impl RoleLike for Agent {

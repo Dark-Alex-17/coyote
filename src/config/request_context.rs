@@ -4139,6 +4139,7 @@ mod tests {
     use super::super::mcp_factory::McpFactory;
     use super::*;
     use crate::config::AppState;
+    use crate::config::agent::AgentConfig;
     use crate::function::{ToolCall, skill};
     use crate::mcp::{McpServer, McpServersConfig, McpTransportType};
     use crate::utils;
@@ -4320,6 +4321,42 @@ mod tests {
         let app = ctx.app.config.clone();
         let extracted = ctx.extract_role(&app).unwrap();
         assert_eq!(extracted.name(), "");
+    }
+
+    #[test]
+    fn extract_role_agent_without_reasoning_effort_inherits_app_config() {
+        let mut ctx = create_test_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "test-agent".to_string(),
+            reasoning_effort: None,
+            ..AgentConfig::default()
+        }));
+        let app = AppConfig {
+            reasoning_effort: Some("max".to_string()),
+            ..AppConfig::default()
+        };
+
+        let extracted = ctx.extract_role(&app).unwrap();
+
+        assert_eq!(extracted.reasoning_effort(), Some("max".to_string()));
+    }
+
+    #[test]
+    fn extract_role_agent_with_explicit_reasoning_effort_takes_priority_over_app_config() {
+        let mut ctx = create_test_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "test-agent".to_string(),
+            reasoning_effort: Some("low".to_string()),
+            ..AgentConfig::default()
+        }));
+        let app = AppConfig {
+            reasoning_effort: Some("max".to_string()),
+            ..AppConfig::default()
+        };
+
+        let extracted = ctx.extract_role(&app).unwrap();
+
+        assert_eq!(extracted.reasoning_effort(), Some("low".to_string()));
     }
 
     #[test]
