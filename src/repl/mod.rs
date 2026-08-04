@@ -281,7 +281,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 59]> = LazyLock::new(|| {
         ReplCommand::new(
             ".recover",
             "Recover interrupted session after API error or Ctrl+C",
-            AssertState::pass(),
+            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
         ),
         ReplCommand::new(
             ".regenerate",
