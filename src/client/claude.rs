@@ -1,3 +1,5 @@
+use std::mem;
+
 use super::access_token::get_access_token;
 use super::claude_oauth::ClaudeOAuthProvider;
 use super::oauth::{self, OAuthProvider};
@@ -232,8 +234,8 @@ pub async fn claude_chat_completions_streaming(
                         handler.text("\n</think>\n\n")?;
                         reasoning_state = 0;
                         handler.thinking_block(ThinkingBlock::Thinking {
-                            thinking: std::mem::take(&mut thinking_text),
-                            signature: std::mem::take(&mut thinking_signature),
+                            thinking: mem::take(&mut thinking_text),
+                            signature: mem::take(&mut thinking_signature),
                         });
                     }
                     if !function_name.is_empty() {
@@ -245,10 +247,11 @@ pub async fn claude_chat_completions_streaming(
                             })?
                         };
                         handler.tool_call(ToolCall::new(
-                            function_name.clone(),
+                            mem::take(&mut function_name),
                             arguments,
-                            Some(function_id.clone()),
+                            Some(mem::take(&mut function_id)),
                         ))?;
+                        function_arguments.clear();
                     }
                 }
                 _ => {}

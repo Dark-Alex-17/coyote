@@ -1,3 +1,5 @@
+use std::mem;
+
 use super::*;
 
 use crate::utils::{base64_decode, encode_uri, hex_encode, hmac_sha256, sha256, strip_think_tag};
@@ -275,10 +277,11 @@ async fn chat_completions_streaming(
                                     format!("Tool call '{function_name}' has non-JSON arguments '{function_arguments}'")
                                 })?;
                                 handler.tool_call(ToolCall::new(
-                                    function_name.clone(),
+                                    mem::take(&mut function_name),
                                     arguments,
-                                    Some(function_id.clone()),
+                                    Some(mem::take(&mut function_id)),
                                 ))?;
+                                function_arguments.clear();
                             }
                         }
                         _ => {}
@@ -529,7 +532,11 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         bail!("Invalid response data: {data}");
     }
 
-    let output = ChatCompletionsOutput { text, tool_calls, ..Default::default() };
+    let output = ChatCompletionsOutput {
+        text,
+        tool_calls,
+        ..Default::default()
+    };
     Ok(output)
 }
 
