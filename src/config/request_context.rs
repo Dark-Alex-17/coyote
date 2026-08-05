@@ -38,6 +38,7 @@ use super::memory::{
 };
 use crate::graph;
 use anyhow::{Context, Error, Result, bail};
+use colored::Colorize;
 use gman::providers::SupportedProvider;
 #[cfg(test)]
 use indexmap::IndexMap;
@@ -1111,10 +1112,17 @@ impl RequestContext {
     }
 
     fn concrete_tool_names(&self) -> Vec<String> {
-        let declarations = match &self.agent {
-            Some(agent) => agent.functions().declarations(),
-            None => self.tool_scope.functions.declarations(),
-        };
+        let declarations: Vec<&FunctionDeclaration> = self
+            .tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .chain(
+                self.agent
+                    .iter()
+                    .flat_map(|agent| agent.functions().declarations()),
+            )
+            .collect();
         declarations
             .iter()
             .filter(|v| {
@@ -2425,8 +2433,12 @@ impl RequestContext {
 
                 println!("Skills:");
                 for (name, description, loaded) in entries {
-                    let marker = if loaded { " (loaded)" } else { "" };
-                    println!("  • {name}{marker} — {description}");
+                    let marker = if loaded {
+                        "✓".green().bold().to_string()
+                    } else {
+                        "✗".red().bold().to_string()
+                    };
+                    println!("  {marker} {name} — {description}");
                 }
 
                 Ok(())
@@ -2450,7 +2462,31 @@ impl RequestContext {
                 names.sort_unstable();
                 names.dedup();
 
-                print_asset_names("tools", &names)
+                let active: HashSet<String> = if self.app.config.function_calling_support {
+                    let role = self.extract_role(&self.app.config)?;
+                    match self.select_functions(&role) {
+                        None => HashSet::new(),
+                        Some(functions) => functions.iter().map(|f| f.name.clone()).collect(),
+                    }
+                } else {
+                    HashSet::new()
+                };
+
+                if names.is_empty() {
+                    println!("No tools found.");
+                    return Ok(());
+                }
+
+                println!("Tools:");
+                for name in &names {
+                    let marker = if active.contains(name.as_str()) {
+                        "✓".green().bold().to_string()
+                    } else {
+                        "✗".red().bold().to_string()
+                    };
+                    println!("  {marker} {name}");
+                }
+                Ok(())
             }
             "mcp-servers" => {
                 let mut names: Vec<String> = vec![];
@@ -2467,7 +2503,32 @@ impl RequestContext {
                 names.sort_unstable();
                 names.dedup();
 
-                print_asset_names("MCP servers", &names)
+                if names.is_empty() {
+                    println!("No MCP servers found.");
+                    return Ok(());
+                }
+
+                let enabled: Option<Vec<String>> = if let Some(session) = &self.session {
+                    session.enabled_mcp_servers()
+                } else if let Some(role) = &self.role {
+                    role.enabled_mcp_servers()
+                } else {
+                    self.app.config.enabled_mcp_servers.clone()
+                };
+                let skill_mcps = self.skill_registry.loaded_mcp_servers();
+
+                println!("MCP servers:");
+                for name in &names {
+                    let active = skill_mcps.contains(name.as_str())
+                        || matches!(&enabled, Some(list) if list.iter().any(|s| s.trim() == "all") || self.mcp_list_covers(list, name));
+                    let marker = if active {
+                        "✓".green().bold().to_string()
+                    } else {
+                        "✗".red().bold().to_string()
+                    };
+                    println!("  {marker} {name}");
+                }
+                Ok(())
             }
             _ => bail!(
                 "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, tools, mcp-servers"
