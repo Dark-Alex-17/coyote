@@ -88,7 +88,6 @@ nodes:
     prompt: |
       Research prompt: {{initial_prompt}}
     tools: []
-    temperature: 0.1
     output_schema:
       type: object
       properties:
@@ -180,7 +179,6 @@ nodes:
     tools:
       - mcp:ddg-search
     max_iterations: 15
-    temperature: 0.1
     state_updates:
       search_output: "{{output}}"
     fallback: synthesize
@@ -251,7 +249,6 @@ nodes:
     tools:
       - mcp:personal-github
     max_iterations: 15
-    temperature: 0.1
     state_updates:
       oss_output: "{{output}}"
     fallback: synthesize
@@ -338,7 +335,6 @@ nodes:
     tools:
       - fetch_url_via_curl
     max_iterations: 20
-    temperature: 0.1
     state_updates:
       findings: "{{output}}"
     fallback: final_format
