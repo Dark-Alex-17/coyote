@@ -88,9 +88,19 @@ async fn run_one_shot(prompt: &str, ctx: &mut RequestContext) -> Result<String> 
 }
 
 fn try_parse_json(raw: &str) -> Option<Value> {
-    let cleaned = strip_code_fences(raw.trim());
-
+    let cleaned = strip_code_fences(strip_thinking_blocks(raw.trim()));
     serde_json::from_str(cleaned).ok()
+}
+
+fn strip_thinking_blocks(s: &str) -> &str {
+    let mut s = s.trim_start();
+    while s.starts_with("<think>") {
+        match s.find("</think>") {
+            Some(end) => s = s[end + "</think>".len()..].trim_start(),
+            None => break,
+        }
+    }
+    s
 }
 
 fn strip_code_fences(s: &str) -> &str {
@@ -146,6 +156,38 @@ mod tests {
         let v = try_parse_json("   \n  {\"x\": true}\n\n").unwrap();
 
         assert_eq!(v, json!({"x": true}));
+    }
+
+    #[test]
+    fn try_parse_json_strips_thinking_blocks() {
+        let raw = "<think>\nsome reasoning\n</think>\n{\"a\": 1}";
+
+        let v = try_parse_json(raw).unwrap();
+
+        assert_eq!(v, json!({"a": 1}));
+    }
+
+    #[test]
+    fn try_parse_json_strips_empty_thinking_block() {
+        let raw = "<think>\n\n</think>\n{\"a\": 1}";
+
+        let v = try_parse_json(raw).unwrap();
+
+        assert_eq!(v, json!({"a": 1}));
+    }
+
+    #[test]
+    fn try_parse_json_strips_multiple_thinking_blocks() {
+        let raw = "<think>first</think>\n<think>second</think>\n{\"a\": 1}";
+
+        let v = try_parse_json(raw).unwrap();
+
+        assert_eq!(v, json!({"a": 1}));
+    }
+
+    #[test]
+    fn try_parse_json_unclosed_think_tag_returns_none() {
+        assert!(try_parse_json("<think>unclosed {\"a\": 1}").is_none());
     }
 
     #[test]
