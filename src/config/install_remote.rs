@@ -947,6 +947,7 @@ fn print_secret_summary(added: &[String], deferred: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::SANDBOX_ENV_FLAG;
     use crate::utils::get_env_name;
     use serial_test::serial;
     use std::env;
@@ -1431,6 +1432,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn merge_detects_missing_secrets_in_output() {
+        if env::var_os(SANDBOX_ENV_FLAG).is_some() {
+            eprintln!(
+                "Skipping merge_detects_missing_secrets_in_output: secret interpolation is disabled inside a sandbox"
+            );
+            return;
+        }
         let _guard = TestVaultConfigGuard::new("merge-secret");
         let dir = fresh_temp_dir("merge-secret-");
         let remote = dir.join("remote.json");
