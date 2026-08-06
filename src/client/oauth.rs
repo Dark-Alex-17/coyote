@@ -131,6 +131,17 @@ pub trait OAuthProvider: Send + Sync {
         vec![]
     }
 
+    /// Extra form/body parameters appended to every token request routed
+    /// through `build_token_request` (authorization-code exchange, refresh,
+    /// client_credentials, and device-code polling). Used e.g. for the
+    /// RFC 8707 `resource` indicator required by the MCP spec.
+    /// NOTE: these are merged AFTER the caller's params and will overwrite
+    /// a colliding key; do not return protocol parameter names
+    /// (grant_type, client_id, code, refresh_token, ...).
+    fn extra_token_params(&self) -> Vec<(&str, &str)> {
+        vec![]
+    }
+
     fn token_request_format(&self) -> TokenRequestFormat {
         TokenRequestFormat::Json
     }
@@ -642,9 +653,14 @@ fn build_token_request(
     provider: &(impl OAuthProvider + ?Sized),
     params: &[(&str, &str)],
 ) -> RequestBuilder {
+    let all_params: Vec<(&str, &str)> = params
+        .iter()
+        .copied()
+        .chain(provider.extra_token_params())
+        .collect();
     let mut request = match provider.token_request_format() {
         TokenRequestFormat::Json => {
-            let body: serde_json::Map<String, Value> = params
+            let body: serde_json::Map<String, Value> = all_params
                 .iter()
                 .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
                 .collect();
@@ -660,7 +676,7 @@ fn build_token_request(
             }
         }
         TokenRequestFormat::FormUrlEncoded => {
-            let mut form: HashMap<String, String> = params
+            let mut form: HashMap<String, String> = all_params
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
@@ -870,6 +886,8 @@ pub(crate) fn client_config_info(
 
 #[cfg(test)]
 mod tests {
+    use std::str;
+
     use super::*;
     use crate::client::openai_compatible::OpenAICompatibleConfig;
     use crate::client::{ModelData, ProviderModels};
@@ -1162,6 +1180,16 @@ echo_pkce_in_token_exchange: true
     }
 
     #[test]
+    fn default_extra_token_params_is_empty() {
+        let provider = OpenAICompatibleOAuthProvider {
+            config: base_config(),
+            client_name: "test".into(),
+        };
+
+        assert!(provider.extra_token_params().is_empty());
+    }
+
+    #[test]
     fn oauth_flow_device_code_parses() {
         let yaml = "client_id: x\ntoken_url: y\nflow: device_code";
 
@@ -1380,5 +1408,64 @@ scopes:
         ));
         assert!(cfg.use_pkce_in_device_flow);
         assert_eq!(cfg.scopes, vec!["read", "write"]);
+    }
+
+    struct ResourceStubProvider;
+
+    impl OAuthProvider for ResourceStubProvider {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn client_id(&self) -> &str {
+            "stub-client"
+        }
+
+        fn authorize_url(&self) -> &str {
+            "https://as.example/authorize"
+        }
+
+        fn token_url(&self) -> &str {
+            "https://as.example/token"
+        }
+
+        fn redirect_uri(&self) -> &str {
+            ""
+        }
+
+        fn scopes(&self) -> String {
+            String::new()
+        }
+
+        fn token_request_format(&self) -> TokenRequestFormat {
+            TokenRequestFormat::FormUrlEncoded
+        }
+
+        fn extra_token_params(&self) -> Vec<(&str, &str)> {
+            vec![("resource", "https://rs.example/mcp")]
+        }
+    }
+
+    #[test]
+    fn build_token_request_appends_extra_token_params_to_form_body() {
+        let provider = ResourceStubProvider;
+
+        let request = build_token_request(
+            &ReqwestClient::new(),
+            &provider,
+            &[("grant_type", "authorization_code")],
+        )
+        .build()
+        .unwrap();
+
+        let body = str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(
+            body.contains("resource=https%3A%2F%2Frs.example%2Fmcp"),
+            "body missing resource param: {body}"
+        );
+        assert!(
+            body.contains("grant_type=authorization_code"),
+            "body missing grant_type param: {body}"
+        );
     }
 }
