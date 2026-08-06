@@ -214,12 +214,8 @@ pub async fn claude_chat_completions_streaming(
                     if let Some(text) = data["delta"]["text"].as_str() {
                         handler.text(text)?;
                     } else if let Some(text) = data["delta"]["thinking"].as_str() {
-                        if reasoning_state == 0 {
-                            handler.text("<think>\n")?;
-                            reasoning_state = 1;
-                        }
+                        reasoning_state = 1;
                         thinking_text.push_str(text);
-                        handler.text(text)?;
                     } else if let Some(signature) = data["delta"]["signature"].as_str() {
                         thinking_signature.push_str(signature);
                     } else if let (true, Some(partial_json)) = (
@@ -231,7 +227,6 @@ pub async fn claude_chat_completions_streaming(
                 }
                 "content_block_stop" => {
                     if reasoning_state == 1 {
-                        handler.text("\n</think>\n\n")?;
                         reasoning_state = 0;
                         handler.thinking_block(ThinkingBlock::Thinking {
                             thinking: mem::take(&mut thinking_text),
@@ -481,7 +476,6 @@ pub fn claude_build_chat_completions_body(
 
 pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     let mut text = String::new();
-    let mut reasoning = None;
     let mut tool_calls = vec![];
     let mut thinking = vec![];
     if let Some(list) = data["content"].as_array() {
@@ -489,10 +483,12 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
             match item["type"].as_str() {
                 Some("thinking") => {
                     if let Some(v) = item["thinking"].as_str() {
-                        reasoning = Some(v.to_string());
                         thinking.push(ThinkingBlock::Thinking {
                             thinking: v.to_string(),
-                            signature: item["signature"].as_str().unwrap_or_default().to_string(),
+                            signature: item["signature"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
                         });
                     }
                 }
@@ -528,10 +524,6 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
             }
         }
     }
-    if let Some(reasoning) = reasoning {
-        text = format!("<think>\n{reasoning}\n</think>\n\n{text}")
-    }
-
     if text.is_empty() && tool_calls.is_empty() {
         bail!("Invalid response data: {data}");
     }
