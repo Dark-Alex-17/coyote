@@ -329,51 +329,99 @@ pub fn claude_build_chat_completions_body(
                     })]
                 }
                 MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results, text, ..
+                    tool_results,
+                    text,
+                    sequence,
                 }) => {
-                    let mut assistant_parts = vec![];
-                    let mut user_parts = vec![];
-                    for (index, tool_result) in tool_results.iter().enumerate() {
-                        for block in &tool_result.thinking {
-                            assistant_parts.push(json!(block));
-                        }
-                        let round_text = if index == 0 && !text.is_empty() {
-                            Some(text.as_str())
-                        } else {
-                            tool_result.text.as_deref()
-                        };
-                        if let Some(round_text) = round_text {
-                            let round_text = strip_think_tag(round_text);
-                            let round_text = round_text.trim();
-                            if !round_text.is_empty() {
-                                assistant_parts.push(json!({
-                                    "type": "text",
-                                    "text": round_text,
-                                }))
+                    if !sequence {
+                        let mut assistant_parts = vec![];
+                        let mut user_parts = vec![];
+                        for (index, tool_result) in tool_results.iter().enumerate() {
+                            for block in &tool_result.thinking {
+                                assistant_parts.push(json!(block));
                             }
+                            let round_text = if index == 0 && !text.is_empty() {
+                                Some(text.as_str())
+                            } else {
+                                tool_result.text.as_deref()
+                            };
+                            if let Some(round_text) = round_text {
+                                let round_text = strip_think_tag(round_text);
+                                let round_text = round_text.trim();
+                                if !round_text.is_empty() {
+                                    assistant_parts.push(json!({
+                                        "type": "text",
+                                        "text": round_text,
+                                    }))
+                                }
+                            }
+                            assistant_parts.push(json!({
+                                "type": "tool_use",
+                                "id": tool_result.call.id,
+                                "name": tool_result.call.name,
+                                "input": tool_result.call.arguments,
+                            }));
+                            user_parts.push(json!({
+                                "type": "tool_result",
+                                "tool_use_id": tool_result.call.id,
+                                "content": tool_result.output.to_string(),
+                            }));
                         }
-                        assistant_parts.push(json!({
-                            "type": "tool_use",
-                            "id": tool_result.call.id,
-                            "name": tool_result.call.name,
-                            "input": tool_result.call.arguments,
-                        }));
-                        user_parts.push(json!({
-                            "type": "tool_result",
-                            "tool_use_id": tool_result.call.id,
-                            "content": tool_result.output.to_string(),
-                        }));
+                        vec![
+                            json!({ "role": "assistant", "content": assistant_parts }),
+                            json!({ "role": "user", "content": user_parts }),
+                        ]
+                    } else {
+                        // One pair per round: Claude can reuse tool_use IDs across API calls.
+                        let mut messages = vec![];
+                        let mut assistant_parts: Vec<serde_json::Value> = vec![];
+                        let mut user_parts: Vec<serde_json::Value> = vec![];
+                        for (index, tool_result) in tool_results.iter().enumerate() {
+                            if index > 0 && tool_result.text.is_some() {
+                                messages.push(
+                                    json!({ "role": "assistant", "content": assistant_parts }),
+                                );
+                                messages.push(json!({ "role": "user", "content": user_parts }));
+                                assistant_parts = vec![];
+                                user_parts = vec![];
+                            }
+                            for block in &tool_result.thinking {
+                                assistant_parts.push(json!(block));
+                            }
+                            let round_text = if index == 0 && !text.is_empty() {
+                                Some(text.as_str())
+                            } else {
+                                tool_result.text.as_deref()
+                            };
+                            if let Some(round_text) = round_text {
+                                let round_text = strip_think_tag(round_text);
+                                let round_text = round_text.trim();
+                                if !round_text.is_empty() {
+                                    assistant_parts.push(json!({
+                                        "type": "text",
+                                        "text": round_text,
+                                    }))
+                                }
+                            }
+                            assistant_parts.push(json!({
+                                "type": "tool_use",
+                                "id": tool_result.call.id,
+                                "name": tool_result.call.name,
+                                "input": tool_result.call.arguments,
+                            }));
+                            user_parts.push(json!({
+                                "type": "tool_result",
+                                "tool_use_id": tool_result.call.id,
+                                "content": tool_result.output.to_string(),
+                            }));
+                        }
+                        if !assistant_parts.is_empty() {
+                            messages
+                                .push(json!({ "role": "assistant", "content": assistant_parts }));
+                            messages.push(json!({ "role": "user", "content": user_parts }));
+                        }
+                        messages
                     }
-                    vec![
-                        json!({
-                            "role": "assistant",
-                            "content": assistant_parts,
-                        }),
-                        json!({
-                            "role": "user",
-                            "content": user_parts,
-                        }),
-                    ]
                 }
             }
         })
