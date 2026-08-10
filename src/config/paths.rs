@@ -445,7 +445,7 @@ pub(crate) fn is_rag_sidecar_name(name: &str) -> bool {
 ///
 /// Callers must run this BEFORE unlinking the primary `.yaml`. If the YAML goes first
 /// and this then fails, the RAG disappears from `list_rags()` — so the user can no
-/// longer select it to retry — while its `allowedDomains` entry keeps being injected
+/// longer select it to retry — while its network allow entry keeps being injected
 /// into every sandbox launch.
 pub(crate) fn remove_rag_sidecars(dir: &Path, name: &str) -> Result<()> {
     let duckdb_path = dir.join(format!("{name}.duckdb"));

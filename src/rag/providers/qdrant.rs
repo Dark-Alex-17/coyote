@@ -89,7 +89,7 @@ impl QdrantProvider {
             .context("Failed to build reqwest client")
     }
 
-    fn normalize_base_url(host: &str) -> String {
+    pub(crate) fn normalize_base_url(host: &str) -> String {
         if host.starts_with("http://") || host.starts_with("https://") {
             host.to_string()
         } else {

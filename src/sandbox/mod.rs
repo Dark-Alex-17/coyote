@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use which::which;
 
-mod mcp_credentials;
+pub(crate) mod mcp_credentials;
 mod mixins;
 
 pub(crate) use mcp_credentials::sandbox_secret_env_var;
@@ -346,7 +346,12 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
         let Some(placeholder) = data.driver_config.get("api_key") else {
             continue;
         };
-        if registered.contains(&stem) {
+        // The sidecar mixin declares `credentials[].service` under the same
+        // derivation, so the bound value and the inject rule that consumes it
+        // always name the same service. Passing the raw stem here would produce
+        // an id sbx rejects for any RAG whose name is not already a valid id.
+        let service_id = mcp_credentials::secret_service_id(&stem);
+        if service_id.is_empty() || registered.contains(&service_id) {
             continue;
         }
         let secret_name = placeholder
@@ -358,7 +363,7 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
         // is recoverable without a restart.
         match vault.get_secret(secret_name, false) {
             Ok(secret_value) => {
-                sbx_secret_set(&stem, &secret_value)
+                sbx_secret_set(&service_id, &secret_value)
                     .context("Failed to register RAG secret with sbx")?;
             }
             Err(e) => {
