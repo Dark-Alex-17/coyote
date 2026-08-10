@@ -10,6 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// Serializes `INSTALL` across every thread in this process. DuckDB installs an
+/// extension by downloading it to a temp file and then MOVING that file into
+/// `~/.duckdb/extensions/...`. Two threads installing the same extension at once
+/// both perform that move; on Windows the loser's move targets a file the winner
+/// already holds open and fails with "Access is denied", where POSIX would let the
+/// replacement through. Guards nothing but the install step, so it is never held
+/// across a `DuckDbProvider::conn` guard and cannot invert lock order.
+static INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
 /// Derive the DuckDB sidecar path from a RAG's YAML path: `docs.yaml` -> `docs.duckdb`.
 pub(crate) fn duckdb_path_from_yaml(yaml_path: &Path) -> PathBuf {
     yaml_path.with_extension("duckdb")
@@ -78,7 +87,20 @@ impl DuckDbProvider {
     /// not have it yet. `LOAD` is attempted first so an extension that is already
     /// installed costs nothing and never touches the network; `INSTALL` is only reached
     /// once, on a machine seeing the extension for the first time.
+    ///
+    /// `LOAD` is per-connection and so runs on every connection; only `INSTALL` is
+    /// serialized, and the second `LOAD` under the lock is what keeps it to one
+    /// install. Without that re-check, every thread that queued behind the winner
+    /// would still run a redundant `INSTALL` and re-trigger the same file move.
     fn ensure_extension(conn: &Connection, name: &str) -> Result<()> {
+        if conn.execute_batch(&format!("LOAD {name};")).is_ok() {
+            return Ok(());
+        }
+        // A poisoned lock means some other thread panicked mid-install; the lock owns
+        // no state to corrupt, so recover rather than failing every later open.
+        let _install_guard = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Re-check now that we hold the lock: whoever held it before us may already
+        // have installed the extension, in which case this `LOAD` finds it on disk.
         if conn.execute_batch(&format!("LOAD {name};")).is_ok() {
             return Ok(());
         }
