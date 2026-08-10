@@ -12,7 +12,10 @@ mod splitter;
 
 use self::graph::{KnowledgeGraph, extract_entities};
 use self::provider::RagProvider;
-use self::providers::YamlProvider;
+// `providers::duckdb_path_from_yaml(path)` is called through the module path in
+// `create()`, so `providers` itself must stay in scope — do not collapse it into
+// the `use` below.
+use self::providers::{DuckDbProvider, YamlProvider};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bm25::{Language, SearchEngine, SearchEngineBuilder};
@@ -121,6 +124,9 @@ pub struct RagInitConfig {
     pub extractor_model: Option<String>,
     pub extractor_prompt: Option<String>,
     pub graph_hops: Option<usize>,
+    /// `None` -> "yaml". No serde attribute: this struct derives only
+    /// `Debug, Clone, Default` and is built in Rust, never deserialized.
+    pub driver: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -147,7 +153,8 @@ impl Rag {
             bail!("Cannot build RAG knowledge base '{name}' with no documents");
         }
         println!("⚙ Initializing RAG...");
-        let data = Self::resolve_init_data(app, config)?;
+        let mut data = Self::resolve_init_data(app, config)?;
+        data.driver = config.driver.clone().unwrap_or_else(|| "yaml".to_string());
         let mut rag = Self::create(app, name, save_path, data)?;
         let loaders = app.document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
@@ -257,12 +264,37 @@ impl Rag {
         save_path: &Path,
         doc_paths: &[String],
         abort_signal: AbortSignal,
+        prompt_for_driver: bool,
     ) -> Result<Self> {
         if !*IS_STDOUT_TERMINAL {
             bail!("Failed to init rag in non-interactive mode");
         }
         println!("⚙ Initializing RAG...");
         let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(app)?;
+        // Only interactive named-RAG creation offers a driver choice. Temp RAGs and
+        // agent startup pass `false`; an explicit flag is used rather than inferring
+        // from the name because the agent path passes the literal name "rag", which is
+        // indistinguishable from a user creating a RAG genuinely named `rag`.
+        let driver = if prompt_for_driver {
+            let options = vec![
+                "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
+                "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search. Can only be open in ONE Coyote process at a time, and its driver cannot be changed later without recreating the RAG",
+            ];
+            let sel = Select::new("RAG storage driver:", options)
+                .with_starting_cursor(0)
+                .prompt()?;
+            if sel.starts_with("duckdb") {
+                println!(
+                    "Note: a duckdb RAG can only be open in one Coyote process at a time, \
+                     and changing its driver later means deleting and recreating the RAG."
+                );
+                "duckdb"
+            } else {
+                "yaml"
+            }
+        } else {
+            "yaml"
+        };
         let reranker_model = app.rag_reranker_model.clone();
         let top_k = app.rag_top_k;
         let extractor_model = match app.rag_extractor_model.clone() {
@@ -275,7 +307,7 @@ impl Rag {
             app.rag_graph_hops
         };
         let extractor_prompt = app.rag_extractor_prompt.clone();
-        let data = RagData::new(
+        let mut data = RagData::new(
             embedding_model.id(),
             chunk_size,
             chunk_overlap,
@@ -288,6 +320,7 @@ impl Rag {
                 graph_hops: Some(graph_hops),
             },
         );
+        data.driver = driver.to_string();
         let mut rag = Self::create(app, name, save_path, data)?;
         let mut paths = doc_paths.to_vec();
         if paths.is_empty() {
@@ -315,9 +348,50 @@ impl Rag {
         Self::create(app, name, path, data)
     }
 
-    pub fn create(app: &AppConfig, name: &str, path: &Path, data: RagData) -> Result<Self> {
-        let bm25 = data.build_bm25();
-        let provider: Box<dyn RagProvider> = Box::new(YamlProvider::from_data(&data));
+    /// `mut data` — the duckdb arm rehydrates `data.vectors` from the sidecar.
+    pub fn create(app: &AppConfig, name: &str, path: &Path, mut data: RagData) -> Result<Self> {
+        // Deliberately does NOT call rebuild_indexes: both callers construct the Rag
+        // before any documents are added, so rebuilding empty data would be a no-op.
+        // Actual population happens later via sync_documents.
+        let (provider, bm25): (Box<dyn RagProvider>, _) = match data.driver.as_str() {
+            "duckdb" => {
+                let db_path = providers::duckdb_path_from_yaml(path);
+                let dim = embedding_dim_for_model(&data.embedding_model);
+                let duck = DuckDbProvider::open(&db_path, dim)?;
+                // HYDRATE — mandatory, not an optimization. The YAML file for a duckdb
+                // RAG deliberately omits `vectors`, so `data.vectors` arrives empty from
+                // disk. Refilling it from the sidecar is what makes the NEXT incremental
+                // sync non-destructive: rebuild_indexes does CREATE OR REPLACE TABLE and
+                // writes exactly what data.vectors holds. Skip this and the first
+                // `.edit rag-docs` after a restart wipes every previously indexed vector.
+                //
+                // Guarded on is_empty() so a caller that already has vectors in memory
+                // is never overwritten by an empty table.
+                //
+                // 🔴 `?`, NOT `unwrap_or_default()`. A hydration failure must propagate.
+                // Degrading to an empty map here loads a RAG that looks healthy, answers
+                // every query with nothing, and then loses the store permanently on the
+                // first `.edit rag-docs`. The legitimate "nothing indexed yet" case is
+                // already Ok(empty) — open() runs CREATE TABLE IF NOT EXISTS — so `?`
+                // costs a new RAG nothing.
+                if data.vectors.is_empty() {
+                    data.vectors = duck.read_all_vectors()?;
+                }
+                // data.files is always populated for duckdb, so build_bm25() is the only
+                // path; there is no from-DuckDB fallback.
+                let bm25 = data.build_bm25();
+                (Box::new(duck), bm25)
+            }
+            "qdrant" => bail!(
+                "Qdrant RAGs cannot be constructed via Rag::create(); \
+                 use Rag::attach() or Rag::load_async() instead"
+            ),
+            _ => {
+                // "yaml" and any unknown driver — in-memory HNSW.
+                let bm25 = data.build_bm25();
+                (Box::new(YamlProvider::from_data(&data)), bm25)
+            }
+        };
         let node_to_docs = data.knowledge_graph.build_node_to_docs();
         let embedding_model =
             Model::retrieve_model(app, &data.embedding_model, ModelType::Embedding)?;
@@ -460,8 +534,18 @@ impl Rag {
         let path = Path::new(&self.path);
         ensure_parent_exists(path)?;
 
-        let content = serde_yaml::to_string(&self.data)
-            .with_context(|| format!("Failed to serde rag '{}'", self.name))?;
+        let content = if self.data.driver == "duckdb" {
+            // Embeddings live in the .duckdb sidecar; keep them out of the YAML file.
+            // Clone-and-empty rather than mutating self.data — the live map must stay
+            // complete for the next incremental sync, and save() takes &self, so any
+            // clear-then-restore would leave the object corrupted on an early return.
+            let mut on_disk = self.data.clone();
+            on_disk.vectors.clear();
+            serde_yaml::to_string(&on_disk)
+        } else {
+            serde_yaml::to_string(&self.data)
+        }
+        .with_context(|| format!("Failed to serde rag '{}'", self.name))?;
         fs::write(path, content).with_context(|| {
             format!("Failed to save rag '{}' to '{}'", self.name, path.display())
         })?;
@@ -841,13 +925,18 @@ impl Rag {
         }
 
         progress(&spinner, "Building store".into());
+        // Derived in-memory state is refreshed BEFORE the fallible provider rebuild.
+        // `self.data` has already been mutated at this point, so returning early on a
+        // provider error while `bm25`/`node_to_docs` still describe the previous corpus
+        // would leave this Rag internally inconsistent. Both are pure functions of
+        // `self.data` and cannot fail, so doing them first is always safe.
+        self.bm25 = self.data.build_bm25();
+        self.node_to_docs = self.data.knowledge_graph.build_node_to_docs();
         // `refresh` is true for a full re-index (.rebuild rag / --rebuild-rag /
         // initial build) and false for an incremental .edit rag-docs change.
         // Passing it through is what stops a remote provider from wiping its
         // collection on a one-file add.
         self.provider.rebuild_indexes(&self.data, refresh).await?;
-        self.bm25 = self.data.build_bm25();
-        self.node_to_docs = self.data.knowledge_graph.build_node_to_docs();
 
         Ok(())
     }
@@ -1660,9 +1749,38 @@ fn reciprocal_rank_fusion(
         .collect()
 }
 
+/// Map an embedding model id to its vector dimension.
+///
+/// The DuckDB `FLOAT[N]` column type and its HNSW index are fixed at schema-creation
+/// time, so this value must be decided before the first insert. An unrecognized model
+/// falls back to 1536; if that is wrong, DuckDB raises a dimension-mismatch error on
+/// the first insert rather than silently corrupting the schema, and the recovery is to
+/// delete the sidecar and re-ingest from source.
+fn embedding_dim_for_model(model_id: &str) -> usize {
+    match model_id {
+        m if m.contains("3-large") => 3072,
+        m if m.contains("3-small") || m.contains("ada-002") => 1536,
+        m if m.contains("nomic-embed-text") || m.contains("all-minilm") => 768,
+        m if m.contains("jina-embeddings-v2") => 1024,
+        _ => 1536,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_dim_for_model_maps_known_models() {
+        assert_eq!(embedding_dim_for_model("text-embedding-3-large"), 3072);
+        assert_eq!(embedding_dim_for_model("text-embedding-3-small"), 1536);
+        assert_eq!(embedding_dim_for_model("text-embedding-ada-002"), 1536);
+        assert_eq!(embedding_dim_for_model("nomic-embed-text"), 768);
+        assert_eq!(embedding_dim_for_model("all-minilm"), 768);
+        assert_eq!(embedding_dim_for_model("jina-embeddings-v2-base-en"), 1024);
+        // Unknown models fall back to the OpenAI-compatible default.
+        assert_eq!(embedding_dim_for_model("some-unknown-model"), 1536);
+    }
 
     #[test]
     fn document_id_round_trip() {

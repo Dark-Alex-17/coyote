@@ -171,7 +171,15 @@ impl Agent {
                 let rag = app_state
                     .rag_cache
                     .load_with(key, || async move {
-                        Rag::init(&app_clone, "rag", &rag_path_clone, &document_paths, abort).await
+                        Rag::init(
+                            &app_clone,
+                            "rag",
+                            &rag_path_clone,
+                            &document_paths,
+                            abort,
+                            false,
+                        )
+                        .await
                     })
                     .await?;
                 Some(rag)
@@ -983,6 +991,10 @@ async fn init_graph_rags(
                 extractor_model: rag_node.extractor_model.clone(),
                 extractor_prompt: rag_node.extractor_prompt.clone(),
                 graph_hops: rag_node.graph_hops,
+                // Graph-node RAGs are yaml-only: `RagNode` has no `driver` field, so
+                // there is nothing to forward. The rest-pattern also keeps this literal
+                // from breaking on future `RagInitConfig` additions.
+                ..Default::default()
             };
             let fully_specified = config.embedding_model.is_some()
                 && config.chunk_size.is_some()

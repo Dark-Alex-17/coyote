@@ -142,6 +142,12 @@ pub struct RequestContext {
     pub role: Option<Role>,
     pub session: Option<Session>,
     pub rag: Option<Arc<Rag>>,
+    /// The cache key `self.rag` was actually inserted under, carried rather than
+    /// reconstructed. Reconstruction was the bug: the invalidation sites do not have
+    /// the information needed to rebuild the key (agent RAGs are inserted under the
+    /// AGENT's name but `rag.name()` is the constant "rag"), so insert and invalidate
+    /// silently disagreed. `None` for the temp RAG, which bypasses the cache entirely.
+    pub rag_key: Option<RagKey>,
     pub agent: Option<Agent>,
 
     pub last_message: Option<LastMessage>,
@@ -176,6 +182,7 @@ impl RequestContext {
             role: None,
             session: None,
             rag: None,
+            rag_key: None,
             agent: None,
             last_message: None,
             tool_scope: ToolScope::default(),
@@ -229,6 +236,7 @@ impl RequestContext {
             role: None,
             session: None,
             rag: None,
+            rag_key: None,
             agent: None,
             last_message: None,
             tool_scope: ToolScope {
@@ -277,6 +285,7 @@ impl RequestContext {
             role: self.role.clone(),
             session: self.session.clone(),
             rag: self.rag.clone(),
+            rag_key: self.rag_key.clone(),
             agent: self.agent.clone(),
             last_message: self.last_message.clone(),
             tool_scope: self.tool_scope.clone(),
@@ -315,6 +324,7 @@ impl RequestContext {
             role: None,
             session: None,
             rag: None,
+            rag_key: None,
             agent: None,
             last_message: None,
             tool_scope: ToolScope {
@@ -2554,6 +2564,14 @@ impl RequestContext {
                     match file_ext {
                         Some(file_ext) => {
                             if let Some(name) = name.to_string_lossy().strip_suffix(file_ext) {
+                                // Sidecars are not independently deletable assets.
+                                // Guarded on `kind == "rag"` because this scan is shared
+                                // by all six kinds, and `session`/`macro` also use
+                                // `.yaml`. The helper lives in paths.rs beside
+                                // list_rags() so both filters cannot drift apart.
+                                if kind == "rag" && paths::is_rag_sidecar_name(name) {
+                                    continue;
+                                }
                                 names.push(name.to_string());
                             }
                         }
@@ -2590,6 +2608,13 @@ impl RequestContext {
             match file_ext {
                 Some(ext) => {
                     let path = dir.join(format!("{name}{ext}"));
+                    // Sidecars FIRST. If this fails, the .yaml is still on disk, the
+                    // RAG is still listed, and the user can retry. Unlinking the .yaml
+                    // first would make the deletion unretryable while leaving an
+                    // orphaned mixin whitelisting a host in every sandbox launch.
+                    if kind == "rag" {
+                        paths::remove_rag_sidecars(&dir, &name)?;
+                    }
                     remove_file(&path).with_context(|| {
                         format!("Failed to delete {kind} at '{}'", path.display())
                     })?;
@@ -3729,6 +3754,14 @@ impl RequestContext {
             .then(|| Arc::new(RwLock::new(Supervisor::new(max_concurrent, max_depth))));
 
         self.rag = agent.rag();
+        // Keep `rag_key` in lockstep with `rag`. Agent RAGs are cached under
+        // `RagKey::Agent(<agent name>)` (see `Agent::init`), so mirror that key exactly;
+        // leaving the previous key in place would let `.rebuild rag` invalidate an
+        // unrelated RAG's cache entry, and leaving it `None` would invalidate nothing.
+        self.rag_key = self
+            .rag
+            .is_some()
+            .then(|| RagKey::Agent(agent.name().to_string()));
         self.agent = Some(agent);
         self.supervisor = supervisor;
         self.inbox = None;
@@ -3777,6 +3810,11 @@ impl RequestContext {
             self.pending_agents_guardrail_count = 0;
             self.todo_list = TodoList::default();
             self.rag.take();
+            // Cleared alongside `rag` so the pair never disagrees: an agent RAG is
+            // cached under `RagKey::Agent(<agent name>)`, and leaving that key behind
+            // would outlive the RAG it names. Latent rather than live today only
+            // because `rebuild_rag`/`edit_rag_docs` bail on `rag.is_none()` first.
+            self.rag_key = None;
             self.discontinuous_last_message();
         }
         Ok(())
@@ -4087,7 +4125,9 @@ impl RequestContext {
         let rag_cache = self.rag_cache();
         let working_mode = self.working_mode;
 
-        let rag: Arc<Rag> = match rag {
+        // The key is returned alongside the Rag rather than assigned inside the match:
+        // `rag_cache` borrows `self`, so writing `self.rag_key` there is E0506.
+        let (rag, rag_key): (Arc<Rag>, Option<RagKey>) = match rag {
             None => {
                 let rag_path = self.rag_file(super::TEMP_RAG_NAME);
                 if rag_path.exists() {
@@ -4095,14 +4135,28 @@ impl RequestContext {
                         format!("Failed to cleanup previous '{}' rag", super::TEMP_RAG_NAME)
                     })?;
                 }
-                Arc::new(Rag::init(&app, super::TEMP_RAG_NAME, &rag_path, &[], abort_signal).await?)
+                // The temp RAG is never inserted into the cache, so it has no key.
+                (
+                    Arc::new(
+                        Rag::init(
+                            &app,
+                            super::TEMP_RAG_NAME,
+                            &rag_path,
+                            &[],
+                            abort_signal,
+                            false,
+                        )
+                        .await?,
+                    ),
+                    None,
+                )
             }
             Some(name) => {
                 let rag_path = self.rag_file(name);
                 let key = RagKey::Named(name.to_string());
 
-                rag_cache
-                    .load_with(key, || {
+                let loaded = rag_cache
+                    .load_with(key.clone(), || {
                         let app = app.clone();
                         let rag_path = rag_path.clone();
                         let abort_signal = abort_signal.clone();
@@ -4111,16 +4165,19 @@ impl RequestContext {
                                 if working_mode.is_cmd() {
                                     bail!("Unknown RAG '{name}'");
                                 }
-                                Rag::init(&app, name, &rag_path, &[], abort_signal.clone()).await
+                                Rag::init(&app, name, &rag_path, &[], abort_signal.clone(), true)
+                                    .await
                             } else {
                                 Rag::load(&app, name, &rag_path)
                             }
                         }
                     })
-                    .await?
+                    .await?;
+                (loaded, Some(key))
             }
         };
         self.rag = Some(rag);
+        self.rag_key = rag_key;
         Ok(())
     }
 
@@ -4161,12 +4218,9 @@ impl RequestContext {
             bail!("No changes")
         }
 
-        let key = if self.agent.is_some() {
-            RagKey::Agent(rag.name().to_string())
-        } else {
-            RagKey::Named(rag.name().to_string())
-        };
-        self.rag_cache().invalidate(&key);
+        if let Some(key) = self.rag_key.clone() {
+            self.rag_cache().invalidate(&key);
+        }
 
         rag.refresh_document_paths(
             &new_document_paths,
@@ -4194,12 +4248,9 @@ impl RequestContext {
             );
         }
 
-        let key = if self.agent.is_some() {
-            RagKey::Agent(rag.name().to_string())
-        } else {
-            RagKey::Named(rag.name().to_string())
-        };
-        self.rag_cache().invalidate(&key);
+        if let Some(key) = self.rag_key.clone() {
+            self.rag_cache().invalidate(&key);
+        }
 
         let document_paths = rag.document_paths().to_vec();
         println!(
@@ -4613,6 +4664,49 @@ mod tests {
 
         assert!(ctx.agent.is_none());
         assert!(ctx.rag.is_none());
+        assert_eq!(ctx.rag_key, None);
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_does_not_carry_stale_rag_key() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        // Stand in for the state `.rag docs` leaves behind: `use_rag` sets `rag` and
+        // `rag_key` together, so a named key is live when the agent is entered.
+        ctx.rag_key = Some(RagKey::Named("docs".to_string()));
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())
+                    .await
+                    .unwrap();
+            });
+
+        // This agent has no RAG, so `rag` is None and `rag_key` must be None as well.
+        // Carrying `Named("docs")` across the transition would point `.rebuild rag`
+        // at an unrelated RAG's cache entry.
+        assert!(ctx.rag.is_none());
+        assert_eq!(ctx.rag_key, None);
     }
 
     #[test]
@@ -5998,6 +6092,31 @@ mod tests {
         let rags_dir = paths::rags_dir();
         create_dir_all(&rags_dir).unwrap();
         assert!(paths::list_rags().is_empty());
+    }
+
+    /// A `<name>.sbx-mixin.yaml` sidecar must not appear as a phantom RAG in TAB
+    /// completion or `.list rag`. A RAG whose name legitimately contains a dot must
+    /// still be listed — the filter uses `ends_with`, not `contains('.')`.
+    #[test]
+    #[serial]
+    fn list_rags_skips_sbx_mixin_sidecars() {
+        let _guard = TestConfigDirGuard::new();
+        let rags_dir = paths::rags_dir();
+        create_dir_all(&rags_dir).unwrap();
+        write(rags_dir.join("docs.yaml"), "embedding_model: test").unwrap();
+        write(rags_dir.join("docs.sbx-mixin.yaml"), "kind: mixin").unwrap();
+        write(rags_dir.join("v2.docs.yaml"), "embedding_model: test").unwrap();
+
+        let names = paths::list_rags();
+        assert!(names.contains(&"docs".to_string()));
+        assert!(
+            names.contains(&"v2.docs".to_string()),
+            "a dotted RAG name must still be listed: {names:?}"
+        );
+        assert!(
+            !names.contains(&"docs.sbx-mixin".to_string()),
+            "the sandbox mixin sidecar must not appear as a RAG: {names:?}"
+        );
     }
 
     #[test]
