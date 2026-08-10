@@ -40,15 +40,57 @@ _write_project_cache() {
 _detect_heuristic() {
   local dir="$1"
 
+  local runner="" runner_type="" runner_targets=""
+  if [[ -f "${dir}/Taskfile.yml" || -f "${dir}/Taskfile.yaml" || -f "${dir}/taskfile.yml" || -f "${dir}/taskfile.yaml" ]]; then
+    runner="task" runner_type="taskfile"
+    runner_targets=$( (cd "${dir}" && task --list-all 2>/dev/null | sed -n 's/^\* \([^:[:space:]]*\):.*/\1/p') || true)
+  elif [[ -f "${dir}/justfile" || -f "${dir}/Justfile" ]]; then
+    runner="just" runner_type="just"
+    runner_targets=$( (cd "${dir}" && just --summary 2>/dev/null | tr ' ' '\n') || true)
+  elif [[ -f "${dir}/Makefile" || -f "${dir}/makefile" || -f "${dir}/GNUmakefile" ]]; then
+    runner="make" runner_type="make"
+    local mk mkfiles=()
+    for mk in Makefile makefile GNUmakefile; do
+      [[ -f "${dir}/${mk}" ]] && mkfiles+=("${dir}/${mk}")
+    done
+    runner_targets=$(sed -n 's/^\([A-Za-z0-9_][A-Za-z0-9_.-]*\):\([^=].*\|\)$/\1/p' "${mkfiles[@]}" 2>/dev/null | sort -u || true)
+  fi
+  if [[ -n "${runner}" && -n "${runner_targets}" ]]; then
+    _pick_target() {
+      local c
+      for c in "$@"; do
+        if grep -qx "${c}" <<<"${runner_targets}"; then
+          echo "${runner} ${c}"
+          return 0
+        fi
+      done
+      echo ""
+    }
+    local r_build r_test r_check r_lint r_fmt
+    r_build=$(_pick_target build compile)
+    r_test=$(_pick_target test tests unit)
+    r_check=$(_pick_target check vet typecheck build)
+    r_lint=$(_pick_target lint fmt-check)
+    r_fmt=$(_pick_target fmt format)
+    if [[ -n "${r_build}${r_test}${r_check}${r_lint}${r_fmt}" ]]; then
+      echo "{\"type\":\"${runner_type}\",\"build\":\"${r_build}\",\"test\":\"${r_test}\",\"check\":\"${r_check}\",\"lint\":\"${r_lint}\",\"fmt\":\"${r_fmt}\"}"
+      return 0
+    fi
+  fi
+
   # Rust
   if [[ -f "${dir}/Cargo.toml" ]]; then
-    echo '{"type":"rust","build":"cargo build","test":"cargo test","check":"cargo check"}'
+    echo '{"type":"rust","build":"cargo build","test":"cargo test","check":"cargo check","lint":"cargo clippy --no-deps -- -D warnings","fmt":"cargo fmt"}'
     return 0
   fi
 
   # Go
   if [[ -f "${dir}/go.mod" ]]; then
-    echo '{"type":"go","build":"go build ./...","test":"go test ./...","check":"go vet ./..."}'
+    local go_lint=""
+    if compgen -G "${dir}/.golangci.*" &>/dev/null && command -v golangci-lint &>/dev/null; then
+      go_lint="golangci-lint run"
+    fi
+    echo "{\"type\":\"go\",\"build\":\"go build ./...\",\"test\":\"go test ./...\",\"check\":\"go vet ./...\",\"lint\":\"${go_lint}\",\"fmt\":\"gofmt -w .\"}"
     return 0
   fi
 
@@ -65,7 +107,25 @@ _detect_heuristic() {
     [[ -f "${dir}/pnpm-lock.yaml" ]] && pm="pnpm"
     [[ -f "${dir}/yarn.lock" ]] && pm="yarn"
 
-    echo "{\"type\":\"nodejs\",\"build\":\"${pm} run build\",\"test\":\"${pm} test\",\"check\":\"${pm} run lint\"}"
+    # Emit only scripts the manifest actually declares (same introspection
+    # contract as the runner tier: never guess a target into existence).
+    _pkg_script() {
+      local s
+      for s in "$@"; do
+        if jq -e --arg s "$s" '.scripts[$s] // empty' "${dir}/package.json" &>/dev/null; then
+          echo "${pm} run ${s}"
+          return 0
+        fi
+      done
+      echo ""
+    }
+    local p_build p_test p_check p_lint p_fmt
+    p_build=$(_pkg_script build compile)
+    p_test=$(_pkg_script test)
+    p_check=$(_pkg_script check typecheck tsc)
+    p_lint=$(_pkg_script lint)
+    p_fmt=$(_pkg_script fmt format prettier)
+    echo "{\"type\":\"nodejs\",\"build\":\"${p_build}\",\"test\":\"${p_test}\",\"check\":\"${p_check}\",\"lint\":\"${p_lint}\",\"fmt\":\"${p_fmt}\"}"
     return 0
   fi
 
@@ -82,7 +142,7 @@ _detect_heuristic() {
       check_cmd="uv run ruff check ."
     fi
 
-    echo "{\"type\":\"python\",\"build\":\"\",\"test\":\"${test_cmd}\",\"check\":\"${check_cmd}\"}"
+    echo "{\"type\":\"python\",\"build\":\"\",\"test\":\"${test_cmd}\",\"check\":\"${check_cmd}\",\"lint\":\"${check_cmd}\",\"fmt\":\"ruff format .\"}"
     return 0
   fi
 
@@ -141,17 +201,6 @@ _detect_heuristic() {
   # Zig
   if [[ -f "${dir}/build.zig" ]]; then
     echo '{"type":"zig","build":"zig build","test":"zig build test","check":"zig build"}'
-    return 0
-  fi
-
-  # Generic build systems (last resort before LLM)
-  if [[ -f "${dir}/justfile" ]] || [[ -f "${dir}/Justfile" ]]; then
-    echo '{"type":"just","build":"just build","test":"just test","check":"just lint"}'
-    return 0
-  fi
-
-  if [[ -f "${dir}/Makefile" ]] || [[ -f "${dir}/makefile" ]] || [[ -f "${dir}/GNUmakefile" ]]; then
-    echo '{"type":"make","build":"make build","test":"make test","check":"make lint"}'
     return 0
   fi
 
@@ -218,7 +267,9 @@ _detect_with_llm() {
   local prompt
   prompt=$(cat <<-EOF
 
-		Analyze this project directory and determine the project type, primary language, and the correct shell commands to build, test, and check (lint/typecheck) it.
+		Analyze this project directory and determine the project type, primary language, and the correct shell commands to build, test, check (typecheck/vet), lint, and format it.
+
+		PRIORITY RULE: if the project declares its own task-runner interface (a Taskfile, justfile, Makefile, package.json scripts, or similar), those declared targets ARE the correct commands — prefer them over generic ecosystem defaults, and never invent a target the interface does not declare.
 
 		EOF
 	)
@@ -226,12 +277,12 @@ _detect_with_llm() {
   prompt+=$(cat <<-EOF
 
 		Respond with ONLY a valid JSON object. No markdown fences, no explanation, no extra text.
-		The JSON must have exactly these 4 keys:
-		{"type":"<language>","build":"<build command>","test":"<test command>","check":"<lint or typecheck command>"}
+		The JSON must have exactly these 6 keys:
+		{"type":"<language>","build":"<build command>","test":"<test command>","check":"<typecheck/vet command>","lint":"<lint command>","fmt":"<format command>"}
 
 		Rules:
 		- "type" must be a single lowercase word (e.g. rust, go, python, nodejs, java, ruby, elixir, cpp, c, zig, haskell, scala, kotlin, dart, swift, php, dotnet, etc.)
-		- If a command doesn't apply to this project, use an empty string, ""
+		- If a command doesn't apply to this project, use an empty string, "" — NEVER guess a command that might not exist; a wrongly-guessed command is worse than an empty one
 		- Use the most standard/common commands for the detected ecosystem
 		- If you detect a package manager lockfile, use that package manager (e.g. pnpm over npm)
 		EOF
@@ -244,7 +295,7 @@ _detect_with_llm() {
   llm_response=$(echo "${llm_response}" | grep -o '{[^}]*}' | head -1)
 
   if echo "${llm_response}" | jq -e '.type and .build != null and .test != null and .check != null' &>/dev/null; then
-    echo "${llm_response}" | jq -c '{type: (.type // "unknown"), build: (.build // ""), test: (.test // ""), check: (.check // "")}'
+    echo "${llm_response}" | jq -c '{type: (.type // "unknown"), build: (.build // ""), test: (.test // ""), check: (.check // ""), lint: (.lint // ""), fmt: (.fmt // "")}'
     return 0
   fi
 
@@ -258,7 +309,7 @@ detect_project() {
 
   local cached
   if cached=$(_read_project_cache "${dir}"); then
-    echo "${cached}" | jq -c '{type, build, test, check}'
+    echo "${cached}" | jq -c '{type, build, test, check, lint: (.lint // ""), fmt: (.fmt // "")}'
     return 0
   fi
 
@@ -284,6 +335,31 @@ detect_project() {
   fi
 
   echo '{"type":"unknown","build":"","test":"","check":""}'
+}
+
+# resolve_gate_dir maps a workspace root to the directory verification gates
+# must run in. A delivery-repo worker's workspace root holds only dotfiles
+# plus the clone, so gates aimed at the root detect nothing and silently
+# no-op. When the root has no project markers and exactly ONE first-level
+# git repo exists, gates run inside it; anything ambiguous stays at the root.
+resolve_gate_dir() {
+  local dir="${1:-.}"
+  local m
+  for m in Taskfile.yml Taskfile.yaml taskfile.yml Cargo.toml go.mod package.json pyproject.toml setup.py pom.xml build.gradle mix.exs Gemfile composer.json Makefile justfile Justfile CMakeLists.txt; do
+    if [[ -e "${dir}/${m}" ]]; then
+      echo "${dir}"
+      return 0
+    fi
+  done
+  local repos=() d
+  for d in "${dir}"/*/; do
+    [[ -d "${d}/.git" ]] && repos+=("${d}")
+  done
+  if [[ ${#repos[@]} -eq 1 ]]; then
+    echo "${repos[0]%/}"
+    return 0
+  fi
+  echo "${dir}"
 }
 
 ###########################

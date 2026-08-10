@@ -1,5 +1,5 @@
 use crate::config::ensure_parent_exists;
-use crate::sandbox::SANDBOX_ENV_FLAG;
+use crate::sandbox::{SANDBOX_ENV_FLAG, sandbox_secret_env_var};
 use crate::vault::{SECRET_RE, Vault};
 use anyhow::Result;
 use anyhow::anyhow;
@@ -358,7 +358,32 @@ fn required_cli_preflight(label: &str, cli: &str, install_url: &str) {
 
 pub fn interpolate_secrets(content: &str, vault: &Vault) -> Result<(String, Vec<String>)> {
     if env::var_os(SANDBOX_ENV_FLAG).is_some() {
-        return Ok((content.to_string(), vec![]));
+        let (parsed, missing) = interpolate_secrets_with(content, None, |name| {
+            env::var(sandbox_secret_env_var(name)).map_err(|_| {
+                anyhow!(SecretError::NotFound {
+                    key: name.to_string(),
+                    provider: "sandbox environment",
+                })
+            })
+        })?;
+
+        if !missing.is_empty() {
+            let mut env_vars: Vec<String> = missing
+                .iter()
+                .map(|name| sandbox_secret_env_var(name))
+                .collect();
+            env_vars.sort();
+            env_vars.dedup();
+            eprintln!(
+                "Config references secrets that are not available inside this sandbox \
+                 (expected env vars: {}). Sandbox secrets are provisioned at creation \
+                 from the host; add the missing secrets on the host, then re-create \
+                 the sandbox.",
+                env_vars.join(", ")
+            );
+        }
+
+        return Ok((parsed, missing));
     }
     interpolate_secrets_with(content, vault.auth_hint(), |name| {
         vault.get_secret(name, false)

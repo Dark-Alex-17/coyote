@@ -4,7 +4,7 @@
 #   sbx create --kit ./sbx-kit/ coyote --name testing .
 #   sbx cp $HOME/.config/coyote/ testing:/home/agent/.config/
 #   sbx run testing --kit ./sbx-kit/
-schemaVersion: '1'
+schemaVersion: '2'
 kind: sandbox
 name: coyote
 displayName: Coyote
@@ -14,198 +14,255 @@ description: >
 
 sandbox:
   image: 'darkalex17/coyote:v0.8.3'
-  aiFilename: COYOTE.md
-  entrypoint:
-    run: ['bash', '-lc', 'exec /home/agent/.cargo/bin/coyote']
+  entrypoint: ['bash', '-lc', 'exec /home/agent/.cargo/bin/coyote']
 
-network:
-  # Proxy-managed LLM providers: the proxy substitutes `proxy-managed` for
-  # the env var inside the sandbox and rewrites the auth header per
-  # serviceAuth at request time. Multiple domains may map to one service
-  # (e.g. jina) so they share a single credential.
-  serviceDomains:
-    api.openai.com: openai
-    api.anthropic.com: anthropic
-    generativelanguage.googleapis.com: gemini
-    api.cohere.ai: cohere
-    api.groq.com: groq
-    openrouter.ai: openrouter
-    api.ai21.com: ai21
-    api.cloudflare.com: cloudflare
-    api.deepinfra.com: deepinfra
-    api.deepseek.com: deepseek
-    api.mistral.ai: mistral
-    api.perplexity.ai: perplexity
-    api.voyageai.com: voyageai
-    api.x.ai: xai
-    api.jina.ai: jina
-    r.jina.ai: jina
-    qianfan.baidubce.com: ernie
-    api.hunyuan.cloud.tencent.com: hunyuan
-    api.minimax.chat: minimax
-    api.moonshot.cn: moonshot
-    dashscope.aliyuncs.com: qianwen
-    open.bigmodel.cn: zhipuai
-  serviceAuth:
-    openai:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    anthropic:
-      headerName: x-api-key
-      valueFormat: '%s'
-    gemini:
-      headerName: x-goog-api-key
-      valueFormat: '%s'
-    cohere:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    groq:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    openrouter:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    ai21:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    cloudflare:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    deepinfra:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    deepseek:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    mistral:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    perplexity:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    voyageai:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    xai:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    jina:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    ernie:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    hunyuan:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    minimax:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    moonshot:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    qianwen:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-    zhipuai:
-      headerName: Authorization
-      valueFormat: 'Bearer %s'
-  allowedDomains:
-    # Coyote release + self-update + model-registry sync
-    - 'github.com:443'
-    - 'api.github.com:443'
-    - 'raw.githubusercontent.com:443'
-    - 'objects.githubusercontent.com:443'
-    - '*.githubusercontent.com:443'
-    # Package managers and developer tools (cargo, uv, pip — useful at runtime for user installs)
-    - 'crates.io:443'
-    - 'static.crates.io:443'
-    - 'pypi.org:443'
-    - 'files.pythonhosted.org:443'
-    - 'astral.sh:443'
-    - 'sh.rustup.rs:443'
-    - 'static.rust-lang.org:443'
+permissions:
+  network:
+    allow:
+      # Coyote release + self-update + model-registry sync
+      - 'github.com'
+      - 'api.github.com'
+      - 'raw.githubusercontent.com'
+      - 'objects.githubusercontent.com'
+      - '*.githubusercontent.com'
+      # Package managers and developer tools (cargo, uv, pip — useful at runtime for user installs)
+      - 'crates.io'
+      - 'static.crates.io'
+      - 'pypi.org'
+      - 'files.pythonhosted.org'
+      - 'astral.sh'
+      - 'sh.rustup.rs'
+      - 'static.rust-lang.org'
 
-    # LLM model OAuth + API endpoints
-    - 'claude.ai:443'
-    - 'console.anthropic.com:443'
-    - 'accounts.google.com:443'
-    # *.googleapis.com covers oauth2 + userinfo + VertexAI regional endpoints
-    # (*-aiplatform.googleapis.com). Do not narrow without re-checking VertexAI.
-    - '*.googleapis.com:443'
+      # LLM model OAuth + API endpoints
+      - 'claude.ai'
+      - 'console.anthropic.com'
+      - 'accounts.google.com'
+      # *.googleapis.com covers oauth2 + userinfo + VertexAI regional endpoints
+      # (*-aiplatform.googleapis.com). Do not narrow without re-checking VertexAI.
+      - '*.googleapis.com'
 
-    # Bedrock and GitHub Models use signed / GitHub-PAT auth that the proxy
-    # cannot rewrite. Domains are allow-listed; credentials must be injected
-    # separately (see README "Extending").
-    - '*.amazonaws.com:443'
-    - 'models.inference.ai.azure.com:443'
+      # Bedrock and GitHub Models use signed / GitHub-PAT auth that the proxy
+      # cannot rewrite; credentials must be injected separately (see README
+      # "Extending"). NOTE: '*.amazonaws.com' matches exactly ONE label, so
+      # two-label regional Bedrock hosts must be enumerated explicitly
+      # ('**.' is declared but not yet enforced by sbx). Add your region
+      # via a mixin if it's missing below.
+      - '*.amazonaws.com'
+      - 'bedrock-runtime.us-east-1.amazonaws.com'
+      - 'bedrock-runtime.us-east-2.amazonaws.com'
+      - 'bedrock-runtime.us-west-2.amazonaws.com'
+      - 'bedrock-runtime.eu-west-1.amazonaws.com'
+      - 'bedrock-runtime.eu-central-1.amazonaws.com'
+      - 'bedrock-runtime.ap-southeast-2.amazonaws.com'
+      - 'bedrock-runtime.ap-northeast-1.amazonaws.com'
+      - 'models.inference.ai.azure.com'
 
+      # Proxy-managed LLM provider APIs. Every credentials[].apiKey.inject
+      # domain below MUST also appear here. sbx does not derive allow entries
+      # from inject rules.
+      - 'api.openai.com'
+      - 'api.anthropic.com'
+      - 'generativelanguage.googleapis.com'
+      - 'api.cohere.ai'
+      - 'api.groq.com'
+      - 'openrouter.ai'
+      - 'api.ai21.com'
+      - 'api.cloudflare.com'
+      - 'api.deepinfra.com'
+      - 'api.deepseek.com'
+      - 'api.mistral.ai'
+      - 'api.perplexity.ai'
+      - 'api.voyageai.com'
+      - 'api.x.ai'
+      - 'api.jina.ai'
+      - 'r.jina.ai'
+      - 'qianfan.baidubce.com'
+      - 'api.hunyuan.cloud.tencent.com'
+      - 'api.minimax.chat'
+      - 'api.moonshot.cn'
+      - 'dashscope.aliyuncs.com'
+      - 'open.bigmodel.cn'
+
+# Proxy-managed LLM providers: inside the sandbox each apiKey env var holds
+# the `proxy-managed` sentinel; the proxy injects the real value into the
+# request header per the inject rules at request time. Values are bound by
+# the user via credential bindings (`sbx secret set <service>`); Coyote
+# pre-seeds them from its vault at launch. Multiple domains may map to one
+# service (e.g. jina) so they share a single credential.
 credentials:
-  sources:
-    openai:
-      env:
-        - OPENAI_API_KEY
-    anthropic:
-      env:
-        - ANTHROPIC_API_KEY
-    gemini:
-      env:
-        - GEMINI_API_KEY
-        - GOOGLE_API_KEY
-    cohere:
-      env:
-        - COHERE_API_KEY
-    groq:
-      env:
-        - GROQ_API_KEY
-    openrouter:
-      env:
-        - OPENROUTER_API_KEY
-    ai21:
-      env:
-        - AI21_API_KEY
-    cloudflare:
-      env:
-        - CLOUDFLARE_API_KEY
-    deepinfra:
-      env:
-        - DEEPINFRA_API_KEY
-    deepseek:
-      env:
-        - DEEPSEEK_API_KEY
-    mistral:
-      env:
-        - MISTRAL_API_KEY
-    perplexity:
-      env:
-        - PERPLEXITY_API_KEY
-    voyageai:
-      env:
-        - VOYAGE_API_KEY
-    xai:
-      env:
-        - XAI_API_KEY
-    jina:
-      env:
-        - JINA_API_KEY
-    ernie:
-      env:
-        - ERNIE_API_KEY
-    hunyuan:
-      env:
-        - HUNYUAN_API_KEY
-    minimax:
-      env:
-        - MINIMAX_API_KEY
-    moonshot:
-      env:
-        - MOONSHOT_API_KEY
-    qianwen:
-      env:
-        - DASHSCOPE_API_KEY
-    zhipuai:
-      env:
-        - ZHIPUAI_API_KEY
+  - service: openai
+    description: OpenAI API key, injected on api.openai.com
+    apiKey:
+      name: OPENAI_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.openai.com
+          scheme: bearer
+  - service: anthropic
+    description: Anthropic API key, injected as x-api-key on api.anthropic.com
+    apiKey:
+      name: ANTHROPIC_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.anthropic.com
+          header: x-api-key
+          format: '%s'
+  - service: gemini
+    description: Google Gemini API key, injected as x-goog-api-key on generativelanguage.googleapis.com
+    apiKey:
+      name: GEMINI_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: generativelanguage.googleapis.com
+          header: x-goog-api-key
+          format: '%s'
+  - service: cohere
+    description: Cohere API key, injected on api.cohere.ai
+    apiKey:
+      name: COHERE_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.cohere.ai
+          scheme: bearer
+  - service: groq
+    description: Groq API key, injected on api.groq.com
+    apiKey:
+      name: GROQ_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.groq.com
+          scheme: bearer
+  - service: openrouter
+    description: OpenRouter API key, injected on openrouter.ai
+    apiKey:
+      name: OPENROUTER_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: openrouter.ai
+          scheme: bearer
+  - service: ai21
+    description: AI21 Labs API key, injected on api.ai21.com
+    apiKey:
+      name: AI21_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.ai21.com
+          scheme: bearer
+  - service: cloudflare
+    description: Cloudflare Workers AI API key, injected on api.cloudflare.com
+    apiKey:
+      name: CLOUDFLARE_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.cloudflare.com
+          scheme: bearer
+  - service: deepinfra
+    description: DeepInfra API key, injected on api.deepinfra.com
+    apiKey:
+      name: DEEPINFRA_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.deepinfra.com
+          scheme: bearer
+  - service: deepseek
+    description: DeepSeek API key, injected on api.deepseek.com
+    apiKey:
+      name: DEEPSEEK_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.deepseek.com
+          scheme: bearer
+  - service: mistral
+    description: Mistral API key, injected on api.mistral.ai
+    apiKey:
+      name: MISTRAL_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.mistral.ai
+          scheme: bearer
+  - service: perplexity
+    description: Perplexity API key, injected on api.perplexity.ai
+    apiKey:
+      name: PERPLEXITY_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.perplexity.ai
+          scheme: bearer
+  - service: voyageai
+    description: Voyage AI API key, injected on api.voyageai.com
+    apiKey:
+      name: VOYAGE_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.voyageai.com
+          scheme: bearer
+  - service: xai
+    description: xAI (Grok) API key, injected on api.x.ai
+    apiKey:
+      name: XAI_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.x.ai
+          scheme: bearer
+  - service: jina
+    description: Jina API key, injected on api.jina.ai and r.jina.ai
+    apiKey:
+      name: JINA_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.jina.ai
+          scheme: bearer
+        - domain: r.jina.ai
+          scheme: bearer
+  - service: ernie
+    description: Baidu ERNIE API key, injected on qianfan.baidubce.com
+    apiKey:
+      name: ERNIE_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: qianfan.baidubce.com
+          scheme: bearer
+  - service: hunyuan
+    description: Tencent Hunyuan API key, injected on api.hunyuan.cloud.tencent.com
+    apiKey:
+      name: HUNYUAN_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.hunyuan.cloud.tencent.com
+          scheme: bearer
+  - service: minimax
+    description: MiniMax API key, injected on api.minimax.chat
+    apiKey:
+      name: MINIMAX_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.minimax.chat
+          scheme: bearer
+  - service: moonshot
+    description: Moonshot AI API key, injected on api.moonshot.cn
+    apiKey:
+      name: MOONSHOT_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: api.moonshot.cn
+          scheme: bearer
+  - service: qianwen
+    description: Alibaba Qianwen (DashScope) API key, injected on dashscope.aliyuncs.com
+    apiKey:
+      name: DASHSCOPE_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: dashscope.aliyuncs.com
+          scheme: bearer
+  - service: zhipuai
+    description: Zhipu AI (GLM) API key, injected on open.bigmodel.cn
+    apiKey:
+      name: ZHIPUAI_API_KEY
+      proxyManaged: true
+      inject:
+        - domain: open.bigmodel.cn
+          scheme: bearer
 
 environment:
   variables:
@@ -213,32 +270,14 @@ environment:
     COYOTE_LOG_LEVEL: INFO
     COYOTE_CONFIG_DIR: /home/agent/.config/coyote
     EDITOR: nano
-  proxyManaged:
-    - OPENAI_API_KEY
-    - ANTHROPIC_API_KEY
-    - GEMINI_API_KEY
-    - GOOGLE_API_KEY
-    - COHERE_API_KEY
-    - GROQ_API_KEY
-    - OPENROUTER_API_KEY
-    - AI21_API_KEY
-    - CLOUDFLARE_API_KEY
-    - DEEPINFRA_API_KEY
-    - DEEPSEEK_API_KEY
-    - MISTRAL_API_KEY
-    - PERPLEXITY_API_KEY
-    - VOYAGE_API_KEY
-    - XAI_API_KEY
-    - JINA_API_KEY
-    - ERNIE_API_KEY
-    - HUNYUAN_API_KEY
-    - MINIMAX_API_KEY
-    - MOONSHOT_API_KEY
-    - DASHSCOPE_API_KEY
-    - ZHIPUAI_API_KEY
+    # Alias for the gemini credential: v2 apiKey supports a single env name
+    # (GEMINI_API_KEY above). Coyote also recognizes GOOGLE_API_KEY, so keep
+    # it set to the sentinel. Header injection happens per-domain regardless
+    # of which env var the app reads.
+    GOOGLE_API_KEY: proxy-managed
 
-commands:
-  initFiles:
+setup:
+  files:
     - path: /home/agent/.config/git/ssh-signing-key-command
       mode: '0755'
       description: Resolve the forwarded SSH agent key for Git SSH signing
@@ -290,39 +329,45 @@ commands:
       background: false
       description: Bootstrap Coyote config directory on first sandbox start
 
-agentContext: |
-  ## Sandbox environment
+agentInstructions:
+  filename: COYOTE.md
+  content: |
+    ## Sandbox environment
 
-  You are running inside a Docker sandbox launched via `sbx run coyote`. The
-  user's project workspace is mounted at its absolute host path and is the
-  current working directory. `sudo` is passwordless; use it for system
-  package installs.
+    You are running inside a Docker sandbox launched via `sbx run coyote`. The
+    user's project workspace is mounted at its absolute host path and is the
+    current working directory. `sudo` is passwordless; use it for system
+    package installs.
 
-  Coyote's configuration lives at `~/.config/coyote/` and logs at
-  `~/.cache/coyote/coyote.log`. Persistence is enabled, so config, sessions,
-  vault state, OAuth tokens, and installed tools survive sandbox restarts.
+    Coyote's configuration lives at `~/.config/coyote/` and logs at
+    `~/.cache/coyote/coyote.log`. Persistence is enabled, so config, sessions,
+    vault state, OAuth tokens, and installed tools survive sandbox restarts.
 
-  LLM provider credentials are forwarded by the sandbox HTTP proxy. The
-  following provider env vars are recognized - export the ones you use on
-  the host before running `sbx run coyote`:
+    LLM provider credentials are forwarded by the sandbox HTTP proxy via
+    credential bindings. Coyote pre-seeds them from its vault at launch
+    (`sbx secret set <service>`); users can also bind values manually on the
+    host with `sbx secret set <service>` or `sbx secret import`. Recognized
+    services:
 
-    OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY / GOOGLE_API_KEY,
-    COHERE_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY, AI21_API_KEY,
-    CLOUDFLARE_API_KEY, DEEPINFRA_API_KEY, DEEPSEEK_API_KEY,
-    MISTRAL_API_KEY, PERPLEXITY_API_KEY, VOYAGE_API_KEY, XAI_API_KEY,
-    JINA_API_KEY, ERNIE_API_KEY, HUNYUAN_API_KEY, MINIMAX_API_KEY, 
-    MOONSHOT_API_KEY, DASHSCOPE_API_KEY (Qwen), ZHIPUAI_API_KEY
+      openai, anthropic, gemini, cohere, groq, openrouter, ai21,
+      cloudflare, deepinfra, deepseek, mistral, perplexity, voyageai,
+      xai, jina, ernie, hunyuan, minimax, moonshot, qianwen, zhipuai
 
-  Inside the sandbox these appear as the placeholder string `proxy-managed`;
-  the proxy substitutes the real value at request time. OAuth flows for
-  Claude Pro/Max and Gemini are also allow-listed.
+    Inside the sandbox the corresponding env vars (OPENAI_API_KEY, etc.)
+    hold the placeholder string `proxy-managed`; the proxy substitutes the
+    real value at request time. OAuth flows for Claude Pro/Max and Gemini
+    are also allow-listed.
 
-  Bedrock (AWS) and VertexAI (Google Cloud) use signed/OAuth-token requests
-  that the proxy cannot rewrite. Their domains are allow-listed but you must
-  inject credentials yourself via `sbx run --env AWS_ACCESS_KEY_ID=...` or
-  a mixin kit that mounts a service-account JSON.
+    Bedrock (AWS) and VertexAI (Google Cloud) use signed/OAuth-token requests
+    that the proxy cannot rewrite, so you must inject credentials yourself via
+    `sbx run --env AWS_ACCESS_KEY_ID=...` or a mixin kit that mounts a
+    service-account JSON. VertexAI regional endpoints are allow-listed via
+    `*.googleapis.com`. Bedrock runtime endpoints are allow-listed for
+    us-east-1/2, us-west-2, eu-west-1, eu-central-1, ap-southeast-2, and
+    ap-northeast-1 only; other regions need a mixin allow entry
+    (`bedrock-runtime.<region>.amazonaws.com`).
 
-  Useful first-run commands:
-  - `coyote --info`          # show config paths and resolved settings
-  - `coyote --list-secrets`  # initialise the local vault
-  - `coyote --authenticate <client>`  # OAuth flow (Claude Pro/Max, Gemini)
+    Useful first-run commands:
+    - `coyote --info`          # show config paths and resolved settings
+    - `coyote --list-secrets`  # initialise the local vault
+    - `coyote --authenticate <client>`  # OAuth flow (Claude Pro/Max, Gemini)

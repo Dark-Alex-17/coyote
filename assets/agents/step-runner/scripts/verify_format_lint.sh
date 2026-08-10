@@ -13,19 +13,18 @@ else
 fi
 
 project_dir=$(echo "$state" | jq -r '.project_dir // "."')
-project_type=$(detect_project "$project_dir" | jq -r '.type // "unknown"')
+project_dir=$(resolve_gate_dir "$project_dir")
+project_info=$(detect_project "$project_dir")
+project_type=$(echo "$project_info" | jq -r '.type // "unknown"')
 
 format_cmd="${FORMAT_CMD:-}"
 if [[ -z "$format_cmd" ]]; then
-  case "$project_type" in
-    rust) format_cmd="cargo fmt" ;;
-    go) format_cmd="gofmt -w ." ;;
-    python) command -v ruff &>/dev/null && format_cmd="ruff format ." ;;
-  esac
+  format_cmd=$(echo "$project_info" | jq -r '.fmt // ""')
 fi
+if [[ "$format_cmd" == "null" ]]; then format_cmd=""; fi
 
 if [[ -z "$format_cmd" ]]; then
-  format_output="(no format command configured for project type '$project_type'; skipped. Set FORMAT_CMD to enable.)"
+  format_output="(GATE NOT RUN: no format command configured or detected for project type '$project_type'. This is NOT evidence that formatting is clean. Set FORMAT_CMD to enable.)"
 else
   fmt_rc=0
   fmt_out=$(cd "$project_dir" && eval "$format_cmd" 2>&1) || fmt_rc=$?
@@ -37,12 +36,18 @@ fi
 
 lint_cmd="${LINT_CMD:-}"
 if [[ -z "$lint_cmd" ]]; then
+  lint_cmd=$(echo "$project_info" | jq -r '.lint // ""')
+fi
+# The skip message must read as a WARNING, never a reassurance: the previous
+# wording ("linting is covered by the build/check command") was quoted
+# verbatim by workers as false evidence that linting passed
+if [[ -z "$lint_cmd" || "$lint_cmd" == "null" ]]; then
   jq -nc \
     --arg fo "$format_output" \
     '{
       "format_output": $fo,
       "lint_ok": true,
-      "lint_output": "(no LINT_CMD configured; linting is covered by the build/check command)",
+      "lint_output": "(GATE NOT RUN: no lint command configured or detected. This is NOT evidence that linting passed — set LINT_CMD or add a Taskfile lint target, and never report linting as covered.)",
       "_next": "verify_build"
     }'
   exit 0

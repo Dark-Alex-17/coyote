@@ -13,6 +13,7 @@ else
 fi
 
 project_dir=$(echo "$state" | jq -r '.project_dir // "."')
+project_dir=$(resolve_gate_dir "$project_dir")
 
 if [[ -n "${TEST_CMD:-}" ]]; then
   cmd="$TEST_CMD"
@@ -24,7 +25,7 @@ fi
 if [[ -z "$cmd" || "$cmd" == "null" ]]; then
   jq -nc '{
     "tests_ok": true,
-    "tests_output": "(no test command available for this project type)",
+    "tests_output": "(GATE NOT RUN: no test command configured or detected. This is NOT evidence that tests passed — set TEST_CMD, and never report the suite as green.)",
     "_next": "edge_case_sweep"
   }'
   exit 0

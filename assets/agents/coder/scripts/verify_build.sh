@@ -13,6 +13,7 @@ else
 fi
 
 project_dir=$(echo "$state" | jq -r '.project_dir // "."')
+project_dir=$(resolve_gate_dir "$project_dir")
 
 if [[ -n "${BUILD_CMD:-}" ]]; then
   cmd="$BUILD_CMD"
@@ -24,7 +25,7 @@ fi
 if [[ -z "$cmd" || "$cmd" == "null" ]]; then
   jq -nc '{
     "build_ok": true,
-    "build_output": "(no build/check command available for this project type)",
+    "build_output": "(GATE NOT RUN: no build/check command configured or detected. This is NOT evidence that the build passed — set BUILD_CMD, and never report the build as verified.)",
     "_next": "verify_tests"
   }'
   exit 0

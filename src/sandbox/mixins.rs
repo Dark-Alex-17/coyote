@@ -34,8 +34,12 @@ impl DiscoveredMixin {
 pub fn wrap_mixin_as_kit(mixin_path: &Path) -> Result<PathBuf> {
     let bytes = fs::read(mixin_path)
         .with_context(|| format!("Failed to read sbx mixin {}", mixin_path.display()))?;
+    wrap_mixin_bytes_as_kit(&bytes, &mixin_path.display().to_string())
+}
+
+pub fn wrap_mixin_bytes_as_kit(bytes: &[u8], label: &str) -> Result<PathBuf> {
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    hasher.update(bytes);
     let hash = format!("{:x}", hasher.finalize());
 
     let kit_dir = paths::sbx_mixin_kits_dir().join(&hash);
@@ -49,14 +53,10 @@ pub fn wrap_mixin_as_kit(mixin_path: &Path) -> Result<PathBuf> {
 
     fs::create_dir_all(&kit_dir)
         .with_context(|| format!("Failed to create mixin kit dir {}", kit_dir.display()))?;
-    fs::write(&spec_path, &bytes)
+    fs::write(&spec_path, bytes)
         .with_context(|| format!("Failed to write {}", spec_path.display()))?;
 
-    debug!(
-        "Wrapped mixin {} as kit at {}",
-        mixin_path.display(),
-        kit_dir.display()
-    );
+    debug!("Wrapped mixin {label} as kit at {}", kit_dir.display());
 
     Ok(kit_dir)
 }
@@ -97,15 +97,18 @@ pub fn summarize(path: &Path) -> Result<(usize, usize)> {
         .with_context(|| format!("Failed to parse sbx mixin {}", path.display()))?;
 
     let installs = value
-        .get("commands")
-        .and_then(|c| c.get("install"))
+        .get("setup")
+        .and_then(|s| s.get("install"))
+        .or_else(|| value.get("commands").and_then(|c| c.get("install")))
         .and_then(|i| i.as_sequence())
         .map(|s| s.len())
         .unwrap_or(0);
 
     let domains = value
-        .get("network")
-        .and_then(|n| n.get("allowedDomains"))
+        .get("permissions")
+        .and_then(|p| p.get("network"))
+        .and_then(|n| n.get("allow"))
+        .or_else(|| value.get("network").and_then(|n| n.get("allowedDomains")))
         .and_then(|d| d.as_sequence())
         .map(|s| s.len())
         .unwrap_or(0);
@@ -224,6 +227,34 @@ mod tests {
     #[test]
     fn summarize_counts_installs_and_domains() {
         let root = unique_root("sbx-mixin-counts");
+        let path = root.join("sbx-mixin.yaml");
+        fs::write(
+            &path,
+            r#"
+schemaVersion: "2"
+kind: mixin
+setup:
+  install:
+    - command: "echo hi"
+    - command: "echo bye"
+permissions:
+  network:
+    allow:
+      - "a.example.com:443"
+      - "b.example.com:443"
+      - "c.example.com:443"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(summarize(&path).unwrap(), (2, 3));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn summarize_falls_back_to_v1_field_paths() {
+        let root = unique_root("sbx-mixin-counts-v1");
         let path = root.join("sbx-mixin.yaml");
         fs::write(
             &path,
@@ -373,6 +404,19 @@ network:
 
             assert!(spec.exists(), "spec.yaml must exist in wrapped kit dir");
             assert_eq!(fs::read_to_string(&spec).unwrap(), content);
+        }
+
+        #[test]
+        #[serial]
+        fn wrap_mixin_bytes_as_kit_writes_spec_yaml() {
+            let _guard = TestCacheDirGuard::new();
+            let content = b"schemaVersion: '2'\nkind: mixin\nname: generated\n";
+
+            let kit_dir = wrap_mixin_bytes_as_kit(content, "generated").unwrap();
+            let spec = kit_dir.join("spec.yaml");
+
+            assert!(spec.exists(), "spec.yaml must exist in wrapped kit dir");
+            assert_eq!(fs::read(&spec).unwrap(), content);
         }
 
         #[test]
