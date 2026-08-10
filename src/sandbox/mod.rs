@@ -10,12 +10,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use which::which;
 
+mod mcp_credentials;
 mod mixins;
+
+pub(crate) use mcp_credentials::sandbox_secret_env_var;
 
 use crate::config::AppConfig;
 use crate::config::Config;
 use crate::config::VAULT_DATA_FILE_NAME;
 use crate::config::paths;
+use crate::sandbox::mcp_credentials::MCP_MIXIN_NAME;
 use crate::sandbox::mixins::DiscoveredMixin;
 use crate::utils::run_command_with_output;
 use crate::vault::SECRET_RE;
@@ -49,9 +53,11 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
     let vault = Vault::init(&bootstrap)?;
     let registered = sbx_registered_services()?;
     inject_llm_secret(&config_content, &vault, &registered)?;
-    if !fresh {
-        inject_mcp_secrets(&vault, &registered)?;
-    }
+    let credentials_mixin = if fresh {
+        None
+    } else {
+        inject_mcp_secrets(&vault, &registered)?
+    };
 
     let discovered = mixins::discover()?;
 
@@ -59,7 +65,7 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
         info!("Re-attaching to existing sandbox '{name}'");
     } else {
         mixins::log_discovery(&discovered, false);
-        create_sandbox(&name, &kit_path, &discovered)?;
+        create_sandbox(&name, &kit_path, &discovered, credentials_mixin.as_deref())?;
         if !fresh {
             copy_host_files(&name)?;
         }
@@ -232,7 +238,7 @@ fn inject_llm_secret(
         if registered.contains(&service) {
             eprintln!(
                 "Secret for '{service}' already registered with sbx. \
-                 To update it, run: sbx secret set -g --force {service}"
+                 To update it, run: sbx secret set --force {service}"
             );
             continue;
         }
@@ -247,23 +253,14 @@ fn inject_llm_secret(
     Ok(())
 }
 
-fn find_secret_placeholder(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => SECRET_RE
-            .captures(s)
-            .ok()
-            .flatten()
-            .map(|caps| caps[1].to_string()),
-        Value::Object(map) => map.values().find_map(find_secret_placeholder),
-        Value::Array(arr) => arr.iter().find_map(find_secret_placeholder),
-        _ => None,
-    }
-}
-
-fn inject_mcp_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()> {
+/// Registers one sbx secret per distinct `{{placeholder}}` in the MCP config
+/// and returns the generated schema-v2 `coyote-mcp` mixin (network egress for
+/// every remote MCP server + credential declarations), or `None` when the MCP
+/// config references no remote servers and no secrets.
+fn inject_mcp_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<Option<String>> {
     let mcp_path = paths::mcp_config_file();
     if !mcp_path.exists() {
-        return Ok(());
+        return Ok(None);
     }
 
     let content = fs::read_to_string(&mcp_path)
@@ -272,40 +269,51 @@ fn inject_mcp_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
         .with_context(|| format!("Failed to parse {}", mcp_path.display()))?;
 
     let Some(servers) = mcp.get("mcpServers").and_then(|v| v.as_object()) else {
-        return Ok(());
+        return Ok(None);
     };
 
-    for (server_name, server_config) in servers {
-        let Some(secret_name) = find_secret_placeholder(server_config) else {
-            continue;
-        };
+    let credentials = mcp_credentials::collect_credentials(servers)?;
+    let allow_entries = mcp_credentials::collect_server_allow_entries(servers);
+    if credentials.is_empty() && allow_entries.is_empty() {
+        return Ok(None);
+    }
 
-        if registered.contains(server_name.as_str()) {
+    for credential in &credentials {
+        if registered.contains(credential.service_id.as_str()) {
             eprintln!(
-                "Secret for '{server_name}' already registered with sbx. \
-                 To update it, run: sbx secret set -g --force {server_name}"
+                "Secret for '{}' already registered with sbx. \
+                 To update it, run: sbx secret set --force {}",
+                credential.service_id, credential.service_id
             );
             continue;
         }
 
-        let secret_value = vault.get_secret(&secret_name, false).with_context(|| {
-            format!(
-                "Secret '{secret_name}' referenced by MCP server '{server_name}' not found \
-                 in vault. Add it with: coyote --add-secret {secret_name}"
-            )
-        })?;
+        let secret_value = vault
+            .get_secret(&credential.secret_name, false)
+            .with_context(|| {
+                format!(
+                    "Secret '{}' referenced by MCP server(s) {} not found \
+                     in vault. Add it with: coyote --add-secret {}",
+                    credential.secret_name,
+                    mcp_credentials::quoted_list(&credential.servers),
+                    credential.secret_name
+                )
+            })?;
 
-        sbx_secret_set(server_name, &secret_value)?;
+        sbx_secret_set(&credential.service_id, &secret_value)?;
     }
 
-    Ok(())
+    Ok(Some(mcp_credentials::render_mixin_yaml(
+        &credentials,
+        &allow_entries,
+    )?))
 }
 
 fn provider_to_sbx_service(provider_type: &str, client_name: Option<&str>) -> String {
     match provider_type {
         "claude" => "anthropic".to_string(),
         "openai" => "openai".to_string(),
-        "gemini" | "vertexai" => "google".to_string(),
+        "gemini" | "vertexai" => "gemini".to_string(),
         "openai-compatible" => client_name.unwrap_or("openai-compatible").to_string(),
         other => client_name.unwrap_or(other).to_string(),
     }
@@ -338,25 +346,29 @@ fn sbx_registered_services() -> Result<HashSet<String>> {
 
 fn sbx_secret_set(service: &str, secret_value: &str) -> Result<()> {
     let mut child = Command::new(SBX_BINARY)
-        .args(["secret", "set", "-g", service])
+        .args(["secret", "set", service])
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("Failed to spawn `sbx secret set -g`")?;
+        .context("Failed to spawn `sbx secret set`")?;
 
     if let Some(mut stdin_handle) = child.stdin.take() {
         stdin_handle
             .write_all(secret_value.as_bytes())
-            .context("Failed to write secret to `sbx secret set -g` stdin")?;
+            .context("Failed to write secret to `sbx secret set` stdin")?;
     }
 
     let status = child
         .wait()
-        .context("Failed to wait for `sbx secret set -g`")?;
+        .context("Failed to wait for `sbx secret set`")?;
 
     if !status.success() {
-        bail!("`sbx secret set -g {service}` exited with {status}");
+        eprintln!(
+            "Warning: failed to register sbx secret '{service}' \
+             (`sbx secret set {service}` exited with {status}). \
+             Set it manually with: echo '<value>' | sbx secret set {service}"
+        );
     }
 
     Ok(())
@@ -375,9 +387,17 @@ fn sandbox_exists(name: &str) -> Result<bool> {
         .any(|line| line.split_whitespace().next() == Some(name)))
 }
 
-fn create_sandbox(name: &str, kit_path: &Path, mixins: &[DiscoveredMixin]) -> Result<()> {
+fn create_sandbox(
+    name: &str,
+    kit_path: &Path,
+    mixins: &[DiscoveredMixin],
+    credentials_mixin: Option<&str>,
+) -> Result<()> {
     info!("Creating sandbox '{name}'");
-    let args = build_create_args(name, kit_path, mixins)?;
+    let credentials_kit = credentials_mixin
+        .map(|yaml| mixins::wrap_mixin_bytes_as_kit(yaml.as_bytes(), MCP_MIXIN_NAME))
+        .transpose()?;
+    let args = build_create_args(name, kit_path, mixins, credentials_kit.as_deref())?;
     debug!("sbx {}", args.join(" "));
     let status = Command::new(SBX_BINARY)
         .args(&args)
@@ -398,6 +418,7 @@ fn build_create_args(
     name: &str,
     kit_path: &Path,
     mixins: &[DiscoveredMixin],
+    credentials_kit: Option<&Path>,
 ) -> Result<Vec<String>> {
     let kit_str = kit_path
         .to_str()
@@ -419,6 +440,15 @@ fn build_create_args(
             .to_string();
         args.push("--kit".to_string());
         args.push(mixin_str);
+    }
+
+    if let Some(kit) = credentials_kit {
+        let cred_str = kit
+            .to_str()
+            .ok_or_else(|| anyhow!("Credentials kit path is not valid UTF-8: {}", kit.display()))?
+            .to_string();
+        args.push("--kit".to_string());
+        args.push(cred_str);
     }
 
     args.push(SANDBOX_AGENT.to_string());
@@ -558,6 +588,7 @@ fn chown_agent_recursive(sandbox: &str, path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn sanitize_name_lowercases() {
@@ -626,8 +657,8 @@ mod tests {
     #[test]
     fn build_create_args_emits_base_kit_before_mixins() {
         let kit = PathBuf::from("/cache/sbx-kit");
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let dir_a = env::temp_dir().join(format!("coyote-mixin-a-{unique}"));
@@ -650,7 +681,7 @@ mod tests {
             },
         ];
 
-        let args = build_create_args("my-box", &kit, &mixins).unwrap();
+        let args = build_create_args("my-box", &kit, &mixins, None).unwrap();
 
         assert_eq!(
             args,
@@ -676,7 +707,9 @@ mod tests {
     #[test]
     fn build_create_args_with_no_mixins_omits_mixin_kits() {
         let kit = PathBuf::from("/cache/sbx-kit");
-        let args = build_create_args("box", &kit, &[]).unwrap();
+
+        let args = build_create_args("box", &kit, &[], None).unwrap();
+
         assert_eq!(
             args,
             vec![
@@ -689,5 +722,80 @@ mod tests {
                 ".".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn build_create_args_appends_credentials_kit_after_mixins() {
+        let kit = PathBuf::from("/cache/sbx-kit");
+        let credentials_kit = PathBuf::from("/cache/sbx-mixin-kits/abc123");
+
+        let args = build_create_args("box", &kit, &[], Some(&credentials_kit)).unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "create".to_string(),
+                "--name".to_string(),
+                "box".to_string(),
+                "--kit".to_string(),
+                "/cache/sbx-kit".to_string(),
+                "--kit".to_string(),
+                "/cache/sbx-mixin-kits/abc123".to_string(),
+                "coyote".to_string(),
+                ".".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_create_args_orders_base_kit_then_mixins_then_credentials_kit() {
+        let kit = PathBuf::from("/cache/sbx-kit");
+        let credentials_kit = PathBuf::from("/cache/sbx-mixin-kits/abc123");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("coyote-mixin-cred-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mixins = vec![DiscoveredMixin {
+            path: dir.clone(),
+            label: "user".into(),
+            install_count: 0,
+            domain_count: 0,
+        }];
+
+        let args = build_create_args("box", &kit, &mixins, Some(&credentials_kit)).unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "create".to_string(),
+                "--name".to_string(),
+                "box".to_string(),
+                "--kit".to_string(),
+                "/cache/sbx-kit".to_string(),
+                "--kit".to_string(),
+                dir.display().to_string(),
+                "--kit".to_string(),
+                "/cache/sbx-mixin-kits/abc123".to_string(),
+                "coyote".to_string(),
+                ".".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_to_sbx_service_maps_gemini_family_to_gemini() {
+        assert_eq!(provider_to_sbx_service("gemini", None), "gemini");
+        assert_eq!(provider_to_sbx_service("vertexai", None), "gemini");
+    }
+
+    #[test]
+    fn provider_to_sbx_service_maps_known_providers() {
+        assert_eq!(provider_to_sbx_service("claude", None), "anthropic");
+        assert_eq!(provider_to_sbx_service("openai", None), "openai");
     }
 }

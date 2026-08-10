@@ -1,11 +1,38 @@
-schemaVersion: '1'
+schemaVersion: '2'
 kind: mixin
 name: sisyphus-ddg
 description: >
-  Allows Sisyphus to hit all domains since it utilizes the DuckDuckGo
-  MCP server. This allows the MCP server to actually perform web searches
-  on arbitrary domains and retrieve info for the agent.
+  Allows Sisyphus to reach DuckDuckGo plus a curated set of common
+  content domains for its web-search MCP server. Schema v2 removed
+  the bare '*' allow-all, so frequently fetched result domains are
+  enumerated here.
 
-network:
-  allowedDomains:
-    - '*'
+agentInstructions:
+  content: |
+    Web search runs against an enumerated network allow list. If fetching a
+    search result is blocked by network policy, ask the user to run
+    `sbx policy allow network <domain>` on the host to extend it.
+
+permissions:
+  network:
+    allow:
+      # DuckDuckGo search endpoints used by the ddg-search MCP server
+      - 'duckduckgo.com'
+      - 'html.duckduckgo.com'
+      - 'lite.duckduckgo.com'
+      # Common content/result domains fetched from search results
+      # ('*.host' matches exactly one label and not the bare host itself)
+      - '*.wikipedia.org'
+      - 'github.com'
+      - '*.githubusercontent.com'
+      - 'stackoverflow.com'
+      - '*.stackexchange.com'
+      - 'developer.mozilla.org'
+      - 'docs.python.org'
+      - 'doc.rust-lang.org'
+      - 'docs.rs'
+      - 'crates.io'
+      - 'pypi.org'
+      - 'www.npmjs.com'
+      # Jina reader fallback for fetching arbitrary pages as markdown
+      - 'r.jina.ai'
