@@ -146,11 +146,18 @@ impl Agent {
         let rag = if rag_path.exists() {
             let key = RagKey::Agent(name.to_string());
             let app_clone = app.clone();
+            let vault_clone = app_state.vault.clone();
             let rag_path_clone = rag_path.clone();
             let rag = app_state
                 .rag_cache
                 .load_with(key, || async move {
-                    Rag::load(&app_clone, DEFAULT_AGENT_NAME, &rag_path_clone)
+                    Rag::load_async(
+                        &app_clone,
+                        &vault_clone,
+                        DEFAULT_AGENT_NAME,
+                        &rag_path_clone,
+                    )
+                    .await
                 })
                 .await?;
             Some(rag)
@@ -972,12 +979,13 @@ async fn init_graph_rags(
         };
         let rag = if rag_path.exists() {
             let app_clone = app.clone();
+            let vault_clone = app_state.vault.clone();
             let path_clone = rag_path.clone();
             let name_clone = node_id.clone();
             app_state
                 .rag_cache
                 .load_with(key, || async move {
-                    Rag::load(&app_clone, &name_clone, &path_clone)
+                    Rag::load_async(&app_clone, &vault_clone, &name_clone, &path_clone).await
                 })
                 .await?
         } else {

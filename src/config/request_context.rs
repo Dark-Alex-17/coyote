@@ -4122,6 +4122,9 @@ impl RequestContext {
         }
 
         let app = self.app.config.clone();
+        // Hoisted: `rag_cache` below borrows `self`, so the loader closure cannot
+        // reach through `self` for the vault. `GlobalVault` is an Arc, so this is cheap.
+        let vault = self.app.vault.clone();
         let rag_cache = self.rag_cache();
         let working_mode = self.working_mode;
 
@@ -4158,6 +4161,7 @@ impl RequestContext {
                 let loaded = rag_cache
                     .load_with(key.clone(), || {
                         let app = app.clone();
+                        let vault = vault.clone();
                         let rag_path = rag_path.clone();
                         let abort_signal = abort_signal.clone();
                         async move {
@@ -4168,7 +4172,7 @@ impl RequestContext {
                                 Rag::init(&app, name, &rag_path, &[], abort_signal.clone(), true)
                                     .await
                             } else {
-                                Rag::load(&app, name, &rag_path)
+                                Rag::load_async(&app, &vault, name, &rag_path).await
                             }
                         }
                     })
@@ -4178,6 +4182,30 @@ impl RequestContext {
         };
         self.rag = Some(rag);
         self.rag_key = rag_key;
+        Ok(())
+    }
+
+    pub async fn attach_rag(&mut self, name: &str) -> Result<()> {
+        let rag_path = self.rag_file(name);
+        if rag_path.exists() {
+            bail!(
+                "RAG '{name}' already exists at '{}'. \
+                 Use a different name, or delete the existing file first.",
+                rag_path.display()
+            );
+        }
+        let app = self.app.config.as_ref();
+        let vault = self.app.vault.clone();
+        let rag = Rag::attach(app, &vault, name, &rag_path).await?;
+        let rag = Arc::new(rag);
+        // Populate the cache so a later `.rag <name>` reuses this instance rather
+        // than re-running the network preflight. Attach is always a global RAG.
+        let key = RagKey::Named(name.to_string());
+        self.rag_cache().insert(key.clone(), &rag);
+        self.rag = Some(rag);
+        // Carried so invalidation in rebuild_rag()/edit_rag_docs() can find this
+        // entry; without it a stale Arc would linger in the cache all session.
+        self.rag_key = Some(key);
         Ok(())
     }
 

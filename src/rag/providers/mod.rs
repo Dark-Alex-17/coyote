@@ -11,3 +11,6 @@ pub use self::duckdb::DuckDbProvider;
 // in providers/duckdb.rs, and the re-export must be `pub(crate)` too — a `pub use` of
 // a `pub(crate)` item is E0364/E0365.
 pub(crate) use self::duckdb::duckdb_path_from_yaml;
+
+mod qdrant;
+pub use self::qdrant::QdrantProvider;

@@ -53,7 +53,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 59]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 60]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -215,6 +215,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 59]> = LazyLock::new(|| {
         ReplCommand::new(
             ".rag",
             "Initialize or access RAG",
+            AssertState::False(StateFlags::AGENT),
+        ),
+        ReplCommand::new(
+            ".rag attach",
+            "Attach to a pre-existing external RAG (Qdrant)",
             AssertState::False(StateFlags::AGENT),
         ),
         ReplCommand::new(
@@ -885,7 +890,20 @@ pub async fn run_repl_command(
                 task::spawn_blocking(move || config::run_self_update(version, false)).await??;
             }
             ".rag" => {
-                ctx.use_rag(args, abort_signal.clone()).await?;
+                // `split_first_arg` rather than `starts_with("attach ")`: the latter
+                // misses a bare `.rag attach`, which would silently create a RAG
+                // literally named "attach".
+                match split_first_arg(args) {
+                    Some(("attach", rest)) => match rest {
+                        Some(name) if !name.trim().is_empty() => {
+                            ctx.attach_rag(name.trim()).await?;
+                        }
+                        _ => println!("Usage: .rag attach <name>"),
+                    },
+                    _ => {
+                        ctx.use_rag(args, abort_signal.clone()).await?;
+                    }
+                }
             }
             ".agent" => match split_first_arg(args) {
                 Some((agent_name, args)) => {
@@ -1711,8 +1729,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_59_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 59);
+    fn repl_commands_has_60_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 60);
     }
 
     #[test]

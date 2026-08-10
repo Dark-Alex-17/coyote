@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::config::paths;
 
 const SBX_MIXIN_FILE_NAME: &str = "sbx-mixin.yaml";
+const SBX_MIXIN_FILE_SUFFIX: &str = ".sbx-mixin.yaml";
 const KIT_SPEC_FILE_NAME: &str = "spec.yaml";
 
 #[derive(Debug, Clone)]
@@ -70,6 +71,13 @@ pub fn discover() -> Result<Vec<DiscoveredMixin>> {
         out.push(read_mixin(path)?);
     }
     for path in collect_subdir_mixins(&paths::agents_data_dir()) {
+        out.push(read_mixin(path)?);
+    }
+    // RAG sidecars are FLAT files named `<rag>.sbx-mixin.yaml` inside rags/, not
+    // the `<subdir>/sbx-mixin.yaml` shape the two scans above walk. Loaded
+    // unconditionally, mirroring agents/*: a RAG mixin only adds an outbound
+    // allowlist entry for that RAG's host and opens no inbound rules.
+    for path in collect_flat_mixins(&paths::rags_dir()) {
         out.push(read_mixin(path)?);
     }
 
@@ -168,6 +176,30 @@ fn collect_subdir_mixins(dir: &Path) -> Vec<PathBuf> {
         if candidate.exists() {
             result.push(candidate);
         }
+    }
+
+    result
+}
+
+/// Mixins stored as flat `<name>.sbx-mixin.yaml` files directly inside `dir`,
+/// matched by suffix rather than by exact filename.
+fn collect_flat_mixins(dir: &Path) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    let Ok(rd) = read_dir(dir) else { return result };
+
+    let mut entries: Vec<_> = rd
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(SBX_MIXIN_FILE_SUFFIX))
+        })
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        result.push(entry.path());
     }
 
     result
@@ -438,5 +470,55 @@ network:
                 "kit_path should not return the original file path"
             );
         }
+    }
+
+    /// RAG sidecars are flat `<name>.sbx-mixin.yaml` files, matched by SUFFIX.
+    #[test]
+    fn collect_flat_mixins_matches_rag_sidecars_by_suffix() {
+        let root = unique_root("flat-mixins");
+        fs::write(root.join("company-docs.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
+        fs::write(root.join("alpha.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
+        // The RAGs themselves must not be picked up, only their sidecars.
+        fs::write(root.join("company-docs.yaml"), "driver: qdrant\n").unwrap();
+        fs::write(root.join("notes.yaml"), "driver: yaml\n").unwrap();
+        // A directory whose name ends in the suffix is not a mixin file.
+        fs::create_dir_all(root.join("decoy.sbx-mixin.yaml")).unwrap();
+
+        let found = collect_flat_mixins(&root);
+        let names: Vec<_> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        // Sorted by file name, so the order is deterministic.
+        assert_eq!(
+            names,
+            vec!["alpha.sbx-mixin.yaml", "company-docs.sbx-mixin.yaml"]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Why `collect_flat_mixins` had to be written: the existing collector walks
+    /// SUBDIRECTORIES for a file named exactly `sbx-mixin.yaml`, so it cannot see
+    /// a flat sidecar. If this ever starts finding them, the new collector is
+    /// redundant — but until then, removing it silently drops every RAG mixin.
+    #[test]
+    fn collect_subdir_mixins_cannot_see_flat_rag_sidecars() {
+        let root = unique_root("flat-vs-subdir");
+        fs::write(root.join("company-docs.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
+
+        assert!(collect_subdir_mixins(&root).is_empty());
+        assert_eq!(collect_flat_mixins(&root).len(), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_flat_mixins_tolerates_a_missing_directory() {
+        let root = unique_root("flat-missing");
+        let absent = root.join("nope");
+        assert!(collect_flat_mixins(&absent).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

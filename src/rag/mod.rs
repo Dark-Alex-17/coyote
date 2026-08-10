@@ -15,7 +15,8 @@ use self::provider::RagProvider;
 // `providers::duckdb_path_from_yaml(path)` is called through the module path in
 // `create()`, so `providers` itself must stay in scope — do not collapse it into
 // the `use` below.
-use self::providers::{DuckDbProvider, YamlProvider};
+use self::providers::{DuckDbProvider, QdrantProvider, YamlProvider};
+use crate::vault::{Vault, interpolate_secrets};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bm25::{Language, SearchEngine, SearchEngineBuilder};
@@ -348,6 +349,232 @@ impl Rag {
         Self::create(app, name, path, data)
     }
 
+    /// Loads a RAG from a YAML file. External drivers need an async constructor
+    /// because building their provider performs a network preflight.
+    pub async fn load_async(
+        app: &AppConfig,
+        vault: &Vault,
+        name: &str,
+        path: &Path,
+    ) -> Result<Self> {
+        let err = || format!("Failed to load rag '{name}' at '{}'", path.display());
+        let raw_content = fs::read_to_string(path).with_context(err)?;
+
+        // Parsed WITHOUT secret interpolation, so `driver_config` keeps its
+        // `{{...}}` placeholders. Interpolating here would bake the resolved API
+        // key into `self.data`, which `save()` then writes back to disk in
+        // plaintext.
+        let data: RagData = serde_yaml::from_str(&raw_content).with_context(err)?;
+
+        // Validated before the match so the rule applies to every driver, including
+        // the sync fallthrough below.
+        data.validate().with_context(err)?;
+
+        match data.driver.as_str() {
+            "qdrant" => {
+                let host = data
+                    .driver_config
+                    .get("host")
+                    .context("qdrant driver requires 'host' in driver_config")?
+                    .clone();
+                let collection = data
+                    .driver_config
+                    .get("collection")
+                    .context("qdrant driver requires 'collection' in driver_config")?
+                    .clone();
+
+                // Resolved out of band and kept in a local; it never enters `data`.
+                let api_key: Option<String> = match data.driver_config.get("api_key") {
+                    Some(placeholder) => {
+                        let (resolved, _) =
+                            interpolate_secrets(placeholder, vault).with_context(|| {
+                                format!("Failed to resolve api_key secret for RAG '{name}'")
+                            })?;
+                        Some(resolved)
+                    }
+                    None => None,
+                };
+
+                let provider = QdrantProvider::new(&host, &collection, api_key.as_deref()).await?;
+                let embedding_model =
+                    Model::retrieve_model(app, &data.embedding_model, ModelType::Embedding)?;
+                Ok(Rag {
+                    app_config: Arc::new(app.clone()),
+                    name: name.to_string(),
+                    path: path.display().to_string(),
+                    embedding_model,
+                    bm25: data.build_bm25(),
+                    provider: Box::new(provider),
+                    node_to_docs: data.knowledge_graph.build_node_to_docs(),
+                    data,
+                    last_sources: RwLock::new(None),
+                })
+            }
+            // yaml/duckdb take the sync path. It re-reads and re-parses the file;
+            // that cost is accepted to keep every existing caller untouched.
+            _ => Self::load(app, name, path),
+        }
+    }
+
+    /// Connects to a pre-existing external collection. Coyote is a query-only
+    /// client here: it never indexes documents into it.
+    pub async fn attach(
+        app: &AppConfig,
+        vault: &Vault,
+        name: &str,
+        save_path: &Path,
+    ) -> Result<Self> {
+        if !*IS_STDOUT_TERMINAL {
+            bail!("Cannot run attach wizard in non-interactive mode");
+        }
+        println!("⚙ Attaching to external RAG...");
+
+        let driver = Select::new("Select driver:", vec!["qdrant"]).prompt()?;
+
+        let host = Text::new("Host (e.g. qdrant.company.com:6333):")
+            .with_validator(required!("This field is required"))
+            .with_validator(|input: &str| {
+                // Bracketed IPv6 literals would produce a malformed sandbox
+                // allowedDomains entry, so refuse them at the prompt.
+                Ok(if input.contains('[') || input.contains(']') {
+                    Validation::Invalid(
+                        "Bracketed IPv6 literals are not supported; use a hostname.".into(),
+                    )
+                } else {
+                    Validation::Valid
+                })
+            })
+            .prompt()?;
+
+        let api_key_entry: Option<(String, String)> = {
+            let needs_key = Confirm::new("Does this instance require an API key?")
+                .with_default(true)
+                .prompt()?;
+            if needs_key {
+                let secret_name = Text::new("Vault secret name for API key:")
+                    .with_default("QDRANT_API_KEY")
+                    .with_validator(required!("This field is required"))
+                    .prompt()?;
+                let resolved = vault.get_secret(&secret_name, false).with_context(|| {
+                    format!(
+                        "Secret '{secret_name}' not found in vault. \
+                         Run `coyote --add-secret {secret_name}` first."
+                    )
+                })?;
+                Some((secret_name, resolved))
+            } else {
+                None
+            }
+        };
+
+        println!("⚙ Connecting to {host}...");
+        let api_key = api_key_entry.as_ref().map(|(_, v)| v.as_str());
+        let collections = QdrantProvider::list_collections(&host, api_key)
+            .await
+            .with_context(|| format!("Failed to connect to {host}. Check host and API key."))?;
+
+        if collections.is_empty() {
+            bail!("No collections found in this Qdrant instance");
+        }
+        println!(
+            "✓ Connected. {} collection(s) available.",
+            collections.len()
+        );
+
+        let collection = Select::new("Select collection:", collections).prompt()?;
+
+        // Point IDs are read with `as_u64()`, which yields None for a JSON string.
+        // A UUID-keyed collection would therefore return zero hits with no error,
+        // so refuse it here instead of attaching something silently broken.
+        if let Some(raw_id) = QdrantProvider::sample_point_id(&host, &collection, api_key).await?
+            && raw_id.starts_with('"')
+        {
+            bail!(
+                "Collection '{collection}' uses string (UUID) point IDs. \
+                 Coyote requires integer point IDs. Rebuild the collection with integer IDs \
+                 (e.g. LangChain: pass ids=list(range(len(docs))) to add_documents())."
+            );
+        }
+        println!("ℹ  This collection must store document text in a 'page_content' payload field.");
+
+        let dim = QdrantProvider::get_vector_dimension(&host, &collection, api_key)
+            .await
+            .unwrap_or(0);
+        // Queries send a single unnamed vector, which a named/multi-vector
+        // collection rejects with HTTP 400 every time. Checked separately from
+        // `dim` because `dim == 0` also means "the request failed".
+        if QdrantProvider::is_multi_vector(&host, &collection, api_key).await? {
+            bail!(
+                "Collection '{collection}' uses named (multi-vector) configuration. \
+                 Coyote queries with a single unnamed vector and would fail with HTTP 400 \
+                 on every request. Attach a single-vector collection instead."
+            );
+        }
+        if dim > 0 {
+            let candidates = embedding_model_candidates_for_dimension(dim);
+            if !candidates.is_empty() {
+                println!(
+                    "Collection uses {dim}-dim vectors. Likely models: {}",
+                    candidates.join(", ")
+                );
+            }
+        }
+        println!(
+            "⚠️  If the embedding model doesn't match what built this collection, \
+             queries will return bad results."
+        );
+        let models = list_models(app, ModelType::Embedding);
+        if models.is_empty() {
+            bail!("No available embedding model");
+        }
+        let embedding_model_id = select_embedding_model(&models)?;
+
+        let mut driver_config = IndexMap::new();
+        driver_config.insert("host".to_string(), host.clone());
+        driver_config.insert("collection".to_string(), collection.clone());
+        if let Some((secret_name, _)) = &api_key_entry {
+            driver_config.insert("api_key".to_string(), format!("{{{{{secret_name}}}}}"));
+        }
+
+        let data = RagData {
+            driver: driver.to_string(),
+            attached: true,
+            driver_config,
+            embedding_model: embedding_model_id,
+            chunk_size: app.rag_chunk_size.unwrap_or(1024),
+            chunk_overlap: app.rag_chunk_overlap.unwrap_or(50),
+            // A top_k of 0 makes every query return nothing.
+            top_k: app.rag_top_k.max(1),
+            ..RagData::default()
+        };
+        data.validate()?;
+
+        let embedding_model =
+            Model::retrieve_model(app, &data.embedding_model, ModelType::Embedding)?;
+        let provider = QdrantProvider::new(&host, &collection, api_key).await?;
+        let rag = Rag {
+            app_config: Arc::new(app.clone()),
+            name: name.to_string(),
+            path: save_path.display().to_string(),
+            embedding_model,
+            // Both empty: an attached RAG holds no local text and no local graph.
+            bm25: data.build_bm25(),
+            node_to_docs: IndexMap::new(),
+            provider: Box::new(provider),
+            data,
+            last_sources: RwLock::new(None),
+        };
+
+        rag.save()?;
+        println!("✓ Attached '{name}' → collection '{collection}' on {host}.");
+
+        let env_var = rag_env_var_name(name);
+        let (header_name, value_format) = driver_auth_header(driver);
+        generate_rag_sbx_mixin(save_path, &host, name, &env_var, header_name, value_format)?;
+
+        Ok(rag)
+    }
+
     /// `mut data` — the duckdb arm rehydrates `data.vectors` from the sidecar.
     pub fn create(app: &AppConfig, name: &str, path: &Path, mut data: RagData) -> Result<Self> {
         // Deliberately does NOT call rebuild_indexes: both callers construct the Rag
@@ -491,6 +718,13 @@ impl Rag {
     }
 
     pub fn set_last_sources(&self, ids: &[DocumentId]) {
+        if self.data.attached {
+            // `data.files` is empty for an attached RAG; the local index is not the
+            // source of truth. A static label is honest, an empty list is not.
+            *self.last_sources.write() =
+                Some("[attached RAG — source list unavailable]".to_string());
+            return;
+        }
         let mut sources: IndexMap<String, Vec<String>> = IndexMap::new();
         for id in ids {
             let (file_index, _) = id.split();
@@ -665,6 +899,9 @@ impl Rag {
     }
 
     fn resolve_source(&self, id: &DocumentId) -> String {
+        if self.data.attached {
+            return self.data.attached_source_label();
+        }
         let (file_index, _) = id.split();
         self.data
             .files
@@ -674,6 +911,9 @@ impl Rag {
     }
 
     fn format_sources(&self, ids: &[DocumentId]) -> String {
+        if self.data.attached {
+            return format!("- {}", self.data.attached_source_label());
+        }
         let mut seen = IndexSet::new();
         for id in ids {
             let (file_index, _) = id.split();
@@ -1231,6 +1471,11 @@ pub struct RagData {
     pub driver: String,
     #[serde(default)]
     pub attached: bool,
+    /// Driver-specific connection parameters (qdrant: `host`, `collection`, `api_key`).
+    /// Secret-bearing values are stored as `{{SECRET_NAME}}` placeholders and resolved
+    /// out of band at load time, so a resolved credential never reaches disk.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub driver_config: IndexMap<String, String>,
 
     pub embedding_model: String,
     #[serde(default)]
@@ -1268,6 +1513,7 @@ impl Debug for RagData {
         f.debug_struct("RagData")
             .field("driver", &self.driver)
             .field("attached", &self.attached)
+            .field("driver_config", &self.driver_config)
             .field("embedding_model", &self.embedding_model)
             .field("chunk_size", &self.chunk_size)
             .field("chunk_overlap", &self.chunk_overlap)
@@ -1297,6 +1543,7 @@ impl RagData {
         Self {
             driver: "yaml".to_string(),
             attached: false,
+            driver_config: Default::default(),
             embedding_model,
             chunk_size,
             chunk_overlap,
@@ -1316,6 +1563,15 @@ impl RagData {
 
     fn default_driver() -> String {
         "yaml".to_string()
+    }
+
+    /// Citation label for an attached RAG. Its documents live in a remote
+    /// collection, so there is no local file path to cite.
+    fn attached_source_label(&self) -> String {
+        match self.driver_config.get("collection") {
+            Some(collection) => format!("[external collection: {collection}]"),
+            None => "[external collection]".to_string(),
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -1494,6 +1750,131 @@ impl DocumentId {
         let low = value & low_mask;
         let high = value >> (usize::BITS / 2);
         (high, low)
+    }
+}
+
+/// Writes the per-RAG sandbox sidecar that whitelists the external host and tells
+/// the sbx proxy which header to rewrite with the stored credential.
+///
+/// Two details are load-bearing and fail silently if guessed:
+///   1. The schema envelope is mandatory. `wrap_mixin_as_kit` copies this file
+///      byte-for-byte to `spec.yaml` inside a kit dir handed to `sbx create --kit`,
+///      with no `kind` rewrite — so an envelope-less file can break the launch
+///      itself, not merely this RAG's traffic.
+///   2. `allowedDomains` entries carry a port; `serviceDomains` keys are bare
+///      hostnames. The asymmetry is deliberate.
+fn generate_rag_sbx_mixin(
+    rag_yaml_path: &Path,
+    host: &str,
+    service_name: &str,
+    env_var: &str,
+    header_name: &str,
+    value_format: &str,
+) -> Result<()> {
+    let (bare_host, allowed_domain) = sbx_domain_forms(host);
+    let mixin_path = rag_yaml_path.with_extension("sbx-mixin.yaml");
+    let content = format!(
+        r#"schemaVersion: "1"
+kind: mixin
+name: rag-{service_name}
+description: >
+  Auto-generated by the Coyote attach wizard for RAG '{service_name}'. Allows
+  outbound traffic to its external vector store and tells the sbx proxy which
+  header to rewrite with the stored credential. Do not edit manually.
+
+network:
+  allowedDomains:
+    - "{allowed_domain}"
+  serviceDomains:
+    {bare_host}: {service_name}
+  serviceAuth:
+    {service_name}:
+      headerName: {header_name}
+      valueFormat: "{value_format}"
+
+credentials:
+  sources:
+    {service_name}:
+      env:
+        - {env_var}
+
+environment:
+  proxyManaged:
+    - {env_var}
+"#
+    );
+    fs::write(&mixin_path, &content).with_context(|| {
+        format!(
+            "Failed to write sandbox mixin to '{}'",
+            mixin_path.display()
+        )
+    })?;
+    println!("✓ Sandbox mixin: '{}'.", mixin_path.display());
+    Ok(())
+}
+
+/// Splits a user-supplied host into the two forms sbx needs:
+/// `(bare_host, allowed_domain)`.
+///
+/// `bare_host` is the `serviceDomains` KEY — hostname only, no scheme, no port.
+/// `allowed_domain` is an `allowedDomains` ENTRY — always `host:port`.
+///
+/// The rule: emit the host verbatim when it already carries a numeric port,
+/// otherwise append the default for the scheme. Stripping the port fails
+/// silently — the sandbox just denies the connection, with no compile or test
+/// signal. Defaults match `normalize_base_url`, which assumes `http://` when no
+/// scheme is given: plain host → 6333, explicit `https://` → 443.
+fn sbx_domain_forms(host: &str) -> (String, String) {
+    let is_https = host.starts_with("https://");
+    let hostport = host
+        .strip_prefix("https://")
+        .or_else(|| host.strip_prefix("http://"))
+        .unwrap_or(host)
+        .trim_end_matches('/')
+        // A trailing ':' with no digits is a typo, not a port. Trim it so the
+        // default-port arm cannot emit "host::6333".
+        .trim_end_matches(':');
+    match hostport.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+            (h.to_string(), hostport.to_string())
+        }
+        _ => {
+            let port = if is_https { 443 } else { 6333 };
+            (hostport.to_string(), format!("{hostport}:{port}"))
+        }
+    }
+}
+
+/// Derives a deterministic env var name from a RAG name:
+/// `company-docs` → `COMPANY_DOCS_API_KEY`.
+fn rag_env_var_name(rag_name: &str) -> String {
+    format!(
+        "{}_API_KEY",
+        rag_name.to_uppercase().replace(['-', ' '], "_")
+    )
+}
+
+/// How a driver authenticates its HTTP requests. Qdrant uses a bare `api-key`
+/// header rather than `Authorization: Bearer`.
+fn driver_auth_header(driver: &str) -> (&'static str, &'static str) {
+    match driver {
+        "qdrant" => ("api-key", "%s"),
+        _ => ("Authorization", "Bearer %s"),
+    }
+}
+
+/// Embedding models known to produce a given vector dimension, used to hint the
+/// user toward a model compatible with the collection they just picked.
+fn embedding_model_candidates_for_dimension(dim: u64) -> Vec<&'static str> {
+    match dim {
+        1536 => vec!["text-embedding-3-small", "text-embedding-ada-002"],
+        3072 => vec!["text-embedding-3-large"],
+        768 => vec!["nomic-embed-text", "all-minilm-l6-v2"],
+        1024 => vec![
+            "text-embedding-3-small (matryoshka-1024)",
+            "jina-embeddings-v2-base",
+        ],
+        _ => vec![],
     }
 }
 
@@ -1769,6 +2150,221 @@ fn embedding_dim_for_model(model_id: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scratch directory for tests that must write a real file.
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!("coyote-rag-{tag}-{unique}"));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn attached_ragdata_serializes_driver_and_attached() {
+        let mut data = RagData {
+            driver: "qdrant".to_string(),
+            attached: true,
+            embedding_model: "text-embedding-3-small".to_string(),
+            top_k: 5,
+            ..Default::default()
+        };
+        data.driver_config
+            .insert("host".into(), "localhost:6333".into());
+        data.driver_config.insert("collection".into(), "c".into());
+        data.driver_config
+            .insert("api_key".into(), "{{QDRANT_API_KEY}}".into());
+        data.validate().unwrap();
+        let yaml = serde_yaml::to_string(&data).unwrap();
+        assert!(yaml.contains("attached: true"));
+        assert!(yaml.contains("driver: qdrant"));
+        // The placeholder is what reaches disk — never a resolved secret.
+        assert!(yaml.contains("{{QDRANT_API_KEY}}"));
+    }
+
+    /// A qdrant RAG's vectors MUST survive serialization.
+    ///
+    /// `save()` omits vectors only for `driver == "duckdb"`. Qdrant must not join
+    /// that guard: Cosine collections L2-normalize on write, so the YAML copy is
+    /// the only place the unnormalized originals survive. This fails loudly the
+    /// day someone "tidies" the guard into `matches!(driver, "duckdb" | "qdrant")`.
+    #[test]
+    fn save_round_trips_qdrant_vectors_intact() {
+        let mut data = RagData {
+            driver: "qdrant".to_string(),
+            attached: true,
+            embedding_model: "text-embedding-3-small".to_string(),
+            top_k: 5,
+            ..Default::default()
+        };
+        // Deliberately NOT unit-length: magnitude 5, so any normalization is visible.
+        data.vectors.insert(DocumentId(0), vec![3.0, 0.0, 0.0, 4.0]);
+        let yaml = serde_yaml::to_string(&data).unwrap();
+        assert!(
+            yaml.contains("vectors:"),
+            "qdrant vectors must be serialized, not omitted"
+        );
+        let back: RagData = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            back.vectors.get(&DocumentId(0)),
+            Some(&vec![3.0, 0.0, 0.0, 4.0]),
+            "magnitudes must survive — Qdrant normalizes, the YAML copy must not"
+        );
+    }
+
+    /// `allowedDomains` entries are host:PORT; `serviceDomains` keys are bare
+    /// hostnames. Stripping the port breaks sandbox whitelisting silently — no
+    /// compile error, no runtime error on the host, just a denied connection
+    /// inside the sandbox. This test is the only signal.
+    #[test]
+    fn sbx_domain_forms_keeps_explicit_ports_and_defaults_the_rest() {
+        assert_eq!(
+            sbx_domain_forms("rag.example.com:6333"),
+            ("rag.example.com".into(), "rag.example.com:6333".into())
+        );
+        // A non-default explicit port must survive.
+        assert_eq!(
+            sbx_domain_forms("rag.example.com:7777").1,
+            "rag.example.com:7777"
+        );
+        // Bare host → Qdrant's REST default, matching normalize_base_url.
+        assert_eq!(
+            sbx_domain_forms("rag.example.com"),
+            ("rag.example.com".into(), "rag.example.com:6333".into())
+        );
+        // The scheme is stripped; http keeps 6333.
+        assert_eq!(
+            sbx_domain_forms("http://localhost:6333").1,
+            "localhost:6333"
+        );
+        // https with no port → 443 (the Qdrant Cloud shape).
+        assert_eq!(
+            sbx_domain_forms("https://xyz.cloud.qdrant.io"),
+            (
+                "xyz.cloud.qdrant.io".into(),
+                "xyz.cloud.qdrant.io:443".into()
+            )
+        );
+        // A dangling colon is a typo, not a port: trimmed, then defaulted.
+        assert_eq!(
+            sbx_domain_forms("rag.example.com:").1,
+            "rag.example.com:6333"
+        );
+    }
+
+    /// The generated mixin must carry the schema envelope: `wrap_mixin_as_kit`
+    /// copies it verbatim to `spec.yaml` for `sbx create --kit`, with no `kind`
+    /// rewrite, so an envelope-less file can break the launch itself.
+    #[test]
+    fn generated_sbx_mixin_carries_the_schema_envelope() {
+        let dir = TempDir::new("mixin");
+        let yaml_path = dir.path.join("company-docs.yaml");
+        generate_rag_sbx_mixin(
+            &yaml_path,
+            "rag.example.com",
+            "company-docs",
+            "COMPANY_DOCS_API_KEY",
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+        let text = fs::read_to_string(dir.path.join("company-docs.sbx-mixin.yaml")).unwrap();
+
+        assert!(
+            text.starts_with("schemaVersion:"),
+            "envelope must come first:\n{text}"
+        );
+        assert!(
+            text.contains("kind: mixin"),
+            "kind must be `mixin`, not `sandbox`"
+        );
+        assert!(text.contains("name: rag-company-docs"));
+        assert!(text.contains("description:"));
+
+        // It must parse as YAML at all — a broken format! escape is invisible otherwise.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(parsed["kind"].as_str(), Some("mixin"));
+        // The list entry carries the port; the map key does not.
+        assert_eq!(
+            parsed["network"]["allowedDomains"][0].as_str(),
+            Some("rag.example.com:6333")
+        );
+        assert_eq!(
+            parsed["network"]["serviceDomains"]["rag.example.com"].as_str(),
+            Some("company-docs")
+        );
+        // The proxy rewrites this header with the credential it holds.
+        assert_eq!(
+            parsed["network"]["serviceAuth"]["company-docs"]["headerName"].as_str(),
+            Some("api-key")
+        );
+        assert_eq!(
+            parsed["credentials"]["sources"]["company-docs"]["env"][0].as_str(),
+            Some("COMPANY_DOCS_API_KEY")
+        );
+        assert_eq!(
+            parsed["environment"]["proxyManaged"][0].as_str(),
+            Some("COMPANY_DOCS_API_KEY")
+        );
+    }
+
+    #[test]
+    fn rag_env_var_name_uppercases_and_underscores() {
+        assert_eq!(rag_env_var_name("company-docs"), "COMPANY_DOCS_API_KEY");
+        assert_eq!(rag_env_var_name("my rag"), "MY_RAG_API_KEY");
+        assert_eq!(rag_env_var_name("docs"), "DOCS_API_KEY");
+    }
+
+    #[test]
+    fn driver_auth_header_uses_a_bare_api_key_for_qdrant() {
+        // Qdrant's REST API reads `api-key`, NOT `Authorization: Bearer`.
+        assert_eq!(driver_auth_header("qdrant"), ("api-key", "%s"));
+        assert_eq!(
+            driver_auth_header("something-else"),
+            ("Authorization", "Bearer %s")
+        );
+    }
+
+    /// An attached RAG has no local `files`, so the citation helpers would
+    /// otherwise emit "unknown" and an empty source list for every result.
+    #[test]
+    fn attached_rag_citation_helpers_do_not_fall_back_to_the_empty_file_index() {
+        let mut data = RagData {
+            driver: "qdrant".to_string(),
+            attached: true,
+            embedding_model: "text-embedding-3-small".to_string(),
+            top_k: 5,
+            ..Default::default()
+        };
+        data.driver_config
+            .insert("collection".into(), "company-kb".into());
+        assert!(data.files.is_empty());
+
+        // The real helper — `resolve_source`/`format_sources` both delegate here.
+        assert_eq!(
+            data.attached_source_label(),
+            "[external collection: company-kb]"
+        );
+
+        // Degrades to a generic label rather than "unknown" when the collection
+        // name is absent.
+        data.driver_config.shift_remove("collection");
+        assert_eq!(data.attached_source_label(), "[external collection]");
+    }
 
     #[test]
     fn embedding_dim_for_model_maps_known_models() {

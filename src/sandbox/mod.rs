@@ -16,6 +16,7 @@ use crate::config::AppConfig;
 use crate::config::Config;
 use crate::config::VAULT_DATA_FILE_NAME;
 use crate::config::paths;
+use crate::rag::RagData;
 use crate::sandbox::mixins::DiscoveredMixin;
 use crate::utils::run_command_with_output;
 use crate::vault::SECRET_RE;
@@ -51,6 +52,7 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
     inject_llm_secret(&config_content, &vault, &registered)?;
     if !fresh {
         inject_mcp_secrets(&vault, &registered)?;
+        inject_rag_secrets(&vault, &registered)?;
     }
 
     let discovered = mixins::discover()?;
@@ -298,6 +300,65 @@ fn inject_mcp_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
         sbx_secret_set(server_name, &secret_value)?;
     }
 
+    Ok(())
+}
+
+/// Registers the API key of every attached RAG with the sbx proxy.
+///
+/// `launch()` has no notion of an active RAG — that is runtime state set by
+/// `--rag` / `.rag` and never persisted — so every attached RAG is scanned
+/// unconditionally, exactly as `inject_mcp_secrets` does for MCP servers.
+fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()> {
+    let rags_dir = paths::rags_dir();
+    if !rags_dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&rags_dir)?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            // Skip sidecars ("myrag.sbx-mixin.yaml" has stem "myrag.sbx-mixin").
+            Some(s) if !paths::is_rag_sidecar_name(s) => s.to_string(),
+            _ => continue,
+        };
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(data) = serde_yaml::from_str::<RagData>(&raw) else {
+            continue;
+        };
+        if !data.attached {
+            continue;
+        }
+        let Some(placeholder) = data.driver_config.get("api_key") else {
+            continue;
+        };
+        if registered.contains(&stem) {
+            continue;
+        }
+        let secret_name = placeholder
+            .trim_start_matches("{{")
+            .trim_end_matches("}}")
+            .trim();
+        // Degrade rather than abort: one stale RAG key must not block the whole
+        // sandbox launch. Queries to that RAG fail with a 401 at runtime, which
+        // is recoverable without a restart.
+        match vault.get_secret(secret_name, false) {
+            Ok(secret_value) => {
+                sbx_secret_set(&stem, &secret_value)
+                    .context("Failed to register RAG secret with sbx")?;
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not load secret '{secret_name}' for RAG '{stem}': {e}. \
+                     Queries to this RAG will fail inside the sandbox. \
+                     Run `coyote --add-secret {secret_name}` to fix."
+                );
+            }
+        }
+    }
     Ok(())
 }
 
