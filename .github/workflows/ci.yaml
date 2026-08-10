@@ -36,11 +36,24 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
 
+    # The extension directory is DuckDB-version-specific (v<x.y.z>/<platform>/), so the
+    # key is derived from Cargo.lock, which pins the duckdb crate. A hardcoded version in
+    # the key would keep hitting after a crate bump and, because an exact hit skips the
+    # save, the new extensions would be re-downloaded on every run and never cached.
     - name: Cache DuckDB Extensions
+      id: duckdb-extensions
       uses: actions/cache@v4
       with:
         path: ~/.duckdb/extensions
-        key: duckdb-ext-${{ matrix.os }}-v1.5.5
+        key: duckdb-ext-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+
+    # Populates the cache on a miss: opening a DuckDB store installs vss and fts when
+    # they are absent, and the post-job save then has something to store. Runs the
+    # DuckDB tests only, so a download failure is reported here rather than as a wall of
+    # unrelated-looking test failures.
+    - name: Install DuckDB Extensions
+      if: steps.duckdb-extensions.outputs.cache-hit != 'true'
+      run: cargo test --all duckdb
 
     - name: Test
       run: cargo test --all

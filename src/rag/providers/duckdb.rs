@@ -44,11 +44,12 @@ impl DuckDbProvider {
         // "Setting with name ... is not in the catalog, but it exists in the vss
         // extension". Omitting it entirely makes CREATE INDEX ... USING HNSW on a
         // file-backed database fail with "HNSW index persistence is not yet supported
-        // by default". LOAD vss -> LOAD fts -> SET -> CREATE INDEX.
+        // by default". ensure vss (installing it if missing) -> ensure fts -> SET ->
+        // CREATE INDEX.
+        Self::ensure_extension(&conn, "vss")?;
+        Self::ensure_extension(&conn, "fts")?;
         conn.execute_batch(&format!(
-            "LOAD vss;
-             LOAD fts;
-             SET hnsw_enable_experimental_persistence = true;
+            "SET hnsw_enable_experimental_persistence = true;
              CREATE TABLE IF NOT EXISTS vectors (
                  doc_id UBIGINT PRIMARY KEY,
                  embedding FLOAT[{dim}]
@@ -71,6 +72,29 @@ impl DuckDbProvider {
             dim,
             fts_ready: AtomicBool::new(fts_exists),
         })
+    }
+
+    /// Make a DuckDB extension available on `conn`, installing it if this machine does
+    /// not have it yet. `LOAD` is attempted first so an extension that is already
+    /// installed costs nothing and never touches the network; `INSTALL` is only reached
+    /// once, on a machine seeing the extension for the first time.
+    fn ensure_extension(conn: &Connection, name: &str) -> Result<()> {
+        if conn.execute_batch(&format!("LOAD {name};")).is_ok() {
+            return Ok(());
+        }
+        conn.execute_batch(&format!("INSTALL {name};"))
+            .with_context(|| {
+                format!(
+                    "Failed to install the DuckDB `{name}` extension. The duckdb RAG driver \
+                     needs it, and downloading it needs network access the first time. If this \
+                     machine is offline, connect once and retry, or run `INSTALL {name};` \
+                     yourself from a DuckDB shell."
+                )
+            })?;
+        conn.execute_batch(&format!("LOAD {name};"))
+            .with_context(|| {
+                format!("Failed to load the DuckDB `{name}` extension after installing it.")
+            })
     }
 
     /// Read all `(doc_id, embedding)` pairs so `create()` can hydrate `data.vectors`
