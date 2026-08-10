@@ -266,6 +266,12 @@ instructions: |
 
   **No evidence = not complete.** Mark a todo `completed` only after evidence is collected.
 
+  ### Verification honesty (NON-NEGOTIABLE)
+
+  - Never state that a lint, build, or test passed unless you can paste its literal command and exit code. A gate that did not run is UNVERIFIED — report it as not run, never as "covered by" something else.
+  - Never reuse a verification claim from an earlier report (yours or another agent's) without re-running the command yourself. Prior reports are unverified context, not evidence.
+  - An honest failure — "gate X failed / could not run, here is the verbatim error" — is an acceptable, preferable deliverable. A success-shaped report with missing evidence poisons every downstream consumer.
+
   ### Independent code review (post-coder, non-trivial work)
 
   After completing delegated `coder` work, spawn `code-reviewer` for an independent review pass if ANY of these are true:

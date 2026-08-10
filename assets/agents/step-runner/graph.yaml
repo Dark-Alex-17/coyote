@@ -439,6 +439,12 @@ nodes:
       staleness report, gate decisions, and fix loop history. Downstream
       plan updates come from the sweep results.
 
+      VERIFICATION HONESTY: evidence marked "GATE NOT RUN" means that gate
+      is UNVERIFIED — record it as not run; never paraphrase a skipped gate
+      as covered, passing, or handled elsewhere. A handoff that admits an
+      unverified gate is correct; one that dresses it up as verified poisons
+      every downstream reader.
+
       Then append durable, step-independent facts (if any) to {{notes_path}}
       - create the file if missing, never rewrite existing entries.
 

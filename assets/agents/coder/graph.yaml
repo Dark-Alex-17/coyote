@@ -227,6 +227,11 @@ nodes:
          on unfamiliar lints, etc.).
       4. No dead code, no commented-out blocks, no premature abstractions.
       5. End your turn when editing is done. The graph runs verification next.
+      6. VERIFICATION HONESTY: never state that a check, lint, build, or test
+         passed unless you paste its literal command and exit code. A gate
+         that did not run is UNVERIFIED — say so. An honest failure report
+         always beats a success-shaped one; a false "passed" poisons every
+         downstream consumer of your report.
 
       Project directory: {{project_dir}}
     prompt: |
@@ -248,7 +253,7 @@ nodes:
       - fs_write
       - fs_patch
       - execute_command
-    max_iterations: 30
+    max_iterations: 100
     state_updates:
       last_node_output: '{{output}}'
     fallback: end_failure
