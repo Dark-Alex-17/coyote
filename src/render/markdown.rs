@@ -1749,6 +1749,97 @@ std::error::Error>> {
         );
     }
 
+    /// Removes CSI escape sequences so only printable content is measured.
+    ///
+    /// Deliberately tolerant of malformed input: a sequence that was sliced
+    /// mid-escape swallows the following characters, which is precisely the
+    /// corruption `render_table_pads_columns_by_display_width` exists to catch.
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '\u{1b}' {
+                out.push(c);
+                continue;
+            }
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn strip_ansi_removes_sgr_and_keeps_text() {
+        assert_eq!(strip_ansi("\x1b[1mbold\x1b[0m"), "bold");
+        assert_eq!(strip_ansi("\x1b[38;5;120mx\x1b[39m"), "x");
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    /// `render_table` hands comfy-table pre-styled cells that already contain
+    /// ANSI escapes, and `colorize_box_chars` adds more afterwards. Column
+    /// widths are therefore only correct if the escapes are excluded from the
+    /// width calculation. When they are not, the table still renders and every
+    /// other assertion in this file still passes -- only the alignment silently
+    /// degrades -- so this is the sole guard over that behaviour.
+    #[test]
+    fn render_table_pads_columns_by_display_width() {
+        use unicode_width::UnicodeWidthStr;
+
+        const WRAP_WIDTH: u16 = 80;
+
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        render.wrap_width = Some(WRAP_WIDTH);
+
+        let header = vec![
+            "**Setting**".into(),
+            "*Default*".into(),
+            "`Description`".into(),
+        ];
+        let alignments = vec![
+            CellAlignment::Left,
+            CellAlignment::Right,
+            CellAlignment::Center,
+        ];
+        let rows = vec![
+            vec![
+                "**temperature**".into(),
+                "`0.7`".into(),
+                "Controls how *random* the sampled reply is allowed to be".into(),
+            ],
+            vec![
+                "**top_p**".into(),
+                "`1.0`".into(),
+                "Nucleus sampling cutoff, applied **after** temperature".into(),
+            ],
+        ];
+
+        let output = render.render_table(header, alignments, rows);
+
+        assert!(
+            output.contains('\u{1b}'),
+            "fixture must actually contain ANSI escapes: {output:?}",
+        );
+
+        let widths: Vec<usize> = output
+            .lines()
+            .map(|line| strip_ansi(line).width())
+            .collect();
+        assert!(!widths.is_empty(), "table rendered no lines");
+
+        for (index, width) in widths.iter().enumerate() {
+            assert_eq!(
+                *width, WRAP_WIDTH as usize,
+                "line {index} display width; all widths were {widths:?} in output:\n{output}",
+            );
+        }
+    }
+
     #[test]
     fn state_machine_renders_full_table_and_flushes_on_paragraph() {
         let options = RenderOptions::default();

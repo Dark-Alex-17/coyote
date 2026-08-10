@@ -36,6 +36,12 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
 
+    - name: Cache DuckDB Extensions
+      uses: actions/cache@v4
+      with:
+        path: ~/.duckdb/extensions
+        key: duckdb-ext-${{ matrix.os }}-v1.5.5
+
     - name: Test
       run: cargo test --all
 
