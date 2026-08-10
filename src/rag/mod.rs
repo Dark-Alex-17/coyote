@@ -5,10 +5,14 @@ use crate::config::*;
 use crate::utils::*;
 
 mod graph;
+mod provider;
+mod providers;
 mod serde_vectors;
 mod splitter;
 
 use self::graph::{KnowledgeGraph, extract_entities};
+use self::provider::RagProvider;
+use self::providers::YamlProvider;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bm25::{Language, SearchEngine, SearchEngineBuilder};
@@ -56,8 +60,11 @@ pub struct Rag {
     name: String,
     path: String,
     embedding_model: Model,
-    hnsw: Hnsw<'static, f32, DistCosine>,
+    // Local BM25: keyword search + graph seeding. Always built from `data.files`
+    // regardless of driver, and kept on `Rag` so the sync `graph_search` can use it.
     bm25: SearchEngine<DocumentId>,
+    // Vector storage + content retrieval.
+    provider: Box<dyn RagProvider>,
     data: RagData,
     last_sources: RwLock<Option<String>>,
     node_to_docs: IndexMap<u32, Vec<DocumentId>>,
@@ -74,6 +81,19 @@ impl Debug for Rag {
     }
 }
 
+// CLONING A `Rag` DOES NOT SNAPSHOT ITS BACKING STORE.
+//
+// `provider.duplicate(&self.data)` is a true snapshot for YamlProvider only.
+// DuckDbProvider Arc-clones one shared `Mutex<Connection>` over one file, and
+// QdrantProvider addresses the same remote collection. So for those drivers the
+// clone and the original are two views of ONE store.
+//
+// INVARIANT: after calling `rebuild_indexes` on a cloned `Rag`, the pre-clone
+// instance MUST be discarded immediately and MUST NOT serve further queries.
+// Cloning to READ is always fine; cloning to REBUILD makes the original a
+// half-truth (pre-rebuild `data`, post-rebuild store). Note that reassigning
+// `RequestContext.rag` drops only one holder of the old `Arc<Rag>` — forked
+// request contexts, agents, captured inputs and the RAG cache keep theirs.
 impl Clone for Rag {
     fn clone(&self) -> Self {
         Self {
@@ -81,8 +101,8 @@ impl Clone for Rag {
             name: self.name.clone(),
             path: self.path.clone(),
             embedding_model: self.embedding_model.clone(),
-            hnsw: self.data.build_hnsw(),
             bm25: self.data.build_bm25(),
+            provider: self.provider.duplicate(&self.data),
             node_to_docs: self.data.knowledge_graph.build_node_to_docs(),
             data: self.data.clone(),
             last_sources: RwLock::new(None),
@@ -296,8 +316,8 @@ impl Rag {
     }
 
     pub fn create(app: &AppConfig, name: &str, path: &Path, data: RagData) -> Result<Self> {
-        let hnsw = data.build_hnsw();
         let bm25 = data.build_bm25();
+        let provider: Box<dyn RagProvider> = Box::new(YamlProvider::from_data(&data));
         let node_to_docs = data.knowledge_graph.build_node_to_docs();
         let embedding_model =
             Model::retrieve_model(app, &data.embedding_model, ModelType::Embedding)?;
@@ -307,8 +327,8 @@ impl Rag {
             path: path.display().to_string(),
             data,
             embedding_model,
-            hnsw,
             bm25,
+            provider,
             node_to_docs,
             last_sources: RwLock::new(None),
         };
@@ -821,7 +841,11 @@ impl Rag {
         }
 
         progress(&spinner, "Building store".into());
-        self.hnsw = self.data.build_hnsw();
+        // `refresh` is true for a full re-index (.rebuild rag / --rebuild-rag /
+        // initial build) and false for an incremental .edit rag-docs change.
+        // Passing it through is what stops a remote provider from wiping its
+        // collection on a one-file add.
+        self.provider.rebuild_indexes(&self.data, refresh).await?;
         self.bm25 = self.data.build_bm25();
         self.node_to_docs = self.data.knowledge_graph.build_node_to_docs();
 
@@ -834,17 +858,30 @@ impl Rag {
         top_k: usize,
         rerank_model: Option<&str>,
     ) -> Result<Vec<(DocumentId, String)>> {
-        let (vector_search_results, keyword_search_results) = tokio::join!(
-            self.vector_search(query, top_k, 0.0),
-            self.keyword_search(query, top_k, 0.0),
-        );
-
-        let vector_search_results = vector_search_results?;
+        let vector_search_results = self.vector_search(query, top_k, 0.0).await?;
         debug!("vector_search_results: {vector_search_results:?}",);
         let vector_search_ids: Vec<DocumentId> =
             vector_search_results.into_iter().map(|(v, _)| v).collect();
 
-        let keyword_search_results = keyword_search_results?;
+        let keyword_search_results: Vec<(DocumentId, f32)> =
+            if self.provider.has_native_keyword_search() {
+                // Keyword is ONE of three RRF rankers (vector + keyword + graph);
+                // its absence is survivable and produces a slightly worse ranking,
+                // whereas a `?` here turns a provider FTS fault into TOTAL query
+                // failure — the user gets an error instead of the results the
+                // vector and graph rankers already retrieved. Degrade, do not
+                // propagate, and do not silently swap in the local BM25 either:
+                // that would change the ranking algorithm mid-query.
+                match self.provider.keyword_search(query, top_k).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("native keyword search failed, dropping the keyword ranker: {e}");
+                        Vec::new()
+                    }
+                }
+            } else {
+                self.keyword_search(query, top_k, 0.0)
+            };
         debug!("keyword_search_results: {keyword_search_results:?}",);
         let keyword_search_ids: Vec<DocumentId> =
             keyword_search_results.into_iter().map(|(v, _)| v).collect();
@@ -857,13 +894,20 @@ impl Rag {
                     .concat()
                     .into_iter()
                     .collect();
-                let mut documents = vec![];
-                let mut documents_ids = vec![];
-                for id in ids {
-                    if let Some(document) = self.data.get(id) {
-                        documents_ids.push(id);
-                        documents.push(document.page_content.to_string());
-                    }
+                // `ids` is an `IndexSet` here, not the `Vec` of the RRF branch below,
+                // and `&IndexSet<_>` does not coerce to `&[DocumentId]`.
+                let ids: Vec<DocumentId> = ids.into_iter().collect();
+                let fetched = self.provider.fetch_content(&ids).await?;
+                // Build both vectors from the SAME source in the SAME iteration —
+                // never zip two independently-built lists. The reranker returns
+                // positional indices into `documents`, so any drift between the two
+                // resolves reranked hits to the wrong document's text. A partial
+                // fetch simply yields a shorter pair, and both shrink together.
+                let mut documents_ids = Vec::with_capacity(fetched.len());
+                let mut documents = Vec::with_capacity(fetched.len());
+                for (id, text) in fetched {
+                    documents_ids.push(id);
+                    documents.push(text);
                 }
                 let data = RerankData::new(query.to_string(), documents, top_k);
                 let list = client.rerank(&data).await.context("Failed to rerank")?;
@@ -895,13 +939,9 @@ impl Rag {
                 ids
             }
         };
-        let output = ids
-            .into_iter()
-            .filter_map(|id| {
-                let document = self.data.get(id)?;
-                Some((id, document.page_content.clone()))
-            })
-            .collect();
+        // `ids` is the ranked list; `fetch_content` preserves that order per the
+        // trait's ordering contract, so the result is returned as-is.
+        let output = self.provider.fetch_content(&ids).await?;
         Ok(output)
     }
 
@@ -918,35 +958,24 @@ impl Rag {
         );
         let texts = splitter.split_text(query);
         let embeddings_data = EmbeddingsData::new(texts, true);
-        let embeddings = self.create_embeddings(embeddings_data, None).await?;
-        let output = self
-            .hnsw
-            .parallel_search(&embeddings, top_k, 30)
-            .into_iter()
-            .flat_map(|list| {
-                list.into_iter()
-                    .filter_map(|v| {
-                        let score = 1.0 - v.distance;
-                        if score > min_score {
-                            Some((DocumentId(v.d_id), score))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        Ok(output)
+        let query_embeddings = self.create_embeddings(embeddings_data, None).await?;
+
+        let mut results: Vec<(DocumentId, f32)> = vec![];
+        for embedding in &query_embeddings {
+            let batch = self
+                .provider
+                .vector_search(embedding, top_k, min_score)
+                .await?;
+            results.extend(batch);
+        }
+        Ok(merge_vector_results(results))
     }
 
-    async fn keyword_search(
-        &self,
-        query: &str,
-        top_k: usize,
-        min_score: f32,
-    ) -> Result<Vec<(DocumentId, f32)>> {
+    /// Local in-memory BM25 over `data.files` — empty for attached RAGs, which is
+    /// correct: they have no local text.
+    fn keyword_search(&self, query: &str, top_k: usize, min_score: f32) -> Vec<(DocumentId, f32)> {
         let results = self.bm25.search(query, top_k);
-        let output: Vec<(DocumentId, f32)> = results
+        results
             .into_iter()
             .filter_map(|v| {
                 let score = v.score;
@@ -956,8 +985,7 @@ impl Rag {
                     None
                 }
             })
-            .collect();
-        Ok(output)
+            .collect()
     }
 
     fn graph_search(&self, query: &str, top_k: usize) -> Vec<DocumentId> {
@@ -1243,11 +1271,21 @@ impl RagData {
         }
     }
 
-    pub fn get(&self, id: DocumentId) -> Option<&RagDocument> {
-        let (file_index, document_index) = id.split();
-        let file = self.files.get(&file_index)?;
-        let document = file.documents.get(document_index)?;
-        Some(document)
+    /// Every (DocumentId, &RagDocument) in the corpus, in `files` order.
+    ///
+    /// This — NOT `vectors` — is the authoritative document id space. BM25, the
+    /// knowledge graph and content lookup all key off it; `vectors` is a subset,
+    /// since `add`'s zip truncates whenever fewer embeddings come back than
+    /// document ids were sent.
+    pub fn iter_documents(&self) -> impl Iterator<Item = (DocumentId, &RagDocument)> {
+        self.files.iter().flat_map(|(file_index, file)| {
+            file.documents
+                .iter()
+                .enumerate()
+                .map(move |(document_index, document)| {
+                    (DocumentId::new(*file_index, document_index), document)
+                })
+        })
     }
 
     pub fn del(&mut self, file_ids: Vec<FileId>) {
@@ -1285,13 +1323,12 @@ impl RagData {
     }
 
     pub fn build_bm25(&self) -> SearchEngine<DocumentId> {
-        let mut documents = vec![];
-        for (file_index, file) in self.files.iter() {
-            for (document_index, document) in file.documents.iter().enumerate() {
-                let id = DocumentId::new(*file_index, document_index);
-                documents.push(bm25::Document::new(id, &document.page_content))
-            }
-        }
+        // Shares `iter_documents` with the providers' content maps so the BM25 key
+        // space and the content key space are identical by construction.
+        let documents: Vec<_> = self
+            .iter_documents()
+            .map(|(id, doc)| bm25::Document::new(id, &doc.page_content))
+            .collect();
         SearchEngineBuilder::<DocumentId>::with_documents(Language::English, documents)
             .k1(1.5)
             .b(0.75)
@@ -1580,6 +1617,27 @@ fn find_hash_skip(
         .map(|(i, v)| (i, *v))
 }
 
+/// Global score sort + dedup keeping the best score per document.
+///
+/// NO overall cap: each `provider.vector_search` call already returns <= top_k,
+/// so the pool is bounded by `top_k * query_chunks`, and `reciprocal_rank_fusion`
+/// truncates to `top_k` itself. Capping here would let whichever query chunk has
+/// the strongest absolute scores crowd out every other chunk's hits.
+///
+/// Free function (not a method) so it is unit-testable without an embeddings client.
+fn merge_vector_results(mut results: Vec<(DocumentId, f32)>) -> Vec<(DocumentId, f32)> {
+    debug_assert!(
+        results.iter().all(|(_, score)| score.is_finite()),
+        "provider returned a non-finite score; NaN silently degrades sort order"
+    );
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    let mut seen = IndexSet::new();
+    results
+        .into_iter()
+        .filter(|(id, _)| seen.insert(*id))
+        .collect()
+}
+
 fn reciprocal_rank_fusion(
     list_of_document_ids: Vec<Vec<DocumentId>>,
     list_of_weights: Vec<f32>,
@@ -1695,7 +1753,7 @@ mod tests {
     }
 
     #[test]
-    fn rag_data_get_returns_document() {
+    fn rag_data_iter_documents_yields_all_documents_in_file_order() {
         let mut data = RagData::new(
             "m".into(),
             100,
@@ -1712,15 +1770,21 @@ mod tests {
         };
         data.files.insert(0, file);
 
-        let doc = data.get(DocumentId::new(0, 0)).unwrap();
-        assert_eq!(doc.page_content, "first");
-
-        let doc = data.get(DocumentId::new(0, 1)).unwrap();
-        assert_eq!(doc.page_content, "second");
+        let documents: Vec<_> = data
+            .iter_documents()
+            .map(|(id, doc)| (id, doc.page_content.as_str()))
+            .collect();
+        assert_eq!(
+            documents,
+            vec![
+                (DocumentId::new(0, 0), "first"),
+                (DocumentId::new(0, 1), "second"),
+            ]
+        );
     }
 
     #[test]
-    fn rag_data_get_returns_none_for_missing_file() {
+    fn rag_data_iter_documents_is_empty_without_files() {
         let data = RagData::new(
             "m".into(),
             100,
@@ -1730,11 +1794,14 @@ mod tests {
             None,
             GraphRagConfig::default(),
         );
-        assert!(data.get(DocumentId::new(99, 0)).is_none());
+        assert_eq!(data.iter_documents().count(), 0);
     }
 
+    /// The document id space is `files`, never `vectors`: `add`'s zip truncates
+    /// silently, so a vector may exist for an id no file provides. Content lookup
+    /// and BM25 both key off this iterator and must agree.
     #[test]
-    fn rag_data_get_returns_none_for_missing_document() {
+    fn rag_data_iter_documents_ignores_vector_only_ids() {
         let mut data = RagData::new(
             "m".into(),
             100,
@@ -1750,7 +1817,10 @@ mod tests {
             documents: vec![RagDocument::new("only one")],
         };
         data.files.insert(0, file);
-        assert!(data.get(DocumentId::new(0, 5)).is_none());
+        data.vectors.insert(DocumentId::new(0, 5), vec![1.0]);
+
+        let ids: Vec<_> = data.iter_documents().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![DocumentId::new(0, 0)]);
     }
 
     #[test]
@@ -1995,6 +2065,49 @@ mod tests {
         assert_eq!(
             result[0], doc_a,
             "higher-weight signal's top doc should rank first"
+        );
+    }
+
+    #[test]
+    fn merge_vector_results_empty_input() {
+        let result = super::merge_vector_results(vec![]);
+        assert!(result.is_empty(), "empty input should produce empty output");
+    }
+
+    #[test]
+    fn merge_vector_results_keeps_best_score_per_document() {
+        let doc = DocumentId::new(0, 0);
+        let result = super::merge_vector_results(vec![(doc, 0.2), (doc, 0.9)]);
+        assert_eq!(result.len(), 1, "a document must not be double-counted");
+        assert_eq!(result[0].0, doc);
+        assert_eq!(
+            result[0].1, 0.9,
+            "dedup must keep the highest score, not the first seen"
+        );
+    }
+
+    #[test]
+    fn merge_vector_results_sorts_globally_by_descending_score() {
+        let doc_a = DocumentId::new(0, 0);
+        let doc_b = DocumentId::new(1, 0);
+        let doc_c = DocumentId::new(2, 0);
+        // Interleaved as two per-chunk hit lists would arrive: concatenating them
+        // would yield a, c, b — only a global sort produces c, a, b.
+        let result = super::merge_vector_results(vec![(doc_a, 0.5), (doc_c, 0.9), (doc_b, 0.1)]);
+        let ids: Vec<DocumentId> = result.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![doc_c, doc_a, doc_b]);
+    }
+
+    #[test]
+    fn merge_vector_results_does_not_truncate() {
+        let input: Vec<(DocumentId, f32)> = (0..10)
+            .map(|i| (DocumentId::new(i, 0), i as f32 / 10.0))
+            .collect();
+        let result = super::merge_vector_results(input);
+        assert_eq!(
+            result.len(),
+            10,
+            "merging must not cap the pool; truncation belongs to reciprocal_rank_fusion"
         );
     }
 
