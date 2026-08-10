@@ -2773,7 +2773,12 @@ impl RequestContext {
                 }
             }
             "rag_top_k" => {
-                let value = value.parse().with_context(|| "Invalid value")?;
+                let value: usize = value.parse().with_context(|| "Invalid value")?;
+                if value == 0 {
+                    bail!(
+                        "rag_top_k must be >= 1; a top_k of 0 makes every query return no results."
+                    );
+                }
                 if !self.set_rag_top_k(value)? {
                     self.update_app_config(|app| app.rag_top_k = value);
                 }
@@ -4125,6 +4130,12 @@ impl RequestContext {
             None => bail!("No RAG"),
         };
 
+        if rag.is_attached() {
+            bail!(
+                "Cannot edit documents on an attached RAG — Coyote does not own its source documents."
+            );
+        }
+
         let document_paths = rag.document_paths();
         let temp_file = temp_file(&format!("-rag-{}", rag.name()), ".txt");
         tokio::fs::write(&temp_file, &document_paths.join("\n"))
@@ -4157,8 +4168,14 @@ impl RequestContext {
         };
         self.rag_cache().invalidate(&key);
 
-        rag.refresh_document_paths(&new_document_paths, false, &self.app.config, abort_signal)
-            .await?;
+        rag.refresh_document_paths(
+            &new_document_paths,
+            false,
+            false,
+            &self.app.config,
+            abort_signal,
+        )
+        .await?;
         self.rag = Some(Arc::new(rag));
         Ok(())
     }
@@ -4169,6 +4186,14 @@ impl RequestContext {
             None => bail!("No RAG"),
         };
 
+        if rag.is_attached() {
+            bail!(
+                "Cannot rebuild an attached RAG — Coyote does not own its source documents. \
+                 Re-index from the system that originally created '{}'.",
+                rag.name()
+            );
+        }
+
         let key = if self.agent.is_some() {
             RagKey::Agent(rag.name().to_string())
         } else {
@@ -4177,7 +4202,12 @@ impl RequestContext {
         self.rag_cache().invalidate(&key);
 
         let document_paths = rag.document_paths().to_vec();
-        rag.refresh_document_paths(&document_paths, true, &self.app.config, abort_signal)
+        println!(
+            "Rebuilding re-embeds every document ({} files). \
+             This will call the embedding API and may take a while.",
+            rag.file_count()
+        );
+        rag.refresh_document_paths(&document_paths, true, true, &self.app.config, abort_signal)
             .await?;
         self.rag = Some(Arc::new(rag));
         Ok(())

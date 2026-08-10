@@ -132,7 +132,7 @@ impl Rag {
         let loaders = app.document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
         abortable_run_with_spinner_rx(
-            rag.sync_documents(doc_paths, true, loaders, Some(spinner)),
+            rag.sync_documents(doc_paths, true, false, loaders, Some(spinner)),
             spinner_rx,
             abort_signal,
         )
@@ -276,7 +276,7 @@ impl Rag {
         let loaders = app.document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
         abortable_run_with_spinner_rx(
-            rag.sync_documents(&paths, true, loaders, Some(spinner)),
+            rag.sync_documents(&paths, true, false, loaders, Some(spinner)),
             spinner_rx,
             abort_signal,
         )
@@ -291,6 +291,7 @@ impl Rag {
         let err = || format!("Failed to load rag '{name}' at '{}'", path.display());
         let content = fs::read_to_string(path).with_context(err)?;
         let data: RagData = serde_yaml::from_str(&content).with_context(err)?;
+        data.validate().with_context(err)?;
         Self::create(app, name, path, data)
     }
 
@@ -322,13 +323,20 @@ impl Rag {
         &mut self,
         document_paths: &[String],
         refresh: bool,
+        force_reingest: bool,
         app: &AppConfig,
         abort_signal: AbortSignal,
     ) -> Result<()> {
         let loaders = app.document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
         abortable_run_with_spinner_rx(
-            self.sync_documents(document_paths, refresh, loaders, Some(spinner)),
+            self.sync_documents(
+                document_paths,
+                refresh,
+                force_reingest,
+                loaders,
+                Some(spinner),
+            ),
             spinner_rx,
             abort_signal,
         )
@@ -455,6 +463,8 @@ impl Rag {
             .collect();
         let data = json!({
             "path": self.path,
+            "driver": self.driver(),
+            "attached": self.is_attached(),
             "embedding_model": self.embedding_model.id(),
             "chunk_size": self.data.chunk_size,
             "chunk_overlap": self.data.chunk_overlap,
@@ -474,6 +484,18 @@ impl Rag {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn is_attached(&self) -> bool {
+        self.data.attached
+    }
+
+    pub fn driver(&self) -> &str {
+        &self.data.driver
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.data.files.len()
     }
 
     pub fn is_temp(&self) -> bool {
@@ -565,9 +587,15 @@ impl Rag {
         &mut self,
         paths: &[String],
         refresh: bool,
+        force_reingest: bool,
         loaders: HashMap<String, String>,
         spinner: Option<Spinner>,
     ) -> Result<()> {
+        debug_assert!(
+            !force_reingest || refresh,
+            "force_reingest requires refresh"
+        );
+        let refresh = refresh || force_reingest;
         if let Some(spinner) = &spinner {
             let _ = spinner.set_message(String::new());
         }
@@ -685,11 +713,9 @@ impl Rag {
         } in loaded_documents
         {
             let hash = sha256(&contents);
-            if let Some(file_ids) = to_deleted.get_mut(&hash)
-                && let Some((i, _)) = file_ids
-                    .iter()
-                    .enumerate()
-                    .find(|(_, v)| self.data.files[*v].path == path)
+            if let Some((i, _)) =
+                find_hash_skip(force_reingest, &to_deleted, &self.data.files, &hash, &path)
+                && let Some(file_ids) = to_deleted.get_mut(&hash)
             {
                 if file_ids.len() == 1 {
                     to_deleted.swap_remove(&hash);
@@ -1084,16 +1110,31 @@ impl Rag {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RagData {
+    #[serde(default = "RagData::default_driver")]
+    pub driver: String,
+    #[serde(default)]
+    pub attached: bool,
+
     pub embedding_model: String,
+    #[serde(default)]
     pub chunk_size: usize,
+    #[serde(default)]
     pub chunk_overlap: usize,
     pub reranker_model: Option<String>,
+    #[serde(default)]
     pub top_k: usize,
     pub batch_size: Option<usize>,
+    #[serde(default)]
     pub next_file_id: FileId,
+    #[serde(default)]
     pub document_paths: Vec<String>,
+    #[serde(default)]
     pub files: IndexMap<FileId, RagFile>,
-    #[serde(with = "serde_vectors")]
+    #[serde(
+        default,
+        with = "serde_vectors",
+        skip_serializing_if = "IndexMap::is_empty"
+    )]
     pub vectors: IndexMap<DocumentId, Vec<f32>>,
     #[serde(default)]
     pub extractor_model: Option<String>,
@@ -1108,6 +1149,8 @@ pub struct RagData {
 impl Debug for RagData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RagData")
+            .field("driver", &self.driver)
+            .field("attached", &self.attached)
             .field("embedding_model", &self.embedding_model)
             .field("chunk_size", &self.chunk_size)
             .field("chunk_overlap", &self.chunk_overlap)
@@ -1135,6 +1178,8 @@ impl RagData {
         graph: GraphRagConfig,
     ) -> Self {
         Self {
+            driver: "yaml".to_string(),
+            attached: false,
             embedding_model,
             chunk_size,
             chunk_overlap,
@@ -1149,6 +1194,52 @@ impl RagData {
             extractor_prompt: graph.extractor_prompt,
             graph_hops: graph.graph_hops,
             knowledge_graph: KnowledgeGraph::default(),
+        }
+    }
+
+    fn default_driver() -> String {
+        "yaml".to_string()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.top_k == 0 {
+            bail!(
+                "top_k must be >= 1 (got 0). A top_k of 0 makes every query return \
+                 no results with no error. Set `top_k:` in the RAG YAML."
+            );
+        }
+        if !self.attached {
+            if self.chunk_size == 0 {
+                bail!(
+                    "chunk_size must be >= 1 (got 0) for a non-attached RAG. A \
+                     chunk_size of 0 panics with a divide-by-zero while sizing \
+                     embedding batches. Set `chunk_size:` in the RAG YAML."
+                );
+            }
+            if self.chunk_overlap >= self.chunk_size {
+                bail!(
+                    "chunk_overlap ({}) must be strictly less than chunk_size ({}).",
+                    self.chunk_overlap,
+                    self.chunk_size
+                );
+            }
+        }
+        match (self.driver.as_str(), self.attached) {
+            ("yaml", false) => Ok(()),
+            ("duckdb", false) => Ok(()),
+            ("qdrant", true) => Ok(()),
+            ("qdrant", false) => Ok(()),
+            ("yaml", true) => bail!(
+                "driver 'yaml' cannot be attached (attached: true). \
+                 Attached RAGs require an external driver (qdrant)."
+            ),
+            ("duckdb", true) => bail!(
+                "driver 'duckdb' cannot be attached (attached: true). \
+                 DuckDB is a local-only driver; use 'qdrant' for external collections."
+            ),
+            (other, _) => {
+                bail!("Unknown RAG driver '{other}'. Valid drivers: yaml, duckdb, qdrant.")
+            }
         }
     }
 
@@ -1205,6 +1296,20 @@ impl RagData {
             .k1(1.5)
             .b(0.75)
             .build()
+    }
+}
+
+impl Default for RagData {
+    fn default() -> Self {
+        RagData::new(
+            String::new(),
+            0,
+            0,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        )
     }
 }
 
@@ -1449,6 +1554,30 @@ fn progress(spinner: &Option<Spinner>, message: String) {
     if let Some(spinner) = spinner {
         let _ = spinner.set_message(message);
     }
+}
+
+/// Decide whether a just-loaded document may skip re-chunking and re-embedding.
+///
+/// Returns the position of the matching `FileId` within `to_deleted[hash]`, together with
+/// that `FileId`. The caller needs the position to un-mark the file for deletion. `None`
+/// means "ingest this document": either a full re-ingest was requested, or no
+/// already-indexed file has both this content hash and this path.
+fn find_hash_skip(
+    force_reingest: bool,
+    to_deleted: &IndexMap<String, Vec<FileId>>,
+    files: &IndexMap<FileId, RagFile>,
+    hash: &str,
+    path: &str,
+) -> Option<(usize, FileId)> {
+    if force_reingest {
+        return None;
+    }
+    let file_ids = to_deleted.get(hash)?;
+    file_ids
+        .iter()
+        .enumerate()
+        .find(|(_, v)| files[*v].path == path)
+        .map(|(i, v)| (i, *v))
 }
 
 fn reciprocal_rank_fusion(
@@ -1867,5 +1996,190 @@ mod tests {
             result[0], doc_a,
             "higher-weight signal's top doc should rank first"
         );
+    }
+
+    fn hash_skip_fixture() -> (IndexMap<FileId, RagFile>, IndexMap<String, Vec<FileId>>) {
+        let mut files: IndexMap<FileId, RagFile> = Default::default();
+        files.insert(
+            7,
+            RagFile {
+                hash: "abc".into(),
+                path: "test.txt".into(),
+                documents: vec![RagDocument::new("unchanged")],
+            },
+        );
+        let mut to_deleted: IndexMap<String, Vec<FileId>> = Default::default();
+        to_deleted.insert("abc".into(), vec![7]);
+        (files, to_deleted)
+    }
+
+    #[test]
+    fn force_reingest_re_embeds_hash_identical_files() {
+        let (files, to_deleted) = hash_skip_fixture();
+        assert_eq!(
+            find_hash_skip(true, &to_deleted, &files, "abc", "test.txt"),
+            None,
+            "a forced re-ingest must not skip an unchanged file"
+        );
+    }
+
+    #[test]
+    fn refresh_without_force_still_hash_skips() {
+        let (files, to_deleted) = hash_skip_fixture();
+        assert_eq!(
+            find_hash_skip(false, &to_deleted, &files, "abc", "test.txt"),
+            Some((0, 7)),
+            "an unchanged file should be skipped and un-marked for deletion"
+        );
+    }
+
+    #[test]
+    fn find_hash_skip_returns_none_on_path_change() {
+        let (files, to_deleted) = hash_skip_fixture();
+        assert_eq!(
+            find_hash_skip(false, &to_deleted, &files, "abc", "moved.txt"),
+            None
+        );
+        assert_eq!(
+            find_hash_skip(true, &to_deleted, &files, "abc", "moved.txt"),
+            None
+        );
+    }
+
+    #[test]
+    fn ragdata_new_has_yaml_driver_and_not_attached() {
+        let data = RagData::new(
+            "text-embedding-3-small".to_string(),
+            1024,
+            50,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+        assert_eq!(data.driver, "yaml");
+        assert!(!data.attached);
+    }
+
+    #[test]
+    fn ragdata_deserializes_without_driver_field() {
+        let yaml = "
+embedding_model: text-embedding-3-small
+chunk_size: 1024
+chunk_overlap: 50
+top_k: 5
+next_file_id: 0
+document_paths: []
+files: {}
+vectors: {}
+";
+        let data: RagData = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(data.driver, "yaml");
+        assert!(!data.attached);
+    }
+
+    #[test]
+    fn ragdata_round_trips_driver_and_attached() {
+        let mut data = RagData::new(
+            "text-embedding-3-small".to_string(),
+            1024,
+            50,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+        data.driver = "qdrant".to_string();
+        data.attached = true;
+
+        let yaml = serde_yaml::to_string(&data).unwrap();
+        let restored: RagData = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.driver, "qdrant");
+        assert!(restored.attached);
+    }
+
+    #[test]
+    fn ragdata_validate_rejects_yaml_attached() {
+        let mut data = RagData::new(
+            "m".into(),
+            1024,
+            50,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+        data.attached = true;
+        let err = data.validate().unwrap_err().to_string();
+        assert!(err.contains("cannot be attached"), "got: {err}");
+    }
+
+    #[test]
+    fn ragdata_validate_accepts_qdrant_attached() {
+        let mut data = RagData::new(
+            "m".into(),
+            1024,
+            50,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+        data.driver = "qdrant".to_string();
+        data.attached = true;
+        assert!(data.validate().is_ok());
+    }
+
+    #[test]
+    fn ragdata_validate_rejects_zero_top_k_from_a_truncated_yaml() {
+        let yaml = "
+embedding_model: text-embedding-3-small
+chunk_size: 1024
+chunk_overlap: 50
+";
+        let data: RagData = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(data.top_k, 0, "a missing top_k must default to 0");
+        let err = data.validate().unwrap_err().to_string();
+        assert!(err.contains("top_k must be >= 1"), "got: {err}");
+    }
+
+    #[test]
+    fn ragdata_validate_rejects_zero_chunk_size_when_not_attached() {
+        let yaml = "
+embedding_model: text-embedding-3-small
+top_k: 5
+";
+        let data: RagData = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(data.chunk_size, 0);
+        let err = data.validate().unwrap_err().to_string();
+        assert!(err.contains("chunk_size must be >= 1"), "got: {err}");
+    }
+
+    #[test]
+    fn ragdata_validate_allows_zero_chunk_size_when_attached() {
+        let yaml = "
+driver: qdrant
+attached: true
+embedding_model: text-embedding-3-small
+top_k: 5
+";
+        let data: RagData = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(data.chunk_size, 0);
+        assert!(data.validate().is_ok());
+    }
+
+    #[test]
+    fn ragdata_validate_rejects_overlap_not_less_than_chunk_size() {
+        let data = RagData::new(
+            "m".into(),
+            100,
+            100,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+        let err = data.validate().unwrap_err().to_string();
+        assert!(err.contains("chunk_overlap"), "got: {err}");
     }
 }
