@@ -3,10 +3,124 @@ use crate::rag::{DocumentId, RagData};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, Response, StatusCode};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Marks a `DocumentId` that stands in for a point id Coyote cannot carry
+/// directly. Qdrant accepts UUID strings as point ids, and that is what
+/// LangChain writes by default.
+///
+/// `DocumentId` packs `(file_index, document_index)` into one `usize` with the
+/// file index in the high half, so this bit is only reachable at a file index of
+/// 2^31. Nothing local gets near that, and an attached RAG builds no local index
+/// at all — `data.files` and `data.vectors` stay empty and every
+/// `DocumentId::split` caller early-returns on `data.attached`. Along the
+/// attached path the id is an opaque key carried through RRF, which is what
+/// makes a synthetic one safe here and nowhere else.
+const SYNTHETIC_ID_TAG: usize = 1 << (usize::BITS - 1);
+
+/// Two-way map between a raw Qdrant point id and the `DocumentId` the retrieval
+/// pipeline sees.
+///
+/// Only ids that cannot survive the round trip are interned. A plain `u64` that
+/// fits below the tag keeps mapping to itself, so integer-keyed collections
+/// behave exactly as they did before this map existed.
+#[derive(Default)]
+struct PointIdInterner {
+    handles: HashMap<String, DocumentId>,
+    raw: HashMap<DocumentId, Value>,
+    next: usize,
+}
+
+impl PointIdInterner {
+    /// The `DocumentId` for a raw point id, minting a handle if one is needed.
+    ///
+    /// `None` only for a missing id, which is a malformed response.
+    fn document_id(&mut self, raw: &Value) -> Option<DocumentId> {
+        if raw.is_null() {
+            return None;
+        }
+        // The pre-existing integer path, unchanged. `try_from` rather than `as`
+        // so a value too wide for the target's `usize` is interned instead of
+        // silently truncated into a different point.
+        if let Some(n) = raw.as_u64()
+            && let Ok(n) = usize::try_from(n)
+            && n & SYNTHETIC_ID_TAG == 0
+        {
+            return Some(DocumentId(n));
+        }
+        Some(self.intern(raw))
+    }
+
+    fn intern(&mut self, raw: &Value) -> DocumentId {
+        // Keyed on the JSON rendering, so the string "1" and the integer 1 are
+        // not conflated into one point.
+        let key = raw.to_string();
+        if let Some(handle) = self.handles.get(&key) {
+            return *handle;
+        }
+        let handle = DocumentId(SYNTHETIC_ID_TAG | self.next);
+        self.next += 1;
+        self.handles.insert(key, handle);
+        self.raw.insert(handle, raw.clone());
+        handle
+    }
+
+    /// The original id for a handle, or `None` when the id was never interned —
+    /// i.e. it is a plain integer that is already its own id.
+    fn raw_id(&self, handle: DocumentId) -> Option<&Value> {
+        self.raw.get(&handle)
+    }
+
+    /// Builds the `ids` array for an outbound `/points` fetch. Every entry is the
+    /// id Qdrant issued, integer or string; a synthetic handle must never leave
+    /// this process.
+    fn outbound_ids(&self, ids: &[DocumentId]) -> Vec<Value> {
+        ids.iter()
+            .map(|id| match self.raw_id(*id) {
+                Some(raw) => raw.clone(),
+                None => Value::from(id.0 as u64),
+            })
+            .collect()
+    }
+}
+
+fn parse_search_hits(
+    interner: &mut PointIdInterner,
+    body: &Value,
+    min_score: f32,
+) -> Result<Vec<(DocumentId, f32)>> {
+    let hits = body["result"]
+        .as_array()
+        .context("Unexpected /points/search response shape")?;
+
+    Ok(hits
+        .iter()
+        .filter_map(|pt| {
+            let score = pt["score"].as_f64()? as f32;
+            Some((interner.document_id(&pt["id"])?, score))
+        })
+        .filter(|(_, score)| *score > min_score)
+        .collect())
+}
+
+fn parse_points(interner: &mut PointIdInterner, body: &Value) -> Result<Vec<(DocumentId, String)>> {
+    let points = body["result"]
+        .as_array()
+        .context("Unexpected /points response shape")?;
+
+    Ok(points
+        .iter()
+        .filter_map(|pt| {
+            let text = pt["payload"]["page_content"].as_str()?.to_string();
+            Some((interner.document_id(&pt["id"])?, text))
+        })
+        .collect())
+}
 
 /// Render Qdrant's error envelope into a human-readable message.
 ///
@@ -65,6 +179,7 @@ pub struct QdrantProvider {
     client: Client,
     base_url: String,
     collection: String,
+    point_ids: Arc<RwLock<PointIdInterner>>,
 }
 
 impl QdrantProvider {
@@ -139,6 +254,7 @@ impl QdrantProvider {
             client,
             base_url,
             collection: collection.to_string(),
+            point_ids: Arc::default(),
         })
     }
 
@@ -252,22 +368,11 @@ impl RagProvider for QdrantProvider {
             );
         }
         let data: Value = resp.json().await?;
-        let results = data["result"]
-            .as_array()
-            .context("Unexpected /points/search response shape")?
-            .iter()
-            .filter_map(|pt| {
-                // String (UUID) IDs yield None here and are dropped. The attach
-                // wizard rejects such collections up front so this cannot silently
-                // become "zero results, no error".
-                let id = pt["id"].as_u64()? as usize;
-                let score = pt["score"].as_f64()? as f32;
-                Some((DocumentId(id), score))
-            })
-            .filter(|(_, score)| *score > min_score)
-            .collect();
+        // The interner is what lets a UUID-keyed collection work: a string id gets
+        // a synthetic handle here and the original is replayed by `fetch_content`.
+        let mut interner = self.point_ids.write();
 
-        Ok(results)
+        parse_search_hits(&mut interner, &data, min_score)
     }
 
     async fn fetch_content(&self, ids: &[DocumentId]) -> Result<Vec<(DocumentId, String)>> {
@@ -275,7 +380,8 @@ impl RagProvider for QdrantProvider {
             return Ok(vec![]);
         }
         let url = format!("{}/collections/{}/points", self.base_url, self.collection);
-        let id_list: Vec<u64> = ids.iter().map(|d| d.0 as u64).collect();
+        // Qdrant is asked for the ids it issued, never for a synthetic handle.
+        let id_list = self.point_ids.read().outbound_ids(ids);
         let body = serde_json::json!({
             "ids": id_list,
             "with_payload": true,
@@ -291,16 +397,10 @@ impl RagProvider for QdrantProvider {
             );
         }
         let data: Value = resp.json().await?;
-        let mut rows: Vec<(DocumentId, String)> = data["result"]
-            .as_array()
-            .context("Unexpected /points response shape")?
-            .iter()
-            .filter_map(|pt| {
-                let id = pt["id"].as_u64()? as usize;
-                let text = pt["payload"]["page_content"].as_str()?.to_string();
-                Some((DocumentId(id), text))
-            })
-            .collect();
+        let mut rows = {
+            let mut interner = self.point_ids.write();
+            parse_points(&mut interner, &data)?
+        };
         // `/points` does not guarantee response order matches request order, and the
         // caller's RRF ranking is carried by that order. Restore it.
         let position: HashMap<DocumentId, usize> =
@@ -328,10 +428,17 @@ impl RagProvider for QdrantProvider {
         // Cloning the client shares the connection pool and the injected api-key
         // header. Sharing is correct: both handles address the same remote
         // collection, and neither of them writes to it.
+        //
+        // The point-id map is shared for the same reason, and because it MUST be:
+        // `Rag::clone()` hands the clone `DocumentId`s that the original minted,
+        // so a fresh map would resolve them to nothing and `fetch_content` would
+        // ask Qdrant for a synthetic handle — zero results, no error. Resetting it
+        // would also re-mint handles for ids the original still holds.
         Box::new(Self {
             client: self.client.clone(),
             base_url: self.base_url.clone(),
             collection: self.collection.clone(),
+            point_ids: Arc::clone(&self.point_ids),
         })
     }
 }
@@ -428,6 +535,7 @@ mod tests {
             client: Client::new(),
             base_url: "http://localhost:6333".to_string(),
             collection: "c".to_string(),
+            point_ids: Arc::default(),
         };
 
         let attached = RagData {
@@ -462,9 +570,152 @@ mod tests {
             client: Client::new(),
             base_url: "http://127.0.0.1:1".to_string(),
             collection: "c".to_string(),
+            point_ids: Arc::default(),
         };
 
         assert!(provider.fetch_content(&[]).await.unwrap().is_empty());
+    }
+
+    /// A UUID-keyed collection has to survive the whole `vector_search` →
+    /// `fetch_content` round trip, and the fetch must ask Qdrant for the ORIGINAL
+    /// string id. Parsing ids with `as_u64()` used to drop these hits inside a
+    /// `filter_map`, i.e. zero results and no error.
+    #[test]
+    fn uuid_point_ids_round_trip_and_are_requested_verbatim() {
+        let mut interner = PointIdInterner::default();
+        let first_uuid = "3f1b0c2e-1111-4000-8000-000000000001";
+        let second_uuid = "3f1b0c2e-2222-4000-8000-000000000002";
+
+        let search = serde_json::json!({
+            "result": [
+                {"id": first_uuid, "score": 0.91},
+                {"id": second_uuid, "score": 0.42},
+            ]
+        });
+        let hits = parse_search_hits(&mut interner, &search, 0.0).unwrap();
+        assert_eq!(hits.len(), 2, "string ids must not be silently dropped");
+
+        let ids: Vec<DocumentId> = hits.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            interner.outbound_ids(&ids),
+            vec![Value::from(first_uuid), Value::from(second_uuid)],
+            "the fetch must send the ids Qdrant issued, not the handles"
+        );
+
+        // Qdrant may answer /points in any order; the handles still map back and
+        // the caller's RRF ranking is recoverable.
+        let points = serde_json::json!({
+            "result": [
+                {"id": second_uuid, "payload": {"page_content": "second"}},
+                {"id": first_uuid, "payload": {"page_content": "first"}},
+            ]
+        });
+        let mut rows = parse_points(&mut interner, &points).unwrap();
+        let position: HashMap<DocumentId, usize> =
+            ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        rows.sort_by_key(|(id, _)| position.get(id).copied().unwrap_or(usize::MAX));
+        assert_eq!(
+            rows,
+            vec![
+                (ids[0], "first".to_string()),
+                (ids[1], "second".to_string())
+            ]
+        );
+    }
+
+    /// Integer-keyed collections must be untouched by the interner: the id maps to
+    /// itself on the way in and goes back out as the same integer.
+    #[test]
+    fn integer_point_ids_are_passed_through_untouched() {
+        let mut interner = PointIdInterner::default();
+        let search = serde_json::json!({
+            "result": [{"id": 7, "score": 0.9}, {"id": 0, "score": 0.5}]
+        });
+
+        let hits = parse_search_hits(&mut interner, &search, 0.0).unwrap();
+        assert_eq!(
+            hits,
+            vec![(DocumentId(7), 0.9_f32), (DocumentId(0), 0.5_f32)]
+        );
+
+        let ids: Vec<DocumentId> = hits.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            interner.outbound_ids(&ids),
+            vec![Value::from(7_u64), Value::from(0_u64)],
+            "integer ids must not be regressed into synthetic handles"
+        );
+        assert!(
+            interner.raw_id(DocumentId(7)).is_none(),
+            "a plain integer id is its own id and needs no map entry"
+        );
+    }
+
+    /// Synthetic handles are stable per point id and live in a range no packed
+    /// `DocumentId` can reach.
+    #[test]
+    fn synthetic_handles_are_stable_and_never_collide_with_packed_ids() {
+        let mut interner = PointIdInterner::default();
+        let uuid = Value::from("9d2f0a11-3333-4000-8000-00000000000a");
+
+        let handle = interner.document_id(&uuid).unwrap();
+        assert_eq!(
+            interner.document_id(&uuid).unwrap(),
+            handle,
+            "the same point id must keep the same handle across queries"
+        );
+        assert_ne!(
+            interner.document_id(&Value::from("other")).unwrap(),
+            handle,
+            "distinct point ids must not share a handle"
+        );
+        assert_ne!(handle.0 & SYNTHETIC_ID_TAG, 0, "a handle carries the tag");
+
+        // A packed (file_index, document_index) never sets the tag bit: it is the
+        // top bit of the file index, which would take 2^31 indexed files.
+        for (file_index, document_index) in [(0, 0), (1, 0), (0, 4242), (1_000_000, 999)] {
+            assert_eq!(
+                DocumentId::new(file_index, document_index).0 & SYNTHETIC_ID_TAG,
+                0,
+                "packed ({file_index}, {document_index}) must stay out of the handle range"
+            );
+        }
+
+        // The one integer id that WOULD land on the tag is interned instead of
+        // being handed back as itself, so it cannot alias a handle.
+        let collides = Value::from(SYNTHETIC_ID_TAG as u64);
+        let interned = interner.document_id(&collides).unwrap();
+        assert_eq!(interner.raw_id(interned), Some(&collides));
+        assert_eq!(
+            interner.outbound_ids(&[interned]),
+            vec![collides],
+            "the original integer must still be what Qdrant is asked for"
+        );
+    }
+
+    /// `duplicate()` shares the map rather than resetting it: `Rag::clone()` hands
+    /// the clone `DocumentId`s the original minted, and a fresh map would turn
+    /// those into requests for a synthetic handle — zero results, no error.
+    #[test]
+    fn duplicate_shares_the_point_id_map() {
+        let provider = QdrantProvider {
+            client: Client::new(),
+            base_url: "http://127.0.0.1:1".to_string(),
+            collection: "c".to_string(),
+            point_ids: Arc::default(),
+        };
+        let uuid = Value::from("c0ffee00-4444-4000-8000-000000000007");
+        let handle = provider.point_ids.write().document_id(&uuid).unwrap();
+
+        let dup = provider.duplicate(&RagData {
+            driver: "qdrant".to_string(),
+            attached: true,
+            ..Default::default()
+        });
+        // Downcasting is not available through `dyn RagProvider`, so go via the
+        // shared Arc: the clone must observe the original's interning.
+        assert_eq!(Arc::strong_count(&provider.point_ids), 2);
+        assert_eq!(provider.point_ids.read().raw_id(handle), Some(&uuid));
+        drop(dup);
     }
 
     #[tokio::test]

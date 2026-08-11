@@ -475,18 +475,6 @@ impl Rag {
             }
         }
 
-        // Point IDs are read with `as_u64()`, which yields None for a JSON string.
-        // A UUID-keyed collection would therefore return zero hits with no error,
-        // so refuse it here instead of attaching something silently broken.
-        if let Some(raw_id) = &sample_id
-            && raw_id.starts_with('"')
-        {
-            bail!(
-                "Collection '{collection}' uses string (UUID) point IDs. \
-                 Coyote requires integer point IDs. Rebuild the collection with integer IDs \
-                 (e.g. LangChain: pass ids=list(range(len(docs))) to add_documents())."
-            );
-        }
         println!("ℹ  This collection must store document text in a 'page_content' payload field.");
 
         let dim = QdrantProvider::get_vector_dimension(&host, &collection, api_key)
