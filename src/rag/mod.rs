@@ -274,15 +274,17 @@ impl Rag {
         let driver = if prompt_for_driver {
             let options = vec![
                 "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
-                "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search. Can only be open in ONE Coyote process at a time, and its driver cannot be changed later without recreating the RAG",
+                "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search. Several Coyote processes can query it at once, but ingesting or rebuilding it locks the others out until that finishes, and its driver cannot be changed later without recreating the RAG",
             ];
             let sel = Select::new("RAG storage driver:", options)
                 .with_starting_cursor(0)
                 .prompt()?;
             if sel.starts_with("duckdb") {
                 println!(
-                    "Note: a duckdb RAG can only be open in one Coyote process at a time, \
-                     and changing its driver later means deleting and recreating the RAG."
+                    "Note: several Coyote processes can query a duckdb RAG at the same time, \
+                     but while one process is ingesting or rebuilding it the others cannot \
+                     read it until that finishes. Changing its driver later means deleting \
+                     and recreating the RAG."
                 );
                 "duckdb"
             } else {
