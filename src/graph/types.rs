@@ -367,6 +367,13 @@ pub struct RagNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_hops: Option<usize>,
 
+    /// Storage driver for this node's knowledge base ("yaml", "duckdb"). `None`
+    /// means "yaml". Only honored when the knowledge base is first built;
+    /// changing it afterwards has no effect until the RAG is deleted and
+    /// re-initialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_updates: Option<HashMap<String, String>>,
 
@@ -1151,5 +1158,101 @@ nodes:
         let triage = graph.get_node("triage").unwrap();
         assert!(triage.next.as_ref().unwrap().is_fan_out());
         assert_eq!(triage.next.as_ref().unwrap().as_slice().len(), 2);
+    }
+
+    fn rag_node_of(graph: &Graph, id: &str) -> RagNode {
+        match &graph.get_node(id).unwrap().node_type {
+            NodeType::Rag(r) => r.clone(),
+            other => panic!("expected a rag node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rag_node_deserializes_an_explicit_driver() {
+        let yaml = r#"
+name: kb
+start: research
+nodes:
+  research:
+    type: rag
+    documents: ["./docs"]
+    driver: duckdb
+    next: done
+  done:
+    type: end
+    output: ok
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(
+            rag_node_of(&graph, "research").driver.as_deref(),
+            Some("duckdb")
+        );
+    }
+
+    /// Workflows written before drivers existed must keep parsing, and must keep
+    /// asking for nothing, so `RagInitConfig` resolves them to the yaml default.
+    #[test]
+    fn rag_node_without_a_driver_stays_unset() {
+        let yaml = r#"
+name: kb
+start: research
+nodes:
+  research:
+    type: rag
+    documents: ["./docs"]
+    next: done
+  done:
+    type: end
+    output: ok
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(rag_node_of(&graph, "research").driver, None);
+    }
+
+    #[test]
+    fn rag_node_driver_survives_a_serialize_round_trip() {
+        let yaml = r#"
+name: kb
+start: research
+nodes:
+  research:
+    type: rag
+    documents: ["./docs"]
+    driver: duckdb
+    next: done
+  done:
+    type: end
+    output: ok
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let reparsed: Graph =
+            serde_yaml::from_str(&serde_yaml::to_string(&graph).unwrap()).unwrap();
+
+        assert_eq!(
+            rag_node_of(&reparsed, "research").driver.as_deref(),
+            Some("duckdb")
+        );
+    }
+
+    /// `skip_serializing_if` must keep `driver:` out of graphs that never set it.
+    #[test]
+    fn rag_node_without_a_driver_omits_the_key_when_serialized() {
+        let yaml = r#"
+name: kb
+start: research
+nodes:
+  research:
+    type: rag
+    documents: ["./docs"]
+    next: done
+  done:
+    type: end
+    output: ok
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(!serde_yaml::to_string(&graph).unwrap().contains("driver"));
     }
 }
