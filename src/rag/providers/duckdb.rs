@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use duckdb::Connection;
 use duckdb::types::Value;
+use duckdb::{AccessMode, Config, Connection};
 use indexmap::IndexMap;
 use log::warn;
 use std::path::{Path, PathBuf};
@@ -17,8 +17,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// `~/.duckdb/extensions/...`. Two threads installing the same extension at once
 /// both perform that move; on Windows the loser's move targets a file the winner
 /// already holds open and fails with "Access is denied", where POSIX would let the
-/// replacement through. Guards nothing but the install step, so it is never held
-/// across a `DuckDbProvider::conn` guard and cannot invert lock order.
+/// replacement through. Guards nothing but the install step.
+///
+/// Lock order is `DuckDbProvider::conn` -> INSTALL_LOCK, never the reverse:
+/// `ensure_writable` reopens the connection, and so may install, while holding the
+/// `ConnHandle` guard, whereas nothing ever acquires a `ConnHandle` guard while
+/// holding this lock. The cycle that would deadlock cannot form.
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
 /// Derive the DuckDB sidecar path from a RAG's YAML path: `docs.yaml` -> `docs.duckdb`.
@@ -26,9 +30,44 @@ pub(crate) fn duckdb_path_from_yaml(yaml_path: &Path) -> PathBuf {
     yaml_path.with_extension("duckdb")
 }
 
+/// The shared connection together with the access mode it was opened with.
+///
+/// `conn` is an `Option` only so that an upgrade can DROP the read-only connection
+/// before asking DuckDB for a read-write one. It is `Some` at every point an outside
+/// caller can observe, and is never left `None` on a path that returns `Ok`.
+struct ConnHandle {
+    conn: Option<Connection>,
+    /// True when `conn` was opened READ_WRITE. This lives behind the same mutex as the
+    /// connection itself rather than next to it in `DuckDbProvider`, so that a
+    /// `duplicate()` clone sharing the `Arc` observes an upgrade performed through any
+    /// other handle instead of keeping its own stale copy of the mode.
+    writable: bool,
+}
+
+impl ConnHandle {
+    fn conn(&self) -> Result<&Connection> {
+        self.conn.as_ref().ok_or_else(Self::lost)
+    }
+
+    fn conn_mut(&mut self) -> Result<&mut Connection> {
+        self.conn.as_mut().ok_or_else(Self::lost)
+    }
+
+    /// Only reachable when a read-write upgrade failed AND reopening read-only failed
+    /// too. Returning an error beats panicking inside a locked scope, which would
+    /// poison the mutex for the remaining life of the process.
+    fn lost() -> anyhow::Error {
+        anyhow!(
+            "The DuckDB connection was lost: upgrading it to read-write failed and the \
+             store could not be reopened read-only afterwards. Another process is \
+             holding the file; retry once it has released it."
+        )
+    }
+}
+
 pub struct DuckDbProvider {
     path: PathBuf,
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<Mutex<ConnHandle>>,
     /// Embedding dimension; fixed at open time because the `FLOAT[N]` column depends on it.
     dim: usize,
     /// True once an FTS index has been built on `documents`. Until then
@@ -40,28 +79,140 @@ pub struct DuckDbProvider {
 impl DuckDbProvider {
     /// Open (or create) the DuckDB file. `dim` is the embedding vector dimension,
     /// supplied by the caller who knows the model.
+    ///
+    /// Opens READ-ONLY whenever the file already carries a complete schema, so that any
+    /// number of Coyote processes can query the same RAG at the same time. DuckDB allows
+    /// many concurrent readers XOR exactly one writer, so the exclusive read-write handle
+    /// is taken only when there is actually something to write: when the store has to be
+    /// created or initialized here, or lazily through `ensure_writable` on the rebuild
+    /// path.
     pub fn open(db_path: &Path, dim: usize) -> Result<Self> {
-        let conn = Connection::open(db_path).with_context(|| {
+        let (conn, writable) = Self::open_for_workload(db_path, dim)?;
+        // A reopened file may already carry a live FTS index from a previous session,
+        // in which case keyword search works immediately.
+        let fts_exists = Self::probe_fts_index(&conn);
+        Ok(Self {
+            path: db_path.to_path_buf(),
+            conn: Arc::new(Mutex::new(ConnHandle {
+                conn: Some(conn),
+                writable,
+            })),
+            dim,
+            fts_ready: AtomicBool::new(fts_exists),
+        })
+    }
+
+    /// Pick the weakest access mode that can serve this store, returning the connection
+    /// and whether it came back writable.
+    fn open_for_workload(db_path: &Path, dim: usize) -> Result<(Connection, bool)> {
+        if db_path.exists()
+            && let Ok(conn) = Self::open_read_only(db_path)
+            && Self::store_is_initialized(&conn)
+        {
+            return Ok((conn, false));
+        }
+        // Three cases land here: the file does not exist yet, it could not be opened
+        // read-only (another process holds it read-write), or it carries no usable
+        // schema. All of them need a read-write handle, and the read-write attempt is
+        // also what produces the actionable lock error for the middle case.
+        let conn = Self::open_read_write(db_path, dim)?;
+        Ok((conn, true))
+    }
+
+    /// Is this file already a fully initialized Coyote store?
+    ///
+    /// This gate decides whether a read-only open is viable, so it must be exact: every
+    /// statement in `init_schema` is rejected outright on a read-only handle, INCLUDING
+    /// `CREATE TABLE IF NOT EXISTS` against a table that already exists, which DuckDB
+    /// refuses rather than treating as a no-op. Anything missing therefore forces a
+    /// read-write open. The HNSW index is part of the check because a store whose tables
+    /// survived but whose index did not would otherwise be opened read-only and silently
+    /// serve every `vector_search` from a full scan.
+    fn store_is_initialized(conn: &Connection) -> bool {
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM duckdb_tables() \
+                 WHERE table_name IN ('vectors', 'documents')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if tables < 2 {
+            return false;
+        }
+        conn.query_row(
+            "SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'hnsw_idx'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    /// Open the store read-only. Many processes may hold such a handle at once.
+    fn open_read_only(db_path: &Path) -> Result<Connection> {
+        let config = Config::default()
+            .access_mode(AccessMode::ReadOnly)
+            .context("Failed to build a read-only DuckDB configuration")?;
+        let conn = Connection::open_with_flags(db_path, config).with_context(|| {
             format!(
-                "Failed to open the DuckDB store at '{}'. If another Coyote process (or \
-                 another window) has this RAG open, close it and retry — a duckdb RAG can \
-                 only be open in ONE process at a time. Unlike the yaml driver, its data \
-                 lives in a single file with an exclusive lock.",
+                "Failed to open the DuckDB store at '{}' read-only",
                 db_path.display()
             )
         })?;
-        // Statement order is load-bearing. `hnsw_enable_experimental_persistence` is
-        // registered BY the vss extension, so setting it before `LOAD vss` fails with
-        // "Setting with name ... is not in the catalog, but it exists in the vss
-        // extension". Omitting it entirely makes CREATE INDEX ... USING HNSW on a
-        // file-backed database fail with "HNSW index persistence is not yet supported
-        // by default". ensure vss (installing it if missing) -> ensure fts -> SET ->
-        // CREATE INDEX.
-        Self::ensure_extension(&conn, "vss")?;
-        Self::ensure_extension(&conn, "fts")?;
+        Self::establish_session(&conn)?;
+        Ok(conn)
+    }
+
+    /// Open the store read-write and make sure its schema exists. Exactly one process
+    /// may hold such a handle, and no reader from another process may hold it meanwhile.
+    fn open_read_write(db_path: &Path, dim: usize) -> Result<Connection> {
+        let config = Config::default()
+            .access_mode(AccessMode::ReadWrite)
+            .context("Failed to build a read-write DuckDB configuration")?;
+        let conn = Connection::open_with_flags(db_path, config).with_context(|| {
+            format!(
+                "Failed to open the DuckDB store at '{}' for writing. Another Coyote \
+                 process (or another window) has this RAG open: a duckdb RAG supports MANY \
+                 concurrent READERS, but only ONE writer at a time, and a writer excludes \
+                 readers in other processes. Close that process, or wait for its sync to \
+                 finish, and retry.",
+                db_path.display()
+            )
+        })?;
+        Self::establish_session(&conn)?;
+        Self::init_schema(&conn, dim)?;
+        Ok(conn)
+    }
+
+    /// Install the per-connection session state that every connection needs, whatever
+    /// its access mode.
+    ///
+    /// Extension `LOAD`s and `SET` are per-CONNECTION, not per-database: a connection
+    /// opened later — an upgrade, in particular — starts with none of this and must run
+    /// it again. None of these statements write to the database, so they all succeed on
+    /// a read-only handle.
+    ///
+    /// Statement order is load-bearing. `hnsw_enable_experimental_persistence` is
+    /// registered BY the vss extension, so setting it before `LOAD vss` fails with
+    /// "Setting with name ... is not in the catalog, but it exists in the vss
+    /// extension". ensure vss (installing it if missing) -> ensure fts -> SET.
+    fn establish_session(conn: &Connection) -> Result<()> {
+        Self::ensure_extension(conn, "vss")?;
+        Self::ensure_extension(conn, "fts")?;
+        conn.execute_batch("SET hnsw_enable_experimental_persistence = true;")
+            .context("Failed to enable DuckDB HNSW index persistence")
+    }
+
+    /// Create the tables and the vector index. Every statement here WRITES, so this only
+    /// ever runs on a read-write connection.
+    ///
+    /// Must be preceded by `establish_session`: without the `SET` it performs, a
+    /// CREATE INDEX ... USING HNSW on a file-backed database fails with "HNSW index
+    /// persistence is not yet supported by default".
+    fn init_schema(conn: &Connection, dim: usize) -> Result<()> {
         conn.execute_batch(&format!(
-            "SET hnsw_enable_experimental_persistence = true;
-             CREATE TABLE IF NOT EXISTS vectors (
+            "CREATE TABLE IF NOT EXISTS vectors (
                  doc_id UBIGINT PRIMARY KEY,
                  embedding FLOAT[{dim}]
              );
@@ -73,16 +224,44 @@ impl DuckDbProvider {
                  page_content TEXT NOT NULL
              );"
         ))
-        .context("Failed to initialize DuckDB schema")?;
-        // A reopened file may already carry a live FTS index from a previous session,
-        // in which case keyword search works immediately.
-        let fts_exists = Self::probe_fts_index(&conn);
-        Ok(Self {
-            path: db_path.to_path_buf(),
-            conn: Arc::new(Mutex::new(conn)),
-            dim,
-            fts_ready: AtomicBool::new(fts_exists),
-        })
+        .context("Failed to initialize DuckDB schema")
+    }
+
+    /// Guarantee the shared connection is read-write, upgrading it in place if it is not.
+    /// EVERY write path must call this before touching the store.
+    ///
+    /// The upgrade replaces the `Connection` INSIDE the shared `Arc<Mutex<..>>`, so
+    /// `duplicate()` clones, which share that `Arc`, see it too. The read-only connection
+    /// is dropped before the read-write open because DuckDB tracks the file lock per
+    /// database instance and the old handle still holds one.
+    ///
+    /// On failure the store is reopened read-only so that queries keep working, and the
+    /// error is propagated so the caller aborts instead of writing. A failed upgrade must
+    /// leave the provider degraded, never bricked, and never silently read-only-with-a-
+    /// caller-that-thinks-it-wrote.
+    fn ensure_writable(&self) -> Result<()> {
+        let mut handle = self.lock_conn()?;
+        if handle.writable {
+            return Ok(());
+        }
+        drop(handle.conn.take());
+        match Self::open_read_write(&self.path, self.dim) {
+            Ok(conn) => {
+                handle.conn = Some(conn);
+                handle.writable = true;
+                Ok(())
+            }
+            Err(e) => {
+                handle.conn = Self::open_read_only(&self.path).ok();
+                Err(e.context(format!(
+                    "Cannot write to the DuckDB RAG at '{}': it is open read-only and could \
+                     not be upgraded to read-write, because another Coyote process has this \
+                     RAG open. NOTHING WAS WRITTEN. Close the other process, or wait for it \
+                     to finish, and retry.",
+                    self.path.display()
+                )))
+            }
+        }
     }
 
     /// Make a DuckDB extension available on `conn`, installing it if this machine does
@@ -136,8 +315,10 @@ impl DuckDbProvider {
     /// `rebuild_indexes` does `CREATE OR REPLACE TABLE` and writes exactly what it is
     /// given, so a thinned map is committed as the new truth on the next sync.
     pub(crate) fn read_all_vectors(&self) -> Result<IndexMap<DocumentId, Vec<f32>>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare("SELECT doc_id, embedding FROM vectors")?;
+        let handle = self.lock_conn()?;
+        let mut stmt = handle
+            .conn()?
+            .prepare("SELECT doc_id, embedding FROM vectors")?;
         let raw: Vec<(u64, Vec<f32>)> = stmt
             .query_map([], |row| {
                 let id: u64 = row.get(0)?;
@@ -226,7 +407,7 @@ impl DuckDbProvider {
     /// Never `.lock().unwrap()` here: a panic anywhere inside a locked scope poisons the
     /// mutex permanently, and an unwrap would then turn every subsequent RAG query into
     /// a panic for the remaining life of the process.
-    fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>> {
+    fn lock_conn(&self) -> Result<MutexGuard<'_, ConnHandle>> {
         self.conn
             .lock()
             .map_err(|e| anyhow!("DuckDB connection mutex was poisoned: {e}"))
@@ -253,7 +434,7 @@ impl RagProvider for DuckDbProvider {
             .collect::<Vec<_>>()
             .join(", ");
         let dim = self.dim;
-        let conn = self.lock_conn()?;
+        let handle = self.lock_conn()?;
         // array_cosine_distance requires a FLOAT[N] ARRAY, not the LIST type FLOAT[].
         // ORDER BY distance ASC is required for the planner to use hnsw_idx; the
         // similarity form (DESC) does NOT trigger the ANN index. Distance is converted
@@ -263,7 +444,7 @@ impl RagProvider for DuckDbProvider {
              array_cosine_distance(embedding, [{vals}]::FLOAT[{dim}]) AS distance \
              FROM vectors ORDER BY distance ASC LIMIT {top_k}"
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = handle.conn()?.prepare(&sql)?;
         let results = stmt
             .query_map([], |row| {
                 let id: u64 = row.get(0)?;
@@ -300,12 +481,12 @@ impl RagProvider for DuckDbProvider {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let conn = self.lock_conn()?;
+        let handle = self.lock_conn()?;
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let sql =
             format!("SELECT doc_id, page_content FROM documents WHERE doc_id IN ({placeholders})");
         let params: Vec<Value> = ids.iter().map(|id| Value::UBigInt(id.0 as u64)).collect();
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = handle.conn()?.prepare(&sql)?;
         let mut rows: Vec<(DocumentId, String)> = stmt
             .query_map(duckdb::params_from_iter(params.iter()), |row| {
                 let id: u64 = row.get(0)?;
@@ -345,8 +526,10 @@ impl RagProvider for DuckDbProvider {
                 // Scoped: the guard MUST be dropped before `lock_conn()` is taken again
                 // below. `Mutex` is not reentrant; holding both self-deadlocks at
                 // runtime, with no compile error.
-                let conn = self.lock_conn()?;
-                conn.query_row("SELECT count(*) FROM vectors", [], |r| r.get(0))
+                let handle = self.lock_conn()?;
+                handle
+                    .conn()?
+                    .query_row("SELECT count(*) FROM vectors", [], |r| r.get(0))
                     .context("Failed to count existing vectors before rebuild")?
             };
             if existing > 0 {
@@ -372,7 +555,16 @@ impl RagProvider for DuckDbProvider {
             }
         }
         let dim = self.dim;
-        let mut conn = self.lock_conn()?;
+        // THE write path. Everything above this line only reads, so the upgrade happens
+        // here, after both guards have had their say: a rebuild that is going to be
+        // refused must not first take the exclusive lock away from other processes.
+        //
+        // This is also the point that makes a silently-dropped write impossible. If the
+        // upgrade fails, `?` aborts the rebuild before a single statement is issued and
+        // the caller gets the error. Nothing below can run on a read-only connection.
+        self.ensure_writable()?;
+        let mut handle = self.lock_conn()?;
+        let conn = handle.conn_mut()?;
         let tx = conn
             .transaction()
             .context("Failed to begin DuckDB transaction")?;
@@ -476,9 +668,9 @@ impl RagProvider for DuckDbProvider {
     }
 
     async fn keyword_search(&self, query: &str, top_k: usize) -> Result<Vec<(DocumentId, f32)>> {
-        let conn = self.lock_conn()?;
+        let handle = self.lock_conn()?;
         // match_bm25 returns NULL for non-matching rows; WHERE filters them out.
-        let mut stmt = conn.prepare(
+        let mut stmt = handle.conn()?.prepare(
             "SELECT doc_id, fts_main_documents.match_bm25(doc_id, ?) AS score
              FROM documents
              WHERE score IS NOT NULL
@@ -533,6 +725,10 @@ impl RagProvider for DuckDbProvider {
         // disk and a rebuild through one handle is immediately visible to the other.
         // That is unavoidable for any on-disk store and is handled by the discipline
         // documented on `Rag`'s Clone impl, the pre-clone instance must be discarded.
+        //
+        // Sharing the Arc also shares the ACCESS MODE, which lives inside the ConnHandle
+        // rather than beside it: when one handle upgrades itself to read-write, every
+        // clone is upgraded with it and none is left holding a stale "read-only" belief.
         Box::new(DuckDbProvider {
             path: self.path.clone(),
             conn: Arc::clone(&self.conn),
@@ -547,6 +743,7 @@ mod tests {
     use super::*;
     use crate::rag::provider::RagProvider;
     use crate::rag::{RagDocument, RagFile};
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, fs};
 
@@ -625,7 +822,8 @@ mod tests {
     async fn open_creates_schema() {
         let db = TempDb::new("schema");
         let provider = DuckDbProvider::open(&db.path, 3).unwrap();
-        let conn = provider.conn.lock().unwrap();
+        let handle = provider.conn.lock().unwrap();
+        let conn = handle.conn().unwrap();
 
         let v: i64 = conn
             .query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))
@@ -643,7 +841,8 @@ mod tests {
         let db = TempDb::new("vsearch");
         let provider = DuckDbProvider::open(&db.path, 3).unwrap();
         {
-            let conn = provider.conn.lock().unwrap();
+            let handle = provider.conn.lock().unwrap();
+            let conn = handle.conn().unwrap();
             // The ::FLOAT[3] cast is REQUIRED: a bare [0.1, 0.2, 0.3] literal infers
             // DOUBLE[], which does not match the FLOAT[N] ARRAY column type.
             conn.execute(
@@ -668,7 +867,8 @@ mod tests {
         let db = TempDb::new("fetch");
         let provider = DuckDbProvider::open(&db.path, 3).unwrap();
         {
-            let conn = provider.conn.lock().unwrap();
+            let handle = provider.conn.lock().unwrap();
+            let conn = handle.conn().unwrap();
             conn.execute(
                 "INSERT INTO documents (doc_id, page_content) VALUES (42, 'hello world')",
                 [],
@@ -712,7 +912,8 @@ mod tests {
             .await
             .expect("second rebuild must not violate the primary key constraint");
 
-        let conn = provider.conn.lock().unwrap();
+        let handle = provider.conn.lock().unwrap();
+        let conn = handle.conn().unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))
             .unwrap();
@@ -744,7 +945,8 @@ mod tests {
         reloaded.vectors.insert(DocumentId(2), vec![0.7, 0.8, 0.9]);
         provider.rebuild_indexes(&reloaded, false).await.unwrap();
 
-        let conn = provider.conn.lock().unwrap();
+        let handle = provider.conn.lock().unwrap();
+        let conn = handle.conn().unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))
             .unwrap();
@@ -768,7 +970,8 @@ mod tests {
         data.vectors.insert(DocumentId(0), vec![0.1, 0.2, 0.3]);
         provider.rebuild_indexes(&data, true).await.unwrap();
         {
-            let conn = provider.conn.lock().unwrap();
+            let handle = provider.conn.lock().unwrap();
+            let conn = handle.conn().unwrap();
             let docs: i64 = conn
                 .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
                 .unwrap();
@@ -849,7 +1052,8 @@ mod tests {
             "got: {err}"
         );
 
-        let conn = provider.conn.lock().unwrap();
+        let handle = provider.conn.lock().unwrap();
+        let conn = handle.conn().unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))
             .unwrap();
@@ -877,7 +1081,8 @@ mod tests {
         let dup = provider.duplicate(&minimal_rag_data());
 
         {
-            let conn = provider.conn.lock().unwrap();
+            let handle = provider.conn.lock().unwrap();
+            let conn = handle.conn().unwrap();
             conn.execute(
                 "INSERT INTO documents (doc_id, page_content) VALUES (7, 'shared row')",
                 [],
@@ -900,7 +1105,8 @@ mod tests {
         let db = TempDb::new("nonfinite");
         let provider = DuckDbProvider::open(&db.path, 3).unwrap();
         {
-            let conn = provider.conn.lock().unwrap();
+            let handle = provider.conn.lock().unwrap();
+            let conn = handle.conn().unwrap();
             conn.execute(
                 "INSERT INTO vectors (doc_id, embedding) VALUES (0, [0.1, 0.2, 0.3]::FLOAT[3])",
                 [],
@@ -920,6 +1126,310 @@ mod tests {
         assert!(
             err.to_string().contains("non-finite"),
             "hydration must abort rather than silently drop the row; got: {err}"
+        );
+    }
+
+    /// Was the shared connection opened read-write? Reads the flag that lives inside the
+    /// shared handle, which is the same one `ensure_writable` flips.
+    fn is_writable(provider: &DuckDbProvider) -> bool {
+        provider.conn.lock().unwrap().writable
+    }
+
+    /// Build a fully initialized store, then let the read-write handle go so the file is
+    /// unlocked for the next opener.
+    async fn seed_store(path: &Path) {
+        let mut provider = DuckDbProvider::open(path, 3).unwrap();
+        assert!(is_writable(&provider), "a fresh file must open read-write");
+        let mut data = populated_rag_data();
+        data.vectors
+            .insert(DocumentId::new(0, 0), vec![0.1, 0.2, 0.3]);
+        provider.rebuild_indexes(&data, true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fresh_file_is_opened_read_write() {
+        let db = TempDb::new("freshrw");
+        let provider = DuckDbProvider::open(&db.path, 3).unwrap();
+
+        assert!(
+            is_writable(&provider),
+            "the schema has to be created, which writes, so a missing file must open \
+             read-write"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_initialized_store_is_reopened_read_only() {
+        let db = TempDb::new("reopenro");
+        seed_store(&db.path).await;
+
+        let provider = DuckDbProvider::open(&db.path, 3).unwrap();
+
+        assert!(
+            !is_writable(&provider),
+            "a store that needs no schema work must open read-only, so that other Coyote \
+             processes can query it at the same time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_without_the_coyote_schema_is_opened_read_write() {
+        let db = TempDb::new("noschema");
+        {
+            // A valid DuckDB file that is not one of ours. Opening it read-only would
+            // strand it forever: the init batch is refused on a read-only handle.
+            let conn = Connection::open(&db.path).unwrap();
+            conn.execute_batch("CREATE TABLE unrelated (x INTEGER);")
+                .unwrap();
+        }
+
+        let provider = DuckDbProvider::open(&db.path, 3).unwrap();
+
+        assert!(
+            is_writable(&provider),
+            "a schema-less file must open read-write"
+        );
+        let handle = provider.conn.lock().unwrap();
+        let tables: i64 = handle
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM duckdb_tables() \
+                 WHERE table_name IN ('vectors', 'documents')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 2, "the schema must have been created");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_store_still_serves_vector_and_keyword_search() {
+        let db = TempDb::new("rosearch");
+        seed_store(&db.path).await;
+
+        let provider = DuckDbProvider::open(&db.path, 3).unwrap();
+        assert!(!is_writable(&provider), "precondition: opened read-only");
+
+        let hits = provider
+            .vector_search(&[0.1, 0.2, 0.3], 5, 0.0)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the persisted HNSW index must be queryable read-only"
+        );
+        assert!(hits[0].1 > 0.99);
+
+        assert!(
+            provider.has_native_keyword_search(),
+            "the FTS index built by the previous session must still be detected on a \
+             read-only handle"
+        );
+        let kw = provider.keyword_search("alpha", 5).await.unwrap();
+        assert_eq!(kw.len(), 1, "keyword search must work read-only");
+
+        let docs = provider
+            .fetch_content(&[DocumentId::new(0, 0)])
+            .await
+            .unwrap();
+        assert_eq!(docs[0].1, "alpha keyword");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_handle_refuses_a_direct_write() {
+        let db = TempDb::new("rorefuse");
+        seed_store(&db.path).await;
+        let provider = DuckDbProvider::open(&db.path, 3).unwrap();
+        assert!(!is_writable(&provider), "precondition: opened read-only");
+
+        let handle = provider.conn.lock().unwrap();
+        let err = handle
+            .conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO documents (doc_id, page_content) VALUES (99, 'nope')",
+                [],
+            )
+            .unwrap_err();
+
+        // The backstop, not the primary defence: `rebuild_indexes` upgrades first and
+        // never reaches a write on a read-only handle. It matters anyway because DuckDB
+        // lets `transaction()` open and `commit()` return Ok on a read-only connection,
+        // so a write that slipped through would look like it had succeeded.
+        assert!(
+            err.to_string().contains("read-only mode"),
+            "a read-only handle must refuse writes loudly; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_indexes_upgrades_a_read_only_connection() {
+        let db = TempDb::new("upgrade");
+        seed_store(&db.path).await;
+
+        let mut provider = DuckDbProvider::open(&db.path, 3).unwrap();
+        assert!(!is_writable(&provider), "precondition: opened read-only");
+
+        let mut data = populated_rag_data();
+        data.vectors = provider.read_all_vectors().unwrap();
+        data.vectors
+            .insert(DocumentId::new(1, 0), vec![0.4, 0.5, 0.6]);
+        provider.rebuild_indexes(&data, false).await.unwrap();
+
+        assert!(
+            is_writable(&provider),
+            "the write path must have upgraded the connection in place"
+        );
+
+        // The upgraded connection is a NEW connection, so the per-connection session
+        // state has to have been re-established on it. Without the re-run `SET`, the
+        // CREATE INDEX ... USING HNSW inside rebuild_indexes would already have failed.
+        let persisted: String = {
+            let handle = provider.conn.lock().unwrap();
+            handle
+                .conn()
+                .unwrap()
+                .query_row(
+                    "SELECT CAST(current_setting('hnsw_enable_experimental_persistence') \
+                     AS VARCHAR)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            persisted, "true",
+            "the upgraded connection must re-run the SET; session state does not carry \
+             over from the dropped read-only connection"
+        );
+
+        drop(provider);
+        let reopened = DuckDbProvider::open(&db.path, 3).unwrap();
+        let all = reopened.read_all_vectors().unwrap();
+        assert_eq!(all.len(), 2, "the upgraded write must have reached disk");
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_is_visible_through_duplicate_clones() {
+        let db = TempDb::new("upgradedup");
+        seed_store(&db.path).await;
+
+        let mut provider = DuckDbProvider::open(&db.path, 3).unwrap();
+        assert!(!is_writable(&provider), "precondition: opened read-only");
+        let dup = provider.duplicate(&minimal_rag_data());
+
+        let mut data = populated_rag_data();
+        data.vectors = provider.read_all_vectors().unwrap();
+        provider.rebuild_indexes(&data, false).await.unwrap();
+
+        // `duplicate()` shares the Arc, and the access mode lives inside it, so the clone
+        // must observe the upgrade rather than keep believing it is read-only.
+        let via_dup = dup.fetch_content(&[DocumentId::new(0, 0)]).await.unwrap();
+        assert_eq!(
+            via_dup.len(),
+            1,
+            "the clone must still read after an upgrade"
+        );
+        assert!(
+            is_writable(&provider),
+            "the shared handle must report writable to every clone"
+        );
+    }
+
+    /// Two REAL OS processes reading one store at the same time.
+    ///
+    /// Ignored by default because it re-executes the test binary as a child process,
+    /// which is heavier and more environment-dependent than the rest of the suite. Run it
+    /// with:
+    ///   cargo test --all -- --ignored duckdb_store_is_shared_across_processes
+    ///
+    /// It cannot be written as an ordinary in-process test: DuckDB keeps ONE database
+    /// instance per process, so a second open in the same process bypasses the file lock
+    /// entirely (a read-write open succeeds even while this process holds a read-only
+    /// one). Only separate processes exercise the lock this feature exists to avoid.
+    #[tokio::test]
+    #[ignore = "spawns a second OS process; run explicitly with --ignored"]
+    async fn duckdb_store_is_shared_across_processes() {
+        const CHILD_DB: &str = "COYOTE_DUCKDB_MULTIPROC_DB";
+        const CHILD_EXPECT: &str = "COYOTE_DUCKDB_MULTIPROC_EXPECT";
+        const TEST_NAME: &str =
+            "rag::providers::duckdb::tests::duckdb_store_is_shared_across_processes";
+
+        if let Ok(path) = env::var(CHILD_DB) {
+            let expect = env::var(CHILD_EXPECT).unwrap_or_default();
+            let opened = DuckDbProvider::open(Path::new(&path), 3);
+            match expect.as_str() {
+                "readable" => {
+                    let provider = opened.expect(
+                        "a second process must be able to open a store that another \
+                         process holds READ-ONLY",
+                    );
+                    assert!(!is_writable(&provider), "the child must land read-only");
+                    let hits = provider
+                        .vector_search(&[0.1, 0.2, 0.3], 5, 0.0)
+                        .await
+                        .unwrap();
+                    assert_eq!(hits.len(), 1, "the child must read the seeded vector");
+                }
+                "blocked" => {
+                    let err = opened.err().expect(
+                        "a second process must NOT be able to open a store that another \
+                         process holds READ-WRITE",
+                    );
+                    let msg = format!("{err:#}");
+                    assert!(
+                        msg.contains("concurrent READERS") && msg.contains("only ONE writer"),
+                        "the lock error must explain the reader/writer rule; got: {msg}"
+                    );
+                }
+                other => panic!("unknown child expectation {other:?}"),
+            }
+            return;
+        }
+
+        let db = TempDb::new("multiproc");
+        seed_store(&db.path).await;
+
+        let run_child = |expect: &str| {
+            Command::new(env::current_exe().unwrap())
+                .args(["--exact", "--ignored", "--nocapture", TEST_NAME])
+                .env(CHILD_DB, &db.path)
+                .env(CHILD_EXPECT, expect)
+                .output()
+                .expect("failed to spawn the child test process")
+        };
+
+        // Phase 1: this process holds a READ-ONLY handle. The child must get one too.
+        let provider = DuckDbProvider::open(&db.path, 3).unwrap();
+        assert!(!is_writable(&provider), "precondition: parent is read-only");
+        let out = run_child("readable");
+        assert!(
+            out.status.success(),
+            "child could not share the read-only store:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let hits = provider
+            .vector_search(&[0.1, 0.2, 0.3], 5, 0.0)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the parent must still read after the child ran"
+        );
+
+        // Phase 2: upgrade this process to READ-WRITE. The child must now be refused,
+        // with the message that explains why.
+        provider.ensure_writable().unwrap();
+        let out = run_child("blocked");
+        assert!(
+            out.status.success(),
+            "a writer must exclude other processes, with an actionable error:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
