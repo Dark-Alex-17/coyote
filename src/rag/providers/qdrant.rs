@@ -3,6 +3,9 @@ use crate::rag::{DocumentId, RagData};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::{Client, Response, StatusCode};
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// Render Qdrant's error envelope into a human-readable message.
@@ -15,22 +18,18 @@ use std::collections::HashMap;
 ///   * routing-level 404s (a wrong HTTP verb) return an EMPTY body with no JSON at
 ///     all, which without the length check surfaces as "EOF while parsing a value"
 ///     instead of the actual 404.
-fn format_error_body(status: reqwest::StatusCode, body: &str) -> String {
+fn format_error_body(status: StatusCode, body: &str) -> String {
     if body.is_empty() {
         return format!("HTTP {status} (empty body — check the HTTP verb and path)");
     }
-    serde_json::from_str::<serde_json::Value>(body)
+    serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| v["status"]["error"].as_str().map(str::to_string))
         .unwrap_or_else(|| format!("HTTP {status}: {body}"))
 }
 
 /// Read the vector dimension out of a parsed `GET /collections/{name}` response.
-///
-/// Unnamed collections put `size` directly under `vectors`; named ones nest it
-/// under the vector's name. Both shapes occur in the wild, so try the flat one
-/// first and fall back to the first named entry.
-fn vector_dimension_from_collection(body: &serde_json::Value) -> Result<u64> {
+fn vector_dimension_from_collection(body: &Value) -> Result<u64> {
     let params = &body["result"]["config"]["params"];
     params["vectors"]["size"]
         .as_u64()
@@ -47,12 +46,12 @@ fn vector_dimension_from_collection(body: &serde_json::Value) -> Result<u64> {
 /// (multi-vector) collection.
 ///
 /// `vector_search` posts an unnamed vector, which a named-vector collection
-/// rejects with HTTP 400 on every query — so attaching one yields a RAG that is
+/// rejects with HTTP 400 on every query, so attaching one yields a RAG that is
 /// silently 100% broken. A named collection holding a SINGLE vector is
 /// structurally a map, identical in kind to the multi-named case, and rejects
 /// the same way; testing for a numeric `size` directly under `vectors` catches
 /// it, whereas counting keys (`len() > 1`) would wrongly accept it.
-fn is_multi_vector_config(body: &serde_json::Value) -> bool {
+fn is_multi_vector_config(body: &Value) -> bool {
     body["result"]["config"]["params"]["vectors"]["size"]
         .as_u64()
         .is_none()
@@ -63,27 +62,21 @@ fn is_multi_vector_config(body: &serde_json::Value) -> bool {
 /// Attach-only: this provider never writes to the remote collection. Coyote does
 /// not own the data, and `rebuild_indexes` refuses rather than pretending to.
 pub struct QdrantProvider {
-    /// `reqwest::Client` is Arc-backed, so `clone()` is O(1) and shares both the
-    /// connection pool and the `api-key` default header injected at build time.
-    client: reqwest::Client,
-    /// Includes the scheme, e.g. `http://qdrant.example.com:6333`.
+    client: Client,
     base_url: String,
     collection: String,
 }
 
 impl QdrantProvider {
-    /// The resolved API key is injected as a default header here and is
-    /// deliberately NOT stored on the struct: the plaintext value stays a local
-    /// of the caller and never outlives it.
-    fn make_client(api_key: Option<&str>) -> Result<reqwest::Client> {
-        let mut headers = reqwest::header::HeaderMap::new();
+    fn make_client(api_key: Option<&str>) -> Result<Client> {
+        let mut headers = HeaderMap::new();
         if let Some(key) = api_key {
-            let mut value = reqwest::header::HeaderValue::from_str(key)
-                .context("api-key header value is not valid ASCII")?;
+            let mut value =
+                HeaderValue::from_str(key).context("api-key header value is not valid ASCII")?;
             value.set_sensitive(true);
             headers.insert("api-key", value);
         }
-        reqwest::Client::builder()
+        Client::builder()
             .default_headers(headers)
             .build()
             .context("Failed to build reqwest client")
@@ -97,7 +90,7 @@ impl QdrantProvider {
         }
     }
 
-    async fn error_message(resp: reqwest::Response) -> String {
+    async fn error_message(resp: Response) -> String {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         format_error_body(status, &body)
@@ -109,7 +102,7 @@ impl QdrantProvider {
         host: &str,
         collection: &str,
         api_key: Option<&str>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<Value> {
         let base_url = Self::normalize_base_url(host);
         let client = Self::make_client(api_key)?;
         let resp = client
@@ -123,13 +116,13 @@ impl QdrantProvider {
                 Self::error_message(resp).await
             );
         }
+
         Ok(resp.json().await?)
     }
 
     pub async fn new(host: &str, collection: &str, api_key: Option<&str>) -> Result<Self> {
         let base_url = Self::normalize_base_url(host);
         let client = Self::make_client(api_key)?;
-        // Preflight: confirm the collection exists and we may read it.
         let resp = client
             .get(format!("{base_url}/collections/{collection}"))
             .send()
@@ -141,6 +134,7 @@ impl QdrantProvider {
                 Self::error_message(resp).await
             );
         }
+
         Ok(Self {
             client,
             base_url,
@@ -162,13 +156,15 @@ impl QdrantProvider {
                 Self::error_message(resp).await
             );
         }
-        let body: serde_json::Value = resp.json().await?;
+
+        let body: Value = resp.json().await?;
         let names = body["result"]["collections"]
             .as_array()
             .context("Unexpected /collections response shape")?
             .iter()
             .filter_map(|v| v["name"].as_str().map(str::to_string))
             .collect();
+
         Ok(names)
     }
 
@@ -178,6 +174,7 @@ impl QdrantProvider {
         api_key: Option<&str>,
     ) -> Result<u64> {
         let body = Self::fetch_collection(host, collection, api_key).await?;
+
         vector_dimension_from_collection(&body)
     }
 
@@ -187,11 +184,10 @@ impl QdrantProvider {
         api_key: Option<&str>,
     ) -> Result<bool> {
         let body = Self::fetch_collection(host, collection, api_key).await?;
+
         Ok(is_multi_vector_config(&body))
     }
 
-    /// Peek at one point to learn how its ID is typed. Returns the raw JSON
-    /// rendering, so a string ID comes back quoted and an integer one bare.
     pub async fn sample_point_id(
         host: &str,
         collection: &str,
@@ -201,23 +197,27 @@ impl QdrantProvider {
         let client = Self::make_client(api_key)?;
         let url = format!("{base_url}/collections/{collection}/points/scroll");
         let body = serde_json::json!({ "limit": 1, "with_payload": false });
+
         let resp = client
             .post(&url)
             .json(&body)
             .send()
             .await
             .with_context(|| format!("Failed to connect to {host}"))?;
+
         if !resp.status().is_success() {
             bail!(
                 "Failed to sample a point from '{collection}': {}",
                 Self::error_message(resp).await
             );
         }
-        let data: serde_json::Value = resp.json().await?;
+
+        let data: Value = resp.json().await?;
         let id_val = data["result"]["points"]
             .as_array()
             .and_then(|pts| pts.first())
             .map(|pt| pt["id"].to_string());
+
         Ok(id_val)
     }
 }
@@ -251,7 +251,7 @@ impl RagProvider for QdrantProvider {
                 Self::error_message(resp).await
             );
         }
-        let data: serde_json::Value = resp.json().await?;
+        let data: Value = resp.json().await?;
         let results = data["result"]
             .as_array()
             .context("Unexpected /points/search response shape")?
@@ -266,6 +266,7 @@ impl RagProvider for QdrantProvider {
             })
             .filter(|(_, score)| *score > min_score)
             .collect();
+
         Ok(results)
     }
 
@@ -279,7 +280,9 @@ impl RagProvider for QdrantProvider {
             "ids": id_list,
             "with_payload": true,
         });
+
         let resp = self.client.post(&url).json(&body).send().await?;
+
         if !resp.status().is_success() {
             bail!(
                 "Qdrant point fetch on '{}' failed: {}",
@@ -287,7 +290,7 @@ impl RagProvider for QdrantProvider {
                 Self::error_message(resp).await
             );
         }
-        let data: serde_json::Value = resp.json().await?;
+        let data: Value = resp.json().await?;
         let mut rows: Vec<(DocumentId, String)> = data["result"]
             .as_array()
             .context("Unexpected /points response shape")?
@@ -303,13 +306,14 @@ impl RagProvider for QdrantProvider {
         let position: HashMap<DocumentId, usize> =
             ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
         rows.sort_by_key(|(id, _)| position.get(id).copied().unwrap_or(usize::MAX));
+
         Ok(rows)
     }
 
     async fn rebuild_indexes(&mut self, data: &RagData, _full_rebuild: bool) -> Result<()> {
         // Both arms refuse. A silent `Ok(())` would make `.rebuild rag` and
         // `.edit rag-docs` look like they worked while writing nothing to the
-        // remote — leaving the user believing the collection was updated.
+        // remote, leaving the user believing the collection was updated.
         if data.attached {
             bail!(
                 "This RAG is attached to an external Qdrant collection. Coyote does not own \
@@ -340,7 +344,7 @@ mod tests {
     fn error_message_reads_the_object_status_envelope() {
         let body =
             r#"{"status": {"error": "Wrong input: Not existing vector name error:"}, "time": 0.0}"#;
-        let msg = format_error_body(reqwest::StatusCode::BAD_REQUEST, body);
+        let msg = format_error_body(StatusCode::BAD_REQUEST, body);
         assert!(msg.contains("Not existing vector name"), "got: {msg}");
         assert!(
             !msg.contains("EOF"),
@@ -350,15 +354,14 @@ mod tests {
 
     #[test]
     fn error_message_survives_the_string_status_and_the_empty_body() {
-        // Success envelope: `status` is a bare string, so the object lookup misses
-        // and we must fall back rather than panic or invent an error text.
-        let ok = format_error_body(reqwest::StatusCode::OK, r#"{"status": "ok", "time": 0.0}"#);
+        let ok = format_error_body(StatusCode::OK, r#"{"status": "ok", "time": 0.0}"#);
         assert!(
             ok.contains("200"),
             "no `status.error` present → fall back to status+body: {ok}"
         );
-        // Routing-level 404 from a wrong HTTP verb: empty body, no JSON at all.
-        let empty = format_error_body(reqwest::StatusCode::NOT_FOUND, "");
+
+        let empty = format_error_body(StatusCode::NOT_FOUND, "");
+
         assert!(empty.contains("empty body"), "got: {empty}");
         assert!(
             empty.contains("verb"),
@@ -384,15 +387,11 @@ mod tests {
 
     #[test]
     fn is_multi_vector_rejects_the_named_single_collection() {
-        // The only supported shape: a single unnamed vector.
         let unnamed = serde_json::json!({
             "result": {"config": {"params": {"vectors": {"size": 1536, "distance": "Cosine"}}}}
         });
         assert!(!is_multi_vector_config(&unnamed));
 
-        // Named but SINGLE — structurally a map, and writes to it fail with
-        // `400 "Wrong input: Not existing vector name error:"`. A `len() > 1` check
-        // would wrongly accept this one; that is the bug this case exists to catch.
         let named_single = serde_json::json!({
             "result": {"config": {"params": {"vectors": {"text": {"size": 1536}}}}}
         });
@@ -426,7 +425,7 @@ mod tests {
     #[tokio::test]
     async fn rebuild_indexes_refuses_for_attached_and_unattached_alike() {
         let mut provider = QdrantProvider {
-            client: reqwest::Client::new(),
+            client: Client::new(),
             base_url: "http://localhost:6333".to_string(),
             collection: "c".to_string(),
         };
@@ -459,13 +458,12 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_content_short_circuits_on_an_empty_id_list() {
-        // No network is touched: the early return happens before any request, which
-        // is why this can assert against an unreachable host.
         let provider = QdrantProvider {
-            client: reqwest::Client::new(),
+            client: Client::new(),
             base_url: "http://127.0.0.1:1".to_string(),
             collection: "c".to_string(),
         };
+
         assert!(provider.fetch_content(&[]).await.unwrap().is_empty());
     }
 
@@ -475,6 +473,7 @@ mod tests {
         let collections = QdrantProvider::list_collections("http://localhost:6333", None)
             .await
             .unwrap();
+
         assert!(!collections.is_empty());
     }
 
@@ -485,7 +484,9 @@ mod tests {
             .await
             .unwrap();
         let embedding = vec![0.0f32; 1536];
+
         let results = provider.vector_search(&embedding, 5, 0.0).await.unwrap();
+
         assert!(results.len() <= 5);
     }
 }

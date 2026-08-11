@@ -73,10 +73,6 @@ pub fn discover() -> Result<Vec<DiscoveredMixin>> {
     for path in collect_subdir_mixins(&paths::agents_data_dir()) {
         out.push(read_mixin(path)?);
     }
-    // RAG sidecars are FLAT files named `<rag>.sbx-mixin.yaml` inside rags/, not
-    // the `<subdir>/sbx-mixin.yaml` shape the two scans above walk. Loaded
-    // unconditionally, mirroring agents/*: a RAG mixin only adds an outbound
-    // allowlist entry for that RAG's host and opens no inbound rules.
     for path in collect_flat_mixins(&paths::rags_dir()) {
         out.push(read_mixin(path)?);
     }
@@ -184,8 +180,6 @@ fn collect_subdir_mixins(dir: &Path) -> Vec<PathBuf> {
     result
 }
 
-/// Mixins stored as flat `<name>.sbx-mixin.yaml` files directly inside `dir`,
-/// matched by suffix rather than by exact filename.
 fn collect_flat_mixins(dir: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
     let Ok(rd) = read_dir(dir) else { return result };
@@ -516,16 +510,13 @@ network:
         }
     }
 
-    /// RAG sidecars are flat `<name>.sbx-mixin.yaml` files, matched by SUFFIX.
     #[test]
     fn collect_flat_mixins_matches_rag_sidecars_by_suffix() {
         let root = unique_root("flat-mixins");
         fs::write(root.join("company-docs.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
         fs::write(root.join("alpha.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
-        // The RAGs themselves must not be picked up, only their sidecars.
         fs::write(root.join("company-docs.yaml"), "driver: qdrant\n").unwrap();
         fs::write(root.join("notes.yaml"), "driver: yaml\n").unwrap();
-        // A directory whose name ends in the suffix is not a mixin file.
         fs::create_dir_all(root.join("decoy.sbx-mixin.yaml")).unwrap();
 
         let found = collect_flat_mixins(&root);
@@ -533,7 +524,6 @@ network:
             .iter()
             .map(|p| p.file_name().unwrap().to_str().unwrap())
             .collect();
-        // Sorted by file name, so the order is deterministic.
         assert_eq!(
             names,
             vec!["alpha.sbx-mixin.yaml", "company-docs.sbx-mixin.yaml"]

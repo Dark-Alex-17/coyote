@@ -414,11 +414,10 @@ pub fn list_rags() -> Vec<String> {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 if let Some(name) = name.to_string_lossy().strip_suffix(".yaml") {
-                    // Sidecars are not RAGs. `.duckdb` files are already excluded by
-                    // the `.yaml` suffix check above; this rejects `<name>.sbx-mixin`.
                     if is_rag_sidecar_name(name) {
                         continue;
                     }
+
                     names.push(name.to_string());
                 }
             }
@@ -429,24 +428,10 @@ pub fn list_rags() -> Vec<String> {
     }
 }
 
-/// True for the sidecar YAML files that must never be listed or deleted as RAGs.
-/// `name` is the already-stripped stem (i.e. after `strip_suffix(".yaml")`).
-/// Uses `ends_with`, not `contains('.')`, so a RAG legitimately named "v2.docs" is
-/// not rejected.
 pub(crate) fn is_rag_sidecar_name(name: &str) -> bool {
     name.ends_with(".sbx-mixin")
 }
 
-/// Remove every sidecar belonging to RAG `name` in `dir`. Missing files are NOT an
-/// error. A failure to remove an EXISTING mixin IS an error and must propagate — a
-/// silently-orphaned mixin keeps a sandbox network permission alive after the user
-/// believes it is gone. The `.duckdb` orphan is only wasted disk, so its removal
-/// failure is ignorable; the asymmetry is deliberate.
-///
-/// Callers must run this BEFORE unlinking the primary `.yaml`. If the YAML goes first
-/// and this then fails, the RAG disappears from `list_rags()` — so the user can no
-/// longer select it to retry — while its network allow entry keeps being injected
-/// into every sandbox launch.
 pub(crate) fn remove_rag_sidecars(dir: &Path, name: &str) -> Result<()> {
     let duckdb_path = dir.join(format!("{name}.duckdb"));
     if duckdb_path.exists() {
@@ -463,6 +448,7 @@ pub(crate) fn remove_rag_sidecars(dir: &Path, name: &str) -> Result<()> {
             )
         })?;
     }
+
     Ok(())
 }
 
@@ -889,8 +875,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Unique temp dir for the sidecar helper tests. These take `dir: &Path` directly,
-    /// so no env-var mutation and therefore no `#[serial]` is needed.
     fn sidecar_temp_dir(label: &str) -> PathBuf {
         let unique = time::SystemTime::now()
             .duration_since(time::UNIX_EPOCH)
@@ -903,7 +887,6 @@ mod tests {
 
     #[test]
     fn is_rag_sidecar_name_accepts_dotted_rag_names() {
-        // A RAG legitimately named "v2.docs" must not be mistaken for a sidecar.
         assert!(!is_rag_sidecar_name("v2.docs"));
         assert!(!is_rag_sidecar_name("myrag"));
         assert!(is_rag_sidecar_name("myrag.sbx-mixin"));
@@ -940,8 +923,6 @@ mod tests {
         let root = sidecar_temp_dir("rag-sidecars-order");
         let yaml = root.join("docs.yaml");
         fs::write(&yaml, "rag").unwrap();
-        // A non-empty DIRECTORY at the mixin path makes remove_file fail, standing in
-        // for any real removal failure (permissions, a busy mount).
         let mixin = root.join("docs.sbx-mixin.yaml");
         fs::create_dir_all(&mixin).unwrap();
         fs::write(mixin.join("blocker"), "x").unwrap();
@@ -952,8 +933,6 @@ mod tests {
                 .contains("Failed to remove the sandbox mixin"),
             "got: {err}"
         );
-        // The whole point of removing sidecars first: the RAG is still on disk, still
-        // listed, and the deletion is retryable.
         assert!(
             yaml.exists(),
             "the .yaml must survive a sidecar-removal failure so the delete is retryable"

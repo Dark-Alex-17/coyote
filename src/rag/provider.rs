@@ -4,11 +4,6 @@ use async_trait::async_trait;
 
 /// Abstracts where RAG vector data is stored and queried.
 ///
-/// Implementors:
-///   - YamlProvider: HNSW in-memory, state derived from RagData.vectors/files
-///   - DuckDbProvider: DuckDB on-disk vector index + document store
-///   - QdrantProvider: remote Qdrant collection
-///
 /// The Rag orchestrator owns: embeddings, chunking, BM25 keyword search, graph RAG,
 /// entity extraction, RRF merging. Providers own: vector storage and content retrieval.
 #[async_trait]
@@ -26,7 +21,7 @@ pub trait RagProvider: Send + Sync {
     ///
     /// **Ordering contract:** implementations MUST return results in the same
     /// relative order as the input `ids` slice. `hybrid_search` passes an
-    /// RRF-ranked list and feeds the result straight to the LLM — a provider
+    /// RRF-ranked list and feeds the result straight to the LLM. A provider
     /// that returns rows in storage order (e.g. Qdrant `get_points`, DuckDB
     /// `WHERE id IN (...)`) would silently discard the ranking. Implementations
     /// that query an unordered backend must re-sort by input position before
@@ -43,34 +38,28 @@ pub trait RagProvider: Send + Sync {
     /// Called once at the end of every sync_documents pass.
     ///
     /// `full_rebuild` mirrors `sync_documents`' `refresh` parameter:
-    ///   - `true`  — a full re-index (`.rebuild rag`, `--rebuild-rag`, initial build).
+    ///   - `true`: a full re-index (`.rebuild rag`, `--rebuild-rag`, initial build).
     ///     Destructive strategies (wipe-then-reindex) are permitted.
-    ///   - `false` — an incremental change (`.edit rag-docs` adding/removing a file).
+    ///   - `false`: an incremental change (`.edit rag-docs` adding/removing a file).
     ///     Implementations MUST NOT wipe existing state; upsert only.
     ///
     /// The parameter is part of the signature from the outset so it is fixed
-    /// while there is exactly one implementor. Yaml/DuckDb ignore it —
+    /// while there is exactly one implementor. Yaml/DuckDb ignore it,
     /// rebuilding their local state wholesale is fast and always correct.
     /// Only a remote provider is destructive enough to care.
-    ///
-    /// YamlProvider: rebuilds HNSW + content map from data.vectors/files.
-    /// DuckDbProvider: writes new rows to DuckDB, deletes removed rows.
-    /// QdrantProvider: no-op while attach-only — remote data is unchanged.
     async fn rebuild_indexes(&mut self, data: &RagData, full_rebuild: bool) -> Result<()>;
 
     /// Keyword / full-text search. Returns (DocumentId, BM25-style score) sorted desc.
     ///
-    /// Default impl returns `Ok(vec![])` — callers fall back to `Rag.bm25` (local in-memory
-    /// BM25 built from `data.files`). DuckDbProvider overrides this with a native FTS query
-    /// (DuckDB's `fts` extension, installed once at schema-creation time).
+    /// Default impl returns `Ok(vec![])`. Callers fall back to `Rag.bm25` (local in-memory
+    /// BM25 built from `data.files`).
     ///
     /// Callers check `has_native_keyword_search()` before deciding which path to take:
     ///   - true  → call this method; skip `Rag.bm25`
     ///   - false → call `Rag.keyword_search()` which uses `Rag.bm25` (sync, infallible)
-    ///
-    /// YamlProvider and QdrantProvider do NOT override this (return empty).
     async fn keyword_search(&self, query: &str, top_k: usize) -> Result<Vec<(DocumentId, f32)>> {
         let _ = (query, top_k);
+
         Ok(vec![])
     }
 

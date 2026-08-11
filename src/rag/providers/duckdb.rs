@@ -1,9 +1,11 @@
 use crate::rag::provider::RagProvider;
 use crate::rag::{DocumentId, RagData};
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use duckdb::Connection;
+use duckdb::types::Value;
 use indexmap::IndexMap;
 use log::warn;
 use std::path::{Path, PathBuf};
@@ -136,9 +138,6 @@ impl DuckDbProvider {
     pub(crate) fn read_all_vectors(&self) -> Result<IndexMap<DocumentId, Vec<f32>>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare("SELECT doc_id, embedding FROM vectors")?;
-        // Collect into a Result, NOT a filter_map. `.filter_map(|r| r.ok())` here would
-        // turn a systematic decode failure (e.g. a schema written by a different duckdb
-        // version) into a silently short map, indistinguishable from an empty store.
         let raw: Vec<(u64, Vec<f32>)> = stmt
             .query_map([], |row| {
                 let id: u64 = row.get(0)?;
@@ -146,12 +145,12 @@ impl DuckDbProvider {
                 // column is read as a `Value` and destructured. A FLOAT[N] column yields
                 // `Value::Array`, a FLOAT[] column yields `Value::List`; match both so
                 // the reader survives a file written under either schema.
-                let embedding: Vec<f32> = match row.get::<_, duckdb::types::Value>(1)? {
-                    duckdb::types::Value::Array(vals) | duckdb::types::Value::List(vals) => vals
+                let embedding: Vec<f32> = match row.get::<_, Value>(1)? {
+                    Value::Array(vals) | Value::List(vals) => vals
                         .into_iter()
                         .map(|v| match v {
-                            duckdb::types::Value::Float(f) => f,
-                            duckdb::types::Value::Double(d) => d as f32,
+                            Value::Float(f) => f,
+                            Value::Double(d) => d as f32,
                             _ => f32::NAN,
                         })
                         .collect(),
@@ -184,6 +183,7 @@ impl DuckDbProvider {
             }
             out.insert(DocumentId(id as usize), embedding);
         }
+
         Ok(out)
     }
 
@@ -192,11 +192,10 @@ impl DuckDbProvider {
     ///
     /// A schema-existence check alone is NOT sufficient. After
     /// `CREATE OR REPLACE TABLE documents`, the `fts_main_documents` schema still
-    /// exists and `match_bm25` still SUCCEEDS — but returns zero rows for every term.
+    /// exists and `match_bm25` still SUCCEEDS, but returns zero rows for every term.
     /// The index is silently dead. The probe therefore asserts that a KNOWN row comes
     /// back rather than merely that the call did not error.
     fn probe_fts_index(conn: &Connection) -> bool {
-        // 1. Structural check — cheap, and short-circuits a never-built index.
         let schema_exists = conn
             .query_row(
                 "SELECT COUNT(*) FROM duckdb_schemas() WHERE schema_name = 'fts_main_documents'",
@@ -208,11 +207,6 @@ impl DuckDbProvider {
         if !schema_exists {
             return false;
         }
-        // 2. Liveness check — pull a real token out of a real row and confirm the index
-        //    scores that same row. A live index returns >= 1; a stale one returns 0
-        //    without erroring. An empty `documents` table cannot be probed, and
-        //    reporting false is correct: there is nothing to keyword-search, and the
-        //    next rebuild_indexes sets the flag directly.
         conn.query_row(
             "SELECT COUNT(*) FROM documents d
              WHERE fts_main_documents.match_bm25(
@@ -250,7 +244,6 @@ impl RagProvider for DuckDbProvider {
         top_k: usize,
         min_score: f32,
     ) -> Result<Vec<(DocumentId, f32)>> {
-        // Validate before building the SQL literal — a NaN would produce malformed SQL.
         if embedding.iter().any(|f| !f.is_finite()) {
             bail!("Query embedding contains a non-finite value (NaN or infinity)");
         }
@@ -276,11 +269,11 @@ impl RagProvider for DuckDbProvider {
                 let id: u64 = row.get(0)?;
                 // `array_cosine_distance` on a FLOAT[N] column returns FLOAT (f32), NOT
                 // DOUBLE. Reading it as f64 raises InvalidColumnType INSIDE the closure,
-                // which a bare `.filter_map(|r| r.ok())` would silently discard —
+                // which a bare `.filter_map(|r| r.ok())` would silently discard,
                 // yielding ZERO results with no error and no log line.
-                let distance: f32 = match row.get::<_, duckdb::types::Value>(1)? {
-                    duckdb::types::Value::Float(f) => f,
-                    duckdb::types::Value::Double(d) => d as f32,
+                let distance: f32 = match row.get::<_, Value>(1)? {
+                    Value::Float(f) => f,
+                    Value::Double(d) => d as f32,
                     other => {
                         warn!("unexpected distance type from DuckDB: {other:?}");
                         return Err(duckdb::Error::InvalidQuery);
@@ -299,6 +292,7 @@ impl RagProvider for DuckDbProvider {
             })
             .filter(|(_, score)| *score > min_score)
             .collect();
+
         Ok(results)
     }
 
@@ -310,10 +304,7 @@ impl RagProvider for DuckDbProvider {
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let sql =
             format!("SELECT doc_id, page_content FROM documents WHERE doc_id IN ({placeholders})");
-        let params: Vec<duckdb::types::Value> = ids
-            .iter()
-            .map(|id| duckdb::types::Value::UBigInt(id.0 as u64))
-            .collect();
+        let params: Vec<Value> = ids.iter().map(|id| Value::UBigInt(id.0 as u64)).collect();
         let mut stmt = conn.prepare(&sql)?;
         let mut rows: Vec<(DocumentId, String)> = stmt
             .query_map(duckdb::params_from_iter(params.iter()), |row| {
@@ -329,22 +320,21 @@ impl RagProvider for DuckDbProvider {
                 }
             })
             .collect();
-        // Ordering contract: `WHERE doc_id IN (...)` returns rows in storage order, NOT
-        // in the order of `ids`. Since `ids` is the RRF-ranked list, returning storage
-        // order would silently discard the ranking. Re-sort by input position.
-        let position: std::collections::HashMap<DocumentId, usize> =
+        let position: HashMap<DocumentId, usize> =
             ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+
         rows.sort_by_key(|(id, _)| position.get(id).copied().unwrap_or(usize::MAX));
+
         Ok(rows)
     }
 
     async fn rebuild_indexes(&mut self, data: &RagData, _full_rebuild: bool) -> Result<()> {
-        // Local on-disk state — a wholesale table reset plus re-INSERT is always
+        // Local on-disk state. A wholesale table reset plus re-INSERT is always
         // correct, so the incremental/full distinction is ignored.
         //
         // 🔴 ANTI-WIPE GUARD. The CREATE OR REPLACE TABLE below writes exactly what
         // `data.vectors` holds. An empty map on a RAG that HAS indexed files, against a
-        // store that ALREADY holds vectors, is always a bug — a failed/skipped
+        // store that ALREADY holds vectors, is always a bug; a failed/skipped
         // hydration, or a caller that emptied the live map. Refuse rather than commit
         // the loss. Every legitimate empty-vector rebuild also has an empty `files`
         // (a fresh RAG; the zero-document tests), so this cannot fire on a correct call.
@@ -353,7 +343,7 @@ impl RagProvider for DuckDbProvider {
         if data.vectors.is_empty() && !data.files.is_empty() {
             let existing: i64 = {
                 // Scoped: the guard MUST be dropped before `lock_conn()` is taken again
-                // below. `Mutex` is not reentrant — holding both self-deadlocks at
+                // below. `Mutex` is not reentrant; holding both self-deadlocks at
                 // runtime, with no compile error.
                 let conn = self.lock_conn()?;
                 conn.query_row("SELECT count(*) FROM vectors", [], |r| r.get(0))
@@ -382,7 +372,6 @@ impl RagProvider for DuckDbProvider {
             }
         }
         let dim = self.dim;
-        // `Connection::transaction()` takes `&mut self`, so this binding must be `mut`.
         let mut conn = self.lock_conn()?;
         let tx = conn
             .transaction()
@@ -408,7 +397,7 @@ impl RagProvider for DuckDbProvider {
 
         {
             // Plain INSERT: tables are empty after CREATE OR REPLACE, so no PK conflict.
-            // The embedding is bound as TEXT and cast in SQL — the duckdb crate's
+            // The embedding is bound as TEXT and cast in SQL. The duckdb crate's
             // `bind_parameter` has no arm for List/Array, so binding a vector directly
             // fails at runtime with "binding List parameters is not yet supported".
             let mut vstmt = tx.prepare(&format!(
@@ -418,12 +407,12 @@ impl RagProvider for DuckDbProvider {
                 tx.prepare("INSERT INTO documents (doc_id, page_content) VALUES (?, ?)")?;
 
             // 🔴 TWO INDEPENDENT LOOPS. `documents` is keyed on `files`, `vectors` on
-            // `vectors` — they are DIFFERENT key sets and neither is a subset of the
+            // `vectors`. They are DIFFERENT key sets and neither is a subset of the
             // other. Do not merge these into one loop over `&data.vectors` gated on a
             // lookup into `files`: that produces keys(documents) ⊆ keys(vectors), and
             // every id in `files \ vectors` (which `RagData::add`'s zip truncation
             // really does produce) becomes a live, rankable id from BM25 and
-            // graph_search that resolves to nothing — no error, no log line.
+            // graph_search that resolves to nothing; no error, no log line.
             for (id, doc) in data.iter_documents() {
                 dstmt.execute(duckdb::params![id.0 as u64, doc.page_content.as_str()])?;
             }
@@ -461,7 +450,7 @@ impl RagProvider for DuckDbProvider {
 
         // Rebuild the FTS index (must be outside the transaction). This rebuild is
         // MANDATORY on every pass, not an optimization: CREATE OR REPLACE TABLE above
-        // leaves the old fts_main_documents schema in place but DEAD — match_bm25 keeps
+        // leaves the old fts_main_documents schema in place but DEAD; match_bm25 keeps
         // succeeding while returning zero rows for every term.
         // GUARDED on a non-empty table: FTS cannot index an empty table, and
         // rebuild_indexes is legitimately called with zero documents (a fresh RAG, and
@@ -480,7 +469,7 @@ impl RagProvider for DuckDbProvider {
 
         // Live only if an index was actually built. With zero documents there is no FTS
         // index, so `has_native_keyword_search()` must stay false and hybrid_search must
-        // fall back to local BM25 — which is also empty, and therefore correct.
+        // fall back to local BM25, which is also empty, and therefore correct.
         self.fts_ready.store(doc_count > 0, Ordering::Relaxed);
 
         Ok(())
@@ -501,11 +490,11 @@ impl RagProvider for DuckDbProvider {
                 let id: u64 = row.get(0)?;
                 // Same hazard as vector_search's distance column: guessing the width
                 // wrong raises InvalidColumnType INSIDE the closure, which a bare
-                // `.filter_map(|r| r.ok())` silently discards — yielding ZERO keyword
+                // `.filter_map(|r| r.ok())` silently discards, yielding ZERO keyword
                 // hits, indistinguishable from "the query matched nothing".
-                let score: f32 = match row.get::<_, duckdb::types::Value>(1)? {
-                    duckdb::types::Value::Double(d) => d as f32,
-                    duckdb::types::Value::Float(f) => f,
+                let score: f32 = match row.get::<_, Value>(1)? {
+                    Value::Double(d) => d as f32,
+                    Value::Float(f) => f,
                     other => {
                         warn!("unexpected match_bm25 score type from DuckDB: {other:?}");
                         return Err(duckdb::Error::InvalidQuery);
@@ -543,7 +532,7 @@ impl RagProvider for DuckDbProvider {
         // This means DuckDbProvider clones are NOT independent snapshots: state lives on
         // disk and a rebuild through one handle is immediately visible to the other.
         // That is unavoidable for any on-disk store and is handled by the discipline
-        // documented on `Rag`'s Clone impl — the pre-clone instance must be discarded.
+        // documented on `Rag`'s Clone impl, the pre-clone instance must be discarded.
         Box::new(DuckDbProvider {
             path: self.path.clone(),
             conn: Arc::clone(&self.conn),
@@ -556,44 +545,37 @@ impl RagProvider for DuckDbProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Trait methods are only callable with the trait in scope.
     use crate::rag::provider::RagProvider;
-    // `RagFile` / `RagDocument` have private fields; struct-literal construction
-    // compiles only because this module is a descendant of `crate::rag`. They are
-    // deliberately not in the non-test `use` block — unused there, and `--deny warnings`
-    // rejects that.
     use crate::rag::{RagDocument, RagFile};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{env, fs};
 
-    /// Unique temp path per test. `tempfile` is not a dev-dependency; this mirrors the
-    /// house pattern used elsewhere in the tree.
     struct TempDb {
         path: PathBuf,
     }
 
     impl TempDb {
         fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("coyote-duckdb-{tag}-{unique}.duckdb"));
+            let path = env::temp_dir().join(format!("coyote-duckdb-{tag}-{unique}.duckdb"));
             Self { path }
         }
     }
 
     impl Drop for TempDb {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-            // DuckDB writes a `<path>.wal` sidecar; remove it too or /tmp accumulates
-            // one per test run.
-            let _ = std::fs::remove_file(self.path.with_extension("duckdb.wal"));
+            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(self.path.with_extension("duckdb.wal"));
         }
     }
 
     /// ⚠️ NOTE THE EMPTY `files`. This fixture describes a RAG with ZERO documents.
     /// Since `rebuild_indexes` populates the `documents` table from
     /// `data.iter_documents()` (keyed on `files`), any test built on this helper alone
-    /// exercises the `vectors` table and NOTHING ELSE — no `documents` rows, no FTS
+    /// exercises the `vectors` table and NOTHING ELSE. No `documents` rows, no FTS
     /// index. That is correct for the rebuild tests below, and is exactly why the
     /// FTS-flag test and the `fetch_content` tests use `populated_rag_data()` instead.
     /// Do not "simplify" them back onto this helper.
@@ -609,7 +591,7 @@ mod tests {
         }
     }
 
-    /// Two files, one document each — the minimum fixture that produces `documents`
+    /// Two files, one document each; the minimum fixture that produces `documents`
     /// rows.
     fn populated_rag_data() -> RagData {
         let mut data = minimal_rag_data();
@@ -644,12 +626,14 @@ mod tests {
         let db = TempDb::new("schema");
         let provider = DuckDbProvider::open(&db.path, 3).unwrap();
         let conn = provider.conn.lock().unwrap();
+
         let v: i64 = conn
             .query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))
             .unwrap();
         let d: i64 = conn
             .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
             .unwrap();
+
         assert_eq!(v, 0);
         assert_eq!(d, 0);
     }
@@ -668,10 +652,12 @@ mod tests {
             )
             .unwrap();
         }
+
         let results = provider
             .vector_search(&[0.1, 0.2, 0.3], 5, 0.0)
             .await
             .unwrap();
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.0, 0);
         assert!(results[0].1 > 0.99);
@@ -689,7 +675,9 @@ mod tests {
             )
             .unwrap();
         }
+
         let results = provider.fetch_content(&[DocumentId(42)]).await.unwrap();
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, "hello world");
     }
@@ -700,19 +688,15 @@ mod tests {
         let mut provider = DuckDbProvider::open(&db.path, 3).unwrap();
         let data = minimal_rag_data();
         provider.rebuild_indexes(&data, true).await.unwrap();
+
         let results = provider
             .vector_search(&[0.1, 0.2, 0.3], 5, 0.0)
             .await
             .unwrap();
-        assert!(results.is_empty()); // no vectors in empty data
+
+        assert!(results.is_empty());
     }
 
-    /// Rebuilding TWICE must succeed.
-    ///
-    /// The first rebuild always passes because the tables start empty. The bug this
-    /// guards against — `DELETE FROM` plus re-INSERT of the same PKs inside one
-    /// transaction — only fires on the SECOND rebuild, with "Duplicate key ... violates
-    /// primary key constraint". A single-rebuild test cannot catch it.
     #[tokio::test]
     async fn rebuild_indexes_is_idempotent_across_two_passes() {
         let db = TempDb::new("idempotent");
@@ -722,7 +706,7 @@ mod tests {
         data.vectors.insert(DocumentId(1), vec![0.4, 0.5, 0.6]);
 
         provider.rebuild_indexes(&data, true).await.unwrap();
-        // Second pass over the SAME doc_ids — this is the assertion that matters.
+
         provider
             .rebuild_indexes(&data, true)
             .await
@@ -735,27 +719,16 @@ mod tests {
         assert_eq!(count, 2, "rebuild must replace rows, not duplicate them");
     }
 
-    /// Guards the incremental data-loss bug: `sync_documents` hash-skips unchanged
-    /// files, so on an incremental pass `data.vectors` holds ONLY the newly embedded
-    /// chunks. If the live map is ever emptied, the `CREATE OR REPLACE TABLE` in
-    /// rebuild_indexes writes only those, destroying every previously indexed vector.
-    /// Hydration via `read_all_vectors()` is what prevents it.
-    ///
-    /// This simulates the real restart-then-edit sequence: build, drop the in-memory
-    /// map, rehydrate from disk, add one vector, rebuild incrementally.
     #[tokio::test]
     async fn rebuild_indexes_preserves_prior_vectors_on_incremental_pass() {
         let db = TempDb::new("incremental");
         let mut provider = DuckDbProvider::open(&db.path, 3).unwrap();
 
-        // Pass 1 — initial full build with two vectors.
         let mut data = minimal_rag_data();
         data.vectors.insert(DocumentId(0), vec![0.1, 0.2, 0.3]);
         data.vectors.insert(DocumentId(1), vec![0.4, 0.5, 0.6]);
         provider.rebuild_indexes(&data, true).await.unwrap();
 
-        // Simulate a restart: the YAML on disk carries NO vectors, so a fresh RagData
-        // starts empty. create() hydrates it back from the sidecar.
         let mut reloaded = minimal_rag_data();
         assert!(
             reloaded.vectors.is_empty(),
@@ -768,7 +741,6 @@ mod tests {
             "hydration must restore both vectors"
         );
 
-        // Pass 2 — incremental add of ONE new chunk.
         reloaded.vectors.insert(DocumentId(2), vec![0.7, 0.8, 0.9]);
         provider.rebuild_indexes(&reloaded, false).await.unwrap();
 
@@ -783,14 +755,6 @@ mod tests {
         );
     }
 
-    /// `has_native_keyword_search()` must be false before any FTS index exists,
-    /// otherwise hybrid_search routes into keyword_search and the `?` turns a DuckDB
-    /// catalog error into a total query failure.
-    ///
-    /// 🔴 THE FIXTURE MUST CARRY DOCUMENTS. `rebuild_indexes` builds the FTS index only
-    /// when the `documents` table is non-empty, and that table is filled from
-    /// `data.iter_documents()` (keyed on `files`), never from `vectors`. With `files`
-    /// empty the pragma is skipped and `fts_ready` stores `false`.
     #[tokio::test]
     async fn keyword_search_is_not_advertised_before_first_rebuild() {
         let db = TempDb::new("ftsflag");
@@ -800,13 +764,10 @@ mod tests {
             "a freshly opened DB has no FTS index yet"
         );
 
-        // 2 files × 1 document → 2 `documents` rows → doc_count > 0 → pragma runs.
         let mut data = populated_rag_data();
         data.vectors.insert(DocumentId(0), vec![0.1, 0.2, 0.3]);
         provider.rebuild_indexes(&data, true).await.unwrap();
         {
-            // Pin the precondition explicitly. If this ever reads 0 the assertion below
-            // is vacuous and the FTS hazard is unguarded again.
             let conn = provider.conn.lock().unwrap();
             let docs: i64 = conn
                 .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
@@ -819,23 +780,11 @@ mod tests {
         );
     }
 
-    /// The `documents` table is keyed on `files`, NOT on `vectors`.
-    ///
-    /// `fetch_content` is the sink for BOTH the BM25 and graph_search paths, and both
-    /// enumerate `files` via `iter_documents()`. If `rebuild_indexes` only inserts a
-    /// documents row for ids that also appear in `data.vectors`, every id in
-    /// `files \ vectors` resolves to nothing: healthy BM25 scores, healthy graph hits,
-    /// zero results, no error.
-    ///
-    /// The incremental test CANNOT catch this — its fixture has an empty `files`, so the
-    /// documents table is empty in every assertion either way.
     #[tokio::test]
     async fn fetch_content_resolves_documents_without_vectors() {
         let db = TempDb::new("docsnovec");
         let mut provider = DuckDbProvider::open(&db.path, 3).unwrap();
 
-        // Two files, one document each — but a vector for ONLY THE FIRST. This is the
-        // `RagData::add` zip-truncation shape.
         let mut data = populated_rag_data();
         let id_a = DocumentId::new(0, 0);
         let id_b = DocumentId::new(1, 0);
@@ -858,13 +807,6 @@ mod tests {
         assert_eq!(got[1].1, "beta keyword");
     }
 
-    /// `fetch_content` must return rows in INPUT order, not storage order.
-    ///
-    /// `YamlProvider` satisfies this contract structurally — it maps over `ids` — so the
-    /// existing yaml test proves nothing about DuckDB. DuckDB's `WHERE doc_id IN (...)`
-    /// returns storage order and relies on an explicit positional re-sort, which is what
-    /// can actually regress. `ids` is the RRF-ranked list, so losing the order silently
-    /// discards the ranking while still returning the right documents.
     #[tokio::test]
     async fn duckdb_fetch_content_preserves_input_order() {
         let db = TempDb::new("order");
@@ -872,11 +814,9 @@ mod tests {
         let data = populated_rag_data();
         provider.rebuild_indexes(&data, true).await.unwrap();
 
-        let id_a = DocumentId::new(0, 0); // inserted first  → storage order 0
-        let id_b = DocumentId::new(1, 0); // inserted second → storage order 1
+        let id_a = DocumentId::new(0, 0);
+        let id_b = DocumentId::new(1, 0);
 
-        // REVERSED relative to storage order. Without the positional re-sort this
-        // returns ["alpha keyword", "beta keyword"] and the assertion fails.
         let got = provider.fetch_content(&[id_b, id_a]).await.unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].0, id_b, "input order must win over storage order");
@@ -885,19 +825,11 @@ mod tests {
         assert_eq!(got[1].1, "alpha keyword");
     }
 
-    /// The anti-wipe guard.
-    ///
-    /// `rebuild_indexes` does `CREATE OR REPLACE TABLE` and writes exactly what
-    /// `data.vectors` holds. An empty map on a RAG that HAS indexed files, against a
-    /// store that already holds vectors, is always a bug (failed hydration, or a caller
-    /// that emptied the live map) and must be refused rather than committed. The loss
-    /// would otherwise be permanent: nothing re-embeds it back.
     #[tokio::test]
     async fn rebuild_indexes_refuses_to_wipe_when_vectors_are_empty_but_files_are_not() {
         let db = TempDb::new("nowipe");
         let mut provider = DuckDbProvider::open(&db.path, 3).unwrap();
 
-        // A healthy store: two files with documents, two vectors.
         let mut data = populated_rag_data();
         data.vectors
             .insert(DocumentId::new(0, 0), vec![0.1, 0.2, 0.3]);
@@ -905,8 +837,7 @@ mod tests {
             .insert(DocumentId::new(1, 0), vec![0.4, 0.5, 0.6]);
         provider.rebuild_indexes(&data, true).await.unwrap();
 
-        // Now the failure state: vectors lost in memory, files intact.
-        let broken = populated_rag_data(); // same files, NO vectors
+        let broken = populated_rag_data();
         assert!(
             broken.vectors.is_empty() && !broken.files.is_empty(),
             "precondition"
@@ -918,7 +849,6 @@ mod tests {
             "got: {err}"
         );
 
-        // The store must be untouched — this is the whole point.
         let conn = provider.conn.lock().unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))
@@ -929,31 +859,23 @@ mod tests {
         );
     }
 
-    /// The guard must NOT fire on a legitimately empty RAG — otherwise a fresh
-    /// `Rag::init()` cannot complete. Empty `vectors` AND empty `files` is fine.
     #[tokio::test]
     async fn rebuild_indexes_allows_empty_vectors_when_files_are_also_empty() {
         let db = TempDb::new("emptyok");
         let mut provider = DuckDbProvider::open(&db.path, 3).unwrap();
-        let data = minimal_rag_data(); // no files, no vectors
+        let data = minimal_rag_data();
         provider
             .rebuild_indexes(&data, true)
             .await
             .expect("a fresh RAG with nothing indexed must rebuild cleanly");
     }
 
-    /// `duplicate()` must clone the Arc, NOT call `open()` again.
-    ///
-    /// This asserts SHARED state, which is the actual contract. It deliberately does NOT
-    /// use `fetch_content(&[])` — that early-returns before ever touching the
-    /// connection, so it would pass even against a broken double-opening implementation.
     #[tokio::test]
     async fn duplicate_shares_the_same_connection() {
         let db = TempDb::new("dup");
         let provider = DuckDbProvider::open(&db.path, 3).unwrap();
         let dup = provider.duplicate(&minimal_rag_data());
 
-        // Write through the ORIGINAL...
         {
             let conn = provider.conn.lock().unwrap();
             conn.execute(
@@ -962,8 +884,9 @@ mod tests {
             )
             .unwrap();
         }
-        // ...and read it back through the DUPLICATE. Only possible if they share state.
+
         let via_dup = dup.fetch_content(&[DocumentId(7)]).await.unwrap();
+
         assert_eq!(
             via_dup.len(),
             1,
@@ -972,8 +895,6 @@ mod tests {
         assert_eq!(via_dup[0].1, "shared row");
     }
 
-    /// A decode failure must abort hydration rather than yield a thinned map: a short
-    /// map is what the next CREATE OR REPLACE commits as the new truth.
     #[tokio::test]
     async fn read_all_vectors_rejects_non_finite_embeddings() {
         let db = TempDb::new("nonfinite");
@@ -1005,6 +926,7 @@ mod tests {
     #[test]
     fn duckdb_path_from_yaml_swaps_extension() {
         let p = duckdb_path_from_yaml(Path::new("/tmp/rags/docs.yaml"));
+
         assert_eq!(p, PathBuf::from("/tmp/rags/docs.duckdb"));
     }
 }

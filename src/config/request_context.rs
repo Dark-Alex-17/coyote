@@ -142,11 +142,6 @@ pub struct RequestContext {
     pub role: Option<Role>,
     pub session: Option<Session>,
     pub rag: Option<Arc<Rag>>,
-    /// The cache key `self.rag` was actually inserted under, carried rather than
-    /// reconstructed. Reconstruction was the bug: the invalidation sites do not have
-    /// the information needed to rebuild the key (agent RAGs are inserted under the
-    /// AGENT's name but `rag.name()` is the constant "rag"), so insert and invalidate
-    /// silently disagreed. `None` for the temp RAG, which bypasses the cache entirely.
     pub rag_key: Option<RagKey>,
     pub agent: Option<Agent>,
 
@@ -4122,14 +4117,10 @@ impl RequestContext {
         }
 
         let app = self.app.config.clone();
-        // Hoisted: `rag_cache` below borrows `self`, so the loader closure cannot
-        // reach through `self` for the vault. `GlobalVault` is an Arc, so this is cheap.
         let vault = self.app.vault.clone();
         let rag_cache = self.rag_cache();
         let working_mode = self.working_mode;
 
-        // The key is returned alongside the Rag rather than assigned inside the match:
-        // `rag_cache` borrows `self`, so writing `self.rag_key` there is E0506.
         let (rag, rag_key): (Arc<Rag>, Option<RagKey>) = match rag {
             None => {
                 let rag_path = self.rag_file(super::TEMP_RAG_NAME);
@@ -4138,7 +4129,6 @@ impl RequestContext {
                         format!("Failed to cleanup previous '{}' rag", super::TEMP_RAG_NAME)
                     })?;
                 }
-                // The temp RAG is never inserted into the cache, so it has no key.
                 (
                     Arc::new(
                         Rag::init(
@@ -4198,13 +4188,9 @@ impl RequestContext {
         let vault = self.app.vault.clone();
         let rag = Rag::attach(app, &vault, name, &rag_path).await?;
         let rag = Arc::new(rag);
-        // Populate the cache so a later `.rag <name>` reuses this instance rather
-        // than re-running the network preflight. Attach is always a global RAG.
         let key = RagKey::Named(name.to_string());
         self.rag_cache().insert(key.clone(), &rag);
         self.rag = Some(rag);
-        // Carried so invalidation in rebuild_rag()/edit_rag_docs() can find this
-        // entry; without it a stale Arc would linger in the cache all session.
         self.rag_key = Some(key);
         Ok(())
     }
@@ -4217,7 +4203,7 @@ impl RequestContext {
 
         if rag.is_attached() {
             bail!(
-                "Cannot edit documents on an attached RAG — Coyote does not own its source documents."
+                "Cannot edit documents on an attached RAG; Coyote does not own its source documents."
             );
         }
 
@@ -4270,7 +4256,7 @@ impl RequestContext {
 
         if rag.is_attached() {
             bail!(
-                "Cannot rebuild an attached RAG — Coyote does not own its source documents. \
+                "Cannot rebuild an attached RAG; Coyote does not own its source documents. \
                  Re-index from the system that originally created '{}'.",
                 rag.name()
             );
@@ -4716,8 +4702,6 @@ mod tests {
         )
         .unwrap();
 
-        // Stand in for the state `.rag docs` leaves behind: `use_rag` sets `rag` and
-        // `rag_key` together, so a named key is live when the agent is entered.
         ctx.rag_key = Some(RagKey::Named("docs".to_string()));
 
         tokio::runtime::Builder::new_current_thread()
@@ -4730,9 +4714,6 @@ mod tests {
                     .unwrap();
             });
 
-        // This agent has no RAG, so `rag` is None and `rag_key` must be None as well.
-        // Carrying `Named("docs")` across the transition would point `.rebuild rag`
-        // at an unrelated RAG's cache entry.
         assert!(ctx.rag.is_none());
         assert_eq!(ctx.rag_key, None);
     }
@@ -6122,9 +6103,6 @@ mod tests {
         assert!(paths::list_rags().is_empty());
     }
 
-    /// A `<name>.sbx-mixin.yaml` sidecar must not appear as a phantom RAG in TAB
-    /// completion or `.list rag`. A RAG whose name legitimately contains a dot must
-    /// still be listed — the filter uses `ends_with`, not `contains('.')`.
     #[test]
     #[serial]
     fn list_rags_skips_sbx_mixin_sidecars() {

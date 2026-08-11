@@ -1749,11 +1749,6 @@ std::error::Error>> {
         );
     }
 
-    /// Removes CSI escape sequences so only printable content is measured.
-    ///
-    /// Deliberately tolerant of malformed input: a sequence that was sliced
-    /// mid-escape swallows the following characters, which is precisely the
-    /// corruption `render_table_pads_columns_by_display_width` exists to catch.
     fn strip_ansi(text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut chars = text.chars();
@@ -1780,12 +1775,6 @@ std::error::Error>> {
         assert_eq!(strip_ansi("plain"), "plain");
     }
 
-    /// `render_table` hands comfy-table pre-styled cells that already contain
-    /// ANSI escapes, and `colorize_box_chars` adds more afterwards. Column
-    /// widths are therefore only correct if the escapes are excluded from the
-    /// width calculation. When they are not, the table still renders and every
-    /// other assertion in this file still passes -- only the alignment silently
-    /// degrades -- so this is the sole guard over that behaviour.
     #[test]
     fn render_table_pads_columns_by_display_width() {
         use unicode_width::UnicodeWidthStr;

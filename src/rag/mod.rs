@@ -12,9 +12,6 @@ mod splitter;
 
 use self::graph::{KnowledgeGraph, extract_entities};
 use self::provider::RagProvider;
-// `providers::duckdb_path_from_yaml(path)` is called through the module path in
-// `create()`, so `providers` itself must stay in scope — do not collapse it into
-// the `use` below.
 use self::providers::{DuckDbProvider, QdrantProvider, YamlProvider};
 use crate::sandbox::mcp_credentials;
 use crate::vault::{Vault, interpolate_secrets};
@@ -65,10 +62,7 @@ pub struct Rag {
     name: String,
     path: String,
     embedding_model: Model,
-    // Local BM25: keyword search + graph seeding. Always built from `data.files`
-    // regardless of driver, and kept on `Rag` so the sync `graph_search` can use it.
     bm25: SearchEngine<DocumentId>,
-    // Vector storage + content retrieval.
     provider: Box<dyn RagProvider>,
     data: RagData,
     last_sources: RwLock<Option<String>>,
@@ -126,8 +120,7 @@ pub struct RagInitConfig {
     pub extractor_model: Option<String>,
     pub extractor_prompt: Option<String>,
     pub graph_hops: Option<usize>,
-    /// `None` -> "yaml". No serde attribute: this struct derives only
-    /// `Debug, Clone, Default` and is built in Rust, never deserialized.
+    /// `None` -> "yaml"
     pub driver: Option<String>,
 }
 
@@ -367,8 +360,6 @@ impl Rag {
         // plaintext.
         let data: RagData = serde_yaml::from_str(&raw_content).with_context(err)?;
 
-        // Validated before the match so the rule applies to every driver, including
-        // the sync fallthrough below.
         data.validate().with_context(err)?;
 
         match data.driver.as_str() {
@@ -384,7 +375,6 @@ impl Rag {
                     .context("qdrant driver requires 'collection' in driver_config")?
                     .clone();
 
-                // Resolved out of band and kept in a local; it never enters `data`.
                 let api_key: Option<String> = match data.driver_config.get("api_key") {
                     Some(placeholder) => {
                         let (resolved, _) =
@@ -411,14 +401,10 @@ impl Rag {
                     last_sources: RwLock::new(None),
                 })
             }
-            // yaml/duckdb take the sync path. It re-reads and re-parses the file;
-            // that cost is accepted to keep every existing caller untouched.
             _ => Self::load(app, name, path),
         }
     }
 
-    /// Connects to a pre-existing external collection. Coyote is a query-only
-    /// client here: it never indexes documents into it.
     pub async fn attach(
         app: &AppConfig,
         vault: &Vault,
@@ -435,8 +421,6 @@ impl Rag {
         let host = Text::new("Host (e.g. qdrant.company.com:6333):")
             .with_validator(required!("This field is required"))
             .with_validator(|input: &str| {
-                // Bracketed IPv6 literals would produce a malformed sandbox
-                // network allow entry, so refuse them at the prompt.
                 Ok(if input.contains('[') || input.contains(']') {
                     Validation::Invalid(
                         "Bracketed IPv6 literals are not supported; use a hostname.".into(),
@@ -583,7 +567,6 @@ impl Rag {
         Ok(rag)
     }
 
-    /// `mut data` — the duckdb arm rehydrates `data.vectors` from the sidecar.
     pub fn create(app: &AppConfig, name: &str, path: &Path, mut data: RagData) -> Result<Self> {
         // Deliberately does NOT call rebuild_indexes: both callers construct the Rag
         // before any documents are added, so rebuilding empty data would be a no-op.
@@ -603,11 +586,11 @@ impl Rag {
                 // Guarded on is_empty() so a caller that already has vectors in memory
                 // is never overwritten by an empty table.
                 //
-                // 🔴 `?`, NOT `unwrap_or_default()`. A hydration failure must propagate.
-                // Degrading to an empty map here loads a RAG that looks healthy, answers
-                // every query with nothing, and then loses the store permanently on the
-                // first `.edit rag-docs`. The legitimate "nothing indexed yet" case is
-                // already Ok(empty) — open() runs CREATE TABLE IF NOT EXISTS — so `?`
+                // WARNING: `?`, NOT `unwrap_or_default()`. A hydration failure must
+                // propagate. Degrading to an empty map here loads a RAG that looks healthy,
+                // answers every query with nothing, and then loses the store permanently
+                // on the first `.edit rag-docs`. The legitimate "nothing indexed yet" case
+                // is already Ok(empty) (open() runs CREATE TABLE IF NOT EXISTS) so `?`
                 // costs a new RAG nothing.
                 if data.vectors.is_empty() {
                     data.vectors = duck.read_all_vectors()?;
@@ -622,7 +605,6 @@ impl Rag {
                  use Rag::attach() or Rag::load_async() instead"
             ),
             _ => {
-                // "yaml" and any unknown driver — in-memory HNSW.
                 let bm25 = data.build_bm25();
                 (Box::new(YamlProvider::from_data(&data)), bm25)
             }
@@ -730,7 +712,7 @@ impl Rag {
             // `data.files` is empty for an attached RAG; the local index is not the
             // source of truth. A static label is honest, an empty list is not.
             *self.last_sources.write() =
-                Some("[attached RAG — source list unavailable]".to_string());
+                Some("[Using attached RAG. Source list unavailable]".to_string());
             return;
         }
         let mut sources: IndexMap<String, Vec<String>> = IndexMap::new();
@@ -922,6 +904,7 @@ impl Rag {
         if self.data.attached {
             return format!("- {}", self.data.attached_source_label());
         }
+
         let mut seen = IndexSet::new();
         for id in ids {
             let (file_index, _) = id.split();
@@ -1202,20 +1185,13 @@ impl Rag {
 
         let keyword_search_results: Vec<(DocumentId, f32)> =
             if self.provider.has_native_keyword_search() {
-                // Keyword is ONE of three RRF rankers (vector + keyword + graph);
-                // its absence is survivable and produces a slightly worse ranking,
-                // whereas a `?` here turns a provider FTS fault into TOTAL query
-                // failure — the user gets an error instead of the results the
-                // vector and graph rankers already retrieved. Degrade, do not
-                // propagate, and do not silently swap in the local BM25 either:
-                // that would change the ranking algorithm mid-query.
-                match self.provider.keyword_search(query, top_k).await {
-                    Ok(v) => v,
-                    Err(e) => {
+                self.provider
+                    .keyword_search(query, top_k)
+                    .await
+                    .unwrap_or_else(|e| {
                         warn!("native keyword search failed, dropping the keyword ranker: {e}");
                         Vec::new()
-                    }
-                }
+                    })
             } else {
                 self.keyword_search(query, top_k, 0.0)
             };
@@ -1231,8 +1207,6 @@ impl Rag {
                     .concat()
                     .into_iter()
                     .collect();
-                // `ids` is an `IndexSet` here, not the `Vec` of the RRF branch below,
-                // and `&IndexSet<_>` does not coerce to `&[DocumentId]`.
                 let ids: Vec<DocumentId> = ids.into_iter().collect();
                 let fetched = self.provider.fetch_content(&ids).await?;
                 // Build both vectors from the SAME source in the SAME iteration —
@@ -1276,8 +1250,6 @@ impl Rag {
                 ids
             }
         };
-        // `ids` is the ranked list; `fetch_content` preserves that order per the
-        // trait's ordering contract, so the result is returned as-is.
         let output = self.provider.fetch_content(&ids).await?;
         Ok(output)
     }
@@ -1308,7 +1280,7 @@ impl Rag {
         Ok(merge_vector_results(results))
     }
 
-    /// Local in-memory BM25 over `data.files` — empty for attached RAGs, which is
+    /// Local in-memory BM25 over `data.files`. This is empty for attached RAGs, which is
     /// correct: they have no local text.
     fn keyword_search(&self, query: &str, top_k: usize, min_score: f32) -> Vec<(DocumentId, f32)> {
         let results = self.bm25.search(query, top_k);
@@ -1479,9 +1451,6 @@ pub struct RagData {
     pub driver: String,
     #[serde(default)]
     pub attached: bool,
-    /// Driver-specific connection parameters (qdrant: `host`, `collection`, `api_key`).
-    /// Secret-bearing values are stored as `{{SECRET_NAME}}` placeholders and resolved
-    /// out of band at load time, so a resolved credential never reaches disk.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub driver_config: IndexMap<String, String>,
 
@@ -1589,6 +1558,7 @@ impl RagData {
                  no results with no error. Set `top_k:` in the RAG YAML."
             );
         }
+
         if !self.attached {
             if self.chunk_size == 0 {
                 bail!(
@@ -1597,6 +1567,7 @@ impl RagData {
                      embedding batches. Set `chunk_size:` in the RAG YAML."
                 );
             }
+
             if self.chunk_overlap >= self.chunk_size {
                 bail!(
                     "chunk_overlap ({}) must be strictly less than chunk_size ({}).",
@@ -1605,6 +1576,7 @@ impl RagData {
                 );
             }
         }
+
         match (self.driver.as_str(), self.attached) {
             ("yaml", false) => Ok(()),
             ("duckdb", false) => Ok(()),
@@ -1626,7 +1598,7 @@ impl RagData {
 
     /// Every (DocumentId, &RagDocument) in the corpus, in `files` order.
     ///
-    /// This — NOT `vectors` — is the authoritative document id space. BM25, the
+    /// This, NOT `vectors`, is the authoritative document id space. BM25, the
     /// knowledge graph and content lookup all key off it; `vectors` is a subset,
     /// since `add`'s zip truncates whenever fewer embeddings come back than
     /// document ids were sent.
@@ -1783,9 +1755,6 @@ fn generate_rag_sbx_mixin(
     header_name: &str,
     value_format: &str,
 ) -> Result<()> {
-    // The client reaches the store through `normalize_base_url`, so deriving the
-    // allow entry from that same URL keeps the whitelist and the actual dialled
-    // port from drifting apart.
     let base_url = QdrantProvider::normalize_base_url(host);
     let Some(allow_entry) = mcp_credentials::allow_entry_for_url(&base_url) else {
         eprintln!(
@@ -1793,6 +1762,7 @@ fn generate_rag_sbx_mixin(
              grammar, so no sandbox mixin was written for RAG '{service_name}'. \
              Queries to this RAG will be blocked inside the sandbox."
         );
+
         return Ok(());
     };
 
@@ -1826,12 +1796,11 @@ fn generate_rag_sbx_mixin(
             mixin_path.display()
         )
     })?;
+
     println!("✓ Sandbox mixin: '{}'.", mixin_path.display());
     Ok(())
 }
 
-/// Bearer credentials are spelled as a `scheme`, everything else as an explicit
-/// `header`; the two are mutually exclusive in the inject grammar.
 fn rag_inject_rule(
     domain: &str,
     header_name: &str,
@@ -1856,8 +1825,6 @@ fn rag_inject_rule(
     }
 }
 
-/// Derives a deterministic env var name from a RAG name:
-/// `company-docs` → `COMPANY_DOCS_API_KEY`.
 fn rag_env_var_name(rag_name: &str) -> String {
     format!(
         "{}_API_KEY",
@@ -1865,8 +1832,6 @@ fn rag_env_var_name(rag_name: &str) -> String {
     )
 }
 
-/// How a driver authenticates its HTTP requests. Qdrant uses a bare `api-key`
-/// header rather than `Authorization: Bearer`.
 fn driver_auth_header(driver: &str) -> (&'static str, &'static str) {
     match driver {
         "qdrant" => ("api-key", "%s"),
@@ -2104,8 +2069,6 @@ fn find_hash_skip(
 /// so the pool is bounded by `top_k * query_chunks`, and `reciprocal_rank_fusion`
 /// truncates to `top_k` itself. Capping here would let whichever query chunk has
 /// the strongest absolute scores crowd out every other chunk's hits.
-///
-/// Free function (not a method) so it is unit-testable without an embeddings client.
 fn merge_vector_results(mut results: Vec<(DocumentId, f32)>) -> Vec<(DocumentId, f32)> {
     debug_assert!(
         results.iter().all(|(_, score)| score.is_finite()),
@@ -2161,16 +2124,17 @@ fn embedding_dim_for_model(model_id: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// Scratch directory for tests that must write a real file.
     struct TempDir {
-        path: std::path::PathBuf,
+        path: PathBuf,
     }
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let path = env::temp_dir().join(format!("coyote-rag-{tag}-{unique}"));
@@ -2272,10 +2236,6 @@ mod tests {
             .collect()
     }
 
-    /// The generated mixin must carry the kit v2 schema envelope:
-    /// `wrap_mixin_as_kit` copies it verbatim to `spec.yaml` for
-    /// `sbx create --kit`, with no `kind` rewrite and no validation on Coyote's
-    /// side, so a stale envelope breaks the launch itself.
     #[test]
     fn generated_sbx_mixin_carries_the_schema_envelope() {
         let (text, parsed) = render_rag_mixin(
@@ -2290,14 +2250,11 @@ mod tests {
             text.starts_with("schemaVersion:"),
             "envelope must come first:\n{text}"
         );
-        // Quoted string, never the numeric 2 — the kit rejects an int here.
         assert_eq!(parsed["schemaVersion"].as_str(), Some("2"));
         assert_eq!(parsed["kind"].as_str(), Some("mixin"));
         assert_eq!(parsed["name"].as_str(), Some("rag-company-docs"));
         assert!(parsed["description"].as_str().is_some());
 
-        // https/443 is the only bare-host case; 6333 must carry its port, and
-        // the bare host must NOT also be listed.
         assert_eq!(allow_list(&parsed), vec!["rag.example.com:6333"]);
 
         let credential = &parsed["credentials"][0];
@@ -2313,14 +2270,11 @@ mod tests {
         assert_eq!(inject["header"].as_str(), Some("api-key"));
         assert_eq!(inject["format"].as_str(), Some("%s"));
 
-        // sbx does not derive allow entries from inject rules; an inject
-        // domain that is not allowed is a dead rule.
         assert!(
             allow_list(&parsed).contains(&inject["domain"].as_str().unwrap().to_string()),
             "every inject domain must also appear in allow:\n{text}"
         );
 
-        // The v1 vocabulary is gone, not merely unused.
         for dead in ["allowedDomains", "serviceDomains", "serviceAuth"] {
             assert!(!text.contains(dead), "v1 key '{dead}' survived:\n{text}");
         }
@@ -2334,8 +2288,6 @@ mod tests {
         );
     }
 
-    /// The allow entry has to name the port the client actually dials, which is
-    /// whatever `normalize_base_url` resolves to — not a Qdrant-specific guess.
     #[test]
     fn generated_sbx_mixin_allows_the_port_the_client_dials() {
         let cases = [
@@ -2361,8 +2313,6 @@ mod tests {
         }
     }
 
-    /// `Authorization: Bearer` is spelled as a scheme; `header` and `scheme` are
-    /// mutually exclusive in the inject grammar.
     #[test]
     fn generated_sbx_mixin_spells_bearer_as_a_scheme() {
         let (_, parsed) = render_rag_mixin(
@@ -2372,16 +2322,14 @@ mod tests {
             "Authorization",
             "Bearer %s",
         );
+
         let inject = &parsed["credentials"][0]["apiKey"]["inject"][0];
+
         assert_eq!(inject["scheme"].as_str(), Some("bearer"));
         assert!(inject["header"].is_null());
         assert!(inject["format"].is_null());
     }
 
-    /// The bind in `inject_rag_secrets` and the `service` declared here both run
-    /// the RAG name through `secret_service_id`. If they disagreed, the proxy
-    /// would hold a value under one id and an inject rule under another, and the
-    /// header would never be rewritten.
     #[test]
     fn generated_sbx_mixin_service_id_matches_the_host_side_bind() {
         let (_, parsed) = render_rag_mixin(
@@ -2391,9 +2339,10 @@ mod tests {
             "api-key",
             "%s",
         );
+
         assert_eq!(
             parsed["credentials"][0]["service"].as_str(),
-            Some(crate::sandbox::mcp_credentials::secret_service_id("My_Docs").as_str())
+            Some(mcp_credentials::secret_service_id("My_Docs").as_str())
         );
         assert_eq!(
             parsed["credentials"][0]["service"].as_str(),
@@ -2401,12 +2350,11 @@ mod tests {
         );
     }
 
-    /// A store with no API key still needs egress, but declaring a credential
-    /// nothing ever binds would leave sbx waiting on a binding that never comes.
     #[test]
     fn generated_sbx_mixin_omits_credentials_when_there_is_no_api_key() {
         let (text, parsed) =
             render_rag_mixin("https://store.example.com", "docs", None, "api-key", "%s");
+
         assert_eq!(allow_list(&parsed), vec!["store.example.com"]);
         assert!(
             parsed["credentials"].is_null(),
@@ -2423,7 +2371,6 @@ mod tests {
 
     #[test]
     fn driver_auth_header_uses_a_bare_api_key_for_qdrant() {
-        // Qdrant's REST API reads `api-key`, NOT `Authorization: Bearer`.
         assert_eq!(driver_auth_header("qdrant"), ("api-key", "%s"));
         assert_eq!(
             driver_auth_header("something-else"),
@@ -2431,8 +2378,6 @@ mod tests {
         );
     }
 
-    /// An attached RAG has no local `files`, so the citation helpers would
-    /// otherwise emit "unknown" and an empty source list for every result.
     #[test]
     fn attached_rag_citation_helpers_do_not_fall_back_to_the_empty_file_index() {
         let mut data = RagData {
@@ -2446,7 +2391,6 @@ mod tests {
             .insert("collection".into(), "company-kb".into());
         assert!(data.files.is_empty());
 
-        // The real helper — `resolve_source`/`format_sources` both delegate here.
         assert_eq!(
             data.attached_source_label(),
             "[external collection: company-kb]"
@@ -2580,6 +2524,7 @@ mod tests {
             .iter_documents()
             .map(|(id, doc)| (id, doc.page_content.as_str()))
             .collect();
+
         assert_eq!(
             documents,
             vec![
@@ -2600,12 +2545,10 @@ mod tests {
             None,
             GraphRagConfig::default(),
         );
+
         assert_eq!(data.iter_documents().count(), 0);
     }
 
-    /// The document id space is `files`, never `vectors`: `add`'s zip truncates
-    /// silently, so a vector may exist for an id no file provides. Content lookup
-    /// and BM25 both key off this iterator and must agree.
     #[test]
     fn rag_data_iter_documents_ignores_vector_only_ids() {
         let mut data = RagData::new(
@@ -2876,14 +2819,17 @@ mod tests {
 
     #[test]
     fn merge_vector_results_empty_input() {
-        let result = super::merge_vector_results(vec![]);
+        let result = merge_vector_results(vec![]);
+
         assert!(result.is_empty(), "empty input should produce empty output");
     }
 
     #[test]
     fn merge_vector_results_keeps_best_score_per_document() {
         let doc = DocumentId::new(0, 0);
-        let result = super::merge_vector_results(vec![(doc, 0.2), (doc, 0.9)]);
+
+        let result = merge_vector_results(vec![(doc, 0.2), (doc, 0.9)]);
+
         assert_eq!(result.len(), 1, "a document must not be double-counted");
         assert_eq!(result[0].0, doc);
         assert_eq!(
@@ -2897,10 +2843,10 @@ mod tests {
         let doc_a = DocumentId::new(0, 0);
         let doc_b = DocumentId::new(1, 0);
         let doc_c = DocumentId::new(2, 0);
-        // Interleaved as two per-chunk hit lists would arrive: concatenating them
-        // would yield a, c, b — only a global sort produces c, a, b.
-        let result = super::merge_vector_results(vec![(doc_a, 0.5), (doc_c, 0.9), (doc_b, 0.1)]);
+
+        let result = merge_vector_results(vec![(doc_a, 0.5), (doc_c, 0.9), (doc_b, 0.1)]);
         let ids: Vec<DocumentId> = result.iter().map(|(id, _)| *id).collect();
+
         assert_eq!(ids, vec![doc_c, doc_a, doc_b]);
     }
 
@@ -2909,7 +2855,9 @@ mod tests {
         let input: Vec<(DocumentId, f32)> = (0..10)
             .map(|i| (DocumentId::new(i, 0), i as f32 / 10.0))
             .collect();
-        let result = super::merge_vector_results(input);
+
+        let result = merge_vector_results(input);
+
         assert_eq!(
             result.len(),
             10,
@@ -2935,6 +2883,7 @@ mod tests {
     #[test]
     fn force_reingest_re_embeds_hash_identical_files() {
         let (files, to_deleted) = hash_skip_fixture();
+
         assert_eq!(
             find_hash_skip(true, &to_deleted, &files, "abc", "test.txt"),
             None,
@@ -2945,6 +2894,7 @@ mod tests {
     #[test]
     fn refresh_without_force_still_hash_skips() {
         let (files, to_deleted) = hash_skip_fixture();
+
         assert_eq!(
             find_hash_skip(false, &to_deleted, &files, "abc", "test.txt"),
             Some((0, 7)),
@@ -2955,6 +2905,7 @@ mod tests {
     #[test]
     fn find_hash_skip_returns_none_on_path_change() {
         let (files, to_deleted) = hash_skip_fixture();
+
         assert_eq!(
             find_hash_skip(false, &to_deleted, &files, "abc", "moved.txt"),
             None
@@ -2976,6 +2927,7 @@ mod tests {
             None,
             GraphRagConfig::default(),
         );
+
         assert_eq!(data.driver, "yaml");
         assert!(!data.attached);
     }
@@ -2992,7 +2944,9 @@ document_paths: []
 files: {}
 vectors: {}
 ";
+
         let data: RagData = serde_yaml::from_str(yaml).unwrap();
+
         assert_eq!(data.driver, "yaml");
         assert!(!data.attached);
     }
@@ -3013,6 +2967,7 @@ vectors: {}
 
         let yaml = serde_yaml::to_string(&data).unwrap();
         let restored: RagData = serde_yaml::from_str(&yaml).unwrap();
+
         assert_eq!(restored.driver, "qdrant");
         assert!(restored.attached);
     }
@@ -3029,7 +2984,9 @@ vectors: {}
             GraphRagConfig::default(),
         );
         data.attached = true;
+
         let err = data.validate().unwrap_err().to_string();
+
         assert!(err.contains("cannot be attached"), "got: {err}");
     }
 
@@ -3046,6 +3003,7 @@ vectors: {}
         );
         data.driver = "qdrant".to_string();
         data.attached = true;
+
         assert!(data.validate().is_ok());
     }
 

@@ -387,10 +387,6 @@ pub(crate) fn collect_server_allow_entries(
     out.into_iter().collect()
 }
 
-/// The single definition of the sbx kit v2 allow-list entry grammar: https on
-/// the default port yields a bare host, anything else is spelled `host:port`.
-/// Bracketed IPv6 hosts and non-http(s) schemes have no representation in the
-/// grammar and yield `None`.
 pub(crate) fn allow_entry_for_url(raw: &str) -> Option<String> {
     let url = Url::parse(raw).ok()?;
     let scheme = url.scheme();
@@ -465,12 +461,6 @@ struct Network {
     allow: Vec<String>,
 }
 
-/// Serializes one sbx kit v2 mixin document.
-///
-/// Every `inject[].domain` is unioned into `permissions.network.allow`: sbx
-/// does not derive allow entries from inject rules, so a rule whose domain is
-/// not allowed would be dead. Enforcing it here keeps the invariant in one
-/// place for every mixin Coyote generates.
 pub(crate) fn render_mixin_document(
     name: &str,
     description: &str,

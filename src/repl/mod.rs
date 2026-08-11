@@ -219,7 +219,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 60]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".rag attach",
-            "Attach to a pre-existing external RAG (Qdrant)",
+            "Attach to a pre-existing external RAG",
             AssertState::False(StateFlags::AGENT),
         ),
         ReplCommand::new(
@@ -889,22 +889,17 @@ pub async fn run_repl_command(
                 let version = args.map(|s| s.trim().to_string());
                 task::spawn_blocking(move || config::run_self_update(version, false)).await??;
             }
-            ".rag" => {
-                // `split_first_arg` rather than `starts_with("attach ")`: the latter
-                // misses a bare `.rag attach`, which would silently create a RAG
-                // literally named "attach".
-                match split_first_arg(args) {
-                    Some(("attach", rest)) => match rest {
-                        Some(name) if !name.trim().is_empty() => {
-                            ctx.attach_rag(name.trim()).await?;
-                        }
-                        _ => println!("Usage: .rag attach <name>"),
-                    },
-                    _ => {
-                        ctx.use_rag(args, abort_signal.clone()).await?;
+            ".rag" => match split_first_arg(args) {
+                Some(("attach", rest)) => match rest {
+                    Some(name) if !name.trim().is_empty() => {
+                        ctx.attach_rag(name.trim()).await?;
                     }
+                    _ => println!("Usage: .rag attach <name>"),
+                },
+                _ => {
+                    ctx.use_rag(args, abort_signal.clone()).await?;
                 }
-            }
+            },
             ".agent" => match split_first_arg(args) {
                 Some((agent_name, args)) => {
                     let (new_args, _) = split_args_text(args.unwrap_or_default(), cfg!(windows));

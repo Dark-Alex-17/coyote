@@ -314,11 +314,6 @@ fn inject_mcp_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<Opt
     )?))
 }
 
-/// Registers the API key of every attached RAG with the sbx proxy.
-///
-/// `launch()` has no notion of an active RAG — that is runtime state set by
-/// `--rag` / `.rag` and never persisted — so every attached RAG is scanned
-/// unconditionally, exactly as `inject_mcp_secrets` does for MCP servers.
 fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()> {
     let rags_dir = paths::rags_dir();
     if !rags_dir.exists() {
@@ -330,7 +325,6 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
             continue;
         }
         let stem = match path.file_stem().and_then(|s| s.to_str()) {
-            // Skip sidecars ("myrag.sbx-mixin.yaml" has stem "myrag.sbx-mixin").
             Some(s) if !paths::is_rag_sidecar_name(s) => s.to_string(),
             _ => continue,
         };
@@ -346,10 +340,6 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
         let Some(placeholder) = data.driver_config.get("api_key") else {
             continue;
         };
-        // The sidecar mixin declares `credentials[].service` under the same
-        // derivation, so the bound value and the inject rule that consumes it
-        // always name the same service. Passing the raw stem here would produce
-        // an id sbx rejects for any RAG whose name is not already a valid id.
         let service_id = mcp_credentials::secret_service_id(&stem);
         if service_id.is_empty() || registered.contains(&service_id) {
             continue;
@@ -358,9 +348,7 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
             .trim_start_matches("{{")
             .trim_end_matches("}}")
             .trim();
-        // Degrade rather than abort: one stale RAG key must not block the whole
-        // sandbox launch. Queries to that RAG fail with a 401 at runtime, which
-        // is recoverable without a restart.
+
         match vault.get_secret(secret_name, false) {
             Ok(secret_value) => {
                 sbx_secret_set(&service_id, &secret_value)
@@ -375,6 +363,7 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
             }
         }
     }
+
     Ok(())
 }
 

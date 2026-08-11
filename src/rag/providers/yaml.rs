@@ -20,9 +20,6 @@ impl YamlProvider {
     }
 
     fn build_content_map(data: &RagData) -> IndexMap<DocumentId, String> {
-        // Keyed on `files`, NOT `vectors`: this is the exact replacement for the
-        // per-id document lookup it supersedes, and it must resolve every id that
-        // BM25 or graph_search can produce — both of which enumerate `files`.
         data.iter_documents()
             .map(|(id, doc)| (id, doc.page_content.clone()))
             .collect()
@@ -52,12 +49,11 @@ impl RagProvider for YamlProvider {
                 })
             })
             .collect();
+
         Ok(results)
     }
 
     async fn fetch_content(&self, ids: &[DocumentId]) -> Result<Vec<(DocumentId, String)>> {
-        // Iterating `ids` (not `content_map`) satisfies the trait's ordering
-        // contract for free — output order mirrors input order.
         Ok(ids
             .iter()
             .filter_map(|id| self.content_map.get(id).map(|text| (*id, text.clone())))
@@ -65,10 +61,10 @@ impl RagProvider for YamlProvider {
     }
 
     async fn rebuild_indexes(&mut self, data: &RagData, _full_rebuild: bool) -> Result<()> {
-        // Local in-memory state — a wholesale rebuild is fast and always correct,
-        // so the incremental/full distinction is irrelevant here.
         self.hnsw = data.build_hnsw();
+
         self.content_map = Self::build_content_map(data);
+
         Ok(())
     }
 
@@ -80,14 +76,9 @@ impl RagProvider for YamlProvider {
 #[cfg(test)]
 mod provider_tests {
     use super::*;
-    // `RagFile` and `RagDocument` are not used by the impl above, so they are
-    // imported here rather than at module scope. Both have private fields, which
-    // is why these tests must live in-crate rather than under `tests/`.
     use crate::rag::{RagDocument, RagFile};
 
     fn minimal_rag_data() -> RagData {
-        // `..Default::default()` rather than an exhaustive struct literal so that
-        // later additions to `RagData` do not break this helper.
         RagData {
             embedding_model: "text-embedding-3-small".to_string(),
             chunk_size: 1024,
@@ -99,7 +90,7 @@ mod provider_tests {
         }
     }
 
-    /// Two files, one chunk each, with vectors — the minimum needed to exercise
+    /// Two files, one chunk each, with vectors, the minimum needed to exercise
     /// `build_content_map` and the `fetch_content` ordering contract.
     /// `DocumentId::new(f, d)` packs (file_index, document_index); `RagData::add`
     /// is the real insertion path but a direct literal is sufficient and avoids
@@ -143,13 +134,12 @@ mod provider_tests {
     async fn yaml_provider_empty_data_returns_nothing() {
         let data = minimal_rag_data();
         let provider = YamlProvider::from_data(&data);
+
         let results = provider.fetch_content(&[]).await.unwrap();
+
         assert!(results.is_empty());
     }
 
-    /// `fetch_content` MUST return results in the same relative order as the input
-    /// ids. The reversed-input case is the one that fails if an implementation ever
-    /// iterates its own map instead of `ids`.
     #[tokio::test]
     async fn yaml_provider_fetch_content_preserves_input_order() {
         let data = populated_rag_data();
@@ -163,8 +153,8 @@ mod provider_tests {
         assert_eq!(forward[0].1, "alpha");
         assert_eq!(forward[1].1, "beta");
 
-        // Reversed input must produce reversed output — NOT storage order.
         let reversed = provider.fetch_content(&[b, a]).await.unwrap();
+
         assert_eq!(
             reversed[0].1, "beta",
             "fetch_content must honor input order"
@@ -172,8 +162,6 @@ mod provider_tests {
         assert_eq!(reversed[1].1, "alpha");
     }
 
-    /// A missing id is skipped, not an error, and does not disturb the order of
-    /// the ids that DO resolve.
     #[tokio::test]
     async fn yaml_provider_fetch_content_skips_missing_ids() {
         let data = populated_rag_data();
@@ -189,23 +177,16 @@ mod provider_tests {
         assert_eq!(out[1].1, "beta");
     }
 
-    /// `YamlProvider::duplicate()` rebuilds from `data`, so the clone is a genuine
-    /// independent snapshot. Providers backed by a shared store deliberately are not.
     #[tokio::test]
     async fn yaml_provider_duplicate_returns_equivalent_content() {
-        // MUST be populated_rag_data(): on minimal_rag_data() both providers hold an
-        // EMPTY content map, so `assert_eq!(r1, r2)` compares two empty vectors and
-        // passes against a duplicate() that returns nothing at all.
         let data = populated_rag_data();
         let provider = YamlProvider::from_data(&data);
         let dup = provider.duplicate(&data);
         let ids = [DocumentId::new(0, 0), DocumentId::new(1, 0)];
-        // Query with REAL ids, not `&[]` — an empty slice is answered without ever
-        // touching the content map, so it would pass against a broken duplicate().
+
         let r1 = provider.fetch_content(&ids).await.unwrap();
         let r2 = dup.fetch_content(&ids).await.unwrap();
-        // Guard against the vacuous case: if both sides resolved nothing, the equality
-        // below proves nothing. Assert the fixture actually produced content first.
+
         assert_eq!(r1.len(), 2, "fixture must resolve both documents");
         assert_eq!(
             r1, r2,
@@ -213,11 +194,6 @@ mod provider_tests {
         );
     }
 
-    /// The content store is keyed on `files`, never on `vectors`. A vector may exist
-    /// for an id with no backing file (a stale entry, or a file dropped mid-sync);
-    /// keying on `vectors` would surface such an id with empty text instead of
-    /// dropping it. The shared fixture only ever inserts vectors for ids that also
-    /// have files, so this case has to be constructed here.
     #[tokio::test]
     async fn yaml_provider_content_is_keyed_on_files_not_vectors() {
         let mut data = populated_rag_data();
@@ -232,7 +208,6 @@ mod provider_tests {
             "an id present only in `vectors` must not resolve to content"
         );
 
-        // The file-backed ids still resolve, so the assertion above is not vacuous.
         let real = provider
             .fetch_content(&[DocumentId::new(0, 0), DocumentId::new(1, 0)])
             .await
