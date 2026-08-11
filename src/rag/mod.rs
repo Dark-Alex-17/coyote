@@ -377,10 +377,22 @@ impl Rag {
 
                 let api_key: Option<String> = match data.driver_config.get("api_key") {
                     Some(placeholder) => {
-                        let (resolved, _) =
-                            interpolate_secrets(placeholder, vault).with_context(|| {
+                        let (resolved, missing) = interpolate_secrets(placeholder, vault)
+                            .with_context(|| {
                                 format!("Failed to resolve api_key secret for RAG '{name}'")
                             })?;
+                        // A secret the vault does not hold is NOT an error inside
+                        // `interpolate_secrets`: it substitutes an empty string and
+                        // only reports the name. Accepting that silently attaches with
+                        // `api_key = ""`, and the user sees an unexplained 401 from the
+                        // server instead of the typo they made.
+                        if !missing.is_empty() {
+                            bail!(
+                                "RAG '{name}' references secrets that are missing from the vault: {}. \
+                                 Add them with `coyote --add-secret <name>`, then try again.",
+                                missing.join(", ")
+                            );
+                        }
                         Some(resolved)
                     }
                     None => None,
