@@ -274,7 +274,7 @@ impl Rag {
         let driver = if prompt_for_driver {
             let options = vec![
                 "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
-                "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search. Several Coyote processes can query it at once, but ingesting or rebuilding it locks the others out until that finishes, and its driver cannot be changed later without recreating the RAG",
+                "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search.",
             ];
             let sel = Select::new("RAG storage driver:", options)
                 .with_starting_cursor(0)
