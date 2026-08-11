@@ -491,13 +491,7 @@ impl Rag {
             );
         }
         if dim > 0 {
-            let candidates = embedding_model_candidates_for_dimension(dim);
-            if !candidates.is_empty() {
-                println!(
-                    "Collection uses {dim}-dim vectors. Likely models: {}",
-                    candidates.join(", ")
-                );
-            }
+            println!("Collection uses {dim}-dim vectors.");
         }
         println!(
             "⚠️  If the embedding model doesn't match what built this collection, \
@@ -1831,21 +1825,6 @@ fn driver_auth_header(driver: &str) -> (&'static str, &'static str) {
     match driver {
         "qdrant" => ("api-key", "%s"),
         _ => ("Authorization", "Bearer %s"),
-    }
-}
-
-/// Embedding models known to produce a given vector dimension, used to hint the
-/// user toward a model compatible with the collection they just picked.
-fn embedding_model_candidates_for_dimension(dim: u64) -> Vec<&'static str> {
-    match dim {
-        1536 => vec!["text-embedding-3-small", "text-embedding-ada-002"],
-        3072 => vec!["text-embedding-3-large"],
-        768 => vec!["nomic-embed-text", "all-minilm-l6-v2"],
-        1024 => vec![
-            "text-embedding-3-small (matryoshka-1024)",
-            "jina-embeddings-v2-base",
-        ],
-        _ => vec![],
     }
 }
 
