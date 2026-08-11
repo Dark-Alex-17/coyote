@@ -355,50 +355,27 @@ impl Rag {
         let raw_content = fs::read_to_string(path).with_context(err)?;
 
         // Parsed WITHOUT secret interpolation, so `driver_config` keeps its
-        // `{{...}}` placeholders. Interpolating here would bake the resolved API
-        // key into `self.data`, which `save()` then writes back to disk in
-        // plaintext.
+        // `{{...}}` placeholders in `self.data`. Resolution happens below, into a
+        // function-local copy only — see `resolve_driver_config` for why the
+        // resolved values must never travel back into `data`.
         let data: RagData = serde_yaml::from_str(&raw_content).with_context(err)?;
 
         data.validate().with_context(err)?;
 
         match data.driver.as_str() {
             "qdrant" => {
-                let host = data
-                    .driver_config
+                let driver_config = resolve_driver_config(&data.driver_config, vault, name)?;
+                let host = driver_config
                     .get("host")
                     .context("qdrant driver requires 'host' in driver_config")?
                     .clone();
-                let collection = data
-                    .driver_config
+                let collection = driver_config
                     .get("collection")
                     .context("qdrant driver requires 'collection' in driver_config")?
                     .clone();
+                let api_key = driver_config.get("api_key").map(String::as_str);
 
-                let api_key: Option<String> = match data.driver_config.get("api_key") {
-                    Some(placeholder) => {
-                        let (resolved, missing) = interpolate_secrets(placeholder, vault)
-                            .with_context(|| {
-                                format!("Failed to resolve api_key secret for RAG '{name}'")
-                            })?;
-                        // A secret the vault does not hold is NOT an error inside
-                        // `interpolate_secrets`: it substitutes an empty string and
-                        // only reports the name. Accepting that silently attaches with
-                        // `api_key = ""`, and the user sees an unexplained 401 from the
-                        // server instead of the typo they made.
-                        if !missing.is_empty() {
-                            bail!(
-                                "RAG '{name}' references secrets that are missing from the vault: {}. \
-                                 Add them with `coyote --add-secret <name>`, then try again.",
-                                missing.join(", ")
-                            );
-                        }
-                        Some(resolved)
-                    }
-                    None => None,
-                };
-
-                let provider = QdrantProvider::new(&host, &collection, api_key.as_deref()).await?;
+                let provider = QdrantProvider::new(&host, &collection, api_key).await?;
                 let embedding_model =
                     Model::retrieve_model(app, &data.embedding_model, ModelType::Embedding)?;
                 Ok(Rag {
@@ -2133,6 +2110,72 @@ fn embedding_dim_for_model(model_id: &str) -> usize {
     }
 }
 
+/// Resolves `{{SECRET}}` placeholders in every `driver_config` value against the
+/// vault, returning a DETACHED copy.
+///
+/// Three properties this must preserve, each of which has already bitten:
+///
+///  1. The resolved values never go back into `RagData`. `Rag::save()`
+///     serializes `self.data`, and `.set rag_top_k`, `.set rag_reranker_model`
+///     and every post-sync save call it — so a resolved credential parked in
+///     `data.driver_config` gets written to the RAG's YAML file in plaintext the
+///     next time the user changes any setting.
+///  2. The literal `{{NAME}}` text survives in `data` and on disk. Sandbox
+///     credential provisioning parses that placeholder back out of the file to
+///     learn which vault secret to bind into the sandbox; resolve it away and
+///     provisioning silently finds nothing to register.
+///  3. Only `driver_config` is interpolated, never the whole file. The rest of a
+///     RAG file is ingested document text and vectors — where `{{...}}` is
+///     ordinary content (Jinja, Mustache, Vue, Go templates) that would be read
+///     as a secret reference, blanked to `""`, and persisted on the next save.
+///     `driver_config` is small and is the only place credentials live.
+fn resolve_driver_config(
+    driver_config: &IndexMap<String, String>,
+    vault: &Vault,
+    rag_name: &str,
+) -> Result<IndexMap<String, String>> {
+    resolve_driver_config_with(driver_config, rag_name, |value| {
+        interpolate_secrets(value, vault)
+    })
+}
+
+/// Interpolation core, taking the resolver as an argument so it can be exercised
+/// without a vault. Mirrors `interpolate_secrets` / `interpolate_secrets_with`.
+fn resolve_driver_config_with<F>(
+    driver_config: &IndexMap<String, String>,
+    rag_name: &str,
+    mut interpolate: F,
+) -> Result<IndexMap<String, String>>
+where
+    F: FnMut(&str) -> Result<(String, Vec<String>)>,
+{
+    let mut resolved = IndexMap::with_capacity(driver_config.len());
+    let mut missing: Vec<String> = Vec::new();
+    for (key, value) in driver_config {
+        let (value, value_missing) = interpolate(value).with_context(|| {
+            format!("Failed to resolve '{key}' in driver_config for RAG '{rag_name}'")
+        })?;
+        missing.extend(value_missing);
+        resolved.insert(key.clone(), value);
+    }
+
+    // A secret the vault does not hold is NOT an error inside
+    // `interpolate_secrets`: it substitutes the empty string and only reports the
+    // name. Accepting that ships an empty credential, and the user sees an
+    // unexplained 401 from the server instead of the typo they made.
+    if !missing.is_empty() {
+        missing.sort();
+        missing.dedup();
+        bail!(
+            "RAG '{rag_name}' references secrets that are missing from the vault: {}. \
+             Add them with `coyote --add-secret <name>`, then try again.",
+            missing.join(", ")
+        );
+    }
+
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2181,6 +2224,122 @@ mod tests {
         assert!(yaml.contains("driver: qdrant"));
         // The placeholder is what reaches disk — never a resolved secret.
         assert!(yaml.contains("{{QDRANT_API_KEY}}"));
+    }
+
+    const FAKE_SECRET: &str = "sk-live-fake-value-for-tests";
+
+    fn attached_qdrant_data() -> RagData {
+        let mut data = RagData {
+            driver: "qdrant".to_string(),
+            attached: true,
+            embedding_model: "text-embedding-3-small".to_string(),
+            top_k: 5,
+            ..Default::default()
+        };
+        data.driver_config
+            .insert("host".into(), "localhost:6333".into());
+        data.driver_config.insert("collection".into(), "c".into());
+        data.driver_config
+            .insert("api_key".into(), "{{QDRANT_API_KEY}}".into());
+        data
+    }
+
+    /// THE invariant behind `resolve_driver_config` returning a detached copy.
+    ///
+    /// `save()` serializes `self.data`, and `.set rag_top_k`, `.set
+    /// rag_reranker_model` and every post-sync save call it. If load ever bakes
+    /// the resolved credential into `data.driver_config`, the next trivial
+    /// setting change writes the user's plaintext API key into the RAG's YAML
+    /// file. The literal placeholder must also survive, because sandbox
+    /// credential provisioning parses it back off disk.
+    #[test]
+    fn a_save_after_load_writes_the_placeholder_not_the_resolved_secret() {
+        let dir = TempDir::new("driver-config-secret");
+        let path = dir.path.join("kb.yaml");
+        let data = attached_qdrant_data();
+
+        // Exactly what `load_async` does with the parsed data.
+        let resolved = resolve_driver_config_with(&data.driver_config, "kb", |value| {
+            Ok((value.replace("{{QDRANT_API_KEY}}", FAKE_SECRET), vec![]))
+        })
+        .unwrap();
+        assert_eq!(
+            resolved["api_key"], FAKE_SECRET,
+            "the live client still has to receive the real key"
+        );
+        assert_eq!(
+            data.driver_config["api_key"], "{{QDRANT_API_KEY}}",
+            "resolution must not mutate the RagData that save() serializes"
+        );
+
+        let rag = Rag {
+            app_config: Arc::new(AppConfig::default()),
+            name: "kb".to_string(),
+            path: path.display().to_string(),
+            embedding_model: Model::new("openai", "text-embedding-3-small"),
+            bm25: data.build_bm25(),
+            provider: Box::new(YamlProvider::from_data(&data)),
+            node_to_docs: IndexMap::new(),
+            data,
+            last_sources: RwLock::new(None),
+        };
+        assert!(rag.save().unwrap());
+
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("{{QDRANT_API_KEY}}"),
+            "sandbox provisioning parses this placeholder back off disk: {on_disk}"
+        );
+        assert!(
+            !on_disk.contains(FAKE_SECRET),
+            "a save after load leaked the plaintext secret to {}",
+            path.display()
+        );
+    }
+
+    /// Every value is interpolated, not just `api_key` — a credential-bearing
+    /// field added later must not ship its raw placeholder to the server.
+    #[test]
+    fn resolution_covers_every_driver_config_value() {
+        let mut driver_config = IndexMap::new();
+        driver_config.insert("host".to_string(), "{{QDRANT_HOST}}".to_string());
+        driver_config.insert("collection".to_string(), "c".to_string());
+        driver_config.insert("api_key".to_string(), "{{QDRANT_API_KEY}}".to_string());
+
+        let resolved = resolve_driver_config_with(&driver_config, "kb", |value| {
+            let out = value
+                .replace("{{QDRANT_HOST}}", "qdrant.internal:6333")
+                .replace("{{QDRANT_API_KEY}}", FAKE_SECRET);
+            Ok((out, vec![]))
+        })
+        .unwrap();
+
+        assert_eq!(resolved["host"], "qdrant.internal:6333");
+        assert_eq!(resolved["collection"], "c");
+        assert_eq!(resolved["api_key"], FAKE_SECRET);
+    }
+
+    /// Missing secrets are reported together, deduplicated, and name the RAG.
+    #[test]
+    fn missing_secrets_fail_the_load_instead_of_resolving_to_empty() {
+        let mut driver_config = IndexMap::new();
+        driver_config.insert("host".to_string(), "{{QDRANT_HOST}}".to_string());
+        driver_config.insert("api_key".to_string(), "{{QDRANT_API_KEY}}".to_string());
+
+        let err = resolve_driver_config_with(&driver_config, "kb", |value| {
+            // What `interpolate_secrets` really does for an absent secret: blank it
+            // out and report the name rather than returning Err.
+            Ok((
+                String::new(),
+                vec![value.trim_matches(['{', '}']).to_string()],
+            ))
+        })
+        .expect_err("an empty API key must not be accepted as a successful load");
+
+        let msg = err.to_string();
+        assert!(msg.contains("kb"), "the RAG must be named: {msg}");
+        assert!(msg.contains("QDRANT_HOST"), "got: {msg}");
+        assert!(msg.contains("QDRANT_API_KEY"), "got: {msg}");
     }
 
     /// A qdrant RAG's vectors MUST survive serialization.
