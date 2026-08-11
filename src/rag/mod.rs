@@ -18,6 +18,7 @@ use crate::vault::{Vault, interpolate_secrets};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bm25::{Language, SearchEngine, SearchEngineBuilder};
+use gman::SecretError;
 use hnsw_rs::prelude::*;
 use indexmap::{IndexMap, IndexSet};
 use inquire::{Confirm, Select, Text, required, validator::Validation};
@@ -429,12 +430,7 @@ impl Rag {
                     .with_default("QDRANT_API_KEY")
                     .with_validator(required!("This field is required"))
                     .prompt()?;
-                let resolved = vault.get_secret(&secret_name, false).with_context(|| {
-                    format!(
-                        "Secret '{secret_name}' not found in vault. \
-                         Run `coyote --add-secret {secret_name}` first."
-                    )
-                })?;
+                let resolved = resolve_or_create_api_key_secret(vault, &secret_name)?;
                 Some((secret_name, resolved))
             } else {
                 None
@@ -2110,6 +2106,57 @@ fn embedding_dim_for_model(model_id: &str) -> usize {
     }
 }
 
+/// True only for "the vault does not hold this key".
+///
+/// Everything else — an auth failure, a provider outage, or the vault being
+/// disabled because Coyote is running inside a sandbox — must NOT be treated as
+/// a missing secret. Offering to create one in those cases would prompt for a
+/// value that cannot be stored and bury the real reason.
+fn is_missing_secret(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<SecretError>(),
+        Some(SecretError::NotFound { .. })
+    )
+}
+
+/// Reads `secret_name` out of the vault, offering to create it in place when the
+/// vault simply does not hold it yet.
+///
+/// Sending the user off to run `coyote --add-secret` mid-wizard discarded every
+/// answer they had already given. `Vault::add_secret` does the masked prompt,
+/// the provider write and the confirmation line, so this defers to it rather
+/// than collecting or storing the value itself.
+fn resolve_or_create_api_key_secret(vault: &Vault, secret_name: &str) -> Result<String> {
+    let read_err = match vault.get_secret(secret_name, false) {
+        Ok(secret) => return Ok(secret),
+        Err(err) => err,
+    };
+    if !is_missing_secret(&read_err) {
+        return Err(read_err)
+            .with_context(|| format!("Cannot read secret '{secret_name}' from the vault"));
+    }
+
+    let create = Confirm::new(&format!(
+        "Secret '{secret_name}' is not in the vault. Create it now?"
+    ))
+    .with_default(true)
+    .prompt()?;
+    if !create {
+        bail!(
+            "This instance needs an API key, so '{secret_name}' has to exist before \
+             attaching. Add it with `coyote --add-secret {secret_name}` and re-run, or \
+             re-run and answer 'no' when asked whether the instance requires an API key."
+        );
+    }
+
+    vault
+        .add_secret(secret_name)
+        .with_context(|| format!("Failed to store secret '{secret_name}' in the vault"))?;
+    vault
+        .get_secret(secret_name, false)
+        .with_context(|| format!("Secret '{secret_name}' is unreadable after being stored"))
+}
+
 /// Resolves `{{SECRET}}` placeholders in every `driver_config` value against the
 /// vault, returning a DETACHED copy.
 ///
@@ -2340,6 +2387,29 @@ mod tests {
         assert!(msg.contains("kb"), "the RAG must be named: {msg}");
         assert!(msg.contains("QDRANT_HOST"), "got: {msg}");
         assert!(msg.contains("QDRANT_API_KEY"), "got: {msg}");
+    }
+
+    /// Only a genuine NotFound may trigger the attach wizard's "create it now?"
+    /// offer. The vault is disabled wholesale inside a sandbox, where creating a
+    /// secret is impossible — misreading that as "missing" would prompt for a
+    /// value that cannot be stored and hide why.
+    #[test]
+    fn only_a_not_found_error_counts_as_a_missing_secret() {
+        let not_found = anyhow::Error::new(SecretError::NotFound {
+            key: "QDRANT_API_KEY".to_string(),
+            provider: "local",
+        });
+        assert!(is_missing_secret(&not_found));
+
+        let auth_failed = anyhow::Error::new(SecretError::AuthFailed {
+            provider: "local",
+            source: anyhow!("bad vault password"),
+        });
+        assert!(!is_missing_secret(&auth_failed));
+
+        // What `Vault::get_secret` returns in sandbox mode: a plain anyhow error.
+        let sandboxed = anyhow!("Vault management is disabled in sandbox mode.");
+        assert!(!is_missing_secret(&sandboxed));
     }
 
     /// A qdrant RAG's vectors MUST survive serialization.
