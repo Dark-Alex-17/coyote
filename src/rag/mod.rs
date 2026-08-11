@@ -453,10 +453,32 @@ impl Rag {
 
         let collection = Select::new("Select collection:", collections).prompt()?;
 
+        let sample_id = QdrantProvider::sample_point_id(&host, &collection, api_key).await?;
+
+        // `None` means the scroll came back with no points at all: the collection
+        // is empty. Attaching is not necessarily wrong — another tool may be about
+        // to fill it — but accepting it silently yields a RAG that answers every
+        // query with nothing and never explains why, and none of the checks below
+        // can tell that apart from a misconfiguration. Ask, defaulting to no, so it
+        // cannot happen by accident. (`attach` already refuses to run
+        // non-interactively, so there is no unattended path through this prompt.)
+        if sample_id.is_none() {
+            println!(
+                "⚠️  Collection '{collection}' contains no points. Queries will return \
+                 nothing until something writes to it."
+            );
+            let attach_anyway = Confirm::new("Attach to this empty collection anyway?")
+                .with_default(false)
+                .prompt()?;
+            if !attach_anyway {
+                bail!("Collection '{collection}' is empty; nothing to attach to.");
+            }
+        }
+
         // Point IDs are read with `as_u64()`, which yields None for a JSON string.
         // A UUID-keyed collection would therefore return zero hits with no error,
         // so refuse it here instead of attaching something silently broken.
-        if let Some(raw_id) = QdrantProvider::sample_point_id(&host, &collection, api_key).await?
+        if let Some(raw_id) = &sample_id
             && raw_id.starts_with('"')
         {
             bail!(
