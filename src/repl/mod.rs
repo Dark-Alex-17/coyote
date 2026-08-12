@@ -892,7 +892,7 @@ pub async fn run_repl_command(
             ".rag" => match split_first_arg(args) {
                 Some(("attach", rest)) => match rest {
                     Some(name) if !name.trim().is_empty() => {
-                        ctx.attach_rag(name.trim()).await?;
+                        ctx.attach_rag(name.trim(), abort_signal.clone()).await?;
                     }
                     _ => println!("Usage: .rag attach <name>"),
                 },

@@ -1,4 +1,5 @@
 pub(crate) mod memory;
+pub(crate) mod rag_query;
 pub(crate) mod skill;
 pub(crate) mod supervisor;
 pub(crate) mod todo;
@@ -23,6 +24,7 @@ use futures_util::future;
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use memory::MEMORY_FUNCTION_PREFIX;
+use rag_query::RAG_FUNCTION_PREFIX;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -493,6 +495,16 @@ impl Functions {
     pub fn append_user_interaction_functions(&mut self) {
         self.declarations
             .extend(user_interaction::user_interaction_function_declarations());
+    }
+
+    pub fn append_rag_query_functions(&mut self) {
+        self.declarations
+            .extend(rag_query::rag_query_function_declarations());
+    }
+
+    pub fn remove_rag_query_functions(&mut self) {
+        self.declarations
+            .retain(|f| !f.name.starts_with(RAG_FUNCTION_PREFIX));
     }
 
     pub fn append_mcp_meta_functions(&mut self, mcp_servers: Vec<String>) {
@@ -1248,6 +1260,15 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("User interaction failed: {e}");
+                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        json!({"tool_call_error": error_msg})
+                    })
+            }
+            _ if cmd_name.starts_with(RAG_FUNCTION_PREFIX) => {
+                rag_query::handle_rag_tool(ctx, &cmd_name, &json_data)
+                    .await
+                    .unwrap_or_else(|e| {
+                        let error_msg = format!("RAG query failed: {e}");
                         eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
                         json!({"tool_call_error": error_msg})
                     })

@@ -856,6 +856,20 @@ impl Rag {
         Ok((embeddings, sources, ids))
     }
 
+    pub async fn search_chunks(
+        &self,
+        text: &str,
+        top_k: usize,
+        rerank_model: Option<&str>,
+    ) -> Result<Vec<(String, String)>> {
+        let results = self.hybrid_search(text, top_k, rerank_model).await?;
+
+        Ok(results
+            .into_iter()
+            .map(|(id, content)| (content, self.resolve_source(&id)))
+            .collect())
+    }
+
     pub async fn search_with_template(
         &self,
         app: &AppConfig,

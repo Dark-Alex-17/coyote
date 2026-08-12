@@ -248,6 +248,10 @@ impl Agent {
             }
         }
 
+        if rag.is_some() && app.function_calling_support && graph_for_rag.is_none() {
+            functions.append_rag_query_functions();
+        }
+
         agent_config.replace_tools_placeholder(&functions);
 
         Ok(Self {

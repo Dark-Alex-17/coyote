@@ -16,8 +16,9 @@ use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
     FunctionDeclaration, Functions, ToolCallTracker, ToolResult, memory::MEMORY_FUNCTION_PREFIX,
-    skill::SKILL_FUNCTION_PREFIX, supervisor::SUPERVISOR_FUNCTION_PREFIX,
-    todo::TODO_FUNCTION_PREFIX, user_interaction::USER_FUNCTION_PREFIX,
+    rag_query::RAG_FUNCTION_PREFIX, skill::SKILL_FUNCTION_PREFIX,
+    supervisor::SUPERVISOR_FUNCTION_PREFIX, todo::TODO_FUNCTION_PREFIX,
+    user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
@@ -715,6 +716,7 @@ impl RequestContext {
 
     pub fn exit_rag(&mut self) -> Result<()> {
         self.rag.take();
+        self.tool_scope.functions.remove_rag_query_functions();
         Ok(())
     }
 
@@ -1137,6 +1139,7 @@ impl RequestContext {
                     && !v.name.starts_with("agent__")
                     && !v.name.starts_with("memory__")
                     && !v.name.starts_with("skill__")
+                    && !v.name.starts_with("rag__")
             })
             .map(|v| v.name.clone())
             .collect()
@@ -1957,7 +1960,8 @@ impl RequestContext {
                             || (!matches!(role.skills_enabled(), Some(false))
                                 && v.name.starts_with(SKILL_FUNCTION_PREFIX))
                             || (self.auto_continue_config().enabled
-                                && v.name.starts_with(TODO_FUNCTION_PREFIX)))
+                                && v.name.starts_with(TODO_FUNCTION_PREFIX))
+                            || v.name.starts_with(RAG_FUNCTION_PREFIX))
                             && !existing.contains(&v.name)
                     })
                     .cloned()
@@ -1987,6 +1991,7 @@ impl RequestContext {
                             || v.name.starts_with(TODO_FUNCTION_PREFIX)
                             || v.name.starts_with(SUPERVISOR_FUNCTION_PREFIX)
                             || v.name.starts_with(MEMORY_FUNCTION_PREFIX)
+                            || v.name.starts_with(RAG_FUNCTION_PREFIX)
                     });
                 }
 
@@ -3467,6 +3472,12 @@ impl RequestContext {
         if self.should_register_memory_tools() {
             functions.append_memory_functions();
         }
+        if self.rag.is_some()
+            && app.function_calling_support
+            && !self.agent.as_ref().is_some_and(|a| a.is_graph())
+        {
+            functions.append_rag_query_functions();
+        }
 
         let tool_tracker = self.tool_scope.tool_tracker.clone();
         self.tool_scope = ToolScope {
@@ -4136,7 +4147,7 @@ impl RequestContext {
                             super::TEMP_RAG_NAME,
                             &rag_path,
                             &[],
-                            abort_signal,
+                            abort_signal.clone(),
                             false,
                         )
                         .await?,
@@ -4172,10 +4183,11 @@ impl RequestContext {
         };
         self.rag = Some(rag);
         self.rag_key = rag_key;
+        self.refresh_tool_scope(abort_signal).await?;
         Ok(())
     }
 
-    pub async fn attach_rag(&mut self, name: &str) -> Result<()> {
+    pub async fn attach_rag(&mut self, name: &str, abort_signal: AbortSignal) -> Result<()> {
         let rag_path = self.rag_file(name);
         if rag_path.exists() {
             bail!(
@@ -4192,6 +4204,7 @@ impl RequestContext {
         self.rag_cache().insert(key.clone(), &rag);
         self.rag = Some(rag);
         self.rag_key = Some(key);
+        self.refresh_tool_scope(abort_signal).await?;
         Ok(())
     }
 
