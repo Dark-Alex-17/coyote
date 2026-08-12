@@ -193,6 +193,11 @@ impl QdrantProvider {
         }
         Client::builder()
             .default_headers(headers)
+            // reqwest picks up ambient proxy settings by default, which routes even
+            // a loopback Qdrant through whatever proxy the environment dictates and
+            // fails with that proxy's error rather than Qdrant's. Every other client
+            // in Coyote discards them the same way, in `utils::set_proxy`.
+            .no_proxy()
             .build()
             .context("Failed to build reqwest client")
     }
