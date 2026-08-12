@@ -185,7 +185,7 @@ impl Agent {
                             &rag_path_clone,
                             &document_paths,
                             abort,
-                            false,
+                            true,
                         )
                         .await
                     })
@@ -1025,7 +1025,7 @@ async fn init_graph_rags(
             {
                 bail!("rag node '{node_id}': {message}");
             }
-            let config = rag_init_config(rag_node);
+            let mut config = rag_init_config(rag_node);
             let fully_specified = config.embedding_model.is_some()
                 && config.chunk_size.is_some()
                 && config.chunk_overlap.is_some();
@@ -1050,6 +1050,10 @@ async fn init_graph_rags(
                         "Agent '{agent_name}' has rag node '{node_id}' but its RAG was not \
                          initialized. RAG initialization is required for this agent."
                     );
+                }
+
+                if config.driver.is_none() {
+                    config.driver = Some(crate::rag::select_rag_driver()?);
                 }
             }
 

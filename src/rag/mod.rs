@@ -267,31 +267,10 @@ impl Rag {
         }
         println!("⚙ Initializing RAG...");
         let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(app)?;
-        // Only interactive named-RAG creation offers a driver choice. Temp RAGs and
-        // agent startup pass `false`; an explicit flag is used rather than inferring
-        // from the name because the agent path passes the literal name "rag", which is
-        // indistinguishable from a user creating a RAG genuinely named `rag`.
         let driver = if prompt_for_driver {
-            let options = vec![
-                "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
-                "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search.",
-            ];
-            let sel = Select::new("RAG storage driver:", options)
-                .with_starting_cursor(0)
-                .prompt()?;
-            if sel.starts_with("duckdb") {
-                println!(
-                    "Note: several Coyote processes can query a duckdb RAG at the same time, \
-                     but while one process is ingesting or rebuilding it the others cannot \
-                     read it until that finishes. Changing its driver later means deleting \
-                     and recreating the RAG."
-                );
-                "duckdb"
-            } else {
-                "yaml"
-            }
+            select_rag_driver()?
         } else {
-            "yaml"
+            "yaml".to_string()
         };
         let reranker_model = app.rag_reranker_model.clone();
         let top_k = app.rag_top_k;
@@ -318,7 +297,7 @@ impl Rag {
                 graph_hops: Some(graph_hops),
             },
         );
-        data.driver = driver.to_string();
+        data.driver = driver;
         let mut rag = Self::create(app, name, save_path, data)?;
         let mut paths = doc_paths.to_vec();
         if paths.is_empty() {
@@ -1865,6 +1844,27 @@ fn select_embedding_model(models: &[&Model]) -> Result<String> {
         .with_formatter(&|opt| opt.value.value.clone())
         .prompt()?;
     Ok(result.value)
+}
+
+pub(crate) fn select_rag_driver() -> Result<String> {
+    let options = vec![
+        "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
+        "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search.",
+    ];
+    let sel = Select::new("RAG storage driver:", options)
+        .with_starting_cursor(0)
+        .prompt()?;
+    if sel.starts_with("duckdb") {
+        println!(
+            "Note: several Coyote processes can query a duckdb RAG at the same time, \
+             but while one process is ingesting or rebuilding it the others cannot \
+             read it until that finishes. Changing its driver later means deleting \
+             and recreating the RAG."
+        );
+        Ok("duckdb".to_string())
+    } else {
+        Ok("yaml".to_string())
+    }
 }
 
 const EXTRACTOR_SKIP: &str = "Skip";
