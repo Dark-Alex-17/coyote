@@ -184,9 +184,6 @@ pub struct QdrantProvider {
 }
 
 impl QdrantProvider {
-    /// A proxy cannot usefully forward to an address that means something different
-    /// on its side, and anything that intercepts proxied traffic answers for a store
-    /// that is running fine, so the failure names the proxy rather than Qdrant.
     fn skips_proxy(base_url: &str) -> bool {
         let Ok(url) = Url::parse(base_url) else {
             return false;
