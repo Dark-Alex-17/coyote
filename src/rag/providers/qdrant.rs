@@ -1,6 +1,5 @@
 use crate::rag::provider::RagProvider;
 use crate::rag::{DocumentId, RagData};
-use crate::utils::apply_proxy;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -10,6 +9,7 @@ use reqwest::{Client, Response, StatusCode};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use url::{Host, Url};
 
 /// Marks a `DocumentId` that stands in for a point id Coyote cannot carry
 /// directly. Qdrant accepts UUID strings as point ids, and that is what
@@ -184,7 +184,25 @@ pub struct QdrantProvider {
 }
 
 impl QdrantProvider {
-    fn make_client(api_key: Option<&str>) -> Result<Client> {
+    /// A proxy cannot usefully forward to an address that means something different
+    /// on its side, and anything that intercepts proxied traffic answers for a store
+    /// that is running fine, so the failure names the proxy rather than Qdrant.
+    fn skips_proxy(base_url: &str) -> bool {
+        let Ok(url) = Url::parse(base_url) else {
+            return false;
+        };
+        match url.host() {
+            Some(Host::Domain(name)) => {
+                name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local")
+            }
+            Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+            // No stable is_unique_local, so fc00::/7 is matched directly.
+            Some(Host::Ipv6(ip)) => ip.is_loopback() || ip.segments()[0] & 0xfe00 == 0xfc00,
+            None => false,
+        }
+    }
+
+    fn make_client(base_url: &str, api_key: Option<&str>) -> Result<Client> {
         let mut headers = HeaderMap::new();
         if let Some(key) = api_key {
             let mut value =
@@ -192,9 +210,11 @@ impl QdrantProvider {
             value.set_sensitive(true);
             headers.insert("api-key", value);
         }
-        apply_proxy(Client::builder().default_headers(headers), None)?
-            .build()
-            .context("Failed to build reqwest client")
+        let mut builder = Client::builder().default_headers(headers);
+        if Self::skips_proxy(base_url) {
+            builder = builder.no_proxy();
+        }
+        builder.build().context("Failed to build reqwest client")
     }
 
     pub(crate) fn normalize_base_url(host: &str) -> String {
@@ -219,7 +239,7 @@ impl QdrantProvider {
         api_key: Option<&str>,
     ) -> Result<Value> {
         let base_url = Self::normalize_base_url(host);
-        let client = Self::make_client(api_key)?;
+        let client = Self::make_client(&base_url, api_key)?;
         let resp = client
             .get(format!("{base_url}/collections/{collection}"))
             .send()
@@ -237,7 +257,7 @@ impl QdrantProvider {
 
     pub async fn new(host: &str, collection: &str, api_key: Option<&str>) -> Result<Self> {
         let base_url = Self::normalize_base_url(host);
-        let client = Self::make_client(api_key)?;
+        let client = Self::make_client(&base_url, api_key)?;
         let resp = client
             .get(format!("{base_url}/collections/{collection}"))
             .send()
@@ -260,7 +280,7 @@ impl QdrantProvider {
 
     pub async fn list_collections(host: &str, api_key: Option<&str>) -> Result<Vec<String>> {
         let base_url = Self::normalize_base_url(host);
-        let client = Self::make_client(api_key)?;
+        let client = Self::make_client(&base_url, api_key)?;
         let resp = client
             .get(format!("{base_url}/collections"))
             .send()
@@ -310,7 +330,7 @@ impl QdrantProvider {
         api_key: Option<&str>,
     ) -> Result<Option<String>> {
         let base_url = Self::normalize_base_url(host);
-        let client = Self::make_client(api_key)?;
+        let client = Self::make_client(&base_url, api_key)?;
         let url = format!("{base_url}/collections/{collection}/points/scroll");
         let body = serde_json::json!({ "limit": 1, "with_payload": false });
 
@@ -575,6 +595,39 @@ mod tests {
         };
 
         assert!(provider.fetch_content(&[]).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_and_private_hosts_skip_the_proxy() {
+        for host in [
+            "http://localhost:6333",
+            "http://127.0.0.1:6333",
+            "http://192.168.0.56:6333",
+            "http://10.1.2.3:6333",
+            "http://172.16.4.5:6333",
+            "http://qdrant.local:6333",
+            "http://[::1]:6333",
+        ] {
+            assert!(
+                QdrantProvider::skips_proxy(host),
+                "{host} should not be proxied"
+            );
+        }
+    }
+
+    #[test]
+    fn public_hosts_still_honour_the_environment() {
+        for host in [
+            "https://qdrant.example.com",
+            "http://8.8.8.8:6333",
+            "https://xyz.eu-central.aws.cloud.qdrant.io:6333",
+            "http://172.32.0.1:6333",
+        ] {
+            assert!(
+                !QdrantProvider::skips_proxy(host),
+                "{host} must keep the environment's proxy"
+            );
+        }
     }
 
     /// Euclid collections score by NEGATIVE distance, so the 0.0 the caller
