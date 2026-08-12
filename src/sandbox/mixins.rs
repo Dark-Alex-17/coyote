@@ -1,9 +1,10 @@
 use std::env;
 use std::fs;
 use std::fs::{read_dir, read_to_string};
+use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_yaml::Value;
 use sha2::{Digest, Sha256};
 
@@ -12,6 +13,7 @@ use crate::config::paths;
 const SBX_MIXIN_FILE_NAME: &str = "sbx-mixin.yaml";
 const SBX_MIXIN_FILE_SUFFIX: &str = ".sbx-mixin.yaml";
 const KIT_SPEC_FILE_NAME: &str = "spec.yaml";
+const MIXIN_FILES_DIR_NAME: &str = "files";
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredMixin {
@@ -34,31 +36,150 @@ impl DiscoveredMixin {
 pub fn wrap_mixin_as_kit(mixin_path: &Path) -> Result<PathBuf> {
     let bytes = fs::read(mixin_path)
         .with_context(|| format!("Failed to read sbx mixin {}", mixin_path.display()))?;
-    wrap_mixin_bytes_as_kit(&bytes, &mixin_path.display().to_string())
+    let label = mixin_path.display().to_string();
+
+    let files = mixin_path
+        .parent()
+        .map(|p| p.join(MIXIN_FILES_DIR_NAME))
+        .filter(|p| p.is_dir())
+        .map(|dir| collect_staged_files(&dir))
+        .transpose()?
+        .unwrap_or_default();
+
+    stage_kit(&bytes, &files, &label)
 }
 
 pub fn wrap_mixin_bytes_as_kit(bytes: &[u8], label: &str) -> Result<PathBuf> {
+    stage_kit(bytes, &[], label)
+}
+
+struct StagedFile {
+    relpath: PathBuf,
+    mode: u32,
+    bytes: Vec<u8>,
+}
+
+fn stage_kit(spec_bytes: &[u8], files: &[StagedFile], label: &str) -> Result<PathBuf> {
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
+    hasher.update(spec_bytes);
+    for f in files {
+        let rel_str = f.relpath.to_str().ok_or_else(|| {
+            anyhow!(
+                "Non-UTF-8 path inside mixin {MIXIN_FILES_DIR_NAME}/: {}",
+                f.relpath.display()
+            )
+        })?;
+        hasher.update(b"\0COYOTE_MIXIN_FILE\0");
+        hasher.update((rel_str.len() as u64).to_le_bytes());
+        hasher.update(rel_str.as_bytes());
+        hasher.update(f.mode.to_le_bytes());
+        hasher.update((f.bytes.len() as u64).to_le_bytes());
+        hasher.update(&f.bytes);
+    }
     let hash = format!("{:x}", hasher.finalize());
 
     let kit_dir = paths::sbx_mixin_kits_dir().join(&hash);
     let spec_path = kit_dir.join(KIT_SPEC_FILE_NAME);
+    let files_dst = kit_dir.join(MIXIN_FILES_DIR_NAME);
 
-    if let Ok(existing) = fs::read(&spec_path)
-        && existing == bytes
-    {
+    let spec_matches = fs::read(&spec_path).is_ok_and(|existing| existing == spec_bytes);
+    let files_ready = files.is_empty() || files_dst.is_dir();
+    if spec_matches && files_ready {
         return Ok(kit_dir);
     }
 
     fs::create_dir_all(&kit_dir)
         .with_context(|| format!("Failed to create mixin kit dir {}", kit_dir.display()))?;
-    fs::write(&spec_path, bytes)
+    fs::write(&spec_path, spec_bytes)
         .with_context(|| format!("Failed to write {}", spec_path.display()))?;
+
+    if !files.is_empty() {
+        if files_dst.exists() {
+            fs::remove_dir_all(&files_dst).with_context(|| {
+                format!(
+                    "Failed to clear stale mixin files at {}",
+                    files_dst.display()
+                )
+            })?;
+        }
+        for f in files {
+            let dst = files_dst.join(&f.relpath);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create dir {}", parent.display()))?;
+            }
+            fs::write(&dst, &f.bytes)
+                .with_context(|| format!("Failed to write staged mixin file {}", dst.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&dst, fs::Permissions::from_mode(f.mode))
+                    .with_context(|| format!("Failed to set mode on {}", dst.display()))?;
+            }
+        }
+    }
 
     debug!("Wrapped mixin {label} as kit at {}", kit_dir.display());
 
     Ok(kit_dir)
+}
+
+fn collect_staged_files(root: &Path) -> Result<Vec<StagedFile>> {
+    let mut out = Vec::new();
+    walk_staged_files(root, Path::new(""), &mut out)?;
+    Ok(out)
+}
+
+fn walk_staged_files(abs_dir: &Path, rel_dir: &Path, out: &mut Vec<StagedFile>) -> Result<()> {
+    let rd = fs::read_dir(abs_dir)
+        .with_context(|| format!("Failed to read mixin files dir {}", abs_dir.display()))?;
+    let mut entries: Vec<_> = rd
+        .collect::<io::Result<Vec<_>>>()
+        .with_context(|| format!("Failed to iterate mixin files dir {}", abs_dir.display()))?;
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("Failed to stat {}", entry.path().display()))?;
+        let abs = entry.path();
+        let rel = rel_dir.join(entry.file_name());
+
+        if file_type.is_symlink() {
+            bail!(
+                "Symlinks are not allowed inside a mixin {MIXIN_FILES_DIR_NAME}/ tree: {}",
+                abs.display()
+            );
+        }
+
+        if file_type.is_dir() {
+            walk_staged_files(&abs, &rel, out)?;
+        } else if file_type.is_file() {
+            let bytes = fs::read(&abs)
+                .with_context(|| format!("Failed to read staged mixin file {}", abs.display()))?;
+            let mode = staged_file_mode(&entry)?;
+            out.push(StagedFile {
+                relpath: rel,
+                mode,
+                bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn staged_file_mode(entry: &fs::DirEntry) -> Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = entry
+        .metadata()
+        .with_context(|| format!("Failed to stat {}", entry.path().display()))?;
+    Ok(meta.permissions().mode() & 0o777)
+}
+
+#[cfg(not(unix))]
+fn staged_file_mode(_entry: &fs::DirEntry) -> Result<u32> {
+    Ok(0o644)
 }
 
 pub fn discover() -> Result<Vec<DiscoveredMixin>> {
@@ -554,6 +675,196 @@ network:
             assert_ne!(
                 wrapped, mixin,
                 "kit_path should not return the original file path"
+            );
+        }
+
+        fn write_staged_file(mixin: &Path, rel: &str, content: &[u8]) {
+            let dst = mixin.parent().unwrap().join(MIXIN_FILES_DIR_NAME).join(rel);
+            fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            fs::write(&dst, content).unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn wrap_mixin_as_kit_copies_sibling_files_tree_into_kit() {
+            let _guard = TestCacheDirGuard::new();
+            let mixin = write_mixin("files-copy", "kind: mixin\nname: probe\n");
+            write_staged_file(&mixin, "home/hello.md", b"# hello\n");
+            write_staged_file(&mixin, "home/nested/deep.txt", b"deep\n");
+
+            let kit_dir = wrap_mixin_as_kit(&mixin).unwrap();
+
+            assert!(kit_dir.join("spec.yaml").exists());
+            let files_root = kit_dir.join(MIXIN_FILES_DIR_NAME);
+            assert!(files_root.is_dir(), "kit dir must contain a files/ tree");
+            assert_eq!(
+                fs::read(files_root.join("home/hello.md")).unwrap(),
+                b"# hello\n"
+            );
+            assert_eq!(
+                fs::read(files_root.join("home/nested/deep.txt")).unwrap(),
+                b"deep\n"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn wrap_mixin_as_kit_hash_changes_when_a_staged_file_is_edited() {
+            let _guard = TestCacheDirGuard::new();
+            let mixin = write_mixin("files-hash-content", "kind: mixin\nname: probe\n");
+            write_staged_file(&mixin, "home/note.md", b"before\n");
+            let kit_before = wrap_mixin_as_kit(&mixin).unwrap();
+
+            write_staged_file(&mixin, "home/note.md", b"after\n");
+            let kit_after = wrap_mixin_as_kit(&mixin).unwrap();
+
+            assert_ne!(
+                kit_before, kit_after,
+                "editing a staged file must invalidate the kit hash"
+            );
+            assert_eq!(
+                fs::read(kit_after.join("files/home/note.md")).unwrap(),
+                b"after\n"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn wrap_mixin_as_kit_hash_changes_when_a_staged_file_is_added() {
+            let _guard = TestCacheDirGuard::new();
+            let mixin = write_mixin("files-hash-added", "kind: mixin\nname: probe\n");
+            write_staged_file(&mixin, "home/one.md", b"one\n");
+            let kit_before = wrap_mixin_as_kit(&mixin).unwrap();
+
+            write_staged_file(&mixin, "home/two.md", b"two\n");
+            let kit_after = wrap_mixin_as_kit(&mixin).unwrap();
+
+            assert_ne!(
+                kit_before, kit_after,
+                "adding a staged file must invalidate the kit hash"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn wrap_mixin_as_kit_hash_unchanged_when_no_files_dir() {
+            let _guard = TestCacheDirGuard::new();
+            let content = "kind: mixin\nname: legacy\n";
+            let mixin = write_mixin("legacy-no-files", content);
+
+            let with_helper = wrap_mixin_as_kit(&mixin).unwrap();
+            let bytes_only = wrap_mixin_bytes_as_kit(content.as_bytes(), "legacy").unwrap();
+
+            assert_eq!(
+                with_helper, bytes_only,
+                "mixins without a sibling files/ must keep the legacy bytes-only hash to reuse existing cache dirs"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn wrap_mixin_as_kit_ignores_sibling_files_that_is_not_a_directory() {
+            let _guard = TestCacheDirGuard::new();
+            let content = "kind: mixin\nname: probe\n";
+            let mixin = write_mixin("files-not-a-dir", content);
+            fs::write(mixin.parent().unwrap().join(MIXIN_FILES_DIR_NAME), b"decoy").unwrap();
+
+            let wrapped = wrap_mixin_as_kit(&mixin).unwrap();
+            let bytes_only = wrap_mixin_bytes_as_kit(content.as_bytes(), "probe").unwrap();
+
+            assert_eq!(
+                wrapped, bytes_only,
+                "a regular file named files must be ignored, not staged"
+            );
+            assert!(!wrapped.join(MIXIN_FILES_DIR_NAME).exists());
+        }
+
+        #[test]
+        #[serial]
+        fn wrap_mixin_as_kit_rebuilds_files_when_cache_dir_missing_files_tree() {
+            let _guard = TestCacheDirGuard::new();
+            let mixin = write_mixin("files-rebuild", "kind: mixin\nname: probe\n");
+            write_staged_file(&mixin, "home/hello.md", b"hi\n");
+
+            let kit_dir = wrap_mixin_as_kit(&mixin).unwrap();
+            let files_dst = kit_dir.join(MIXIN_FILES_DIR_NAME);
+            fs::remove_dir_all(&files_dst).unwrap();
+            assert!(!files_dst.exists());
+
+            let kit_again = wrap_mixin_as_kit(&mixin).unwrap();
+
+            assert_eq!(kit_again, kit_dir, "kit path is content-addressed");
+            assert!(
+                files_dst.is_dir(),
+                "a partial cache (spec present, files/ missing) must be rebuilt"
+            );
+            assert_eq!(fs::read(files_dst.join("home/hello.md")).unwrap(), b"hi\n");
+        }
+
+        #[test]
+        #[serial]
+        fn wrap_mixin_as_kit_deterministic_with_staged_files() {
+            let _guard = TestCacheDirGuard::new();
+            let content = "kind: mixin\nname: probe\n";
+            let mixin_one = write_mixin("determ-1", content);
+            write_staged_file(&mixin_one, "home/note.md", b"same\n");
+            let mixin_two = write_mixin("determ-2", content);
+            write_staged_file(&mixin_two, "home/note.md", b"same\n");
+
+            let kit_a = wrap_mixin_as_kit(&mixin_one).unwrap();
+            let kit_b = wrap_mixin_as_kit(&mixin_two).unwrap();
+
+            assert_eq!(
+                kit_a, kit_b,
+                "identical spec+files must produce the same content-addressed kit dir"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn wrap_mixin_as_kit_rejects_symlinks_inside_files_tree() {
+            use std::os::unix::fs::symlink;
+
+            let _guard = TestCacheDirGuard::new();
+            let mixin = write_mixin("files-symlink", "kind: mixin\nname: probe\n");
+            let files_dir = mixin.parent().unwrap().join(MIXIN_FILES_DIR_NAME);
+            fs::create_dir_all(&files_dir).unwrap();
+            let target = files_dir.join("target.txt");
+            fs::write(&target, b"real").unwrap();
+            symlink(&target, files_dir.join("link.txt")).unwrap();
+
+            let err = wrap_mixin_as_kit(&mixin).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("Symlinks are not allowed"),
+                "expected symlink rejection, got: {msg}"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn wrap_mixin_as_kit_preserves_executable_bit() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _guard = TestCacheDirGuard::new();
+            let mixin = write_mixin("files-exec", "kind: mixin\nname: probe\n");
+            write_staged_file(&mixin, "bin/run.sh", b"#!/bin/sh\necho hi\n");
+            let src = mixin
+                .parent()
+                .unwrap()
+                .join(MIXIN_FILES_DIR_NAME)
+                .join("bin/run.sh");
+            fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let kit_dir = wrap_mixin_as_kit(&mixin).unwrap();
+            let dst = kit_dir.join("files/bin/run.sh");
+            let mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+
+            assert_eq!(
+                mode, 0o755,
+                "executable bit must survive the copy into the kit dir"
             );
         }
     }
