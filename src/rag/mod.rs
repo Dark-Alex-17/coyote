@@ -586,6 +586,17 @@ impl Rag {
                 if data.vectors.is_empty() {
                     data.vectors = duck.read_all_vectors()?;
                 }
+                if data.vectors.is_empty() && !data.files.is_empty() {
+                    println!(
+                        "{} RAG '{name}' lists {} indexed file(s), but its vector store \
+                         '{}' holds no vectors, so every search will return nothing. A \
+                         duckdb RAG is two files: bring the .duckdb sidecar along with \
+                         the .yaml, or re-embed with `.rebuild rag`.",
+                        warning_text("WARNING:"),
+                        data.files.len(),
+                        db_path.display()
+                    );
+                }
                 // data.files is always populated for duckdb, so build_bm25() is the only
                 // path; there is no from-DuckDB fallback.
                 let bm25 = data.build_bm25();
