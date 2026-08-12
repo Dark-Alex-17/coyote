@@ -104,7 +104,10 @@ fn parse_search_hits(
             let score = pt["score"].as_f64()? as f32;
             Some((interner.document_id(&pt["id"])?, score))
         })
-        .filter(|(_, score)| *score > min_score)
+        // Only a positive floor is a floor. Euclid collections score by negative
+        // distance, so a 0.0 floor would drop every hit — the exact failure the
+        // caller avoids `score_threshold` to prevent.
+        .filter(|(_, score)| min_score <= 0.0 || *score > min_score)
         .collect())
 }
 
@@ -353,7 +356,8 @@ impl RagProvider for QdrantProvider {
         // `score_threshold` is deliberately NOT sent. It is metric-aware: on Cosine
         // collections 0.0 means "no floor" as expected, but Euclid collections score
         // by negative distance, where 0.0 filters everything out. The attach wizard
-        // does not pin the distance metric, so filter locally instead.
+        // does not pin the distance metric, so filter locally instead — where a
+        // 0.0 floor is correctly treated as "no floor" (see `parse_search_hits`).
         let body = serde_json::json!({
             "vector": embedding,
             "limit": top_k,
@@ -574,6 +578,40 @@ mod tests {
         };
 
         assert!(provider.fetch_content(&[]).await.unwrap().is_empty());
+    }
+
+    /// Euclid collections score by NEGATIVE distance, so the 0.0 the caller
+    /// passes must mean "no floor". Filtering on it drops every hit — the exact
+    /// bug that keeps Qdrant's own `score_threshold` off the wire.
+    #[test]
+    fn a_zero_floor_keeps_negative_euclid_scores() {
+        let mut interner = PointIdInterner::default();
+        let search = serde_json::json!({
+            "result": [
+                {"id": 1, "score": -0.12},
+                {"id": 2, "score": -8.5},
+            ]
+        });
+
+        let hits = parse_search_hits(&mut interner, &search, 0.0).unwrap();
+
+        assert_eq!(hits.len(), 2, "a 0.0 floor must not drop negative scores");
+    }
+
+    #[test]
+    fn a_positive_floor_still_filters() {
+        let mut interner = PointIdInterner::default();
+        let search = serde_json::json!({
+            "result": [
+                {"id": 1, "score": 0.9},
+                {"id": 2, "score": 0.2},
+            ]
+        });
+
+        let hits = parse_search_hits(&mut interner, &search, 0.5).unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, DocumentId(1));
     }
 
     /// A UUID-keyed collection has to survive the whole `vector_search` →
