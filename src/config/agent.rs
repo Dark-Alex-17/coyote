@@ -4,6 +4,7 @@ use crate::{
     client::Model,
     config::memory,
     function::{Functions, run_llm_function},
+    graph, rag,
 };
 
 use super::rag_cache::RagKey;
@@ -1021,7 +1022,7 @@ async fn init_graph_rags(
             // Graph validation catches this too, but it is skipped when
             // `validate_before_run` is off, so this guard is the load-bearing one.
             if let Some(driver) = &rag_node.driver
-                && let Some(message) = crate::graph::validator::rag_driver_error(driver)
+                && let Some(message) = graph::validator::rag_driver_error(driver)
             {
                 bail!("rag node '{node_id}': {message}");
             }
@@ -1053,7 +1054,7 @@ async fn init_graph_rags(
                 }
 
                 if config.driver.is_none() {
-                    config.driver = Some(crate::rag::select_rag_driver()?);
+                    config.driver = Some(rag::select_rag_driver()?);
                 }
             }
 
