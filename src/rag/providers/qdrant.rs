@@ -104,9 +104,6 @@ fn parse_search_hits(
             let score = pt["score"].as_f64()? as f32;
             Some((interner.document_id(&pt["id"])?, score))
         })
-        // Only a positive floor is a floor. Euclid collections score by negative
-        // distance, so a 0.0 floor would drop every hit — the exact failure the
-        // caller avoids `score_threshold` to prevent.
         .filter(|(_, score)| min_score <= 0.0 || *score > min_score)
         .collect())
 }
@@ -356,7 +353,7 @@ impl RagProvider for QdrantProvider {
         // `score_threshold` is deliberately NOT sent. It is metric-aware: on Cosine
         // collections 0.0 means "no floor" as expected, but Euclid collections score
         // by negative distance, where 0.0 filters everything out. The attach wizard
-        // does not pin the distance metric, so filter locally instead — where a
+        // does not pin the distance metric, so filter locally instead; i.e. where a
         // 0.0 floor is correctly treated as "no floor" (see `parse_search_hits`).
         let body = serde_json::json!({
             "vector": embedding,

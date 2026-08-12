@@ -603,7 +603,7 @@ impl Rag {
             }
             // Explicitly NOT a catch-all falling through to yaml. A typo'd driver
             // used to build a yaml store, pay to embed the whole corpus, persist
-            // the bad driver, and only fail on the NEXT run — leaving the RAG
+            // the bad driver, and only fail on the NEXT run, leaving the RAG
             // unusable without hand-editing the YAML.
             other => bail!(
                 "Unknown RAG driver '{other}' for RAG '{name}'. \
@@ -1179,11 +1179,6 @@ impl Rag {
         top_k: usize,
         rerank_model: Option<&str>,
     ) -> Result<Vec<(DocumentId, String)>> {
-        // The two legs run CONCURRENTLY. Both can be network round trips on a
-        // remote provider (embedding the query, then the vector search; a native
-        // keyword search), so awaiting them in sequence roughly doubles the
-        // latency of every hybrid query. The local BM25 branch is synchronous and
-        // simply runs inline inside the future.
         let keyword_leg = async {
             if self.provider.has_native_keyword_search() {
                 self.provider
@@ -1587,11 +1582,6 @@ impl RagData {
             }
         }
 
-        // An api_key must be a `{{NAME}}` reference, never the credential itself.
-        // Two reasons, both load-bearing: a literal key here gets committed to the
-        // RAG YAML in plaintext, and sandbox provisioning parses this value back
-        // out to learn which vault secret to bind, so a literal one silently
-        // provisions nothing (and used to be echoed to stderr on failure).
         if let Some(api_key) = self.driver_config.get("api_key")
             && placeholder_secret_name(api_key).is_none()
         {
@@ -3290,9 +3280,6 @@ vectors: {}
         assert!(data.validate().is_ok());
     }
 
-    /// A literal credential in `driver_config.api_key` is refused outright: it
-    /// would be persisted to the RAG YAML in plaintext, and sandbox
-    /// provisioning parses this field expecting a placeholder.
     #[test]
     fn ragdata_validate_rejects_a_literal_api_key() {
         let mut data = RagData::new(
@@ -3337,15 +3324,10 @@ vectors: {}
         assert!(data.validate().is_ok());
     }
 
-    /// The parser is the single thing standing between a hand-edited literal key
-    /// and a "could not load secret '<the key>'" line in the user's terminal.
     #[test]
     fn placeholder_secret_name_accepts_only_well_formed_placeholders() {
         assert_eq!(placeholder_secret_name("{{NAME}}"), Some("NAME"));
         assert_eq!(placeholder_secret_name("  {{ NAME }}  "), Some("NAME"));
-
-        // Every one of these used to survive the old trim_matches unchanged and
-        // then be used as a secret name.
         assert_eq!(placeholder_secret_name("sk-literal-key"), None);
         assert_eq!(placeholder_secret_name(""), None);
         assert_eq!(placeholder_secret_name("{{}}"), None);

@@ -344,10 +344,6 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
         if service_id.is_empty() || registered.contains(&service_id) {
             continue;
         }
-        // A literal key must NOT be mistaken for a secret NAME. The trims that
-        // used to stand here leave a non-placeholder value completely untouched,
-        // so the vault lookup below would run with the credential as the "name"
-        // and the warning would then print that credential to stderr.
         let Some(secret_name) = placeholder_secret_name(placeholder) else {
             eprintln!(
                 "Warning: RAG '{stem}' has a driver_config.api_key that is not a \
