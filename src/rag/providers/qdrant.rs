@@ -1,5 +1,6 @@
 use crate::rag::provider::RagProvider;
 use crate::rag::{DocumentId, RagData};
+use crate::utils::apply_proxy;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -191,9 +192,7 @@ impl QdrantProvider {
             value.set_sensitive(true);
             headers.insert("api-key", value);
         }
-        Client::builder()
-            .default_headers(headers)
-            .no_proxy()
+        apply_proxy(Client::builder().default_headers(headers), None)?
             .build()
             .context("Failed to build reqwest client")
     }

@@ -56,9 +56,7 @@ pub trait Client: Sync + Send {
         let mut builder = ReqwestClient::builder();
         let extra = self.extra_config();
         let timeout = extra.and_then(|v| v.connect_timeout).unwrap_or(10);
-        if let Some(proxy) = extra.and_then(|v| v.proxy.as_deref()) {
-            builder = set_proxy(builder, proxy)?;
-        }
+        builder = apply_proxy(builder, extra.and_then(|v| v.proxy.as_deref()))?;
         if let Some(user_agent) = self.app_config().user_agent.as_ref() {
             builder = builder.user_agent(user_agent);
         }

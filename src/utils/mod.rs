@@ -295,16 +295,81 @@ pub fn is_url(path: &str) -> bool {
     path.starts_with("http://") || path.starts_with("https://")
 }
 
-pub fn set_proxy(
+/// 127.0.0.1 means something different to a proxy than it does to us, so a tool
+/// that intercepts proxied traffic answers for a local service that is running
+/// fine, and the failure reads as a fault in Coyote or in that service.
+const LOCAL_NO_PROXY: &str =
+    "localhost,127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local";
+
+/// Applies proxy settings, keeping local traffic direct. `configured` is a
+/// client's own `extra.proxy`, where `"-"` means no proxy at all; with nothing
+/// configured an ambient `*_PROXY` is still honoured for public hosts.
+pub fn apply_proxy(
     mut builder: reqwest::ClientBuilder,
-    proxy: &str,
+    configured: Option<&str>,
 ) -> Result<reqwest::ClientBuilder> {
+    // reqwest offers no way to add rules to the proxies it auto-detects, so
+    // detection is disabled and redone below.
     builder = builder.no_proxy();
-    if !proxy.is_empty() && proxy != "-" {
-        builder = builder
-            .proxy(reqwest::Proxy::all(proxy).with_context(|| format!("Invalid proxy `{proxy}`"))?);
-    };
+
+    let configured = configured.map(str::trim).filter(|p| !p.is_empty());
+    if configured == Some("-") {
+        return Ok(builder);
+    }
+    let exempt = no_proxy_rules();
+    if let Some(url) = configured {
+        let proxy = reqwest::Proxy::all(url)
+            .with_context(|| format!("Invalid proxy `{url}`"))?
+            .no_proxy(reqwest::NoProxy::from_string(&exempt));
+        return Ok(builder.proxy(proxy));
+    }
+
+    // Split per scheme, because HTTP_PROXY and HTTPS_PROXY are allowed to differ.
+    for (is_https, keys) in [
+        (
+            true,
+            ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"],
+        ),
+        (
+            false,
+            ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"],
+        ),
+    ] {
+        let Some(url) = first_env(&keys) else {
+            continue;
+        };
+        let proxy = if is_https {
+            reqwest::Proxy::https(&url)
+        } else {
+            reqwest::Proxy::http(&url)
+        };
+        let proxy = proxy
+            .with_context(|| format!("Invalid proxy `{url}`"))?
+            .no_proxy(reqwest::NoProxy::from_string(&exempt));
+        builder = builder.proxy(proxy);
+    }
     Ok(builder)
+}
+
+fn first_env(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Replacing reqwest's auto-detection loses its `NO_PROXY` handling, so that is
+/// merged back in here.
+fn no_proxy_rules() -> String {
+    let mut rules = LOCAL_NO_PROXY.to_string();
+    let extra = env::var("NO_PROXY")
+        .or_else(|_| env::var("no_proxy"))
+        .unwrap_or_default();
+    if !extra.trim().is_empty() {
+        rules.push(',');
+        rules.push_str(extra.trim());
+    }
+    rules
 }
 
 pub fn decode_bin<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T> {
@@ -315,6 +380,47 @@ pub fn decode_bin<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Invalid rule syntax makes `from_string` return `None`, which silently drops
+    /// every exemption and sends local traffic back through the proxy.
+    #[test]
+    fn the_local_no_proxy_rules_are_valid() {
+        assert!(
+            reqwest::NoProxy::from_string(LOCAL_NO_PROXY).is_some(),
+            "reqwest rejected LOCAL_NO_PROXY, so nothing would be exempt"
+        );
+    }
+
+    #[test]
+    fn local_rules_cover_loopback_and_private_ranges() {
+        for host in [
+            "localhost",
+            "127.0.0.0/8",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+        ] {
+            assert!(
+                LOCAL_NO_PROXY.contains(host),
+                "{host} must stay exempt from proxying"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dash_means_no_proxy_at_all() {
+        assert!(apply_proxy(reqwest::ClientBuilder::new(), Some("-")).is_ok());
+        assert!(apply_proxy(reqwest::ClientBuilder::new(), Some(" - ")).is_ok());
+    }
+
+    #[test]
+    fn an_unparseable_proxy_is_reported() {
+        let err = apply_proxy(reqwest::ClientBuilder::new(), Some("not a url"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Invalid proxy"), "got: {err}");
+    }
 
     #[test]
     #[cfg(not(target_os = "windows"))]
