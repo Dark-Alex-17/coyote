@@ -437,10 +437,6 @@ pub(crate) fn remove_rag_sidecars(dir: &Path, name: &str) -> Result<()> {
     if duckdb_path.exists() {
         let _ = remove_file(&duckdb_path);
     }
-    // DuckDB keeps its write-ahead log in a sibling file and only removes it on a
-    // clean close, so a crash or a kill leaves one behind. Deleting the database
-    // without it strands a `.wal` that the next RAG created under the same name
-    // would inherit as if it were its own.
     let wal_path = dir.join(format!("{name}.duckdb.wal"));
     if wal_path.exists() {
         let _ = remove_file(&wal_path);
@@ -905,7 +901,6 @@ mod tests {
     fn remove_rag_sidecars_removes_duckdb_wal_and_mixin() {
         let root = sidecar_temp_dir("rag-sidecars-both");
         let duckdb = root.join("docs.duckdb");
-        // DuckDB leaves this behind whenever it was not closed cleanly.
         let wal = root.join("docs.duckdb.wal");
         let mixin = root.join("docs.sbx-mixin.yaml");
         fs::write(&duckdb, "db").unwrap();
