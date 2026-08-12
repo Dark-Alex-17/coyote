@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use which::which;
 
-mod mcp_credentials;
+pub(crate) mod mcp_credentials;
 mod mixins;
 
 pub(crate) use mcp_credentials::sandbox_secret_env_var;
@@ -19,6 +19,7 @@ use crate::config::AppConfig;
 use crate::config::Config;
 use crate::config::VAULT_DATA_FILE_NAME;
 use crate::config::paths;
+use crate::rag::RagData;
 use crate::sandbox::mcp_credentials::MCP_MIXIN_NAME;
 use crate::sandbox::mixins::DiscoveredMixin;
 use crate::utils::run_command_with_output;
@@ -53,6 +54,10 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
     let vault = Vault::init(&bootstrap)?;
     let registered = sbx_registered_services()?;
     inject_llm_secret(&config_content, &vault, &registered)?;
+    if !fresh {
+        inject_rag_secrets(&vault, &registered)?;
+    }
+
     let credentials_mixin = if fresh {
         None
     } else {
@@ -307,6 +312,87 @@ fn inject_mcp_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<Opt
         &credentials,
         &allow_entries,
     )?))
+}
+
+fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()> {
+    let rags_dir = paths::rags_dir();
+    if !rags_dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&rags_dir)?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) if !paths::is_rag_sidecar_name(s) => s.to_string(),
+            _ => continue,
+        };
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(data) = serde_yaml::from_str::<RagData>(&raw) else {
+            continue;
+        };
+        if !data.attached {
+            continue;
+        }
+        let secret_names = driver_config_secret_names(&data);
+        let Some((primary, extra)) = secret_names.split_first() else {
+            continue;
+        };
+
+        let service_id = mcp_credentials::secret_service_id(&stem);
+        if !service_id.is_empty() && !registered.contains(&service_id) {
+            bind_rag_secret(vault, &service_id, primary, &stem)?;
+        }
+
+        for name in extra {
+            let id = mcp_credentials::secret_service_id(name);
+            if !id.is_empty() && !registered.contains(&id) {
+                bind_rag_secret(vault, &id, name, &stem)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn driver_config_secret_names(data: &RagData) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for value in data.driver_config.values() {
+        let trimmed = value.trim();
+        let Ok(Some(caps)) = SECRET_RE.captures(trimmed) else {
+            continue;
+        };
+        if caps.get(0).map(|m| m.as_str()) != Some(trimmed) {
+            continue;
+        }
+        let Some(name) = caps.get(1).map(|m| m.as_str().trim()) else {
+            continue;
+        };
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+fn bind_rag_secret(vault: &Vault, service_id: &str, secret_name: &str, stem: &str) -> Result<()> {
+    match vault.get_secret(secret_name, false) {
+        Ok(secret_value) => {
+            sbx_secret_set(service_id, &secret_value)
+                .context("Failed to register RAG secret with sbx")?;
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: could not load secret '{secret_name}' for RAG '{stem}': {e}. \
+                 Queries to this RAG will fail inside the sandbox. \
+                 Run `coyote --add-secret {secret_name}` to fix."
+            );
+        }
+    }
+    Ok(())
 }
 
 fn provider_to_sbx_service(provider_type: &str, client_name: Option<&str>) -> String {
@@ -588,6 +674,64 @@ fn chown_agent_recursive(sandbox: &str, path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rag_with(driver_config: &[(&str, &str)]) -> RagData {
+        let mut data = RagData::new("m".into(), 1024, 50, None, 5, None, Default::default());
+        data.driver = "qdrant".to_string();
+        data.attached = true;
+        for (k, v) in driver_config {
+            data.driver_config.insert(k.to_string(), v.to_string());
+        }
+        data
+    }
+
+    #[test]
+    fn secret_names_are_found_whatever_the_field_is_called() {
+        let data = rag_with(&[
+            ("host", "qdrant.example.com:6333"),
+            ("collection", "docs"),
+            ("token", "{{SOME_TOKEN}}"),
+        ]);
+
+        assert_eq!(driver_config_secret_names(&data), vec!["SOME_TOKEN"]);
+    }
+
+    #[test]
+    fn a_literal_credential_is_not_treated_as_a_secret_name() {
+        let data = rag_with(&[("api_key", "sk-a-real-looking-key")]);
+
+        assert!(driver_config_secret_names(&data).is_empty());
+    }
+
+    #[test]
+    fn plain_values_are_never_mistaken_for_secrets() {
+        let data = rag_with(&[("host", "localhost:6333"), ("collection", "docs")]);
+
+        assert!(driver_config_secret_names(&data).is_empty());
+    }
+
+    #[test]
+    fn a_partial_placeholder_is_not_a_credential() {
+        let data = rag_with(&[("api_key", "Bearer {{KEY}}")]);
+
+        assert!(driver_config_secret_names(&data).is_empty());
+    }
+
+    #[test]
+    fn several_secrets_are_all_found_and_deduped() {
+        let data = rag_with(&[
+            ("api_key", "{{QDRANT_KEY}}"),
+            ("host", "localhost:6333"),
+            ("token", "{{ OTHER_TOKEN }}"),
+            ("fallback_key", "{{QDRANT_KEY}}"),
+        ]);
+
+        assert_eq!(
+            driver_config_secret_names(&data),
+            vec!["QDRANT_KEY", "OTHER_TOKEN"],
+            "order follows driver_config, and a repeat is not registered twice"
+        );
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

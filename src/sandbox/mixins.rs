@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::config::paths;
 
 const SBX_MIXIN_FILE_NAME: &str = "sbx-mixin.yaml";
+const SBX_MIXIN_FILE_SUFFIX: &str = ".sbx-mixin.yaml";
 const KIT_SPEC_FILE_NAME: &str = "spec.yaml";
 
 #[derive(Debug, Clone)]
@@ -66,10 +67,16 @@ pub fn discover() -> Result<Vec<DiscoveredMixin>> {
     push_if_exists(&mut out, paths::sbx_mixin_file())?;
     push_if_exists(&mut out, paths::global_tools_sbx_mixin_file())?;
 
-    for path in collect_subdir_mixins(&paths::functions_dir()) {
+    for path in collect_mixins(&paths::functions_dir(), &[ScanMode::SubdirNamed]) {
         out.push(read_mixin(path)?);
     }
-    for path in collect_subdir_mixins(&paths::agents_data_dir()) {
+    for path in collect_mixins(
+        &paths::agents_data_dir(),
+        &[ScanMode::SubdirNamed, ScanMode::SubdirFlat],
+    ) {
+        out.push(read_mixin(path)?);
+    }
+    for path in collect_mixins(&paths::rags_dir(), &[ScanMode::Flat]) {
         out.push(read_mixin(path)?);
     }
 
@@ -156,7 +163,73 @@ fn read_mixin(path: PathBuf) -> Result<DiscoveredMixin> {
     })
 }
 
-fn collect_subdir_mixins(dir: &Path) -> Vec<PathBuf> {
+/// One on-disk layout a mixin scan can look for. A scan takes a set of these,
+/// and each mode contributes only the shape it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanMode {
+    /// `<dir>/*.sbx-mixin.yaml`
+    Flat,
+    /// `<dir>/*/sbx-mixin.yaml`
+    SubdirNamed,
+    /// `<dir>/*/*.sbx-mixin.yaml`
+    SubdirFlat,
+}
+
+/// Collects mixin paths under `dir` for every requested layout. Missing or
+/// unreadable directories yield nothing rather than an error — these paths are
+/// all optional on disk.
+///
+/// Order is deterministic: flat matches first (sorted by file name), then each
+/// subdirectory in sorted order, contributing its named mixin before its
+/// suffixed ones.
+fn collect_mixins(dir: &Path, modes: &[ScanMode]) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+
+    if modes.contains(&ScanMode::Flat) {
+        result.extend(suffixed_mixins_in(dir));
+    }
+
+    let named = modes.contains(&ScanMode::SubdirNamed);
+    let subdir_flat = modes.contains(&ScanMode::SubdirFlat);
+    if !named && !subdir_flat {
+        return result;
+    }
+
+    for subdir in subdirs_of(dir) {
+        if named {
+            let candidate = subdir.join(SBX_MIXIN_FILE_NAME);
+            if candidate.exists() {
+                result.push(candidate);
+            }
+        }
+        if subdir_flat {
+            result.extend(suffixed_mixins_in(&subdir));
+        }
+    }
+
+    result
+}
+
+fn suffixed_mixins_in(dir: &Path) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    let Ok(rd) = read_dir(dir) else { return result };
+
+    let mut entries: Vec<_> = rd
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(SBX_MIXIN_FILE_SUFFIX))
+        })
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    result.extend(entries.into_iter().map(|e| e.path()));
+    result
+}
+
+fn subdirs_of(dir: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
     let Ok(rd) = read_dir(dir) else { return result };
 
@@ -166,13 +239,7 @@ fn collect_subdir_mixins(dir: &Path) -> Vec<PathBuf> {
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
-    for entry in entries {
-        let candidate = entry.path().join(SBX_MIXIN_FILE_NAME);
-        if candidate.exists() {
-            result.push(candidate);
-        }
-    }
-
+    result.extend(entries.into_iter().map(|e| e.path()));
     result
 }
 
@@ -190,6 +257,13 @@ mod tests {
         let root = env::temp_dir().join(format!("coyote-{prefix}-{nanos}"));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn file_names(paths: &[PathBuf]) -> Vec<&str> {
+        paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect()
     }
 
     #[test]
@@ -275,7 +349,7 @@ network:
     }
 
     #[test]
-    fn collect_subdir_mixins_sorts_and_skips_missing() {
+    fn subdir_named_scan_sorts_and_skips_missing() {
         let root = unique_root("sbx-mixin-subdirs");
         for name in ["zebra", "apple", "no-mixin", "mango"] {
             let dir = root.join(name);
@@ -285,7 +359,7 @@ network:
             }
         }
 
-        let found = collect_subdir_mixins(&root);
+        let found = collect_mixins(&root, &[ScanMode::SubdirNamed]);
         let names: Vec<String> = found
             .iter()
             .map(|p| {
@@ -303,9 +377,9 @@ network:
     }
 
     #[test]
-    fn collect_subdir_mixins_returns_empty_for_missing_dir() {
+    fn subdir_named_scan_returns_empty_for_missing_dir() {
         let absent = env::temp_dir().join("coyote-definitely-not-here-xyz");
-        let found = collect_subdir_mixins(&absent);
+        let found = collect_mixins(&absent, &[ScanMode::SubdirNamed]);
         assert!(found.is_empty());
     }
 
@@ -482,5 +556,127 @@ network:
                 "kit_path should not return the original file path"
             );
         }
+    }
+
+    #[test]
+    fn flat_scan_matches_rag_sidecars_by_suffix() {
+        let root = unique_root("flat-mixins");
+        fs::write(root.join("company-docs.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
+        fs::write(root.join("alpha.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
+        fs::write(root.join("company-docs.yaml"), "driver: qdrant\n").unwrap();
+        fs::write(root.join("notes.yaml"), "driver: yaml\n").unwrap();
+        fs::create_dir_all(root.join("decoy.sbx-mixin.yaml")).unwrap();
+
+        let found = collect_mixins(&root, &[ScanMode::Flat]);
+        assert_eq!(
+            file_names(&found),
+            vec!["alpha.sbx-mixin.yaml", "company-docs.sbx-mixin.yaml"]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Every scan site in `discover()` picks its modes assuming each mode owns
+    /// exactly one layout and nothing else. `agents_data_dir()` requests two
+    /// modes at once, so an overlap would collect the same file twice and
+    /// `create_sandbox` would pass it as two `--kit` flags.
+    #[test]
+    fn each_scan_mode_owns_exactly_one_layout() {
+        let root = unique_root("scan-mode-ownership");
+        let agent = root.join("researcher");
+        fs::create_dir_all(&agent).unwrap();
+        let flat = root.join("company-docs.sbx-mixin.yaml");
+        let subdir_named = agent.join("sbx-mixin.yaml");
+        let subdir_flat = agent.join("handbook.sbx-mixin.yaml");
+        for path in [&flat, &subdir_named, &subdir_flat] {
+            fs::write(path, "kind: mixin\n").unwrap();
+        }
+
+        assert_eq!(collect_mixins(&root, &[ScanMode::Flat]), vec![flat.clone()]);
+        assert_eq!(
+            collect_mixins(&root, &[ScanMode::SubdirNamed]),
+            vec![subdir_named.clone()]
+        );
+        assert_eq!(
+            collect_mixins(&root, &[ScanMode::SubdirFlat]),
+            vec![subdir_flat.clone()]
+        );
+
+        let all = collect_mixins(
+            &root,
+            &[ScanMode::Flat, ScanMode::SubdirNamed, ScanMode::SubdirFlat],
+        );
+        assert_eq!(all, vec![flat, subdir_named, subdir_flat]);
+
+        let mut deduped = all.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            all.len(),
+            "no mixin may be collected twice: {all:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn flat_scan_tolerates_a_missing_directory() {
+        let root = unique_root("flat-missing");
+        let absent = root.join("nope");
+        assert!(collect_mixins(&absent, &[ScanMode::Flat]).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `generate_rag_sbx_mixin` writes an agent-scoped RAG sidecar next to the
+    /// rag yaml, at `<agents>/<agent>/<rag>.sbx-mixin.yaml`. Before `SubdirFlat`
+    /// existed, nothing scanned that shape and attaching a Qdrant RAG from
+    /// inside an agent produced no network allow rule and no credential.
+    #[test]
+    fn agent_scoped_rag_sidecar_is_discovered() {
+        let root = unique_root("agent-scoped-rag");
+        let agent = root.join("researcher");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("company-docs.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
+        fs::write(agent.join("company-docs.yaml"), "driver: qdrant\n").unwrap();
+
+        let found = collect_mixins(&root, &[ScanMode::SubdirNamed, ScanMode::SubdirFlat]);
+        assert_eq!(found, vec![agent.join("company-docs.sbx-mixin.yaml")]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_level_mixin_and_rag_sidecars_are_both_discovered() {
+        let root = unique_root("agent-both-shapes");
+        let agent = root.join("researcher");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("sbx-mixin.yaml"), "kind: mixin\n").unwrap();
+        fs::write(agent.join("zebra.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
+        fs::write(agent.join("alpha.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
+
+        let found = collect_mixins(&root, &[ScanMode::SubdirNamed, ScanMode::SubdirFlat]);
+        assert_eq!(
+            file_names(&found),
+            vec![
+                "sbx-mixin.yaml",
+                "alpha.sbx-mixin.yaml",
+                "zebra.sbx-mixin.yaml"
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn subdir_flat_scan_ignores_a_directory_named_like_a_mixin() {
+        let root = unique_root("subdir-flat-decoy");
+        let agent = root.join("researcher");
+        fs::create_dir_all(agent.join("decoy.sbx-mixin.yaml")).unwrap();
+
+        assert!(collect_mixins(&root, &[ScanMode::SubdirFlat]).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

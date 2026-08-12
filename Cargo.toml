@@ -17,8 +17,9 @@ exclude = [".github", "CONTRIBUTING.md"]
 anyhow = "1.0.69"
 bytes = "1.4.0"
 clap = { version = "4.5.40", features = ["cargo", "derive", "wrap_help"] }
-comfy-table = { version = "7.2.2", features = ["custom_styling"] }
+comfy-table = { version = "7.1.4", features = ["custom_styling"] }
 dirs = "6.0.0"
+duckdb = { version = "1.10505.0", features = ["bundled"] }
 dunce = "1.0.5"
 futures-util = "0.3.29"
 inquire = "0.9.4"

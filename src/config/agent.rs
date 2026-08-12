@@ -4,6 +4,7 @@ use crate::{
     client::Model,
     config::memory,
     function::{Functions, run_llm_function},
+    graph, rag,
 };
 
 use super::rag_cache::RagKey;
@@ -12,6 +13,7 @@ use crate::config::prompts::{
     DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS, DEFAULT_TODO_INSTRUCTIONS,
     DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
+use crate::graph::types::RagNode;
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::rag::RagInitConfig;
 use crate::vault::SECRET_RE;
@@ -146,11 +148,18 @@ impl Agent {
         let rag = if rag_path.exists() {
             let key = RagKey::Agent(name.to_string());
             let app_clone = app.clone();
+            let vault_clone = app_state.vault.clone();
             let rag_path_clone = rag_path.clone();
             let rag = app_state
                 .rag_cache
                 .load_with(key, || async move {
-                    Rag::load(&app_clone, DEFAULT_AGENT_NAME, &rag_path_clone)
+                    Rag::load_async(
+                        &app_clone,
+                        &vault_clone,
+                        DEFAULT_AGENT_NAME,
+                        &rag_path_clone,
+                    )
+                    .await
                 })
                 .await?;
             Some(rag)
@@ -171,7 +180,15 @@ impl Agent {
                 let rag = app_state
                     .rag_cache
                     .load_with(key, || async move {
-                        Rag::init(&app_clone, "rag", &rag_path_clone, &document_paths, abort).await
+                        Rag::init(
+                            &app_clone,
+                            "rag",
+                            &rag_path_clone,
+                            &document_paths,
+                            abort,
+                            true,
+                        )
+                        .await
                     })
                     .await?;
                 Some(rag)
@@ -937,6 +954,30 @@ fn resolve_document_paths(
     Ok(document_paths)
 }
 
+/// How a graph rag node describes the knowledge base it wants built.
+///
+/// `driver` is forwarded as-is: `None` means the node did not ask for one, which
+/// `RagInitConfig` resolves to yaml, so workflows written before drivers existed
+/// keep their current storage.
+///
+/// Every field is now named explicitly, so adding one to `RagInitConfig` breaks
+/// this literal. That is deliberate: the new field then gets a decision about
+/// whether a rag node can drive it, instead of silently taking its default.
+fn rag_init_config(rag_node: &RagNode) -> RagInitConfig {
+    RagInitConfig {
+        embedding_model: rag_node.embedding_model.clone(),
+        chunk_size: rag_node.chunk_size,
+        chunk_overlap: rag_node.chunk_overlap,
+        reranker_model: rag_node.reranker_model.clone(),
+        top_k: rag_node.top_k,
+        batch_size: rag_node.batch_size,
+        extractor_model: rag_node.extractor_model.clone(),
+        extractor_prompt: rag_node.extractor_prompt.clone(),
+        graph_hops: rag_node.graph_hops,
+        driver: rag_node.driver.clone(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn init_graph_rags(
     app: &AppConfig,
@@ -964,26 +1005,28 @@ async fn init_graph_rags(
         };
         let rag = if rag_path.exists() {
             let app_clone = app.clone();
+            let vault_clone = app_state.vault.clone();
             let path_clone = rag_path.clone();
             let name_clone = node_id.clone();
             app_state
                 .rag_cache
                 .load_with(key, || async move {
-                    Rag::load(&app_clone, &name_clone, &path_clone)
+                    Rag::load_async(&app_clone, &vault_clone, &name_clone, &path_clone).await
                 })
                 .await?
         } else {
-            let config = RagInitConfig {
-                embedding_model: rag_node.embedding_model.clone(),
-                chunk_size: rag_node.chunk_size,
-                chunk_overlap: rag_node.chunk_overlap,
-                reranker_model: rag_node.reranker_model.clone(),
-                top_k: rag_node.top_k,
-                batch_size: rag_node.batch_size,
-                extractor_model: rag_node.extractor_model.clone(),
-                extractor_prompt: rag_node.extractor_prompt.clone(),
-                graph_hops: rag_node.graph_hops,
-            };
+            // Checked before anything is built: an unknown driver would otherwise
+            // fall through `Rag::create`'s catch-all to a yaml store, embed every
+            // document, and persist the bogus driver string. The RAG would then be
+            // rejected on every subsequent load, leaving the agent unstartable.
+            // Graph validation catches this too, but it is skipped when
+            // `validate_before_run` is off, so this guard is the load-bearing one.
+            if let Some(driver) = &rag_node.driver
+                && let Some(message) = graph::validator::rag_driver_error(driver)
+            {
+                bail!("rag node '{node_id}': {message}");
+            }
+            let mut config = rag_init_config(rag_node);
             let fully_specified = config.embedding_model.is_some()
                 && config.chunk_size.is_some()
                 && config.chunk_overlap.is_some();
@@ -1008,6 +1051,10 @@ async fn init_graph_rags(
                         "Agent '{agent_name}' has rag node '{node_id}' but its RAG was not \
                          initialized. RAG initialization is required for this agent."
                     );
+                }
+
+                if config.driver.is_none() {
+                    config.driver = Some(rag::select_rag_driver()?);
                 }
             }
 
@@ -1316,5 +1363,40 @@ version: "1.0"
         let meta: AgentMetadataStub = serde_yaml::from_str(yaml).unwrap();
 
         assert_eq!(meta.description, "");
+    }
+
+    #[test]
+    fn rag_init_config_forwards_an_explicit_driver() {
+        let node: RagNode =
+            serde_yaml::from_str("documents: [\"./docs\"]\ndriver: duckdb\n").unwrap();
+
+        assert_eq!(rag_init_config(&node).driver.as_deref(), Some("duckdb"));
+    }
+
+    /// A node that names no driver must forward `None`, which `RagInitConfig`
+    /// documents as "yaml". Existing workflows therefore keep their yaml store.
+    #[test]
+    fn rag_init_config_leaves_the_driver_unset_by_default() {
+        let node: RagNode = serde_yaml::from_str("documents: [\"./docs\"]\n").unwrap();
+
+        assert_eq!(rag_init_config(&node).driver, None);
+    }
+
+    /// The driver must ride alongside the rest of the node's settings, not
+    /// replace them.
+    #[test]
+    fn rag_init_config_forwards_the_other_settings_too() {
+        let node: RagNode = serde_yaml::from_str(
+            "documents: [\"./docs\"]\ndriver: duckdb\nchunk_size: 512\nchunk_overlap: 64\ntop_k: 7\nembedding_model: some:model\n",
+        )
+        .unwrap();
+
+        let config = rag_init_config(&node);
+
+        assert_eq!(config.driver.as_deref(), Some("duckdb"));
+        assert_eq!(config.chunk_size, Some(512));
+        assert_eq!(config.chunk_overlap, Some(64));
+        assert_eq!(config.top_k, Some(7));
+        assert_eq!(config.embedding_model.as_deref(), Some("some:model"));
     }
 }

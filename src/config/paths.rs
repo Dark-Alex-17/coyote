@@ -16,7 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::LevelFilter;
 use std::collections::HashSet;
 use std::env;
-use std::fs::{read_dir, read_to_string};
+use std::fs::{read_dir, read_to_string, remove_file};
 use std::path::{Path, PathBuf};
 
 pub fn config_dir() -> PathBuf {
@@ -414,6 +414,10 @@ pub fn list_rags() -> Vec<String> {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 if let Some(name) = name.to_string_lossy().strip_suffix(".yaml") {
+                    if is_rag_sidecar_name(name) {
+                        continue;
+                    }
+
                     names.push(name.to_string());
                 }
             }
@@ -422,6 +426,34 @@ pub fn list_rags() -> Vec<String> {
         }
         Err(_) => vec![],
     }
+}
+
+pub(crate) fn is_rag_sidecar_name(name: &str) -> bool {
+    name.ends_with(".sbx-mixin")
+}
+
+pub(crate) fn remove_rag_sidecars(dir: &Path, name: &str) -> Result<()> {
+    let duckdb_path = dir.join(format!("{name}.duckdb"));
+    if duckdb_path.exists() {
+        let _ = remove_file(&duckdb_path);
+    }
+    let wal_path = dir.join(format!("{name}.duckdb.wal"));
+    if wal_path.exists() {
+        let _ = remove_file(&wal_path);
+    }
+    let mixin_path = dir.join(format!("{name}.sbx-mixin.yaml"));
+    if mixin_path.exists() {
+        remove_file(&mixin_path).with_context(|| {
+            format!(
+                "Failed to remove the sandbox mixin for RAG '{name}' at '{}'. \
+                 The RAG was NOT deleted so you can retry; this host remains \
+                 whitelisted in the sandbox until the file is removed.",
+                mixin_path.display()
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 pub fn list_macros() -> Vec<String> {
@@ -844,6 +876,74 @@ mod tests {
                 None => env::remove_var(get_env_name("skills_dir")),
             }
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn sidecar_temp_dir(label: &str) -> PathBuf {
+        let unique = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("coyote-{label}-test-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn is_rag_sidecar_name_accepts_dotted_rag_names() {
+        assert!(!is_rag_sidecar_name("v2.docs"));
+        assert!(!is_rag_sidecar_name("myrag"));
+        assert!(is_rag_sidecar_name("myrag.sbx-mixin"));
+        assert!(is_rag_sidecar_name("v2.docs.sbx-mixin"));
+    }
+
+    #[test]
+    fn remove_rag_sidecars_removes_duckdb_wal_and_mixin() {
+        let root = sidecar_temp_dir("rag-sidecars-both");
+        let duckdb = root.join("docs.duckdb");
+        let wal = root.join("docs.duckdb.wal");
+        let mixin = root.join("docs.sbx-mixin.yaml");
+        fs::write(&duckdb, "db").unwrap();
+        fs::write(&wal, "wal").unwrap();
+        fs::write(&mixin, "mixin").unwrap();
+
+        remove_rag_sidecars(&root, "docs").unwrap();
+
+        assert!(!duckdb.exists(), "the .duckdb sidecar must be removed");
+        assert!(!wal.exists(), "the .duckdb.wal sidecar must be removed");
+        assert!(
+            !mixin.exists(),
+            "the .sbx-mixin.yaml sidecar must be removed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_is_ok_when_absent() {
+        let root = sidecar_temp_dir("rag-sidecars-absent");
+        assert!(remove_rag_sidecars(&root, "docs").is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_runs_before_yaml_unlink() {
+        let root = sidecar_temp_dir("rag-sidecars-order");
+        let yaml = root.join("docs.yaml");
+        fs::write(&yaml, "rag").unwrap();
+        let mixin = root.join("docs.sbx-mixin.yaml");
+        fs::create_dir_all(&mixin).unwrap();
+        fs::write(mixin.join("blocker"), "x").unwrap();
+
+        let err = remove_rag_sidecars(&root, "docs").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to remove the sandbox mixin"),
+            "got: {err}"
+        );
+        assert!(
+            yaml.exists(),
+            "the .yaml must survive a sidecar-removal failure so the delete is retryable"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

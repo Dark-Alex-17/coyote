@@ -2,6 +2,7 @@ use super::state::template_root_keys;
 use super::types::{Graph, Node, NodeType};
 use crate::client::{Model, ModelType};
 use crate::config::{Agent, AppConfig, paths};
+use crate::rag::{GraphRagConfig, RagData};
 use anyhow::{Result, bail};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -96,6 +97,51 @@ pub struct GraphValidator {
     skill_exists: fn(&str) -> bool,
 }
 
+/// A minimal `RagData` whose only interesting field is `driver`. The numeric
+/// arguments are the smallest values that satisfy `validate()`'s unrelated
+/// floors (top_k >= 1, and chunk_size >= 1 with chunk_overlap < chunk_size for
+/// a non-attached RAG). `RagData::new` sets `attached: false`, which is the
+/// correct shape here: a graph rag node always builds its own local knowledge
+/// base from `documents` and can never be attached.
+fn rag_driver_probe(driver: &str) -> RagData {
+    let mut data = RagData::new(
+        String::new(),
+        1,
+        0,
+        None,
+        1,
+        None,
+        GraphRagConfig::default(),
+    );
+    data.driver = driver.to_string();
+    data
+}
+
+/// `Some(message)` when `driver` is one that `RagData::validate()` would reject.
+///
+/// The set of valid drivers is defined in exactly one place, `RagData::validate()`,
+/// so this asks that function rather than restating the list here.
+///
+/// Fails open on purpose: the first probe below uses the default driver, which is
+/// valid by definition. If even that one is rejected, `validate()` has grown a
+/// precondition the probe fixture no longer satisfies, and every verdict from here
+/// would be a false positive that rejects working graphs. In that case we decline
+/// to judge and leave enforcement to RAG construction. The
+/// `rag_driver_probe_fixture_is_accepted` test turns that silent degradation into a
+/// loud failure. Both `validate()` calls are load-bearing; neither is redundant.
+pub(crate) fn rag_driver_error(driver: &str) -> Option<String> {
+    if rag_driver_probe(&RagData::default().driver)
+        .validate()
+        .is_err()
+    {
+        return None;
+    }
+    rag_driver_probe(driver)
+        .validate()
+        .err()
+        .map(|err| err.to_string())
+}
+
 impl GraphValidator {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -153,6 +199,11 @@ impl GraphValidator {
                         "RAG node has no 'state_updates'; its retrieval result will \
                          not be written to state",
                     ));
+                }
+                if let Some(driver) = &r.driver
+                    && let Some(message) = rag_driver_error(driver)
+                {
+                    result.error(ValidationError::with_node(node_id, message));
                 }
             }
         }
@@ -1031,6 +1082,7 @@ mod tests {
                 extractor_model: None,
                 extractor_prompt: None,
                 graph_hops: None,
+                driver: None,
                 state_updates,
                 timeout: None,
             }),
@@ -1383,6 +1435,55 @@ mod tests {
                 .iter()
                 .any(|w| w.message.contains("RAG node"))
         );
+    }
+
+    /// Guards the fail-open branch in `rag_driver_error`. If this fails,
+    /// `RagData::validate()` grew a precondition the probe fixture no longer
+    /// satisfies and rag-node driver validation has silently switched itself off.
+    /// Repair the fixture in `rag_driver_probe`; do not delete this test.
+    #[test]
+    fn rag_driver_probe_fixture_is_accepted() {
+        let default_driver = RagData::default().driver;
+        assert!(
+            rag_driver_probe(&default_driver).validate().is_ok(),
+            "probe fixture rejected for the default driver '{default_driver}'"
+        );
+    }
+
+    #[test]
+    fn rag_driver_error_defers_to_ragdata_validate() {
+        assert_eq!(rag_driver_error("yaml"), None);
+        assert_eq!(rag_driver_error("duckdb"), None);
+
+        let message = rag_driver_error("duckdbb").expect("unknown driver must be rejected");
+        assert!(message.contains("duckdbb"), "got: {message}");
+    }
+
+    #[test]
+    fn rag_node_with_unknown_driver_errors_naming_the_node() {
+        let mut node = rag_node("kb", &["./docs"], true);
+        if let NodeType::Rag(ref mut r) = node.node_type {
+            r.driver = Some("postgres".into());
+        }
+        let graph = graph_with(vec![("kb", node), ("end", end_node("end"))], "kb");
+
+        let result = validator().validate(&graph);
+
+        assert!(!result.is_valid());
+        let err = result.into_result().unwrap_err().to_string();
+        assert!(err.contains("[kb]"), "must name the node: {err}");
+        assert!(err.contains("postgres"), "must name the driver: {err}");
+    }
+
+    #[test]
+    fn rag_node_with_duckdb_driver_produces_no_findings() {
+        let mut node = rag_node("kb", &["./docs"], true);
+        if let NodeType::Rag(ref mut r) = node.node_type {
+            r.driver = Some("duckdb".into());
+        }
+        let graph = graph_with(vec![("kb", node), ("end", end_node("end"))], "kb");
+
+        assert!(validator().validate(&graph).is_valid());
     }
 
     fn agent_node(id: &str, agent: &str, next: Option<&str>) -> Node {

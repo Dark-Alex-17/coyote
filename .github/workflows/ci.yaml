@@ -36,6 +36,17 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
 
+    - name: Cache DuckDB Extensions
+      id: duckdb-extensions
+      uses: actions/cache@v4
+      with:
+        path: ~/.duckdb/extensions
+        key: duckdb-ext-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+
+    - name: Install DuckDB Extensions
+      if: steps.duckdb-extensions.outputs.cache-hit != 'true'
+      run: cargo test --all duckdb
+
     - name: Test
       run: cargo test --all
 
