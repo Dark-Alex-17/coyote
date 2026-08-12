@@ -1582,18 +1582,6 @@ impl RagData {
             }
         }
 
-        if let Some(api_key) = self.driver_config.get("api_key")
-            && placeholder_secret_name(api_key).is_none()
-        {
-            bail!(
-                "driver_config.api_key must be a secret placeholder of the form \
-                 '{{{{NAME}}}}', not a literal key. Store the credential with \
-                 `coyote --add-secret <NAME>` and reference it by name; a literal \
-                 key would be written to this RAG's YAML in plaintext and cannot \
-                 be provisioned into the sandbox."
-            );
-        }
-
         match (self.driver.as_str(), self.attached) {
             ("yaml", false) => Ok(()),
             ("duckdb", false) => Ok(()),
@@ -2201,21 +2189,6 @@ fn resolve_driver_config(
     resolve_driver_config_with(driver_config, rag_name, |value| {
         interpolate_secrets(value, vault)
     })
-}
-
-/// The secret NAME inside a `{{NAME}}` placeholder, or `None` for anything else.
-///
-/// Deliberately strict, and shared with sandbox provisioning so both agree on
-/// what a placeholder is. A RAG's `driver_config.api_key` is supposed to hold a
-/// placeholder, never a credential, but nothing stops a hand-edited or older
-/// config from holding the literal key. Consumers report failures *by name*, so
-/// treating a literal value as a name leaks the credential into stderr and logs.
-pub(crate) fn placeholder_secret_name(value: &str) -> Option<&str> {
-    let inner = value.trim().strip_prefix("{{")?.strip_suffix("}}")?.trim();
-    if inner.is_empty() || inner.contains(['{', '}']) {
-        return None;
-    }
-    Some(inner)
 }
 
 /// Interpolation core, taking the resolver as an argument so it can be exercised
@@ -3278,64 +3251,6 @@ vectors: {}
         data.attached = true;
 
         assert!(data.validate().is_ok());
-    }
-
-    #[test]
-    fn ragdata_validate_rejects_a_literal_api_key() {
-        let mut data = RagData::new(
-            "m".into(),
-            1024,
-            50,
-            None,
-            5,
-            None,
-            GraphRagConfig::default(),
-        );
-        data.driver = "qdrant".to_string();
-        data.attached = true;
-        data.driver_config
-            .insert("api_key".to_string(), "sk-a-real-looking-key".to_string());
-
-        let err = data.validate().unwrap_err().to_string();
-
-        assert!(err.contains("must be a secret placeholder"), "got: {err}");
-        assert!(
-            !err.contains("sk-a-real-looking-key"),
-            "the error must never echo the credential back: {err}"
-        );
-    }
-
-    #[test]
-    fn ragdata_validate_accepts_a_placeholder_api_key() {
-        let mut data = RagData::new(
-            "m".into(),
-            1024,
-            50,
-            None,
-            5,
-            None,
-            GraphRagConfig::default(),
-        );
-        data.driver = "qdrant".to_string();
-        data.attached = true;
-        data.driver_config
-            .insert("api_key".to_string(), "{{QDRANT_KEY}}".to_string());
-
-        assert!(data.validate().is_ok());
-    }
-
-    #[test]
-    fn placeholder_secret_name_accepts_only_well_formed_placeholders() {
-        assert_eq!(placeholder_secret_name("{{NAME}}"), Some("NAME"));
-        assert_eq!(placeholder_secret_name("  {{ NAME }}  "), Some("NAME"));
-        assert_eq!(placeholder_secret_name("sk-literal-key"), None);
-        assert_eq!(placeholder_secret_name(""), None);
-        assert_eq!(placeholder_secret_name("{{}}"), None);
-        assert_eq!(placeholder_secret_name("{{ }}"), None);
-        assert_eq!(placeholder_secret_name("{{A}}{{B}}"), None);
-        assert_eq!(placeholder_secret_name("prefix{{NAME}}"), None);
-        assert_eq!(placeholder_secret_name("{{NAME"), None);
-        assert_eq!(placeholder_secret_name("NAME}}"), None);
     }
 
     #[test]

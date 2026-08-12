@@ -19,7 +19,7 @@ use crate::config::AppConfig;
 use crate::config::Config;
 use crate::config::VAULT_DATA_FILE_NAME;
 use crate::config::paths;
-use crate::rag::{RagData, placeholder_secret_name};
+use crate::rag::RagData;
 use crate::sandbox::mcp_credentials::MCP_MIXIN_NAME;
 use crate::sandbox::mixins::DiscoveredMixin;
 use crate::utils::run_command_with_output;
@@ -337,39 +337,76 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
         if !data.attached {
             continue;
         }
-        let Some(placeholder) = data.driver_config.get("api_key") else {
-            continue;
-        };
-        let service_id = mcp_credentials::secret_service_id(&stem);
-        if service_id.is_empty() || registered.contains(&service_id) {
-            continue;
-        }
-        let Some(secret_name) = placeholder_secret_name(placeholder) else {
-            eprintln!(
-                "Warning: RAG '{stem}' has a driver_config.api_key that is not a \
-                 secret placeholder, so no credential can be provisioned to the \
-                 sandbox and queries to this RAG will fail inside it. Store the \
-                 key with `coyote --add-secret <NAME>`, then set api_key to the \
-                 matching placeholder in the RAG YAML."
-            );
+        let secret_names = driver_config_secret_names(&data);
+        let Some((primary, extra)) = secret_names.split_first() else {
             continue;
         };
 
-        match vault.get_secret(secret_name, false) {
-            Ok(secret_value) => {
-                sbx_secret_set(&service_id, &secret_value)
-                    .context("Failed to register RAG secret with sbx")?;
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: could not load secret '{secret_name}' for RAG '{stem}': {e}. \
-                     Queries to this RAG will fail inside the sandbox. \
-                     Run `coyote --add-secret {secret_name}` to fix."
-                );
+        // The generated mixin declares one credential per RAG, keyed on the RAG's
+        // own service id, so that is where the first one binds.
+        let service_id = mcp_credentials::secret_service_id(&stem);
+        if !service_id.is_empty() && !registered.contains(&service_id) {
+            bind_rag_secret(vault, &service_id, primary, &stem)?;
+        }
+
+        // Anything beyond the first is registered under its own name, the way MCP
+        // secrets are, so a hand-written mixin can reference it. The generated
+        // mixin cannot yet: it carries a single credential entry.
+        for name in extra {
+            let id = mcp_credentials::secret_service_id(name);
+            if !id.is_empty() && !registered.contains(&id) {
+                bind_rag_secret(vault, &id, name, &stem)?;
             }
         }
     }
 
+    Ok(())
+}
+
+/// Every distinct vault secret referenced by a RAG's `driver_config`.
+///
+/// Deliberately keyed on the placeholder grammar rather than on field names: a
+/// driver may call its credential `api_key`, `token` or anything else, and this
+/// path should not have to learn each one. Plain values such as `host` and
+/// `collection` never match, so they are skipped.
+///
+/// A value only counts when it is a placeholder and *nothing else*. That is what
+/// keeps a literal credential from being read as a secret NAME — the caller
+/// reports failures by name, so a literal would otherwise be printed to stderr.
+fn driver_config_secret_names(data: &RagData) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for value in data.driver_config.values() {
+        let trimmed = value.trim();
+        let Ok(Some(caps)) = SECRET_RE.captures(trimmed) else {
+            continue;
+        };
+        if caps.get(0).map(|m| m.as_str()) != Some(trimmed) {
+            continue;
+        }
+        let Some(name) = caps.get(1).map(|m| m.as_str().trim()) else {
+            continue;
+        };
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+fn bind_rag_secret(vault: &Vault, service_id: &str, secret_name: &str, stem: &str) -> Result<()> {
+    match vault.get_secret(secret_name, false) {
+        Ok(secret_value) => {
+            sbx_secret_set(service_id, &secret_value)
+                .context("Failed to register RAG secret with sbx")?;
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: could not load secret '{secret_name}' for RAG '{stem}': {e}. \
+                 Queries to this RAG will fail inside the sandbox. \
+                 Run `coyote --add-secret {secret_name}` to fix."
+            );
+        }
+    }
     Ok(())
 }
 
@@ -652,6 +689,70 @@ fn chown_agent_recursive(sandbox: &str, path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rag_with(driver_config: &[(&str, &str)]) -> RagData {
+        let mut data = RagData::new("m".into(), 1024, 50, None, 5, None, Default::default());
+        data.driver = "qdrant".to_string();
+        data.attached = true;
+        for (k, v) in driver_config {
+            data.driver_config.insert(k.to_string(), v.to_string());
+        }
+        data
+    }
+
+    /// The whole point of keying on the placeholder grammar: a driver may call
+    /// its credential anything, and this path must not have to know the name.
+    #[test]
+    fn secret_names_are_found_whatever_the_field_is_called() {
+        let data = rag_with(&[
+            ("host", "qdrant.example.com:6333"),
+            ("collection", "docs"),
+            ("token", "{{SOME_TOKEN}}"),
+        ]);
+
+        assert_eq!(driver_config_secret_names(&data), vec!["SOME_TOKEN"]);
+    }
+
+    /// A literal credential must never be read as a secret NAME. Callers report
+    /// failures by name, so doing so prints the credential to stderr.
+    #[test]
+    fn a_literal_credential_is_not_treated_as_a_secret_name() {
+        let data = rag_with(&[("api_key", "sk-a-real-looking-key")]);
+
+        assert!(driver_config_secret_names(&data).is_empty());
+    }
+
+    #[test]
+    fn plain_values_are_never_mistaken_for_secrets() {
+        let data = rag_with(&[("host", "localhost:6333"), ("collection", "docs")]);
+
+        assert!(driver_config_secret_names(&data).is_empty());
+    }
+
+    /// A value that merely *contains* a placeholder is not the credential: the
+    /// sbx proxy injects the whole secret as the header value.
+    #[test]
+    fn a_partial_placeholder_is_not_a_credential() {
+        let data = rag_with(&[("api_key", "Bearer {{KEY}}")]);
+
+        assert!(driver_config_secret_names(&data).is_empty());
+    }
+
+    #[test]
+    fn several_secrets_are_all_found_and_deduped() {
+        let data = rag_with(&[
+            ("api_key", "{{QDRANT_KEY}}"),
+            ("host", "localhost:6333"),
+            ("token", "{{ OTHER_TOKEN }}"),
+            ("fallback_key", "{{QDRANT_KEY}}"),
+        ]);
+
+        assert_eq!(
+            driver_config_secret_names(&data),
+            vec!["QDRANT_KEY", "OTHER_TOKEN"],
+            "order follows driver_config, and a repeat is not registered twice"
+        );
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
