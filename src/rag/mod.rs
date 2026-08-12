@@ -592,13 +592,23 @@ impl Rag {
                 (Box::new(duck), bm25)
             }
             "qdrant" => bail!(
-                "Qdrant RAGs cannot be constructed via Rag::create(); \
-                 use Rag::attach() or Rag::load_async() instead"
+                "RAG '{name}' uses driver 'qdrant' without `attached: true`. \
+                 Coyote can currently only READ a pre-existing Qdrant \
+                 collection — attach one with `.rag attach`. Writing to a \
+                 Coyote-owned Qdrant collection is not supported yet."
             ),
-            _ => {
+            "yaml" => {
                 let bm25 = data.build_bm25();
                 (Box::new(YamlProvider::from_data(&data)), bm25)
             }
+            // Explicitly NOT a catch-all falling through to yaml. A typo'd driver
+            // used to build a yaml store, pay to embed the whole corpus, persist
+            // the bad driver, and only fail on the NEXT run — leaving the RAG
+            // unusable without hand-editing the YAML.
+            other => bail!(
+                "Unknown RAG driver '{other}' for RAG '{name}'. \
+                 Valid drivers: yaml, duckdb, qdrant."
+            ),
         };
         let node_to_docs = data.knowledge_graph.build_node_to_docs();
         let embedding_model =
@@ -1169,12 +1179,12 @@ impl Rag {
         top_k: usize,
         rerank_model: Option<&str>,
     ) -> Result<Vec<(DocumentId, String)>> {
-        let vector_search_results = self.vector_search(query, top_k, 0.0).await?;
-        debug!("vector_search_results: {vector_search_results:?}",);
-        let vector_search_ids: Vec<DocumentId> =
-            vector_search_results.into_iter().map(|(v, _)| v).collect();
-
-        let keyword_search_results: Vec<(DocumentId, f32)> =
+        // The two legs run CONCURRENTLY. Both can be network round trips on a
+        // remote provider (embedding the query, then the vector search; a native
+        // keyword search), so awaiting them in sequence roughly doubles the
+        // latency of every hybrid query. The local BM25 branch is synchronous and
+        // simply runs inline inside the future.
+        let keyword_leg = async {
             if self.provider.has_native_keyword_search() {
                 self.provider
                     .keyword_search(query, top_k)
@@ -1185,7 +1195,16 @@ impl Rag {
                     })
             } else {
                 self.keyword_search(query, top_k, 0.0)
-            };
+            }
+        };
+        let (vector_search_results, keyword_search_results) =
+            tokio::join!(self.vector_search(query, top_k, 0.0), keyword_leg);
+
+        let vector_search_results = vector_search_results?;
+        debug!("vector_search_results: {vector_search_results:?}",);
+        let vector_search_ids: Vec<DocumentId> =
+            vector_search_results.into_iter().map(|(v, _)| v).collect();
+
         debug!("keyword_search_results: {keyword_search_results:?}",);
         let keyword_search_ids: Vec<DocumentId> =
             keyword_search_results.into_iter().map(|(v, _)| v).collect();
@@ -1566,6 +1585,23 @@ impl RagData {
                     self.chunk_size
                 );
             }
+        }
+
+        // An api_key must be a `{{NAME}}` reference, never the credential itself.
+        // Two reasons, both load-bearing: a literal key here gets committed to the
+        // RAG YAML in plaintext, and sandbox provisioning parses this value back
+        // out to learn which vault secret to bind, so a literal one silently
+        // provisions nothing (and used to be echoed to stderr on failure).
+        if let Some(api_key) = self.driver_config.get("api_key")
+            && placeholder_secret_name(api_key).is_none()
+        {
+            bail!(
+                "driver_config.api_key must be a secret placeholder of the form \
+                 '{{{{NAME}}}}', not a literal key. Store the credential with \
+                 `coyote --add-secret <NAME>` and reference it by name; a literal \
+                 key would be written to this RAG's YAML in plaintext and cannot \
+                 be provisioned into the sandbox."
+            );
         }
 
         match (self.driver.as_str(), self.attached) {
@@ -2175,6 +2211,21 @@ fn resolve_driver_config(
     resolve_driver_config_with(driver_config, rag_name, |value| {
         interpolate_secrets(value, vault)
     })
+}
+
+/// The secret NAME inside a `{{NAME}}` placeholder, or `None` for anything else.
+///
+/// Deliberately strict, and shared with sandbox provisioning so both agree on
+/// what a placeholder is. A RAG's `driver_config.api_key` is supposed to hold a
+/// placeholder, never a credential, but nothing stops a hand-edited or older
+/// config from holding the literal key. Consumers report failures *by name*, so
+/// treating a literal value as a name leaks the credential into stderr and logs.
+pub(crate) fn placeholder_secret_name(value: &str) -> Option<&str> {
+    let inner = value.trim().strip_prefix("{{")?.strip_suffix("}}")?.trim();
+    if inner.is_empty() || inner.contains(['{', '}']) {
+        return None;
+    }
+    Some(inner)
 }
 
 /// Interpolation core, taking the resolver as an argument so it can be exercised
@@ -3237,6 +3288,72 @@ vectors: {}
         data.attached = true;
 
         assert!(data.validate().is_ok());
+    }
+
+    /// A literal credential in `driver_config.api_key` is refused outright: it
+    /// would be persisted to the RAG YAML in plaintext, and sandbox
+    /// provisioning parses this field expecting a placeholder.
+    #[test]
+    fn ragdata_validate_rejects_a_literal_api_key() {
+        let mut data = RagData::new(
+            "m".into(),
+            1024,
+            50,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+        data.driver = "qdrant".to_string();
+        data.attached = true;
+        data.driver_config
+            .insert("api_key".to_string(), "sk-a-real-looking-key".to_string());
+
+        let err = data.validate().unwrap_err().to_string();
+
+        assert!(err.contains("must be a secret placeholder"), "got: {err}");
+        assert!(
+            !err.contains("sk-a-real-looking-key"),
+            "the error must never echo the credential back: {err}"
+        );
+    }
+
+    #[test]
+    fn ragdata_validate_accepts_a_placeholder_api_key() {
+        let mut data = RagData::new(
+            "m".into(),
+            1024,
+            50,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+        data.driver = "qdrant".to_string();
+        data.attached = true;
+        data.driver_config
+            .insert("api_key".to_string(), "{{QDRANT_KEY}}".to_string());
+
+        assert!(data.validate().is_ok());
+    }
+
+    /// The parser is the single thing standing between a hand-edited literal key
+    /// and a "could not load secret '<the key>'" line in the user's terminal.
+    #[test]
+    fn placeholder_secret_name_accepts_only_well_formed_placeholders() {
+        assert_eq!(placeholder_secret_name("{{NAME}}"), Some("NAME"));
+        assert_eq!(placeholder_secret_name("  {{ NAME }}  "), Some("NAME"));
+
+        // Every one of these used to survive the old trim_matches unchanged and
+        // then be used as a secret name.
+        assert_eq!(placeholder_secret_name("sk-literal-key"), None);
+        assert_eq!(placeholder_secret_name(""), None);
+        assert_eq!(placeholder_secret_name("{{}}"), None);
+        assert_eq!(placeholder_secret_name("{{ }}"), None);
+        assert_eq!(placeholder_secret_name("{{A}}{{B}}"), None);
+        assert_eq!(placeholder_secret_name("prefix{{NAME}}"), None);
+        assert_eq!(placeholder_secret_name("{{NAME"), None);
+        assert_eq!(placeholder_secret_name("NAME}}"), None);
     }
 
     #[test]

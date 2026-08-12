@@ -19,7 +19,7 @@ use crate::config::AppConfig;
 use crate::config::Config;
 use crate::config::VAULT_DATA_FILE_NAME;
 use crate::config::paths;
-use crate::rag::RagData;
+use crate::rag::{RagData, placeholder_secret_name};
 use crate::sandbox::mcp_credentials::MCP_MIXIN_NAME;
 use crate::sandbox::mixins::DiscoveredMixin;
 use crate::utils::run_command_with_output;
@@ -344,10 +344,20 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
         if service_id.is_empty() || registered.contains(&service_id) {
             continue;
         }
-        let secret_name = placeholder
-            .trim_start_matches("{{")
-            .trim_end_matches("}}")
-            .trim();
+        // A literal key must NOT be mistaken for a secret NAME. The trims that
+        // used to stand here leave a non-placeholder value completely untouched,
+        // so the vault lookup below would run with the credential as the "name"
+        // and the warning would then print that credential to stderr.
+        let Some(secret_name) = placeholder_secret_name(placeholder) else {
+            eprintln!(
+                "Warning: RAG '{stem}' has a driver_config.api_key that is not a \
+                 secret placeholder, so no credential can be provisioned to the \
+                 sandbox and queries to this RAG will fail inside it. Store the \
+                 key with `coyote --add-secret <NAME>`, then set api_key to the \
+                 matching placeholder in the RAG YAML."
+            );
+            continue;
+        };
 
         match vault.get_secret(secret_name, false) {
             Ok(secret_value) => {
