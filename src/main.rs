@@ -196,6 +196,18 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let mcp_action =
+        cli.mcp_list || cli.mcp_get.is_some() || cli.mcp_remove.is_some() || cli.mcp_add.is_some();
+    if mcp_action {
+        let cfg = Config::load_with_interpolation(true).await?;
+        let app_config = AppConfig::from_config(cfg)?;
+        let vault = Vault::init(&app_config)?;
+
+        mcp::manage::handle(&cli, &vault)?;
+
+        return Ok(());
+    }
+
     if vault_flags {
         let cfg = Config::load_with_interpolation(true).await?;
         let app_config = AppConfig::from_config(cfg)?;

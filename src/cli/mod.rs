@@ -13,6 +13,20 @@ use is_terminal::IsTerminal;
 use std::collections::HashSet;
 use std::io::{Read, stdin};
 
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpTransportArg {
+    Stdio,
+    Http,
+    Sse,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpScopeArg {
+    #[default]
+    User,
+    Workspace,
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 #[command(
@@ -41,10 +55,15 @@ use std::io::{Read, stdin};
 				"list_skills", "skill", "tail_logs", "completions", "update",
 			])
 	),
+	group(
+		ArgGroup::new("mcp-action")
+			.args(["mcp_add", "mcp_remove", "mcp_list", "mcp_get"])
+			.multiple(false)
+	),
 )]
 pub struct Cli {
     /// Input text
-    #[arg(trailing_var_arg = true)]
+    #[arg(allow_hyphen_values = true)]
     text: Vec<String>,
 
     /// Select a LLM model
@@ -224,6 +243,57 @@ pub struct Cli {
     #[arg(long, exclusive = true, value_name = "SERVER_NAME", help_heading = "Authentication", add = ArgValueCompleter::new(mcp_server_completer))]
     pub auth_mcp: Option<String>,
 
+    /// Add an MCP server. Use `-- <cmd> [args...]` for stdio, or `--url <URL>` for http/sse.
+    #[arg(long, value_name = "NAME", help_heading = "MCP Servers")]
+    pub mcp_add: Option<String>,
+    /// Remove an MCP server by name
+    #[arg(long, value_name = "NAME", help_heading = "MCP Servers", add = ArgValueCompleter::new(mcp_server_completer))]
+    pub mcp_remove: Option<String>,
+    /// List all configured MCP servers (user + workspace scopes)
+    #[arg(long, help_heading = "MCP Servers")]
+    pub mcp_list: bool,
+    /// Show the JSON config for one MCP server
+    #[arg(long, value_name = "NAME", help_heading = "MCP Servers", add = ArgValueCompleter::new(mcp_server_completer))]
+    pub mcp_get: Option<String>,
+    /// Transport for --mcp-add: stdio (default when `--` present), http, or sse
+    #[arg(
+        long,
+        value_enum,
+        value_name = "TRANSPORT",
+        help_heading = "MCP Servers"
+    )]
+    pub transport: Option<McpTransportArg>,
+    /// URL for http/sse MCP server (used with --mcp-add)
+    #[arg(long, value_name = "URL", help_heading = "MCP Servers")]
+    pub url: Option<String>,
+    /// Scope for MCP config: user (~/.config/coyote/functions/mcp.json) or workspace (./.coyote/mcp.json). Default: user
+    #[arg(long, value_enum, value_name = "SCOPE", help_heading = "MCP Servers")]
+    pub scope: Option<McpScopeArg>,
+    /// Environment variable for stdio MCP server (repeatable): --env KEY=VALUE
+    #[arg(long, value_name = "KEY=VALUE", help_heading = "MCP Servers")]
+    pub env: Vec<String>,
+    /// HTTP header for http/sse MCP server (repeatable): --header "Name: Value"
+    #[arg(long, value_name = "HEADER", help_heading = "MCP Servers")]
+    pub header: Vec<String>,
+    /// Working directory for stdio MCP server
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::AnyPath, help_heading = "MCP Servers")]
+    pub cwd: Option<String>,
+    /// OAuth client ID for http/sse MCP server
+    #[arg(long, value_name = "ID", help_heading = "MCP Servers")]
+    pub client_id: Option<String>,
+    /// OAuth client secret for http/sse MCP server (use {{NAME}} to reference a vault secret)
+    #[arg(long, value_name = "SECRET", help_heading = "MCP Servers")]
+    pub client_secret: Option<String>,
+    /// OAuth callback port for http/sse MCP server
+    #[arg(long, value_name = "PORT", help_heading = "MCP Servers")]
+    pub callback_port: Option<u16>,
+    /// OAuth redirect host for http/sse MCP server
+    #[arg(long, value_name = "HOST", help_heading = "MCP Servers")]
+    pub redirect_host: Option<String>,
+    /// Overwrite an existing MCP server (with --mcp-add) or skip confirmation (with --mcp-remove)
+    #[arg(long, help_heading = "MCP Servers")]
+    pub mcp_force: bool,
+
     /// Launch Coyote inside a Docker sandbox (via `sbx`); name defaults to current directory basename
     #[arg(long, value_name = "NAME", help_heading = "Sandbox")]
     pub sandbox: Option<Option<String>>,
@@ -254,6 +324,15 @@ pub struct Cli {
     /// Generate static shell completion scripts
     #[arg(long, value_name = "SHELL", value_enum, help_heading = "Shell")]
     pub completions: Option<ShellCompletion>,
+
+    /// Stdio command for --mcp-add: everything after `--` is passed to the server verbatim
+    #[arg(
+        last = true,
+        allow_hyphen_values = true,
+        value_name = "CMD",
+        help_heading = "MCP Servers"
+    )]
+    pub mcp_command: Vec<String>,
 }
 
 impl Cli {
@@ -632,5 +711,89 @@ mod tests {
     #[test]
     fn parse_sandbox_is_exclusive() {
         assert!(Cli::try_parse_from(["coyote", "--sandbox", "--agent", "foo"]).is_err());
+    }
+
+    #[test]
+    fn parse_mcp_add_stdio_with_trailing_command() {
+        let cli = parse(&[
+            "--mcp-add",
+            "myserver",
+            "--",
+            "npx",
+            "some-server",
+            "--flag",
+            "arg1",
+        ]);
+        assert_eq!(cli.mcp_add, Some("myserver".to_string()));
+        assert_eq!(
+            cli.mcp_command,
+            vec!["npx", "some-server", "--flag", "arg1"]
+        );
+        assert!(cli.text.is_empty());
+    }
+
+    #[test]
+    fn parse_mcp_add_stdio_with_env_and_command() {
+        let cli = parse(&[
+            "--mcp-add",
+            "s",
+            "--env",
+            "API_KEY={{API_KEY}}",
+            "--env",
+            "MODE=dev",
+            "--",
+            "npx",
+            "srv",
+        ]);
+        assert_eq!(cli.mcp_add, Some("s".to_string()));
+        assert_eq!(cli.env, vec!["API_KEY={{API_KEY}}", "MODE=dev"]);
+        assert_eq!(cli.mcp_command, vec!["npx", "srv"]);
+    }
+
+    #[test]
+    fn parse_mcp_add_http_with_header() {
+        let cli = parse(&[
+            "--mcp-add",
+            "notion",
+            "--transport",
+            "http",
+            "--url",
+            "https://mcp.notion.com/mcp",
+            "--header",
+            "Authorization: Bearer {{NOTION_TOKEN}}",
+        ]);
+        assert_eq!(cli.mcp_add, Some("notion".to_string()));
+        assert!(matches!(cli.transport, Some(McpTransportArg::Http)));
+        assert_eq!(cli.url, Some("https://mcp.notion.com/mcp".to_string()));
+        assert_eq!(
+            cli.header,
+            vec!["Authorization: Bearer {{NOTION_TOKEN}}"]
+        );
+        assert!(cli.mcp_command.is_empty());
+    }
+
+    #[test]
+    fn parse_mcp_list_flag() {
+        let cli = parse(&["--mcp-list"]);
+        assert!(cli.mcp_list);
+    }
+
+    #[test]
+    fn parse_mcp_scope_workspace() {
+        let cli = parse(&["--mcp-list", "--scope", "workspace"]);
+        assert!(cli.mcp_list);
+        assert!(matches!(cli.scope, Some(McpScopeArg::Workspace)));
+    }
+
+    #[test]
+    fn parse_mcp_action_group_is_exclusive() {
+        assert!(Cli::try_parse_from(["coyote", "--mcp-list", "--mcp-get", "foo"]).is_err());
+    }
+
+    #[test]
+    fn parse_trailing_text_unchanged_without_dash_dash() {
+        let cli = parse(&["hello", "world"]);
+        assert_eq!(cli.text, vec!["hello", "world"]);
+        assert!(cli.mcp_command.is_empty());
     }
 }

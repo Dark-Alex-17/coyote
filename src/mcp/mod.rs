@@ -1,3 +1,4 @@
+pub(crate) mod manage;
 pub(crate) mod oauth;
 mod sse_transport;
 
@@ -62,6 +63,8 @@ pub(crate) struct McpServersConfig {
 pub(crate) struct McpOAuthConfig {
     #[serde(rename = "clientId", skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    #[serde(rename = "clientSecret", skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
     #[serde(rename = "callbackPort", skip_serializing_if = "Option::is_none")]
     pub callback_port: Option<u16>,
     #[serde(rename = "redirectHost", skip_serializing_if = "Option::is_none")]
