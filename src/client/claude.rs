@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::mem;
 
 use super::access_token::get_access_token;
@@ -368,17 +369,32 @@ pub fn claude_build_chat_completions_body(
                         ]
                     } else {
                         // One pair per round: Claude can reuse tool_use IDs across API calls.
+                        // A round boundary is detected by the presence of round text, but
+                        // rounds where the model emitted only tool calls (no narration)
+                        // carry no text marker. As a backstop, also split whenever a
+                        // tool_use ID would repeat within the current assistant message —
+                        // the API rejects duplicate tool_use IDs in a single message.
                         let mut messages = vec![];
                         let mut assistant_parts: Vec<serde_json::Value> = vec![];
                         let mut user_parts: Vec<serde_json::Value> = vec![];
+                        let mut chunk_ids: HashSet<&str> = HashSet::new();
                         for (index, tool_result) in tool_results.iter().enumerate() {
-                            if index > 0 && tool_result.text.is_some() {
+                            let id_collision = tool_result
+                                .call
+                                .id
+                                .as_deref()
+                                .is_some_and(|id| chunk_ids.contains(id));
+                            if index > 0 && (tool_result.text.is_some() || id_collision) {
                                 messages.push(
                                     json!({ "role": "assistant", "content": assistant_parts }),
                                 );
                                 messages.push(json!({ "role": "user", "content": user_parts }));
                                 assistant_parts = vec![];
                                 user_parts = vec![];
+                                chunk_ids.clear();
+                            }
+                            if let Some(id) = tool_result.call.id.as_deref() {
+                                chunk_ids.insert(id);
                             }
                             for block in &tool_result.thinking {
                                 assistant_parts.push(json!(block));
@@ -485,10 +501,7 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
                     if let Some(v) = item["thinking"].as_str() {
                         thinking.push(ThinkingBlock::Thinking {
                             thinking: v.to_string(),
-                            signature: item["signature"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_string(),
+                            signature: item["signature"].as_str().unwrap_or_default().to_string(),
                         });
                     }
                 }
@@ -534,4 +547,101 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         thinking,
     };
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::function::{ToolCall, ToolResult};
+
+    fn tool_result(id: &str, text: Option<&str>) -> ToolResult {
+        ToolResult {
+            call: ToolCall::new("fs_read".into(), json!({"path": "x"}), Some(id.into())),
+            output: json!("ok"),
+            text: text.map(|t| t.to_string()),
+            thinking: vec![],
+        }
+    }
+
+    fn build_body(tool_results: Vec<ToolResult>) -> Value {
+        let data = ChatCompletionsData {
+            messages: vec![
+                Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::ToolCalls(MessageContentToolCalls {
+                        tool_results,
+                        text: String::new(),
+                        sequence: true,
+                    }),
+                ),
+            ],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream: false,
+        };
+        claude_build_chat_completions_body(data, &Model::new("claude", "claude-test")).unwrap()
+    }
+
+    fn assert_unique_tool_use_ids_per_message(body: &Value) {
+        for message in body["messages"].as_array().unwrap() {
+            let Some(content) = message["content"].as_array() else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            for block in content {
+                if block["type"] == "tool_use" {
+                    let id = block["id"].as_str().unwrap();
+                    assert!(
+                        seen.insert(id.to_string()),
+                        "duplicate tool_use id `{id}` within a single assistant message: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sequence_splits_on_round_text() {
+        let body = build_body(vec![
+            tool_result("toolu_A", None),
+            tool_result("toolu_B", None),
+            tool_result("toolu_C", Some("running another tool")),
+        ]);
+
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 5, "body: {body}");
+        assert_unique_tool_use_ids_per_message(&body);
+    }
+
+    #[test]
+    fn sequence_splits_on_reused_id_in_textless_round() {
+        let body = build_body(vec![
+            tool_result("toolu_A", None),
+            tool_result("toolu_B", None),
+            tool_result("toolu_A", None),
+        ]);
+
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 5, "body: {body}");
+        assert_unique_tool_use_ids_per_message(&body);
+    }
+
+    #[test]
+    fn sequence_keeps_textless_rounds_merged_when_ids_are_unique() {
+        let body = build_body(vec![
+            tool_result("toolu_A", None),
+            tool_result("toolu_B", None),
+            tool_result("toolu_C", None),
+        ]);
+
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 3, "body: {body}");
+        assert_unique_tool_use_ids_per_message(&body);
+    }
 }
