@@ -342,16 +342,11 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
             continue;
         };
 
-        // The generated mixin declares one credential per RAG, keyed on the RAG's
-        // own service id, so that is where the first one binds.
         let service_id = mcp_credentials::secret_service_id(&stem);
         if !service_id.is_empty() && !registered.contains(&service_id) {
             bind_rag_secret(vault, &service_id, primary, &stem)?;
         }
 
-        // Anything beyond the first is registered under its own name, the way MCP
-        // secrets are, so a hand-written mixin can reference it. The generated
-        // mixin cannot yet: it carries a single credential entry.
         for name in extra {
             let id = mcp_credentials::secret_service_id(name);
             if !id.is_empty() && !registered.contains(&id) {
@@ -363,16 +358,6 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
     Ok(())
 }
 
-/// Every distinct vault secret referenced by a RAG's `driver_config`.
-///
-/// Deliberately keyed on the placeholder grammar rather than on field names: a
-/// driver may call its credential `api_key`, `token` or anything else, and this
-/// path should not have to learn each one. Plain values such as `host` and
-/// `collection` never match, so they are skipped.
-///
-/// A value only counts when it is a placeholder and *nothing else*. That is what
-/// keeps a literal credential from being read as a secret NAME — the caller
-/// reports failures by name, so a literal would otherwise be printed to stderr.
 fn driver_config_secret_names(data: &RagData) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for value in data.driver_config.values() {
@@ -700,8 +685,6 @@ mod tests {
         data
     }
 
-    /// The whole point of keying on the placeholder grammar: a driver may call
-    /// its credential anything, and this path must not have to know the name.
     #[test]
     fn secret_names_are_found_whatever_the_field_is_called() {
         let data = rag_with(&[
@@ -713,8 +696,6 @@ mod tests {
         assert_eq!(driver_config_secret_names(&data), vec!["SOME_TOKEN"]);
     }
 
-    /// A literal credential must never be read as a secret NAME. Callers report
-    /// failures by name, so doing so prints the credential to stderr.
     #[test]
     fn a_literal_credential_is_not_treated_as_a_secret_name() {
         let data = rag_with(&[("api_key", "sk-a-real-looking-key")]);
@@ -729,8 +710,6 @@ mod tests {
         assert!(driver_config_secret_names(&data).is_empty());
     }
 
-    /// A value that merely *contains* a placeholder is not the credential: the
-    /// sbx proxy injects the whole secret as the header value.
     #[test]
     fn a_partial_placeholder_is_not_a_credential() {
         let data = rag_with(&[("api_key", "Bearer {{KEY}}")]);
