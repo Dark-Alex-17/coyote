@@ -334,7 +334,7 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
         let Ok(data) = serde_yaml::from_str::<RagData>(&raw) else {
             continue;
         };
-        if !data.attached {
+        if !rag_needs_sandbox_secrets(&data) {
             continue;
         }
         let secret_names = driver_config_secret_names(&data);
@@ -356,6 +356,20 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
     }
 
     Ok(())
+}
+
+/// Whether this RAG needs its credential provisioned into the sandbox.
+///
+/// The question is answered by the driver, not by `attached`. What matters is
+/// whether the store sits behind a network hop the sandbox blocks by default
+/// and a credential the proxy has to inject; who wrote the documents is
+/// irrelevant to both. A Coyote-owned Qdrant RAG dials exactly the same remote
+/// host as an attached one, so testing ownership here left its key
+/// unprovisioned — queries then failed silently inside the sandbox while
+/// working perfectly on the host. yaml and duckdb stores are local files and
+/// need neither a credential nor an allow-list entry.
+fn rag_needs_sandbox_secrets(data: &RagData) -> bool {
+    data.driver == "qdrant"
 }
 
 fn driver_config_secret_names(data: &RagData) -> Vec<String> {
@@ -675,14 +689,58 @@ fn chown_agent_recursive(sandbox: &str, path: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn rag_with(driver_config: &[(&str, &str)]) -> RagData {
+    fn rag_shaped(driver: &str, attached: bool, driver_config: &[(&str, &str)]) -> RagData {
         let mut data = RagData::new("m".into(), 1024, 50, None, 5, None, Default::default());
-        data.driver = "qdrant".to_string();
-        data.attached = true;
+        data.driver = driver.to_string();
+        data.attached = attached;
         for (k, v) in driver_config {
             data.driver_config.insert(k.to_string(), v.to_string());
         }
         data
+    }
+
+    fn rag_with(driver_config: &[(&str, &str)]) -> RagData {
+        rag_shaped("qdrant", true, driver_config)
+    }
+
+    /// The whole point of the driver test. An owned RAG is `attached: false`,
+    /// but its collection lives on the same remote host as an attached one, so
+    /// filtering on ownership left its key unprovisioned — and the failure is
+    /// invisible until someone actually runs a query inside sbx.
+    #[test]
+    fn an_owned_qdrant_rag_is_provisioned_like_an_attached_one() {
+        let owned = rag_shaped("qdrant", false, &[("api_key", "{{QDRANT_KEY}}")]);
+
+        assert!(rag_needs_sandbox_secrets(&owned));
+        assert_eq!(
+            driver_config_secret_names(&owned),
+            vec!["QDRANT_KEY"],
+            "passing the filter is worthless if the name it binds is not found"
+        );
+    }
+
+    #[test]
+    fn an_attached_qdrant_rag_is_still_provisioned() {
+        let attached = rag_shaped("qdrant", true, &[("api_key", "{{QDRANT_KEY}}")]);
+
+        assert!(rag_needs_sandbox_secrets(&attached));
+    }
+
+    /// yaml and duckdb stores are local files: no host to allow, no credential
+    /// to inject. The `attached` flag must not change that either way — it no
+    /// longer takes part in the decision.
+    #[test]
+    fn a_local_store_is_never_provisioned() {
+        for driver in ["yaml", "duckdb"] {
+            for attached in [false, true] {
+                let data = rag_shaped(driver, attached, &[("api_key", "{{SOME_KEY}}")]);
+
+                assert!(
+                    !rag_needs_sandbox_secrets(&data),
+                    "{driver} (attached: {attached}) reaches no network host"
+                );
+            }
+        }
     }
 
     #[test]
