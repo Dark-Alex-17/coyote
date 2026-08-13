@@ -1122,7 +1122,7 @@ impl Rag {
             let mut texts = vec![];
             for file in rag_files.into_iter() {
                 for (document_index, document) in file.documents.iter().enumerate() {
-                    let doc_id = DocumentId::new(next_file_id, document_index);
+                    let doc_id = DocumentId::try_new(next_file_id, document_index)?;
                     document_ids.push(doc_id);
                     texts.push(document.page_content.clone());
                     if self.data.extractor_model.is_some() {
@@ -1792,6 +1792,33 @@ impl DocumentId {
     pub fn new(file_index: usize, document_index: usize) -> Self {
         let value = (file_index << (usize::BITS / 2)) | document_index;
         Self(value)
+    }
+
+    /// Checked constructor for the one site that mints ids from unbounded input.
+    ///
+    /// `new` packs both indices into a single `usize`, half the bits each, and
+    /// quietly mangles either one that does not fit: an oversized file index
+    /// shifts its high bits off the top, an oversized document index bleeds into
+    /// the file index's half. Both produce an id that `split` decodes as some
+    /// other document. `new` stays infallible because `iter_documents` rebuilds
+    /// ids inside a closure that yields tuples and cannot propagate a `Result`,
+    /// and the values it feeds in came out of `split` to begin with.
+    ///
+    /// This is the packing bound — what fits in a `DocumentId` — and nothing
+    /// else; a wire format may well accept a narrower range.
+    pub fn try_new(file_index: usize, document_index: usize) -> Result<Self> {
+        let half = usize::BITS / 2;
+        if file_index >> half != 0 {
+            bail!(
+                "file index {file_index} does not fit in the {half} bits a DocumentId packs it into"
+            );
+        }
+        if document_index >> half != 0 {
+            bail!(
+                "document index {document_index} does not fit in the {half} bits a DocumentId packs it into"
+            );
+        }
+        Ok(Self::new(file_index, document_index))
     }
 
     pub fn split(self) -> (usize, usize) {
@@ -2818,6 +2845,48 @@ mod tests {
         let a = DocumentId::new(0, 1);
         let b = DocumentId::new(1, 0);
         assert!(a < b);
+    }
+
+    #[test]
+    fn document_id_try_new_accepts_indices_that_fit_the_packing() {
+        let id = DocumentId::try_new(5, 17).unwrap();
+        assert_eq!(id.split(), (5, 17));
+    }
+
+    #[test]
+    fn document_id_try_new_rejects_a_file_index_wider_than_half_a_usize() {
+        let too_wide = 1usize << (usize::BITS / 2);
+
+        let err = DocumentId::try_new(too_wide, 0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("file index"),
+            "a file index that would shift its high bits away must be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn document_id_try_new_rejects_a_document_index_wider_than_half_a_usize() {
+        let too_wide = 1usize << (usize::BITS / 2);
+
+        let err = DocumentId::try_new(0, too_wide).unwrap_err().to_string();
+
+        assert!(
+            err.contains("document index"),
+            "a document index that would bleed into the file index must be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn document_id_try_new_packs_identically_to_new() {
+        let checked = DocumentId::try_new(9, 4).unwrap();
+
+        assert_eq!(
+            checked,
+            DocumentId::new(9, 4),
+            "try_new only adds a bound check; in range it must pack exactly as new does"
+        );
+        assert_eq!(checked.split(), (9, 4));
     }
 
     #[test]
