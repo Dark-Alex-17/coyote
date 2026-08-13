@@ -1635,7 +1635,10 @@ mod tests {
     fn guard_d_does_not_trip_on_a_full_rebuild_turnover() {
         // `.rebuild rag` retires every FileId and mints a new one, so nearly every
         // remote point is legitimately replaced while the paths are untouched.
-        // Counting points or file ids instead of paths would refuse here.
+        // Counting points or deleted ids instead of paths would refuse here. A
+        // *completed* turnover leaves the file-id count unchanged, so this shape
+        // alone does not separate paths from file ids — the interrupted turnover
+        // below is what does that.
         let mut remote = BTreeMap::new();
         for file_id in 0..100usize {
             scroll_file(
@@ -1659,6 +1662,51 @@ mod tests {
 
         assert_eq!(out.upsert_files.len(), 100);
         assert_eq!(out.delete_ids.len(), 100);
+    }
+
+    #[test]
+    fn guard_d_does_not_trip_on_an_interrupted_turnover() {
+        // A `.rebuild rag` killed partway leaves the remote holding BOTH
+        // generations of FileIds while local state rolled back — deletes run last
+        // and the YAML is only saved on success. This is the shape that separates
+        // counting paths from counting file ids, and it is why the unit has to be
+        // paths: 100 files with 40 of them re-minted before the crash gives 140
+        // remote file ids against 100 local files, which clears the threshold and
+        // would refuse to recover from precisely the state this reconcile exists
+        // to repair. The paths never moved, so the path count sees no shrinkage.
+        let mut remote = BTreeMap::new();
+        for file_id in 0..100usize {
+            scroll_file(
+                &mut remote,
+                file_id,
+                "old",
+                &format!("doc-{file_id:03}.md"),
+                0..1,
+            );
+        }
+        // The 40 re-minted before the interruption, over the same paths.
+        for n in 0..40usize {
+            scroll_file(&mut remote, n + 100, "new", &format!("doc-{n:03}.md"), 0..1);
+        }
+
+        let desired: BTreeMap<FileId, DesiredFile> = (0..100usize)
+            .map(|n| {
+                (
+                    n + 100,
+                    desired_file(n + 100, "new", &format!("doc-{n:03}.md"), 1),
+                )
+            })
+            .collect();
+
+        // 100 distinct remote paths against 100 distinct local paths: no
+        // shrinkage. Counting distinct file ids instead would see 140 against
+        // 100, and 40 > max(10, 140 / 4) would bail.
+        let out = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), true)
+            .expect("an interrupted turnover must stay recoverable");
+
+        // The stale generation goes; the 40 already-written points are rewritten.
+        assert_eq!(out.delete_ids.len(), 100);
+        assert_eq!(out.upsert_files.len(), 100);
     }
 
     #[test]
