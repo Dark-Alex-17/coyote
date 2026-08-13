@@ -1,13 +1,14 @@
 use crate::rag::provider::RagProvider;
-use crate::rag::{DocumentId, RagData};
+use crate::rag::{DocumentId, FileId, RagData};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use log::warn;
 use parking_lot::RwLock;
 use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, Method, Response, StatusCode};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use url::{Host, Url};
 
@@ -176,10 +177,8 @@ fn is_multi_vector_config(body: &Value) -> bool {
 /// which remote points to drop, and when to refuse outright.
 ///
 /// It is deliberately free of HTTP so that everything able to delete remote data
-/// is exercised by plain maps in the tests below. Nothing calls it yet — the
-/// scroll/upsert/delete passes that consume it land separately, and the
-/// `dead_code` allow goes with them.
-#[allow(dead_code)]
+/// is exercised by plain maps in the tests below. `rebuild_indexes` supplies the
+/// scrolled remote state and carries out the plan this returns.
 mod owned {
     use crate::rag::{DocumentId, FileId};
 
@@ -597,10 +596,277 @@ mod owned {
     }
 }
 
-/// Query-only client for an external Qdrant collection.
+/// How many points one scroll page asks for.
+const SCROLL_PAGE_SIZE: u64 = 1000;
+
+/// The payload fields the scroll must fetch.
 ///
-/// Attach-only: this provider never writes to the remote collection. Coyote does
-/// not own the data, and `rebuild_indexes` refuses rather than pretending to.
+/// Trimming this list neither fails to compile nor fails at runtime — it
+/// silently disables whichever guard reads the missing field. Without
+/// `writer_id` the foreign-install warning never fires, without
+/// `embedding_model` the model-mixing refusal never fires, without `path` the
+/// bulk-deletion threshold never fires. They just stop happening.
+const SCROLL_PAYLOAD_FIELDS: [&str; 6] = [
+    "file_id",
+    "file_hash",
+    "coyote_rag_id",
+    "writer_id",
+    "embedding_model",
+    "path",
+];
+
+/// The largest request body Coyote sends, half the server's 32 MiB hard limit.
+/// The margin absorbs the `{"points": [...]}` envelope and the separators
+/// between points, which the per-point accounting does not measure.
+const UPSERT_BYTE_CAP: usize = 16 * 1024 * 1024;
+
+/// How many ids one delete request carries.
+const DELETE_ID_CHUNK: usize = 1000;
+
+/// Payload schema version stamped on every point Coyote writes.
+const PAYLOAD_SCHEMA_VERSION: u64 = 1;
+
+/// The upsert verb and endpoint.
+///
+/// `PUT`, not `POST`: `POST /collections/{c}/points` is the get-by-id route
+/// `fetch_content` uses. The two verbs share a path and have disjoint required
+/// fields, so mixing them up is a 400 rather than a silent no-op.
+///
+/// `wait` is a query parameter and only works as one. In the body it is ignored:
+/// the server returns 200 with `status: "acknowledged"`, meaning the write is
+/// queued with no channel to report a later failure.
+fn upsert_request(base_url: &str, collection: &str) -> (Method, String) {
+    (
+        Method::PUT,
+        format!("{base_url}/collections/{collection}/points?wait=true"),
+    )
+}
+
+/// The delete verb and endpoint. `DELETE` on this path is a routing-level 404
+/// with an empty body; the operation is a `POST`.
+fn delete_request(base_url: &str, collection: &str) -> (Method, String) {
+    (
+        Method::POST,
+        format!("{base_url}/collections/{collection}/points/delete?wait=true"),
+    )
+}
+
+/// Rejects a write the server has not applied yet.
+///
+/// `acknowledged` means the request was queued and returned before the WAL
+/// applied it, so nothing will ever report a failure that happens afterwards.
+/// The sync's success gates the YAML save, and that only holds together if
+/// reported success means durable.
+fn check_write_completed(body: &Value, operation: &str) -> Result<()> {
+    match body["result"]["status"].as_str() {
+        Some("completed") => Ok(()),
+        Some(status) => bail!(
+            "Qdrant reported the {operation} as '{status}' rather than 'completed'. The write \
+             is not durable yet, so Coyote cannot treat this sync as successful."
+        ),
+        None => bail!("Unexpected {operation} response shape: {body}"),
+    }
+}
+
+/// One scroll page's request body. `offset` is the previous page's
+/// `next_page_offset`, absent on the first page.
+fn scroll_request(offset: Option<&Value>) -> Value {
+    let mut body = serde_json::json!({
+        "limit": SCROLL_PAGE_SIZE,
+        "with_vector": false,
+        "with_payload": { "include": SCROLL_PAYLOAD_FIELDS },
+    });
+    if let Some(offset) = offset {
+        body["offset"] = offset.clone();
+    }
+
+    body
+}
+
+/// Maps a scrolled point's payload onto the fields the reconcile judges.
+///
+/// Absent and empty are equally unusable for the string fields, so both arrive
+/// as an empty string. `file_id` has no such sentinel and stays `None`.
+fn remote_point(payload: &Value) -> owned::RemotePoint {
+    let text = |field: &str| payload[field].as_str().unwrap_or_default().to_string();
+
+    owned::RemotePoint {
+        file_id: payload["file_id"].as_u64(),
+        file_hash: text("file_hash"),
+        coyote_rag_id: text("coyote_rag_id"),
+        writer_id: text("writer_id"),
+        embedding_model: text("embedding_model"),
+        path: text("path"),
+    }
+}
+
+/// One point's payload.
+///
+/// `file_id` and `chunk_index` go out as JSON integers: the `file_id` payload
+/// index is typed `integer` and a string does not match it. `page_content` is
+/// the name the read path reads.
+fn point_payload(
+    file_id: FileId,
+    chunk_index: usize,
+    file_hash: &str,
+    path: &str,
+    page_content: &str,
+    ctx: &owned::ReconcileCtx,
+) -> Value {
+    // Bumping this version is not enough on its own to migrate anything. An
+    // unchanged file hash-matches and is never rewritten, so its points keep
+    // whatever schema they were written under. Migrating them means adding
+    // `schema_version` to the scroll's include list and forcing a version
+    // mismatch into the upsert set.
+    serde_json::json!({
+        "file_id": file_id as u64,
+        "chunk_index": chunk_index as u64,
+        "file_hash": file_hash,
+        "page_content": page_content,
+        "path": path,
+        "coyote_rag_id": ctx.rag_id,
+        "writer_id": ctx.writer_id,
+        "embedding_model": ctx.embedding_model,
+        "schema_version": PAYLOAD_SCHEMA_VERSION,
+    })
+}
+
+/// One point as the upsert body carries it.
+fn upsert_point(id: u64, vector: &[f32], payload: Value) -> Value {
+    serde_json::json!({ "id": id, "vector": vector, "payload": payload })
+}
+
+/// A point waiting for a batch, with the serialized length that decides which
+/// batch it lands in.
+struct PendingPoint {
+    body: Value,
+    bytes: usize,
+    /// Names the chunk if it turns out to be too large to send at all.
+    origin: String,
+}
+
+fn pending_point(body: Value, origin: String) -> Result<PendingPoint> {
+    let bytes = serde_json::to_vec(&body)
+        .context("Failed to serialize a Qdrant point")?
+        .len();
+
+    Ok(PendingPoint {
+        body,
+        bytes,
+        origin,
+    })
+}
+
+/// Groups points into request bodies that stay under `cap`.
+///
+/// Lengths are measured, never derived from the vector dimension: chunk text
+/// dominates the body and varies per point. A point that cannot fit in a request
+/// of its own is an error here rather than a 400 from the server.
+fn batch_points(points: Vec<PendingPoint>, cap: usize) -> Result<Vec<Vec<Value>>> {
+    let mut batches: Vec<Vec<Value>> = Vec::new();
+    let mut batch: Vec<Value> = Vec::new();
+    let mut bytes = 0usize;
+
+    for point in points {
+        if point.bytes > cap {
+            bail!(
+                "Refusing to sync: {} serializes to {} bytes, more than the {cap} bytes Coyote \
+                 sends to Qdrant in one request. Lower the RAG's chunk size and re-ingest the \
+                 document.",
+                point.origin,
+                point.bytes
+            );
+        }
+        if !batch.is_empty() && bytes + point.bytes > cap {
+            batches.push(std::mem::take(&mut batch));
+            bytes = 0;
+        }
+        bytes += point.bytes;
+        batch.push(point.body);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+
+    Ok(batches)
+}
+
+/// Splits the delete list into per-request id chunks.
+fn delete_id_batches(ids: &[u64]) -> impl Iterator<Item = &[u64]> {
+    ids.chunks(DELETE_ID_CHUNK)
+}
+
+/// Rejects an upsert that cannot carry every point the reconcile selected.
+///
+/// The upsert loop walks the file's local chunks and skips any selected id it
+/// finds no chunk for, so a selected id outside `local.documents` is dropped in
+/// silence: the sync reports success, the file's hash matches from then on, and
+/// the point is neither retried nor deleted on any later sync. Nothing recovers
+/// from that, so a mismatch stops the sync before it writes anything for this
+/// file.
+fn check_selection_complete(path: &str, pending: usize, selected: usize) -> Result<()> {
+    if pending != selected {
+        bail!(
+            "Refusing to sync: the reconcile selected {selected} points for '{path}' but only \
+             {pending} of them exist in the local copy. Writing those would report a success \
+             that silently drops the rest, after which the file's hash matches and they are \
+             never written again."
+        );
+    }
+
+    Ok(())
+}
+
+/// Rejects a collection the read and write paths cannot both use.
+///
+/// `local_dim` is the length of any local vector. `None` means the RAG holds no
+/// vectors to measure against, so the size check is skipped rather than guessed —
+/// there is nothing to upsert in that case either. The static model-to-dimension
+/// map is not an alternative: it answers 1536 for every model it does not know,
+/// which would bail on collections that are perfectly fine.
+fn check_collection_config(
+    body: &Value,
+    collection: &str,
+    host: &str,
+    local_dim: Option<usize>,
+) -> Result<()> {
+    if is_multi_vector_config(body) {
+        bail!(
+            "Collection '{collection}' on {host} stores named vectors, but Coyote reads and \
+             writes a single unnamed one, which a named-vector collection rejects on every \
+             request."
+        );
+    }
+
+    match body["result"]["config"]["params"]["vectors"]["distance"].as_str() {
+        Some("Cosine") => {}
+        distance => bail!(
+            "Collection '{collection}' on {host} uses {} distance, but Coyote scores owned \
+             collections with Cosine: the read path filters on the raw similarity, which only \
+             Cosine reports on the scale it expects.",
+            distance.unwrap_or("an unreadable")
+        ),
+    }
+
+    if let Some(local_dim) = local_dim {
+        let remote_dim = vector_dimension_from_collection(body)?;
+        if remote_dim != local_dim as u64 {
+            bail!(
+                "Collection '{collection}' on {host} stores {remote_dim}-dimensional vectors but \
+                 this RAG's are {local_dim}-dimensional, so the embedding model changed after the \
+                 collection was created. Delete the collection in Qdrant and run `.rebuild rag`."
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Client for a Qdrant collection, attached or Coyote-owned.
+///
+/// An attached collection is read-only: Coyote does not own the documents, so
+/// `rebuild_indexes` refuses rather than pretending to. An owned collection is
+/// reconciled against the local corpus on every sync.
 pub struct QdrantProvider {
     client: Client,
     base_url: String,
@@ -778,6 +1044,269 @@ impl QdrantProvider {
 
         Ok(id_val)
     }
+
+    /// `GET /collections/{c}/exists`.
+    ///
+    /// This and `create_collection` take a client instead of `&self` because a
+    /// collection has to exist before a provider can be built — `new` fetches the
+    /// collection and fails when it is absent, so the creation wizard that will
+    /// call them has no provider to call them on. The client comes from
+    /// `make_client` and already carries the api key.
+    pub(crate) async fn collection_exists(
+        client: &Client,
+        base_url: &str,
+        collection: &str,
+    ) -> Result<bool> {
+        let resp = client
+            .get(format!("{base_url}/collections/{collection}/exists"))
+            .send()
+            .await
+            .with_context(|| format!("Failed to connect to {base_url}"))?;
+        if !resp.status().is_success() {
+            bail!(
+                "Failed to check whether collection '{collection}' exists: {}",
+                Self::error_message(resp).await
+            );
+        }
+
+        let body: Value = resp.json().await.with_context(|| {
+            format!("Unreadable collection-exists response for '{collection}' on {base_url}")
+        })?;
+        body["result"]["exists"]
+            .as_bool()
+            .context("Unexpected collection-exists response shape")
+    }
+
+    /// Creates the collection, then the `file_id` payload index the schema
+    /// requires.
+    ///
+    /// One unnamed vector with Cosine distance and server defaults for everything
+    /// else. Cosine matches the DuckDB driver and the read path's client-side
+    /// `> min_score` filtering. It also L2-normalizes on write — write
+    /// `[3, 0, 0, 0]` and read back `[1, 0, 0, 0]` — which is exactly why vectors
+    /// are never hydrated back from Qdrant: the local YAML copy is the only
+    /// authoritative one.
+    ///
+    /// The index is created here rather than by the caller so the two cannot
+    /// drift apart.
+    pub(crate) async fn create_collection(
+        client: &Client,
+        base_url: &str,
+        collection: &str,
+        dim: usize,
+    ) -> Result<()> {
+        let body = serde_json::json!({ "vectors": { "size": dim, "distance": "Cosine" } });
+        let resp = client
+            .put(format!("{base_url}/collections/{collection}"))
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("Failed to connect to {base_url}"))?;
+        if !resp.status().is_success() {
+            bail!(
+                "Failed to create collection '{collection}': {}",
+                Self::error_message(resp).await
+            );
+        }
+
+        Self::create_file_id_index(client, base_url, collection).await
+    }
+
+    /// Creates the `file_id` payload index, typed `integer`.
+    ///
+    /// Not for queries: nothing in this file sends a `filter` — `vector_search`
+    /// posts only `vector`, `limit` and `with_payload`, and deletes go by
+    /// explicit id. What the index carries is the field's declared type, and the
+    /// type is what is load-bearing here: the scroll reads `payload["file_id"]`
+    /// with `as_u64()`, which answers `None` for a JSON string and trips the
+    /// mandatory-field bail in the reconcile.
+    ///
+    /// `wait=true` because index creation is a write like any other, and the
+    /// index has to exist before the first point lands.
+    async fn create_file_id_index(client: &Client, base_url: &str, collection: &str) -> Result<()> {
+        let body = serde_json::json!({ "field_name": "file_id", "field_schema": "integer" });
+        let resp = client
+            .put(format!(
+                "{base_url}/collections/{collection}/index?wait=true"
+            ))
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("Failed to connect to {base_url}"))?;
+        if !resp.status().is_success() {
+            bail!(
+                "Failed to create the file_id payload index on '{collection}': {}",
+                Self::error_message(resp).await
+            );
+        }
+        let body: Value = resp.json().await.with_context(|| {
+            format!("Unreadable index-creation response for '{collection}' on {base_url}")
+        })?;
+
+        check_write_completed(&body, "file_id payload index creation")
+    }
+
+    /// Checks the existing collection against what both paths assume before
+    /// anything is written to it, so a mismatch is one clear error rather than a
+    /// mid-batch 400.
+    async fn preflight(&self, local_dim: Option<usize>) -> Result<()> {
+        let resp = self
+            .client
+            .get(format!("{}/collections/{}", self.base_url, self.collection))
+            .send()
+            .await
+            .with_context(|| format!("Failed to connect to {}", self.base_url))?;
+        if !resp.status().is_success() {
+            bail!(
+                "Failed to read collection '{}': {}",
+                self.collection,
+                Self::error_message(resp).await
+            );
+        }
+        let body: Value = resp.json().await.with_context(|| {
+            format!(
+                "Unreadable collection config for '{}' on {}",
+                self.collection, self.base_url
+            )
+        })?;
+
+        check_collection_config(&body, &self.collection, &self.base_url, local_dim)
+    }
+
+    /// Pages the whole collection into the map the reconcile judges.
+    ///
+    /// Collect only: nothing is decided here. The scan also has to finish before
+    /// the first write. Qdrant's scroll is a cursor over an ordered id space, not
+    /// a snapshot, so a write interleaved with it can move a point past the
+    /// cursor and out of the scan entirely — and a point the scan never saw is a
+    /// point the reconcile cannot account for.
+    async fn scroll_all(&self) -> Result<BTreeMap<u64, owned::RemotePoint>> {
+        let url = format!(
+            "{}/collections/{}/points/scroll",
+            self.base_url, self.collection
+        );
+        let mut remote = BTreeMap::new();
+        let mut offset: Option<Value> = None;
+
+        loop {
+            let resp = self
+                .client
+                .post(&url)
+                .json(&scroll_request(offset.as_ref()))
+                .send()
+                .await
+                .with_context(|| format!("Failed to connect to {}", self.base_url))?;
+            if !resp.status().is_success() {
+                bail!(
+                    "Failed to scroll collection '{}': {}",
+                    self.collection,
+                    Self::error_message(resp).await
+                );
+            }
+            let body: Value = resp.json().await.with_context(|| {
+                format!(
+                    "Unreadable scroll response for collection '{}' on {}",
+                    self.collection, self.base_url
+                )
+            })?;
+            let points = body["result"]["points"]
+                .as_array()
+                .context("Unexpected /points/scroll response shape")?;
+            let page_is_empty = points.is_empty();
+
+            for point in points {
+                let Some(id) = point["id"].as_u64() else {
+                    bail!(
+                        "Refusing to sync: collection '{}' on {} holds a point with a \
+                         non-integer id ({}). Coyote-owned collections use integer ids \
+                         exclusively, so this collection holds data Coyote did not write. \
+                         Point this RAG at a different collection, or delete the collection in \
+                         Qdrant if the other data is disposable.",
+                        self.collection,
+                        self.base_url,
+                        point["id"]
+                    );
+                };
+                remote.insert(id, remote_point(&point["payload"]));
+            }
+
+            // Null on the last page, and only there.
+            match body["result"]["next_page_offset"].clone() {
+                Value::Null => break,
+                cursor => {
+                    // A server that hands back the offset it was given, or that
+                    // pages nothing while still promising more, would spin this
+                    // loop forever over a map that only grows.
+                    if page_is_empty || offset.as_ref() == Some(&cursor) {
+                        bail!(
+                            "Failed to scroll collection '{}' on {}: the scroll made no \
+                             progress at offset {cursor}, so paging it again would never \
+                             finish.",
+                            self.collection,
+                            self.base_url
+                        );
+                    }
+                    offset = Some(cursor);
+                }
+            }
+        }
+
+        Ok(remote)
+    }
+
+    async fn upsert_points(&self, points: Vec<Value>) -> Result<()> {
+        let count = points.len();
+        let (method, url) = upsert_request(&self.base_url, &self.collection);
+        let resp = self
+            .client
+            .request(method, url)
+            .json(&serde_json::json!({ "points": points }))
+            .send()
+            .await
+            .with_context(|| format!("Failed to connect to {}", self.base_url))?;
+        if !resp.status().is_success() {
+            bail!(
+                "Failed to write {count} points to collection '{}': {}",
+                self.collection,
+                Self::error_message(resp).await
+            );
+        }
+        let body: Value = resp.json().await.with_context(|| {
+            format!(
+                "Unreadable upsert response for collection '{}' on {}",
+                self.collection, self.base_url
+            )
+        })?;
+
+        check_write_completed(&body, "upsert")
+    }
+
+    async fn delete_points(&self, ids: &[u64]) -> Result<()> {
+        let (method, url) = delete_request(&self.base_url, &self.collection);
+        let resp = self
+            .client
+            .request(method, url)
+            .json(&serde_json::json!({ "points": ids }))
+            .send()
+            .await
+            .with_context(|| format!("Failed to connect to {}", self.base_url))?;
+        if !resp.status().is_success() {
+            bail!(
+                "Failed to delete {} points from collection '{}': {}",
+                ids.len(),
+                self.collection,
+                Self::error_message(resp).await
+            );
+        }
+        let body: Value = resp.json().await.with_context(|| {
+            format!(
+                "Unreadable delete response for collection '{}' on {}",
+                self.collection, self.base_url
+            )
+        })?;
+
+        check_write_completed(&body, "delete")
+    }
 }
 
 #[async_trait]
@@ -853,9 +1382,9 @@ impl RagProvider for QdrantProvider {
         Ok(rows)
     }
 
-    async fn rebuild_indexes(&mut self, data: &RagData, _full_rebuild: bool) -> Result<()> {
-        // Both arms refuse. A silent `Ok(())` would make `.rebuild rag` and
-        // `.edit rag-docs` look like they worked while writing nothing to the
+    async fn rebuild_indexes(&mut self, data: &RagData, full_rebuild: bool) -> Result<()> {
+        // First, and never relaxed. A silent `Ok(())` would make `.rebuild rag`
+        // and `.edit rag-docs` look like they worked while writing nothing to the
         // remote, leaving the user believing the collection was updated.
         if data.attached {
             bail!(
@@ -864,7 +1393,181 @@ impl RagProvider for QdrantProvider {
                  create a Coyote-owned RAG with `.rag <name>`."
             );
         }
-        bail!("Writing to Qdrant is not supported yet (attach-only).");
+
+        // Refused at run time, on the one entry point that writes. It must not
+        // become a `compile_error!`: attaching to a collection something else
+        // writes is supported on 32-bit, and a compile-time refusal would take
+        // the whole crate down with the write path. `DocumentId` packs 16/16 bits
+        // on a 32-bit target, so every wire id from file index 1 upwards exceeds
+        // `u32::MAX`, fails the read path's `usize::try_from` and gets interned as
+        // a synthetic handle — while BM25 and the vectors map keep the 16/16-packed
+        // id. One document, two ids, two search legs that never agree.
+        #[cfg(target_pointer_width = "32")]
+        bail!(
+            "Coyote cannot write to a Qdrant collection on a 32-bit build: a remote point id \
+             does not fit in a 32-bit document id, so the same document would answer to two \
+             different ids on the vector and keyword search legs. Attaching to a collection \
+             something else writes still works."
+        );
+
+        // TODO: refresh the local content map here, and only here. It has to run
+        // after the guards above and before any HTTP below, so that a failed
+        // write cannot leave the map describing a state the remote never
+        // reached. Until it lands, every `fetch_content` resolves against the
+        // remote collection.
+
+        // Read straight off `&RagData`, whose `driver_config` is deliberately left
+        // un-interpolated; a vault-resolved copy is not this RAG's identity. Never
+        // mint a replacement either — a fresh marker orphans every point already
+        // in the collection behind the ownership guard.
+        let Some(rag_id) = data
+            .driver_config
+            .get("coyote_rag_id")
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+        else {
+            bail!(
+                "Refusing to sync: this RAG has no `coyote_rag_id` in its driver_config, which \
+                 is how Coyote recognises the points it wrote to collection '{}'. Minting a new \
+                 one would orphan every point already there. Restore the RAG's YAML from backup.",
+                self.collection
+            );
+        };
+        let writer_id = crate::config::paths::install_id()
+            .context("Failed to read this install's identity, which stamps every point written")?;
+        // The one authoritative dimension available here: the local vectors
+        // themselves. `None` means there is nothing to upsert anyway. One length
+        // is enough because a RAG embeds its whole corpus with a single model —
+        // a changed model is a `.rebuild rag`, and a mixed collection is refused
+        // by the reconcile's embedding-model guard.
+        let local_dim = data.vectors.values().next().map(Vec::len);
+
+        let creating_collection =
+            !Self::collection_exists(&self.client, &self.base_url, &self.collection).await?;
+        if creating_collection {
+            if !full_rebuild {
+                bail!(
+                    "Collection '{}' no longer exists on {}. Run `.rebuild rag` to recreate and \
+                     repopulate it from the local copy.",
+                    self.collection,
+                    self.base_url
+                );
+            }
+            // Recreating destroys nothing: the collection is gone, and the local
+            // YAML holds every vector. Without this arm every guard that says
+            // "delete the collection in Qdrant" is a dead end.
+            let Some(dim) = local_dim else {
+                bail!(
+                    "Collection '{}' does not exist on {} and this RAG holds no vectors, so \
+                     Coyote cannot tell what vector size to create it with. This usually means \
+                     the RAG's YAML was truncated or hand-edited; restore it from backup.",
+                    self.collection,
+                    self.base_url
+                );
+            };
+            Self::create_collection(&self.client, &self.base_url, &self.collection, dim).await?;
+        } else {
+            self.preflight(local_dim).await?;
+        }
+
+        let ctx = owned::ReconcileCtx {
+            collection: self.collection.clone(),
+            host: self.base_url.clone(),
+            rag_id: rag_id.to_string(),
+            writer_id,
+            embedding_model: data.embedding_model.clone(),
+            vectors_empty: data.vectors.is_empty(),
+            creating_collection,
+        };
+
+        let mut desired: BTreeMap<FileId, owned::DesiredFile> = BTreeMap::new();
+        let mut achievable: BTreeSet<u64> = BTreeSet::new();
+        for (&file_id, file) in &data.files {
+            // Once per file: the bound is on the file index, so checking it per
+            // point would ask the same question once per chunk.
+            owned::check_wire_range(file_id)?;
+            let mut ids = BTreeSet::new();
+            for chunk_index in 0..file.documents.len() {
+                let document_id = DocumentId::new(file_id, chunk_index);
+                let point_id = owned::wire_point_id(document_id);
+                ids.insert(point_id);
+                // A chunk whose embedding failed has no vector, so it is desired
+                // but not achievable this sync.
+                if data.vectors.contains_key(&document_id) {
+                    achievable.insert(point_id);
+                }
+            }
+            desired.insert(
+                file_id,
+                owned::DesiredFile {
+                    hash: file.hash.clone(),
+                    path: file.path.clone(),
+                    ids,
+                },
+            );
+        }
+
+        let remote = self.scroll_all().await?;
+        // Every guard fires in here, before anything is written. An `Err` leaves
+        // the collection untouched.
+        let plan = owned::reconcile(&desired, &achievable, &remote, &ctx, full_rebuild)?;
+        for warning in &plan.warnings {
+            warn!("{warning}");
+        }
+
+        // Upserts first, deletes last. Both orders converge after a crash, so
+        // this is about the window in between: upsert-first leaves stale
+        // duplicates, delete-first leaves documents missing, and for a retrieval
+        // system stale-but-present beats silently absent.
+        for file in &plan.upsert_files {
+            let local = data
+                .files
+                .get(&file.file_id)
+                .context("Reconcile selected a file the local set does not hold")?;
+            let selected: BTreeSet<u64> = file.point_ids.iter().copied().collect();
+            let mut pending = Vec::with_capacity(file.point_ids.len());
+
+            for (chunk_index, document) in local.documents.iter().enumerate() {
+                let document_id = DocumentId::new(file.file_id, chunk_index);
+                let point_id = owned::wire_point_id(document_id);
+                if !selected.contains(&point_id) {
+                    continue;
+                }
+                let vector = data
+                    .vectors
+                    .get(&document_id)
+                    .context("Reconcile selected a point that has no local vector")?;
+                let payload = point_payload(
+                    file.file_id,
+                    chunk_index,
+                    &local.hash,
+                    &local.path,
+                    &document.page_content,
+                    &ctx,
+                );
+                pending.push(pending_point(
+                    upsert_point(point_id, vector, payload),
+                    format!("chunk {chunk_index} of '{}'", local.path),
+                )?);
+            }
+
+            // Every selected point, or none of them: a selected id with no local
+            // chunk behind it would otherwise be skipped in silence.
+            check_selection_complete(&local.path, pending.len(), selected.len())?;
+
+            // A file with nothing achievable yields no batches and so costs no
+            // request, which is what keeps the reconcile free to report it every
+            // sync.
+            for batch in batch_points(pending, UPSERT_BYTE_CAP)? {
+                self.upsert_points(batch).await?;
+            }
+        }
+
+        for ids in delete_id_batches(&plan.delete_ids) {
+            self.delete_points(ids).await?;
+        }
+
+        Ok(())
     }
 
     fn duplicate(&self, _data: &RagData) -> Box<dyn RagProvider> {
@@ -976,10 +1679,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_indexes_refuses_for_attached_and_unattached_alike() {
+    async fn rebuild_indexes_refuses_an_attached_rag_and_an_unmarked_owned_one() {
         let mut provider = QdrantProvider {
             client: Client::new(),
-            base_url: "http://localhost:6333".to_string(),
+            // Both refusals land before the first request, so an unroutable port
+            // is a check that neither of them reaches the network.
+            base_url: "http://127.0.0.1:1".to_string(),
             collection: "c".to_string(),
             point_ids: Arc::default(),
         };
@@ -995,9 +1700,9 @@ mod tests {
             .expect_err("an attached qdrant RAG must never report a successful rebuild");
         assert!(err.to_string().contains("cannot rebuild"), "got: {err}");
 
-        // `attached: false` is reserved for the (unimplemented) write path. It must
-        // also refuse: silently succeeding would run a full paid embedding pass and
-        // then discard every vector.
+        // An owned RAG whose YAML lost its ownership marker. Minting a fresh one
+        // would orphan every point already in the collection behind the ownership
+        // guard, so this stops before it can write anything.
         let owned = RagData {
             driver: "qdrant".to_string(),
             attached: false,
@@ -1006,8 +1711,8 @@ mod tests {
         let err = provider
             .rebuild_indexes(&owned, true)
             .await
-            .expect_err("writing to qdrant is unimplemented and must fail loudly");
-        assert!(err.to_string().contains("not supported yet"), "got: {err}");
+            .expect_err("an owned RAG with no coyote_rag_id must not be synced");
+        assert!(err.to_string().contains("coyote_rag_id"), "got: {err}");
     }
 
     #[tokio::test]
@@ -1819,6 +2524,297 @@ mod tests {
             .expect_err("an id and a payload that disagree must not be reconciled");
 
         assert!(err.to_string().contains("claims file_id 9"), "got: {err}");
+    }
+
+    /// Sized from what `serde_json` actually produces, since the batcher measures
+    /// rather than estimates.
+    fn sized_point(id: u64, text: &str) -> PendingPoint {
+        let payload = point_payload(0, id as usize, "h", "a.md", text, &base_ctx());
+        pending_point(
+            upsert_point(id, &[0.5f32; 4], payload),
+            format!("chunk {id} of 'a.md'"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_payload_carries_every_field_with_integer_ids() {
+        let payload = point_payload(7, 3, "hash-a", "notes.md", "chunk text", &base_ctx());
+
+        let fields: BTreeSet<&str> = payload
+            .as_object()
+            .expect("a payload is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            BTreeSet::from([
+                "chunk_index",
+                "coyote_rag_id",
+                "embedding_model",
+                "file_hash",
+                "file_id",
+                "page_content",
+                "path",
+                "schema_version",
+                "writer_id",
+            ])
+        );
+
+        // The `file_id` payload index is typed `integer`; a string does not match
+        // it, and the difference is invisible until a filter returns nothing.
+        assert_eq!(payload["file_id"].as_u64(), Some(7));
+        assert_eq!(payload["chunk_index"].as_u64(), Some(3));
+        assert!(!payload["file_id"].is_string());
+        assert!(!payload["chunk_index"].is_string());
+        // The read path hardcodes this key.
+        assert_eq!(payload["page_content"].as_str(), Some("chunk text"));
+        assert_eq!(payload["file_hash"].as_str(), Some("hash-a"));
+        assert_eq!(payload["path"].as_str(), Some("notes.md"));
+        assert_eq!(payload["coyote_rag_id"].as_str(), Some(RAG_ID));
+        assert_eq!(payload["writer_id"].as_str(), Some(WRITER_ID));
+        assert_eq!(payload["embedding_model"].as_str(), Some(MODEL));
+        assert_eq!(payload["schema_version"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn batches_flush_before_the_byte_cap_is_exceeded() {
+        let points: Vec<PendingPoint> = (0..3).map(|id| sized_point(id, "x")).collect();
+        let each = points[0].bytes;
+        assert!(
+            points.iter().all(|point| point.bytes == each),
+            "the fixture only measures a cap if its points are the same size"
+        );
+
+        let batches = batch_points(points, each * 2).unwrap();
+
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![2, 1],
+            "the third point must start a batch rather than overflow the cap"
+        );
+    }
+
+    #[test]
+    fn a_file_with_nothing_to_write_sends_no_request() {
+        assert!(batch_points(vec![], UPSERT_BYTE_CAP).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_point_too_large_for_one_request_bails_naming_the_chunk() {
+        let err = batch_points(vec![sized_point(4, "x")], 8)
+            .expect_err("a point that cannot fit alone would only 400 on the server");
+
+        let msg = err.to_string();
+        assert!(msg.contains("chunk 4 of 'a.md'"), "got: {msg}");
+        assert!(
+            msg.contains("chunk size"),
+            "the message must say what to change: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_selected_point_with_no_local_chunk_stops_the_sync() {
+        assert!(check_selection_complete("a.md", 4, 4).is_ok());
+
+        // Skipping it instead reports success, leaves the file's hash matching
+        // from then on, and never writes or deletes the point again.
+        let err = check_selection_complete("notes/a.md", 3, 4)
+            .expect_err("a selected point that cannot be built is lost silently");
+
+        let msg = err.to_string();
+        assert!(msg.contains("notes/a.md"), "got: {msg}");
+        assert!(msg.contains("selected 4 points"), "got: {msg}");
+        assert!(msg.contains("only 3"), "got: {msg}");
+    }
+
+    #[test]
+    fn the_scroll_asks_for_every_field_a_guard_reads() {
+        let body = scroll_request(None);
+
+        let include: Vec<&str> = body["with_payload"]["include"]
+            .as_array()
+            .expect("the include list is an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        // Dropping any of these disables a guard silently — it stops firing
+        // rather than failing — which is what this test exists to prevent.
+        for field in [
+            "file_id",
+            "file_hash",
+            "coyote_rag_id",
+            "writer_id",
+            "embedding_model",
+            "path",
+        ] {
+            assert!(include.contains(&field), "{field} missing from {include:?}");
+        }
+        assert_eq!(include.len(), 6);
+        assert_eq!(body["with_vector"], serde_json::json!(false));
+        assert!(
+            body.get("offset").is_none(),
+            "the first page is requested without a cursor"
+        );
+
+        let next = scroll_request(Some(&serde_json::json!(4096)));
+        assert_eq!(next["offset"], serde_json::json!(4096));
+    }
+
+    #[test]
+    fn a_scrolled_payload_maps_absent_fields_onto_the_empty_string() {
+        let full = remote_point(&serde_json::json!({
+            "file_id": 2,
+            "file_hash": "h",
+            "coyote_rag_id": RAG_ID,
+            "writer_id": WRITER_ID,
+            "embedding_model": MODEL,
+            "path": "a.md",
+        }));
+        assert_eq!(full.file_id, Some(2));
+        assert_eq!(full.path, "a.md");
+        assert_eq!(full.coyote_rag_id, RAG_ID);
+
+        // `file_id` is the one field with no usable empty value, so its absence
+        // stays distinguishable and the reconcile can refuse on it.
+        let bare = remote_point(&serde_json::json!({}));
+        assert_eq!(bare.file_id, None);
+        assert_eq!(bare, RemotePoint::default());
+    }
+
+    #[test]
+    fn both_write_requests_pin_their_verb_and_wait_for_the_write_to_apply() {
+        let (upsert_method, upsert) = upsert_request("http://localhost:6333", "docs");
+        let (delete_method, delete) = delete_request("http://localhost:6333", "docs");
+
+        // `POST` on the upsert path is `fetch_content`'s get-by-id route, and
+        // `DELETE` on the delete path is a routing-level 404 with an empty body.
+        // Both mistakes share their path with the right verb, so only the verb
+        // itself separates them.
+        assert_eq!(upsert_method, Method::PUT);
+        assert_eq!(delete_method, Method::POST);
+        // Sent in the body instead, `wait` is silently ignored and the server
+        // answers before the write is durable.
+        assert_eq!(
+            upsert,
+            "http://localhost:6333/collections/docs/points?wait=true"
+        );
+        assert_eq!(
+            delete,
+            "http://localhost:6333/collections/docs/points/delete?wait=true"
+        );
+    }
+
+    #[test]
+    fn an_acknowledged_write_is_not_a_successful_one() {
+        let completed = serde_json::json!({"result": {"operation_id": 1, "status": "completed"}});
+        assert!(check_write_completed(&completed, "upsert").is_ok());
+
+        let acknowledged = serde_json::json!({"result": {"status": "acknowledged"}});
+        let err = check_write_completed(&acknowledged, "upsert")
+            .expect_err("acknowledged means queued, not durable");
+        assert!(err.to_string().contains("acknowledged"), "got: {err}");
+
+        let junk = serde_json::json!({"result": {}});
+        assert!(check_write_completed(&junk, "delete").is_err());
+    }
+
+    #[test]
+    fn deletes_are_chunked_at_a_thousand_ids() {
+        let ids: Vec<u64> = (0..2500).collect();
+
+        let batches: Vec<&[u64]> = delete_id_batches(&ids).collect();
+
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            vec![1000, 1000, 500]
+        );
+        assert_eq!(batches.concat(), ids, "no id may be dropped or reordered");
+        assert_eq!(
+            delete_id_batches(&[]).count(),
+            0,
+            "an empty delete list sends nothing"
+        );
+    }
+
+    #[test]
+    fn check_collection_config_rejects_what_the_read_and_write_paths_cannot_share() {
+        let ok = serde_json::json!({
+            "result": {"config": {"params": {"vectors": {"size": 4, "distance": "Cosine"}}}}
+        });
+        assert!(check_collection_config(&ok, "docs", "http://h", Some(4)).is_ok());
+        // No local vector to measure against: the check is skipped, never guessed
+        // from the model name.
+        assert!(check_collection_config(&ok, "docs", "http://h", None).is_ok());
+
+        let err = check_collection_config(&ok, "docs", "http://h", Some(1536))
+            .expect_err("a dimension mismatch 400s on every batch");
+        assert!(err.to_string().contains("1536-dimensional"), "got: {err}");
+
+        let named = serde_json::json!({
+            "result": {"config": {"params": {"vectors": {"t": {"size": 4, "distance": "Cosine"}}}}}
+        });
+        let err = check_collection_config(&named, "docs", "http://h", Some(4))
+            .expect_err("a named-vector collection rejects every unnamed query");
+        assert!(err.to_string().contains("named vectors"), "got: {err}");
+
+        let euclid = serde_json::json!({
+            "result": {"config": {"params": {"vectors": {"size": 4, "distance": "Euclid"}}}}
+        });
+        let err = check_collection_config(&euclid, "docs", "http://h", Some(4))
+            .expect_err("only Cosine scores on the scale the read path filters against");
+        assert!(err.to_string().contains("Euclid"), "got: {err}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Qdrant instance at localhost:6333"]
+    async fn qdrant_owned_round_trip_requires_running_instance() {
+        const HOST: &str = "http://localhost:6333";
+        const COLLECTION: &str = "coyote-owned-round-trip";
+
+        let client = QdrantProvider::make_client(HOST, None).unwrap();
+        if !QdrantProvider::collection_exists(&client, HOST, COLLECTION)
+            .await
+            .unwrap()
+        {
+            QdrantProvider::create_collection(&client, HOST, COLLECTION, 4)
+                .await
+                .unwrap();
+        }
+        let provider = QdrantProvider::new(HOST, COLLECTION, None).await.unwrap();
+        let ctx = base_ctx();
+        let ids: Vec<u64> = (0..2)
+            .map(|chunk| wire_point_id(DocumentId::new(1, chunk)))
+            .collect();
+        let points: Vec<Value> = ids
+            .iter()
+            .enumerate()
+            .map(|(chunk, id)| {
+                let payload = point_payload(1, chunk, "hash", "round-trip.md", "text", &ctx);
+                upsert_point(*id, &[0.5f32; 4], payload)
+            })
+            .collect();
+
+        provider.upsert_points(points).await.unwrap();
+
+        let remote = provider.scroll_all().await.unwrap();
+        for id in &ids {
+            let point = remote
+                .get(id)
+                .unwrap_or_else(|| panic!("point {id} must scroll back after a completed upsert"));
+            assert_eq!(point.file_id, Some(1));
+            assert_eq!(point.coyote_rag_id, RAG_ID);
+            assert_eq!(point.path, "round-trip.md");
+        }
+
+        provider.delete_points(&ids).await.unwrap();
+
+        let remote = provider.scroll_all().await.unwrap();
+        assert!(
+            ids.iter().all(|id| !remote.contains_key(id)),
+            "the delete pass must remove exactly the ids it was given"
+        );
     }
 
     #[tokio::test]

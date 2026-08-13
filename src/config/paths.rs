@@ -168,7 +168,6 @@ const INSTALL_ID_FILE_NAME: &str = "install-id";
 ///
 /// It lives next to the config rather than inside it, so it survives config
 /// edits and is never carried along when a config file is copied elsewhere.
-#[allow(dead_code)]
 pub fn install_id() -> Result<String> {
     read_or_mint_install_id(&local_dir(INSTALL_ID_FILE_NAME))
 }
