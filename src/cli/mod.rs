@@ -765,10 +765,7 @@ mod tests {
         assert_eq!(cli.mcp_add, Some("notion".to_string()));
         assert!(matches!(cli.transport, Some(McpTransportArg::Http)));
         assert_eq!(cli.url, Some("https://mcp.notion.com/mcp".to_string()));
-        assert_eq!(
-            cli.header,
-            vec!["Authorization: Bearer {{NOTION_TOKEN}}"]
-        );
+        assert_eq!(cli.header, vec!["Authorization: Bearer {{NOTION_TOKEN}}"]);
         assert!(cli.mcp_command.is_empty());
     }
 
