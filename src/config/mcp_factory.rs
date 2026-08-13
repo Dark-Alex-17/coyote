@@ -103,7 +103,7 @@ impl McpFactory {
         }
 
         let bearer_token = if spec.is_remote() {
-            oauth::load_valid_mcp_token(name)
+            oauth::load_or_refresh_mcp_token(name).await
         } else {
             None
         };

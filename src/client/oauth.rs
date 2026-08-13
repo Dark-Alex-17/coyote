@@ -2,13 +2,13 @@ use super::access_token::{is_valid_access_token, set_access_token};
 use super::openai_compatible_oauth::OpenAICompatibleOAuthProvider;
 use super::{ClientConfig, ProviderModels};
 use crate::config::paths;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Error, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use indexmap::IndexMap;
 use inquire::Text;
-use reqwest::{Client as ReqwestClient, RequestBuilder};
+use reqwest::{Client as ReqwestClient, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -16,6 +16,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::sync;
 use url::Url;
 use uuid::Uuid;
 
@@ -197,10 +201,20 @@ pub struct OAuthTokens {
     pub account_id: Option<String>,
 }
 
+const TOKEN_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> Result<()> {
     match provider.flow() {
         OAuthFlow::Pkce => run_pkce_flow(provider, client_name).await,
-        OAuthFlow::ClientCredentials => run_client_credentials_flow(provider, client_name).await,
+        OAuthFlow::ClientCredentials => {
+            run_client_credentials_flow(provider, client_name).await?;
+            println!(
+                "Successfully authenticated client '{}' with {} via OAuth (client_credentials). Tokens saved.",
+                client_name,
+                provider.provider_name()
+            );
+            Ok(())
+        }
         OAuthFlow::DeviceCode => run_device_code_flow(provider, client_name).await,
     }
 }
@@ -301,12 +315,20 @@ async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Resul
 
     let access_token = response["access_token"]
         .as_str()
-        .ok_or_else(|| anyhow!("Missing access_token in response: {response}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "Missing access_token in response (keys: {})",
+                token_response_keys(&response)
+            )
+        })?
         .to_string();
     let refresh_token = response["refresh_token"].as_str().map(|s| s.to_string());
-    let expires_in = response["expires_in"]
-        .as_i64()
-        .ok_or_else(|| anyhow!("Missing expires_in in response: {response}"))?;
+    let expires_in = response["expires_in"].as_i64().ok_or_else(|| {
+        anyhow!(
+            "Missing expires_in in response (keys: {})",
+            token_response_keys(&response)
+        )
+    })?;
 
     let expires_at = Utc::now().timestamp() + expires_in;
 
@@ -334,7 +356,9 @@ async fn run_client_credentials_flow(
     provider: &dyn OAuthProvider,
     client_name: &str,
 ) -> Result<()> {
-    let client = ReqwestClient::new();
+    let client = ReqwestClient::builder()
+        .timeout(TOKEN_ENDPOINT_TIMEOUT)
+        .build()?;
     let scopes = provider.scopes();
     let mut params: Vec<(&str, &str)> = vec![
         ("grant_type", "client_credentials"),
@@ -349,11 +373,19 @@ async fn run_client_credentials_flow(
 
     let access_token = response["access_token"]
         .as_str()
-        .ok_or_else(|| anyhow!("Missing access_token in client_credentials response: {response}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "Missing access_token in client_credentials response (keys: {})",
+                token_response_keys(&response)
+            )
+        })?
         .to_string();
-    let expires_in = response["expires_in"]
-        .as_i64()
-        .ok_or_else(|| anyhow!("Missing expires_in in client_credentials response: {response}"))?;
+    let expires_in = response["expires_in"].as_i64().ok_or_else(|| {
+        anyhow!(
+            "Missing expires_in in client_credentials response (keys: {})",
+            token_response_keys(&response)
+        )
+    })?;
     let expires_at = Utc::now().timestamp() + expires_in;
 
     let tokens = OAuthTokens {
@@ -363,11 +395,6 @@ async fn run_client_credentials_flow(
         account_id: provider.extract_account_id(&response),
     };
     save_oauth_tokens(client_name, &tokens)?;
-    println!(
-        "Successfully authenticated client '{}' with {} via OAuth (client_credentials). Tokens saved.",
-        client_name,
-        provider.provider_name()
-    );
 
     Ok(())
 }
@@ -417,19 +444,28 @@ async fn run_device_code_flow(provider: &dyn OAuthProvider, client_name: &str) -
     let device_code = device_response["device_code"]
         .as_str()
         .ok_or_else(|| {
-            anyhow!("Missing device_code in device authorization response: {device_response}")
+            anyhow!(
+                "Missing device_code in device authorization response (keys: {})",
+                token_response_keys(&device_response)
+            )
         })?
         .to_string();
     let user_code = device_response["user_code"]
         .as_str()
         .ok_or_else(|| {
-            anyhow!("Missing user_code in device authorization response: {device_response}")
+            anyhow!(
+                "Missing user_code in device authorization response (keys: {})",
+                token_response_keys(&device_response)
+            )
         })?
         .to_string();
     let verification_uri = device_response["verification_uri"]
         .as_str()
         .ok_or_else(|| {
-            anyhow!("Missing verification_uri in device authorization response: {device_response}")
+            anyhow!(
+                "Missing verification_uri in device authorization response (keys: {})",
+                token_response_keys(&device_response)
+            )
         })?
         .to_string();
     let verification_uri_complete = device_response["verification_uri_complete"]
@@ -551,8 +587,74 @@ fn save_oauth_tokens(client_name: &str, tokens: &OAuthTokens) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(tokens)?;
-    fs::write(path, json)?;
+    // Write-then-rename so a crash mid-write never truncates the live token file.
+    let mut tmp = path.clone().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    // Tokens are live credentials: create the file owner-only, not umask-default.
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(&tmp)?.write_all(json.as_bytes())?;
+    fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+pub(crate) fn token_response_keys(response: &Value) -> String {
+    match response.as_object() {
+        Some(map) => {
+            let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            format!("[{}]", keys.join(", "))
+        }
+        None => "<non-object response>".to_string(),
+    }
+}
+
+fn parse_refresh_response(
+    status: StatusCode,
+    response: &Value,
+    previous_refresh_token: Option<&str>,
+) -> Result<(String, Option<String>, i64)> {
+    if let Some(error) = response["error"].as_str() {
+        let description = response["error_description"]
+            .as_str()
+            .unwrap_or("no description");
+        if matches!(error, "invalid_grant" | "invalid_token") {
+            bail!(
+                "OAuth refresh token was rejected ({error}: {description}). Please re-authenticate."
+            );
+        }
+        bail!("Token refresh failed ({error}: {description})");
+    }
+    if !status.is_success() {
+        bail!("Token refresh failed with HTTP status {status}");
+    }
+
+    let access_token = response["access_token"]
+        .as_str()
+        .ok_or_else(|| {
+            anyhow!(
+                "Missing access_token in refresh response (keys: {})",
+                token_response_keys(response)
+            )
+        })?
+        .to_string();
+    let refresh_token = response["refresh_token"]
+        .as_str()
+        .or(previous_refresh_token)
+        .map(str::to_string);
+    let expires_in = response["expires_in"].as_i64().ok_or_else(|| {
+        anyhow!(
+            "Missing expires_in in refresh response (keys: {})",
+            token_response_keys(response)
+        )
+    })?;
+
+    Ok((access_token, refresh_token, expires_in))
 }
 
 pub async fn refresh_oauth_token(
@@ -577,19 +679,23 @@ pub async fn refresh_oauth_token(
         ],
     );
 
-    let response: Value = request.send().await?.json().await?;
+    let (status, response) = tokio::time::timeout(TOKEN_ENDPOINT_TIMEOUT, async {
+        let response = request.send().await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        Ok::<_, Error>((status, body))
+    })
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "Token refresh for '{}' timed out after {}s",
+            client_name,
+            TOKEN_ENDPOINT_TIMEOUT.as_secs()
+        )
+    })??;
 
-    let access_token = response["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Missing access_token in refresh response: {response}"))?
-        .to_string();
-    let refresh_token = response["refresh_token"]
-        .as_str()
-        .map(|s| s.to_string())
-        .or_else(|| tokens.refresh_token.clone());
-    let expires_in = response["expires_in"]
-        .as_i64()
-        .ok_or_else(|| anyhow!("Missing expires_in in refresh response: {response}"))?;
+    let (access_token, refresh_token, expires_in) =
+        parse_refresh_response(status, &response, tokens.refresh_token.as_deref())?;
 
     let expires_at = Utc::now().timestamp() + expires_in;
 
@@ -609,6 +715,20 @@ pub async fn refresh_oauth_token(
     Ok(new_tokens)
 }
 
+/// Per-client lock so concurrent requests perform a single refresh.
+/// Returns a clone of the Arc so the parking_lot guard is dropped before the
+/// caller awaits on the tokio mutex.
+fn refresh_guard(client_name: &str) -> Arc<sync::Mutex<()>> {
+    static GUARDS: OnceLock<parking_lot::Mutex<HashMap<String, Arc<sync::Mutex<()>>>>> =
+        OnceLock::new();
+    GUARDS
+        .get_or_init(Default::default)
+        .lock()
+        .entry(client_name.to_string())
+        .or_default()
+        .clone()
+}
+
 pub async fn prepare_oauth_access_token(
     client: &ReqwestClient,
     provider: &dyn OAuthProvider,
@@ -624,15 +744,35 @@ pub async fn prepare_oauth_access_token(
     };
 
     let tokens = if Utc::now().timestamp() >= tokens.expires_at {
-        match provider.flow() {
-            OAuthFlow::Pkce | OAuthFlow::DeviceCode => {
-                refresh_oauth_token(client, provider, client_name, &tokens).await?
+        let guard = refresh_guard(client_name);
+        let _guard = guard.lock().await;
+
+        // A concurrent caller may have refreshed while we waited for the
+        // lock; a valid in-memory token means the winner already populated
+        // the cache.
+        if is_valid_access_token(client_name) {
+            return Ok(true);
+        }
+
+        let tokens = match load_oauth_tokens(client_name) {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+
+        if Utc::now().timestamp() >= tokens.expires_at {
+            match provider.flow() {
+                OAuthFlow::Pkce | OAuthFlow::DeviceCode => {
+                    refresh_oauth_token(client, provider, client_name, &tokens).await?
+                }
+                OAuthFlow::ClientCredentials => {
+                    run_client_credentials_flow(provider, client_name).await?;
+                    load_oauth_tokens(client_name).ok_or_else(|| {
+                        anyhow!("Token file missing after client_credentials refresh")
+                    })?
+                }
             }
-            OAuthFlow::ClientCredentials => {
-                run_client_credentials_flow(provider, client_name).await?;
-                load_oauth_tokens(client_name)
-                    .ok_or_else(|| anyhow!("Token file missing after client_credentials refresh"))?
-            }
+        } else {
+            tokens
         }
     } else {
         tokens
@@ -886,11 +1026,54 @@ pub(crate) fn client_config_info(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
     use std::str;
+    use std::time::UNIX_EPOCH;
 
     use super::*;
     use crate::client::openai_compatible::OpenAICompatibleConfig;
     use crate::client::{ModelData, ProviderModels};
+    use crate::utils::get_env_name;
+    use serial_test::serial;
+    use std::{env, time::SystemTime};
+
+    fn with_temp_cache<F: FnOnce()>(f: F) {
+        struct Restore {
+            key: String,
+            prev: Option<OsString>,
+            root: PathBuf,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.prev.take() {
+                        Some(v) => env::set_var(&self.key, v),
+                        None => env::remove_var(&self.key),
+                    }
+                }
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("coyote-client-oauth-test-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let env_key = get_env_name("cache_dir");
+        let prev = env::var_os(&env_key);
+        unsafe {
+            env::set_var(&env_key, &root);
+        }
+        let _restore = Restore {
+            key: env_key,
+            prev,
+            root,
+        };
+        f();
+    }
 
     fn base_config() -> OAuthConfig {
         OAuthConfig {
@@ -1467,5 +1650,105 @@ scopes:
             body.contains("grant_type=authorization_code"),
             "body missing grant_type param: {body}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn save_oauth_tokens_roundtrips_and_leaves_no_tmp_file() {
+        with_temp_cache(|| {
+            let tokens = OAuthTokens {
+                access_token: "at-123".into(),
+                refresh_token: Some("rt-456".into()),
+                expires_at: 1234567890,
+                account_id: Some("acct-789".into()),
+            };
+
+            save_oauth_tokens("atomic-test", &tokens).unwrap();
+
+            let loaded = load_oauth_tokens("atomic-test").unwrap();
+            assert_eq!(loaded.access_token, "at-123");
+            assert_eq!(loaded.refresh_token.as_deref(), Some("rt-456"));
+            assert_eq!(loaded.expires_at, 1234567890);
+            assert_eq!(loaded.account_id.as_deref(), Some("acct-789"));
+
+            let dir = paths::oauth_tokens_dir();
+            let leftover_tmp = fs::read_dir(&dir)
+                .unwrap()
+                .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".tmp"));
+            assert!(!leftover_tmp, "temp file left behind in {dir:?}");
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(paths::token_file("atomic-test"))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "token file mode was {mode:o}");
+            }
+        });
+    }
+
+    #[test]
+    fn parse_refresh_response_invalid_grant_redacts_and_prompts_reauth() {
+        let response = serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "refresh token revoked",
+            "refresh_token": "planted-secret-token",
+        });
+
+        let err = parse_refresh_response(StatusCode::BAD_REQUEST, &response, Some("old-rt"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("re-authenticate"), "unexpected error: {err}");
+        assert!(
+            !err.contains("planted-secret-token"),
+            "error leaked token material: {err}"
+        );
+    }
+
+    #[test]
+    fn token_response_keys_lists_keys_without_values() {
+        let response = serde_json::json!({
+            "access_token": "secret-at",
+            "token_type": "SecretBearer",
+        });
+
+        let keys = token_response_keys(&response);
+
+        assert!(keys.contains("access_token"), "missing key name: {keys}");
+        assert!(keys.contains("token_type"), "missing key name: {keys}");
+        assert!(!keys.contains("secret-at"), "leaked value: {keys}");
+        assert!(!keys.contains("SecretBearer"), "leaked value: {keys}");
+    }
+
+    #[test]
+    fn parse_refresh_response_rotates_refresh_token_when_present() {
+        let response = serde_json::json!({
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+            "expires_in": 3600,
+        });
+
+        let (access_token, refresh_token, expires_in) =
+            parse_refresh_response(StatusCode::OK, &response, Some("old-rt")).unwrap();
+
+        assert_eq!(access_token, "new-at");
+        assert_eq!(refresh_token.as_deref(), Some("new-rt"));
+        assert_eq!(expires_in, 3600);
+    }
+
+    #[test]
+    fn parse_refresh_response_keeps_old_refresh_token_when_absent() {
+        let response = serde_json::json!({
+            "access_token": "new-at",
+            "expires_in": 3600,
+        });
+
+        let (_, refresh_token, _) =
+            parse_refresh_response(StatusCode::OK, &response, Some("old-rt")).unwrap();
+
+        assert_eq!(refresh_token.as_deref(), Some("old-rt"));
     }
 }

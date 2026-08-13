@@ -327,7 +327,7 @@ impl McpRegistry {
             .with_context(|| format!("MCP server not found in config: {id}"))?;
 
         let bearer_token = if spec.is_remote() {
-            oauth::load_valid_mcp_token(&id)
+            oauth::load_or_refresh_mcp_token(&id).await
         } else {
             None
         };

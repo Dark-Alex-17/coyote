@@ -1,14 +1,24 @@
-use crate::client::oauth::{OAuthProvider, TokenRequestFormat, load_oauth_tokens, run_oauth_flow};
+use crate::client::oauth::{
+    OAuthProvider, OAuthTokens, TokenRequestFormat, load_oauth_tokens, refresh_oauth_token,
+    run_oauth_flow, token_response_keys,
+};
 use crate::config::paths;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use inquire::Text;
-use log::warn;
+use log::{debug, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::net::TcpListener;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::sync;
 use url::Url;
+
+const REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const REFRESH_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Deserialize)]
 struct ProtectedResourceMetadata {
@@ -34,6 +44,10 @@ struct McpRegistration {
     client_id: String,
     #[serde(default)]
     redirect_uri: Option<String>,
+    #[serde(default)]
+    token_url: Option<String>,
+    #[serde(default)]
+    resource: Option<String>,
 }
 
 struct DiscoveredOAuth {
@@ -124,8 +138,19 @@ pub async fn run_mcp_oauth_flow(
         None
     };
 
-    let (client_id, redirect_uri) = if let Some(reused) = cached_reuse {
-        reused
+    let (client_id, redirect_uri) = if let Some((client_id, redirect_uri)) = cached_reuse {
+        // Re-save so registrations cached before token_url/resource were
+        // persisted gain them, enabling token refresh next time.
+        if let Err(e) = save_registration(
+            server_name,
+            &client_id,
+            &redirect_uri,
+            &metadata.token_endpoint,
+            &resource,
+        ) {
+            debug!("Failed to update cached MCP registration for '{server_name}': {e}");
+        }
+        (client_id, redirect_uri)
     } else {
         let bind_addr = format!("127.0.0.1:{}", callback_port.unwrap_or(0));
         let listener = TcpListener::bind(&bind_addr)?;
@@ -137,10 +162,7 @@ pub async fn run_mcp_oauth_flow(
             id.to_string()
         } else if let Some(reg_endpoint) = &metadata.registration_endpoint {
             match register_client(reg_endpoint, &redirect_uri).await {
-                Ok(id) => {
-                    let _ = save_registration(server_name, &id, &redirect_uri);
-                    id
-                }
+                Ok(id) => id,
                 Err(e) => {
                     warn!("Dynamic client registration failed: {e}. Falling back to manual entry.");
                     Text::new("Enter the OAuth client ID for this MCP server:")
@@ -153,6 +175,18 @@ pub async fn run_mcp_oauth_flow(
                 .prompt()
                 .context("Failed to read client ID")?
         };
+        // Persist regardless of how the client_id was obtained (DCR, config,
+        // or manual entry) so refresh_mcp_token can run the refresh_token
+        // grant later without interactive re-auth.
+        if let Err(e) = save_registration(
+            server_name,
+            &client_id,
+            &redirect_uri,
+            &metadata.token_endpoint,
+            &resource,
+        ) {
+            debug!("Failed to cache MCP registration for '{server_name}': {e}");
+        }
         (client_id, redirect_uri)
     };
 
@@ -168,12 +202,113 @@ pub async fn run_mcp_oauth_flow(
     run_oauth_flow(&provider, &mcp_token_key(server_name)).await
 }
 
-pub fn load_valid_mcp_token(server_name: &str) -> Option<String> {
-    let tokens = load_oauth_tokens(&mcp_token_key(server_name))?;
+pub async fn load_or_refresh_mcp_token(server_name: &str) -> Option<String> {
+    let key = mcp_token_key(server_name);
+    let tokens = load_oauth_tokens(&key)?;
     if Utc::now().timestamp() < tokens.expires_at {
-        Some(tokens.access_token)
-    } else {
-        None
+        return Some(tokens.access_token);
+    }
+
+    if in_refresh_failure_backoff(server_name) {
+        debug!("Skipping token refresh for MCP server '{server_name}': recent attempt failed");
+        return None;
+    }
+
+    let lock = refresh_lock(server_name);
+    let _guard = lock.lock().await;
+
+    // A concurrent caller may have refreshed while we waited for the lock.
+    let tokens = load_oauth_tokens(&key)?;
+    if Utc::now().timestamp() < tokens.expires_at {
+        return Some(tokens.access_token);
+    }
+
+    if in_refresh_failure_backoff(server_name) {
+        debug!("Skipping token refresh for MCP server '{server_name}': recent attempt failed");
+        return None;
+    }
+
+    match refresh_mcp_token(server_name, &key, &tokens).await {
+        Ok(access_token) => Some(access_token),
+        Err(e) => {
+            note_refresh_failure(server_name);
+            warn!(
+                "Failed to refresh OAuth token for MCP server '{server_name}'. \
+                 Run `.mcp auth {server_name}` to re-authenticate."
+            );
+            debug!(
+                "Token refresh error for MCP server '{server_name}': {}",
+                redact_refresh_error(&e)
+            );
+            None
+        }
+    }
+}
+
+async fn refresh_mcp_token(server_name: &str, key: &str, tokens: &OAuthTokens) -> Result<String> {
+    if tokens.refresh_token.is_none() {
+        return Err(anyhow!("no refresh token stored"));
+    }
+
+    let reg =
+        load_registration(server_name).ok_or_else(|| anyhow!("no cached client registration"))?;
+    let token_url = reg.token_url.ok_or_else(|| {
+        anyhow!("cached registration has no token URL (saved by an older version)")
+    })?;
+    let resource = reg.resource.ok_or_else(|| {
+        anyhow!("cached registration has no resource (saved by an older version)")
+    })?;
+
+    let provider = McpOAuthProvider {
+        client_id: reg.client_id,
+        authorize_url: String::new(),
+        token_url,
+        scopes: String::new(),
+        fixed_redirect: String::new(),
+        resource,
+    };
+
+    let client = Client::builder().timeout(REFRESH_HTTP_TIMEOUT).build()?;
+    let refreshed = refresh_oauth_token(&client, &provider, key, tokens).await?;
+    Ok(refreshed.access_token)
+}
+
+fn refresh_lock(server_name: &str) -> Arc<sync::Mutex<()>> {
+    static LOCKS: OnceLock<parking_lot::Mutex<HashMap<String, Arc<sync::Mutex<()>>>>> =
+        OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .entry(server_name.to_string())
+        .or_default()
+        .clone()
+}
+
+fn refresh_failures() -> &'static parking_lot::Mutex<HashMap<String, Instant>> {
+    static FAILURES: OnceLock<parking_lot::Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
+fn note_refresh_failure(server_name: &str) {
+    refresh_failures()
+        .lock()
+        .insert(server_name.to_string(), Instant::now());
+}
+
+fn in_refresh_failure_backoff(server_name: &str) -> bool {
+    refresh_failures()
+        .lock()
+        .get(server_name)
+        .is_some_and(|failed_at| failed_at.elapsed() < REFRESH_FAILURE_BACKOFF)
+}
+
+/// Refresh errors may embed the token endpoint's JSON response, which can
+/// contain live tokens; strip everything from the first `{` before logging.
+fn redact_refresh_error(e: &anyhow::Error) -> String {
+    let msg = e.to_string();
+    match msg.find('{') {
+        Some(idx) => format!("{}<response body redacted>", &msg[..idx]),
+        None => msg,
     }
 }
 
@@ -187,7 +322,13 @@ fn load_registration(server_name: &str) -> Option<McpRegistration> {
     serde_json::from_str(&content).ok()
 }
 
-fn save_registration(server_name: &str, client_id: &str, redirect_uri: &str) -> Result<()> {
+fn save_registration(
+    server_name: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    token_url: &str,
+    resource: &str,
+) -> Result<()> {
     let dir = paths::oauth_tokens_dir();
     fs::create_dir_all(&dir)?;
 
@@ -195,6 +336,8 @@ fn save_registration(server_name: &str, client_id: &str, redirect_uri: &str) -> 
     let reg = McpRegistration {
         client_id: client_id.to_string(),
         redirect_uri: Some(redirect_uri.to_string()),
+        token_url: Some(token_url.to_string()),
+        resource: Some(resource.to_string()),
     };
 
     fs::write(path, serde_json::to_string_pretty(&reg)?)?;
@@ -244,7 +387,12 @@ async fn register_client(endpoint: &str, redirect_uri: &str) -> Result<String> {
 
     response["client_id"]
         .as_str()
-        .ok_or_else(|| anyhow!("Missing client_id in registration response: {response}"))
+        .ok_or_else(|| {
+            anyhow!(
+                "Missing client_id in registration response (keys: {})",
+                token_response_keys(&response)
+            )
+        })
         .map(|s| s.to_string())
 }
 
@@ -426,11 +574,31 @@ mod tests {
     use crate::utils::get_env_name;
     use serial_test::serial;
     use std::{
-        env, fs,
+        env,
+        ffi::OsString,
+        fs,
+        path::PathBuf,
         time::{self, SystemTime},
     };
 
     fn with_temp_cache<F: FnOnce()>(f: F) {
+        struct Restore {
+            key: String,
+            prev: Option<OsString>,
+            root: PathBuf,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.prev.take() {
+                        Some(v) => env::set_var(&self.key, v),
+                        None => env::remove_var(&self.key),
+                    }
+                }
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
         let unique = SystemTime::now()
             .duration_since(time::UNIX_EPOCH)
             .unwrap()
@@ -442,14 +610,12 @@ mod tests {
         unsafe {
             env::set_var(&env_key, &root);
         }
+        let _restore = Restore {
+            key: env_key,
+            prev,
+            root,
+        };
         f();
-        unsafe {
-            match prev {
-                Some(v) => env::set_var(&env_key, v),
-                None => env::remove_var(&env_key),
-            }
-        }
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -685,12 +851,19 @@ mod tests {
                 "notion",
                 "client-xyz-123",
                 "http://127.0.0.1:49152/callback",
+                "https://as.example/token",
+                "https://mcp.example/mcp",
             )
             .unwrap();
 
-            let loaded = load_registration("notion");
+            let loaded = load_registration("notion").unwrap();
 
-            assert_eq!(loaded.unwrap().client_id, "client-xyz-123");
+            assert_eq!(loaded.client_id, "client-xyz-123");
+            assert_eq!(
+                loaded.token_url.as_deref(),
+                Some("https://as.example/token")
+            );
+            assert_eq!(loaded.resource.as_deref(), Some("https://mcp.example/mcp"));
         });
     }
 
@@ -708,8 +881,22 @@ mod tests {
     #[serial]
     fn registration_second_save_overwrites_first() {
         with_temp_cache(|| {
-            save_registration("github", "first-id", "http://127.0.0.1:49152/callback").unwrap();
-            save_registration("github", "second-id", "http://127.0.0.1:49153/callback").unwrap();
+            save_registration(
+                "github",
+                "first-id",
+                "http://127.0.0.1:49152/callback",
+                "https://as.example/token",
+                "https://mcp.example/mcp",
+            )
+            .unwrap();
+            save_registration(
+                "github",
+                "second-id",
+                "http://127.0.0.1:49153/callback",
+                "https://as.example/token",
+                "https://mcp.example/mcp",
+            )
+            .unwrap();
 
             let loaded = load_registration("github").unwrap();
 
@@ -737,6 +924,8 @@ mod tests {
 
             assert_eq!(loaded.client_id, "legacy-id");
             assert_eq!(loaded.redirect_uri, None);
+            assert_eq!(loaded.token_url, None);
+            assert_eq!(loaded.resource, None);
         });
     }
 
@@ -744,7 +933,14 @@ mod tests {
     #[serial]
     fn save_registration_persists_redirect_uri() {
         with_temp_cache(|| {
-            save_registration("aws", "client-abc", "http://127.0.0.1:49152/callback").unwrap();
+            save_registration(
+                "aws",
+                "client-abc",
+                "http://127.0.0.1:49152/callback",
+                "https://as.example/token",
+                "https://mcp.example/mcp",
+            )
+            .unwrap();
 
             let loaded = load_registration("aws").unwrap();
 
@@ -754,6 +950,82 @@ mod tests {
                 Some("http://127.0.0.1:49152/callback")
             );
         });
+    }
+
+    #[test]
+    fn mcp_registration_deserializes_without_new_fields_and_roundtrips() {
+        let old: McpRegistration = serde_json::from_str(r#"{"client_id":"legacy-id"}"#).unwrap();
+
+        assert_eq!(old.client_id, "legacy-id");
+        assert_eq!(old.token_url, None);
+        assert_eq!(old.resource, None);
+
+        let full = McpRegistration {
+            client_id: "client-abc".into(),
+            redirect_uri: Some("http://127.0.0.1:49152/callback".into()),
+            token_url: Some("https://as.example/token".into()),
+            resource: Some("https://mcp.example/mcp".into()),
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        let back: McpRegistration = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.token_url.as_deref(), Some("https://as.example/token"));
+        assert_eq!(back.resource.as_deref(), Some("https://mcp.example/mcp"));
+    }
+
+    #[test]
+    #[serial]
+    fn expired_token_with_old_format_registration_returns_none() {
+        with_temp_cache(|| {
+            let dir = paths::oauth_tokens_dir();
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                paths::token_file("mcp_legacyref"),
+                r#"{"access_token":"stale","refresh_token":"refresh-abc","expires_at":0}"#,
+            )
+            .unwrap();
+            fs::write(
+                dir.join("mcp_legacyref_registration.json"),
+                r#"{"client_id":"legacy-id"}"#,
+            )
+            .unwrap();
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let token = rt.block_on(load_or_refresh_mcp_token("legacyref"));
+
+            assert_eq!(token, None);
+        });
+    }
+
+    #[test]
+    fn refresh_failure_backoff_memoizes_per_server() {
+        assert!(!in_refresh_failure_backoff("backoff-test-server"));
+
+        note_refresh_failure("backoff-test-server");
+
+        assert!(in_refresh_failure_backoff("backoff-test-server"));
+        assert!(!in_refresh_failure_backoff("backoff-other-server"));
+    }
+
+    #[test]
+    fn redact_refresh_error_strips_response_body() {
+        let with_body = anyhow!(
+            "Missing access_token in refresh response: {}",
+            r#"{"access_token":"live-secret"}"#
+        );
+        let without_body = anyhow!("no refresh token stored");
+
+        assert_eq!(
+            redact_refresh_error(&with_body),
+            "Missing access_token in refresh response: <response body redacted>"
+        );
+        assert_eq!(
+            redact_refresh_error(&without_body),
+            "no refresh token stored"
+        );
     }
 
     #[test]
