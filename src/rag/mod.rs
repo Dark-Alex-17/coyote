@@ -320,7 +320,8 @@ impl Rag {
     pub fn load(app: &AppConfig, name: &str, path: &Path) -> Result<Self> {
         let err = || format!("Failed to load rag '{name}' at '{}'", path.display());
         let content = fs::read_to_string(path).with_context(err)?;
-        let data: RagData = serde_yaml::from_str(&content).with_context(err)?;
+        let mut data: RagData = serde_yaml::from_str(&content).with_context(err)?;
+        data.normalize();
         data.validate().with_context(err)?;
         Self::create(app, name, path, data)
     }
@@ -340,7 +341,8 @@ impl Rag {
         // `{{...}}` placeholders in `self.data`. Resolution happens below, into a
         // function-local copy only — see `resolve_driver_config` for why the
         // resolved values must never travel back into `data`.
-        let data: RagData = serde_yaml::from_str(&raw_content).with_context(err)?;
+        let mut data: RagData = serde_yaml::from_str(&raw_content).with_context(err)?;
+        data.normalize();
 
         data.validate().with_context(err)?;
 
@@ -1593,6 +1595,21 @@ impl RagData {
 
     fn default_driver() -> String {
         "yaml".to_string()
+    }
+
+    /// Repairs a `next_file_id` that deserialization could not recover.
+    ///
+    /// The field is `#[serde(default)]`, so a YAML written before it existed — or one
+    /// hand-edited without it — loads as 0 while `files` stays populated. The next sync
+    /// would then mint `FileId`s that collide with the indexed ones, overwriting
+    /// unrelated documents. Must run before any sync, hence the call from both load
+    /// paths; it cannot live in `validate`, which only takes `&self`.
+    fn normalize(&mut self) {
+        if self.next_file_id == 0
+            && let Some(max_file_id) = self.files.keys().max()
+        {
+            self.next_file_id = max_file_id + 1;
+        }
     }
 
     /// Citation label for an attached RAG. Its documents live in a remote
@@ -3508,5 +3525,85 @@ top_k: 5
         );
         let err = data.validate().unwrap_err().to_string();
         assert!(err.contains("chunk_overlap"), "got: {err}");
+    }
+
+    #[test]
+    fn ragdata_normalize_repairs_a_next_file_id_lost_by_deserialization() {
+        let mut data = RagData::new(
+            "m".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+        for file_id in [0, 1, 4] {
+            data.files.insert(
+                file_id,
+                RagFile {
+                    hash: "abc".into(),
+                    path: format!("{file_id}.txt"),
+                    documents: vec![RagDocument::new("body")],
+                },
+            );
+        }
+
+        data.normalize();
+
+        assert_eq!(
+            data.next_file_id, 5,
+            "a zero next_file_id with indexed files must be repaired past the \
+             highest FileId so the next sync cannot overwrite them"
+        );
+    }
+
+    #[test]
+    fn ragdata_normalize_leaves_a_correct_next_file_id_untouched() {
+        let mut data = RagData::new(
+            "m".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+        data.files.insert(
+            0,
+            RagFile {
+                hash: "abc".into(),
+                path: "0.txt".into(),
+                documents: vec![RagDocument::new("body")],
+            },
+        );
+        data.next_file_id = 1;
+
+        data.normalize();
+
+        assert_eq!(
+            data.next_file_id, 1,
+            "a next_file_id that deserialized intact must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn ragdata_normalize_keeps_next_file_id_zero_without_files() {
+        let mut data = RagData::new(
+            "m".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+
+        data.normalize();
+
+        assert_eq!(
+            data.next_file_id, 0,
+            "an empty index has no FileId to collide with, so 0 is already correct"
+        );
     }
 }
