@@ -404,14 +404,15 @@ impl Rag {
                     .clone();
                 let api_key = driver_config.get("api_key").map(String::as_str);
 
-                let provider = QdrantProvider::new(&host, &collection, api_key).await?;
                 // An attached collection is not ours: the remote is the only source
                 // of truth for its text, and `data.files` is empty for it anyway.
                 // Skipped explicitly so the intent stays legible.
                 let provider = if data.attached {
-                    provider
+                    QdrantProvider::new_attached(&host, &collection, api_key).await?
                 } else {
-                    provider.with_local_content(&data)
+                    QdrantProvider::new_owned(&host, &collection, api_key)
+                        .await?
+                        .with_local_content(&data)
                 };
                 let embedding_model =
                     Model::retrieve_model(app, &data.embedding_model, ModelType::Embedding)?;
@@ -561,7 +562,7 @@ impl Rag {
 
         let embedding_model =
             Model::retrieve_model(app, &data.embedding_model, ModelType::Embedding)?;
-        let provider = QdrantProvider::new(&host, &collection, api_key).await?;
+        let provider = QdrantProvider::new_attached(&host, &collection, api_key).await?;
         let rag = Rag {
             app_config: Arc::new(app.clone()),
             name: name.to_string(),
@@ -726,7 +727,7 @@ impl Rag {
         let embedding_model =
             Model::retrieve_model(app, &data.embedding_model, ModelType::Embedding)?;
         let provider =
-            QdrantProvider::new(&setup.host, &setup.collection, setup.api_key.as_deref())
+            QdrantProvider::new_owned(&setup.host, &setup.collection, setup.api_key.as_deref())
                 .await?
                 // Empty for this whole session — `data` has no files yet — and kept
                 // for shape only. The map becomes current at the first rebuild.

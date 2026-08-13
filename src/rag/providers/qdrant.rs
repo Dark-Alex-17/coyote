@@ -3,7 +3,7 @@ use crate::rag::{DocumentId, FileId, RagData};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use log::warn;
+use log::{debug, warn};
 use parking_lot::RwLock;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, Method, Response, StatusCode};
@@ -171,6 +171,18 @@ fn is_multi_vector_config(body: &Value) -> bool {
     body["result"]["config"]["params"]["vectors"]["size"]
         .as_u64()
         .is_none()
+}
+
+/// The `exists` flag out of a `GET /collections/{c}/exists` body.
+///
+/// Anything that is not a JSON bool at `result.exists` is an error rather than a
+/// `false`. `new_owned` treats a successful probe as proof the host really is a
+/// Qdrant, so a proxy that answers 200 with something else must not read as
+/// "the collection is absent" and leave a provider pointed at nothing.
+fn collection_exists_from_body(body: &Value) -> Result<bool> {
+    body["result"]["exists"]
+        .as_bool()
+        .context("Unexpected collection-exists response shape")
 }
 
 /// The decision layer for a Coyote-owned collection: which files to write back,
@@ -992,6 +1004,11 @@ pub struct QdrantProvider {
     /// hit here is served without a request, which also covers chunks that have
     /// no vector and hence no remote point at all.
     local_content: HashMap<DocumentId, String>,
+    /// Whether the collection belongs to something else. Fixed by which
+    /// constructor ran and never mutated afterwards; it decides whether a read
+    /// path that finds the collection gone may offer to rebuild it, which is
+    /// only true for a collection Coyote wrote.
+    attached: bool,
 }
 
 impl QdrantProvider {
@@ -1063,7 +1080,45 @@ impl QdrantProvider {
         Ok(resp.json().await?)
     }
 
-    pub async fn new(host: &str, collection: &str, api_key: Option<&str>) -> Result<Self> {
+    /// Builds a provider for a Coyote-owned collection, which is allowed not to
+    /// exist yet.
+    ///
+    /// Existence is `rebuild_indexes`' business, not the constructor's. Several
+    /// guards tell the user to delete the collection in Qdrant and rebuild from
+    /// the local copy; a constructor that refused an absent collection turned
+    /// that advice into a dead end, because the RAG has to load before
+    /// `.rebuild rag` can run at all. The only way out was then a full paid
+    /// re-embed.
+    ///
+    /// The probe is `/collections/{c}/exists` and its answer is deliberately
+    /// discarded — what is wanted from it is that it answered at all. It splits
+    /// "the server is fine, the collection is gone" (HTTP 200 with
+    /// `exists: false`) from everything that must still fail here: an
+    /// unreachable host or DNS failure, a rejected api key, a 5xx, and a
+    /// mistyped base url behind a proxy that answers every path, which this
+    /// endpoint catches because only a Qdrant returns the shape it expects.
+    /// Treating a 404 on the plain collection fetch as "absent" would have
+    /// tolerated that last case and built a provider aimed at nothing.
+    pub async fn new_owned(host: &str, collection: &str, api_key: Option<&str>) -> Result<Self> {
+        let base_url = Self::normalize_base_url(host);
+        let client = Self::make_client(&base_url, api_key)?;
+        if !Self::collection_exists(&client, &base_url, collection).await? {
+            debug!(
+                "Qdrant collection '{collection}' does not exist on {base_url}; the next full \
+                 rebuild recreates it and repopulates it from the local copy."
+            );
+        }
+
+        Ok(Self::build(client, base_url, collection, false))
+    }
+
+    /// Builds a provider for a collection Coyote does not own, which must
+    /// already exist.
+    ///
+    /// An absent one here is a genuine misconfiguration — a typo, or a
+    /// collection somebody else deleted — and there is nothing Coyote could
+    /// recreate from, so it fails at construction.
+    pub async fn new_attached(host: &str, collection: &str, api_key: Option<&str>) -> Result<Self> {
         let base_url = Self::normalize_base_url(host);
         let client = Self::make_client(&base_url, api_key)?;
         let resp = client
@@ -1078,13 +1133,18 @@ impl QdrantProvider {
             );
         }
 
-        Ok(Self {
+        Ok(Self::build(client, base_url, collection, true))
+    }
+
+    fn build(client: Client, base_url: String, collection: &str, attached: bool) -> Self {
+        Self {
             client,
             base_url,
             collection: collection.to_string(),
             point_ids: Arc::default(),
             local_content: HashMap::new(),
-        })
+            attached,
+        }
     }
 
     /// Caches every chunk's text so `fetch_content` can answer without a request.
@@ -1177,11 +1237,9 @@ impl QdrantProvider {
 
     /// `GET /collections/{c}/exists`.
     ///
-    /// This and `create_collection` take a client instead of `&self` because a
-    /// collection has to exist before a provider can be built — `new` fetches the
-    /// collection and fails when it is absent, so the creation wizard that will
-    /// call them has no provider to call them on. The client comes from
-    /// `make_client` and already carries the api key.
+    /// This and `create_collection` take a client instead of `&self` because the
+    /// creation wizard calls them before there is any provider to call them on.
+    /// The client comes from `make_client` and already carries the api key.
     pub(crate) async fn collection_exists(
         client: &Client,
         base_url: &str,
@@ -1202,9 +1260,8 @@ impl QdrantProvider {
         let body: Value = resp.json().await.with_context(|| {
             format!("Unreadable collection-exists response for '{collection}' on {base_url}")
         })?;
-        body["result"]["exists"]
-            .as_bool()
-            .context("Unexpected collection-exists response shape")
+
+        collection_exists_from_body(&body)
     }
 
     /// Creates the collection, then the `file_id` payload index the schema
@@ -1239,10 +1296,10 @@ impl QdrantProvider {
             );
         }
 
-        Self::create_file_id_index(client, base_url, collection).await
+        Self::ensure_file_id_index(client, base_url, collection).await
     }
 
-    /// Creates the `file_id` payload index, typed `integer`.
+    /// Asserts the `file_id` payload index, typed `integer`.
     ///
     /// Not for queries: nothing in this file sends a `filter` — `vector_search`
     /// posts only `vector`, `limit` and `with_payload`, and deletes go by
@@ -1251,9 +1308,18 @@ impl QdrantProvider {
     /// with `as_u64()`, which answers `None` for a JSON string and trips the
     /// mandatory-field bail in the reconcile.
     ///
+    /// Safe to repeat, which is why every full rebuild re-asserts it rather than
+    /// leaving it to collection creation alone: a create that failed between the
+    /// collection and its index would otherwise leave the field untyped forever,
+    /// with no path back. Observed against Qdrant 1.19.0, re-asserting an
+    /// identical index answers HTTP 200 `status: "completed"` in tens of
+    /// milliseconds, and asserting `integer` over an existing `keyword` index
+    /// also answers 200 and replaces it, leaving `payload_schema.file_id` typed
+    /// `integer`.
+    ///
     /// `wait=true` because index creation is a write like any other, and the
     /// index has to exist before the first point lands.
-    async fn create_file_id_index(client: &Client, base_url: &str, collection: &str) -> Result<()> {
+    async fn ensure_file_id_index(client: &Client, base_url: &str, collection: &str) -> Result<()> {
         let body = serde_json::json!({ "field_name": "file_id", "field_schema": "integer" });
         let resp = client
             .put(format!(
@@ -1279,9 +1345,8 @@ impl QdrantProvider {
     /// Creates the collection a new Coyote-owned RAG will write to, or adopts an
     /// existing empty one.
     ///
-    /// Static, and not a method, because a provider cannot exist yet: `new`
-    /// fetches the collection and fails when it is absent. The creation wizard
-    /// calls this before it builds one.
+    /// Static, and not a method, because the creation wizard calls this before
+    /// it builds a provider.
     ///
     /// The collection is created eagerly, at wizard time, rather than on the
     /// first sync: a wrong host, an unusable name or a dimension clash has to
@@ -1497,12 +1562,22 @@ impl RagProvider for QdrantProvider {
             "with_payload": false,
         });
         let resp = self.client.post(&url).json(&body).send().await?;
-        if !resp.status().is_success() {
-            bail!(
-                "Qdrant search on '{}' failed: {}",
-                self.collection,
-                Self::error_message(resp).await
-            );
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = Self::error_message(resp).await;
+            // An owned collection that has gone missing is recoverable from the
+            // local copy at no embedding cost, so say which command does it
+            // rather than surfacing a bare 404. An attached one is somebody
+            // else's to restore.
+            if status == StatusCode::NOT_FOUND && !self.attached {
+                bail!(
+                    "Collection '{}' does not exist on {}. Run `.rebuild rag` to recreate it and \
+                     repopulate it from the local copy — no re-embedding is needed. ({detail})",
+                    self.collection,
+                    self.base_url
+                );
+            }
+            bail!("Qdrant search on '{}' failed: {detail}", self.collection);
         }
         let data: Value = resp.json().await?;
         // The interner is what lets a UUID-keyed collection work: a string id gets
@@ -1687,6 +1762,16 @@ impl RagProvider for QdrantProvider {
             warn!("{warning}");
         }
 
+        // The one place a pre-existing collection's payload index gets repaired.
+        // It sits below the reconcile because that is where the ownership guard
+        // is decided, and an index is a write: asserting it any earlier would
+        // stamp a schema onto a foreign collection before Coyote had established
+        // it may touch it at all. The create arm already asserted it, so this
+        // only covers collections that were found rather than made.
+        if full_rebuild && !creating_collection {
+            Self::ensure_file_id_index(&self.client, &self.base_url, &self.collection).await?;
+        }
+
         // Upserts first, deletes last. Both orders converge after a crash, so
         // this is about the window in between: upsert-first leaves stale
         // duplicates, delete-first leaves documents missing, and for a retrieval
@@ -1758,12 +1843,17 @@ impl RagProvider for QdrantProvider {
         // mutates and rebuilds, so a carried map would outlive the corpus it
         // described and be served as if current. Attached data holds no files,
         // which makes this an empty map and leaves the clone on the remote path.
+        //
+        // `attached` comes from `data` for the same reason: the clone describes
+        // the corpus it was handed, and that is what decides whether a missing
+        // collection is Coyote's to rebuild.
         Box::new(Self {
             client: self.client.clone(),
             base_url: self.base_url.clone(),
             collection: self.collection.clone(),
             point_ids: Arc::clone(&self.point_ids),
             local_content: build_local_content(data),
+            attached: data.attached,
         })
     }
 }
@@ -1775,6 +1865,8 @@ mod tests {
     use crate::rag::FileId;
     use crate::rag::{RagDocument, RagFile};
     use std::collections::{BTreeMap, BTreeSet};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn error_message_reads_the_object_status_envelope() {
@@ -1858,6 +1950,238 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collection_exists_reads_only_a_real_bool() {
+        assert!(
+            !collection_exists_from_body(&serde_json::json!({"result": {"exists": false}}))
+                .unwrap()
+        );
+        assert!(
+            collection_exists_from_body(&serde_json::json!({"result": {"exists": true}})).unwrap()
+        );
+
+        // Everything below is a 200 that is not a Qdrant answering. Reading any
+        // of them as `false` would let `new_owned` build a provider aimed at a
+        // host that never had the collection, and the failure would only surface
+        // at the first rebuild.
+        collection_exists_from_body(&serde_json::json!({}))
+            .expect_err("an empty body has no `exists` to read");
+        collection_exists_from_body(&Value::from("<html><body>hi</body></html>"))
+            .expect_err("a catch-all proxy's HTML page is not an exists probe");
+        collection_exists_from_body(&serde_json::json!({"result": {"exists": "no"}}))
+            .expect_err("a string is not a bool, however much it reads like one");
+    }
+
+    /// A server on an ephemeral port that answers every request with the same
+    /// status and body, and records each request line it was asked for.
+    ///
+    /// The request head is read to its blank line before the reply is written:
+    /// a server that answers and closes without draining leaves the client
+    /// seeing a connection reset instead of the status code under test, which
+    /// would make every assertion below pass for the wrong reason.
+    fn canned_server(status: &str, body: &str) -> (String, Arc<RwLock<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(RwLock::new(Vec::new()));
+
+        let seen = Arc::clone(&requests);
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Ok(peer) = stream.try_clone() else {
+                    continue;
+                };
+                let mut reader = BufReader::new(peer);
+
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                seen.write().push(line.trim_end().to_string());
+                // Drain the headers. `<= 2` catches both the blank CRLF that
+                // ends the head and an EOF part-way through it.
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) <= 2 {
+                        break;
+                    }
+                }
+
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        (base_url, requests)
+    }
+
+    /// A server on an ephemeral port that picks its reply per request. Routes are
+    /// matched in order as substrings of the request line and the first hit wins,
+    /// so callers list the specific paths before the prefixes they share. Every
+    /// request line is recorded in the order it arrived.
+    ///
+    /// Two things it does that `canned_server` does not, both needed once the
+    /// requests carry bodies. The body is drained as well as the head: closing a
+    /// socket with an unread request body still queued on it sends an RST, which
+    /// destroys the response the client has not finished reading. And the reply
+    /// closes the connection, so a rebuild's run of requests cannot pick up a
+    /// pooled socket this fixture has already dropped.
+    ///
+    /// An unmatched request is answered with a 500 so a missing route surfaces as
+    /// a rebuild that failed at a named step rather than as a parse error.
+    fn scripted_server(routes: Vec<(&'static str, String)>) -> (String, Arc<RwLock<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(RwLock::new(Vec::new()));
+
+        let seen = Arc::clone(&requests);
+        let respond = |status: &str, body: &str| {
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let responses: Vec<(&'static str, String)> = routes
+            .into_iter()
+            .map(|(needle, body)| (needle, respond("200 OK", &body)))
+            .collect();
+        let unmatched = respond(
+            "500 Internal Server Error",
+            r#"{"status":{"error":"no route"}}"#,
+        );
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Ok(peer) = stream.try_clone() else {
+                    continue;
+                };
+                let mut reader = BufReader::new(peer);
+
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let request_line = line.trim_end().to_string();
+                seen.write().push(request_line.clone());
+
+                // Drain the headers, keeping the body length on the way past.
+                // `<= 2` catches both the blank CRLF that ends the head and an
+                // EOF part-way through it.
+                let mut body_len = 0usize;
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) <= 2 {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        body_len = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; body_len];
+                let _ = reader.read_exact(&mut body);
+
+                let response = responses
+                    .iter()
+                    .find(|(needle, _)| request_line.contains(needle))
+                    .map_or(&unmatched, |(_, response)| response);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        (base_url, requests)
+    }
+
+    #[tokio::test]
+    async fn new_owned_accepts_an_absent_collection_and_probes_the_exists_endpoint() {
+        let (host, requests) = canned_server("200 OK", r#"{"result":{"exists":false}}"#);
+
+        QdrantProvider::new_owned(&host, "docs", None)
+            .await
+            .expect("an absent collection is the cold-start case the next full rebuild fixes");
+
+        let seen = requests.read();
+        assert!(
+            seen.iter()
+                .any(|line| line.contains("/collections/docs/exists")),
+            "the probe has to be the exists endpoint — a plain collection fetch cannot tell \
+             an absent collection from an unreachable host: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_attached_refuses_a_collection_that_is_not_there() {
+        let (host, _requests) = canned_server("404 Not Found", r#"{"status":{"error":"gone"}}"#);
+
+        let Err(err) = QdrantProvider::new_attached(&host, "docs", None).await else {
+            panic!("Coyote owns no copy of an attached collection and cannot recreate it");
+        };
+
+        assert!(err.to_string().contains("not accessible"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn both_constructors_fail_fast_on_a_rejected_api_key() {
+        // The 403 that a wrong key produces must never be read as "absent" by
+        // the owned arm: that would defer a credentials problem to the first
+        // rebuild, which then recreates the collection instead of reporting it.
+        let (host, _requests) = canned_server("403 Forbidden", r#"{"status":{"error":"denied"}}"#);
+
+        assert!(
+            QdrantProvider::new_owned(&host, "docs", Some("wrong"))
+                .await
+                .is_err(),
+            "a rejected key is not an absent collection"
+        );
+        assert!(
+            QdrantProvider::new_attached(&host, "docs", Some("wrong"))
+                .await
+                .is_err(),
+            "a rejected key is not an accessible collection"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_owned_rejects_a_200_that_is_not_a_qdrant() {
+        // A mistyped base url behind a proxy that answers every path with its
+        // own page. The status is fine; only the body gives it away.
+        let (host, _requests) = canned_server("200 OK", "<html><body>Not Qdrant</body></html>");
+
+        assert!(
+            QdrantProvider::new_owned(&host, "docs", None)
+                .await
+                .is_err(),
+            "a provider must not be built against a host that is not a Qdrant"
+        );
+    }
+
+    /// Both constructors have to fail when nothing is listening at all. This was
+    /// the original bug: an unreachable host read as "the collection is absent",
+    /// so setup succeeded and the RAG only broke later, at query time.
+    #[tokio::test]
+    async fn both_constructors_reject_an_unreachable_host() {
+        const CLOSED: &str = "http://127.0.0.1:1";
+
+        assert!(
+            QdrantProvider::new_owned(CLOSED, "docs", None)
+                .await
+                .is_err(),
+            "a connect failure is not an absent collection"
+        );
+        assert!(
+            QdrantProvider::new_attached(CLOSED, "docs", None)
+                .await
+                .is_err(),
+            "a connect failure is not an accessible collection"
+        );
+    }
+
     #[tokio::test]
     async fn rebuild_indexes_refuses_an_attached_rag_and_an_unmarked_owned_one() {
         let mut provider = QdrantProvider {
@@ -1868,6 +2192,7 @@ mod tests {
             collection: "c".to_string(),
             point_ids: Arc::default(),
             local_content: HashMap::new(),
+            attached: false,
         };
 
         let attached = RagData {
@@ -1904,6 +2229,7 @@ mod tests {
             collection: "c".to_string(),
             point_ids: Arc::default(),
             local_content: HashMap::new(),
+            attached: false,
         };
 
         assert!(provider.fetch_content(&[]).await.unwrap().is_empty());
@@ -2103,6 +2429,7 @@ mod tests {
             collection: "c".to_string(),
             point_ids: Arc::default(),
             local_content: HashMap::new(),
+            attached: false,
         };
         let uuid = Value::from("c0ffee00-4444-4000-8000-000000000007");
         let handle = provider.point_ids.write().document_id(&uuid).unwrap();
@@ -2173,6 +2500,7 @@ mod tests {
             collection: "c".to_string(),
             point_ids: Arc::default(),
             local_content,
+            attached: false,
         }
     }
 
@@ -3250,6 +3578,174 @@ mod tests {
             .expect_err("an unreadable point count is not an empty collection");
     }
 
+    /// The write path end to end, over a fixture that answers every endpoint a
+    /// rebuild touches, pinning the two orderings the sync depends on.
+    ///
+    /// Neither is visible from any one function, so swapping them still passes
+    /// every other test in this file; the damage only shows up later as
+    /// documents that quietly stop being findable.
+    #[tokio::test]
+    async fn a_rebuild_scans_before_it_writes_and_upserts_before_it_deletes() {
+        const COMPLETED: &str = r#"{"result":{"status":"completed"}}"#;
+
+        let point = |file_id: FileId, path: &str, hash: &str| {
+            serde_json::json!({
+                "id": wire_point_id(DocumentId::new(file_id, 0)),
+                "payload": {
+                    "file_id": file_id as u64,
+                    "file_hash": hash,
+                    "path": path,
+                    "coyote_rag_id": RAG_ID,
+                    // Left empty deliberately: a writer id from another install
+                    // only adds a warning, and a warning says nothing about
+                    // ordering.
+                    "writer_id": "",
+                    "embedding_model": MODEL,
+                },
+            })
+        };
+        let scroll = serde_json::json!({
+            "result": {
+                // The two files the corpus still holds, plus the point left
+                // behind by one it no longer does. Without something to retire
+                // the plan produces no delete at all and the second ordering
+                // below could not be observed.
+                "points": [
+                    point(0, "/tmp/a.md", "h0"),
+                    point(1, "/tmp/b.md", "h1"),
+                    point(7, "/tmp/retired.md", "h7"),
+                ],
+                "next_page_offset": null,
+            }
+        })
+        .to_string();
+
+        // Most specific first: scroll, upsert and delete all live under
+        // `/points`, and the exists probe shares `/collections/` with the plain
+        // collection read the preflight makes.
+        let (host, requests) = scripted_server(vec![
+            ("/points/scroll", scroll),
+            ("/points/delete", COMPLETED.to_string()),
+            ("/points?wait=true", COMPLETED.to_string()),
+            ("/index?wait=true", COMPLETED.to_string()),
+            ("/exists", r#"{"result":{"exists":true}}"#.to_string()),
+            (
+                "GET /collections/",
+                r#"{"result":{"config":{"params":{"vectors":{"size":2,"distance":"Cosine"}}}}}"#
+                    .to_string(),
+            ),
+        ]);
+
+        let mut data = owned_rag_data();
+        data.driver_config
+            .insert("coyote_rag_id".to_string(), RAG_ID.to_string());
+        let mut provider = QdrantProvider {
+            client: Client::new(),
+            base_url: host,
+            collection: "c".to_string(),
+            point_ids: Arc::default(),
+            local_content: HashMap::new(),
+            attached: false,
+        };
+
+        provider.rebuild_indexes(&data, true).await.unwrap();
+
+        let seen = requests.read().clone();
+        let position = |needle: &str| seen.iter().position(|line| line.contains(needle));
+        // Every one of these is an `expect`, so a refactor that stops writing
+        // cannot turn this into a test that passes over an empty request log.
+        let scroll = position("/points/scroll")
+            .expect("the plan is built from a scan, so the scan has to happen");
+        let upsert = position("/points?wait=true")
+            .expect("a full rebuild of a corpus with vectors has to write points");
+        let delete = position("/points/delete")
+            .expect("the point left behind by a retired file has to be deleted");
+
+        assert!(
+            scroll < upsert.min(delete),
+            "the scan has to finish before anything is written, because Qdrant's scroll is a \
+             cursor and not a snapshot: a write interleaved with it can move a point past the \
+             cursor and out of the scan entirely. Requests were: {seen:?}"
+        );
+        assert!(
+            upsert < delete,
+            "upsert-first leaves stale duplicates, delete-first leaves documents missing, and \
+             for a retrieval system stale-but-present beats silently absent. Requests were: \
+             {seen:?}"
+        );
+    }
+
+    /// An incremental sync has no mandate to recreate a collection, so when it
+    /// finds one gone it has to name the command that does. A bare error here
+    /// reads as a broken RAG rather than as a one-command recovery that costs no
+    /// re-embedding.
+    #[tokio::test]
+    async fn an_incremental_sync_against_a_missing_collection_points_at_rebuild_rag() {
+        // The exists probe is the only request made before the bail, so a single
+        // canned answer covers the whole run.
+        let (host, _) = canned_server("200 OK", r#"{"result":{"exists":false}}"#);
+
+        let mut data = owned_rag_data();
+        data.driver_config
+            .insert("coyote_rag_id".to_string(), RAG_ID.to_string());
+        let mut provider = QdrantProvider {
+            client: Client::new(),
+            base_url: host,
+            collection: "c".to_string(),
+            point_ids: Arc::default(),
+            local_content: HashMap::new(),
+            attached: false,
+        };
+
+        let err = provider.rebuild_indexes(&data, false).await.expect_err(
+            "an incremental sync must not report success against a collection that is not there",
+        );
+
+        let report = format!("{err:#}");
+        assert!(report.contains(".rebuild rag"), "got: {report}");
+        assert!(
+            report.contains("'c'"),
+            "the message has to name the collection that went missing: {report}"
+        );
+    }
+
+    /// A 404 from search means two different things either side of ownership: a
+    /// collection Coyote wrote is recoverable from the local copy at no
+    /// embedding cost, and one it merely attached to is not Coyote's to
+    /// recreate — offering to would be a promise it cannot keep.
+    #[tokio::test]
+    async fn a_search_404_offers_rebuild_rag_only_for_a_collection_coyote_owns() {
+        let (host, _) = canned_server(
+            "404 Not Found",
+            r#"{"status":{"error":"Collection 'c' doesn't exist!"}}"#,
+        );
+        let provider = |attached: bool| QdrantProvider {
+            client: Client::new(),
+            base_url: host.clone(),
+            collection: "c".to_string(),
+            point_ids: Arc::default(),
+            local_content: HashMap::new(),
+            attached,
+        };
+
+        let owned = provider(false);
+        let err = owned
+            .vector_search(&[0.0, 1.0], 5, 0.0)
+            .await
+            .expect_err("a 404 is not an empty result set");
+        assert!(format!("{err:#}").contains(".rebuild rag"), "got: {err:#}");
+
+        let attached = provider(true);
+        let err = attached
+            .vector_search(&[0.0, 1.0], 5, 0.0)
+            .await
+            .expect_err("a 404 is not an empty result set");
+        assert!(
+            !format!("{err:#}").contains(".rebuild rag"),
+            "Coyote must not offer to rebuild a collection somebody else owns: {err:#}"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires a running Qdrant instance at localhost:6333"]
     async fn ensure_owned_collection_creates_then_adopts_requires_running_instance() {
@@ -3296,7 +3792,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let provider = QdrantProvider::new(HOST, COLLECTION, None).await.unwrap();
+        let provider = QdrantProvider::new_owned(HOST, COLLECTION, None)
+            .await
+            .unwrap();
         let ctx = base_ctx();
         let ids: Vec<u64> = (0..2)
             .map(|chunk| wire_point_id(DocumentId::new(1, chunk)))
@@ -3344,13 +3842,117 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn qdrant_vector_search_returns_results() {
-        let provider = QdrantProvider::new("http://localhost:6333", "test-collection", None)
-            .await
-            .unwrap();
+        // Read-only against a collection this test does not own, so it is built
+        // the way an attached RAG is: the collection must already be there, and
+        // its absence is a setup error rather than something to recreate.
+        let provider =
+            QdrantProvider::new_attached("http://localhost:6333", "test-collection", None)
+                .await
+                .unwrap();
         let embedding = vec![0.0f32; 1536];
 
         let results = provider.vector_search(&embedding, 5, 0.0).await.unwrap();
 
         assert!(results.len() <= 5);
+    }
+
+    /// The failure `new_owned` exists for, end to end: the collection is deleted
+    /// out from under a live RAG, and a cold start has to rebuild it from the
+    /// local copy alone.
+    ///
+    /// Construction against the absent collection is the step that used to fail,
+    /// which left `.rebuild rag` unreachable and a paid re-embed as the only way
+    /// back. Comparing the whole scrolled map rather than a count is what proves
+    /// the recovery is a real repopulation and not merely a collection of the
+    /// right size.
+    #[tokio::test]
+    #[ignore = "requires a running Qdrant instance at localhost:6333"]
+    async fn rebuild_recovers_a_deleted_collection_requires_running_instance() {
+        const HOST: &str = "http://localhost:6333";
+        const COLLECTION: &str = "coyote-cold-start-recovery";
+
+        let mut data = owned_rag_data();
+        data.driver_config
+            .insert("coyote_rag_id".to_string(), RAG_ID.to_string());
+
+        let mut provider = QdrantProvider::new_owned(HOST, COLLECTION, None)
+            .await
+            .unwrap();
+        provider.rebuild_indexes(&data, true).await.unwrap();
+        let before = provider.scroll_all().await.unwrap();
+        assert!(
+            !before.is_empty(),
+            "the baseline must actually hold points, or the comparison below is vacuous"
+        );
+
+        Client::new()
+            .delete(format!("{HOST}/collections/{COLLECTION}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let mut recovered = QdrantProvider::new_owned(HOST, COLLECTION, None)
+            .await
+            .expect("an absent collection must not stop a provider being built for it");
+        recovered.rebuild_indexes(&data, true).await.unwrap();
+
+        let after = recovered.scroll_all().await.unwrap();
+        assert_eq!(
+            after, before,
+            "the recreated collection must carry the same ids and the same payloads as the \
+             one that was deleted"
+        );
+
+        // A third rebuild, over a corpus that has changed, against a collection
+        // that is now there. This is the arm that retires one file and admits
+        // another in a single pass, and the only one that re-asserts the payload
+        // index on a collection Coyote found rather than made.
+        let survivor = wire_point_id(DocumentId::new(0, 0));
+        let arrival = wire_point_id(DocumentId::new(2, 0));
+        let survivor_payload = after
+            .get(&survivor)
+            .expect("the survivor has to be there before it can be shown to have stayed")
+            .clone();
+
+        data.files.swap_remove(&1);
+        data.vectors.swap_remove(&DocumentId::new(1, 0));
+        data.files.insert(
+            2,
+            RagFile {
+                hash: "h2".to_string(),
+                path: "/tmp/c.md".to_string(),
+                documents: vec![RagDocument {
+                    page_content: "gamma".to_string(),
+                    metadata: Default::default(),
+                }],
+            },
+        );
+        data.vectors.insert(DocumentId::new(2, 0), vec![0.0, 1.0]);
+
+        recovered.rebuild_indexes(&data, true).await.unwrap();
+        let changed = recovered.scroll_all().await.unwrap();
+
+        assert_eq!(
+            changed.keys().copied().collect::<BTreeSet<u64>>(),
+            BTreeSet::from([survivor, arrival]),
+            "a changed corpus must leave exactly the points it now describes: the retired \
+             file's point gone, the new file's written, and nothing else"
+        );
+        assert_eq!(
+            changed.get(&survivor),
+            Some(&survivor_payload),
+            "a file nobody touched must come through the pass unchanged — a delete-then-insert \
+             would leave a window in which a query cannot find it"
+        );
+
+        Client::new()
+            .delete(format!("{HOST}/collections/{COLLECTION}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
     }
 }
