@@ -993,6 +993,11 @@ impl Rag {
 
         let mut loaded_documents = vec![];
         let mut has_error = false;
+        // Paths whose load failed. `urls`/`local_paths` know the full path on the error
+        // branch; `recursive_urls`/`protocol_paths` expand inside the loader, so only the
+        // failing root is known and its pages are matched by prefix.
+        let mut failed_exact: IndexSet<String> = Default::default();
+        let mut failed_roots: Vec<String> = vec![];
         let mut index = 0;
         let total = recursive_urls.len() + urls.len() + protocol_paths.len() + local_paths.len();
         let handle_error = |error: anyhow::Error, has_error: &mut bool| {
@@ -1004,7 +1009,10 @@ impl Rag {
             println!("Load {start_url}** [{index}/{total}]");
             match load_recursive_url(&loaders, &start_url).await {
                 Ok(v) => loaded_documents.extend(v),
-                Err(err) => handle_error(err, &mut has_error),
+                Err(err) => {
+                    failed_roots.push(start_url.clone());
+                    handle_error(err, &mut has_error);
+                }
             }
         }
         for url in urls {
@@ -1012,7 +1020,10 @@ impl Rag {
             println!("Load {url} [{index}/{total}]");
             match load_url(&loaders, &url).await {
                 Ok(v) => loaded_documents.push(v),
-                Err(err) => handle_error(err, &mut has_error),
+                Err(err) => {
+                    failed_exact.insert(url.clone());
+                    handle_error(err, &mut has_error);
+                }
             }
         }
         for protocol_path in protocol_paths {
@@ -1020,7 +1031,10 @@ impl Rag {
             println!("Load {protocol_path} [{index}/{total}]");
             match load_protocol_path(&loaders, &protocol_path) {
                 Ok(v) => loaded_documents.extend(v),
-                Err(err) => handle_error(err, &mut has_error),
+                Err(err) => {
+                    failed_roots.push(protocol_path.clone());
+                    handle_error(err, &mut has_error);
+                }
             }
         }
         for local_path in local_paths {
@@ -1028,7 +1042,10 @@ impl Rag {
             println!("Load {local_path} [{index}/{total}]");
             match load_file(&loaders, &local_path).await {
                 Ok(v) => loaded_documents.push(v),
-                Err(err) => handle_error(err, &mut has_error),
+                Err(err) => {
+                    failed_exact.insert(local_path.clone());
+                    handle_error(err, &mut has_error);
+                }
             }
         }
 
@@ -1044,6 +1061,15 @@ impl Rag {
                 bail!("Aborted");
             }
         }
+
+        // Captured here because the loop below moves `loaded_documents`. Only needed when
+        // something failed, so the common path stays allocation-free.
+        let has_load_failure = !failed_exact.is_empty() || !failed_roots.is_empty();
+        let loaded_paths: IndexSet<String> = if has_load_failure {
+            loaded_documents.iter().map(|v| v.path.clone()).collect()
+        } else {
+            Default::default()
+        };
 
         let mut rag_files = vec![];
         for LoadedDocument {
@@ -1109,6 +1135,24 @@ impl Rag {
             embeddings = self
                 .create_embeddings(embeddings_data, spinner.clone())
                 .await?;
+        }
+
+        // Un-mark files whose path resolved but failed to load. Inherently a no-op outside
+        // refresh mode: there `to_deleted` only holds paths that vanished from the config,
+        // which never appear in the failed sets.
+        if has_load_failure {
+            to_deleted.retain(|_, file_ids| {
+                file_ids.retain(|file_id| match self.data.files.get(file_id) {
+                    Some(file) => !is_rescued_from_deletion(
+                        &file.path,
+                        &failed_exact,
+                        &failed_roots,
+                        &loaded_paths,
+                    ),
+                    None => true,
+                });
+                !file_ids.is_empty()
+            });
         }
 
         let to_delete_file_ids: Vec<_> = to_deleted.values().flatten().copied().collect();
@@ -2052,6 +2096,28 @@ fn progress(spinner: &Option<Spinner>, message: String) {
     if let Some(spinner) = spinner {
         let _ = spinner.set_message(message);
     }
+}
+
+/// Decide whether an indexed file marked for deletion must be kept because its path
+/// failed to load.
+///
+/// In refresh mode every indexed file starts out marked for deletion and is only
+/// un-marked by a successful load, so a path that resolved but whose load failed would be
+/// dropped from the index — yet a load failure is not evidence that the document is gone.
+/// Returns `true` when the path failed to load, either exactly or under a failed root,
+/// and no other root loaded that same path successfully. That last condition matters with
+/// overlapping roots: a path another root re-ingested has already been minted a fresh
+/// `FileId`, so keeping the old one would duplicate the document.
+fn is_rescued_from_deletion(
+    path: &str,
+    failed_exact: &IndexSet<String>,
+    failed_roots: &[String],
+    loaded_paths: &IndexSet<String>,
+) -> bool {
+    if loaded_paths.contains(path) {
+        return false;
+    }
+    failed_exact.contains(path) || failed_roots.iter().any(|root| path.starts_with(root))
 }
 
 /// Decide whether a just-loaded document may skip re-chunking and re-embedding.
@@ -3184,6 +3250,119 @@ mod tests {
         assert_eq!(
             find_hash_skip(true, &to_deleted, &files, "abc", "moved.txt"),
             None
+        );
+    }
+
+    fn rescue_args() -> (IndexSet<String>, Vec<String>, IndexSet<String>) {
+        let failed_exact: IndexSet<String> = ["https://example.com/a.html", "notes/todo.md"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let failed_roots = vec![
+            "https://docs.example.com/".to_string(),
+            "confluence://space/".to_string(),
+        ];
+        (failed_exact, failed_roots, Default::default())
+    }
+
+    #[test]
+    fn exact_url_failure_rescues_from_deletion() {
+        let (failed_exact, failed_roots, loaded_paths) = rescue_args();
+
+        assert!(
+            is_rescued_from_deletion(
+                "https://example.com/a.html",
+                &failed_exact,
+                &failed_roots,
+                &loaded_paths
+            ),
+            "a URL that failed to load must not be treated as deleted"
+        );
+    }
+
+    #[test]
+    fn exact_local_path_failure_rescues_from_deletion() {
+        let (failed_exact, failed_roots, loaded_paths) = rescue_args();
+
+        assert!(
+            is_rescued_from_deletion("notes/todo.md", &failed_exact, &failed_roots, &loaded_paths),
+            "local paths are glob-expanded before loading, so they match exactly"
+        );
+    }
+
+    #[test]
+    fn failed_recursive_url_root_rescues_pages_under_it() {
+        let (failed_exact, failed_roots, loaded_paths) = rescue_args();
+
+        assert!(
+            is_rescued_from_deletion(
+                "https://docs.example.com/guide/intro.html",
+                &failed_exact,
+                &failed_roots,
+                &loaded_paths
+            ),
+            "a recursive URL expands inside the loader, so only its root is known on failure"
+        );
+    }
+
+    #[test]
+    fn failed_protocol_path_root_rescues_documents_under_it() {
+        let (failed_exact, failed_roots, loaded_paths) = rescue_args();
+
+        assert!(
+            is_rescued_from_deletion(
+                "confluence://space/page-42",
+                &failed_exact,
+                &failed_roots,
+                &loaded_paths
+            ),
+            "a protocol path expands inside the loader, so only its root is known on failure"
+        );
+    }
+
+    #[test]
+    fn path_loaded_by_another_root_is_not_rescued() {
+        let (failed_exact, failed_roots, _) = rescue_args();
+        let loaded_paths: IndexSet<String> = ["https://docs.example.com/guide/intro.html"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        assert!(
+            !is_rescued_from_deletion(
+                "https://docs.example.com/guide/intro.html",
+                &failed_exact,
+                &failed_roots,
+                &loaded_paths
+            ),
+            "an overlapping root already re-ingested this path under a fresh FileId; \
+             keeping the old one would duplicate the document"
+        );
+    }
+
+    #[test]
+    fn unrelated_path_is_not_rescued() {
+        let (failed_exact, failed_roots, loaded_paths) = rescue_args();
+
+        assert!(
+            !is_rescued_from_deletion(
+                "https://other.example.com/page",
+                &failed_exact,
+                &failed_roots,
+                &loaded_paths
+            ),
+            "a path gone from the config must still be deleted"
+        );
+    }
+
+    #[test]
+    fn no_load_failures_rescue_nothing() {
+        let failed_exact = Default::default();
+        let loaded_paths = Default::default();
+
+        assert!(
+            !is_rescued_from_deletion("notes/todo.md", &failed_exact, &[], &loaded_paths),
+            "with nothing failing, deletion decisions are left untouched"
         );
     }
 
