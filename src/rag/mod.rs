@@ -3044,7 +3044,7 @@ mod tests {
 
     #[test]
     fn reciprocal_rank_fusion_empty_lists() {
-        let result = super::reciprocal_rank_fusion(vec![], vec![], 5);
+        let result = reciprocal_rank_fusion(vec![], vec![], 5);
         assert!(result.is_empty(), "empty input should produce empty output");
     }
 
@@ -3052,7 +3052,7 @@ mod tests {
     fn reciprocal_rank_fusion_deduplicates_across_signals() {
         let doc_a = DocumentId::new(0, 0);
         let doc_b = DocumentId::new(0, 1);
-        let result = super::reciprocal_rank_fusion(
+        let result = reciprocal_rank_fusion(
             vec![vec![doc_a, doc_b], vec![doc_a, doc_b]],
             vec![1.0, 1.0],
             5,
@@ -3069,7 +3069,7 @@ mod tests {
     #[test]
     fn reciprocal_rank_fusion_respects_top_k() {
         let docs: Vec<DocumentId> = (0..10).map(|i| DocumentId::new(0, i)).collect();
-        let result = super::reciprocal_rank_fusion(vec![docs], vec![1.0], 3);
+        let result = reciprocal_rank_fusion(vec![docs], vec![1.0], 3);
         assert_eq!(result.len(), 3, "result should be capped at top_k=3");
     }
 
@@ -3077,7 +3077,7 @@ mod tests {
     fn reciprocal_rank_fusion_weights_affect_ranking() {
         let doc_a = DocumentId::new(0, 0);
         let doc_b = DocumentId::new(0, 1);
-        let result = super::reciprocal_rank_fusion(
+        let result = reciprocal_rank_fusion(
             vec![vec![doc_a, doc_b], vec![doc_b, doc_a]],
             vec![10.0, 1.0],
             2,

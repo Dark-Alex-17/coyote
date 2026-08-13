@@ -33,7 +33,11 @@ source "$LLM_PROMPT_UTILS_FILE"
 
 # shellcheck disable=SC2154
 main() {
-    argc_contents="$(jq -r '.content' <<< "$LLM_TOOL_RAW_JSON")"
+		# Command substitution strips *all* trailing newlines and `jq -r` appends one
+		# of its own, so read with `-j` and pin the real end of the content with a
+		# sentinel that is removed afterwards.
+		argc_contents="$(jq -j '.content' <<< "$LLM_TOOL_RAW_JSON"; printf x)"
+		argc_contents="${argc_contents%x}"
     argc_path="$(jq -r '.path' <<< "$LLM_TOOL_RAW_JSON")"
 
     if [[ ! -f "$argc_path" ]]; then
@@ -41,7 +45,11 @@ main() {
         exit 1
     fi
 
-    new_contents="$(patch_file "$argc_path" <(printf "%s" "$argc_contents"))"
+		# Same sentinel guard on the patched result, otherwise the trailing newline
+		# is stripped again on the way back out. `rc` preserves patch_file's exit
+		# status so a failure still aborts under `set -e`.
+		new_contents="$(patch_file "$argc_path" <(printf "%s" "$argc_contents"); rc=$?; printf x; exit "$rc")"
+		new_contents="${new_contents%x}"
     printf "%s" "$new_contents" | git diff --no-index "$argc_path" - || true
 
     guard_operation "Apply changes?"

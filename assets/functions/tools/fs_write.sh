@@ -15,7 +15,12 @@ source "$LLM_PROMPT_UTILS_FILE"
 
 # shellcheck disable=SC2154
 main() {
-    argc_contents="$(jq -r '.content' <<< "$LLM_TOOL_RAW_JSON")"
+		# Command substitution strips *all* trailing newlines and `jq -r` appends one
+		# of its own, so read with `-j` and pin the real end of the content with a
+		# sentinel that is removed afterwards. Without this every written file loses
+		# its final newline, which breaks formatters such as `cargo fmt --check`.
+		argc_contents="$(jq -j '.content' <<< "$LLM_TOOL_RAW_JSON"; printf x)"
+		argc_contents="${argc_contents%x}"
     argc_path="$(jq -r '.path' <<< "$LLM_TOOL_RAW_JSON")"
 
     if [[ -f "$argc_path" ]]; then
