@@ -862,6 +862,66 @@ fn check_collection_config(
     Ok(())
 }
 
+/// What the creation wizard should do with the collection name it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollectionAction {
+    Create,
+    Adopt,
+}
+
+/// Decides whether a collection name is usable for a new Coyote-owned RAG.
+///
+/// `existing` is the `GET /collections/{c}` body, or `None` when the collection
+/// is absent. Kept apart from the requests so all four outcomes are decided in
+/// one place, over one value, and so the refusals can be exercised without a
+/// server.
+///
+/// Adopting is deliberately restricted to an empty collection. The first sync
+/// reconciles the collection against the local corpus and deletes what it does
+/// not recognise, so adopting a populated one would destroy data this RAG never
+/// wrote. An empty one is the retry case — the process died between creating the
+/// collection and saving the YAML — and reclaiming it is what makes that
+/// recoverable.
+fn plan_owned_collection(
+    existing: Option<&Value>,
+    collection: &str,
+    host: &str,
+    dim: usize,
+    embedding_model: &str,
+) -> Result<CollectionAction> {
+    let Some(body) = existing else {
+        return Ok(CollectionAction::Create);
+    };
+
+    // Never defaulted to zero: reading "no answer" as "empty" would adopt — and
+    // then delete the contents of — a collection whose size could not be read.
+    let points = body["result"]["points_count"].as_u64().with_context(|| {
+        format!(
+            "Cannot tell how many points collection '{collection}' on {host} holds, and Coyote \
+             only adopts an empty collection. Check the collection in Qdrant, or choose a \
+             different name."
+        )
+    })?;
+    if points > 0 {
+        bail!(
+            "Collection '{collection}' on {host} already contains {points} point(s) that were \
+             not written by this RAG. Adopting it would overwrite and delete that data on the \
+             next sync. Choose a different collection name, or delete the collection in Qdrant \
+             first."
+        );
+    }
+
+    check_collection_config(body, collection, host, Some(dim)).with_context(|| {
+        format!(
+            "Collection '{collection}' on {host} cannot be used with embedding model \
+             '{embedding_model}', which produces {dim}-dimensional vectors. Choose a different \
+             collection name, or delete the existing collection in Qdrant."
+        )
+    })?;
+
+    Ok(CollectionAction::Adopt)
+}
+
 /// Chunk text for every document in `data`, keyed by `DocumentId`.
 ///
 /// Built from `iter_documents`, the same iterator `build_bm25` walks, so the
@@ -1214,6 +1274,41 @@ impl QdrantProvider {
         })?;
 
         check_write_completed(&body, "file_id payload index creation")
+    }
+
+    /// Creates the collection a new Coyote-owned RAG will write to, or adopts an
+    /// existing empty one.
+    ///
+    /// Static, and not a method, because a provider cannot exist yet: `new`
+    /// fetches the collection and fails when it is absent. The creation wizard
+    /// calls this before it builds one.
+    ///
+    /// The collection is created eagerly, at wizard time, rather than on the
+    /// first sync: a wrong host, an unusable name or a dimension clash has to
+    /// fail before the user pays for an embedding pass over their whole corpus.
+    pub(crate) async fn ensure_owned_collection(
+        host: &str,
+        collection: &str,
+        api_key: Option<&str>,
+        dim: usize,
+        embedding_model: &str,
+    ) -> Result<CollectionAction> {
+        let base_url = Self::normalize_base_url(host);
+        let client = Self::make_client(&base_url, api_key)?;
+
+        let existing = if Self::collection_exists(&client, &base_url, collection).await? {
+            Some(Self::fetch_collection(host, collection, api_key).await?)
+        } else {
+            None
+        };
+
+        let action =
+            plan_owned_collection(existing.as_ref(), collection, host, dim, embedding_model)?;
+        if action == CollectionAction::Create {
+            Self::create_collection(&client, &base_url, collection, dim).await?;
+        }
+
+        Ok(action)
     }
 
     /// Checks the existing collection against what both paths assume before
@@ -3107,6 +3202,83 @@ mod tests {
         let err = check_collection_config(&euclid, "docs", "http://h", Some(4))
             .expect_err("only Cosine scores on the scale the read path filters against");
         assert!(err.to_string().contains("Euclid"), "got: {err}");
+    }
+
+    #[test]
+    fn plan_owned_collection_creates_adopts_or_refuses() {
+        let empty = serde_json::json!({
+            "result": {
+                "points_count": 0,
+                "config": {"params": {"vectors": {"size": 4, "distance": "Cosine"}}}
+            }
+        });
+
+        assert_eq!(
+            plan_owned_collection(None, "docs", "h:6333", 4, "m").unwrap(),
+            CollectionAction::Create,
+            "an absent collection is the ordinary case and is created"
+        );
+        assert_eq!(
+            plan_owned_collection(Some(&empty), "docs", "h:6333", 4, "m").unwrap(),
+            CollectionAction::Adopt,
+            "reclaiming an empty compatible collection is what makes a create-then-crash \
+             retryable"
+        );
+
+        let populated = serde_json::json!({
+            "result": {
+                "points_count": 12,
+                "config": {"params": {"vectors": {"size": 4, "distance": "Cosine"}}}
+            }
+        });
+        let err = plan_owned_collection(Some(&populated), "docs", "h:6333", 4, "m")
+            .expect_err("the first sync would delete points this RAG never wrote");
+        assert!(err.to_string().contains("12 point(s)"), "got: {err}");
+
+        let err = plan_owned_collection(Some(&empty), "docs", "h:6333", 1536, "embed-3-small")
+            .expect_err("a dimension clash must fail before the corpus is embedded");
+        let report = format!("{err:#}");
+        assert!(report.contains("embed-3-small"), "got: {report}");
+        assert!(report.contains("1536-dimensional"), "got: {report}");
+
+        // Absent, not zero. Reading "no answer" as "empty" would adopt a
+        // collection whose contents the next sync then deletes.
+        let unreadable = serde_json::json!({
+            "result": {"config": {"params": {"vectors": {"size": 4, "distance": "Cosine"}}}}
+        });
+        plan_owned_collection(Some(&unreadable), "docs", "h:6333", 4, "m")
+            .expect_err("an unreadable point count is not an empty collection");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Qdrant instance at localhost:6333"]
+    async fn ensure_owned_collection_creates_then_adopts_requires_running_instance() {
+        const HOST: &str = "http://localhost:6333";
+        const COLLECTION: &str = "coyote-ensure-owned-collection";
+
+        let created = QdrantProvider::ensure_owned_collection(HOST, COLLECTION, None, 4, "m")
+            .await
+            .unwrap();
+        assert_eq!(created, CollectionAction::Create);
+
+        // The create-then-crash retry: the same wizard run again finds its own
+        // empty collection and reclaims it instead of refusing.
+        let adopted = QdrantProvider::ensure_owned_collection(HOST, COLLECTION, None, 4, "m")
+            .await
+            .unwrap();
+        assert_eq!(adopted, CollectionAction::Adopt);
+
+        QdrantProvider::ensure_owned_collection(HOST, COLLECTION, None, 8, "m")
+            .await
+            .expect_err("a collection built for another width must not be adopted");
+
+        Client::new()
+            .delete(format!("{HOST}/collections/{COLLECTION}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
     }
 
     #[tokio::test]

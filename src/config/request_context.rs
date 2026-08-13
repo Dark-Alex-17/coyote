@@ -4144,6 +4144,7 @@ impl RequestContext {
                     Arc::new(
                         Rag::init(
                             &app,
+                            &vault,
                             super::TEMP_RAG_NAME,
                             &rag_path,
                             &[],
@@ -4170,8 +4171,16 @@ impl RequestContext {
                                 if working_mode.is_cmd() {
                                     bail!("Unknown RAG '{name}'");
                                 }
-                                Rag::init(&app, name, &rag_path, &[], abort_signal.clone(), true)
-                                    .await
+                                Rag::init(
+                                    &app,
+                                    &vault,
+                                    name,
+                                    &rag_path,
+                                    &[],
+                                    abort_signal.clone(),
+                                    true,
+                                )
+                                .await
                             } else {
                                 Rag::load_async(&app, &vault, name, &rag_path).await
                             }

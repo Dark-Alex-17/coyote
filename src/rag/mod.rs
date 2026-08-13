@@ -12,7 +12,7 @@ mod splitter;
 
 use self::graph::{KnowledgeGraph, extract_entities};
 use self::provider::RagProvider;
-use self::providers::{DuckDbProvider, QdrantProvider, YamlProvider};
+use self::providers::{CollectionAction, DuckDbProvider, QdrantProvider, YamlProvider};
 use crate::sandbox::mcp_credentials;
 use crate::vault::{Vault, interpolate_secrets};
 
@@ -31,6 +31,7 @@ use std::{
     sync::Arc, time::Duration,
 };
 use tokio::time::sleep;
+use uuid::Uuid;
 
 const BM25_SEED_SCORE: f32 = 0.5;
 
@@ -132,6 +133,18 @@ pub struct GraphRagConfig {
     pub graph_hops: Option<usize>,
 }
 
+/// The answers the owned-Qdrant creation wizard collects, plus the resolved API
+/// key it needs for its own requests.
+///
+/// The resolved key lives here and nowhere else. What reaches `driver_config`,
+/// and therefore the YAML, is the `{{SECRET}}` placeholder that names it.
+struct QdrantInit {
+    host: String,
+    collection: String,
+    secret_name: Option<String>,
+    api_key: Option<String>,
+}
+
 impl Rag {
     fn create_embeddings_client(&self, model: Model) -> Result<Box<dyn Client>> {
         init_client(&self.app_config, model)
@@ -148,6 +161,7 @@ impl Rag {
         if doc_paths.is_empty() {
             bail!("Cannot build RAG knowledge base '{name}' with no documents");
         }
+        reject_non_interactive_qdrant(name, config.driver.as_deref())?;
         println!("⚙ Initializing RAG...");
         let mut data = Self::resolve_init_data(app, config)?;
         data.driver = config.driver.clone().unwrap_or_else(|| "yaml".to_string());
@@ -256,6 +270,7 @@ impl Rag {
 
     pub async fn init(
         app: &AppConfig,
+        vault: &Vault,
         name: &str,
         save_path: &Path,
         doc_paths: &[String],
@@ -268,9 +283,18 @@ impl Rag {
         println!("⚙ Initializing RAG...");
         let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(app)?;
         let driver = if prompt_for_driver {
-            select_rag_driver()?
+            select_rag_driver(true)?
         } else {
             "yaml".to_string()
+        };
+        // Everything the qdrant driver needs is collected here, before the three
+        // prompts below: an unreachable host, an unusable collection or a
+        // dimension clash has to fail while the user is still answering
+        // questions, and long before they pay for an embedding pass.
+        let qdrant = if driver == "qdrant" {
+            Some(Self::qdrant_wizard(app, vault, &embedding_model).await?)
+        } else {
+            None
         };
         let reranker_model = app.rag_reranker_model.clone();
         let top_k = app.rag_top_k;
@@ -298,19 +322,40 @@ impl Rag {
             },
         );
         data.driver = driver;
-        let mut rag = Self::create(app, name, save_path, data)?;
+        let mut rag = match &qdrant {
+            // An owned Qdrant RAG cannot go through `create`: that is sync, and
+            // building its provider performs a network preflight. It also has to
+            // reach disk before the first sync, which `create` does not do.
+            Some(setup) => Self::init_qdrant(app, name, save_path, data, setup).await?,
+            None => Self::create(app, name, save_path, data)?,
+        };
         let mut paths = doc_paths.to_vec();
         if paths.is_empty() {
             paths = add_documents()?;
         };
         let loaders = app.document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
-        abortable_run_with_spinner_rx(
+        let synced = abortable_run_with_spinner_rx(
             rag.sync_documents(&paths, true, false, loaders, Some(spinner)),
             spinner_rx,
             abort_signal,
         )
-        .await?;
+        .await;
+        match &qdrant {
+            // The RAG is already registered and its collection already exists, so
+            // a failure here leaves a RAG with no documents rather than a broken
+            // one. Saying so is the difference between the user re-running the
+            // wizard and the user deleting a perfectly good RAG.
+            Some(setup) => synced.with_context(|| {
+                format!(
+                    "RAG '{name}' is saved and its Qdrant collection '{}' is ready — it just \
+                     holds no documents yet. Add some with `.edit rag-docs` and run \
+                     `.rebuild rag`; there is nothing to clean up first.",
+                    setup.collection
+                )
+            })?,
+            None => synced?,
+        }
         if rag.save()? {
             println!("✓ Saved RAG to '{}'.", save_path.display());
         }
@@ -543,6 +588,178 @@ impl Rag {
             header_name,
             value_format,
         )?;
+
+        Ok(rag)
+    }
+
+    /// Prompts for a Coyote-owned Qdrant collection and creates it.
+    ///
+    /// Mirrors `attach`'s host / vault-key / connectivity sequence, and stops at
+    /// the point where the two diverge: `attach` picks an existing collection to
+    /// read, this one makes a collection to write.
+    async fn qdrant_wizard(
+        app: &AppConfig,
+        vault: &Vault,
+        embedding_model: &Model,
+    ) -> Result<QdrantInit> {
+        // Refused at run time, never with a `compile_error!`: attaching to a
+        // collection something else writes is supported on 32-bit, and a
+        // compile-time refusal would take that down along with the write path.
+        // A remote point id does not fit in a 32-bit document id, so the same
+        // document would answer to two different ids on the vector and keyword
+        // search legs.
+        #[cfg(target_pointer_width = "32")]
+        bail!(
+            "Coyote cannot create a Qdrant collection on a 32-bit build. Attaching to a \
+             collection something else writes still works."
+        );
+
+        println!("⚙ Setting up a Coyote-owned Qdrant collection...");
+
+        let host = Text::new("Host (e.g. qdrant.company.com:6333):")
+            .with_validator(required!("This field is required"))
+            .with_validator(|input: &str| {
+                Ok(if input.contains('[') || input.contains(']') {
+                    Validation::Invalid(
+                        "Bracketed IPv6 literals are not supported; use a hostname.".into(),
+                    )
+                } else {
+                    Validation::Valid
+                })
+            })
+            .prompt()?;
+
+        let api_key_entry: Option<(String, String)> = {
+            let needs_key = Confirm::new("Does this instance require an API key?")
+                .with_default(true)
+                .prompt()?;
+            if needs_key {
+                let secret_name = Text::new("Vault secret name for API key:")
+                    .with_default("QDRANT_API_KEY")
+                    .with_validator(required!("This field is required"))
+                    .prompt()?;
+                let resolved = resolve_or_create_api_key_secret(vault, &secret_name)?;
+                Some((secret_name, resolved))
+            } else {
+                None
+            }
+        };
+
+        println!("⚙ Connecting to {host}...");
+        let api_key = api_key_entry.as_ref().map(|(_, v)| v.as_str());
+        // An instance with no collections at all is the ordinary case here, so
+        // unlike `attach` this only checks that the host answers.
+        let collections = QdrantProvider::list_collections(&host, api_key)
+            .await
+            .with_context(|| format!("Failed to connect to {host}. Check host and API key."))?;
+        println!(
+            "✓ Connected. {} existing collection(s) on this instance.",
+            collections.len()
+        );
+
+        let collection = Text::new("Collection to create:")
+            .with_validator(required!("This field is required"))
+            .with_validator(|input: &str| {
+                Ok(
+                    if input
+                        .chars()
+                        .any(|c| c.is_whitespace() || "/?#".contains(c))
+                    {
+                        Validation::Invalid(
+                            "A collection name is used verbatim in a URL path: no spaces, \
+                             '/', '?' or '#'."
+                                .into(),
+                        )
+                    } else {
+                        Validation::Valid
+                    },
+                )
+            })
+            .prompt()?;
+
+        let model_id = embedding_model.id();
+        println!("⚙ Measuring what '{model_id}' embeds to...");
+        let dim = probe_embedding_dim(app, embedding_model).await?;
+        println!("✓ {model_id} produces {dim}-dimensional vectors.");
+
+        match QdrantProvider::ensure_owned_collection(&host, &collection, api_key, dim, &model_id)
+            .await?
+        {
+            CollectionAction::Create => {
+                println!("✓ Created collection '{collection}' ({dim}-dim, Cosine).")
+            }
+            CollectionAction::Adopt => {
+                println!("✓ Adopted the existing empty collection '{collection}'.")
+            }
+        }
+
+        Ok(QdrantInit {
+            host,
+            collection,
+            secret_name: api_key_entry.as_ref().map(|(name, _)| name.clone()),
+            api_key: api_key_entry.map(|(_, key)| key),
+        })
+    }
+
+    /// Builds the owned-Qdrant `Rag` and writes its YAML before anything is
+    /// ingested.
+    ///
+    /// Like `attach`, it builds the provider `await`-side and then the `Rag`
+    /// literal directly, bypassing `create`, which is synchronous.
+    ///
+    /// The early save is mandatory, not a convenience. If the first ingest dies
+    /// after some points have landed and the `coyote_rag_id` was never
+    /// persisted, the retry mints a fresh one, finds a collection stamped with
+    /// the old one, and the ownership guard locks the user out of their own
+    /// collection with no way back. Saving first also guarantees there is always
+    /// a local record of a collection Coyote created. A zero-document owned RAG
+    /// is a legal state: `validate()` accepts it and the next sync fills it in.
+    ///
+    /// This is also the one deliberate exception to the rule that the YAML is
+    /// saved strictly after a successful `rebuild_indexes` — the rule the sync's
+    /// "nothing changed locally, skip the scroll" shortcut depends on. It is
+    /// benign only because `files` is empty here, so there is no local state a
+    /// later sync could mistake for reconciled. Moving any other save earlier
+    /// would turn that shortcut into a correctness bug.
+    async fn init_qdrant(
+        app: &AppConfig,
+        name: &str,
+        save_path: &Path,
+        mut data: RagData,
+        setup: &QdrantInit,
+    ) -> Result<Self> {
+        data.driver_config =
+            qdrant_driver_config(&setup.host, &setup.collection, setup.secret_name.as_deref());
+        data.validate()?;
+
+        let embedding_model =
+            Model::retrieve_model(app, &data.embedding_model, ModelType::Embedding)?;
+        let provider =
+            QdrantProvider::new(&setup.host, &setup.collection, setup.api_key.as_deref())
+                .await?
+                // Empty for this whole session — `data` has no files yet — and kept
+                // for shape only. The map becomes current at the first rebuild.
+                .with_local_content(&data);
+        let rag = Rag {
+            app_config: Arc::new(app.clone()),
+            name: name.to_string(),
+            path: save_path.display().to_string(),
+            embedding_model,
+            bm25: data.build_bm25(),
+            // Unlike an attached RAG, an owned one holds its own corpus, so its
+            // graph is local and this must not be an empty map.
+            node_to_docs: data.knowledge_graph.build_node_to_docs(),
+            provider: Box::new(provider),
+            data,
+            last_sources: RwLock::new(None),
+        };
+
+        if rag.save()? {
+            println!(
+                "✓ Registered RAG '{name}' → collection '{}' on {}.",
+                setup.collection, setup.host
+            );
+        }
 
         Ok(rag)
     }
@@ -1956,14 +2173,31 @@ fn select_embedding_model(models: &[&Model]) -> Result<String> {
     Ok(result.value)
 }
 
-pub(crate) fn select_rag_driver() -> Result<String> {
-    let options = vec![
+/// The storage drivers offered, in cursor order.
+///
+/// `allow_owned_qdrant` is false on the path that feeds `init_with_config`,
+/// which cannot prompt for a host, a collection or an API key. Offering an
+/// option there that always bails afterwards would be a trap.
+fn rag_driver_options(allow_owned_qdrant: bool) -> Vec<&'static str> {
+    let mut options = vec![
         "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
         "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search.",
     ];
-    let sel = Select::new("RAG storage driver:", options)
-        .with_starting_cursor(0)
-        .prompt()?;
+    if allow_owned_qdrant {
+        options.push(
+            "qdrant — remote Qdrant collection; vectors live on the server and are shared by everyone pointing at it. Requires a Qdrant host and API key. Its driver cannot be changed later without recreating the RAG",
+        );
+    }
+    options
+}
+
+pub(crate) fn select_rag_driver(allow_owned_qdrant: bool) -> Result<String> {
+    let sel = Select::new(
+        "RAG storage driver:",
+        rag_driver_options(allow_owned_qdrant),
+    )
+    .with_starting_cursor(0)
+    .prompt()?;
     if sel.starts_with("duckdb") {
         println!(
             "Note: several Coyote processes can query a duckdb RAG at the same time, \
@@ -1972,9 +2206,81 @@ pub(crate) fn select_rag_driver() -> Result<String> {
              and recreating the RAG."
         );
         Ok("duckdb".to_string())
+    } else if sel.starts_with("qdrant") {
+        Ok("qdrant".to_string())
     } else {
         Ok("yaml".to_string())
     }
+}
+
+/// The non-interactive path's refusal of `driver: qdrant`.
+///
+/// `RagInitConfig` carries no host, collection or API key, and this path must
+/// never prompt, so there is nothing here to half-create. Kept even though the
+/// driver picker no longer offers qdrant on this path: a hand-written agent
+/// YAML can still ask for it.
+fn reject_non_interactive_qdrant(name: &str, driver: Option<&str>) -> Result<()> {
+    if driver == Some("qdrant") {
+        bail!(
+            "RAG '{name}' declares `driver: qdrant`, which cannot be created \
+             non-interactively: an owned Qdrant RAG needs a host, collection name and API \
+             key. Create it first with `.rag {name}` and choose the qdrant driver, then \
+             reference it from this agent."
+        );
+    }
+
+    Ok(())
+}
+
+/// The vector width the embedding model actually returns.
+///
+/// A collection is created with a fixed vector size, and every later point that
+/// disagrees with it is rejected with no repair short of deleting the
+/// collection. `embedding_dim_for_model` cannot answer this: it returns 1536 for
+/// every model it does not recognise, which is a guess. One short embedding call
+/// is authoritative and costs far less than getting it wrong.
+async fn probe_embedding_dim(app: &AppConfig, model: &Model) -> Result<usize> {
+    let client = init_client(&Arc::new(app.clone()), model.clone())?;
+    let probed = client
+        .embeddings(&EmbeddingsData::new(vec!["coyote".to_string()], false))
+        .await
+        .with_context(|| format!("Failed to embed a probe string with '{}'", model.id()))?;
+
+    match probed.first().map(Vec::len) {
+        Some(dim) if dim > 0 => Ok(dim),
+        _ => bail!(
+            "Embedding model '{}' returned no vector for a probe string, so Coyote cannot tell \
+             what vector size to create the Qdrant collection with.",
+            model.id()
+        ),
+    }
+}
+
+/// The `driver_config` a newly created owned Qdrant RAG is saved with.
+///
+/// The API key is stored as the `{{SECRET}}` placeholder that names it, never as
+/// the resolved value. `save()` serializes this map verbatim, so a resolved key
+/// would land in the RAG's YAML in plaintext — and sandbox provisioning reads the
+/// placeholder back out of that file to learn which vault secret to bind, so it
+/// would break there too.
+///
+/// `coyote_rag_id` is minted here and is this RAG's identity for every later
+/// ownership check. Not its name, which can be renamed, and not its collection,
+/// which another RAG can be pointed at.
+fn qdrant_driver_config(
+    host: &str,
+    collection: &str,
+    secret_name: Option<&str>,
+) -> IndexMap<String, String> {
+    let mut driver_config = IndexMap::new();
+    driver_config.insert("host".to_string(), host.to_string());
+    driver_config.insert("collection".to_string(), collection.to_string());
+    if let Some(secret_name) = secret_name {
+        driver_config.insert("api_key".to_string(), format!("{{{{{secret_name}}}}}"));
+    }
+    driver_config.insert("coyote_rag_id".to_string(), Uuid::new_v4().to_string());
+
+    driver_config
 }
 
 const EXTRACTOR_SKIP: &str = "Skip";
@@ -2764,6 +3070,119 @@ mod tests {
         assert_eq!(
             driver_auth_header("something-else"),
             ("Authorization", "Bearer %s")
+        );
+    }
+
+    #[test]
+    fn rag_driver_options_offer_qdrant_only_where_the_wizard_can_run() {
+        let interactive = rag_driver_options(true);
+        let non_interactive = rag_driver_options(false);
+
+        assert!(
+            interactive
+                .iter()
+                .any(|option| option.starts_with("qdrant")),
+            "the wizard path must offer the driver it can actually set up"
+        );
+        assert!(
+            !non_interactive
+                .iter()
+                .any(|option| option.starts_with("qdrant")),
+            "offering an option that always bails afterwards is a trap"
+        );
+        assert_eq!(interactive.len(), non_interactive.len() + 1);
+        for prefix in ["yaml", "duckdb"] {
+            assert!(
+                non_interactive
+                    .iter()
+                    .any(|option| option.starts_with(prefix)),
+                "the local drivers stay available on both paths"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn init_with_config_refuses_a_qdrant_driver_it_cannot_prompt_for() {
+        let config = RagInitConfig {
+            driver: Some("qdrant".to_string()),
+            ..Default::default()
+        };
+
+        let err = Rag::init_with_config(
+            &AppConfig::default(),
+            "company-docs",
+            Path::new("/nonexistent/company-docs.yaml"),
+            &["notes.md".to_string()],
+            &config,
+            create_abort_signal(),
+        )
+        .await
+        .expect_err("this path has no host, no collection and no way to ask for either");
+
+        let message = err.to_string();
+        assert!(message.contains("company-docs"), "got: {message}");
+        assert!(message.contains(".rag "), "got: {message}");
+    }
+
+    #[test]
+    fn the_wizards_driver_config_carries_a_placeholder_and_a_fresh_rag_id() {
+        let config = qdrant_driver_config("qdrant.example.com:6333", "docs", Some("QDRANT_KEY"));
+
+        assert_eq!(config["host"], "qdrant.example.com:6333");
+        assert_eq!(config["collection"], "docs");
+        // The resolved key must never reach here: `save()` serializes this map
+        // verbatim into the RAG's YAML, and sandbox provisioning reads the
+        // placeholder back out of that file.
+        assert_eq!(config["api_key"], "{{QDRANT_KEY}}");
+
+        let rag_id = &config["coyote_rag_id"];
+        let parsed = Uuid::parse_str(rag_id).unwrap_or_else(|err| {
+            panic!("the ownership marker must be a UUID, got '{rag_id}': {err}")
+        });
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
+
+        let second = qdrant_driver_config("qdrant.example.com:6333", "docs", Some("QDRANT_KEY"));
+        assert_ne!(
+            config["coyote_rag_id"], second["coyote_rag_id"],
+            "two RAGs pointed at one collection must not share an identity"
+        );
+
+        let keyless = qdrant_driver_config("qdrant.example.com:6333", "docs", None);
+        assert!(!keyless.contains_key("api_key"));
+        assert!(keyless.contains_key("coyote_rag_id"));
+    }
+
+    #[test]
+    fn an_owned_rag_takes_its_graph_map_from_its_own_knowledge_graph() {
+        use super::graph::{ExtractedEntity, ExtractionResult};
+
+        let mut data = RagData {
+            driver: "qdrant".to_string(),
+            embedding_model: "text-embedding-3-small".to_string(),
+            top_k: 5,
+            ..Default::default()
+        };
+        data.knowledge_graph.merge(
+            DocumentId::new(0, 0),
+            ExtractionResult {
+                entities: vec![ExtractedEntity {
+                    name: "Qdrant".to_string(),
+                    entity_type: "TECHNOLOGY".to_string(),
+                    description: None,
+                }],
+                relationships: vec![],
+            },
+        );
+
+        // `attach` hard-codes an empty map because an attached RAG has no local
+        // graph. An owned one does, and reusing that literal would silently
+        // disable graph expansion for every qdrant RAG Coyote creates.
+        let node_to_docs = data.knowledge_graph.build_node_to_docs();
+        let node = data.knowledge_graph.entity_index["qdrant"];
+        assert!(node_to_docs[&node].contains(&DocumentId::new(0, 0)));
+        assert!(
+            !node_to_docs.is_empty(),
+            "an owned RAG's graph map must not be the empty one"
         );
     }
 

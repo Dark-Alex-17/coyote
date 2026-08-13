@@ -175,6 +175,7 @@ impl Agent {
                     resolve_document_paths(&agent_config.documents, &loaders, &agent_data_dir)?;
                 let key = RagKey::Agent(name.to_string());
                 let app_clone = app.clone();
+                let vault_clone = app_state.vault.clone();
                 let rag_path_clone = rag_path.clone();
                 let abort = abort_signal.clone();
                 let rag = app_state
@@ -182,6 +183,7 @@ impl Agent {
                     .load_with(key, || async move {
                         Rag::init(
                             &app_clone,
+                            &vault_clone,
                             "rag",
                             &rag_path_clone,
                             &document_paths,
@@ -1058,7 +1060,9 @@ async fn init_graph_rags(
                 }
 
                 if config.driver.is_none() {
-                    config.driver = Some(rag::select_rag_driver()?);
+                    // False: this feeds `init_with_config`, which cannot prompt
+                    // for a Qdrant host, collection or API key.
+                    config.driver = Some(rag::select_rag_driver(false)?);
                 }
             }
 
