@@ -39,8 +39,10 @@ static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\n]+
 static IMAGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").unwrap());
 static LINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
-static BOLD_AST_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*\*([^*\n]+)\*\*").unwrap());
-static BOLD_US_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"__([^_\n]+)__").unwrap());
+static BOLD_AST_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\*\*((?:[^*\n]|\*(?!\*))+?)\*\*").unwrap());
+static BOLD_US_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"__((?:[^_\n]|_(?!_))+?)__").unwrap());
 static ITALIC_AST_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?<![*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)").unwrap());
 static ITALIC_US_RE: LazyLock<Regex> =
@@ -2417,6 +2419,36 @@ std::error::Error>> {
         assert!(!result.contains("~~"), "markers stripped");
         assert!(result.contains("gone"));
         assert!(result.contains("\x1b[9m"), "strikethrough SGR: {result:?}");
+    }
+
+    #[test]
+    fn bold_asterisk_wraps_italic_asterisk() {
+        let styles = test_styles();
+
+        let result = apply_inline("**loud *soft* loud**", &styles);
+
+        assert!(
+            !result.contains("**"),
+            "outer bold markers stripped: {result:?}"
+        );
+        assert!(result.contains("\x1b[1m"), "bold SGR present: {result:?}");
+        assert!(result.contains("\x1b[3m"), "italic SGR present: {result:?}");
+        assert!(result.contains("soft"));
+    }
+
+    #[test]
+    fn bold_underscore_wraps_italic_underscore() {
+        let styles = test_styles();
+
+        let result = apply_inline("__loud _soft_ loud__", &styles);
+
+        assert!(
+            !result.contains("__"),
+            "outer bold markers stripped: {result:?}"
+        );
+        assert!(result.contains("\x1b[1m"), "bold SGR present: {result:?}");
+        assert!(result.contains("\x1b[3m"), "italic SGR present: {result:?}");
+        assert!(result.contains("soft"));
     }
 
     #[test]
