@@ -36,6 +36,21 @@ RUN set -euo pipefail; \
     install -m 0755 "$TMPDIR/usql_static" /usr/local/bin/usql; \
     rm -rf "$TMPDIR"
 
+RUN set -euo pipefail; \
+    DUCKDB_VERSION=1.5.5; \
+    case "${TARGETARCH}" in \
+      amd64) DUCKDB_ARCH=amd64 ;; \
+      arm64) DUCKDB_ARCH=arm64 ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    TMPDIR=$(mktemp -d); \
+    curl -fsSL --retry 3 \
+      "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-${DUCKDB_ARCH}.gz" \
+      -o "$TMPDIR/duckdb.gz"; \
+    gunzip "$TMPDIR/duckdb.gz"; \
+    install -m 0755 "$TMPDIR/duckdb" /usr/local/bin/duckdb; \
+    rm -rf "$TMPDIR"
+
 USER 1000
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
