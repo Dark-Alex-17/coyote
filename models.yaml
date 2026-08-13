@@ -841,6 +841,11 @@
       referrer: coyote
     echo_pkce_in_token_exchange: true
   models:
+    - name: grok-4.6
+      input_price: 2
+      output_price: 6
+      max_input_tokens: 500000
+      supports_function_calling: true
     - name: grok-4.5
       input_price: 2
       output_price: 6
