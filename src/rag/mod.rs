@@ -360,6 +360,14 @@ impl Rag {
                 let api_key = driver_config.get("api_key").map(String::as_str);
 
                 let provider = QdrantProvider::new(&host, &collection, api_key).await?;
+                // An attached collection is not ours: the remote is the only source
+                // of truth for its text, and `data.files` is empty for it anyway.
+                // Skipped explicitly so the intent stays legible.
+                let provider = if data.attached {
+                    provider
+                } else {
+                    provider.with_local_content(&data)
+                };
                 let embedding_model =
                     Model::retrieve_model(app, &data.embedding_model, ModelType::Embedding)?;
                 Ok(Rag {

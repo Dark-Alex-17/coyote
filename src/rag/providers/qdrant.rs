@@ -862,16 +862,76 @@ fn check_collection_config(
     Ok(())
 }
 
+/// Chunk text for every document in `data`, keyed by `DocumentId`.
+///
+/// Built from `iter_documents`, the same iterator `build_bm25` walks, so the
+/// keyword index and this map share a key space by construction. `data.vectors`
+/// is deliberately not the source: a chunk whose embedding failed has no vector
+/// and therefore no remote point, and that is exactly the chunk this map has to
+/// answer for.
+fn build_local_content(data: &RagData) -> HashMap<DocumentId, String> {
+    data.iter_documents()
+        .map(|(id, doc)| (id, doc.page_content.clone()))
+        .collect()
+}
+
+/// Splits `ids` against the local map: one slot per input position, `None` where
+/// the map has no answer, plus the ids that still need the remote.
+fn split_local_hits(
+    local: &HashMap<DocumentId, String>,
+    ids: &[DocumentId],
+) -> (Vec<Option<String>>, Vec<DocumentId>) {
+    let mut hits = Vec::with_capacity(ids.len());
+    let mut misses = Vec::new();
+    for id in ids {
+        match local.get(id) {
+            Some(text) => hits.push(Some(text.clone())),
+            None => {
+                hits.push(None);
+                misses.push(*id);
+            }
+        }
+    }
+    (hits, misses)
+}
+
+/// Emits by input position, preferring the local answer and falling back to the
+/// remote batch, which arrives in whatever order Qdrant chose. An id neither
+/// source resolved is skipped rather than reported, per the trait.
+fn merge_in_input_order(
+    ids: &[DocumentId],
+    local_hits: Vec<Option<String>>,
+    remote: Vec<(DocumentId, String)>,
+) -> Vec<(DocumentId, String)> {
+    let mut remote: HashMap<DocumentId, String> = remote.into_iter().collect();
+    ids.iter()
+        .zip(local_hits)
+        .filter_map(|(id, local)| local.or_else(|| remote.remove(id)).map(|text| (*id, text)))
+        .collect()
+}
+
 /// Client for a Qdrant collection, attached or Coyote-owned.
 ///
 /// An attached collection is read-only: Coyote does not own the documents, so
 /// `rebuild_indexes` refuses rather than pretending to. An owned collection is
 /// reconciled against the local corpus on every sync.
+///
+/// Anything cached here beyond `client`, `base_url`, `collection` and
+/// `point_ids` owes an explicit answer to one question: what happens to it on
+/// `duplicate` and on `rebuild_indexes`? For `local_content` the answer is that
+/// both rebuild it from the `RagData` they are handed and neither carries the
+/// old map across, because a carried map describes a corpus that has since moved
+/// on and `fetch_content` would serve that stale text with no error to show for
+/// it.
 pub struct QdrantProvider {
     client: Client,
     base_url: String,
     collection: String,
     point_ids: Arc<RwLock<PointIdInterner>>,
+    /// Chunk text keyed by the same document ids BM25 and `data.vectors` use. A
+    /// hit here is served without a request, which also covers chunks that have
+    /// no vector and hence no remote point at all.
+    local_content: HashMap<DocumentId, String>,
 }
 
 impl QdrantProvider {
@@ -963,7 +1023,17 @@ impl QdrantProvider {
             base_url,
             collection: collection.to_string(),
             point_ids: Arc::default(),
+            local_content: HashMap::new(),
         })
+    }
+
+    /// Caches every chunk's text so `fetch_content` can answer without a request.
+    ///
+    /// Only meaningful for a Coyote-owned collection: `data.files` is empty for an
+    /// attached one, so the caller skips this rather than build an empty map.
+    pub fn with_local_content(mut self, data: &RagData) -> Self {
+        self.local_content = build_local_content(data);
+        self
     }
 
     pub async fn list_collections(host: &str, api_key: Option<&str>) -> Result<Vec<String>> {
@@ -1351,9 +1421,17 @@ impl RagProvider for QdrantProvider {
         if ids.is_empty() {
             return Ok(vec![]);
         }
+        let (local_hits, misses) = split_local_hits(&self.local_content, ids);
+        // Nothing left to ask Qdrant for. On an owned collection, whose whole
+        // corpus is in the map, that is the ordinary case and the query path costs
+        // no request at all.
+        if misses.is_empty() {
+            return Ok(merge_in_input_order(ids, local_hits, vec![]));
+        }
+
         let url = format!("{}/collections/{}/points", self.base_url, self.collection);
         // Qdrant is asked for the ids it issued, never for a synthetic handle.
-        let id_list = self.point_ids.read().outbound_ids(ids);
+        let id_list = self.point_ids.read().outbound_ids(&misses);
         let body = serde_json::json!({
             "ids": id_list,
             "with_payload": true,
@@ -1369,17 +1447,14 @@ impl RagProvider for QdrantProvider {
             );
         }
         let data: Value = resp.json().await?;
-        let mut rows = {
+        let remote = {
             let mut interner = self.point_ids.write();
             parse_points(&mut interner, &data)?
         };
         // `/points` does not guarantee response order matches request order, and the
-        // caller's RRF ranking is carried by that order. Restore it.
-        let position: HashMap<DocumentId, usize> =
-            ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
-        rows.sort_by_key(|(id, _)| position.get(id).copied().unwrap_or(usize::MAX));
-
-        Ok(rows)
+        // caller's RRF ranking is carried by that order, so the two sources are
+        // re-laid over the input positions rather than concatenated.
+        Ok(merge_in_input_order(ids, local_hits, remote))
     }
 
     async fn rebuild_indexes(&mut self, data: &RagData, full_rebuild: bool) -> Result<()> {
@@ -1410,11 +1485,13 @@ impl RagProvider for QdrantProvider {
              something else writes still works."
         );
 
-        // TODO: refresh the local content map here, and only here. It has to run
-        // after the guards above and before any HTTP below, so that a failed
-        // write cannot leave the map describing a state the remote never
-        // reached. Until it lands, every `fetch_content` resolves against the
-        // remote collection.
+        // Refreshed here, and only here: after the guards above and before any
+        // HTTP below, so a failed remote write cannot leave the map describing a
+        // state the remote never reached. `data` is already the advanced
+        // in-memory corpus by the time this runs, so from now on `fetch_content`
+        // answers for the new chunks whether or not the write that follows
+        // succeeds.
+        self.local_content = build_local_content(data);
 
         // Read straight off `&RagData`, whose `driver_config` is deliberately left
         // un-interpolated; a vault-resolved copy is not this RAG's identity. Never
@@ -1570,7 +1647,7 @@ impl RagProvider for QdrantProvider {
         Ok(())
     }
 
-    fn duplicate(&self, _data: &RagData) -> Box<dyn RagProvider> {
+    fn duplicate(&self, data: &RagData) -> Box<dyn RagProvider> {
         // Cloning the client shares the connection pool and the injected api-key
         // header. Sharing is correct: both handles address the same remote
         // collection, and neither of them writes to it.
@@ -1580,11 +1657,18 @@ impl RagProvider for QdrantProvider {
         // so a fresh map would resolve them to nothing and `fetch_content` would
         // ask Qdrant for a synthetic handle — zero results, no error. Resetting it
         // would also re-mint handles for ids the original still holds.
+        //
+        // The content map goes the other way: rebuilt from `data`, never carried
+        // from `self`. `Rag::clone` calls this with pre-mutation data and only then
+        // mutates and rebuilds, so a carried map would outlive the corpus it
+        // described and be served as if current. Attached data holds no files,
+        // which makes this an empty map and leaves the clone on the remote path.
         Box::new(Self {
             client: self.client.clone(),
             base_url: self.base_url.clone(),
             collection: self.collection.clone(),
             point_ids: Arc::clone(&self.point_ids),
+            local_content: build_local_content(data),
         })
     }
 }
@@ -1594,6 +1678,7 @@ mod tests {
     use super::owned::*;
     use super::*;
     use crate::rag::FileId;
+    use crate::rag::{RagDocument, RagFile};
     use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
@@ -1687,6 +1772,7 @@ mod tests {
             base_url: "http://127.0.0.1:1".to_string(),
             collection: "c".to_string(),
             point_ids: Arc::default(),
+            local_content: HashMap::new(),
         };
 
         let attached = RagData {
@@ -1722,6 +1808,7 @@ mod tests {
             base_url: "http://127.0.0.1:1".to_string(),
             collection: "c".to_string(),
             point_ids: Arc::default(),
+            local_content: HashMap::new(),
         };
 
         assert!(provider.fetch_content(&[]).await.unwrap().is_empty());
@@ -1920,6 +2007,7 @@ mod tests {
             base_url: "http://127.0.0.1:1".to_string(),
             collection: "c".to_string(),
             point_ids: Arc::default(),
+            local_content: HashMap::new(),
         };
         let uuid = Value::from("c0ffee00-4444-4000-8000-000000000007");
         let handle = provider.point_ids.write().document_id(&uuid).unwrap();
@@ -1934,6 +2022,260 @@ mod tests {
         assert_eq!(Arc::strong_count(&provider.point_ids), 2);
         assert_eq!(provider.point_ids.read().raw_id(handle), Some(&uuid));
         drop(dup);
+    }
+
+    /// An owned corpus of two files whose chunks all carry text, but where
+    /// `(0, 1)` has NO vector — no embedding means no remote point, so only the
+    /// local map can ever answer for it. Populating `vectors` alone would leave
+    /// `build_local_content` empty and every assertion below vacuously true, so
+    /// `files` is the part that matters here.
+    fn owned_rag_data() -> RagData {
+        let mut data = RagData {
+            embedding_model: MODEL.to_string(),
+            driver: "qdrant".to_string(),
+            attached: false,
+            ..Default::default()
+        };
+        data.files.insert(
+            0,
+            RagFile {
+                hash: "h0".to_string(),
+                path: "/tmp/a.md".to_string(),
+                documents: vec![
+                    RagDocument {
+                        page_content: "alpha".to_string(),
+                        metadata: Default::default(),
+                    },
+                    RagDocument {
+                        page_content: "vectorless".to_string(),
+                        metadata: Default::default(),
+                    },
+                ],
+            },
+        );
+        data.files.insert(
+            1,
+            RagFile {
+                hash: "h1".to_string(),
+                path: "/tmp/b.md".to_string(),
+                documents: vec![RagDocument {
+                    page_content: "beta".to_string(),
+                    metadata: Default::default(),
+                }],
+            },
+        );
+        data.vectors.insert(DocumentId::new(0, 0), vec![1.0, 0.0]);
+        data.vectors.insert(DocumentId::new(1, 0), vec![0.0, 1.0]);
+        data
+    }
+
+    /// A provider pointed at a closed port: any request it makes is an `Err`, so
+    /// an `Ok` result is itself evidence the network was never touched.
+    fn unroutable_provider(local_content: HashMap<DocumentId, String>) -> QdrantProvider {
+        QdrantProvider {
+            client: Client::new(),
+            base_url: "http://127.0.0.1:1".to_string(),
+            collection: "c".to_string(),
+            point_ids: Arc::default(),
+            local_content,
+        }
+    }
+
+    /// `rebuild_indexes` refreshes the content map before it touches the network,
+    /// so a chunk with no vector — and therefore no remote point — still resolves.
+    ///
+    /// The fixture deliberately carries no `coyote_rag_id`, so the rebuild stops
+    /// at the ownership guard. That guard sits above `install_id()` (which would
+    /// read the real user config dir) and above the first request, so the fetch
+    /// below can only find anything if the refresh ran above it: move the refresh
+    /// under the guard, or under the HTTP, and the map is empty and this fails.
+    /// The unroutable `base_url` is the other half of the proof — a request would
+    /// turn the fetch into an `Err`.
+    #[tokio::test]
+    async fn rebuild_indexes_refreshes_local_content_before_touching_the_network() {
+        let mut provider = unroutable_provider(HashMap::new());
+        let data = owned_rag_data();
+        let vectorless = DocumentId::new(0, 1);
+        assert!(
+            !data.vectors.contains_key(&vectorless),
+            "the chunk under test must have no vector, or it proves nothing"
+        );
+
+        let err = provider
+            .rebuild_indexes(&data, true)
+            .await
+            .expect_err("an owned RAG with no coyote_rag_id must not be synced");
+        assert!(
+            err.to_string().contains("coyote_rag_id"),
+            "the rebuild must stop at the ownership guard, above install_id and any \
+             request: {err}"
+        );
+
+        let out = provider
+            .fetch_content(&[vectorless])
+            .await
+            .expect("the refreshed map must answer without a request");
+        assert_eq!(
+            out,
+            vec![(vectorless, "vectorless".to_string())],
+            "the new file's vectorless chunk must resolve to its own text"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_rebuilds_the_content_map_from_the_passed_data() {
+        let provider = unroutable_provider(HashMap::new());
+        let data = owned_rag_data();
+        let vectorless = DocumentId::new(0, 1);
+
+        let dup = provider.duplicate(&data);
+
+        let out = dup
+            .fetch_content(&[vectorless])
+            .await
+            .expect("the clone must answer from the map it built, not from the remote");
+        assert_eq!(
+            out,
+            vec![(vectorless, "vectorless".to_string())],
+            "an empty original map must not stop the clone from serving the data it was given"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_does_not_carry_the_originals_content_map() {
+        let old_id = DocumentId::new(0, 1);
+        let provider = unroutable_provider(build_local_content(&owned_rag_data()));
+        let other = RagData {
+            driver: "qdrant".to_string(),
+            ..Default::default()
+        };
+
+        let dup = provider.duplicate(&other);
+
+        assert!(
+            dup.fetch_content(&[old_id]).await.is_err(),
+            "an id the new data does not hold must fall through to the remote, which is \
+             what proves the original's map was not carried across"
+        );
+    }
+
+    #[test]
+    fn merge_in_input_order_emits_by_input_position_across_both_sources() {
+        let a = DocumentId::new(0, 0);
+        let b = DocumentId::new(0, 1);
+        let c = DocumentId::new(1, 0);
+        let unresolved = DocumentId::new(9, 0);
+        let ids = [a, b, c, unresolved];
+        let local_hits = vec![Some("alpha".to_string()), None, None, None];
+        // Qdrant answered in its own order, and for neither `a` nor `unresolved`.
+        let remote = vec![(c, "gamma".to_string()), (b, "beta".to_string())];
+
+        let out = merge_in_input_order(&ids, local_hits, remote);
+
+        assert_eq!(
+            out,
+            vec![
+                (a, "alpha".to_string()),
+                (b, "beta".to_string()),
+                (c, "gamma".to_string()),
+            ],
+            "the output follows the input ids rather than the remote's order, and the id \
+             neither source resolved is skipped, not reported"
+        );
+    }
+
+    /// The half of the split that `merge_in_input_order` trusts blindly: it zips
+    /// `hits` against `ids`, so a slot that goes missing rather than being `None`
+    /// shifts every later hit onto the wrong id and drops the tail, with no error
+    /// to show for it. One slot per input position is what stops that.
+    #[test]
+    fn split_local_hits_keeps_a_slot_per_input_position() {
+        let a = DocumentId::new(0, 0);
+        let absent = DocumentId::new(9, 0);
+        let b = DocumentId::new(1, 0);
+        let local = build_local_content(&owned_rag_data());
+
+        let (hits, misses) = split_local_hits(&local, &[a, absent, b]);
+
+        assert_eq!(
+            hits,
+            vec![Some("alpha".to_string()), None, Some("beta".to_string())],
+            "a miss must leave a hole where it sat, not shorten the row of hits"
+        );
+        assert_eq!(
+            misses,
+            vec![absent],
+            "only what the map could not answer for is asked of the remote, in input order"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_content_serves_an_all_local_id_list_without_a_request() {
+        let data = owned_rag_data();
+        let provider = unroutable_provider(build_local_content(&data));
+        let a = DocumentId::new(0, 0);
+        let vectorless = DocumentId::new(0, 1);
+        let b = DocumentId::new(1, 0);
+
+        // Scrambled relative to corpus order: the result must follow the argument.
+        let out = provider
+            .fetch_content(&[b, vectorless, a])
+            .await
+            .expect("every id hits the map, so no request is made — an Err means one was");
+
+        assert_eq!(
+            out,
+            vec![
+                (b, "beta".to_string()),
+                (vectorless, "vectorless".to_string()),
+                (a, "alpha".to_string()),
+            ],
+            "an all-local fetch must still emit in input order"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attached_provider_has_no_local_content_and_goes_to_the_remote() {
+        let attached = RagData {
+            driver: "qdrant".to_string(),
+            attached: true,
+            ..Default::default()
+        };
+        assert!(
+            build_local_content(&attached).is_empty(),
+            "attached data holds no files, so there is nothing to cache from it"
+        );
+
+        // What the attached arm of `load_async` leaves behind: `with_local_content`
+        // is skipped, so the map stays empty.
+        let provider = unroutable_provider(HashMap::new());
+
+        assert!(
+            provider
+                .fetch_content(&[DocumentId::new(0, 0)])
+                .await
+                .is_err(),
+            "with an empty map every id is a miss and the remote is the only source"
+        );
+    }
+
+    #[test]
+    fn build_local_content_keys_on_files_not_vectors() {
+        let mut data = owned_rag_data();
+        let orphan = DocumentId::new(9, 0);
+        data.vectors.insert(orphan, vec![0.0, 1.0]);
+
+        let map = build_local_content(&data);
+
+        assert!(
+            !map.contains_key(&orphan),
+            "an id present only in `vectors` has no text behind it and must not resolve"
+        );
+        assert_eq!(
+            map.get(&DocumentId::new(0, 1)).map(String::as_str),
+            Some("vectorless"),
+            "a chunk with no vector still has text, and this map is what serves it"
+        );
     }
 
     const RAG_ID: &str = "3f1a0c00-0000-4000-8000-000000000001";
