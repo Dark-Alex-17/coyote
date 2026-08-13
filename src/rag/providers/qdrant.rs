@@ -3709,6 +3709,63 @@ mod tests {
         );
     }
 
+    /// The refusal that stands between a truncated YAML and a silently empty
+    /// collection, on the arm where the collection has to be made rather than
+    /// found.
+    ///
+    /// A rebuild takes the new collection's vector width from the local vectors
+    /// themselves, so a corpus that lists documents but holds none cannot reach
+    /// the point where anything is created. That is also why the reconcile's
+    /// vectors-empty guard never observes a create arm reached from here: an
+    /// absent vector width and an empty vectors map are the same condition, and
+    /// this refusal fires on it first. The reconcile checks the combination
+    /// anyway; what is pinned here is the earlier refusal, because relaxing it —
+    /// taking the width from the embedding model instead, say — is precisely
+    /// what would make that combination reachable.
+    #[tokio::test]
+    async fn a_full_rebuild_of_a_vectorless_corpus_refuses_to_create_the_collection() {
+        // The exists probe is the only request made before the bail, so a single
+        // canned answer covers the whole run.
+        let (host, requests) = canned_server("200 OK", r#"{"result":{"exists":false}}"#);
+
+        let mut data = owned_rag_data();
+        data.driver_config
+            .insert("coyote_rag_id".to_string(), RAG_ID.to_string());
+        // Documents with no vectors at all: what a truncated or hand-edited YAML
+        // looks like from here.
+        data.vectors.clear();
+        let mut provider = QdrantProvider {
+            client: Client::new(),
+            base_url: host,
+            collection: "c".to_string(),
+            point_ids: Arc::default(),
+            local_content: HashMap::new(),
+            attached: false,
+        };
+
+        let err = provider.rebuild_indexes(&data, true).await.expect_err(
+            "creating a collection this RAG cannot populate reports success over an empty RAG",
+        );
+
+        let report = format!("{err:#}");
+        assert!(report.contains("holds no vectors"), "got: {report}");
+        assert!(
+            report.contains("'c'"),
+            "the message has to name the collection: {report}"
+        );
+
+        let seen = requests.read();
+        assert!(
+            !seen.is_empty(),
+            "the exists probe has to run for the create arm to be selected at all"
+        );
+        assert!(
+            seen.iter().all(|line| line.contains("/exists")),
+            "the refusal has to land before the collection is created or a point is written: \
+             {seen:?}"
+        );
+    }
+
     /// A 404 from search means two different things either side of ownership: a
     /// collection Coyote wrote is recoverable from the local copy at no
     /// embedding cost, and one it merely attached to is not Coyote's to
@@ -3827,6 +3884,17 @@ mod tests {
             ids.iter().all(|id| !remote.contains_key(id)),
             "the delete pass must remove exactly the ids it was given"
         );
+
+        // Deleting the points is not enough: the collection this test may have
+        // created outlives the run and accumulates on whatever instance the
+        // suite is pointed at.
+        Client::new()
+            .delete(format!("{HOST}/collections/{COLLECTION}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
     }
 
     #[tokio::test]

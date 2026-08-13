@@ -72,6 +72,10 @@ Coyote requires the following tools to be installed on your system:
     * Optional: if `ast-grep` is not installed, the `ast_grep` tool reports it and agents fall back to `fs_grep`
 * [duckdb](https://duckdb.org/) (for fast, local RAGs)
     * `curl https://install.duckdb.org | sh`
+* [Qdrant](https://qdrant.tech/) (optional, for RAGs whose vectors live on a server instead of beside the RAG)
+    * `docker run -p 6333:6333 -v $(pwd)/qdrant_storage:/qdrant/storage qdrant/qdrant`
+    * Coyote never installs or manages the server; point a RAG at one you run with `.rag` (Coyote owns the
+      collection) or `.rag attach` (something else owns it)
 
 These tools are used to provide various functionalities within Coyote, such as document processing, JSON manipulation,
 etc., and they are used within agents and tools.

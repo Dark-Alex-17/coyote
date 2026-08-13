@@ -133,6 +133,25 @@ pub struct GraphRagConfig {
     pub graph_hops: Option<usize>,
 }
 
+/// The *name* of a vault secret. Never the secret itself.
+///
+/// A name is written to the RAG's YAML as a `{{NAME}}` placeholder; the value it
+/// resolves to is a credential that must never be serialized. Both are `String`
+/// underneath, so without a distinct type the two are interchangeable at every
+/// call that takes one of them — and passing the resolved key where the name
+/// belongs writes a plaintext credential to disk and breaks sandbox
+/// provisioning, which reads the placeholder back out of that file to learn
+/// which secret to bind. Wrapping the name makes that substitution a type error
+/// rather than a matter of care at the call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VaultSecretName(String);
+
+impl fmt::Display for VaultSecretName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// The answers the owned-Qdrant creation wizard collects, plus the resolved API
 /// key it needs for its own requests.
 ///
@@ -141,7 +160,7 @@ pub struct GraphRagConfig {
 struct QdrantInit {
     host: String,
     collection: String,
-    secret_name: Option<String>,
+    secret_name: Option<VaultSecretName>,
     api_key: Option<String>,
 }
 
@@ -458,7 +477,7 @@ impl Rag {
             })
             .prompt()?;
 
-        let api_key_entry: Option<(String, String)> = {
+        let api_key_entry: Option<(VaultSecretName, String)> = {
             let needs_key = Confirm::new("Does this instance require an API key?")
                 .with_default(true)
                 .prompt()?;
@@ -468,7 +487,7 @@ impl Rag {
                     .with_validator(required!("This field is required"))
                     .prompt()?;
                 let resolved = resolve_or_create_api_key_secret(vault, &secret_name)?;
-                Some((secret_name, resolved))
+                Some((VaultSecretName(secret_name), resolved))
             } else {
                 None
             }
@@ -621,7 +640,7 @@ impl Rag {
             })
             .prompt()?;
 
-        let api_key_entry: Option<(String, String)> = {
+        let api_key_entry: Option<(VaultSecretName, String)> = {
             let needs_key = Confirm::new("Does this instance require an API key?")
                 .with_default(true)
                 .prompt()?;
@@ -631,7 +650,7 @@ impl Rag {
                     .with_validator(required!("This field is required"))
                     .prompt()?;
                 let resolved = resolve_or_create_api_key_secret(vault, &secret_name)?;
-                Some((secret_name, resolved))
+                Some((VaultSecretName(secret_name), resolved))
             } else {
                 None
             }
@@ -721,7 +740,7 @@ impl Rag {
         setup: &QdrantInit,
     ) -> Result<Self> {
         data.driver_config =
-            qdrant_driver_config(&setup.host, &setup.collection, setup.secret_name.as_deref());
+            qdrant_driver_config(&setup.host, &setup.collection, setup.secret_name.as_ref());
         data.validate()?;
 
         let embedding_model =
@@ -2291,13 +2310,17 @@ async fn probe_embedding_dim(app: &AppConfig, model: &Model) -> Result<usize> {
 /// placeholder back out of that file to learn which vault secret to bind, so it
 /// would break there too.
 ///
+/// The `secret_name` parameter is a `VaultSecretName` rather than a `&str` so
+/// that handing it a resolved key is rejected by the compiler instead of by
+/// review.
+///
 /// `coyote_rag_id` is minted here and is this RAG's identity for every later
 /// ownership check. Not its name, which can be renamed, and not its collection,
 /// which another RAG can be pointed at.
 fn qdrant_driver_config(
     host: &str,
     collection: &str,
-    secret_name: Option<&str>,
+    secret_name: Option<&VaultSecretName>,
 ) -> IndexMap<String, String> {
     let mut driver_config = IndexMap::new();
     driver_config.insert("host".to_string(), host.to_string());
@@ -3211,13 +3234,15 @@ mod tests {
 
     #[test]
     fn the_wizards_driver_config_carries_a_placeholder_and_a_fresh_rag_id() {
-        let config = qdrant_driver_config("qdrant.example.com:6333", "docs", Some("QDRANT_KEY"));
+        let secret_name = VaultSecretName("QDRANT_KEY".to_string());
+        let config = qdrant_driver_config("qdrant.example.com:6333", "docs", Some(&secret_name));
 
         assert_eq!(config["host"], "qdrant.example.com:6333");
         assert_eq!(config["collection"], "docs");
         // The resolved key must never reach here: `save()` serializes this map
         // verbatim into the RAG's YAML, and sandbox provisioning reads the
-        // placeholder back out of that file.
+        // placeholder back out of that file. The parameter's type is what makes
+        // passing the resolved key instead a compile error.
         assert_eq!(config["api_key"], "{{QDRANT_KEY}}");
 
         let rag_id = &config["coyote_rag_id"];
@@ -3226,7 +3251,7 @@ mod tests {
         });
         assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
 
-        let second = qdrant_driver_config("qdrant.example.com:6333", "docs", Some("QDRANT_KEY"));
+        let second = qdrant_driver_config("qdrant.example.com:6333", "docs", Some(&secret_name));
         assert_ne!(
             config["coyote_rag_id"], second["coyote_rag_id"],
             "two RAGs pointed at one collection must not share an identity"
