@@ -172,6 +172,431 @@ fn is_multi_vector_config(body: &Value) -> bool {
         .is_none()
 }
 
+/// The decision layer for a Coyote-owned collection: which files to write back,
+/// which remote points to drop, and when to refuse outright.
+///
+/// It is deliberately free of HTTP so that everything able to delete remote data
+/// is exercised by plain maps in the tests below. Nothing calls it yet — the
+/// scroll/upsert/delete passes that consume it land separately, and the
+/// `dead_code` allow goes with them.
+#[allow(dead_code)]
+mod owned {
+    use crate::rag::{DocumentId, FileId};
+
+    use anyhow::{Result, bail};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// One past the highest file index the wire point-id format can carry.
+    ///
+    /// Staying below it keeps every `(file_index << 32) | chunk_index` under
+    /// `SYNTHETIC_ID_TAG`, so an owned point always takes the interner's integer
+    /// fast path and can never alias a synthetic handle.
+    ///
+    /// This is the *wire* bound and is deliberately stricter than, and separate
+    /// from, the *packing* bound `DocumentId::try_new` enforces: a file index in
+    /// `[2^31, 2^32)` packs perfectly well locally and only collides remotely.
+    const WIRE_FILE_INDEX_LIMIT: usize = 1 << 31;
+
+    /// The point id an owned collection stores a document under.
+    ///
+    /// The shift is a fixed 32 and must stay that way. `DocumentId` packs with
+    /// `usize::BITS / 2`, which is width-dependent; the wire format is not. The
+    /// two coincide on a 64-bit host, which is what lets the read path parse
+    /// owned ids with no special casing at all.
+    ///
+    /// Infallible by design: the file index is bounded once per file by
+    /// `check_wire_range` before this runs for any of that file's chunks, and a
+    /// chunk-index check here would be vacuous — `split` masks, so an
+    /// overflowing chunk index has already corrupted the file bits by the time
+    /// it returns.
+    pub fn wire_point_id(id: DocumentId) -> u64 {
+        let (file_index, chunk_index) = id.split();
+        ((file_index as u64) << 32) | (chunk_index as u64)
+    }
+
+    /// The file index a wire point id encodes.
+    pub fn wire_file_index(id: u64) -> u64 {
+        id >> 32
+    }
+
+    /// Bound a file index once per file, before any of its points are minted.
+    pub fn check_wire_range(file_index: usize) -> Result<()> {
+        if file_index >= WIRE_FILE_INDEX_LIMIT {
+            bail!(
+                "RAG file index {file_index} is too large to store in Qdrant (limit 2^31). \
+                 This RAG has churned through more files than the remote point-id format \
+                 supports; recreate it to reset the counter."
+            );
+        }
+        Ok(())
+    }
+
+    /// A scrolled remote point, carrying every payload field a guard reads.
+    ///
+    /// Trimming this list disables guards silently rather than failing to
+    /// compile: `writer_id` backs the foreign-install warning, `embedding_model`
+    /// the model-mixing refusal, `path` the bulk-deletion threshold.
+    ///
+    /// An absent payload field arrives as an empty string — absent and empty are
+    /// equally unusable for all of these — except `file_id`, which has no such
+    /// sentinel and so is `None`.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RemotePoint {
+        pub file_id: Option<u64>,
+        pub file_hash: String,
+        pub coyote_rag_id: String,
+        pub writer_id: String,
+        pub embedding_model: String,
+        pub path: String,
+    }
+
+    /// One file's desired remote state, derived from `data.files`.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DesiredFile {
+        pub hash: String,
+        pub path: String,
+        /// Every wire point id the file's chunks map to, embeddable or not.
+        pub ids: BTreeSet<u64>,
+    }
+
+    /// The state the guards compare the remote against that is not per-file.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ReconcileCtx {
+        pub collection: String,
+        pub host: String,
+        /// This RAG's ownership marker, read from `driver_config` and never from
+        /// a vault-resolved copy.
+        pub rag_id: String,
+        /// This Coyote install's identity.
+        pub writer_id: String,
+        pub embedding_model: String,
+        /// `data.vectors.is_empty()`.
+        pub vectors_empty: bool,
+        /// Set when this sync is creating the collection rather than finding it.
+        pub creating_collection: bool,
+    }
+
+    /// A file to write back, with the exact points to write.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct UpsertFile {
+        pub file_id: FileId,
+        /// All of the file's achievable points, never a delta against what the
+        /// remote already holds. The delta is empty in the re-minted-FileId case,
+        /// so writing it would leave the old hash in place, make the retention
+        /// rule keep stale points forever, and re-select the file every sync.
+        ///
+        /// Empty is a legitimate outcome — a file whose chunks have no embeddings
+        /// yet and no remote points is selected on every sync. Callers must not
+        /// turn that into an empty request or count it as work.
+        pub point_ids: Vec<u64>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct Reconcile {
+        pub upsert_files: Vec<UpsertFile>,
+        pub delete_ids: Vec<u64>,
+        /// Non-fatal and meant for `warn!`: a foreign writer id, points written
+        /// before Coyote recorded a model, and the shortfall of desired points
+        /// that have no embedding yet. None of these may become an `Err` — the
+        /// foreign writer warns by design and a shortfall is ordinary.
+        pub warnings: Vec<String>,
+    }
+
+    /// **Owned-collection safety invariant.** For a coyote-owned Qdrant
+    /// collection, `rebuild_indexes` performs exactly two kinds of remote
+    /// mutation: (1) full-replace upserts of points whose IDs are in the desired
+    /// set, and (2) exact-ID deletions of points observed in the pre-write
+    /// scroll that fail the retention rule below — that is, whose ID is absent
+    /// from the desired set, **or** whose ID is currently unachievable *and*
+    /// whose payload `file_hash` disagrees with the local hash for its file. The
+    /// desired set is derived exclusively from `data.files` — every
+    /// `(file_id, chunk_index)` reachable via `iter_documents` — never from
+    /// `data.vectors`, never from remote state, never from vector-map coverage.
+    /// The collection itself is never dropped, recreated, or filter-wiped. Every
+    /// write pass is gated by preconditions: the RAG is not attached; every
+    /// scanned remote point carries this RAG's ownership marker; the desired set
+    /// is non-empty whenever the remote is non-empty; and the corpus has not
+    /// shrunk past the bulk-deletion threshold. Because `sync_documents` always
+    /// presents the complete corpus, and a hash-skipped file retains its FileId
+    /// and chunk list verbatim, every point of an unchanged file is in the
+    /// desired set *by construction* — unreachable by the delete pass regardless
+    /// of hashes, vectors, or remote contents. **Convergence corollary:** from
+    /// any remote state (interrupted sync, reassigned FileIds, stale points), one
+    /// successful sync makes the remote exactly equal to the desired set
+    /// restricted to embeddable points.
+    ///
+    /// **ID-set membership alone is NOT the safety property.** Saying that
+    /// deletion removes exactly the points "absent from the desired set" is
+    /// necessary but not sufficient: a FileId re-minted onto a different file
+    /// after an interrupted sync leaves stale points *inside* the desired ID
+    /// range, carrying the previous file's content. Retention requires per-point
+    /// hash agreement as well. Do not simplify the retention rule back down to a
+    /// set difference.
+    ///
+    /// Every guard is judged here, before the caller writes anything. A guard
+    /// that tripped after the upsert pass would leave the collection mutated
+    /// with the YAML unsaved, so every retry would re-upsert and re-bail forever.
+    pub fn reconcile(
+        desired: &BTreeMap<FileId, DesiredFile>,
+        achievable: &BTreeSet<u64>,
+        remote: &BTreeMap<u64, RemotePoint>,
+        ctx: &ReconcileCtx,
+        full_rebuild: bool,
+    ) -> Result<Reconcile> {
+        let mut warnings = Vec::new();
+
+        // Ownership is judged across the whole scroll before anything else: a
+        // foreign collection must report that it is foreign, not that one of its
+        // points happens to lack a `path`.
+        if remote
+            .values()
+            .any(|point| point.coyote_rag_id.is_empty() || point.coyote_rag_id != ctx.rag_id)
+        {
+            bail!(
+                "Refusing to sync: collection '{}' on {} contains points that do not belong to \
+                 this RAG (expected marker {}). Another Coyote RAG is probably writing to the \
+                 same collection. Point this RAG at a different collection, or delete the \
+                 collection in Qdrant if the other data is disposable. This is not recoverable \
+                 from inside Coyote — it will not adopt or overwrite points it did not write.",
+                ctx.collection,
+                ctx.host,
+                ctx.rag_id
+            );
+        }
+
+        // Same marker, different install. This warns and never bails: using one
+        // owned RAG from two machines serially is legitimate, and only concurrent
+        // use is mutual deletion.
+        let foreign_writer = remote
+            .values()
+            .map(|point| point.writer_id.as_str())
+            .find(|writer| !writer.is_empty() && *writer != ctx.writer_id);
+        if let Some(other) = foreign_writer {
+            warnings.push(format!(
+                "Warning: collection '{}' was last written by a different Coyote install \
+                 ({other}). If two machines sync this RAG concurrently they will delete each \
+                 other's documents. Syncing a `driver: qdrant` RAG's YAML across machines is \
+                 only safe if you never sync from both at once.",
+                ctx.collection
+            ));
+        }
+
+        let mut scrolled: Vec<(u64, FileId)> = Vec::with_capacity(remote.len());
+        let mut remote_paths: BTreeSet<&str> = BTreeSet::new();
+        let mut unmarked_model = 0usize;
+
+        for (&id, point) in remote {
+            let Some(payload_file_id) = point.file_id else {
+                bail!(missing_field(ctx, id, "file_id"));
+            };
+            if point.path.is_empty() {
+                bail!(missing_field(ctx, id, "path"));
+            }
+            if point.file_hash.is_empty() {
+                bail!(missing_field(ctx, id, "file_hash"));
+            }
+
+            // The id and the payload encode the file independently, so a
+            // disagreement is a corrupt or foreign write that carries the right
+            // ownership marker and so slipped past the check above.
+            let encoded_file_id = wire_file_index(id);
+            if encoded_file_id != payload_file_id {
+                bail!(
+                    "Refusing to sync: point {id} in collection '{}' encodes file {encoded_file_id} \
+                     in its id but claims file_id {payload_file_id} in its payload. Coyote will \
+                     not guess which document it belongs to; delete the collection in Qdrant to \
+                     rebuild it from the local copy.",
+                    ctx.collection
+                );
+            }
+            let Ok(file_id) = FileId::try_from(payload_file_id) else {
+                bail!(
+                    "Refusing to sync: point {id} in collection '{}' claims file_id \
+                     {payload_file_id}, which is wider than this build can represent.",
+                    ctx.collection
+                );
+            };
+
+            // A missing model marker only means the point predates Coyote
+            // recording one. A differing one is the corruption case: two vector
+            // spaces in one collection make similarity scores meaningless, and no
+            // dimension check sees it when the models share a width.
+            if point.embedding_model.is_empty() {
+                unmarked_model += 1;
+            } else if point.embedding_model != ctx.embedding_model {
+                bail!(
+                    "Refusing to sync: collection '{}' holds vectors from embedding model '{}' \
+                     but this RAG is configured for '{}'. Mixing embedding models in one \
+                     collection makes similarity scores meaningless. Run `.rebuild rag` to \
+                     re-embed the whole corpus under '{}'.",
+                    ctx.collection,
+                    point.embedding_model,
+                    ctx.embedding_model,
+                    ctx.embedding_model
+                );
+            }
+
+            remote_paths.insert(point.path.as_str());
+            scrolled.push((id, file_id));
+        }
+
+        if unmarked_model > 0 {
+            warnings.push(format!(
+                "Collection '{}' holds {unmarked_model} points with no embedding_model marker, so \
+                 they cannot be checked against '{}'. They were written before Coyote recorded \
+                 one.",
+                ctx.collection, ctx.embedding_model
+            ));
+        }
+
+        // The scroll, not the collection's `points_count`, is the authoritative
+        // non-empty signal: `points_count` is documented as approximate, and a
+        // short scroll is fail-safe here for the same reason it is in the delete
+        // pass below.
+        if desired.is_empty() && !remote.is_empty() {
+            bail!(
+                "Refusing to sync: this RAG has no documents but collection '{}' holds {} points. \
+                 If you intend to discard the remote data, delete the collection in Qdrant \
+                 directly.",
+                ctx.collection,
+                remote.len()
+            );
+        }
+
+        // On the create arm the "remote is populated" conjunct is false by
+        // definition, so it is dropped there. Keeping it would let a truncated
+        // YAML create the collection, find nothing achievable, write zero points
+        // and report success: a silently empty RAG.
+        if ctx.vectors_empty
+            && !desired.is_empty()
+            && (ctx.creating_collection || !remote.is_empty())
+        {
+            bail!(
+                "Refusing to sync: RAG '{}' lists {} documents but holds no vectors. This usually \
+                 means the RAG's YAML was truncated or hand-edited. Restore it from backup, or \
+                 run `.rebuild rag` to re-embed from source.",
+                ctx.collection,
+                desired.len()
+            );
+        }
+
+        // Distinct paths on both sides, not points and not file ids. Points are
+        // useless on the full-rebuild arm, where every FileId is legitimately
+        // retired and re-minted, and file ids are not stable across an
+        // *interrupted* turnover — the remote holds both generations while local
+        // rolled back, so counting them would refuse to recover from exactly the
+        // state this reconcile exists to fix. Paths survive FileId turnover.
+        // Distinct locally too: overlapping source roots can produce two FileIds
+        // sharing one path, which would inflate the local side.
+        let local_paths: BTreeSet<&str> = desired.values().map(|file| file.path.as_str()).collect();
+        // `saturating_sub` is load-bearing, not stylistic: both sides are `usize`
+        // and any growing corpus makes the local side larger, where a plain `-`
+        // panics in debug and wraps to ~1.8e19 in release — clearing every
+        // threshold and refusing every ordinary sync.
+        let dropped = remote_paths.len().saturating_sub(local_paths.len());
+        // A net count, deliberately: `|remote \ local|` would trip on a legitimate
+        // mass rename.
+        if !remote_paths.is_empty() && dropped > usize::max(10, remote_paths.len() / 4) {
+            let examples: Vec<&str> = remote_paths
+                .difference(&local_paths)
+                .take(10)
+                .copied()
+                .collect();
+            bail!(
+                "Refusing to sync: this would delete {dropped} of {} documents from collection \
+                 '{}'. That usually means some source paths did not resolve (an unmounted drive, \
+                 an interrupted cloud sync, a changed ignore rule) rather than a real deletion. \
+                 Confirm the source paths resolve and retry. If the removal is intended, re-run \
+                 after removing the documents in a smaller batch, or delete the collection in \
+                 Qdrant. Documents that would go, up to ten: {}",
+                remote_paths.len(),
+                ctx.collection,
+                examples.join(", ")
+            );
+        }
+
+        let mut remote_by_file: BTreeMap<FileId, BTreeSet<u64>> = BTreeMap::new();
+        for &(id, file_id) in &scrolled {
+            remote_by_file.entry(file_id).or_default().insert(id);
+        }
+
+        let mut upsert_files = Vec::new();
+        let mut shortfall = 0usize;
+
+        for (&file_id, file) in desired {
+            check_wire_range(file_id)?;
+
+            let achievable_ids: BTreeSet<u64> =
+                file.ids.intersection(achievable).copied().collect();
+            shortfall += file.ids.len() - achievable_ids.len();
+
+            let remote_ids = remote_by_file.get(&file_id);
+            let hash_differs = remote_ids
+                .is_some_and(|ids| ids.iter().any(|id| remote[id].file_hash != file.hash));
+            // A subset test against what is *achievable*, never set inequality and
+            // never against the full desired set. Comparing the desired set would
+            // re-select a file with a vectorless chunk forever, since that point
+            // can never exist remotely; testing inequality would re-select forever
+            // whenever the remote holds more points than this sync can produce.
+            // The only question that matters is whether anything writable is
+            // missing remotely.
+            let missing_remotely = !remote_ids.is_some_and(|ids| achievable_ids.is_subset(ids));
+
+            if full_rebuild || remote_ids.is_none() || hash_differs || missing_remotely {
+                upsert_files.push(UpsertFile {
+                    file_id,
+                    point_ids: achievable_ids.into_iter().collect(),
+                });
+            }
+        }
+
+        if shortfall > 0 {
+            warnings.push(format!(
+                "{shortfall} document chunks have no embedding yet and were not written to \
+                 collection '{}'. A later sync writes them once their embeddings succeed.",
+                ctx.collection
+            ));
+        }
+
+        // Built ONLY from scrolled points — never from a filter, never from the
+        // desired set. That is what makes a short scroll fail-safe: an under-scan
+        // leaves points alive instead of deleting ones it never saw. Do not
+        // "optimize" this into a filter-delete.
+        let mut delete_ids = Vec::new();
+        for &(id, file_id) in &scrolled {
+            let keep = desired.get(&file_id).is_some_and(|file| {
+                // The hash conjunct is load-bearing: a FileId re-minted onto a
+                // different file after an interrupted sync leaves the previous
+                // file's points inside the desired id range, so membership alone
+                // would keep content that local state no longer describes. The
+                // achievable disjunct is load-bearing in the other direction:
+                // without it this tests the pre-write scrolled hash and deletes
+                // the very points the upsert pass just wrote.
+                file.ids.contains(&id)
+                    && (achievable.contains(&id) || remote[&id].file_hash == file.hash)
+            });
+            if !keep {
+                delete_ids.push(id);
+            }
+        }
+
+        Ok(Reconcile {
+            upsert_files,
+            delete_ids,
+            warnings,
+        })
+    }
+
+    fn missing_field(ctx: &ReconcileCtx, id: u64, field: &str) -> String {
+        format!(
+            "Refusing to sync: point {id} in collection '{}' has no `{field}` in its payload. \
+             Coyote will not guess which document it belongs to; delete the collection in Qdrant \
+             to rebuild it from the local copy.",
+            ctx.collection
+        )
+    }
+}
+
 /// Query-only client for an external Qdrant collection.
 ///
 /// Attach-only: this provider never writes to the remote collection. Coyote does
@@ -463,7 +888,10 @@ impl RagProvider for QdrantProvider {
 
 #[cfg(test)]
 mod tests {
+    use super::owned::*;
     use super::*;
+    use crate::rag::FileId;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn error_message_reads_the_object_status_envelope() {
@@ -801,6 +1229,548 @@ mod tests {
         assert_eq!(Arc::strong_count(&provider.point_ids), 2);
         assert_eq!(provider.point_ids.read().raw_id(handle), Some(&uuid));
         drop(dup);
+    }
+
+    const RAG_ID: &str = "3f1a0c00-0000-4000-8000-000000000001";
+    const WRITER_ID: &str = "3f1a0c00-0000-4000-8000-0000000000aa";
+    const MODEL: &str = "text-embedding-3-small";
+
+    fn base_ctx() -> ReconcileCtx {
+        ReconcileCtx {
+            collection: "docs".to_string(),
+            host: "http://localhost:6333".to_string(),
+            rag_id: RAG_ID.to_string(),
+            writer_id: WRITER_ID.to_string(),
+            embedding_model: MODEL.to_string(),
+            vectors_empty: false,
+            creating_collection: false,
+        }
+    }
+
+    fn point_ids(file_id: FileId, chunks: impl IntoIterator<Item = usize>) -> BTreeSet<u64> {
+        chunks
+            .into_iter()
+            .map(|chunk| wire_point_id(DocumentId::new(file_id, chunk)))
+            .collect()
+    }
+
+    fn desired_file(file_id: FileId, hash: &str, path: &str, chunks: usize) -> DesiredFile {
+        DesiredFile {
+            hash: hash.to_string(),
+            path: path.to_string(),
+            ids: point_ids(file_id, 0..chunks),
+        }
+    }
+
+    fn scroll_file(
+        remote: &mut BTreeMap<u64, RemotePoint>,
+        file_id: FileId,
+        hash: &str,
+        path: &str,
+        chunks: impl IntoIterator<Item = usize>,
+    ) {
+        for chunk in chunks {
+            remote.insert(
+                wire_point_id(DocumentId::new(file_id, chunk)),
+                RemotePoint {
+                    file_id: Some(file_id as u64),
+                    file_hash: hash.to_string(),
+                    coyote_rag_id: RAG_ID.to_string(),
+                    writer_id: WRITER_ID.to_string(),
+                    embedding_model: MODEL.to_string(),
+                    path: path.to_string(),
+                },
+            );
+        }
+    }
+
+    fn all_ids(desired: &BTreeMap<FileId, DesiredFile>) -> BTreeSet<u64> {
+        desired
+            .values()
+            .flat_map(|file| file.ids.iter().copied())
+            .collect()
+    }
+
+    fn upserted(out: &Reconcile) -> Vec<FileId> {
+        out.upsert_files.iter().map(|file| file.file_id).collect()
+    }
+
+    #[test]
+    fn wire_point_id_shifts_a_fixed_32() {
+        assert_eq!(wire_point_id(DocumentId::new(0, 0)), 0);
+        assert_eq!(wire_point_id(DocumentId::new(7, 3)), (7u64 << 32) | 3);
+        assert_eq!(wire_file_index(wire_point_id(DocumentId::new(7, 3))), 7);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn owned_wire_ids_round_trip_through_the_integer_fast_path() {
+        let id = DocumentId::new(1234, 56);
+        let wire = wire_point_id(id);
+
+        // The shift-32 wire format and the 32/32 local packing coincide here,
+        // which is what lets the read path parse owned points unchanged.
+        assert_eq!(wire, id.0 as u64);
+        assert_eq!(
+            PointIdInterner::default().document_id(&Value::from(wire)),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn check_wire_range_bails_at_two_to_the_31() {
+        assert!(check_wire_range(0).is_ok());
+        assert!(check_wire_range((1 << 31) - 1).is_ok());
+
+        let err = check_wire_range(1 << 31).expect_err("2^31 does not fit the wire format");
+        assert!(err.to_string().contains("limit 2^31"), "got: {err}");
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_largest_allowed_wire_id_stays_below_the_synthetic_tag() {
+        let largest = wire_point_id(DocumentId::new((1 << 31) - 1, u32::MAX as usize));
+
+        assert!(largest < SYNTHETIC_ID_TAG as u64);
+    }
+
+    #[test]
+    fn hash_skipped_file_survives() {
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 3))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "ha", "a.md", 0..3);
+
+        let out = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), false).unwrap();
+
+        assert!(out.upsert_files.is_empty(), "{:?}", out.upsert_files);
+        assert!(out.delete_ids.is_empty(), "{:?}", out.delete_ids);
+    }
+
+    #[test]
+    fn retired_file_id_is_deleted() {
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 2))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "ha", "a.md", 0..2);
+        scroll_file(&mut remote, 2, "hb", "b.md", 0..2);
+
+        let out = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), false).unwrap();
+
+        assert!(out.upsert_files.is_empty(), "{:?}", out.upsert_files);
+        assert_eq!(
+            out.delete_ids,
+            point_ids(2, 0..2).into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn equal_chunk_remint_deletes_the_stale_tail() {
+        // An interrupted sync wrote 10 points for file 5 = fileA; the retry gives
+        // file 5 to fileB, also 10 chunks, and can only embed chunks 0..5. The
+        // tail is still inside the desired id range, so only the hash conjunct
+        // stops fileA's text staying searchable under a FileId that local state
+        // believes is fileB.
+        let desired = BTreeMap::from([(5, desired_file(5, "hb", "b.md", 10))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 5, "ha", "a.md", 0..10);
+
+        let out = reconcile(&desired, &point_ids(5, 0..5), &remote, &base_ctx(), false).unwrap();
+
+        assert_eq!(upserted(&out), vec![5]);
+        assert_eq!(
+            out.delete_ids,
+            point_ids(5, 5..10).into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn partial_re_embed_does_not_livelock_on_an_unembeddable_chunk() {
+        // Chunk 3 has no vector and can never exist remotely. Comparing the
+        // desired set instead of the achievable one would re-upsert this file on
+        // every sync forever.
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 4))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "ha", "a.md", 0..3);
+
+        let out = reconcile(&desired, &point_ids(1, 0..3), &remote, &base_ctx(), false).unwrap();
+
+        assert!(out.upsert_files.is_empty(), "{:?}", out.upsert_files);
+        assert!(out.delete_ids.is_empty(), "{:?}", out.delete_ids);
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(
+            out.warnings[0].contains("no embedding yet"),
+            "{}",
+            out.warnings[0]
+        );
+    }
+
+    #[test]
+    fn partial_re_embed_does_not_livelock_when_the_remote_holds_more() {
+        // An earlier sync embedded chunks 2 and 3; this one cannot. Testing set
+        // inequality instead of a subset would re-upsert forever.
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 4))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "ha", "a.md", 0..4);
+
+        let out = reconcile(&desired, &point_ids(1, 0..2), &remote, &base_ctx(), false).unwrap();
+
+        assert!(out.upsert_files.is_empty(), "{:?}", out.upsert_files);
+        // 2 and 3 are unachievable now, but their payload hash still agrees, so
+        // they are older copies of the same content and stay.
+        assert!(out.delete_ids.is_empty(), "{:?}", out.delete_ids);
+    }
+
+    #[test]
+    fn selected_file_rewrites_every_achievable_point() {
+        // The remote already holds chunks 0 and 1; the file is selected because
+        // its hash changed and must write ALL four achievable points, not the two
+        // the remote is missing. That delta is empty in the re-minted-FileId case,
+        // which would leave the old hash in place and retain stale points forever.
+        let desired = BTreeMap::from([(1, desired_file(1, "new", "a.md", 4))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "old", "a.md", 0..2);
+
+        let out = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), false).unwrap();
+
+        assert_eq!(
+            out.upsert_files,
+            vec![UpsertFile {
+                file_id: 1,
+                point_ids: point_ids(1, 0..4).into_iter().collect(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unembeddable_new_file_is_surfaced_as_an_empty_upsert() {
+        let desired = BTreeMap::from([
+            (1, desired_file(1, "ha", "a.md", 2)),
+            (2, desired_file(2, "hb", "b.md", 1)),
+        ]);
+
+        let out = reconcile(
+            &desired,
+            &point_ids(2, 0..1),
+            &BTreeMap::new(),
+            &base_ctx(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(upserted(&out), vec![1, 2]);
+        assert!(
+            out.upsert_files[0].point_ids.is_empty(),
+            "a file with nothing writable must be visible as a no-op, not a request"
+        );
+        assert_eq!(
+            out.upsert_files[1].point_ids,
+            point_ids(2, 0..1).into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_empty_remote_is_a_pure_insert() {
+        let desired: BTreeMap<FileId, DesiredFile> = (0..3usize)
+            .map(|n| (n, desired_file(n, "h", &format!("doc-{n}.md"), 2)))
+            .collect();
+
+        let out = reconcile(
+            &desired,
+            &all_ids(&desired),
+            &BTreeMap::new(),
+            &base_ctx(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(upserted(&out), vec![0, 1, 2]);
+        assert!(out.delete_ids.is_empty(), "{:?}", out.delete_ids);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn guard_a_trips_when_the_desired_set_is_empty() {
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "ha", "a.md", 0..3);
+
+        let err = reconcile(
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &remote,
+            &base_ctx(),
+            true,
+        )
+        .expect_err("an empty files map against a populated remote is lost local state");
+
+        assert!(err.to_string().contains("has no documents"), "got: {err}");
+    }
+
+    #[test]
+    fn guard_b_trips_when_the_vectors_map_is_empty() {
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 3))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "ha", "a.md", 0..3);
+        let ctx = ReconcileCtx {
+            vectors_empty: true,
+            ..base_ctx()
+        };
+
+        let err = reconcile(&desired, &BTreeSet::new(), &remote, &ctx, false)
+            .expect_err("documents without vectors is a truncated or hand-edited YAML");
+
+        assert!(err.to_string().contains("holds no vectors"), "got: {err}");
+    }
+
+    #[test]
+    fn guard_b_trips_on_the_create_arm_without_a_populated_remote() {
+        // The "remote is populated" conjunct is false by definition when the
+        // collection does not exist yet, so keeping it would let a truncated YAML
+        // create the collection, write nothing, and report success.
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 3))]);
+        let ctx = ReconcileCtx {
+            vectors_empty: true,
+            creating_collection: true,
+            ..base_ctx()
+        };
+
+        let err = reconcile(&desired, &BTreeSet::new(), &BTreeMap::new(), &ctx, true)
+            .expect_err("a truncated YAML must not create a silently empty collection");
+
+        assert!(err.to_string().contains("holds no vectors"), "got: {err}");
+    }
+
+    #[test]
+    fn guard_c_trips_on_a_foreign_ownership_marker() {
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 1))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "ha", "a.md", 0..1);
+        remote
+            .get_mut(&wire_point_id(DocumentId::new(1, 0)))
+            .unwrap()
+            .coyote_rag_id = "someone-elses-rag".to_string();
+
+        let err = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), false)
+            .expect_err("two RAGs on one collection would diff-delete each other");
+
+        let msg = err.to_string();
+        assert!(msg.contains("do not belong to this RAG"), "got: {msg}");
+        assert!(
+            msg.contains("not recoverable from inside Coyote"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ownership_is_judged_before_the_mandatory_payload_fields() {
+        // A foreign collection must report that it is foreign, not that one of
+        // its points happens to lack a `path`.
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 1))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "ha", "a.md", 0..1);
+        let point = remote
+            .get_mut(&wire_point_id(DocumentId::new(1, 0)))
+            .unwrap();
+        point.coyote_rag_id = "someone-elses-rag".to_string();
+        point.path = String::new();
+
+        let err = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), false)
+            .expect_err("a foreign collection must bail on ownership");
+
+        assert!(
+            err.to_string().contains("do not belong to this RAG"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn guard_c2_warns_and_does_not_bail() {
+        // Two machines using one owned RAG serially is legitimate; only
+        // concurrent use is mutual deletion. Bailing would break the legitimate
+        // workflow.
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 2))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "ha", "a.md", 0..2);
+        for point in remote.values_mut() {
+            point.writer_id = "another-install".to_string();
+        }
+
+        let out = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), false).unwrap();
+
+        assert!(out.delete_ids.is_empty(), "{:?}", out.delete_ids);
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(
+            out.warnings[0].contains("different Coyote install"),
+            "{}",
+            out.warnings[0]
+        );
+    }
+
+    #[test]
+    fn guard_d_trips_on_a_large_shrinkage() {
+        let mut remote = BTreeMap::new();
+        for file_id in 0..100usize {
+            scroll_file(
+                &mut remote,
+                file_id,
+                "h",
+                &format!("doc-{file_id:03}.md"),
+                0..1,
+            );
+        }
+        let desired: BTreeMap<FileId, DesiredFile> = (0..10usize)
+            .map(|n| (n, desired_file(n, "h", &format!("doc-{n:03}.md"), 1)))
+            .collect();
+
+        let err = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), false)
+            .expect_err("dropping 90 of 100 documents is unresolved source paths, not intent");
+
+        let msg = err.to_string();
+        assert!(msg.contains("delete 90 of 100 documents"), "got: {msg}");
+        assert!(
+            msg.contains("doc-010.md") && msg.contains("doc-019.md"),
+            "the message must name example paths: {msg}"
+        );
+    }
+
+    #[test]
+    fn guard_d_does_not_trip_on_a_full_rebuild_turnover() {
+        // `.rebuild rag` retires every FileId and mints a new one, so nearly every
+        // remote point is legitimately replaced while the paths are untouched.
+        // Counting points or file ids instead of paths would refuse here.
+        let mut remote = BTreeMap::new();
+        for file_id in 0..100usize {
+            scroll_file(
+                &mut remote,
+                file_id,
+                "old",
+                &format!("doc-{file_id:03}.md"),
+                0..1,
+            );
+        }
+        let desired: BTreeMap<FileId, DesiredFile> = (0..100usize)
+            .map(|n| {
+                (
+                    n + 100,
+                    desired_file(n + 100, "new", &format!("doc-{n:03}.md"), 1),
+                )
+            })
+            .collect();
+
+        let out = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), true).unwrap();
+
+        assert_eq!(out.upsert_files.len(), 100);
+        assert_eq!(out.delete_ids.len(), 100);
+    }
+
+    #[test]
+    fn guard_d_does_not_trip_when_the_corpus_grows() {
+        // The `usize` underflow catch: a plain `-` panics in debug and wraps to
+        // ~1.8e19 in release, which clears every threshold and makes guard D
+        // refuse every ordinary sync.
+        let mut remote = BTreeMap::new();
+        for file_id in 0..3usize {
+            scroll_file(
+                &mut remote,
+                file_id,
+                "h",
+                &format!("doc-{file_id:03}.md"),
+                0..1,
+            );
+        }
+        let desired: BTreeMap<FileId, DesiredFile> = (0..300usize)
+            .map(|n| (n, desired_file(n, "h", &format!("doc-{n:03}.md"), 1)))
+            .collect();
+
+        let out = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), false)
+            .expect("a growing corpus must not look like a mass deletion");
+
+        assert_eq!(out.upsert_files.len(), 297);
+        assert!(out.delete_ids.is_empty(), "{:?}", out.delete_ids);
+    }
+
+    #[test]
+    fn a_differing_embedding_model_bails() {
+        // Two models of the same width pass every dimension check and leave the
+        // collection mixing two vector spaces.
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 1))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "ha", "a.md", 0..1);
+        for point in remote.values_mut() {
+            point.embedding_model = "text-embedding-ada-002".to_string();
+        }
+
+        let err = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), false)
+            .expect_err("mixed embedding models make similarity scores meaningless");
+
+        assert!(
+            err.to_string().contains("Mixing embedding models"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_missing_embedding_model_only_warns() {
+        // Absence just means a pre-upgrade write; only divergence is corruption.
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 1))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "ha", "a.md", 0..1);
+        for point in remote.values_mut() {
+            point.embedding_model = String::new();
+        }
+
+        let out = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), false).unwrap();
+
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(
+            out.warnings[0].contains("no embedding_model marker"),
+            "{}",
+            out.warnings[0]
+        );
+    }
+
+    #[test]
+    fn points_missing_mandatory_payload_fields_bail() {
+        /// Blanks one mandatory payload field on an otherwise healthy point.
+        type Blank = fn(&mut RemotePoint);
+
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 1))]);
+        let id = wire_point_id(DocumentId::new(1, 0));
+        let blanks: [(&str, Blank); 3] = [
+            ("file_id", |point| point.file_id = None),
+            ("path", |point| point.path = String::new()),
+            ("file_hash", |point| point.file_hash = String::new()),
+        ];
+
+        for (field, blank) in blanks {
+            let mut remote = BTreeMap::new();
+            scroll_file(&mut remote, 1, "ha", "a.md", 0..1);
+            blank(remote.get_mut(&id).unwrap());
+
+            let Err(err) = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), false)
+            else {
+                panic!("a point with no `{field}` must bail, never be guessed at");
+            };
+            assert!(
+                err.to_string().contains(&format!("no `{field}`")),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_id_to_payload_file_id_cross_check_bails_on_disagreement() {
+        // Catches corrupt or foreign writes that carry the right ownership marker.
+        let desired = BTreeMap::from([(1, desired_file(1, "ha", "a.md", 1))]);
+        let mut remote = BTreeMap::new();
+        scroll_file(&mut remote, 1, "ha", "a.md", 0..1);
+        remote
+            .get_mut(&wire_point_id(DocumentId::new(1, 0)))
+            .unwrap()
+            .file_id = Some(9);
+
+        let err = reconcile(&desired, &all_ids(&desired), &remote, &base_ctx(), false)
+            .expect_err("an id and a payload that disagree must not be reconciled");
+
+        assert!(err.to_string().contains("claims file_id 9"), "got: {err}");
     }
 
     #[tokio::test]
