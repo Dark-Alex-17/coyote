@@ -29,16 +29,17 @@ use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use skill::SKILL_FUNCTION_PREFIX;
-use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::atomic::Ordering;
+use std::{collections::VecDeque, thread};
 use std::{
     collections::{HashMap, HashSet},
     env, fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 use strum_macros::AsRefStr;
 use supervisor::SUPERVISOR_FUNCTION_PREFIX;
@@ -1456,6 +1457,7 @@ pub fn run_llm_function(
     let mut child = Command::new(&cmd_name)
         .args(&cmd_args)
         .envs(envs)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1464,7 +1466,7 @@ pub fn run_llm_function(
     let stdout = child.stdout.take().expect("Failed to capture stdout");
     let stderr = child.stderr.take().expect("Failed to capture stderr");
 
-    let stdout_thread = std::thread::spawn(move || {
+    let stdout_thread = thread::spawn(move || {
         let mut buffer = [0; 1024];
         let mut reader = stdout;
         let mut out = io::stdout();
@@ -1491,7 +1493,7 @@ pub fn run_llm_function(
         buf
     });
 
-    let stderr_thread = std::thread::spawn(move || {
+    let stderr_thread = thread::spawn(move || {
         let mut buffer = [0; 1024];
         let mut reader = stderr;
         let mut err = io::stderr();
@@ -1518,9 +1520,39 @@ pub fn run_llm_function(
         buf
     });
 
-    let status = child
-        .wait()
-        .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
+    let timeout_secs = env::var("COYOTE_TOOL_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1800);
+    let deadline = (timeout_secs > 0).then(|| Instant::now() + Duration::from_secs(timeout_secs));
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(err) => bail!("Unable to run {command_name}, {err}"),
+        }
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(stdout_thread);
+            drop(stderr_thread);
+            let tool_error_message = format!(
+                "Tool call '{command_name}' timed out after {timeout_secs}s and was killed (set COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited)"
+            );
+            eprintln!(
+                "{}",
+                muted_warning_text(&format!("⚠️ {tool_error_message} ⚠️"))
+            );
+            let error_json = json!({"tool_call_error": tool_error_message});
+
+            debug!("Tool call error: {error_json:?}");
+
+            return Ok(Some(error_json.to_string()));
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
     let stdout_bytes = stdout_thread.join().unwrap_or_default();
     let stderr_bytes = stderr_thread.join().unwrap_or_default();
 

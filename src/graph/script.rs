@@ -54,6 +54,7 @@ impl ScriptExecutor {
         let mut cmd = build_command(language, &script_path)?;
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
         cmd.envs(&self.extra_envs);
         cmd.env("AUTO_CONFIRM", "true");
         match &state_repr {

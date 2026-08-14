@@ -57,11 +57,15 @@ pub trait Client: Sync + Send {
         let mut builder = ReqwestClient::builder();
         let extra = self.extra_config();
         let timeout = extra.and_then(|v| v.connect_timeout).unwrap_or(10);
+        let read_timeout = extra.and_then(|v| v.read_timeout).unwrap_or(300);
         if let Some(proxy) = extra.and_then(|v| v.proxy.as_deref()) {
             builder = set_proxy(builder, proxy)?;
         }
         if let Some(user_agent) = self.app_config().user_agent.as_ref() {
             builder = builder.user_agent(user_agent);
+        }
+        if read_timeout > 0 {
+            builder = builder.read_timeout(Duration::from_secs(read_timeout));
         }
         let client = builder
             .connect_timeout(Duration::from_secs(timeout))
@@ -261,6 +265,7 @@ impl Default for ClientConfig {
 pub struct ExtraConfig {
     pub proxy: Option<String>,
     pub connect_timeout: Option<u64>,
+    pub read_timeout: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

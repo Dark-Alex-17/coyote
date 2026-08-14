@@ -292,6 +292,7 @@ clients:
   #   extra:
   #     proxy: socks5://127.0.0.1:1080                # Set proxy
   #     connect_timeout: 10                           # Set timeout in seconds for connect to api
+  #     read_timeout: 300                             # Set timeout in seconds for a read stall (no bytes received); 0 disables (default: 300)
 
   # See https://platform.openai.com/docs/quickstart
   - type: openai

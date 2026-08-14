@@ -31,7 +31,7 @@ settings:
   max_loop_iterations: 20
   log_state_snapshots: true
   validate_before_run: true
-  timeout: 1800
+  timeout: 14400
 
 initial_state:
   project_dir: ''
@@ -90,6 +90,7 @@ nodes:
       Project directory: {{project_dir}}
     prompt: '{{initial_prompt}}'
     tools: []
+    timeout: 300
     output_schema:
       type: object
       properties:
@@ -254,6 +255,7 @@ nodes:
       - fs_patch
       - execute_command
     max_iterations: 100
+    timeout: 1800
     state_updates:
       last_node_output: '{{output}}'
     fallback: end_failure
@@ -327,6 +329,7 @@ nodes:
       - fs_ls
       - execute_command
     max_iterations: 15
+    timeout: 600
     output_schema:
       type: object
       properties:

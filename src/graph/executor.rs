@@ -250,7 +250,30 @@ impl GraphExecutor {
                 branch_tasks.push(task);
             }
 
-            let joined = join_all(branch_tasks).await;
+            let joined = match graph_timeout {
+                Some(t) => {
+                    let remaining = t.saturating_sub(start.elapsed());
+                    let abort_handles: Vec<_> = branch_tasks
+                        .iter()
+                        .map(|task| task.abort_handle())
+                        .collect();
+                    match tokio::time::timeout(remaining, join_all(branch_tasks)).await {
+                        Ok(joined) => joined,
+                        Err(_) => {
+                            for handle in abort_handles {
+                                handle.abort();
+                            }
+                            bail!(
+                                "Graph '{}' timed out after {}s during super-step with frontier {:?}",
+                                graph.name,
+                                t.as_secs(),
+                                sorted_frontier(&frontier)
+                            );
+                        }
+                    }
+                }
+                None => join_all(branch_tasks).await,
+            };
 
             let mut branch_writes: Vec<BranchWrites> = Vec::new();
             let mut next_frontier: HashSet<String> = HashSet::new();
@@ -792,5 +815,45 @@ nodes:
             err.contains("end_a") && err.contains("end_b"),
             "error should list both End nodes: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn graph_timeout_interrupts_in_flight_super_step() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("sleeper.sh", "#!/bin/bash\nsleep 10\necho '{}'\n");
+
+        let yaml = r#"
+name: inflight_timeout_test
+start: sleeper
+settings:
+  timeout: 1
+nodes:
+  sleeper:
+    type: script
+    script: sleeper.sh
+    state_updates: {}
+    next: done
+  done:
+    type: end
+    output: "done"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await;
+
+        assert!(result.is_err(), "expected in-flight timeout to error");
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("timed out after 1s during super-step"),
+            "error should report during-super-step timeout: {err}"
+        );
+        assert!(err.contains("sleeper"), "error should name frontier: {err}");
     }
 }

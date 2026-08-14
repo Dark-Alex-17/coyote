@@ -430,10 +430,7 @@ mod tests {
         assert!(error_message.contains("test_function_loop"));
     }
 
-    fn new_handler() -> (
-        SseHandler,
-        tokio::sync::mpsc::UnboundedReceiver<SseEvent>,
-    ) {
+    fn new_handler() -> (SseHandler, tokio::sync::mpsc::UnboundedReceiver<SseEvent>) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let abort_signal = crate::utils::create_abort_signal();
         (SseHandler::new(sender, abort_signal), receiver)

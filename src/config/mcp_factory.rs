@@ -103,18 +103,16 @@ impl McpFactory {
         }
 
         let (auth, auth_reason) = resolve_http_auth(name, spec).await;
-        let handle = spawn_mcp_server(spec, log_path, auth)
-            .await
-            .map_err(|e| {
-                if is_auth_required_error(&e) {
-                    e.context(McpAuthRequired {
-                        server: name.to_string(),
-                        reason: auth_reason,
-                    })
-                } else {
-                    e
-                }
-            })?;
+        let handle = spawn_mcp_server(spec, log_path, auth).await.map_err(|e| {
+            if is_auth_required_error(&e) {
+                e.context(McpAuthRequired {
+                    server: name.to_string(),
+                    reason: auth_reason,
+                })
+            } else {
+                e
+            }
+        })?;
         self.insert_active(key, &handle);
         Ok(handle)
     }
