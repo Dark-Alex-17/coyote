@@ -176,6 +176,14 @@ impl SseHandler {
         self.thinking.push(block);
     }
 
+    /// Whether any output (text, tool calls, or thinking blocks) has been
+    /// accumulated. `Client::chat_completions_streaming` gates its 401 retry
+    /// on this: content already streamed to the user would be rendered a
+    /// second time by a retry, so partial responses are never retried.
+    pub fn has_received_content(&self) -> bool {
+        !self.buffer.is_empty() || !self.tool_calls.is_empty() || !self.thinking.is_empty()
+    }
+
     pub fn abort(&self) -> AbortSignal {
         self.abort_signal.clone()
     }
@@ -420,6 +428,46 @@ mod tests {
         let error_message = result.unwrap_err().to_string();
         assert!(error_message.contains("Call loop detected!"));
         assert!(error_message.contains("test_function_loop"));
+    }
+
+    fn new_handler() -> (
+        SseHandler,
+        tokio::sync::mpsc::UnboundedReceiver<SseEvent>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let abort_signal = crate::utils::create_abort_signal();
+        (SseHandler::new(sender, abort_signal), receiver)
+    }
+
+    #[test]
+    fn test_has_received_content_text() {
+        let (mut handler, _rx) = new_handler();
+        assert!(!handler.has_received_content());
+
+        handler.text("hello").unwrap();
+        assert!(handler.has_received_content());
+    }
+
+    #[test]
+    fn test_has_received_content_tool_call() {
+        let (mut handler, _rx) = new_handler();
+        assert!(!handler.has_received_content());
+
+        let call = ToolCall::new("test_function".to_string(), json!({"param": 1}), None);
+        handler.tool_call(call).unwrap();
+        assert!(handler.has_received_content());
+    }
+
+    #[test]
+    fn test_has_received_content_thinking() {
+        let (mut handler, _rx) = new_handler();
+        assert!(!handler.has_received_content());
+
+        handler.thinking_block(ThinkingBlock::Thinking {
+            thinking: "hmm".to_string(),
+            signature: "sig".to_string(),
+        });
+        assert!(handler.has_received_content());
     }
 
     fn split_chunks(text: &str) -> Vec<Vec<u8>> {

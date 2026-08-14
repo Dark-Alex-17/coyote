@@ -63,7 +63,6 @@ pub fn set_access_token(
 /// not it matched `rejected`) — i.e. the client is token-authed and a retry
 /// after refresh is worthwhile. Returns false when there is no entry
 /// (API-key clients).
-#[allow(dead_code)] // Called by the 401-retry path once it lands.
 pub fn distrust_access_token(client_name: &str, rejected: &str) -> bool {
     let mut access_tokens = ACCESS_TOKENS.write();
     let (token, _, _) = match access_tokens.get(client_name) {

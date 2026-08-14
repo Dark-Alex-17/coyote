@@ -1,5 +1,6 @@
 use super::*;
 
+use super::access_token::{distrust_access_token, get_access_token};
 use crate::config::{RenderMode, paths};
 use crate::{
     config::{AppConfig, Input, RequestContext},
@@ -69,6 +70,11 @@ pub trait Client: Sync + Send {
         Ok(client)
     }
 
+    /// On a 401 the cached access token is distrusted and the call retried
+    /// exactly once; the retry re-runs the per-client prepare step, which
+    /// sees the rejection marker, force-refreshes the token, and rebuilds
+    /// the whole request. A second 401 propagates the original error; any
+    /// other retry failure propagates as-is.
     async fn chat_completions(&self, input: Input) -> Result<ChatCompletionsOutput> {
         if self.app_config().dry_run {
             let content = input.echo_messages();
@@ -76,11 +82,30 @@ pub trait Client: Sync + Send {
         }
         let client = self.build_client()?;
         let data = input.prepare_completion_data(self.model(), false)?;
-        self.chat_completions_inner(&client, data)
-            .await
-            .with_context(|| "Failed to call chat-completions api")
+        let err = match self.chat_completions_inner(&client, data).await {
+            Ok(output) => return Ok(output),
+            Err(err) => err,
+        };
+        let ret = if should_retry_auth(&err, self.name()) {
+            debug!(
+                "provider '{}' rejected access token (401); refreshing and retrying once",
+                self.name()
+            );
+            let data = input.prepare_completion_data(self.model(), false)?;
+            match self.chat_completions_inner(&client, data).await {
+                Err(retry_err) if is_auth_error(&retry_err) => Err(err),
+                ret => ret,
+            }
+        } else {
+            Err(err)
+        };
+        ret.with_context(|| "Failed to call chat-completions api")
     }
 
+    /// Same retry-once-on-401 semantics as [`Self::chat_completions`], but
+    /// only while the handler has received nothing yet: retrying after
+    /// partial output has streamed would render it to the user twice. The
+    /// retry lives inside the same `select!` arm so abort stays responsive.
     async fn chat_completions_streaming(
         &self,
         input: &Input,
@@ -97,7 +122,22 @@ pub trait Client: Sync + Send {
                 }
                 let client = self.build_client()?;
                 let data = input.prepare_completion_data(self.model(), true)?;
-                self.chat_completions_streaming_inner(&client, handler, data).await
+                let err = match self.chat_completions_streaming_inner(&client, handler, data).await {
+                    Ok(()) => return Ok(()),
+                    Err(err) => err,
+                };
+                if handler.has_received_content() || !should_retry_auth(&err, self.name()) {
+                    return Err(err);
+                }
+                debug!(
+                    "provider '{}' rejected access token (401); refreshing and retrying once",
+                    self.name()
+                );
+                let data = input.prepare_completion_data(self.model(), true)?;
+                match self.chat_completions_streaming_inner(&client, handler, data).await {
+                    Err(retry_err) if is_auth_error(&retry_err) => Err(err),
+                    ret => ret,
+                }
             } => {
                 handler.done();
                 ret.with_context(|| "Failed to call chat-completions api")
@@ -109,11 +149,27 @@ pub trait Client: Sync + Send {
         }
     }
 
+    /// Same retry-once-on-401 semantics as [`Self::chat_completions`]
+    /// (gemini OAuth embeddings route here).
     async fn embeddings(&self, data: &EmbeddingsData) -> Result<Vec<Vec<f32>>> {
         let client = self.build_client()?;
-        self.embeddings_inner(&client, data)
-            .await
-            .context("Failed to call embeddings api")
+        let err = match self.embeddings_inner(&client, data).await {
+            Ok(output) => return Ok(output),
+            Err(err) => err,
+        };
+        let ret = if should_retry_auth(&err, self.name()) {
+            debug!(
+                "provider '{}' rejected access token (401); refreshing and retrying once",
+                self.name()
+            );
+            match self.embeddings_inner(&client, data).await {
+                Err(retry_err) if is_auth_error(&retry_err) => Err(err),
+                ret => ret,
+            }
+        } else {
+            Err(err)
+        };
+        ret.context("Failed to call embeddings api")
     }
 
     async fn rerank(&self, data: &RerankData) -> Result<RerankOutput> {
@@ -559,7 +615,6 @@ pub async fn noop_rerank(_builder: RequestBuilder, _model: &Model) -> Result<Rer
 
 #[derive(Debug)]
 pub struct ApiStatusError {
-    #[allow(unused)]
     pub status: u16,
     pub message: String,
 }
@@ -571,6 +626,33 @@ impl std::fmt::Display for ApiStatusError {
 }
 
 impl std::error::Error for ApiStatusError {}
+
+/// True when the error chain bottoms out in an [`ApiStatusError`] with
+/// status 401 EXACTLY. 403 (entitlement) and 429 (rate limit) are never
+/// auth failures, and message text is never inspected.
+fn is_auth_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ApiStatusError>()
+        .is_some_and(|api_err| api_err.status == 401)
+}
+
+/// Decides whether a 401 from `client_name` warrants a single retry after a
+/// forced token refresh: the error must be a 401 [`ApiStatusError`], and the
+/// client must have a cached access token to distrust (API-key clients have
+/// none and never retry). Distrusting marks the exact rejected token so the
+/// retry's prepare step force-refreshes it. There is deliberately no backoff:
+/// the blast radius is bounded at one extra request per user-visible call.
+///
+/// Note: vertexai shares the ACCESS_TOKENS cache, so a 401 there also
+/// triggers distrust+retry — deliberate.
+fn should_retry_auth(err: &anyhow::Error, client_name: &str) -> bool {
+    if !is_auth_error(err) {
+        return false;
+    }
+    let Ok(token) = get_access_token(client_name) else {
+        return false;
+    };
+    distrust_access_token(client_name, &token)
+}
 
 pub fn catch_error(data: &Value, status: u16) -> Result<()> {
     if (200..300).contains(&status) {
@@ -760,6 +842,8 @@ fn prompt_input_string(desc: &str, required: bool, help_message: Option<&str>) -
 mod tests {
     use super::*;
 
+    use super::super::access_token::{is_rejected, set_access_token};
+
     fn catch_error_message(data: &Value, status: u16) -> String {
         catch_error(data, status).unwrap_err().to_string()
     }
@@ -858,5 +942,67 @@ mod tests {
         let data = json!({"errors": [{"code": 7000, "message": "No route"}]});
         let err = catch_error(&data, 429).unwrap_err();
         assert_eq!(err.downcast_ref::<ApiStatusError>().unwrap().status, 429);
+    }
+
+    /// Wrapped in `.context(...)` so every test below proves the downcast
+    /// works through an anyhow context chain, as in the trait methods.
+    fn api_status_error(status: u16) -> anyhow::Error {
+        anyhow::Error::new(ApiStatusError {
+            status,
+            message: format!("error (status: {status})"),
+        })
+        .context("Failed to call chat-completions api")
+    }
+
+    fn cache_token(client: &str, token: &str) {
+        set_access_token(
+            client,
+            token.into(),
+            chrono::Utc::now().timestamp() + 3600,
+            None,
+        );
+    }
+
+    #[test]
+    fn test_should_retry_auth_401_with_cached_token() {
+        let client = "should-retry-auth-401";
+        cache_token(client, "at-1");
+
+        assert!(should_retry_auth(&api_status_error(401), client));
+        assert!(is_rejected(client, "at-1"), "rejected marker not set");
+    }
+
+    #[test]
+    fn test_should_retry_auth_non_401_statuses() {
+        let client = "should-retry-auth-non-401";
+        cache_token(client, "at-1");
+
+        for status in [403, 429, 500] {
+            assert!(
+                !should_retry_auth(&api_status_error(status), client),
+                "retried on {status}"
+            );
+        }
+        assert_eq!(get_access_token(client).unwrap(), "at-1");
+        assert!(!is_rejected(client, "at-1"), "marker set without a 401");
+    }
+
+    #[test]
+    fn test_should_retry_auth_non_api_status_error() {
+        let client = "should-retry-auth-non-api";
+        cache_token(client, "at-1");
+
+        let err = anyhow::anyhow!("connection reset").context("Failed to call embeddings api");
+        assert!(!should_retry_auth(&err, client));
+        assert_eq!(get_access_token(client).unwrap(), "at-1");
+        assert!(!is_rejected(client, "at-1"));
+    }
+
+    #[test]
+    fn test_should_retry_auth_401_without_cached_token() {
+        let client = "should-retry-auth-no-token";
+
+        assert!(!should_retry_auth(&api_status_error(401), client));
+        assert!(!is_rejected(client, "at-1"));
     }
 }
