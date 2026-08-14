@@ -1,6 +1,7 @@
+use crate::mcp::oauth::McpTokenStatus;
 use crate::mcp::{
-    ConnectedServer, JsonField, McpServer, McpTransportType, is_auth_required_error, oauth,
-    spawn_mcp_server,
+    ConnectedServer, JsonField, McpAuthReason, McpAuthRequired, McpServer, McpTransportType,
+    is_auth_required_error, oauth, spawn_mcp_server,
 };
 
 use anyhow::Result;
@@ -102,19 +103,20 @@ impl McpFactory {
             return Ok(existing);
         }
 
-        let bearer_token = if spec.is_remote() {
+        let token_status = if spec.is_remote() {
             oauth::load_or_refresh_mcp_token(name).await
         } else {
-            None
+            McpTokenStatus::NotAuthenticated
         };
-        let handle = spawn_mcp_server(spec, log_path, bearer_token)
+        let auth_reason = McpAuthReason::from_token_status(&token_status);
+        let handle = spawn_mcp_server(spec, log_path, token_status.into_token())
             .await
             .map_err(|e| {
                 if is_auth_required_error(&e) {
-                    e.context(format!(
-                        "MCP server '{name}' requires OAuth authentication. \
-                         Run `coyote --auth-mcp {name}` or `.mcp auth {name}` in the REPL to authenticate."
-                    ))
+                    e.context(McpAuthRequired {
+                        server: name.to_string(),
+                        reason: auth_reason,
+                    })
                 } else {
                     e
                 }

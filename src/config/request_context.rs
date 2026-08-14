@@ -22,7 +22,7 @@ use crate::function::{
 };
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
-    MCP_SEARCH_META_FUNCTION_NAME_PREFIX, is_auth_required_error,
+    MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired, is_auth_required_error,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -3427,7 +3427,11 @@ impl RequestContext {
                             {
                                 Ok(handle) => handles.push((id.clone(), handle)),
                                 Err(e) if is_auth_required_error(&e) => {
-                                    auth_required.push(id.clone())
+                                    let reason = e
+                                        .downcast_ref::<McpAuthRequired>()
+                                        .map(|a| a.reason)
+                                        .unwrap_or(McpAuthReason::NotAuthenticated);
+                                    auth_required.push((id.clone(), reason));
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -3444,11 +3448,8 @@ impl RequestContext {
                 for (id, handle) in handles {
                     mcp_runtime.insert(id, handle);
                 }
-                for id in auth_required {
-                    eprintln!(
-                        "Warning: MCP server '{id}' requires OAuth authentication and was not started. \
-                         Run `.mcp auth {id}` (or `coyote --auth-mcp {id}`) to authenticate and attach it."
-                    );
+                for (id, reason) in auth_required {
+                    eprintln!("Warning: {}", McpAuthRequired { server: id, reason });
                 }
             }
         }

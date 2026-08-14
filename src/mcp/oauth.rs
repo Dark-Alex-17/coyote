@@ -202,34 +202,54 @@ pub async fn run_mcp_oauth_flow(
     run_oauth_flow(&provider, &mcp_token_key(server_name)).await
 }
 
-pub async fn load_or_refresh_mcp_token(server_name: &str) -> Option<String> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum McpTokenStatus {
+    Token(String),
+    NotAuthenticated,
+    RefreshFailed,
+}
+
+impl McpTokenStatus {
+    pub fn into_token(self) -> Option<String> {
+        match self {
+            Self::Token(token) => Some(token),
+            Self::NotAuthenticated | Self::RefreshFailed => None,
+        }
+    }
+}
+
+pub async fn load_or_refresh_mcp_token(server_name: &str) -> McpTokenStatus {
     let key = mcp_token_key(server_name);
-    let tokens = load_oauth_tokens(&key)?;
+    let Some(tokens) = load_oauth_tokens(&key) else {
+        return McpTokenStatus::NotAuthenticated;
+    };
     if Utc::now().timestamp() < tokens.expires_at {
-        return Some(tokens.access_token);
+        return McpTokenStatus::Token(tokens.access_token);
     }
 
     if in_refresh_failure_backoff(server_name) {
         debug!("Skipping token refresh for MCP server '{server_name}': recent attempt failed");
-        return None;
+        return McpTokenStatus::RefreshFailed;
     }
 
     let lock = refresh_lock(server_name);
     let _guard = lock.lock().await;
 
     // A concurrent caller may have refreshed while we waited for the lock.
-    let tokens = load_oauth_tokens(&key)?;
+    let Some(tokens) = load_oauth_tokens(&key) else {
+        return McpTokenStatus::NotAuthenticated;
+    };
     if Utc::now().timestamp() < tokens.expires_at {
-        return Some(tokens.access_token);
+        return McpTokenStatus::Token(tokens.access_token);
     }
 
     if in_refresh_failure_backoff(server_name) {
         debug!("Skipping token refresh for MCP server '{server_name}': recent attempt failed");
-        return None;
+        return McpTokenStatus::RefreshFailed;
     }
 
     match refresh_mcp_token(server_name, &key, &tokens).await {
-        Ok(access_token) => Some(access_token),
+        Ok(access_token) => McpTokenStatus::Token(access_token),
         Err(e) => {
             note_refresh_failure(server_name);
             warn!(
@@ -240,7 +260,7 @@ pub async fn load_or_refresh_mcp_token(server_name: &str) -> Option<String> {
                 "Token refresh error for MCP server '{server_name}': {}",
                 redact_refresh_error(&e)
             );
-            None
+            McpTokenStatus::RefreshFailed
         }
     }
 }
@@ -975,7 +995,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn expired_token_with_old_format_registration_returns_none() {
+    fn expired_token_with_old_format_registration_reports_refresh_failed() {
         with_temp_cache(|| {
             let dir = paths::oauth_tokens_dir();
             fs::create_dir_all(&dir).unwrap();
@@ -994,10 +1014,34 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let token = rt.block_on(load_or_refresh_mcp_token("legacyref"));
+            let status = rt.block_on(load_or_refresh_mcp_token("legacyref"));
 
-            assert_eq!(token, None);
+            assert_eq!(status, McpTokenStatus::RefreshFailed);
         });
+    }
+
+    #[test]
+    #[serial]
+    fn missing_token_file_reports_not_authenticated() {
+        with_temp_cache(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let status = rt.block_on(load_or_refresh_mcp_token("never-authed"));
+
+            assert_eq!(status, McpTokenStatus::NotAuthenticated);
+        });
+    }
+
+    #[test]
+    fn token_status_into_token_extracts_only_token_variant() {
+        assert_eq!(
+            McpTokenStatus::Token("tok".into()).into_token(),
+            Some("tok".to_string())
+        );
+        assert_eq!(McpTokenStatus::NotAuthenticated.into_token(), None);
+        assert_eq!(McpTokenStatus::RefreshFailed.into_token(), None);
     }
 
     #[test]

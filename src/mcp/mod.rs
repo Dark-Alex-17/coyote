@@ -21,6 +21,8 @@ use rmcp::{RoleClient, ServiceExt};
 use serde::{Deserialize, Serialize};
 use sse_transport::LegacySseTransport;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::fmt::Display;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -326,23 +328,29 @@ impl McpRegistry {
             .and_then(|c| c.mcp_servers.get(&id))
             .with_context(|| format!("MCP server not found in config: {id}"))?;
 
-        let bearer_token = if spec.is_remote() {
+        let token_status = if spec.is_remote() {
             oauth::load_or_refresh_mcp_token(&id).await
         } else {
-            None
+            oauth::McpTokenStatus::NotAuthenticated
         };
+        let auth_reason = McpAuthReason::from_token_status(&token_status);
 
-        let service = match spawn_mcp_server(spec, self.log_path.as_deref(), bearer_token).await {
-            Ok(s) => s,
-            Err(e) if is_auth_required_error(&e) => {
-                warn!(
-                    "MCP server '{id}' requires OAuth authentication. \
-                     Run `coyote --auth-mcp {id}` or `.mcp auth {id}` in the REPL to authenticate."
-                );
-                return Ok(None);
-            }
-            Err(e) => return Err(e),
-        };
+        let service =
+            match spawn_mcp_server(spec, self.log_path.as_deref(), token_status.into_token()).await
+            {
+                Ok(s) => s,
+                Err(e) if is_auth_required_error(&e) => {
+                    warn!(
+                        "{}",
+                        McpAuthRequired {
+                            server: id,
+                            reason: auth_reason,
+                        }
+                    );
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
 
         let tools = service.list_tools(None).await?;
         debug!("Available tools for MCP server {id}: {tools:?}");
@@ -458,9 +466,59 @@ fn merge_bearer_token(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum McpAuthReason {
+    NotAuthenticated,
+    RefreshFailed,
+    TokenRejected,
+}
+
+impl McpAuthReason {
+    pub(crate) fn from_token_status(status: &oauth::McpTokenStatus) -> Self {
+        match status {
+            oauth::McpTokenStatus::Token(_) => Self::TokenRejected,
+            oauth::McpTokenStatus::NotAuthenticated => Self::NotAuthenticated,
+            oauth::McpTokenStatus::RefreshFailed => Self::RefreshFailed,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct McpAuthRequired {
+    pub server: String,
+    pub reason: McpAuthReason,
+}
+
+impl Display for McpAuthRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let server = &self.server;
+        match self.reason {
+            McpAuthReason::NotAuthenticated => write!(
+                f,
+                "MCP server '{server}' requires OAuth authentication and was not started \
+                 (no stored credentials). Run `.mcp auth {server}` (or `coyote --auth-mcp \
+                 {server}`) to authenticate and attach it."
+            ),
+            McpAuthReason::RefreshFailed => write!(
+                f,
+                "MCP server '{server}' was not started: stored OAuth token has expired and \
+                 automatic refresh failed. Run `.mcp auth {server}` (or `coyote --auth-mcp \
+                 {server}`) to re-authenticate and attach it."
+            ),
+            McpAuthReason::TokenRejected => write!(
+                f,
+                "MCP server '{server}' was not started: the server rejected the stored OAuth \
+                 token. Run `.mcp auth {server}` (or `coyote --auth-mcp {server}`) to \
+                 re-authenticate and attach it."
+            ),
+        }
+    }
+}
+
 pub(crate) fn is_auth_required_error(e: &Error) -> bool {
-    e.chain()
-        .any(|cause| cause.to_string().contains("Auth required"))
+    e.downcast_ref::<McpAuthRequired>().is_some()
+        || e.chain()
+            .any(|cause| cause.to_string().contains("Auth required"))
 }
 
 async fn spawn_http_mcp_server(
@@ -1073,5 +1131,49 @@ mod tests {
         );
 
         assert!(is_auth_required_error(&e));
+    }
+
+    #[test]
+    fn auth_reason_maps_token_status() {
+        assert_eq!(
+            McpAuthReason::from_token_status(&oauth::McpTokenStatus::Token("tok".into())),
+            McpAuthReason::TokenRejected
+        );
+        assert_eq!(
+            McpAuthReason::from_token_status(&oauth::McpTokenStatus::NotAuthenticated),
+            McpAuthReason::NotAuthenticated
+        );
+        assert_eq!(
+            McpAuthReason::from_token_status(&oauth::McpTokenStatus::RefreshFailed),
+            McpAuthReason::RefreshFailed
+        );
+    }
+
+    #[test]
+    fn mcp_auth_required_context_downcasts_with_reason() {
+        let e = anyhow!("Auth required, when send initialize request").context(McpAuthRequired {
+            server: "github".into(),
+            reason: McpAuthReason::RefreshFailed,
+        });
+
+        assert!(is_auth_required_error(&e));
+        let ctx = e.downcast_ref::<McpAuthRequired>().unwrap();
+        assert_eq!(ctx.server, "github");
+        assert_eq!(ctx.reason, McpAuthReason::RefreshFailed);
+    }
+
+    #[test]
+    fn mcp_auth_required_display_is_reason_specific() {
+        let msg = |reason| {
+            McpAuthRequired {
+                server: "github".into(),
+                reason,
+            }
+            .to_string()
+        };
+
+        assert!(msg(McpAuthReason::NotAuthenticated).contains("no stored credentials"));
+        assert!(msg(McpAuthReason::RefreshFailed).contains("expired and automatic refresh failed"));
+        assert!(msg(McpAuthReason::TokenRejected).contains("rejected the stored OAuth token"));
     }
 }
