@@ -528,7 +528,11 @@ guard_operation() {
 # +    print(f"Hello {name}")
 patch_file() {
   awk '
-    FNR == NR {
+    function isHeaderPair(i) {
+      return (patchLines[i] ~ /^--- / && patchLines[i+1] ~ /^\+\+\+ / && patchLines[i+2] ~ /^@@/)
+    }
+
+    FILENAME == ARGV[1] {
       lines[FNR] = $0
       next;
     }
@@ -547,11 +551,6 @@ patch_file() {
       while (patchLineIndex <= totalPatchLines) {
         line = patchLines[patchLineIndex]
 
-        if (line ~ /^--- / || line ~ /^\+\+\+ /) {
-          patchLineIndex++
-          continue
-        }
-
         if (line ~ /^@@/) {
           mode = "hunk"
           hunkIndex++
@@ -560,7 +559,22 @@ patch_file() {
         }
 
         if (mode == "hunk") {
-          while (patchLineIndex <= totalPatchLines && line ~ /^[-+ ]|^\s*$/ && line !~ /^--- /) {
+          while (patchLineIndex <= totalPatchLines) {
+            line = patchLines[patchLineIndex]
+
+            if (line ~ /^\\ No newline/) {
+              patchLineIndex++
+              continue
+            }
+
+            if (isHeaderPair(patchLineIndex)) {
+              break
+            }
+
+            if (line !~ /^[-+ ]/ && line !~ /^[ \t]*$/) {
+              break
+            }
+
             sanitizedLine = substr(line, 2)
 
             if (line !~ /^\+/) {
@@ -574,13 +588,37 @@ patch_file() {
             }
 
             patchLineIndex++
-            line = patchLines[patchLineIndex]
           }
 
           mode = "none"
-        } else {
-          patchLineIndex++
+          continue
         }
+
+        if (isHeaderPair(patchLineIndex)) {
+          patchLineIndex += 2
+          continue
+        }
+
+        if (line ~ /^\\ No newline/) {
+          patchLineIndex++
+          continue
+        }
+
+        if (hunkIndex == 0) {
+          # Preamble before the first hunk: tolerate prose, code fences, and lone headers.
+          patchLineIndex++
+          continue
+        }
+
+        if (line ~ /^[ \t]*$/ || line ~ /^```/) {
+          patchLineIndex++
+          continue
+        }
+
+        print "error: unrecognized line in patch (line " patchLineIndex "): " line > "/dev/stderr"
+        print "" > "/dev/stderr"
+        print "Every line inside a hunk must start with \" \" (context), \"-\" (removal), or \"+\" (addition)." > "/dev/stderr"
+        exit 1
       }
 
       if (hunkIndex == 0) {
@@ -593,6 +631,36 @@ patch_file() {
       }
 
       totalHunks = hunkIndex
+
+      if (totalLines == 0) {
+        for (h = 1; h <= totalHunks; h++) {
+          if (hunkTotalOriginalLines[h] > 0) {
+            print "error: unable to apply patch" > "/dev/stderr"
+            print "" > "/dev/stderr"
+            print "Hunk " h " expects existing content but the file is empty." > "/dev/stderr"
+            exit 1
+          }
+        }
+
+        for (h = 1; h <= totalHunks; h++) {
+          for (i = 1; i <= hunkTotalUpdatedLines[h]; i++) {
+            print hunkUpdatedLines[h,i]
+          }
+        }
+
+        exit 0
+      }
+
+      for (h = 1; h <= totalHunks; h++) {
+        if (hunkTotalOriginalLines[h] == 0) {
+          print "error: unable to apply patch" > "/dev/stderr"
+          print "" > "/dev/stderr"
+          print "Hunk " h " contains no context or removed lines; include at least one" > "/dev/stderr"
+          print "context line so the hunk can be anchored." > "/dev/stderr"
+          exit 1
+        }
+      }
+
       hunkIndex = 1
 
       for (lineIndex = 1; lineIndex <= totalLines; lineIndex++) {
@@ -603,7 +671,7 @@ patch_file() {
           nextLineIndex = lineIndex + 1
 
           for (i = 2; i <= hunkTotalOriginalLines[hunkIndex]; i++) {
-            if (lines[nextLineIndex] != hunkOriginalLines[hunkIndex,i]) {
+            if (nextLineIndex > totalLines || lines[nextLineIndex] != hunkOriginalLines[hunkIndex,i]) {
               if (i - 1 > bestPartialLen[hunkIndex]) {
                 bestPartialLen[hunkIndex] = i - 1
                 bestPartialAnchorLine[hunkIndex] = lineIndex
@@ -646,9 +714,13 @@ patch_file() {
             print "" > "/dev/stderr"
             print "Closest match: anchored at file line " bestPartialAnchorLine[failingHunk] ", matched " bestPartialLen[failingHunk] " of " hunkTotalOriginalLines[failingHunk] " original lines before diverging." > "/dev/stderr"
             print "" > "/dev/stderr"
-            print "At file line " bestPartialDivergeLine[failingHunk] " (hunk original line " bestPartialHunkPos[failingHunk] "):" > "/dev/stderr"
-            print "  expected: " bestPartialExpected[failingHunk] > "/dev/stderr"
-            print "  actual:   " bestPartialActual[failingHunk] > "/dev/stderr"
+            if (bestPartialDivergeLine[failingHunk] > totalLines) {
+              print "The hunk expects additional lines beyond the end of the file (file has " totalLines " lines)." > "/dev/stderr"
+            } else {
+              print "At file line " bestPartialDivergeLine[failingHunk] " (hunk original line " bestPartialHunkPos[failingHunk] "):" > "/dev/stderr"
+              print "  expected: " bestPartialExpected[failingHunk] > "/dev/stderr"
+              print "  actual:   " bestPartialActual[failingHunk] > "/dev/stderr"
+            }
           }
 
           print "" > "/dev/stderr"

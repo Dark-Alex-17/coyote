@@ -23,6 +23,7 @@ pub fn generate_bash_declarations(
         "",
         env::var("TERM_WIDTH").ok().and_then(|v| v.parse().ok()),
     )?;
+    let build_script = allow_empty_required_values(&build_script);
     fs::write(tools_file_path, &build_script)
         .with_context(|| format!("Failed to write built script to '{tools_file_path:?}'"))?;
 
@@ -72,6 +73,20 @@ fn command_to_function_declaration(cmd: &CommandValue) -> Option<FunctionDeclara
 
 fn underscore(s: &str) -> String {
     s.replace('-', "_")
+}
+
+/// argc's generated required-param check uses `-z "${!name:-}"`, which
+/// conflates "not provided" with "provided but empty", so a required option
+/// passed an explicit empty string (e.g. `fs_write --content=''` to create an
+/// empty file) is rejected as "required arguments were not provided". The
+/// JSON schema we advertise to models treats `required` as *presence*, so
+/// rewrite the check to a set-ness test to keep runtime behavior consistent
+/// with the schema. Applied post-build so it survives every regeneration.
+fn allow_empty_required_values(build_script: &str) -> String {
+    build_script.replace(
+        r#"if [[ -z "${!name:-}" ]]; then"#,
+        r#"if [[ -z "${!name+x}" ]]; then"#,
+    )
 }
 
 fn schema_ty(t: &str) -> JsonSchema {
@@ -145,5 +160,25 @@ fn parse_parameters_schema(flags: &[FlagOptionValue]) -> JsonSchema {
         enum_value: None,
         default: None,
         required: Some(required),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_argc_required_check_to_setness_test() {
+        let src = "# @describe test tool\n# @option --content! The content\nmain() { :; }\n";
+        let built = argc::build(src, "", None).expect("argc build failed");
+        assert!(
+            built.contains(r#"if [[ -z "${!name:-}" ]]; then"#),
+            "argc changed its generated required-param template; update allow_empty_required_values()"
+        );
+
+        let fixed = allow_empty_required_values(&built);
+
+        assert!(fixed.contains(r#"if [[ -z "${!name+x}" ]]; then"#));
+        assert!(!fixed.contains(r#"if [[ -z "${!name:-}" ]]; then"#));
     }
 }

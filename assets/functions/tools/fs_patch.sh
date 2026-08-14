@@ -14,6 +14,11 @@ set -e
 #   is the most common cause of "unable to apply patch" failures, especially in files with sed/jq/regex pipelines or
 #   embedded Python with quoted strings.
 # - Hunks are applied in order; the first hunk that fails aborts the whole patch — later hunks are NOT attempted.
+# - Hunks anchor at the FIRST exact match of their context in the file, so include enough context to make each hunk
+#   unique. Hunks must appear in file order.
+# - Every hunk needs at least one context or removed line to anchor it; a hunk containing only additions is an error.
+# - Unrecognized lines inside a hunk are hard errors: every hunk line must start with ' ' (context), '-' (removal),
+#   or '+' (addition).
 # - If you've edited this file in earlier tool calls, fs_cat it again before composing the patch. A stale view of the file
 #   produces context lines that no longer match.
 # - On failure the error message names the failing hunk and shows the expected-vs-actual line. Fix that specific line and
@@ -50,6 +55,14 @@ main() {
 		# status so a failure still aborts under `set -e`.
 		new_contents="$(patch_file "$argc_path" <(printf "%s" "$argc_contents"); rc=$?; printf x; exit "$rc")"
 		new_contents="${new_contents%x}"
+
+		# awk newline-terminates every printed line, so patching a file that lacks
+		# a final newline would silently add one. Preserve the original file's
+		# final-newline state instead.
+		if [[ -n "$(tail -c 1 "$argc_path")" ]]; then
+			new_contents="${new_contents%$'\n'}"
+		fi
+
     printf "%s" "$new_contents" | git diff --no-index "$argc_path" - || true
 
     guard_operation "Apply changes?"
