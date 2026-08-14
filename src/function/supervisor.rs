@@ -85,7 +85,17 @@ pub fn check_pending_agents_guardrail(ctx: &mut RequestContext) -> GuardrailActi
     }
 
     ctx.pending_agents_guardrail_count += 1;
-    GuardrailAction::Inject(build_pending_agents_guardrail_prompt(&pending))
+    let mut prompt = build_pending_agents_guardrail_prompt(&pending);
+    if let Some(queue) = ctx.root_escalation_queue()
+        && queue.has_pending()
+    {
+        let summary = serde_json::to_string(&queue.pending_summary()).unwrap_or_default();
+        prompt.push_str(&format!(
+            "\n\nAdditionally, child agents have pending escalations blocking them. Reply to each \
+             via `agent__reply_escalation` first:\n{summary}"
+        ));
+    }
+    GuardrailAction::Inject(prompt)
 }
 
 pub fn escalation_function_declarations() -> Vec<FunctionDeclaration> {
@@ -1995,5 +2005,103 @@ mod tests {
         let q1 = ctx.ensure_root_escalation_queue();
         let q2 = ctx.ensure_root_escalation_queue();
         assert!(Arc::ptr_eq(&q1, &q2));
+    }
+
+    #[test]
+    fn guardrail_prompt_mentions_pending_escalations() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let join_handle = tokio::spawn(async {
+                time::sleep(Duration::from_secs(60)).await;
+                Ok(AgentResult {
+                    id: "slow".into(),
+                    agent_name: "test".into(),
+                    output: String::new(),
+                    exit_status: AgentExitStatus::Completed,
+                })
+            });
+            let handle = AgentHandle {
+                id: "slow".into(),
+                agent_name: "test".into(),
+                depth: 1,
+                inbox: Arc::new(Inbox::new()),
+                abort_signal: create_abort_signal(),
+                join_handle,
+                child_supervisor: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            let queue = ctx.ensure_root_escalation_queue();
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            queue.submit(EscalationRequest {
+                id: "esc_9".into(),
+                from_agent_id: "a1".into(),
+                from_agent_name: "explore".into(),
+                question: "Which option?".into(),
+                options: None,
+                reply_tx: tx,
+            });
+
+            match check_pending_agents_guardrail(&mut ctx) {
+                GuardrailAction::Inject(prompt) => {
+                    assert!(prompt.contains("agent__reply_escalation"));
+                    assert!(prompt.contains("esc_9"));
+                }
+                _ => panic!("expected Inject action"),
+            }
+        });
+    }
+
+    #[test]
+    fn guardrail_prompt_omits_escalations_when_none_pending() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let join_handle = tokio::spawn(async {
+                time::sleep(Duration::from_secs(60)).await;
+                Ok(AgentResult {
+                    id: "slow".into(),
+                    agent_name: "test".into(),
+                    output: String::new(),
+                    exit_status: AgentExitStatus::Completed,
+                })
+            });
+            let handle = AgentHandle {
+                id: "slow".into(),
+                agent_name: "test".into(),
+                depth: 1,
+                inbox: Arc::new(Inbox::new()),
+                abort_signal: create_abort_signal(),
+                join_handle,
+                child_supervisor: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            match check_pending_agents_guardrail(&mut ctx) {
+                GuardrailAction::Inject(prompt) => {
+                    assert!(!prompt.contains("agent__reply_escalation"));
+                }
+                _ => panic!("expected Inject action"),
+            }
+        });
     }
 }
