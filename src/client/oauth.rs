@@ -1,4 +1,4 @@
-use super::access_token::{is_valid_access_token, set_access_token};
+use super::access_token::{clear_rejected, is_rejected, is_valid_access_token, set_access_token};
 use super::openai_compatible_oauth::OpenAICompatibleOAuthProvider;
 use super::{ClientConfig, ProviderModels};
 use crate::config::paths;
@@ -743,7 +743,9 @@ pub async fn prepare_oauth_access_token(
         None => return Ok(false),
     };
 
-    let tokens = if Utc::now().timestamp() >= tokens.expires_at {
+    let tokens = if Utc::now().timestamp() >= tokens.expires_at
+        || is_rejected(client_name, &tokens.access_token)
+    {
         let guard = refresh_guard(client_name);
         let _guard = guard.lock().await;
 
@@ -759,7 +761,9 @@ pub async fn prepare_oauth_access_token(
             None => return Ok(false),
         };
 
-        if Utc::now().timestamp() >= tokens.expires_at {
+        if Utc::now().timestamp() >= tokens.expires_at
+            || is_rejected(client_name, &tokens.access_token)
+        {
             match provider.flow() {
                 OAuthFlow::Pkce | OAuthFlow::DeviceCode => {
                     refresh_oauth_token(client, provider, client_name, &tokens).await?
@@ -784,6 +788,9 @@ pub async fn prepare_oauth_access_token(
         tokens.expires_at,
         tokens.account_id,
     );
+    // Clear even when the refresh returned the same token (some IdPs reuse
+    // JWTs within validity); otherwise every request re-hits the token endpoint.
+    clear_rejected(client_name);
 
     Ok(true)
 }
@@ -1032,6 +1039,7 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use super::*;
+    use crate::client::access_token::{distrust_access_token, get_access_token};
     use crate::client::openai_compatible::OpenAICompatibleConfig;
     use crate::client::{ModelData, ProviderModels};
     use crate::utils::get_env_name;
@@ -1686,6 +1694,82 @@ scopes:
                     .mode();
                 assert_eq!(mode & 0o777, 0o600, "token file mode was {mode:o}");
             }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_rejected_valid_file_token_attempts_refresh_branch() {
+        with_temp_cache(|| {
+            let client_name = "prepare-rejected-branch-test";
+            let expires_at = Utc::now().timestamp() + 3600;
+            save_oauth_tokens(
+                client_name,
+                &OAuthTokens {
+                    access_token: "rejected-at".into(),
+                    refresh_token: None,
+                    expires_at,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+            set_access_token(client_name, "rejected-at".into(), expires_at, None);
+            assert!(distrust_access_token(client_name, "rejected-at"));
+
+            let err = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(prepare_oauth_access_token(
+                    &ReqwestClient::new(),
+                    &ResourceStubProvider,
+                    client_name,
+                ))
+                .unwrap_err()
+                .to_string();
+
+            // The timestamp-valid but rejected file token must not be trusted;
+            // the refresh branch is taken and bails on the missing refresh token.
+            assert!(err.contains("No refresh token"), "unexpected error: {err}");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_trusts_differing_unmarked_valid_file_token() {
+        with_temp_cache(|| {
+            let client_name = "prepare-differing-token-test";
+            let expires_at = Utc::now().timestamp() + 3600;
+            set_access_token(client_name, "rejected-at".into(), expires_at, None);
+            assert!(distrust_access_token(client_name, "rejected-at"));
+            save_oauth_tokens(
+                client_name,
+                &OAuthTokens {
+                    access_token: "fresh-at".into(),
+                    refresh_token: None,
+                    expires_at,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+
+            let ready = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(prepare_oauth_access_token(
+                    &ReqwestClient::new(),
+                    &ResourceStubProvider,
+                    client_name,
+                ))
+                .unwrap();
+
+            assert!(ready);
+            assert_eq!(get_access_token(client_name).unwrap(), "fresh-at");
+            assert!(
+                !is_rejected(client_name, "rejected-at"),
+                "marker not cleared after successful prepare"
+            );
         });
     }
 
