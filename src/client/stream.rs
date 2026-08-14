@@ -1,4 +1,4 @@
-use super::{ThinkingBlock, ToolCall, catch_error};
+use super::{ApiStatusError, ThinkingBlock, ToolCall, catch_error};
 use crate::utils::AbortSignal;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -224,10 +224,14 @@ where
         let data: Value = match text.parse() {
             Ok(data) => data,
             Err(_) => {
-                bail!(
-                    "Invalid response data: {text} (status: {})",
-                    status.as_u16()
-                );
+                return Err(ApiStatusError {
+                    status: status.as_u16(),
+                    message: format!(
+                        "Invalid response data: {text} (status: {})",
+                        status.as_u16()
+                    ),
+                }
+                .into());
             }
         };
         catch_error(&data, status.as_u16())?;

@@ -557,46 +557,64 @@ pub async fn noop_rerank(_builder: RequestBuilder, _model: &Model) -> Result<Rer
     bail!("The client doesn't support rerank api")
 }
 
+#[derive(Debug)]
+pub struct ApiStatusError {
+    #[allow(unused)]
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for ApiStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ApiStatusError {}
+
 pub fn catch_error(data: &Value, status: u16) -> Result<()> {
     if (200..300).contains(&status) {
         return Ok(());
     }
     debug!("Invalid response, status: {status}, data: {data}");
+    let api_error = |message: String| anyhow::Error::new(ApiStatusError { status, message });
     if let Some(error) = data["error"].as_object() {
         if let (Some(typ), Some(message)) = (
             json_str_from_map(error, "type"),
             json_str_from_map(error, "message"),
         ) {
-            bail!("{message} (type: {typ})");
+            return Err(api_error(format!("{message} (type: {typ})")));
         } else if let (Some(typ), Some(message)) = (
             json_str_from_map(error, "code"),
             json_str_from_map(error, "message"),
         ) {
-            bail!("{message} (code: {typ})");
+            return Err(api_error(format!("{message} (code: {typ})")));
         }
     } else if let Some(error) = data["errors"][0].as_object() {
         if let (Some(code), Some(message)) = (
             error.get("code").and_then(|v| v.as_u64()),
             json_str_from_map(error, "message"),
         ) {
-            bail!("{message} (status: {code})")
+            return Err(api_error(format!("{message} (status: {code})")));
         }
     } else if let Some(error) = data[0]["error"].as_object() {
         if let (Some(status), Some(message)) = (
             json_str_from_map(error, "status"),
             json_str_from_map(error, "message"),
         ) {
-            bail!("{message} (status: {status})")
+            return Err(api_error(format!("{message} (status: {status})")));
         }
     } else if let (Some(detail), Some(status)) = (data["detail"].as_str(), data["status"].as_i64())
     {
-        bail!("{detail} (status: {status})");
+        return Err(api_error(format!("{detail} (status: {status})")));
     } else if let Some(error) = data["error"].as_str() {
-        bail!("{error}");
+        return Err(api_error(error.to_string()));
     } else if let Some(message) = data["message"].as_str() {
-        bail!("{message}");
+        return Err(api_error(message.to_string()));
     }
-    bail!("Invalid response data: {data} (status: {status})");
+    Err(api_error(format!(
+        "Invalid response data: {data} (status: {status})"
+    )))
 }
 
 pub fn json_str_from_map<'a>(
@@ -736,4 +754,109 @@ fn prompt_input_string(desc: &str, required: bool, help_message: Option<&str>) -
     }
     let text = text.prompt()?;
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn catch_error_message(data: &Value, status: u16) -> String {
+        catch_error(data, status).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn test_catch_error_display_json_with_type() {
+        let data = json!({"error": {"type": "invalid_request_error", "message": "Bad request"}});
+        assert_eq!(
+            catch_error_message(&data, 400),
+            "Bad request (type: invalid_request_error)"
+        );
+    }
+
+    #[test]
+    fn test_catch_error_display_json_with_code() {
+        let data = json!({"error": {"code": "rate_limited", "message": "Too many requests"}});
+        assert_eq!(
+            catch_error_message(&data, 429),
+            "Too many requests (code: rate_limited)"
+        );
+    }
+
+    #[test]
+    fn test_catch_error_display_errors_array() {
+        let data = json!({"errors": [{"code": 7000, "message": "No route"}]});
+        assert_eq!(catch_error_message(&data, 404), "No route (status: 7000)");
+    }
+
+    #[test]
+    fn test_catch_error_display_array_error_status() {
+        let data = json!([{"error": {"status": "PERMISSION_DENIED", "message": "Denied"}}]);
+        assert_eq!(
+            catch_error_message(&data, 403),
+            "Denied (status: PERMISSION_DENIED)"
+        );
+    }
+
+    #[test]
+    fn test_catch_error_display_detail_status() {
+        let data = json!({"detail": "Not found", "status": 404});
+        assert_eq!(catch_error_message(&data, 404), "Not found (status: 404)");
+    }
+
+    #[test]
+    fn test_catch_error_display_error_string() {
+        let data = json!({"error": "Something went wrong"});
+        assert_eq!(catch_error_message(&data, 500), "Something went wrong");
+    }
+
+    #[test]
+    fn test_catch_error_display_message_string() {
+        let data = json!({"message": "Unauthorized"});
+        assert_eq!(catch_error_message(&data, 401), "Unauthorized");
+    }
+
+    #[test]
+    fn test_catch_error_display_fallback() {
+        let data = json!({"unexpected": true});
+        assert_eq!(
+            catch_error_message(&data, 500),
+            format!("Invalid response data: {data} (status: 500)")
+        );
+    }
+
+    #[test]
+    fn test_catch_error_ok_on_success_status() {
+        let data = json!({"error": {"type": "x", "message": "y"}});
+        assert!(catch_error(&data, 200).is_ok());
+        assert!(catch_error(&data, 299).is_ok());
+    }
+
+    #[test]
+    fn test_catch_error_downcast_through_context_chain() {
+        let data = json!({"error": {"type": "authentication_error", "message": "Invalid key"}});
+        let err = catch_error(&data, 401)
+            .context("Failed to call chat-completions api")
+            .unwrap_err();
+        let api_err = err
+            .downcast_ref::<ApiStatusError>()
+            .expect("should downcast through context chain");
+        assert_eq!(api_err.status, 401);
+        assert_eq!(api_err.message, "Invalid key (type: authentication_error)");
+    }
+
+    #[test]
+    fn test_catch_error_preserves_status() {
+        let data = json!({"message": "Unauthorized"});
+        let err = catch_error(&data, 401).unwrap_err();
+        assert_eq!(err.downcast_ref::<ApiStatusError>().unwrap().status, 401);
+
+        let data = json!({"detail": "Rate limited", "status": 429});
+        let err = catch_error(&data, 429).unwrap_err();
+        assert_eq!(err.downcast_ref::<ApiStatusError>().unwrap().status, 429);
+
+        // The struct carries the outer HTTP status even when the body embeds another code
+        let data = json!({"errors": [{"code": 7000, "message": "No route"}]});
+        let err = catch_error(&data, 429).unwrap_err();
+        assert_eq!(err.downcast_ref::<ApiStatusError>().unwrap().status, 429);
+    }
 }
