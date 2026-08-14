@@ -1,7 +1,6 @@
-use crate::mcp::oauth::McpTokenStatus;
 use crate::mcp::{
-    ConnectedServer, JsonField, McpAuthReason, McpAuthRequired, McpServer, McpTransportType,
-    is_auth_required_error, oauth, spawn_mcp_server,
+    ConnectedServer, JsonField, McpAuthRequired, McpServer, McpTransportType,
+    is_auth_required_error, resolve_http_auth, spawn_mcp_server,
 };
 
 use anyhow::Result;
@@ -103,13 +102,8 @@ impl McpFactory {
             return Ok(existing);
         }
 
-        let token_status = if spec.is_remote() {
-            oauth::load_or_refresh_mcp_token(name).await
-        } else {
-            McpTokenStatus::NotAuthenticated
-        };
-        let auth_reason = McpAuthReason::from_token_status(&token_status);
-        let handle = spawn_mcp_server(spec, log_path, token_status.into_token())
+        let (auth, auth_reason) = resolve_http_auth(name, spec).await;
+        let handle = spawn_mcp_server(spec, log_path, auth)
             .await
             .map_err(|e| {
                 if is_auth_required_error(&e) {

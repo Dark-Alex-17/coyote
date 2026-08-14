@@ -10,6 +10,7 @@ use log::{debug, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::net::TcpListener;
 use std::sync::{Arc, OnceLock};
@@ -202,11 +203,21 @@ pub async fn run_mcp_oauth_flow(
     run_oauth_flow(&provider, &mcp_token_key(server_name)).await
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum McpTokenStatus {
     Token(String),
     NotAuthenticated,
     RefreshFailed,
+}
+
+impl fmt::Debug for McpTokenStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Token(_) => f.write_str("Token(<redacted>)"),
+            Self::NotAuthenticated => f.write_str("NotAuthenticated"),
+            Self::RefreshFailed => f.write_str("RefreshFailed"),
+        }
+    }
 }
 
 impl McpTokenStatus {
@@ -219,11 +230,28 @@ impl McpTokenStatus {
 }
 
 pub async fn load_or_refresh_mcp_token(server_name: &str) -> McpTokenStatus {
+    load_or_refresh_inner(server_name, None).await
+}
+
+/// Re-acquires a token after the server rejected the current one mid-session
+/// (HTTP 401). The rejection proves the stored token is bad regardless of its
+/// expiry timestamp, so the unexpired fast-paths only short-circuit when the
+/// stored token DIFFERS from `rejected_token` (a concurrent caller genuinely
+/// refreshed while we waited); an unexpired copy of the rejected token is
+/// refreshed anyway. The failure backoff and per-server single-flight lock
+/// still apply.
+pub async fn force_refresh_mcp_token(server_name: &str, rejected_token: &str) -> Option<String> {
+    load_or_refresh_inner(server_name, Some(rejected_token))
+        .await
+        .into_token()
+}
+
+async fn load_or_refresh_inner(server_name: &str, rejected_token: Option<&str>) -> McpTokenStatus {
     let key = mcp_token_key(server_name);
     let Some(tokens) = load_oauth_tokens(&key) else {
         return McpTokenStatus::NotAuthenticated;
     };
-    if Utc::now().timestamp() < tokens.expires_at {
+    if rejected_token.is_none() && Utc::now().timestamp() < tokens.expires_at {
         return McpTokenStatus::Token(tokens.access_token);
     }
 
@@ -235,11 +263,15 @@ pub async fn load_or_refresh_mcp_token(server_name: &str) -> McpTokenStatus {
     let lock = refresh_lock(server_name);
     let _guard = lock.lock().await;
 
-    // A concurrent caller may have refreshed while we waited for the lock.
+    // A concurrent caller may have refreshed while we waited for the lock. An
+    // unexpired token is only trusted if it differs from the rejected one:
+    // the server already proved that exact token bad.
     let Some(tokens) = load_oauth_tokens(&key) else {
         return McpTokenStatus::NotAuthenticated;
     };
-    if Utc::now().timestamp() < tokens.expires_at {
+    if Utc::now().timestamp() < tokens.expires_at
+        && rejected_token.is_none_or(|rejected| rejected != tokens.access_token)
+    {
         return McpTokenStatus::Token(tokens.access_token);
     }
 
@@ -589,10 +621,8 @@ fn extract_base_url(url: &str) -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
     use crate::utils::get_env_name;
-    use serial_test::serial;
     use std::{
         env,
         ffi::OsString,
@@ -601,7 +631,7 @@ mod tests {
         time::{self, SystemTime},
     };
 
-    fn with_temp_cache<F: FnOnce()>(f: F) {
+    pub(crate) fn with_temp_cache<F: FnOnce()>(f: F) {
         struct Restore {
             key: String,
             prev: Option<OsString>,
@@ -637,6 +667,14 @@ mod tests {
         };
         f();
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::with_temp_cache;
+    use super::*;
+    use serial_test::serial;
+    use std::fs;
 
     #[test]
     fn extract_base_url_strips_path_and_query() {
@@ -1032,6 +1070,151 @@ mod tests {
 
             assert_eq!(status, McpTokenStatus::NotAuthenticated);
         });
+    }
+
+    #[test]
+    #[serial]
+    fn force_refresh_returns_concurrently_refreshed_token() {
+        with_temp_cache(|| {
+            fs::create_dir_all(paths::oauth_tokens_dir()).unwrap();
+            fs::write(
+                paths::token_file("mcp_force-fresh"),
+                r#"{"access_token":"fresh-tok","refresh_token":"r","expires_at":9999999999}"#,
+            )
+            .unwrap();
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let token = rt.block_on(force_refresh_mcp_token("force-fresh", "rejected-tok"));
+
+            assert_eq!(token.as_deref(), Some("fresh-tok"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_refresh_unexpired_rejected_token_attempts_real_refresh() {
+        with_temp_cache(|| {
+            fs::create_dir_all(paths::oauth_tokens_dir()).unwrap();
+            fs::write(
+                paths::token_file("mcp_force-rejected"),
+                r#"{"access_token":"same-tok","refresh_token":"r","expires_at":9999999999}"#,
+            )
+            .unwrap();
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let token = rt.block_on(force_refresh_mcp_token("force-rejected", "same-tok"));
+
+            assert_eq!(token, None);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_refresh_missing_token_file_returns_none() {
+        with_temp_cache(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let token = rt.block_on(force_refresh_mcp_token(
+                "force-never-authed",
+                "rejected-tok",
+            ));
+
+            assert_eq!(token, None);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_refresh_failed_refresh_returns_none() {
+        with_temp_cache(|| {
+            fs::create_dir_all(paths::oauth_tokens_dir()).unwrap();
+            fs::write(
+                paths::token_file("mcp_force-fail"),
+                r#"{"access_token":"stale","refresh_token":"r","expires_at":0}"#,
+            )
+            .unwrap();
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let token = rt.block_on(force_refresh_mcp_token("force-fail", "stale"));
+
+            assert_eq!(token, None);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_refresh_concurrent_callers_complete_without_deadlock() {
+        with_temp_cache(|| {
+            fs::create_dir_all(paths::oauth_tokens_dir()).unwrap();
+            fs::write(
+                paths::token_file("mcp_force-concurrent"),
+                r#"{"access_token":"same-tok","refresh_token":"r","expires_at":9999999999}"#,
+            )
+            .unwrap();
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (a, b) = rt.block_on(async {
+                tokio::join!(
+                    force_refresh_mcp_token("force-concurrent", "same-tok"),
+                    force_refresh_mcp_token("force-concurrent", "same-tok"),
+                )
+            });
+
+            assert_eq!(a, None);
+            assert_eq!(b, None);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn force_refresh_respects_failure_backoff() {
+        with_temp_cache(|| {
+            fs::create_dir_all(paths::oauth_tokens_dir()).unwrap();
+            fs::write(
+                paths::token_file("mcp_force-backoff"),
+                r#"{"access_token":"same-tok","refresh_token":"r","expires_at":9999999999}"#,
+            )
+            .unwrap();
+            note_refresh_failure("force-backoff");
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let token = rt.block_on(force_refresh_mcp_token("force-backoff", "same-tok"));
+
+            assert_eq!(token, None);
+        });
+    }
+
+    #[test]
+    fn token_status_debug_redacts_token() {
+        assert_eq!(
+            format!("{:?}", McpTokenStatus::Token("live-secret".into())),
+            "Token(<redacted>)"
+        );
+        assert_eq!(
+            format!("{:?}", McpTokenStatus::NotAuthenticated),
+            "NotAuthenticated"
+        );
+        assert_eq!(
+            format!("{:?}", McpTokenStatus::RefreshFailed),
+            "RefreshFailed"
+        );
     }
 
     #[test]

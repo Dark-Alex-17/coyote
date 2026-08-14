@@ -1,3 +1,4 @@
+mod auth_client;
 pub(crate) mod manage;
 pub(crate) mod oauth;
 mod sse_transport;
@@ -9,6 +10,7 @@ use crate::vault::Vault;
 use crate::vault::interpolate_secrets;
 use anyhow::Error;
 use anyhow::{Context, Result, anyhow};
+use auth_client::McpOAuthClient;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use http::{HeaderName, HeaderValue};
 use indexmap::IndexMap;
@@ -328,29 +330,22 @@ impl McpRegistry {
             .and_then(|c| c.mcp_servers.get(&id))
             .with_context(|| format!("MCP server not found in config: {id}"))?;
 
-        let token_status = if spec.is_remote() {
-            oauth::load_or_refresh_mcp_token(&id).await
-        } else {
-            oauth::McpTokenStatus::NotAuthenticated
-        };
-        let auth_reason = McpAuthReason::from_token_status(&token_status);
+        let (auth, auth_reason) = resolve_http_auth(&id, spec).await;
 
-        let service =
-            match spawn_mcp_server(spec, self.log_path.as_deref(), token_status.into_token()).await
-            {
-                Ok(s) => s,
-                Err(e) if is_auth_required_error(&e) => {
-                    warn!(
-                        "{}",
-                        McpAuthRequired {
-                            server: id,
-                            reason: auth_reason,
-                        }
-                    );
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
-            };
+        let service = match spawn_mcp_server(spec, self.log_path.as_deref(), auth).await {
+            Ok(s) => s,
+            Err(e) if is_auth_required_error(&e) => {
+                warn!(
+                    "{}",
+                    McpAuthRequired {
+                        server: id,
+                        reason: auth_reason,
+                    }
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
 
         let tools = service.list_tools(None).await?;
         debug!("Available tools for MCP server {id}: {tools:?}");
@@ -420,19 +415,76 @@ impl McpRegistry {
     }
 }
 
+/// How a remote MCP server authenticates outgoing requests.
+pub(crate) enum HttpAuth {
+    /// Only the static headers from the server spec; no OAuth token.
+    StaticOnly,
+    /// OAuth-managed: HTTP transports inject a fresh bearer token per request
+    /// via [`McpOAuthClient`] (ignoring the carried token); SSE transports
+    /// send the carried token as a static header.
+    Managed { server: String, token: String },
+}
+
+impl fmt::Debug for HttpAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaticOnly => f.write_str("StaticOnly"),
+            Self::Managed { server, token: _ } => f
+                .debug_struct("Managed")
+                .field("server", server)
+                .field("token", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+impl HttpAuth {
+    pub(crate) fn from_token_status(status: &oauth::McpTokenStatus, server: &str) -> Self {
+        match status {
+            oauth::McpTokenStatus::Token(token) => Self::Managed {
+                server: server.to_string(),
+                token: token.clone(),
+            },
+            oauth::McpTokenStatus::NotAuthenticated | oauth::McpTokenStatus::RefreshFailed => {
+                Self::StaticOnly
+            }
+        }
+    }
+}
+
+pub(crate) async fn resolve_http_auth(name: &str, spec: &McpServer) -> (HttpAuth, McpAuthReason) {
+    let token_status = if spec.is_remote() {
+        oauth::load_or_refresh_mcp_token(name).await
+    } else {
+        oauth::McpTokenStatus::NotAuthenticated
+    };
+    (
+        HttpAuth::from_token_status(&token_status, name),
+        McpAuthReason::from_token_status(&token_status),
+    )
+}
+
 pub(crate) async fn spawn_mcp_server(
     spec: &McpServer,
     log_path: Option<&Path>,
-    bearer_token: Option<String>,
+    auth: HttpAuth,
 ) -> Result<Arc<ConnectedServer>> {
     match spec.transport_type {
         McpTransportType::Http => {
             let url = spec.url.as_deref().expect("validated: http spec has url");
-            let headers = merge_bearer_token(spec.headers.as_ref(), bearer_token);
-            spawn_http_mcp_server(url, headers.as_ref()).await
+            match auth {
+                HttpAuth::Managed { server, token: _ } => {
+                    spawn_oauth_http_mcp_server(url, &server, spec.headers.as_ref()).await
+                }
+                HttpAuth::StaticOnly => spawn_http_mcp_server(url, spec.headers.as_ref()).await,
+            }
         }
         McpTransportType::Sse => {
             let url = spec.url.as_deref().expect("validated: sse spec has url");
+            let bearer_token = match auth {
+                HttpAuth::Managed { server: _, token } => Some(token),
+                HttpAuth::StaticOnly => None,
+            };
             let headers = merge_bearer_token(spec.headers.as_ref(), bearer_token);
             spawn_sse_mcp_server(url, headers.as_ref()).await
         }
@@ -460,6 +512,7 @@ fn merge_bearer_token(
         }
         (Some(h), Some(token)) => {
             let mut m = h.clone();
+            m.retain(|k, _| !k.eq_ignore_ascii_case("authorization"));
             m.insert("Authorization".to_string(), format!("Bearer {token}"));
             Some(m)
         }
@@ -548,6 +601,66 @@ async fn spawn_http_mcp_server(
             .await
             .with_context(|| format!("Failed to connect to HTTP MCP server: {url}"))?,
     );
+    Ok(service)
+}
+
+/// Builds the custom-header map for an OAuth-managed HTTP transport, dropping
+/// any static `Authorization` entry case-insensitively: [`McpOAuthClient`]
+/// owns that header, and a stale configured value must not collide with the
+/// per-request token.
+fn oauth_custom_headers(
+    headers: Option<&IndexMap<String, String>>,
+) -> Result<HashMap<HeaderName, HeaderValue>> {
+    let mut custom = HashMap::new();
+    let Some(hdrs) = headers else {
+        return Ok(custom);
+    };
+
+    for (k, v) in hdrs {
+        if k.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let name = k
+            .parse::<HeaderName>()
+            .with_context(|| format!("Invalid header name: {k}"))?;
+        let value = v
+            .parse::<HeaderValue>()
+            .with_context(|| format!("Invalid header value for {k}"))?;
+        custom.insert(name, value);
+    }
+
+    Ok(custom)
+}
+
+async fn spawn_oauth_http_mcp_server(
+    url: &str,
+    server: &str,
+    headers: Option<&IndexMap<String, String>>,
+) -> Result<Arc<ConnectedServer>> {
+    // Mirror rmcp's default_http_client, which `with_client` bypasses:
+    // idle pooling off avoids a documented TCP delayed-ACK stall, and
+    // redirects off keeps custom headers from being replayed to a redirect
+    // target.
+    let inner = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("Failed to build HTTP client for OAuth-managed MCP transport")?;
+    let client = McpOAuthClient::new(inner, server);
+    // `auth_header` stays None so the wrapper injects a fresh token per
+    // request; `reinit_on_expired_session` defaults to true in rmcp 3.1.2
+    // but is pinned explicitly because transparent session re-init is
+    // load-bearing for long-lived sessions.
+    let config = StreamableHttpClientTransportConfig::with_uri(url)
+        .custom_headers(oauth_custom_headers(headers)?)
+        .reinit_on_expired_session(true);
+    let transport = StreamableHttpClientTransport::with_client(client, config);
+    let service = Arc::new(
+        ().serve(transport)
+            .await
+            .with_context(|| format!("Failed to connect to HTTP MCP server: {url}"))?,
+    );
+
     Ok(service)
 }
 
@@ -1107,6 +1220,92 @@ mod tests {
 
         assert_eq!(result["Authorization"], "Bearer newtoken");
         assert_eq!(result["X-Custom"], "keep");
+    }
+
+    #[test]
+    fn merge_bearer_token_replaces_authorization_case_insensitively() {
+        let mut h = IndexMap::new();
+        h.insert("authorization".to_string(), "Bearer stale-1".to_string());
+        h.insert("AUTHORIZATION".to_string(), "Bearer stale-2".to_string());
+        h.insert("X-Custom".to_string(), "keep".to_string());
+
+        let result = merge_bearer_token(Some(&h), Some("newtoken".to_string())).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["Authorization"], "Bearer newtoken");
+        assert_eq!(result["X-Custom"], "keep");
+        assert!(!result.contains_key("authorization"));
+        assert!(!result.contains_key("AUTHORIZATION"));
+    }
+
+    #[test]
+    fn http_auth_from_token_status_maps_token_to_managed() {
+        assert!(matches!(
+            HttpAuth::from_token_status(&oauth::McpTokenStatus::Token("tok".into()), "srv"),
+            HttpAuth::Managed { server, token } if server == "srv" && token == "tok"
+        ));
+        assert!(matches!(
+            HttpAuth::from_token_status(&oauth::McpTokenStatus::NotAuthenticated, "srv"),
+            HttpAuth::StaticOnly
+        ));
+        assert!(matches!(
+            HttpAuth::from_token_status(&oauth::McpTokenStatus::RefreshFailed, "srv"),
+            HttpAuth::StaticOnly
+        ));
+    }
+
+    #[test]
+    fn http_auth_debug_redacts_token() {
+        let auth = HttpAuth::Managed {
+            server: "srv".into(),
+            token: "live-secret".into(),
+        };
+
+        let debug = format!("{auth:?}");
+
+        assert!(debug.contains("srv"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("live-secret"));
+    }
+
+    #[test]
+    fn oauth_custom_headers_strips_authorization_case_insensitively() {
+        let mut h = IndexMap::new();
+        h.insert("Authorization".to_string(), "Bearer stale-1".to_string());
+        h.insert("authorization".to_string(), "Bearer stale-2".to_string());
+        h.insert("AUTHORIZATION".to_string(), "Bearer stale-3".to_string());
+        h.insert("X-Custom".to_string(), "keep".to_string());
+
+        let custom = oauth_custom_headers(Some(&h)).unwrap();
+
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[&HeaderName::from_static("x-custom")], "keep");
+    }
+
+    #[test]
+    fn oauth_custom_headers_none_is_empty() {
+        assert!(oauth_custom_headers(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn oauth_custom_headers_rejects_invalid_header_name() {
+        let mut h = IndexMap::new();
+        h.insert("bad header".to_string(), "v".to_string());
+
+        assert!(oauth_custom_headers(Some(&h)).is_err());
+    }
+
+    #[test]
+    fn oauth_custom_headers_keeps_non_authorization_headers() {
+        let mut h = IndexMap::new();
+        h.insert("X-Api-Key".to_string(), "k".to_string());
+        h.insert("X-Trace".to_string(), "t".to_string());
+
+        let custom = oauth_custom_headers(Some(&h)).unwrap();
+
+        assert_eq!(custom.len(), 2);
+        assert_eq!(custom[&HeaderName::from_static("x-api-key")], "k");
+        assert_eq!(custom[&HeaderName::from_static("x-trace")], "t");
     }
 
     #[test]
