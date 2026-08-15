@@ -186,7 +186,9 @@ input() {
 }
 
 confirm() {
-  trap "stty echo; exit" EXIT
+  # stty targets stdin, which is /dev/null when the host spawns tool scripts;
+  # point it at the real terminal and stay quiet when there isn't one.
+  trap "stty echo </dev/tty 2>/dev/null; exit" EXIT
   _prompt_text "$1 (y/N)"
   echo -en "\033[36m\c " >&2
 
@@ -229,7 +231,7 @@ list() {
   declare first_row
   first_row=$((last_row - opts_count + 1))
 
-  trap "_cursor_blink_on; stty echo; exit" 2
+  trap "_cursor_blink_on; stty echo </dev/tty 2>/dev/null; exit" 2
 
   _cursor_blink_off
 
@@ -275,7 +277,7 @@ checkbox() {
   declare first_row
   first_row=$((last_row - opts_count + 1))
 
-  trap "_cursor_blink_on; stty echo; exit" 2
+  trap "_cursor_blink_on; stty echo </dev/tty 2>/dev/null; exit" 2
 
   _cursor_blink_off
 
@@ -403,7 +405,7 @@ range() {
   declare current_row
   current_row=$((first_row - 1))
 
-  trap "_cursor_blink_on; stty echo; exit" 2
+  trap "_cursor_blink_on; stty echo </dev/tty 2>/dev/null; exit" 2
 
   _cursor_blink_off
 
