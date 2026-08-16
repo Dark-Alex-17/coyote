@@ -32,7 +32,7 @@ use skill::SKILL_FUNCTION_PREFIX;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::VecDeque, thread};
 use std::{
     collections::{HashMap, HashSet},
@@ -159,7 +159,12 @@ pub(crate) fn write_file_atomic(
         .file_name()
         .and_then(OsStr::to_str)
         .ok_or_else(|| anyhow!("Unable to extract file name from path: {}", path.display()))?;
-    let tmp = path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_file_name(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::write(&tmp, content)?;
 
     #[cfg(unix)]
@@ -2376,6 +2381,39 @@ mod tests {
 
         write_file_atomic(&path, "two", None).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no tmp files left behind"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_file_atomic_concurrent_writers_to_same_target() {
+        let dir = temp_file("-atomic-concurrent-", "");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shim");
+
+        let contents: Vec<String> = (0..8)
+            .map(|i| format!("#!/bin/sh\necho writer-{i}\n"))
+            .collect();
+        thread::scope(|scope| {
+            for content in &contents {
+                scope.spawn(|| {
+                    for _ in 0..50 {
+                        write_file_atomic(&path, content, Some(0o755)).unwrap();
+                    }
+                });
+            }
+        });
+
+        let final_content = fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains(&final_content),
+            "final content must be one writer's complete content, got: {final_content:?}"
+        );
         assert_eq!(
             fs::read_dir(&dir).unwrap().count(),
             1,
