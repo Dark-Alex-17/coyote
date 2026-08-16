@@ -54,20 +54,6 @@ pub async fn expand_glob_paths<T: AsRef<str>>(
     Ok(new_paths)
 }
 
-pub fn clear_dir(dir: &Path) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            fs::remove_dir_all(&path)?;
-        } else {
-            fs::remove_file(&path)?;
-        }
-    }
-    Ok(())
-}
-
 pub fn list_file_names<T: AsRef<Path>>(dir: T, ext: &str) -> Vec<String> {
     match fs::read_dir(dir.as_ref()) {
         Ok(rd) => {

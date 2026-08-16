@@ -138,6 +138,109 @@ fn extract_shebang_runtime(path: &Path) -> Option<String> {
     }
 }
 
+pub(crate) fn write_file_atomic(
+    path: &Path,
+    content: &str,
+    #[cfg_attr(not(unix), expect(unused))] mode: Option<u32>,
+) -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    if fs::read_to_string(path).is_ok_and(|existing| existing == content) {
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
+
+        return Ok(());
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("Unable to extract file name from path: {}", path.display()))?;
+    let tmp = path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+    fs::write(&tmp, content)?;
+
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+    }
+
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+
+    Ok(())
+}
+
+fn tool_source_stems() -> Result<HashSet<String>> {
+    let mut stems = HashSet::new();
+    let tools_dir = paths::global_tools_dir();
+    if !tools_dir.exists() {
+        return Ok(stems);
+    }
+
+    for entry in fs::read_dir(&tools_dir)? {
+        let path = entry?.path();
+        if path.is_file()
+            && let Some(stem) = path.file_stem().and_then(OsStr::to_str)
+        {
+            stems.insert(stem.to_string());
+        }
+    }
+
+    Ok(stems)
+}
+
+fn bin_entry_stem(file_name: &str) -> &str {
+    let name = file_name.strip_prefix("run-").unwrap_or(file_name);
+    Path::new(name)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or(name)
+}
+
+fn prune_stale_bin_entries(
+    bin_dir: &Path,
+    valid_stems: &HashSet<String>,
+    extra_valid_stem: Option<&str>,
+) -> Result<()> {
+    if !bin_dir.exists() {
+        fs::create_dir_all(bin_dir)?;
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(bin_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            debug!(
+                "Removing unexpected directory in bin dir: {}",
+                path.display()
+            );
+            fs::remove_dir_all(&path)?;
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let stem = bin_entry_stem(file_name);
+
+        if valid_stems.contains(stem) || extra_valid_stem == Some(stem) {
+            continue;
+        }
+
+        debug!("Removing stale bin entry: {}", path.display());
+        fs::remove_file(&path)?;
+    }
+
+    Ok(())
+}
+
 pub async fn eval_tool_calls(
     ctx: &mut RequestContext,
     mut calls: Vec<ToolCall>,
@@ -321,7 +424,6 @@ impl Functions {
             })?;
             let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
             let file_path = paths::functions_dir().join(file.as_ref());
-            #[cfg_attr(not(unix), expect(unused))]
             let is_script = file_path
                 .extension()
                 .and_then(OsStr::to_str)
@@ -338,14 +440,7 @@ impl Functions {
 
             ensure_parent_exists(&file_path)?;
             info!("Creating function file: {}", file_path.display());
-            let mut function_file = File::create(&file_path)?;
-            function_file.write_all(content.as_bytes())?;
-
-            #[cfg(unix)]
-            if is_script {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&file_path, fs::Permissions::from_mode(0o755))?;
-            }
+            write_file_atomic(&file_path, content, is_script.then_some(0o755))?;
         }
 
         Ok(())
@@ -396,7 +491,7 @@ impl Functions {
     }
 
     pub fn init(visible_tools: &[String]) -> Result<Self> {
-        Self::clear_global_functions_bin_dir()?;
+        Self::remove_stale_global_function_binaries()?;
 
         let declarations = Self {
             declarations: Self::build_global_tool_declarations(visible_tools)?,
@@ -412,7 +507,7 @@ impl Functions {
     }
 
     pub fn init_agent(name: &str, global_tools: &[String]) -> Result<Self> {
-        Self::clear_agent_bin_dir(name)?;
+        Self::remove_stale_agent_bin_entries(name)?;
 
         let global_tools_declarations = if !global_tools.is_empty() {
             info!("Loading global tools for agent: {name}: {global_tools:?}");
@@ -726,38 +821,23 @@ impl Functions {
         Ok(())
     }
 
-    fn clear_agent_bin_dir(name: &str) -> Result<()> {
+    fn remove_stale_agent_bin_entries(name: &str) -> Result<()> {
         let agent_bin_directory = paths::agent_bin_dir(name);
-        if !agent_bin_directory.exists() {
-            debug!(
-                "Creating agent bin directory: {}",
-                agent_bin_directory.display()
-            );
-            fs::create_dir_all(&agent_bin_directory)?;
-        } else {
-            debug!(
-                "Clearing existing agent bin directory: {}",
-                agent_bin_directory.display()
-            );
-            clear_dir(&agent_bin_directory)?;
-        }
 
-        Ok(())
+        debug!(
+            "Pruning stale entries in agent bin directory: {}",
+            agent_bin_directory.display()
+        );
+
+        prune_stale_bin_entries(&agent_bin_directory, &tool_source_stems()?, Some(name))
     }
 
-    fn clear_global_functions_bin_dir() -> Result<()> {
+    fn remove_stale_global_function_binaries() -> Result<()> {
         let bin_dir = paths::functions_bin_dir();
-        if !bin_dir.exists() {
-            fs::create_dir_all(&bin_dir)?;
-        }
 
-        info!(
-            "Clearing existing function binaries in {}",
-            bin_dir.display()
-        );
-        clear_dir(&bin_dir)?;
+        info!("Pruning stale function binaries in {}", bin_dir.display());
 
-        Ok(())
+        prune_stale_bin_entries(&bin_dir, &tool_source_stems()?, None)
     }
 
     fn build_agent_tool_binaries(name: &str) -> Result<()> {
@@ -858,11 +938,7 @@ impl Functions {
             "{prompt_utils_file}",
             &to_script_path(&paths::bash_prompt_utils_file().to_string_lossy()),
         );
-        if binary_script_file.exists() {
-            fs::remove_file(&binary_script_file)?;
-        }
-        let mut script_file = File::create(&binary_script_file)?;
-        script_file.write_all(content.as_bytes())?;
+        write_file_atomic(&binary_script_file, &content, None)?;
 
         info!(
             "Building binary for function: {} ({})",
@@ -924,8 +1000,7 @@ impl Functions {
 						{run} "{wrapper_binary}" %*"#,
         );
 
-        let mut file = File::create(&binary_file)?;
-        file.write_all(content.as_bytes())?;
+        write_file_atomic(&binary_file, &content, None)?;
 
         Ok(())
     }
@@ -937,8 +1012,6 @@ impl Functions {
         binary_type: BinaryType,
         custom_runtime: Option<&str>,
     ) -> Result<()> {
-        use std::os::unix::prelude::PermissionsExt;
-
         let binary_file = match binary_type {
             BinaryType::Tool(None) => paths::functions_bin_dir().join(binary_name),
             BinaryType::Tool(Some(agent_name)) => {
@@ -1007,31 +1080,16 @@ impl Functions {
                 .parent()
                 .expect("Failed to get parent directory of binary file");
             let script_file = bin_dir.join(format!("run-{binary_name}.ts"));
-            if script_file.exists() {
-                fs::remove_file(&script_file)?;
-            }
-            let mut sf = File::create(&script_file)?;
-            sf.write_all(content.as_bytes())?;
-            fs::set_permissions(&script_file, fs::Permissions::from_mode(0o755))?;
+            write_file_atomic(&script_file, &content, Some(0o755))?;
 
             let ts_runtime = custom_runtime.unwrap_or("tsx");
             let wrapper = format!(
                 "#!/bin/sh\nexec {ts_runtime} \"{}\" \"$@\"\n",
                 script_file.display()
             );
-            if binary_file.exists() {
-                fs::remove_file(&binary_file)?;
-            }
-            let mut wf = File::create(&binary_file)?;
-            wf.write_all(wrapper.as_bytes())?;
-            fs::set_permissions(&binary_file, fs::Permissions::from_mode(0o755))?;
+            write_file_atomic(&binary_file, &wrapper, Some(0o755))?;
         } else {
-            if binary_file.exists() {
-                fs::remove_file(&binary_file)?;
-            }
-            let mut file = File::create(&binary_file)?;
-            file.write_all(content.as_bytes())?;
-            fs::set_permissions(&binary_file, fs::Permissions::from_mode(0o755))?;
+            write_file_atomic(&binary_file, &content, Some(0o755))?;
         }
 
         Ok(())
@@ -2285,5 +2343,91 @@ mod tests {
     fn parse_arguments_returns_err_for_non_object_non_string() {
         let tc = call_with_args("t", json!(42));
         assert!(tc.parse_arguments().is_err());
+    }
+
+    #[test]
+    fn write_file_atomic_writes_and_skips_unchanged() {
+        let dir = temp_file("-atomic-", "");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shim");
+
+        write_file_atomic(&path, "one", Some(0o755)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ino = fs::metadata(&path).unwrap().ino();
+            write_file_atomic(&path, "one", Some(0o755)).unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().ino(),
+                ino,
+                "unchanged content must not be rewritten"
+            );
+        }
+
+        write_file_atomic(&path, "two", None).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no tmp files left behind"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bin_entry_stem_strips_run_prefix_and_extension() {
+        assert_eq!(bin_entry_stem("fs_grep"), "fs_grep");
+        assert_eq!(bin_entry_stem("fs_grep.cmd"), "fs_grep");
+        assert_eq!(bin_entry_stem("run-web_search.ts"), "web_search");
+        assert_eq!(bin_entry_stem("run-fs_grep.sh"), "fs_grep");
+    }
+
+    #[test]
+    fn prune_stale_bin_entries_removes_only_stale_files() {
+        let dir = temp_file("-prune-", "");
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        for name in [
+            "fs_grep",
+            "run-web_search.ts",
+            "old_tool",
+            "run-old_tool.ts",
+            "myagent",
+        ] {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+        let valid_stems: HashSet<String> = ["fs_grep", "web_search"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        prune_stale_bin_entries(&dir, &valid_stems, Some("myagent")).unwrap();
+
+        assert!(dir.join("fs_grep").exists());
+        assert!(dir.join("run-web_search.ts").exists());
+        assert!(dir.join("myagent").exists(), "agent binary must survive");
+        assert!(!dir.join("old_tool").exists());
+        assert!(!dir.join("run-old_tool.ts").exists());
+        assert!(!dir.join("nested").exists(), "directories must be removed");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn prune_stale_bin_entries_creates_missing_dir() {
+        let dir = temp_file("-prune-missing-", "");
+        prune_stale_bin_entries(&dir, &HashSet::new(), None).unwrap();
+        assert!(dir.is_dir());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,11 +1,11 @@
-use crate::function::{FunctionDeclaration, JsonSchema};
+use crate::function::{self, FunctionDeclaration, JsonSchema};
 use anyhow::{Context, Result, bail};
 use argc::{ChoiceValue, CommandValue, FlagOptionValue};
 use indexmap::IndexMap;
+use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::{env, fs};
 
 pub fn generate_bash_declarations(
     mut tool_file: File,
@@ -24,7 +24,7 @@ pub fn generate_bash_declarations(
         env::var("TERM_WIDTH").ok().and_then(|v| v.parse().ok()),
     )?;
     let build_script = allow_empty_required_values(&build_script);
-    fs::write(tools_file_path, &build_script)
+    function::write_file_atomic(tools_file_path, &build_script, Some(0o755))
         .with_context(|| format!("Failed to write built script to '{tools_file_path:?}'"))?;
 
     let command_value = argc::export(&build_script, file_name)
@@ -180,5 +180,35 @@ mod tests {
 
         assert!(fixed.contains(r#"if [[ -z "${!name+x}" ]]; then"#));
         assert!(!fixed.contains(r#"if [[ -z "${!name:-}" ]]; then"#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn second_build_does_not_rewrite_tool_file_test() {
+        use std::fs;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let src = "# @describe test tool\n# @option --content! The content\nmain() { :; }\n";
+        let path = crate::utils::temp_file("bash-build", ".sh");
+        fs::write(&path, src).expect("failed to write temp script");
+
+        let declarations = generate_bash_declarations(File::open(&path).unwrap(), &path, "test")
+            .expect("first build failed");
+        assert!(!declarations.is_empty());
+        let first_ino = fs::metadata(&path).unwrap().ino();
+
+        let declarations = generate_bash_declarations(File::open(&path).unwrap(), &path, "test")
+            .expect("second build failed");
+        assert!(!declarations.is_empty());
+
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(
+            metadata.ino(),
+            first_ino,
+            "second build rewrote an already-built tool file"
+        );
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+
+        fs::remove_file(&path).unwrap();
     }
 }
