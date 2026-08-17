@@ -1648,6 +1648,11 @@ pub fn run_llm_function(
         if !stdout.is_empty() {
             error_json["stdout"] = json!(stdout);
         }
+        if let Ok(contents) = fs::read_to_string(&tmp_file)
+            && !contents.trim().is_empty()
+        {
+            error_json["output"] = json!(contents);
+        }
         debug!("Tool call error: {error_json:?}");
         return Ok(Some(error_json.to_string()));
     }
@@ -2421,6 +2426,32 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_llm_function_includes_llm_output_on_nonzero_exit() {
+        let result = run_llm_function(
+            "bash".into(),
+            vec![
+                "-c".into(),
+                "echo partial-output >> \"$LLM_OUTPUT\"; echo err-text >&2; exit 3".into(),
+            ],
+            HashMap::new(),
+            None,
+        )
+        .unwrap()
+        .expect("nonzero exit must return an error payload");
+
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            json["tool_call_error"]
+                .as_str()
+                .unwrap()
+                .contains("exited with code 3")
+        );
+        assert_eq!(json["stderr"], "err-text");
+        assert_eq!(json["output"], "partial-output\n");
     }
 
     #[test]
