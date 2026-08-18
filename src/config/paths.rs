@@ -148,6 +148,16 @@ pub fn sbx_kit_hash_file() -> PathBuf {
     sbx_kit_dir().join(SBX_KIT_HASH_FILE)
 }
 
+pub fn sandbox_mixin_hashes_dir() -> PathBuf {
+    cache_dir().join("sandbox-mixin-hashes")
+}
+
+pub fn sandbox_mixin_hash_file(sandbox_name: &str) -> PathBuf {
+    // Sandbox names are sanitized by the caller, but never trust a path
+    // component: a stray separator must not escape the hash directory.
+    sandbox_mixin_hashes_dir().join(format!("{}.hash", sandbox_name.replace('/', "_")))
+}
+
 pub fn sbx_mixin_kits_dir() -> PathBuf {
     cache_dir().join(SBX_MIXIN_KITS_DIR_NAME)
 }

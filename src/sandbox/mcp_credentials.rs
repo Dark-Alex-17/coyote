@@ -80,6 +80,8 @@ pub(crate) struct CredentialSpec {
     pub env_var: String,
     pub proxy_managed: bool,
     pub inject: Vec<InjectRule>,
+    pub custom_hosts: Vec<String>,
+    pub custom_allow_entries: Vec<String>,
     pub servers: Vec<String>,
 }
 
@@ -110,8 +112,13 @@ pub(crate) fn collect_credentials(
     }
 
     let mut by_secret: BTreeMap<String, Aggregate> = BTreeMap::new();
+    let mut hosts_by_server: BTreeMap<String, ServerSecretHosts> = BTreeMap::new();
     for (server_name, config) in servers {
-        for occurrence in collect_server_occurrences(config)? {
+        let occurrences = collect_server_occurrences(config)?;
+        if !occurrences.is_empty() {
+            hosts_by_server.insert(server_name.clone(), server_secret_hosts(config));
+        }
+        for occurrence in occurrences {
             let agg = by_secret
                 .entry(occurrence.secret_name)
                 .or_insert_with(|| Aggregate {
@@ -152,8 +159,9 @@ pub(crate) fn collect_credentials(
             eprintln!(
                 "MCP secrets {} all target the '{header}' header for '{domain}'. The \
                  sandbox proxy cannot tell which one a given request needs, so these \
-                 secrets will be resolved from environment variables inside the \
-                 sandbox instead.",
+                 secrets will be provisioned as placeholder-based custom secrets \
+                 instead: each env var holds a unique placeholder that the proxy \
+                 swaps for the real value in outbound request headers.",
                 quoted_list(secrets)
             );
             slot_conflicted.extend(secrets.iter().cloned());
@@ -191,6 +199,21 @@ pub(crate) fn collect_credentials(
         }
 
         let proxy_managed = agg.all_injectable && !slot_conflicted.contains(&secret_name);
+        let (custom_hosts, custom_allow_entries) = if proxy_managed {
+            (Vec::new(), Vec::new())
+        } else {
+            let mut targets: BTreeSet<String> = BTreeSet::new();
+            let mut allow: BTreeSet<String> = BTreeSet::new();
+            for hosts in agg
+                .servers
+                .iter()
+                .filter_map(|server| hosts_by_server.get(server))
+            {
+                targets.extend(hosts.targets.iter().cloned());
+                allow.extend(hosts.allow_entries.iter().cloned());
+            }
+            (targets.into_iter().collect(), allow.into_iter().collect())
+        };
         credentials.push(CredentialSpec {
             secret_name,
             service_id,
@@ -201,6 +224,8 @@ pub(crate) fn collect_credentials(
             } else {
                 Vec::new()
             },
+            custom_hosts,
+            custom_allow_entries,
             servers: agg.servers.into_iter().collect(),
         });
     }
@@ -365,6 +390,98 @@ fn parse_https_domain(raw: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ServerSecretHosts {
+    pub targets: BTreeSet<String>,
+    pub allow_entries: BTreeSet<String>,
+}
+
+pub(crate) fn server_secret_hosts(server: &Value) -> ServerSecretHosts {
+    let mut hosts = ServerSecretHosts::default();
+    scrape_hosts_value(server, &mut hosts);
+
+    if let Some(host) = server
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(|raw| Url::parse(raw).ok())
+        .and_then(|url| url.host_str().map(str::to_string))
+        .filter(|host| is_usable_host(host))
+    {
+        hosts.targets.insert(host);
+    }
+
+    hosts
+}
+
+fn scrape_hosts_value(value: &Value, out: &mut ServerSecretHosts) {
+    match value {
+        Value::String(s) => {
+            for url in urls_in_text(s) {
+                let Some(host) = url.host_str().filter(|h| is_usable_host(h)) else {
+                    continue;
+                };
+                out.targets.insert(host.to_string());
+                if let Some(entry) = allow_entry_for_parsed(&url) {
+                    out.allow_entries.insert(entry);
+                }
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                scrape_hosts_value(v, out);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                scrape_hosts_value(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A host usable in the sbx target and allow grammars: non-empty, not a
+/// bracketed IPv6 literal (no spelling in either grammar), and not an
+/// unresolved `{{placeholder}}` fragment (would register garbage targets
+/// and could fail kit validation at create).
+fn is_usable_host(host: &str) -> bool {
+    !host.is_empty() && !host.starts_with('[') && !host.contains('{') && !host.contains('}')
+}
+
+/// Every http(s) URL embedded in `text`. Tokens end at whitespace, quotes,
+/// or URL-hostile punctuation so comma- or bracket-separated lists don't
+/// bleed into one another.
+fn urls_in_text(text: &str) -> Vec<Url> {
+    const TERMINATORS: &[char] = &['"', '\'', ',', ';', '(', ')', '[', ']', '{', '}', '<', '>'];
+
+    let mut out = Vec::new();
+    for (idx, _) in text.match_indices("http") {
+        let candidate = &text[idx..];
+        if !candidate.starts_with("http://") && !candidate.starts_with("https://") {
+            continue;
+        }
+        let end = candidate
+            .find(|c: char| c.is_whitespace() || TERMINATORS.contains(&c))
+            .unwrap_or(candidate.len());
+        if let Ok(url) = Url::parse(&candidate[..end]) {
+            out.push(url);
+        }
+    }
+
+    out
+}
+
+/// Extracts the host of every http(s) URL embedded in `text`, ports stripped.
+/// Bracketed IPv6 hosts and placeholder fragments are skipped.
+pub(crate) fn hosts_in_text(text: &str) -> BTreeSet<String> {
+    urls_in_text(text)
+        .iter()
+        .filter_map(|url| url.host_str())
+        .filter(|host| is_usable_host(host))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Collects a network allow-list entry for every remote MCP server `url`
 /// (http/https), so user-configured servers are reachable regardless of how,
 /// or whether, their credentials are provisioned. Https on the default port
@@ -394,13 +511,14 @@ pub(crate) fn allow_entry_for_url(raw: &str) -> Option<String> {
         return None;
     }
 
-    let host = url.host_str()?;
-    if host.is_empty() || host.starts_with('[') {
-        return None;
-    }
+    allow_entry_for_parsed(&url)
+}
+
+fn allow_entry_for_parsed(url: &Url) -> Option<String> {
+    let host = url.host_str().filter(|h| is_usable_host(h))?;
 
     match url.port_or_known_default() {
-        Some(443) if scheme == "https" => Some(host.to_string()),
+        Some(443) if url.scheme() == "https" => Some(host.to_string()),
         Some(port) => Some(format!("{host}:{port}")),
         None => None,
     }
@@ -489,12 +607,17 @@ pub(crate) fn render_mixin_document(
     serde_yaml::to_string(&mixin).context("Failed to serialize generated sandbox mixin")
 }
 
+/// Renders the generated `coyote-mcp` mixin. Only proxy-managed credentials
+/// are declared. sbx does not materialize env vars for `proxyManaged: false`
+/// mixin credentials, so the rest are provisioned as custom secrets outside
+/// the mixin, and only their target hosts join the network allow list here.
 pub(crate) fn render_mixin_yaml(
     credentials: &[CredentialSpec],
     server_allow_entries: &[String],
 ) -> Result<String> {
     let entries = credentials
         .iter()
+        .filter(|c| c.proxy_managed)
         .map(|c| CredentialEntry {
             service: c.service_id.clone(),
             description: format!(
@@ -510,14 +633,20 @@ pub(crate) fn render_mixin_yaml(
         })
         .collect();
 
+    let mut allow_entries: Vec<String> = server_allow_entries.to_vec();
+    for credential in credentials.iter().filter(|c| !c.proxy_managed) {
+        allow_entries.extend(credential.custom_allow_entries.iter().cloned());
+    }
+
     render_mixin_document(
         MCP_MIXIN_NAME,
         "Auto-generated by Coyote at launch: allows network egress to the user's remote MCP \
          servers and declares their credentials so Docker Sandboxes binds them (bindings are \
-         approved on first interactive run). Values are pre-seeded from Coyote's vault via \
-         `sbx secret set`.",
+         approved on first interactive run). Proxy-injectable values are pre-seeded from \
+         Coyote's vault via `sbx secret set`; the remaining secrets are provisioned as \
+         placeholder-based custom secrets via `sbx secret set-custom`.",
         entries,
-        server_allow_entries,
+        &allow_entries,
     )
 }
 
@@ -603,6 +732,11 @@ mod tests {
         assert_eq!(cred.service_id, "github-pat");
         assert_eq!(cred.env_var, "COYOTE_SECRET_GITHUB_PAT");
         assert!(cred.proxy_managed);
+        assert!(
+            cred.custom_hosts.is_empty(),
+            "proxy-managed credentials are provisioned via `sbx secret set`, \
+             not set-custom, so they carry no custom hosts"
+        );
         assert_eq!(
             cred.inject,
             vec![InjectRule {
@@ -839,6 +973,12 @@ mod tests {
             "secrets sharing an inject domain must both fall back to env"
         );
         assert!(creds.iter().all(|c| c.inject.is_empty()));
+        assert!(
+            creds
+                .iter()
+                .all(|c| c.custom_hosts == vec!["api.githubcopilot.com".to_string()]),
+            "demoted secrets must derive their set-custom targets from the server url"
+        );
     }
 
     #[test]
@@ -1018,19 +1158,160 @@ mod tests {
     }
 
     #[test]
-    fn rendered_mixin_omits_inject_and_permissions_for_env_based_secrets() {
+    fn rendered_mixin_drops_env_based_credentials() {
         let servers = servers(json!({
             "local": { "command": "run", "env": { "KEY": "{{NOTION_TOKEN}}" } }
         }));
 
         let creds = collect_credentials(&servers).unwrap();
+        assert_eq!(creds.len(), 1);
+        assert!(!creds[0].proxy_managed, "precondition");
+        assert!(
+            creds[0].custom_hosts.is_empty(),
+            "a stdio server with no URLs anywhere yields no derivable hosts"
+        );
+
         let yaml = render_mixin_yaml(&creds, &[]).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
 
-        let cred = &value["credentials"][0];
-        assert_eq!(cred["apiKey"]["proxyManaged"].as_bool(), Some(false));
-        assert!(cred["apiKey"].get("inject").is_none());
+        assert!(
+            value.get("credentials").is_none(),
+            "sbx does not materialize env vars for proxyManaged:false mixin \
+             credentials; declaring them would be dead config"
+        );
         assert!(value.get("permissions").is_none());
+    }
+
+    #[test]
+    fn hosts_in_text_extracts_hosts_and_strips_ports() {
+        assert_eq!(
+            hosts_in_text("https://api.example.com:8443/v1"),
+            BTreeSet::from(["api.example.com".to_string()])
+        );
+        assert_eq!(
+            hosts_in_text("see http://a.example.com/x and https://b.example.com/y"),
+            BTreeSet::from(["a.example.com".to_string(), "b.example.com".to_string()])
+        );
+        assert_eq!(
+            hosts_in_text("https://api.example.com/mcp?key={{KEY}}"),
+            BTreeSet::from(["api.example.com".to_string()])
+        );
+        assert!(hosts_in_text("ws://sock.example.com/mcp").is_empty());
+        assert!(hosts_in_text("qdrant.example.com:6333").is_empty());
+        assert!(hosts_in_text("https://[::1]:8443/mcp").is_empty());
+        assert!(hosts_in_text("httpserver is not a scheme").is_empty());
+    }
+
+    #[test]
+    fn hosts_in_text_terminates_urls_at_punctuation() {
+        assert_eq!(
+            hosts_in_text("https://a.example.com,https://b.example.com;https://c.example.com"),
+            BTreeSet::from([
+                "a.example.com".to_string(),
+                "b.example.com".to_string(),
+                "c.example.com".to_string()
+            ])
+        );
+        assert_eq!(
+            hosts_in_text("(see https://docs.example.com)"),
+            BTreeSet::from(["docs.example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn server_secret_hosts_unions_url_host_and_scraped_urls() {
+        let server = json!({
+            "command": "run",
+            "args": ["--endpoint", "https://api.vendor.example/v2"],
+            "env": { "BASE_URL": "http://internal.example.com:8080/api" }
+        });
+
+        let hosts = server_secret_hosts(&server);
+
+        assert_eq!(
+            hosts.targets,
+            BTreeSet::from([
+                "api.vendor.example".to_string(),
+                "internal.example.com".to_string()
+            ]),
+            "set-custom targets are port-stripped"
+        );
+        assert_eq!(
+            hosts.allow_entries,
+            BTreeSet::from([
+                "api.vendor.example".to_string(),
+                "internal.example.com:8080".to_string()
+            ]),
+            "allow entries keep non-default ports so the hosts stay reachable"
+        );
+    }
+
+    #[test]
+    fn server_secret_hosts_includes_non_http_url_host() {
+        let server = json!({ "url": "ws://sock.example.com/mcp" });
+
+        let hosts = server_secret_hosts(&server);
+
+        assert_eq!(
+            hosts.targets,
+            BTreeSet::from(["sock.example.com".to_string()])
+        );
+        assert!(
+            hosts.allow_entries.is_empty(),
+            "non-http(s) urls have no spelling in the allow grammar"
+        );
+    }
+
+    #[test]
+    fn server_secret_hosts_skips_placeholder_hosts() {
+        let server = json!({
+            "url": "https://{{TENANT}}.example.com/mcp",
+            "env": { "API_URL": "https://{{REGION}}.api.example.com/v1" }
+        });
+
+        let hosts = server_secret_hosts(&server);
+
+        assert!(
+            hosts.targets.is_empty() && hosts.allow_entries.is_empty(),
+            "a host containing an unresolved placeholder must never reach \
+             set-custom argv or the mixin allow list: {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn demoted_credential_hosts_are_unioned_into_allow() {
+        let servers = servers(json!({
+            "local": {
+                "command": "run",
+                "env": {
+                    "KEY": "{{TOKEN}}",
+                    "API_URL": "https://api.internal.example.com:8443/v1"
+                }
+            }
+        }));
+
+        let creds = collect_credentials(&servers).unwrap();
+        assert_eq!(creds.len(), 1);
+        assert!(!creds[0].proxy_managed, "precondition");
+        assert_eq!(
+            creds[0].custom_hosts,
+            vec!["api.internal.example.com".to_string()]
+        );
+        assert_eq!(
+            creds[0].custom_allow_entries,
+            vec!["api.internal.example.com:8443".to_string()],
+            "allow entries keep the port that set-custom targets must strip"
+        );
+
+        let yaml = render_mixin_yaml(&creds, &[]).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+
+        assert!(value.get("credentials").is_none());
+        assert_eq!(
+            value["permissions"]["network"]["allow"][0].as_str(),
+            Some("api.internal.example.com:8443"),
+            "a demoted credential's derived hosts must still be reachable"
+        );
     }
 
     #[test]

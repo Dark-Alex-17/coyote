@@ -2,12 +2,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use rust_embed::RustEmbed;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
-use std::env;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::{env, io};
 use which::which;
 
 pub(crate) mod mcp_credentials;
@@ -52,25 +52,38 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
         ..AppConfig::default()
     };
     let vault = Vault::init(&bootstrap)?;
-    let registered = sbx_registered_services()?;
-    inject_llm_secret(&config_content, &vault, &registered)?;
+    let registered = sbx_registered_secrets()?;
+    inject_llm_secret(&config_content, &vault, &registered.services)?;
+    let mut custom_plans: BTreeMap<String, CustomSecretPlan> = BTreeMap::new();
     if !fresh {
-        inject_rag_secrets(&vault, &registered)?;
+        collect_rag_custom_secrets(&mut custom_plans)?;
     }
 
     let credentials_mixin = if fresh {
         None
     } else {
-        inject_mcp_secrets(&vault, &registered)?
+        inject_mcp_secrets(&vault, &registered, &mut custom_plans)?
     };
+    let new_custom_envs = provision_custom_secrets(&vault, &registered, custom_plans)?;
 
     let discovered = mixins::discover()?;
 
     if sandbox_exists(&name)? {
         info!("Re-attaching to existing sandbox '{name}'");
+        if !fresh {
+            warn_if_mixin_drifted(&name, credentials_mixin.as_deref());
+            if !new_custom_envs.is_empty() {
+                eprintln!(
+                    "Custom secret env var(s) {} were just registered; restart sandbox \
+                     '{name}' for them to appear in its environment.",
+                    mcp_credentials::quoted_list(&new_custom_envs)
+                );
+            }
+        }
     } else {
         mixins::log_discovery(&discovered, false);
         create_sandbox(&name, &kit_path, &discovered, credentials_mixin.as_deref())?;
+        persist_mixin_hash(&name, credentials_mixin.as_deref());
         if !fresh {
             copy_host_files(&name)?;
         }
@@ -214,6 +227,50 @@ fn compute_kit_hash() -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// The generated `coyote-mcp` mixin is baked into a sandbox at create time and
+/// never re-applied on re-attach, so its hash is persisted per sandbox to
+/// detect when the MCP config drifts from the rules the sandbox runs with.
+/// An absent mixin hashes as the empty string, keeping the comparison total.
+fn credentials_mixin_hash(mixin: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(mixin.unwrap_or("").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn persist_mixin_hash(name: &str, mixin: Option<&str>) {
+    let path = paths::sandbox_mixin_hash_file(name);
+    let write = |path: &Path| -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::write(path, credentials_mixin_hash(mixin))
+    };
+
+    if let Err(e) = write(&path) {
+        eprintln!(
+            "Warning: failed to record the sandbox mixin hash at {} ({e}); \
+             stale-rule detection is disabled for sandbox '{name}'.",
+            path.display()
+        );
+    }
+}
+
+fn warn_if_mixin_drifted(name: &str, mixin: Option<&str>) {
+    let path = paths::sandbox_mixin_hash_file(name);
+    let Ok(stored) = fs::read_to_string(&path) else {
+        return;
+    };
+
+    if stored.trim() != credentials_mixin_hash(mixin) {
+        eprintln!(
+            "Warning: the MCP config changed since sandbox '{name}' was created; its \
+             baked-in network and credential rules are stale. Remove and re-create \
+             the sandbox to apply the new rules: sbx rm {name}"
+        );
+    }
+}
+
 fn inject_llm_secret(
     config_content: &str,
     vault: &Vault,
@@ -262,7 +319,17 @@ fn inject_llm_secret(
 /// and returns the generated schema-v2 `coyote-mcp` mixin (network egress for
 /// every remote MCP server + credential declarations), or `None` when the MCP
 /// config references no remote servers and no secrets.
-fn inject_mcp_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<Option<String>> {
+///
+/// Proxy-managed credentials go through `sbx secret set` and are declared in
+/// the mixin. The rest (slot-conflicted or non-header secrets) go through
+/// `sbx secret set-custom`; they are only accumulated into `custom_plans`
+/// here. `provision_custom_secrets` registers each env var once with the
+/// union of targets from every source (MCP and RAG) that needs it.
+fn inject_mcp_secrets(
+    vault: &Vault,
+    registered: &SbxSecrets,
+    custom_plans: &mut BTreeMap<String, CustomSecretPlan>,
+) -> Result<Option<String>> {
     let mcp_path = paths::mcp_config_file();
     if !mcp_path.exists() {
         return Ok(None);
@@ -284,28 +351,34 @@ fn inject_mcp_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<Opt
     }
 
     for credential in &credentials {
-        if registered.contains(credential.service_id.as_str()) {
-            eprintln!(
-                "Secret for '{}' already registered with sbx. \
-                 To update it, run: sbx secret set --force {}",
-                credential.service_id, credential.service_id
-            );
+        if credential.proxy_managed {
+            if registered.services.contains(credential.service_id.as_str()) {
+                eprintln!(
+                    "Secret for '{}' already registered with sbx. \
+                     To update it, run: sbx secret set --force {}",
+                    credential.service_id, credential.service_id
+                );
+                continue;
+            }
+
+            let secret_value = vault
+                .get_secret(&credential.secret_name, false)
+                .with_context(|| mcp_secret_missing_hint(credential))?;
+
+            sbx_secret_set(&credential.service_id, &secret_value)?;
             continue;
         }
 
-        let secret_value = vault
-            .get_secret(&credential.secret_name, false)
-            .with_context(|| {
-                format!(
-                    "Secret '{}' referenced by MCP server(s) {} not found \
-                     in vault. Add it with: coyote --add-secret {}",
-                    credential.secret_name,
-                    mcp_credentials::quoted_list(&credential.servers),
-                    credential.secret_name
-                )
-            })?;
-
-        sbx_secret_set(&credential.service_id, &secret_value)?;
+        add_custom_secret_plan(
+            custom_plans,
+            &credential.secret_name,
+            credential.custom_hosts.iter().cloned(),
+            format!(
+                "MCP server(s) {}",
+                mcp_credentials::quoted_list(&credential.servers)
+            ),
+            true,
+        );
     }
 
     Ok(Some(mcp_credentials::render_mixin_yaml(
@@ -314,7 +387,216 @@ fn inject_mcp_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<Opt
     )?))
 }
 
-fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()> {
+fn mcp_secret_missing_hint(credential: &mcp_credentials::CredentialSpec) -> String {
+    format!(
+        "Secret '{}' referenced by MCP server(s) {} not found \
+         in vault. Add it with: coyote --add-secret {}",
+        credential.secret_name,
+        mcp_credentials::quoted_list(&credential.servers),
+        credential.secret_name
+    )
+}
+
+/// One custom secret to provision, accumulated across every source (RAG
+/// driver configs, demoted MCP credentials) before anything is registered,
+/// so an env var shared by several sources gets exactly one registration
+/// with the union of their target hosts.
+#[derive(Debug, PartialEq, Eq)]
+struct CustomSecretPlan {
+    secret_name: String,
+    hosts: BTreeSet<String>,
+    /// Human labels ("RAG 'docs'", "MCP server(s) 'kong'") for notices.
+    sources: BTreeSet<String>,
+    /// When false a missing vault secret only warns (RAG behavior); any
+    /// strict source (MCP) upgrades the whole plan to a hard error.
+    strict: bool,
+}
+
+fn add_custom_secret_plan(
+    plans: &mut BTreeMap<String, CustomSecretPlan>,
+    secret_name: &str,
+    hosts: impl IntoIterator<Item = String>,
+    source: String,
+    strict: bool,
+) {
+    let plan = plans
+        .entry(sandbox_secret_env_var(secret_name))
+        .or_insert_with(|| CustomSecretPlan {
+            secret_name: secret_name.to_string(),
+            hosts: BTreeSet::new(),
+            sources: BTreeSet::new(),
+            strict: false,
+        });
+    plan.hosts.extend(hosts);
+    plan.sources.insert(source);
+    plan.strict |= strict;
+}
+
+/// Target hosts for a custom secret; falls back to the `'**'` wildcard (match
+/// any host) when none could be derived, so the secret is still provisioned.
+fn custom_secret_targets(plan: &CustomSecretPlan) -> Vec<String> {
+    if plan.hosts.is_empty() {
+        eprintln!(
+            "Warning: no target host could be derived for secret '{}'; \
+             registering its sandbox custom secret with the wildcard target '**', \
+             so the proxy replaces its placeholder in headers sent to ANY host.",
+            plan.secret_name
+        );
+        return vec!["**".to_string()];
+    }
+
+    plan.hosts.iter().cloned().collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CustomSecretAction {
+    /// No custom secret is registered for this env var yet.
+    Register {
+        targets: Vec<String>,
+    },
+    Covered,
+    /// Targets drifted. sbx cannot update targets in place, so the existing
+    /// registration is removed (by placeholder) and re-registered with the
+    /// union of old and new targets. A union so that scope widened outside
+    /// Coyote is never narrowed. Values are re-seeded from the vault, so
+    /// this is an update, not a deletion.
+    Replace {
+        placeholder: String,
+        targets: Vec<String>,
+    },
+}
+
+fn plan_custom_secret_action(
+    existing: Option<&CustomSecret>,
+    wanted: &[String],
+) -> CustomSecretAction {
+    let Some(existing) = existing else {
+        return CustomSecretAction::Register {
+            targets: wanted.to_vec(),
+        };
+    };
+
+    let covered =
+        existing.targets.contains("**") || wanted.iter().all(|t| existing.targets.contains(t));
+    if covered {
+        return CustomSecretAction::Covered;
+    }
+
+    let targets: Vec<String> = existing
+        .targets
+        .iter()
+        .chain(wanted.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    CustomSecretAction::Replace {
+        placeholder: existing.placeholder.clone(),
+        targets,
+    }
+}
+
+/// Registers every accumulated custom secret with sbx and returns the env
+/// vars that were newly (re-)registered. Never re-registers on a value
+/// change (values are write-once here) only on target drift.
+fn provision_custom_secrets(
+    vault: &Vault,
+    registered: &SbxSecrets,
+    plans: BTreeMap<String, CustomSecretPlan>,
+) -> Result<Vec<String>> {
+    let mut new_envs = Vec::new();
+    for (env_var, plan) in plans {
+        let targets = custom_secret_targets(&plan);
+        let sources = plan.sources.iter().cloned().collect::<Vec<_>>().join(", ");
+        eprintln!(
+            "Secret '{}' (used by {sources}) resolves to a proxy placeholder inside \
+             the sandbox (env var {env_var}); the real value is only injected into \
+             HTTP(S) request headers sent to: {}.",
+            plan.secret_name,
+            targets.join(", ")
+        );
+
+        let action = plan_custom_secret_action(registered.custom.get(&env_var), &targets);
+        if let CustomSecretAction::Covered = action {
+            eprintln!("Custom secret '{env_var}' already registered with sbx.");
+            let existing = &registered.custom[&env_var];
+            if existing.targets.contains("**") && targets != ["**"] {
+                eprintln!(
+                    "Note: the existing registration targets the wildcard '**', wider \
+                     than the derived host(s) {}. To re-scope it, remove it with \
+                     `sbx secret rm --placeholder {} -f` and re-launch.",
+                    mcp_credentials::quoted_list(&targets),
+                    existing.placeholder
+                );
+            }
+            continue;
+        }
+
+        // Resolve the value BEFORE any removal so a missing vault secret
+        // never destroys an existing registration.
+        let secret_value = match vault.get_secret(&plan.secret_name, false) {
+            Ok(value) => value,
+            Err(e) if !plan.strict => {
+                eprintln!(
+                    "Warning: could not load secret '{}' (used by {sources}): {e}. \
+                     Requests that need it will fail inside the sandbox. \
+                     Run `coyote --add-secret {}` to fix.",
+                    plan.secret_name, plan.secret_name
+                );
+                continue;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "Secret '{}' (used by {sources}) not found in vault. \
+                         Add it with: coyote --add-secret {}",
+                        plan.secret_name, plan.secret_name
+                    )
+                });
+            }
+        };
+
+        let (targets, replaced) = match action {
+            CustomSecretAction::Register { targets } => (targets, false),
+            CustomSecretAction::Replace {
+                placeholder,
+                targets,
+            } => {
+                eprintln!(
+                    "Updating the sbx custom secret for '{env_var}' to cover target \
+                     host(s) {}.",
+                    mcp_credentials::quoted_list(&targets)
+                );
+
+                if !sbx_secret_rm_custom(&placeholder)? {
+                    continue;
+                }
+
+                (targets, true)
+            }
+            CustomSecretAction::Covered => unreachable!("handled above"),
+        };
+
+        if sbx_secret_set_custom(&env_var, &targets, &secret_value)? {
+            new_envs.push(env_var);
+        } else if replaced {
+            eprintln!(
+                "Warning: the old registration for '{env_var}' was removed but \
+                 re-registering it failed; it will be re-registered from the vault \
+                 on the next launch."
+            );
+        }
+    }
+
+    Ok(new_envs)
+}
+
+/// Accumulates every attached RAG's driver_config secrets into `custom_plans`
+/// (bound to `COYOTE_SECRET_<NAME>`, the env var `interpolate_secrets`
+/// resolves inside the sandbox). Non-strict: a missing vault secret warns at
+/// provisioning time instead of failing the launch, meaning only that RAG's
+/// queries would fail.
+fn collect_rag_custom_secrets(custom_plans: &mut BTreeMap<String, CustomSecretPlan>) -> Result<()> {
     let rags_dir = paths::rags_dir();
     if !rags_dir.exists() {
         return Ok(());
@@ -338,20 +620,19 @@ fn inject_rag_secrets(vault: &Vault, registered: &HashSet<String>) -> Result<()>
             continue;
         }
         let secret_names = driver_config_secret_names(&data);
-        let Some((primary, extra)) = secret_names.split_first() else {
+        if secret_names.is_empty() {
             continue;
-        };
-
-        let service_id = mcp_credentials::secret_service_id(&stem);
-        if !service_id.is_empty() && !registered.contains(&service_id) {
-            bind_rag_secret(vault, &service_id, primary, &stem)?;
         }
 
-        for name in extra {
-            let id = mcp_credentials::secret_service_id(name);
-            if !id.is_empty() && !registered.contains(&id) {
-                bind_rag_secret(vault, &id, name, &stem)?;
-            }
+        let hosts = rag_driver_hosts(&data);
+        for secret_name in &secret_names {
+            add_custom_secret_plan(
+                custom_plans,
+                secret_name,
+                hosts.iter().cloned(),
+                format!("RAG '{stem}'"),
+                false,
+            );
         }
     }
 
@@ -378,21 +659,46 @@ fn driver_config_secret_names(data: &RagData) -> Vec<String> {
     names
 }
 
-fn bind_rag_secret(vault: &Vault, service_id: &str, secret_name: &str, stem: &str) -> Result<()> {
-    match vault.get_secret(secret_name, false) {
-        Ok(secret_value) => {
-            sbx_secret_set(service_id, &secret_value)
-                .context("Failed to register RAG secret with sbx")?;
-        }
-        Err(e) => {
-            eprintln!(
-                "Warning: could not load secret '{secret_name}' for RAG '{stem}': {e}. \
-                 Queries to this RAG will fail inside the sandbox. \
-                 Run `coyote --add-secret {secret_name}` to fix."
-            );
+/// Derives custom-secret target hosts from a RAG's driver_config: any http(s)
+/// URL in a value contributes its host, and the `host`/`url` keys also accept
+/// a bare `host[:port]` value (e.g. `qdrant.example.com:6333`). Ports are
+/// stripped (sbx custom-secret targets are host-only).
+fn rag_driver_hosts(data: &RagData) -> Vec<String> {
+    let mut hosts: BTreeSet<String> = BTreeSet::new();
+    for (key, value) in &data.driver_config {
+        let trimmed = value.trim();
+        hosts.extend(mcp_credentials::hosts_in_text(trimmed));
+        if (key == "host" || key == "url")
+            && let Some(host) = bare_host(trimmed)
+        {
+            hosts.insert(host);
         }
     }
-    Ok(())
+
+    hosts.into_iter().collect()
+}
+
+fn bare_host(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.contains("://")
+        || value.contains("{{")
+        || value.contains('/')
+        || value.contains(char::is_whitespace)
+    {
+        return None;
+    }
+
+    let host = match value.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => value,
+        None => value,
+    };
+
+    if host.is_empty() || host.contains(':') || host.starts_with('[') {
+        return None;
+    }
+
+    Some(host.to_string())
 }
 
 fn provider_to_sbx_service(provider_type: &str, client_name: Option<&str>) -> String {
@@ -405,29 +711,112 @@ fn provider_to_sbx_service(provider_type: &str, client_name: Option<&str>) -> St
     }
 }
 
-fn sbx_registered_services() -> Result<HashSet<String>> {
-    let (success, stdout, _) = run_command_with_output(SBX_BINARY, &["secret", "ls"], None)
+#[derive(Debug, Default)]
+struct SbxSecrets {
+    services: HashSet<String>,
+    custom: HashMap<String, CustomSecret>,
+}
+
+#[derive(Debug)]
+struct CustomSecret {
+    targets: BTreeSet<String>,
+    placeholder: String,
+}
+
+fn sbx_registered_secrets() -> Result<SbxSecrets> {
+    let (success, stdout, stderr) = run_command_with_output(SBX_BINARY, &["secret", "ls"], None)
         .context("Failed to run `sbx secret ls`")?;
 
     if !success {
-        return Ok(HashSet::new());
+        eprintln!(
+            "Warning: `sbx secret ls` failed ({}); Coyote cannot tell which secrets \
+             are already registered and may attempt to re-register existing ones.",
+            stderr.trim()
+        );
+        return Ok(SbxSecrets::default());
     }
 
-    Ok(stdout
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let scope = parts.next()?;
-            let _kind = parts.next()?;
-            let name = parts.next()?;
-            if scope == "(global)" {
-                Some(name.to_string())
-            } else {
-                None
+    Ok(parse_sbx_secret_ls(&stdout))
+}
+
+fn parse_sbx_secret_ls(stdout: &str) -> SbxSecrets {
+    let mut secrets = SbxSecrets::default();
+    let mut in_custom = false;
+    let mut in_header = true;
+    let mut custom_body_lines = 0usize;
+    let mut custom_rows = 0usize;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "CUSTOM SECRETS" {
+            in_custom = true;
+            in_header = true;
+            continue;
+        }
+        if in_header {
+            in_header = false;
+            continue;
+        }
+
+        if in_custom {
+            custom_body_lines += 1;
+            let cols = split_columns(line);
+            let [scope, targets, env, placeholder, ..] = cols.as_slice() else {
+                continue;
+            };
+            custom_rows += 1;
+            if *scope != "(global)" {
+                continue;
             }
-        })
-        .collect())
+            secrets.custom.insert(
+                (*env).to_string(),
+                CustomSecret {
+                    targets: targets.split(',').map(|t| t.trim().to_string()).collect(),
+                    placeholder: (*placeholder).to_string(),
+                },
+            );
+        } else {
+            let mut parts = line.split_whitespace();
+            let (Some(scope), Some(_kind), Some(name)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if scope == "(global)" {
+                secrets.services.insert(name.to_string());
+            }
+        }
+    }
+
+    if custom_body_lines > 0 && custom_rows == 0 {
+        eprintln!(
+            "Warning: no rows could be parsed from the CUSTOM SECRETS section of \
+             `sbx secret ls`; its output format may have changed. Custom-secret \
+             idempotency checks are disabled for this launch."
+        );
+    }
+
+    secrets
+}
+
+fn split_columns(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = line.trim();
+    while !rest.is_empty() {
+        match rest.find("  ") {
+            Some(idx) => {
+                out.push(&rest[..idx]);
+                rest = rest[idx..].trim_start();
+            }
+            None => {
+                out.push(rest);
+                break;
+            }
+        }
+    }
+
+    out
 }
 
 fn sbx_secret_set(service: &str, secret_value: &str) -> Result<()> {
@@ -439,10 +828,11 @@ fn sbx_secret_set(service: &str, secret_value: &str) -> Result<()> {
         .spawn()
         .context("Failed to spawn `sbx secret set`")?;
 
-    if let Some(mut stdin_handle) = child.stdin.take() {
-        stdin_handle
-            .write_all(secret_value.as_bytes())
-            .context("Failed to write secret to `sbx secret set` stdin")?;
+    if let Some(mut stdin_handle) = child.stdin.take()
+        && let Err(e) = stdin_handle.write_all(secret_value.as_bytes())
+        && e.kind() != io::ErrorKind::BrokenPipe
+    {
+        return Err(anyhow!(e).context("Failed to write secret to `sbx secret set` stdin"));
     }
 
     let status = child
@@ -453,11 +843,77 @@ fn sbx_secret_set(service: &str, secret_value: &str) -> Result<()> {
         eprintln!(
             "Warning: failed to register sbx secret '{service}' \
              (`sbx secret set {service}` exited with {status}). \
-             Set it manually with: echo '<value>' | sbx secret set {service}"
+             Set it manually with: sbx secret set {service} \
+             (the value is read from the prompt)"
         );
     }
 
     Ok(())
+}
+
+fn sbx_secret_set_custom(env_var: &str, targets: &[String], secret_value: &str) -> Result<bool> {
+    let mut args: Vec<&str> = vec!["secret", "set-custom", "--env", env_var];
+    for target in targets {
+        args.push("--host");
+        args.push(target);
+    }
+
+    debug!(
+        "sbx secret set-custom --env {env_var} (targets: {})",
+        targets.join(", ")
+    );
+
+    let mut child = Command::new(SBX_BINARY)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("Failed to spawn `sbx secret set-custom`")?;
+
+    if let Some(mut stdin_handle) = child.stdin.take()
+        && let Err(e) = stdin_handle.write_all(secret_value.as_bytes())
+        && e.kind() != io::ErrorKind::BrokenPipe
+    {
+        return Err(anyhow!(e).context("Failed to write secret to `sbx secret set-custom` stdin"));
+    }
+
+    let status = child
+        .wait()
+        .context("Failed to wait for `sbx secret set-custom`")?;
+
+    if !status.success() {
+        let host_flags: String = targets.iter().map(|t| format!(" --host '{t}'")).collect();
+        eprintln!(
+            "Warning: failed to register sbx custom secret '{env_var}' \
+             (`sbx secret set-custom` exited with {status}). Set it manually with: \
+             sbx secret set-custom --env {env_var}{host_flags} \
+             (the value is read from the prompt)"
+        );
+    }
+
+    Ok(status.success())
+}
+
+fn sbx_secret_rm_custom(placeholder: &str) -> Result<bool> {
+    debug!("sbx secret rm --placeholder {placeholder} -f");
+    let status = Command::new(SBX_BINARY)
+        .args(["secret", "rm", "--placeholder", placeholder, "-f"])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("Failed to spawn `sbx secret rm`")?;
+
+    if !status.success() {
+        eprintln!(
+            "Warning: failed to remove the outdated sbx custom secret \
+             (`sbx secret rm --placeholder {placeholder} -f` exited with {status}); \
+             its targets were left unchanged."
+        );
+    }
+
+    Ok(status.success())
 }
 
 fn sandbox_exists(name: &str) -> Result<bool> {
@@ -730,6 +1186,293 @@ mod tests {
             driver_config_secret_names(&data),
             vec!["QDRANT_KEY", "OTHER_TOKEN"],
             "order follows driver_config, and a repeat is not registered twice"
+        );
+    }
+
+    /// Pinned to the `sbx secret ls` output shape of sbx v0.38.0.
+    const SECRET_LS_SAMPLE: &str = "\
+SCOPE      TYPE      NAME               SECRET
+(global)   service   github             (stored)
+(global)   service   kong-prod-pat      (stored)
+(global)   service   anthropic          (oauth configured)
+
+CUSTOM SECRETS
+SCOPE      TARGETS          ENV              PLACEHOLDER               SECRET
+(global)   api.stripe.com   STRIPE_API_KEY   sbx-cs-97BPiO11AS93Tlo5   rk_liv******...******JT6n
+";
+
+    #[test]
+    fn parse_sbx_secret_ls_reads_both_sections() {
+        let secrets = parse_sbx_secret_ls(SECRET_LS_SAMPLE);
+
+        assert_eq!(
+            secrets.services,
+            HashSet::from([
+                "github".to_string(),
+                "kong-prod-pat".to_string(),
+                "anthropic".to_string()
+            ])
+        );
+        let custom = secrets.custom.get("STRIPE_API_KEY").unwrap();
+        assert_eq!(
+            custom.targets,
+            BTreeSet::from(["api.stripe.com".to_string()])
+        );
+        assert_eq!(custom.placeholder, "sbx-cs-97BPiO11AS93Tlo5");
+    }
+
+    #[test]
+    fn parse_sbx_secret_ls_splits_comma_separated_targets() {
+        // Pinned to a live capture: multiple --host targets render as one
+        // comma+space-separated TARGETS field, columns padded to 2+ spaces.
+        let output = "\
+SCOPE      TYPE      NAME     SECRET
+(global)   service   github   (stored)
+
+CUSTOM SECRETS
+SCOPE      TARGETS                                                                             ENV                 PLACEHOLDER               SECRET
+(global)   probe.invalid, other.probe.invalid, a-quite-long-hostname.subdomain.probe.invalid   COYOTE_TEST_PROBE   sbx-cs-TdaC76ZA3MYAfNAt   probe-*******
+";
+
+        let secrets = parse_sbx_secret_ls(output);
+
+        let custom = secrets.custom.get("COYOTE_TEST_PROBE").unwrap();
+        assert_eq!(
+            custom.targets,
+            BTreeSet::from([
+                "probe.invalid".to_string(),
+                "other.probe.invalid".to_string(),
+                "a-quite-long-hostname.subdomain.probe.invalid".to_string()
+            ])
+        );
+        assert_eq!(custom.placeholder, "sbx-cs-TdaC76ZA3MYAfNAt");
+    }
+
+    #[test]
+    fn parse_sbx_secret_ls_without_custom_section() {
+        let output = "\
+SCOPE      TYPE      NAME     SECRET
+(global)   service   github   (stored)
+";
+
+        let secrets = parse_sbx_secret_ls(output);
+
+        assert_eq!(secrets.services, HashSet::from(["github".to_string()]));
+        assert!(secrets.custom.is_empty());
+    }
+
+    #[test]
+    fn parse_sbx_secret_ls_ignores_non_global_rows() {
+        let output = "\
+SCOPE      TYPE      NAME     SECRET
+my-box     service   github   (stored)
+
+CUSTOM SECRETS
+SCOPE    TARGETS          ENV       PLACEHOLDER    SECRET
+my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
+";
+
+        let secrets = parse_sbx_secret_ls(output);
+
+        assert!(secrets.services.is_empty());
+        assert!(secrets.custom.is_empty());
+    }
+
+    #[test]
+    fn parse_sbx_secret_ls_handles_empty_output() {
+        let secrets = parse_sbx_secret_ls("");
+
+        assert!(secrets.services.is_empty());
+        assert!(secrets.custom.is_empty());
+    }
+
+    fn plan_for(secret_name: &str, hosts: &[&str]) -> CustomSecretPlan {
+        CustomSecretPlan {
+            secret_name: secret_name.to_string(),
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            sources: BTreeSet::from(["test".to_string()]),
+            strict: true,
+        }
+    }
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn custom_secret_targets_falls_back_to_wildcard() {
+        assert_eq!(
+            custom_secret_targets(&plan_for("KEY", &[])),
+            vec!["**".to_string()]
+        );
+        assert_eq!(
+            custom_secret_targets(&plan_for("KEY", &["api.example.com"])),
+            vec!["api.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn plan_action_registers_when_no_secret_exists() {
+        assert_eq!(
+            plan_custom_secret_action(None, &strs(&["api.example.com"])),
+            CustomSecretAction::Register {
+                targets: strs(&["api.example.com"])
+            }
+        );
+    }
+
+    #[test]
+    fn plan_action_skips_a_covering_registration() {
+        let existing = CustomSecret {
+            targets: BTreeSet::from(["a.example.com".to_string(), "b.example.com".to_string()]),
+            placeholder: "sbx-cs-x".to_string(),
+        };
+
+        assert_eq!(
+            plan_custom_secret_action(Some(&existing), &strs(&["a.example.com"])),
+            CustomSecretAction::Covered
+        );
+        assert_eq!(
+            plan_custom_secret_action(Some(&existing), &strs(&["a.example.com", "b.example.com"])),
+            CustomSecretAction::Covered
+        );
+    }
+
+    #[test]
+    fn plan_action_treats_wildcard_as_covering_everything() {
+        let existing = CustomSecret {
+            targets: BTreeSet::from(["**".to_string()]),
+            placeholder: "sbx-cs-x".to_string(),
+        };
+
+        assert_eq!(
+            plan_custom_secret_action(Some(&existing), &strs(&["any.example.com"])),
+            CustomSecretAction::Covered,
+            "a wildcard registration is never narrowed, only noted"
+        );
+    }
+
+    #[test]
+    fn plan_action_replaces_on_target_drift_with_the_union() {
+        let existing = CustomSecret {
+            targets: BTreeSet::from(["a.example.com".to_string()]),
+            placeholder: "sbx-cs-x".to_string(),
+        };
+
+        assert_eq!(
+            plan_custom_secret_action(Some(&existing), &strs(&["b.example.com"])),
+            CustomSecretAction::Replace {
+                placeholder: "sbx-cs-x".to_string(),
+                targets: strs(&["a.example.com", "b.example.com"]),
+            },
+            "drift removes the old registration (by placeholder) and re-registers \
+             with the union so scope widened outside Coyote is never narrowed"
+        );
+    }
+
+    #[test]
+    fn shared_rag_and_mcp_secret_accumulates_one_plan_with_unioned_hosts() {
+        let mut plans: BTreeMap<String, CustomSecretPlan> = BTreeMap::new();
+
+        add_custom_secret_plan(
+            &mut plans,
+            "OPENAI_KEY",
+            strs(&["qdrant.example.com"]),
+            "RAG 'docs'".to_string(),
+            false,
+        );
+        add_custom_secret_plan(
+            &mut plans,
+            "OPENAI_KEY",
+            strs(&["api.openai.com"]),
+            "MCP server(s) 'assistant'".to_string(),
+            true,
+        );
+
+        assert_eq!(plans.len(), 1, "one env var must yield one registration");
+        let plan = &plans["COYOTE_SECRET_OPENAI_KEY"];
+        assert_eq!(
+            plan.hosts,
+            BTreeSet::from([
+                "api.openai.com".to_string(),
+                "qdrant.example.com".to_string()
+            ]),
+            "targets from every source are unioned, not last-writer-wins"
+        );
+        assert_eq!(
+            plan.sources,
+            BTreeSet::from([
+                "MCP server(s) 'assistant'".to_string(),
+                "RAG 'docs'".to_string()
+            ])
+        );
+        assert!(
+            plan.strict,
+            "any strict source upgrades the whole plan to a hard error on a missing secret"
+        );
+    }
+
+    #[test]
+    fn rag_driver_hosts_strips_port_from_bare_host() {
+        let data = rag_with(&[("host", "qdrant.example.com:6333"), ("collection", "docs")]);
+
+        assert_eq!(rag_driver_hosts(&data), vec!["qdrant.example.com"]);
+    }
+
+    #[test]
+    fn rag_driver_hosts_scrapes_urls_and_bare_url_key() {
+        let data = rag_with(&[
+            ("url", "https://qdrant.example.com:6333"),
+            ("proxy", "endpoint http://edge.example.com/v1"),
+        ]);
+
+        assert_eq!(
+            rag_driver_hosts(&data),
+            vec!["edge.example.com", "qdrant.example.com"]
+        );
+    }
+
+    #[test]
+    fn rag_driver_hosts_ignores_placeholders_and_non_host_values() {
+        let data = rag_with(&[
+            ("host", "{{QDRANT_HOST}}"),
+            ("api_key", "{{QDRANT_KEY}}"),
+            ("collection", "docs"),
+        ]);
+
+        assert!(rag_driver_hosts(&data).is_empty());
+    }
+
+    #[test]
+    fn bare_host_accepts_host_and_host_port_only() {
+        assert_eq!(
+            bare_host("qdrant.example.com"),
+            Some("qdrant.example.com".to_string())
+        );
+        assert_eq!(bare_host("localhost:6333"), Some("localhost".to_string()));
+        assert_eq!(bare_host("127.0.0.1:6333"), Some("127.0.0.1".to_string()));
+        assert_eq!(bare_host("https://a.example.com"), None);
+        assert_eq!(bare_host("{{HOST}}"), None);
+        assert_eq!(bare_host("host/path"), None);
+        assert_eq!(bare_host("two words"), None);
+        assert_eq!(bare_host("::1"), None);
+        assert_eq!(bare_host("[::1]:6333"), None);
+        assert_eq!(bare_host(""), None);
+    }
+
+    #[test]
+    fn credentials_mixin_hash_distinguishes_content_and_absence() {
+        assert_eq!(
+            credentials_mixin_hash(Some("kind: mixin\n")),
+            credentials_mixin_hash(Some("kind: mixin\n"))
+        );
+        assert_eq!(
+            credentials_mixin_hash(None),
+            credentials_mixin_hash(Some(""))
+        );
+        assert_ne!(
+            credentials_mixin_hash(None),
+            credentials_mixin_hash(Some("kind: mixin\n"))
         );
     }
     use std::time::{SystemTime, UNIX_EPOCH};
