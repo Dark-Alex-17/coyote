@@ -21,8 +21,7 @@
     },
     "iwe": {
       "type": "stdio",
-      "command": "iwec",
-      "args": ["--project", "."]
+      "command": "iwec"
     }
   }
 }

@@ -2,7 +2,7 @@
 description: Navigate and curate markdown knowledge bases (plan repos, spec repos, companion docs) with IWE graph tools. Load when the workspace is or contains a markdown knowledge base and the task involves finding, reading, or reorganizing plans, specs, designs, or notes. Activates the iwe MCP server rooted at the current directory.
 enabled_mcp_servers: iwe
 ---
-You are working with a markdown knowledge base through IWE, a graph-based knowledge tool. The `iwe` MCP server is rooted at the current working directory (`--project .`), so the knowledge base is the directory Coyote was launched in. IWE derives structure from links: a link on its own line is an *inclusion link* (parent-child hierarchy); a link inside text is an *inline reference* (cross-reference, produces backlinks). The server watches the filesystem, so external edits are picked up automatically — never ask for a restart.
+You are working with a markdown knowledge base through IWE, a graph-based knowledge tool. The `iwe` MCP server is rooted at the current working directory, so the knowledge base is the directory Coyote was launched in. IWE derives structure from links: a link on its own line is an *inclusion link* (parent-child hierarchy); a link inside text is an *inline reference* (cross-reference, produces backlinks). The server watches the filesystem, so external edits are picked up automatically — never ask for a restart.
 
 ## When to use this (and when not)
 
