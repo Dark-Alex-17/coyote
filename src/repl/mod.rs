@@ -19,8 +19,8 @@ use crate::config::{AssetCategory, paths};
 use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
 use crate::render::render_error;
 use crate::utils::{
-    AbortSignal, SHELL, abortable_run_with_spinner, create_abort_signal, dimmed_text, run_command,
-    set_text, temp_file,
+    AbortSignal, SHELL, abortable_run_with_spinner, create_abort_signal, dimmed_text,
+    drain_stale_tty_input, run_command, set_text, temp_file,
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
@@ -410,6 +410,10 @@ Type ".help" for additional help.
                 }
             }
         }
+
+        // Discard any stray terminal-query reply bytes (e.g. late colorsaurus
+        // OSC 11 / DA1 responses) so they don't get injected into the prompt.
+        drain_stale_tty_input();
 
         loop {
             if self.abort_signal.aborted_ctrld() {

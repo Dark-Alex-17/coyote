@@ -1,6 +1,6 @@
 use crate::client::{ClientConfig, Model, ModelType, list_models};
 use crate::render::{MarkdownRender, RenderOptions};
-use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, get_env_name};
+use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, drain_stale_tty_input, get_env_name};
 
 use super::paths;
 use anyhow::{Context, Result, anyhow, bail};
@@ -616,14 +616,18 @@ impl AppConfig {
         if self.highlight && self.theme.is_none() {
             if let Some(v) = super::read_env_value::<String>(&get_env_name("theme")) {
                 self.theme = v;
-            } else if *IS_STDOUT_TERMINAL
-                && let Ok(color_scheme) = color_scheme(QueryOptions::default())
-            {
-                let theme = match color_scheme {
-                    ColorScheme::Dark => "dark",
-                    ColorScheme::Light => "light",
-                };
-                self.theme = Some(theme.into());
+            } else if *IS_STDOUT_TERMINAL {
+                if let Ok(color_scheme) = color_scheme(QueryOptions::default()) {
+                    let theme = match color_scheme {
+                        ColorScheme::Dark => "dark",
+                        ColorScheme::Light => "light",
+                    };
+                    self.theme = Some(theme.into());
+                }
+                // The OSC/DA1 reply can arrive after colorsaurus stops reading
+                // (observed under zellij-in-kitty). Drain any late reply bytes so
+                // they are neither echoed nor read as line-editor input.
+                drain_stale_tty_input();
             }
         }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("left_prompt")) {
