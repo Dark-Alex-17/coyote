@@ -35,6 +35,7 @@ use nu_ansi_term::Color;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::{cmp, env, path::PathBuf, process};
@@ -45,7 +46,7 @@ pub static CODE_BLOCK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?ms)```\w*(.*)```").unwrap());
 pub static THINK_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^\s*<think>.*?</think>(\s*|$)").unwrap());
-pub static IS_STDOUT_TERMINAL: LazyLock<bool> = LazyLock::new(|| std::io::stdout().is_terminal());
+pub static IS_STDOUT_TERMINAL: LazyLock<bool> = LazyLock::new(|| io::stdout().is_terminal());
 pub static HEADLESS: AtomicBool = AtomicBool::new(false);
 pub static ACP_SERVER: AtomicBool = AtomicBool::new(false);
 
@@ -131,6 +132,33 @@ pub fn parse_bool(value: &str) -> Option<bool> {
         "0" | "false" => Some(false),
         _ => None,
     }
+}
+
+pub fn drain_stale_tty_input() {
+    use crossterm::event::{poll, read};
+    use std::time::{Duration, Instant};
+
+    if !io::stdin().is_terminal() {
+        return;
+    }
+
+    if crossterm::terminal::enable_raw_mode().is_err() {
+        return;
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        match poll(Duration::from_millis(10)) {
+            Ok(true) => {
+                if read().is_err() {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    let _ = crossterm::terminal::disable_raw_mode();
 }
 
 pub fn estimate_token_length(text: &str) -> usize {

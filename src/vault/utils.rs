@@ -1,5 +1,6 @@
 use crate::config::ensure_parent_exists;
 use crate::sandbox::{SANDBOX_ENV_FLAG, sandbox_secret_env_var};
+use crate::utils::drain_stale_tty_input;
 use crate::vault::{SECRET_RE, Vault};
 use anyhow::Result;
 use anyhow::anyhow;
@@ -68,6 +69,7 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
             }
         }
 
+        drain_stale_tty_input();
         let ans = Confirm::new(
             format!(
                 "The configured password file '{}' is empty. Create a password?",
@@ -107,6 +109,7 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
             }
         }
     } else {
+        drain_stale_tty_input();
         let ans = Confirm::new("No password file configured. Do you want to create one now?")
             .with_default(true)
             .prompt()?;
@@ -185,6 +188,7 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
 }
 
 pub fn prompt_provider_choice() -> Result<Option<SupportedProvider>> {
+    drain_stale_tty_input();
     let choices = vec![
         "local - encrypted file on this machine",
         "aws_secrets_manager - AWS Secrets Manager",

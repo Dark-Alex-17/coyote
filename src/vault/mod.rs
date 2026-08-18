@@ -12,6 +12,7 @@ pub use utils::prompt_provider_choice;
 
 use crate::cli::Cli;
 use crate::config::AppConfig;
+use crate::utils::drain_stale_tty_input;
 use crate::vault::utils::ensure_password_file_initialized;
 use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
@@ -151,6 +152,7 @@ impl Vault {
                 "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
             );
         }
+        drain_stale_tty_input();
         let secret_value = Password::new("Enter the secret value:")
             .with_validator(required!())
             .with_display_mode(PasswordDisplayMode::Masked)
@@ -190,6 +192,7 @@ impl Vault {
                 "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
             );
         }
+        drain_stale_tty_input();
         let secret_value = Password::new("Enter the secret value:")
             .with_validator(required!())
             .with_display_mode(PasswordDisplayMode::Masked)
