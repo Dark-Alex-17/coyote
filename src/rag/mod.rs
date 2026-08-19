@@ -151,7 +151,7 @@ impl Rag {
         println!("⚙ Initializing RAG...");
         let mut data = Self::resolve_init_data(app, config)?;
         data.driver = config.driver.clone().unwrap_or_else(|| "yaml".to_string());
-        let mut rag = Self::create(app, name, save_path, data)?;
+        let mut rag = Self::create(app, name, save_path, data).await?;
         let loaders = app.document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
         abortable_run_with_spinner_rx(
@@ -298,7 +298,7 @@ impl Rag {
             },
         );
         data.driver = driver;
-        let mut rag = Self::create(app, name, save_path, data)?;
+        let mut rag = Self::create(app, name, save_path, data).await?;
         let mut paths = doc_paths.to_vec();
         if paths.is_empty() {
             paths = add_documents()?;
@@ -317,12 +317,12 @@ impl Rag {
         Ok(rag)
     }
 
-    pub fn load(app: &AppConfig, name: &str, path: &Path) -> Result<Self> {
+    pub async fn load(app: &AppConfig, name: &str, path: &Path) -> Result<Self> {
         let err = || format!("Failed to load rag '{name}' at '{}'", path.display());
         let content = fs::read_to_string(path).with_context(err)?;
         let data: RagData = serde_yaml::from_str(&content).with_context(err)?;
         data.validate().with_context(err)?;
-        Self::create(app, name, path, data)
+        Self::create(app, name, path, data).await
     }
 
     /// Loads a RAG from a YAML file. External drivers need an async constructor
@@ -372,7 +372,7 @@ impl Rag {
                     last_sources: RwLock::new(None),
                 })
             }
-            _ => Self::load(app, name, path),
+            _ => Self::load(app, name, path).await,
         }
     }
 
@@ -537,14 +537,22 @@ impl Rag {
         Ok(rag)
     }
 
-    pub fn create(app: &AppConfig, name: &str, path: &Path, mut data: RagData) -> Result<Self> {
+    pub async fn create(
+        app: &AppConfig,
+        name: &str,
+        path: &Path,
+        mut data: RagData,
+    ) -> Result<Self> {
         // Deliberately does NOT call rebuild_indexes: both callers construct the Rag
         // before any documents are added, so rebuilding empty data would be a no-op.
         // Actual population happens later via sync_documents.
         let (provider, bm25): (Box<dyn RagProvider>, _) = match data.driver.as_str() {
             "duckdb" => {
                 let db_path = providers::duckdb_path_from_yaml(path);
-                let dim = embedding_dim_for_model(&data.embedding_model);
+                let dim = match DuckDbProvider::introspect_dim(&db_path)? {
+                    Some(existing) => existing,
+                    None => probe_embedding_dim(app, &data.embedding_model).await?,
+                };
                 let duck = DuckDbProvider::open(&db_path, dim)?;
                 // HYDRATE — mandatory, not an optimization. The YAML file for a duckdb
                 // RAG deliberately omits `vectors`, so `data.vectors` arrives empty from
@@ -2119,21 +2127,25 @@ fn reciprocal_rank_fusion(
         .collect()
 }
 
-/// Map an embedding model id to its vector dimension.
-///
-/// The DuckDB `FLOAT[N]` column type and its HNSW index are fixed at schema-creation
-/// time, so this value must be decided before the first insert. An unrecognized model
-/// falls back to 1536; if that is wrong, DuckDB raises a dimension-mismatch error on
-/// the first insert rather than silently corrupting the schema, and the recovery is to
-/// delete the sidecar and re-ingest from source.
-fn embedding_dim_for_model(model_id: &str) -> usize {
-    match model_id {
-        m if m.contains("3-large") => 3072,
-        m if m.contains("3-small") || m.contains("ada-002") => 1536,
-        m if m.contains("nomic-embed-text") || m.contains("all-minilm") => 768,
-        m if m.contains("jina-embeddings-v2") => 1024,
-        _ => 1536,
+async fn probe_embedding_dim(app: &AppConfig, model_id: &str) -> Result<usize> {
+    let model = Model::retrieve_model(app, model_id, ModelType::Embedding)?;
+    let client = init_client(&Arc::new(app.clone()), model)?;
+    let out = client
+        .embeddings(&EmbeddingsData::new(vec!["dimension probe".into()], false))
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to probe the embedding dimension of model '{model_id}'. \
+                 Creating a duckdb RAG requires one call to the embedding endpoint."
+            )
+        })?;
+    let dim = out.first().map(|v| v.len()).unwrap_or(0);
+
+    if dim == 0 {
+        bail!("Embedding model '{model_id}' returned an empty vector during the dimension probe");
     }
+
+    Ok(dim)
 }
 
 /// True only for "the vault does not hold this key".
@@ -2671,18 +2683,6 @@ mod tests {
         // name is absent.
         data.driver_config.shift_remove("collection");
         assert_eq!(data.attached_source_label(), "[external collection]");
-    }
-
-    #[test]
-    fn embedding_dim_for_model_maps_known_models() {
-        assert_eq!(embedding_dim_for_model("text-embedding-3-large"), 3072);
-        assert_eq!(embedding_dim_for_model("text-embedding-3-small"), 1536);
-        assert_eq!(embedding_dim_for_model("text-embedding-ada-002"), 1536);
-        assert_eq!(embedding_dim_for_model("nomic-embed-text"), 768);
-        assert_eq!(embedding_dim_for_model("all-minilm"), 768);
-        assert_eq!(embedding_dim_for_model("jina-embeddings-v2-base-en"), 1024);
-        // Unknown models fall back to the OpenAI-compatible default.
-        assert_eq!(embedding_dim_for_model("some-unknown-model"), 1536);
     }
 
     #[test]

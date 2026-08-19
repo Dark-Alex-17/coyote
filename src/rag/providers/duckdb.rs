@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use duckdb::types::Value;
-use duckdb::{AccessMode, Config, Connection};
+use duckdb::{AccessMode, Config, Connection, OptionalExt};
 use indexmap::IndexMap;
 use log::warn;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,11 @@ pub(crate) fn duckdb_path_from_yaml(yaml_path: &Path) -> PathBuf {
     yaml_path.with_extension("duckdb")
 }
 
+fn parse_float_array_dim(data_type: &str) -> Option<usize> {
+    let inner = data_type.strip_prefix("FLOAT[")?.strip_suffix(']')?;
+    inner.parse::<usize>().ok().filter(|&n| n > 0)
+}
+
 /// The shared connection together with the access mode it was opened with.
 ///
 /// `conn` is an `Option` only so that an upgrade can DROP the read-only connection
@@ -42,6 +47,11 @@ struct ConnHandle {
     /// `duplicate()` clone sharing the `Arc` observes an upgrade performed through any
     /// other handle instead of keeping its own stale copy of the mode.
     writable: bool,
+    /// Embedding dimension the `FLOAT[N]` column was opened (or last rebuilt) with.
+    /// Shared for the same reason as `writable`: a self-healing rebuild through one
+    /// handle updates the width, and every `duplicate()` clone must cast with the new
+    /// width instead of erroring on a healthy store with its stale copy.
+    dim: usize,
 }
 
 impl ConnHandle {
@@ -68,8 +78,6 @@ impl ConnHandle {
 pub struct DuckDbProvider {
     path: PathBuf,
     conn: Arc<Mutex<ConnHandle>>,
-    /// Embedding dimension; fixed at open time because the `FLOAT[N]` column depends on it.
-    dim: usize,
     /// True once an FTS index has been built on `documents`. Until then
     /// `fts_main_documents.match_bm25` does not exist and any keyword query would
     /// fail with a DuckDB catalog error. Backs `has_native_keyword_search`.
@@ -96,8 +104,8 @@ impl DuckDbProvider {
             conn: Arc::new(Mutex::new(ConnHandle {
                 conn: Some(conn),
                 writable,
+                dim,
             })),
-            dim,
             fts_ready: AtomicBool::new(fts_exists),
         })
     }
@@ -162,6 +170,35 @@ impl DuckDbProvider {
         })?;
         Self::establish_session(&conn)?;
         Ok(conn)
+    }
+
+    pub fn introspect_dim(db_path: &Path) -> Result<Option<usize>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Self::open_read_only(db_path).with_context(|| {
+            format!(
+                "Cannot inspect the existing RAG store at '{}'",
+                db_path.display()
+            )
+        })?;
+        let ty: Option<String> = conn
+            .query_row(
+                "SELECT data_type FROM duckdb_columns() \
+                 WHERE table_name = 'vectors' AND column_name = 'embedding'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .with_context(|| {
+                format!(
+                    "Failed to introspect the embedding dimension of the DuckDB store \
+                     at '{}'",
+                    db_path.display()
+                )
+            })?;
+
+        Ok(ty.and_then(|t| parse_float_array_dim(&t)))
     }
 
     /// Open the store read-write and make sure its schema exists. Exactly one process
@@ -245,7 +282,7 @@ impl DuckDbProvider {
             return Ok(());
         }
         drop(handle.conn.take());
-        match Self::open_read_write(&self.path, self.dim) {
+        match Self::open_read_write(&self.path, handle.dim) {
             Ok(conn) => {
                 handle.conn = Some(conn);
                 handle.writable = true;
@@ -428,13 +465,33 @@ impl RagProvider for DuckDbProvider {
         if embedding.iter().any(|f| !f.is_finite()) {
             bail!("Query embedding contains a non-finite value (NaN or infinity)");
         }
+        let handle = self.lock_conn()?;
+        let dim = handle.dim;
+        if embedding.len() != dim {
+            let rows: i64 = handle
+                .conn()?
+                .query_row("SELECT count(*) FROM vectors", [], |r| r.get(0))
+                .context("Failed to count vectors before a dimension-mismatch query")?;
+            if rows == 0 {
+                // A never-synced store answers "nothing", not a cast error.
+                return Ok(Vec::new());
+            }
+
+            bail!(
+                "RAG store at '{}' was built with {dim}-dim embeddings, but the \
+                 embedding model now returns {}-dim vectors. The embedding model \
+                 changed since ingestion. Re-embed the documents, or delete the \
+                 sidecar file and re-ingest.",
+                self.path.display(),
+                embedding.len()
+            );
+        }
+
         let vals: String = embedding
             .iter()
             .map(|f| f.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        let dim = self.dim;
-        let handle = self.lock_conn()?;
         // array_cosine_distance requires a FLOAT[N] ARRAY, not the LIST type FLOAT[].
         // ORDER BY distance ASC is required for the planner to use hnsw_idx; the
         // similarity form (DESC) does NOT trigger the ANN index. Distance is converted
@@ -554,7 +611,28 @@ impl RagProvider for DuckDbProvider {
                 );
             }
         }
-        let dim = self.dim;
+        let dim = match data.vectors.first() {
+            None => self.lock_conn()?.dim,
+            Some((_, first)) => {
+                let dim = first.len();
+                if let Some((doc_id, other)) = data.vectors.iter().find(|(_, e)| e.len() != dim) {
+                    let matching = data.vectors.values().filter(|e| e.len() == dim).count();
+
+                    bail!(
+                        "Refusing to rebuild the RAG store at '{}': the rebuild batch \
+                         mixes {dim}-dim and {}-dim vectors ({matching} vs {} vectors; \
+                         first mismatch: document {}). Re-embed the documents, or \
+                         delete the sidecar file and re-ingest.",
+                        self.path.display(),
+                        other.len(),
+                        data.vectors.len() - matching,
+                        doc_id.0
+                    );
+                }
+
+                dim
+            }
+        };
         // THE write path. Everything above this line only reads, so the upgrade happens
         // here, after both guards have had their say: a rebuild that is going to be
         // refused must not first take the exclusive lock away from other processes.
@@ -664,6 +742,8 @@ impl RagProvider for DuckDbProvider {
         // fall back to local BM25, which is also empty, and therefore correct.
         self.fts_ready.store(doc_count > 0, Ordering::Relaxed);
 
+        handle.dim = dim;
+
         Ok(())
     }
 
@@ -729,10 +809,11 @@ impl RagProvider for DuckDbProvider {
         // Sharing the Arc also shares the ACCESS MODE, which lives inside the ConnHandle
         // rather than beside it: when one handle upgrades itself to read-write, every
         // clone is upgraded with it and none is left holding a stale "read-only" belief.
+        // The embedding dimension lives there too, so a self-healing rebuild through
+        // one handle updates the width every clone casts with.
         Box::new(DuckDbProvider {
             path: self.path.clone(),
             conn: Arc::clone(&self.conn),
-            dim: self.dim,
             fts_ready: AtomicBool::new(self.fts_ready.load(Ordering::Relaxed)),
         })
     }
@@ -1072,6 +1153,127 @@ mod tests {
             .rebuild_indexes(&data, true)
             .await
             .expect("a fresh RAG with nothing indexed must rebuild cleanly");
+    }
+
+    #[test]
+    fn parse_float_array_dim_handles_arrays_lists_and_scalars() {
+        assert_eq!(parse_float_array_dim("FLOAT[768]"), Some(768));
+        assert_eq!(parse_float_array_dim("FLOAT[]"), None);
+        assert_eq!(parse_float_array_dim("VARCHAR"), None);
+    }
+
+    #[test]
+    fn introspect_dim_round_trips_the_open_dim() {
+        let db = TempDb::new("introspect");
+
+        assert_eq!(
+            DuckDbProvider::introspect_dim(&db.path).unwrap(),
+            None,
+            "a file that does not exist has no dim"
+        );
+        {
+            let _provider = DuckDbProvider::open(&db.path, 5).unwrap();
+        }
+        assert_eq!(DuckDbProvider::introspect_dim(&db.path).unwrap(), Some(5));
+    }
+
+    #[test]
+    fn introspect_dim_propagates_an_unopenable_existing_file() {
+        let db = TempDb::new("introspectgarbage");
+        fs::write(&db.path, b"not a duckdb database").unwrap();
+
+        let err = DuckDbProvider::introspect_dim(&db.path).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains(&format!(
+                "Cannot inspect the existing RAG store at '{}'",
+                db.path.display()
+            )),
+            "an existing-but-unopenable file must be an error naming the path; got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_indexes_self_heals_dim_from_the_vectors_it_writes() {
+        let db = TempDb::new("selfheal");
+        let mut provider = DuckDbProvider::open(&db.path, 5).unwrap();
+        let mut data = minimal_rag_data();
+        data.vectors.insert(DocumentId(0), vec![0.1, 0.2, 0.3]);
+
+        provider.rebuild_indexes(&data, true).await.unwrap();
+
+        let results = provider
+            .vector_search(&[0.1, 0.2, 0.3], 5, 0.0)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        drop(provider);
+        assert_eq!(DuckDbProvider::introspect_dim(&db.path).unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_self_healed_dim_is_visible_through_duplicate_clones() {
+        let db = TempDb::new("dimdup");
+        let mut provider = DuckDbProvider::open(&db.path, 5).unwrap();
+        let dup = provider.duplicate(&minimal_rag_data());
+
+        let mut data = minimal_rag_data();
+        data.vectors.insert(DocumentId(0), vec![0.1, 0.2, 0.3]);
+        provider.rebuild_indexes(&data, true).await.unwrap();
+
+        let results = dup.vector_search(&[0.1, 0.2, 0.3], 5, 0.0).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "a duplicate() clone must observe the dim written by a rebuild through \
+             the original"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_indexes_rejects_mixed_dim_vectors() {
+        let db = TempDb::new("mixeddim");
+        let mut provider = DuckDbProvider::open(&db.path, 3).unwrap();
+        let mut data = minimal_rag_data();
+        data.vectors.insert(DocumentId(0), vec![0.1, 0.2, 0.3]);
+        data.vectors.insert(DocumentId(1), vec![0.1, 0.2, 0.3, 0.4]);
+
+        let err = provider.rebuild_indexes(&data, true).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("rebuild batch mixes"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_search_dim_mismatch_on_empty_store_returns_nothing() {
+        let db = TempDb::new("dimempty");
+        let provider = DuckDbProvider::open(&db.path, 3).unwrap();
+
+        let results = provider.vector_search(&[0.1, 0.2], 5, 0.0).await.unwrap();
+
+        assert!(
+            results.is_empty(),
+            "a never-synced store must answer 'nothing', not a cast error"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_search_dim_mismatch_on_populated_store_errors() {
+        let db = TempDb::new("dimfull");
+        let mut provider = DuckDbProvider::open(&db.path, 3).unwrap();
+        let mut data = minimal_rag_data();
+        data.vectors.insert(DocumentId(0), vec![0.1, 0.2, 0.3]);
+        provider.rebuild_indexes(&data, true).await.unwrap();
+
+        let err = provider
+            .vector_search(&[0.1, 0.2], 5, 0.0)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("was built with"), "got: {err}");
     }
 
     #[tokio::test]
