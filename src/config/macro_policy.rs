@@ -857,6 +857,39 @@ mod tests {
 
     #[test]
     #[serial]
+    fn effective_honors_no_workspace_macros() {
+        with_macro_dirs(|workspace_root, global| {
+            let macros_subdir = workspace_root.join("macros");
+            fs::create_dir_all(&macros_subdir).unwrap();
+            write_macro(&macros_subdir, "shared", VALID_YAML);
+            write_macro(&macros_subdir, "ws-only", VALID_YAML);
+            write_macro(global, "shared", VALID_YAML);
+            write_macro(global, "global-only", VALID_YAML);
+
+            with_macro_dir_envs(workspace_root, global, || {
+                let config = AppConfig::default();
+
+                let policy = MacroPolicy::effective(&config, None, None, None, &[], false);
+                assert_eq!(
+                    policy.find("shared").unwrap().source,
+                    Some(MacroSource::Workspace)
+                );
+                assert!(policy.find("ws-only").is_some());
+                assert!(policy.find("global-only").is_some());
+
+                let policy = MacroPolicy::effective(&config, None, None, None, &[], true);
+                assert_eq!(
+                    policy.find("shared").unwrap().source,
+                    Some(MacroSource::Global)
+                );
+                assert!(policy.find("ws-only").is_none());
+                assert!(policy.find("global-only").is_some());
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
     fn effective_resolves_role_session_and_global_levels() {
         with_macro_dirs(|workspace_root, global_dir| {
             write_macro(global_dir, "a", VALID_YAML);

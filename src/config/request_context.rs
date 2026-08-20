@@ -2505,7 +2505,7 @@ impl RequestContext {
             self.agent.as_ref(),
             self.session.as_ref(),
             &crate::repl::builtin_command_names(),
-            false,
+            self.app.config.no_workspace_macros,
         )
     }
 

@@ -98,6 +98,7 @@ pub struct AppConfig {
     pub user_agent: Option<String>,
     pub save_shell_history: bool,
     pub no_workspace_mcp: bool,
+    pub no_workspace_macros: bool,
     pub sync_models_url: Option<String>,
 
     pub clients: Vec<ClientConfig>,
@@ -181,6 +182,7 @@ impl Default for AppConfig {
             user_agent: None,
             save_shell_history: true,
             no_workspace_mcp: false,
+            no_workspace_macros: false,
             sync_models_url: None,
 
             clients: vec![],
@@ -266,6 +268,7 @@ impl AppConfig {
             user_agent: config.user_agent,
             save_shell_history: config.save_shell_history,
             no_workspace_mcp: false,
+            no_workspace_macros: false,
             sync_models_url: config.sync_models_url,
 
             clients: config.clients,

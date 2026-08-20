@@ -96,6 +96,9 @@ pub struct Cli {
     /// Disable loading workspace MCP servers from .coyote/mcp.json, .coyote/.mcp.json, or .mcp.json
     #[arg(long)]
     pub no_workspace_mcp: bool,
+    /// Disable loading workspace macros from .coyote/macros
+    #[arg(long)]
+    pub no_workspace_macros: bool,
     /// Disable memory for this invocation
     #[arg(long)]
     pub no_memory: bool,

@@ -25,7 +25,7 @@ pub async fn macro_execute(
     if ctx.in_non_isolated_macro() {
         bail!("nested macros not allowed in non-isolated mode");
     }
-    let macro_value = Macro::load(name)?;
+    let macro_value = Macro::load(name, ctx.app.config.no_workspace_macros)?;
     let (mut new_args, text) = split_args_text(args.unwrap_or_default(), cfg!(windows));
     if !text.is_empty() {
         new_args.push(text.to_string());
@@ -140,9 +140,9 @@ pub struct Macro {
 }
 
 impl Macro {
-    pub fn load(name: &str) -> Result<Macro> {
+    pub fn load(name: &str, no_workspace_macros: bool) -> Result<Macro> {
         let workspace_path = paths::workspace_macros_dir().join(format!("{name}.yaml"));
-        let path = if workspace_path.exists() {
+        let path = if !no_workspace_macros && workspace_path.exists() {
             workspace_path
         } else {
             paths::macro_file(name)
@@ -305,6 +305,71 @@ mod tests {
         let path = paths::macros_dir().join(format!("{name}.yaml"));
         ensure_parent_exists(&path).unwrap();
         write(&path, content).unwrap();
+    }
+
+    /// Sets up a temp workspace macros dir and a temp global macros dir, each
+    /// containing a `shared` macro whose `description` names its source, and
+    /// points the workspace/global dir env overrides at them for `f`.
+    fn with_macro_load_envs<F: FnOnce()>(f: F) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("coyote-macro-load-tests-{unique}"));
+        let workspace_root = root.join("workspace");
+        let workspace_macros = workspace_root.join("macros");
+        let global = root.join("global");
+        create_dir_all(&workspace_macros).unwrap();
+        create_dir_all(&global).unwrap();
+        write(
+            workspace_macros.join("shared.yaml"),
+            "description: workspace\nsteps:\n  - \".help\"\n",
+        )
+        .unwrap();
+        write(
+            global.join("shared.yaml"),
+            "description: global\nsteps:\n  - \".help\"\n",
+        )
+        .unwrap();
+
+        let ws_env = get_env_name("workspace_config_dir");
+        let global_env = get_env_name("macros_dir");
+        let prev_ws = env::var_os(&ws_env);
+        let prev_global = env::var_os(&global_env);
+        unsafe {
+            env::set_var(&ws_env, &workspace_root);
+            env::set_var(&global_env, &global);
+        }
+        f();
+        unsafe {
+            match prev_ws {
+                Some(v) => env::set_var(&ws_env, v),
+                None => env::remove_var(&ws_env),
+            }
+            match prev_global {
+                Some(v) => env::set_var(&global_env, v),
+                None => env::remove_var(&global_env),
+            }
+        }
+        let _ = remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn load_prefers_workspace_over_global_by_default() {
+        with_macro_load_envs(|| {
+            let loaded = Macro::load("shared", false).unwrap();
+            assert_eq!(loaded.description.as_deref(), Some("workspace"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn load_skips_workspace_when_no_workspace_macros() {
+        with_macro_load_envs(|| {
+            let loaded = Macro::load("shared", true).unwrap();
+            assert_eq!(loaded.description.as_deref(), Some("global"));
+        });
     }
 
     /// Drives a macro-execution future to completion on a thread with extra
