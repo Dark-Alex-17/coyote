@@ -5,7 +5,7 @@ use crate::utils::{AbortSignal, multiline_text};
 use anyhow::{Context, Result, anyhow};
 use indexmap::IndexMap;
 use rust_embed::Embed;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{File, read_to_string};
 use std::io::Write;
 use std::sync::Arc;
@@ -69,8 +69,12 @@ pub async fn macro_execute(
     Ok(())
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Macro {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default = "default_true")]
+    pub isolated: bool,
     #[serde(default)]
     pub variables: Vec<MacroVariable>,
     pub steps: Vec<String>,
@@ -162,12 +166,17 @@ impl Macro {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MacroVariable {
     pub name: String,
     #[serde(default)]
     pub rest: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -184,6 +193,8 @@ mod tests {
 
     fn macro_with_vars(vars: Vec<MacroVariable>) -> Macro {
         Macro {
+            description: None,
+            isolated: true,
             variables: vars,
             steps: vec![],
         }
@@ -369,5 +380,77 @@ steps:
         let m: Macro = serde_yaml::from_str(yaml).unwrap();
         assert!(m.variables.is_empty());
         assert_eq!(m.steps.len(), 1);
+    }
+
+    #[test]
+    fn deserialize_macro_without_new_fields_uses_defaults() {
+        let yaml = r#"
+steps:
+  - ".help"
+"#;
+        let m: Macro = serde_yaml::from_str(yaml).unwrap();
+        assert!(m.description.is_none());
+        assert!(m.isolated);
+    }
+
+    #[test]
+    fn deserialize_macro_with_description_and_isolated() {
+        let yaml = r#"
+description: "Review WIP against a base branch"
+isolated: false
+steps:
+  - "Review the diff against {{base}}"
+variables:
+  - name: base
+    default: main
+"#;
+        let m: Macro = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            m.description.as_deref(),
+            Some("Review WIP against a base branch")
+        );
+        assert!(!m.isolated);
+        assert_eq!(m.variables.len(), 1);
+    }
+
+    #[test]
+    fn round_trip_preserves_new_fields() {
+        let original = Macro {
+            description: Some("does a thing".to_string()),
+            isolated: false,
+            variables: vec![var("target", false, Some("all"))],
+            steps: vec!["build {{target}}".to_string()],
+        };
+        let yaml = serde_yaml::to_string(&original).unwrap();
+        let back: Macro = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.description.as_deref(), Some("does a thing"));
+        assert!(!back.isolated);
+        assert_eq!(back.variables.len(), 1);
+        assert_eq!(back.variables[0].name, "target");
+        assert_eq!(back.variables[0].default.as_deref(), Some("all"));
+        assert_eq!(back.steps, original.steps);
+    }
+
+    #[test]
+    fn round_trip_defaults_survive() {
+        let original = macro_with_vars(vec![]);
+        let yaml = serde_yaml::to_string(&original).unwrap();
+        assert!(!yaml.contains("description"));
+        let back: Macro = serde_yaml::from_str(&yaml).unwrap();
+        assert!(back.description.is_none());
+        assert!(back.isolated);
+    }
+
+    #[test]
+    fn embedded_macro_assets_deserialize_with_defaults() {
+        for file in MacroAssets::iter() {
+            let embedded = MacroAssets::get(&file).unwrap();
+            let content = std::str::from_utf8(&embedded.data).unwrap();
+            let m: Macro = serde_yaml::from_str(content)
+                .unwrap_or_else(|e| panic!("asset '{}' failed to deserialize: {e}", file.as_ref()));
+            assert!(m.description.is_none(), "asset '{}'", file.as_ref());
+            assert!(m.isolated, "asset '{}'", file.as_ref());
+            assert!(!m.steps.is_empty(), "asset '{}'", file.as_ref());
+        }
     }
 }
