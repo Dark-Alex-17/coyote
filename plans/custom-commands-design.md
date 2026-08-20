@@ -286,10 +286,14 @@ workspace-artifact conventions (VERIFIED mechanics):
   skills (`list_skills` iterates [workspace, global] with shadowing,
   paths.rs:478-501; `has_skill` checks workspace first, :503-505) and
   workspace MCP (HashMap insert, workspace wins, mcp/mod.rs:239).
-- Opt-out mirrors MCP: new `--no-workspace-macros` CLI flag +
-  `no_workspace_macros` config key (default false), modeled on
-  `--no-workspace-mcp` (cli/mod.rs:96-98 → main.rs:222-223,
-  app_config.rs:98).
+- Opt-out mirrors MCP: new `--no-workspace-macros` CLI flag, modeled on
+  `--no-workspace-mcp` (cli/mod.rs:96-98 → main.rs:222-223).
+  IMPLEMENTATION-VERIFIED CORRECTION (T6): `no_workspace_mcp` is
+  CLI-flag-only — AppConfig field exists but there is NO Config-struct key
+  and NO env arm, so a config.yaml entry is non-functional. The exact-mirror
+  ruling therefore makes `no_workspace_macros` CLI-flag-only too.
+  (Pre-existing bug, out of scope: config.example.yaml:140 documents
+  `no_workspace_mcp:` as a yaml key even though it does nothing — follow-up.)
 - Trust model: no confirmation prompt — consistent with workspace MCP and
   skills, which load with no gate (mcp/mod.rs:225-268 merely eprintlns);
   macros are strictly lower-risk since they run only on explicit user
@@ -404,8 +408,9 @@ install-time warning if an installed macro's name shadows a built-in.
   invocation; `isolated` semantics with the role-switch-persists warning.
 - `config.example.yaml`, `config.role.example.md`,
   `config.agent.example.yaml`: `enabled_macros` entries mirroring the
-  existing `enabled_skills` doc comments; `no_workspace_macros` entry
-  alongside the existing `no_workspace_mcp` one (config.example.yaml:140-145).
+  existing `enabled_skills` doc comments. Do NOT add a `no_workspace_macros`
+  yaml entry — the flag is CLI-only (see §5 correction); the existing
+  `no_workspace_mcp` yaml line documents a dead key (pre-existing, follow-up).
 - New `macro.example.yaml` (or extend existing docs) showing all fields incl.
   description/isolated.
 - Workspace macros: document `.coyote/macros/` alongside the existing
