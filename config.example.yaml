@@ -169,6 +169,21 @@ inject_skill_instructions: true   # Inject a short hint pointing the model at `s
                                   # effective enabled skill set is non-empty (default: true).
 skill_instructions: null          # Custom text used for the skill hint when injected. If null, uses built-in default.
 
+# ---- Macros ----
+# Macros are Coyote's custom commands: named sequences of REPL commands and prompts, invoked directly by name
+# (a macro file named `review.yaml` runs as `.review [args]`; built-in commands always win a name collision).
+# Workspace-local macros in `.coyote/macros/` shadow same-named global macros (skip them with --no-workspace-macros).
+# See the [Macros documentation](https://github.com/Dark-Alex-17/coyote/wiki/Macros) for more details.
+enabled_macros: null              # Which macros are invocable by default (no role/agent/session active). null = all visible.
+                                  # An empty list means NO macros are invocable. Accepts either a YAML list or a
+                                  # comma-separated string. Roles, agents, and sessions may define their own
+                                  # `enabled_macros`; the most specific active one wins (session > agent > role > global).
+                                  # Example (list form):
+                                  #   enabled_macros:
+                                  #     - generate-commit-message
+                                  # Example (comma-separated form):
+                                  #   enabled_macros: generate-commit-message,review
+
 # ---- Auto-Continue (Todo System) ----
 # The auto-continue system provides built-in task tracking for improved reliability.
 # When enabled, the model can create todo lists and the system will automatically
