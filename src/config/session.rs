@@ -246,6 +246,9 @@ impl Session {
         if let Some(enabled_skills) = self.enabled_skills() {
             data["enabled_skills"] = json!(enabled_skills);
         }
+        if let Some(enabled_macros) = self.enabled_macros() {
+            data["enabled_macros"] = json!(enabled_macros);
+        }
         if let Some(save_session) = self.save_session() {
             data["save_session"] = save_session.into();
         }
@@ -323,6 +326,10 @@ impl Session {
 
         if let Some(enabled_skills) = self.enabled_skills() {
             items.push(("enabled_skills", enabled_skills.join(",")));
+        }
+
+        if let Some(enabled_macros) = self.enabled_macros() {
+            items.push(("enabled_macros", enabled_macros.join(",")));
         }
 
         if let Some(save_session) = self.save_session() {

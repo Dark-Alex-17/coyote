@@ -12,8 +12,8 @@ use crate::client::{
     oauth,
 };
 use crate::config::{
-    AgentVariables, AppConfig, AssertState, Input, LastMessage, RequestContext, StateFlags,
-    macro_execute,
+    AgentVariables, AppConfig, AssertState, Input, LastMessage, MacroState, RequestContext,
+    StateFlags, macro_execute,
 };
 use crate::config::{AssetCategory, paths};
 use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
@@ -1073,15 +1073,44 @@ pub async fn run_repl_command(
                 }
             },
             ".macro" => match split_first_arg(args) {
-                Some((name, extra)) => {
-                    let app = Arc::clone(&ctx.app.config);
-                    if !paths::has_macro(name) && extra.is_none() {
-                        ctx.new_macro(app.as_ref(), name)?;
-                    } else {
-                        macro_execute(ctx, name, extra, abort_signal.clone()).await?;
+                Some((sub @ ("enable" | "disable"), rest)) => {
+                    match rest.and_then(|v| v.split_whitespace().next()) {
+                        Some(name) => ctx.macro_toggle(name, sub == "enable")?,
+                        None => println!("Usage: .macro {sub} <name>"),
                     }
                 }
-                None => println!("Usage: .macro <name> <text>..."),
+                Some((name, extra)) => {
+                    let policy = ctx.macro_policy();
+                    match policy.find(name).map(|row| &row.state) {
+                        Some(state) if state.is_invocable() => {
+                            macro_execute(ctx, name, extra, abort_signal.clone()).await?;
+                        }
+                        Some(MacroState::DisabledRuntime) => bail!(
+                            r#"Macro '{name}' is disabled. Re-enable it with ".macro enable {name}""#
+                        ),
+                        Some(MacroState::Locked { level }) => bail!(
+                            "Macro '{name}' is restricted by {} enabled_macros",
+                            ctx.macro_lock_owner(*level)
+                        ),
+                        Some(MacroState::Invalid { reason }) => {
+                            bail!("Macro '{name}' is invalid: {reason}")
+                        }
+                        Some(_) | None => {
+                            if extra.is_none() {
+                                let app = Arc::clone(&ctx.app.config);
+                                ctx.new_macro(app.as_ref(), name)?;
+                            } else {
+                                macro_execute(ctx, name, extra, abort_signal.clone()).await?;
+                            }
+                        }
+                    }
+                }
+                None => println!(
+                    r#"Usage:
+    .macro <name> [text]...         # Execute a macro
+    .macro enable <name>            # Re-enable a runtime-disabled macro
+    .macro disable <name>           # Disable a macro for the rest of this process"#
+                ),
             },
             ".file" => match args {
                 Some(args) => {
@@ -1294,7 +1323,23 @@ pub async fn run_repl_command(
                     println!("Usage: .vault <add|get|update|delete|list> [name]")
                 }
             },
-            _ => unknown_command()?,
+            _ => {
+                let name = cmd.strip_prefix('.').unwrap_or(cmd);
+                let policy = ctx.macro_policy();
+                match policy.find(name).map(|row| &row.state) {
+                    Some(MacroState::Enabled) => {
+                        macro_execute(ctx, name, args, abort_signal.clone()).await?;
+                    }
+                    Some(MacroState::DisabledRuntime) => bail!(
+                        r#"Macro '{name}' is disabled. Re-enable it with ".macro enable {name}""#
+                    ),
+                    Some(MacroState::Locked { level }) => bail!(
+                        "Macro '{name}' is restricted by {} enabled_macros",
+                        ctx.macro_lock_owner(*level)
+                    ),
+                    _ => unknown_command()?,
+                }
+            }
         },
         None => {
             if let Some(cmd) = try_extract_shell_command(line) {
@@ -1522,6 +1567,20 @@ fn unknown_command() -> Result<()> {
     bail!(r#"Unknown command. Type ".help" for additional help."#);
 }
 
+/// The name of every built-in REPL command (first word, without the leading
+/// dot), sorted and deduplicated. Macros with one of these names are shadowed
+/// by the built-in and stay reachable only via `.macro <name>`.
+pub fn builtin_command_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = REPL_COMMANDS
+        .iter()
+        .filter_map(|cmd| cmd.name.split_whitespace().next())
+        .filter_map(|name| name.strip_prefix('.'))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 fn dump_repl_help() {
     let head = REPL_COMMANDS
         .iter()
@@ -1531,6 +1590,10 @@ fn dump_repl_help() {
     println!(
         r###"{head}
 {:<24} Run an arbitrary shell command (stdout/stderr stream to your terminal; Ctrl+C interrupts)
+
+Custom commands (macros): macros are coyote's custom commands. An enabled
+macro <name> runs top-level as .<name> [args...], equivalent to ".macro <name>".
+List them with ".list macros"; toggle them with ".macro enable|disable <name>".
 
 Type ::: to start multi-line editing, type ::: to finish it.
 Press Ctrl+O to open an editor for editing the input buffer.
@@ -1730,6 +1793,22 @@ mod tests {
     #[test]
     fn repl_commands_has_60_entries() {
         assert_eq!(REPL_COMMANDS.len(), 60);
+    }
+
+    #[test]
+    fn builtin_command_names_are_sorted_deduped_first_words_without_dots() {
+        let names = builtin_command_names();
+        assert!(!names.is_empty());
+        for name in &names {
+            assert!(!name.starts_with('.'), "'{name}' should not keep the dot");
+            assert!(!name.contains(' '), "'{name}' should be a single word");
+        }
+        assert!(
+            names.windows(2).all(|w| w[0] < w[1]),
+            "names should be sorted and deduplicated: {names:?}"
+        );
+        assert!(names.contains(&"help"));
+        assert!(names.contains(&"macro"));
     }
 
     #[test]

@@ -31,10 +31,8 @@ pub use self::app_config::AppConfig;
 pub use self::app_state::AppState;
 pub use self::input::Input;
 pub use self::install_remote::{install_remote, install_remote_from_repl_args};
-#[allow(unused_imports)]
 pub use self::macro_policy::{
-    DiscoveredMacro, MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState,
-    RESERVED_MACRO_NAMES, ResolvedMacro, discover_macros,
+    MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, ResolvedMacro,
 };
 #[allow(unused_imports)]
 pub use self::request_context::{RenderMode, RequestContext, should_inject_skill_instructions};

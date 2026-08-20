@@ -474,11 +474,6 @@ pub fn list_macros() -> Vec<String> {
     list_file_names(macros_dir(), ".yaml")
 }
 
-pub fn has_macro(name: &str) -> bool {
-    let names = list_macros();
-    names.contains(&name.to_string())
-}
-
 pub fn list_skills() -> Vec<String> {
     let mut names = Vec::new();
     let mut seen = HashSet::new();

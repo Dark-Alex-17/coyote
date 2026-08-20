@@ -75,7 +75,6 @@ pub enum MacroState {
 }
 
 impl MacroState {
-    #[allow(dead_code)]
     pub fn is_invocable(&self) -> bool {
         matches!(self, MacroState::Enabled | MacroState::ShadowedBuiltin)
     }
@@ -95,7 +94,6 @@ pub struct DiscoveredMacro {
 /// One row of the resolved macro set. Missing allowlist entries produce rows
 /// with `source: None`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ResolvedMacro {
     pub name: String,
     pub source: Option<MacroSource>,
@@ -116,7 +114,6 @@ pub struct MacroPolicy {
 }
 
 impl MacroPolicy {
-    #[allow(dead_code)]
     pub fn effective(
         global: &AppConfig,
         role: Option<&Role>,
@@ -199,7 +196,6 @@ impl MacroPolicy {
     /// The invocation target for `name`: the workspace entry when one shadows
     /// a global entry, otherwise the single discovered entry. Missing rows
     /// are never returned.
-    #[allow(dead_code)]
     pub fn find(&self, name: &str) -> Option<&ResolvedMacro> {
         self.macros
             .iter()

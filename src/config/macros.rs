@@ -82,7 +82,12 @@ pub struct Macro {
 
 impl Macro {
     pub fn load(name: &str) -> Result<Macro> {
-        let path = paths::macro_file(name);
+        let workspace_path = paths::workspace_macros_dir().join(format!("{name}.yaml"));
+        let path = if workspace_path.exists() {
+            workspace_path
+        } else {
+            paths::macro_file(name)
+        };
         let err = || format!("Failed to load macro '{name}' at '{}'", path.display());
         let content = read_to_string(&path).with_context(err)?;
         let value: Macro = serde_yaml::from_str(&content).with_context(err)?;

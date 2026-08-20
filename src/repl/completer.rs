@@ -74,7 +74,24 @@ impl Completer for ReplCompleter {
                     format!("{name} ")
                 };
                 create_suggestion(&name, description, span)
-            }))
+            }));
+
+            let macros: Vec<(String, Option<String>)> = ctx
+                .visible_macro_completions()
+                .into_iter()
+                .map(|(name, description)| (format!(".{name}"), description))
+                .filter(|(name, _)| {
+                    command_filter.len() == 1 || name.starts_with(&command_filter[..2])
+                })
+                .collect();
+            let macros = fuzzy_filter(macros, |(name, _)| name.as_str(), &command_filter);
+            suggestions.extend(macros.iter().map(|(name, description)| {
+                create_suggestion(
+                    &format!("{name} "),
+                    description.as_deref().unwrap_or_default(),
+                    span,
+                )
+            }));
         }
         suggestions
     }
