@@ -233,6 +233,10 @@ pub struct RequestContext {
     pub app: Arc<AppState>,
 
     pub macro_flag: bool,
+    /// Companion to `macro_flag`: true while a non-isolated macro is running
+    /// its steps directly on this live context. Isolated macros execute on a
+    /// forked context and leave this false.
+    pub macro_non_isolated: bool,
     pub info_flag: bool,
     pub working_mode: WorkingMode,
 
@@ -270,6 +274,7 @@ impl RequestContext {
         Self {
             app,
             macro_flag: false,
+            macro_non_isolated: false,
             info_flag: false,
             working_mode,
             model: Default::default(),
@@ -324,6 +329,7 @@ impl RequestContext {
         Ok(Self {
             app,
             macro_flag: false,
+            macro_non_isolated: false,
             info_flag,
             working_mode,
             model,
@@ -373,6 +379,7 @@ impl RequestContext {
         Self {
             app: Arc::clone(&self.app),
             macro_flag: self.macro_flag,
+            macro_non_isolated: self.macro_non_isolated,
             info_flag: self.info_flag,
             working_mode: self.working_mode,
             model: self.model.clone(),
@@ -412,6 +419,7 @@ impl RequestContext {
         Self {
             app,
             macro_flag: parent.macro_flag,
+            macro_non_isolated: parent.macro_non_isolated,
             info_flag: parent.info_flag,
             working_mode: WorkingMode::Cmd,
             model: parent.model.clone(),
@@ -2480,6 +2488,14 @@ impl RequestContext {
         Ok(())
     }
 
+    /// Whether a non-isolated macro is currently running its steps on this
+    /// context. Macro invocations are rejected in this mode: the nested
+    /// macro's steps would interleave with the outer macro's on the live
+    /// session.
+    pub fn in_non_isolated_macro(&self) -> bool {
+        self.macro_flag && self.macro_non_isolated
+    }
+
     /// The resolved macro set for the active context (workspace + global
     /// discovery, effective `enabled_macros` allowlist, built-in shadowing).
     pub fn macro_policy(&self) -> MacroPolicy {
@@ -4016,8 +4032,11 @@ impl RequestContext {
 
         // Graph agents manage their own state; never engage a session,
         // not even an inherited app-level `agent_session` default.
+        // Isolated macros suppress an inherited default too — their forked
+        // context has no session to return to. A non-isolated macro's `.agent`
+        // step engages it exactly as if the user had typed the command.
         let session_name = session_name.map(|v| v.to_string()).or_else(|| {
-            if self.macro_flag || is_graph_agent {
+            if (self.macro_flag && !self.macro_non_isolated) || is_graph_agent {
                 None
             } else {
                 agent.agent_session().map(|v| v.to_string())
@@ -6563,6 +6582,73 @@ mod tests {
         assert!(
             ctx.session.is_none(),
             "Graph agent must not engage a session, not even an inherited default"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_suppresses_inherited_session_in_isolated_macro() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.macro_flag = true;
+        ctx.update_app_config(|app| app.agent_session = Some("inherited".to_string()));
+
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        assert!(
+            ctx.session.is_none(),
+            "an isolated macro must keep suppressing the agent's default session"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_engages_inherited_session_in_non_isolated_macro() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.macro_flag = true;
+        ctx.macro_non_isolated = true;
+        ctx.update_app_config(|app| app.agent_session = Some("inherited".to_string()));
+
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        assert!(
+            ctx.session.is_some(),
+            "a non-isolated macro's agent step must engage the default session as if typed"
         );
     }
 

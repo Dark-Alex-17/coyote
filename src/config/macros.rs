@@ -2,12 +2,13 @@ use crate::config::paths;
 use crate::config::{RequestContext, RoleLike, ensure_parent_exists};
 use crate::repl::{run_repl_command, split_args_text};
 use crate::utils::{AbortSignal, multiline_text};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, read_to_string};
 use std::io::Write;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 #[derive(Embed)]
@@ -21,6 +22,9 @@ pub async fn macro_execute(
     args: Option<&str>,
     abort_signal: AbortSignal,
 ) -> Result<()> {
+    if ctx.in_non_isolated_macro() {
+        bail!("nested macros not allowed in non-isolated mode");
+    }
     let macro_value = Macro::load(name)?;
     let (mut new_args, text) = split_args_text(args.unwrap_or_default(), cfg!(windows));
     if !text.is_empty() {
@@ -29,6 +33,17 @@ pub async fn macro_execute(
     let variables = macro_value
         .resolve_variables(&new_args)
         .map_err(|err| anyhow!("{err}. Usage: {}", macro_value.usage(name)))?;
+
+    if !macro_value.isolated {
+        let mut live = MacroModeGuard::new(ctx);
+        for step in &macro_value.steps {
+            let command = Macro::interpolate_command(step, &variables);
+            println!(">> {}", multiline_text(&command));
+            run_repl_command(&mut live, abort_signal.clone(), &command).await?;
+        }
+        return Ok(());
+    }
+
     let role = ctx.extract_role(ctx.app.config.as_ref())?;
     let mut app_config = (*ctx.app.config).clone();
     app_config.temperature = role.temperature();
@@ -67,6 +82,50 @@ pub async fn macro_execute(
         run_repl_command(&mut macro_ctx, abort_signal.clone(), &command).await?;
     }
     Ok(())
+}
+
+/// Marks a live context as executing a non-isolated macro for the duration of
+/// its steps. Restores the previous flag and mode on drop, so every exit path
+/// — including a failing step — leaves the context as it found it.
+struct MacroModeGuard<'a> {
+    ctx: &'a mut RequestContext,
+    prev_flag: bool,
+    prev_non_isolated: bool,
+}
+
+impl<'a> MacroModeGuard<'a> {
+    fn new(ctx: &'a mut RequestContext) -> Self {
+        let prev_flag = ctx.macro_flag;
+        let prev_non_isolated = ctx.macro_non_isolated;
+        ctx.macro_flag = true;
+        ctx.macro_non_isolated = true;
+        Self {
+            ctx,
+            prev_flag,
+            prev_non_isolated,
+        }
+    }
+}
+
+impl Deref for MacroModeGuard<'_> {
+    type Target = RequestContext;
+
+    fn deref(&self) -> &Self::Target {
+        self.ctx
+    }
+}
+
+impl DerefMut for MacroModeGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.ctx
+    }
+}
+
+impl Drop for MacroModeGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.macro_flag = self.prev_flag;
+        self.ctx.macro_non_isolated = self.prev_non_isolated;
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -187,6 +246,90 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AppState, Session, WorkingMode};
+    use crate::utils::{create_abort_signal, get_env_name};
+    use serial_test::serial;
+    use std::env;
+    use std::fs::{create_dir_all, remove_dir_all, write};
+    use std::future::Future;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestConfigDirGuard {
+        key: String,
+        previous: Option<std::ffi::OsString>,
+        path: PathBuf,
+    }
+
+    impl TestConfigDirGuard {
+        fn new() -> Self {
+            let key = get_env_name("config_dir");
+            let previous = env::var_os(&key);
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!("coyote-macros-tests-{unique}"));
+            create_dir_all(&path).unwrap();
+            unsafe {
+                env::set_var(&key, &path);
+            }
+            Self {
+                key,
+                previous,
+                path,
+            }
+        }
+    }
+
+    impl Drop for TestConfigDirGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                unsafe {
+                    env::set_var(&self.key, previous);
+                }
+            } else {
+                unsafe {
+                    env::remove_var(&self.key);
+                }
+            }
+            let _ = remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_ctx() -> RequestContext {
+        RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
+    }
+
+    fn write_macro_file(name: &str, content: &str) {
+        let path = paths::macros_dir().join(format!("{name}.yaml"));
+        ensure_parent_exists(&path).unwrap();
+        write(&path, content).unwrap();
+    }
+
+    /// Drives a macro-execution future to completion on a thread with extra
+    /// stack headroom: nested `run_repl_command` poll frames are deep in
+    /// debug builds and overflow the 2 MiB default test-thread stack.
+    fn run_async<F>(f: F) -> F::Output
+    where
+        F: Future + Send,
+        F::Output: Send,
+    {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(f)
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
 
     fn var(name: &str, rest: bool, default: Option<&str>) -> MacroVariable {
         MacroVariable {
@@ -457,5 +600,209 @@ variables:
             assert!(m.isolated, "asset '{}'", file.as_ref());
             assert!(!m.steps.is_empty(), "asset '{}'", file.as_ref());
         }
+    }
+
+    #[test]
+    #[serial]
+    fn non_isolated_steps_run_on_live_ctx_and_mutations_persist() {
+        let _guard = TestConfigDirGuard::new();
+        write_macro_file(
+            "live-macro",
+            "isolated: false\nsteps:\n  - \".set temperature 0.42\"\n",
+        );
+        let mut ctx = test_ctx();
+        ctx.session = Some(Session::default());
+
+        run_async(macro_execute(
+            &mut ctx,
+            "live-macro",
+            None,
+            create_abort_signal(),
+        ))
+        .unwrap();
+
+        assert!(ctx.session.is_some(), "live session must survive the macro");
+        assert_eq!(
+            ctx.session.as_ref().unwrap().temperature(),
+            Some(0.42),
+            "the step must mutate the live context's session, not a fork"
+        );
+        assert!(!ctx.macro_flag, "flag must be restored after success");
+        assert!(
+            !ctx.macro_non_isolated,
+            "mode must be restored after success"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn non_isolated_step_failure_aborts_and_restores_flag_and_mode() {
+        let _guard = TestConfigDirGuard::new();
+        write_macro_file(
+            "fail-macro",
+            "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \".update\"\n  - \".set temperature 0.1\"\n",
+        );
+        let mut ctx = test_ctx();
+        ctx.session = Some(Session::default());
+
+        let result = run_async(macro_execute(
+            &mut ctx,
+            "fail-macro",
+            None,
+            create_abort_signal(),
+        ));
+
+        assert!(result.is_err(), "a failing step must abort the macro");
+        assert_eq!(
+            ctx.session.as_ref().unwrap().temperature(),
+            Some(0.9),
+            "completed steps' mutations persist; steps after the failure never run"
+        );
+        assert!(!ctx.macro_flag, "flag must be restored on the error path");
+        assert!(
+            !ctx.macro_non_isolated,
+            "mode must be restored on the error path"
+        );
+    }
+
+    #[test]
+    fn nested_macro_rejected_when_non_isolated_mode_active() {
+        let mut ctx = test_ctx();
+        ctx.macro_flag = true;
+        ctx.macro_non_isolated = true;
+
+        let result = run_async(macro_execute(
+            &mut ctx,
+            "anything",
+            None,
+            create_abort_signal(),
+        ));
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nested macros not allowed in non-isolated mode"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn non_isolated_macro_step_invoking_macro_is_rejected() {
+        let _guard = TestConfigDirGuard::new();
+        write_macro_file(
+            "outer-macro",
+            "isolated: false\nsteps:\n  - \".inner-macro\"\n",
+        );
+        write_macro_file(
+            "inner-macro",
+            "isolated: false\nsteps:\n  - \".set temperature 0.5\"\n",
+        );
+        let mut ctx = test_ctx();
+        ctx.session = Some(Session::default());
+
+        let result = run_async(macro_execute(
+            &mut ctx,
+            "outer-macro",
+            None,
+            create_abort_signal(),
+        ));
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nested macros not allowed in non-isolated mode"),
+            "{err}"
+        );
+        assert_eq!(
+            ctx.session.as_ref().unwrap().temperature(),
+            None,
+            "the nested macro's steps must not run"
+        );
+        assert!(!ctx.macro_flag);
+        assert!(!ctx.macro_non_isolated);
+    }
+
+    #[test]
+    #[serial]
+    fn isolated_macro_step_runs_non_isolated_macro_inline_on_fork() {
+        let _guard = TestConfigDirGuard::new();
+        write_macro_file("iso-outer-macro", "steps:\n  - \".inner-macro\"\n");
+        write_macro_file(
+            "inner-macro",
+            "isolated: false\nsteps:\n  - \".set temperature 0.33\"\n",
+        );
+        let mut ctx = test_ctx();
+        ctx.session = Some(Session::default());
+
+        run_async(macro_execute(
+            &mut ctx,
+            "iso-outer-macro",
+            None,
+            create_abort_signal(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            ctx.session.as_ref().unwrap().temperature(),
+            None,
+            "the inline run happens on the fork, never on the live context"
+        );
+        assert!(!ctx.macro_flag);
+        assert!(!ctx.macro_non_isolated);
+    }
+
+    #[test]
+    #[serial]
+    fn isolated_macro_still_forks_and_leaves_live_ctx_untouched() {
+        let _guard = TestConfigDirGuard::new();
+        write_macro_file("iso-macro", "steps:\n  - \".set temperature 0.77\"\n");
+        let mut ctx = test_ctx();
+        ctx.session = Some(Session::default());
+        let app_before = Arc::clone(&ctx.app.config);
+
+        run_async(macro_execute(
+            &mut ctx,
+            "iso-macro",
+            None,
+            create_abort_signal(),
+        ))
+        .unwrap();
+
+        assert!(ctx.session.is_some());
+        assert_eq!(
+            ctx.session.as_ref().unwrap().temperature(),
+            None,
+            "an isolated macro's mutations must stay on the fork"
+        );
+        assert!(
+            Arc::ptr_eq(&ctx.app.config, &app_before),
+            "isolated execution must not swap the live app config"
+        );
+        assert!(!ctx.macro_flag);
+    }
+
+    #[test]
+    #[serial]
+    fn guard_restores_prior_flag_values_after_inline_run() {
+        let _guard = TestConfigDirGuard::new();
+        write_macro_file(
+            "inner-macro",
+            "isolated: false\nsteps:\n  - \".set temperature 0.11\"\n",
+        );
+        let mut ctx = test_ctx();
+        ctx.macro_flag = true;
+
+        run_async(macro_execute(
+            &mut ctx,
+            "inner-macro",
+            None,
+            create_abort_signal(),
+        ))
+        .unwrap();
+
+        assert!(
+            ctx.macro_flag,
+            "a pre-existing flag must be restored, not cleared"
+        );
+        assert!(!ctx.macro_non_isolated);
     }
 }
