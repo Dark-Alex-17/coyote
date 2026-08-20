@@ -46,6 +46,12 @@ pub struct Session {
         deserialize_with = "super::deserialize_csv_or_vec"
     )]
     enabled_skills: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_macros: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     save_session: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -929,6 +935,45 @@ mod tests {
         assert_eq!(session.name(), "");
         assert_eq!(session.role_name(), None);
         assert!(!session.dirty());
+    }
+
+    #[test]
+    fn session_enabled_macros_absent_is_none() {
+        let session: Session = serde_yaml::from_str("model: provider:test\nmessages: []").unwrap();
+        assert_eq!(session.enabled_macros, None);
+    }
+
+    #[test]
+    fn session_enabled_macros_empty_list_is_some_empty() {
+        let session: Session =
+            serde_yaml::from_str("model: provider:test\nenabled_macros: []\nmessages: []").unwrap();
+        assert_eq!(session.enabled_macros, Some(vec![]));
+    }
+
+    #[test]
+    fn session_enabled_macros_empty_string_is_some_empty() {
+        let session: Session =
+            serde_yaml::from_str("model: provider:test\nenabled_macros: \"\"\nmessages: []")
+                .unwrap();
+        assert_eq!(session.enabled_macros, Some(vec![]));
+    }
+
+    #[test]
+    fn session_enabled_macros_csv_string() {
+        let session: Session =
+            serde_yaml::from_str("model: provider:test\nenabled_macros: \"a,b\"\nmessages: []")
+                .unwrap();
+        assert_eq!(
+            session.enabled_macros,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn session_serialize_omits_enabled_macros_when_none() {
+        let session = Session::default();
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        assert!(!yaml.contains("enabled_macros"));
     }
 
     #[test]

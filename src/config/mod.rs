@@ -221,6 +221,8 @@ pub struct Config {
     #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
     pub enabled_skills: Option<Vec<String>>,
     pub visible_skills: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
+    pub enabled_macros: Option<Vec<String>>,
 
     pub mcp_server_support: bool,
     pub mapping_mcp_servers: IndexMap<String, String>,
@@ -303,6 +305,7 @@ impl Default for Config {
             skills_enabled: true,
             enabled_skills: None,
             visible_skills: None,
+            enabled_macros: None,
 
             mcp_server_support: true,
             mapping_mcp_servers: Default::default(),
@@ -1122,6 +1125,42 @@ clients:
         assert!(cfg.save_session.is_none());
         assert!(cfg.enabled_tools.is_none());
         assert!(cfg.enabled_mcp_servers.is_none());
+    }
+
+    #[test]
+    fn config_enabled_macros_absent_is_none() {
+        let cfg: Config = serde_yaml::from_str("model: provider:test").unwrap();
+        assert_eq!(cfg.enabled_macros, None);
+    }
+
+    #[test]
+    fn config_enabled_macros_empty_string_is_some_empty() {
+        let cfg: Config = serde_yaml::from_str("enabled_macros: \"\"").unwrap();
+        assert_eq!(cfg.enabled_macros, Some(vec![]));
+    }
+
+    #[test]
+    fn config_enabled_macros_csv_string() {
+        let cfg: Config = serde_yaml::from_str("enabled_macros: \"a, b\"").unwrap();
+        assert_eq!(
+            cfg.enabled_macros,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn config_enabled_macros_list() {
+        let cfg: Config = serde_yaml::from_str("enabled_macros:\n  - a\n  - b").unwrap();
+        assert_eq!(
+            cfg.enabled_macros,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn config_enabled_macros_null_is_none() {
+        let cfg: Config = serde_yaml::from_str("enabled_macros: null").unwrap();
+        assert_eq!(cfg.enabled_macros, None);
     }
 
     #[test]

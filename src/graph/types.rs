@@ -589,6 +589,14 @@ nodes:
     }
 
     #[test]
+    fn graph_silently_ignores_enabled_macros_key() {
+        let yaml = "name: g\nenabled_macros: [\"x\"]\nstart: x\nnodes:\n  x:\n    id: x\n    type: end\n    output: ok\n";
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(graph.name, "g");
+        assert_eq!(graph.start, "x");
+    }
+
+    #[test]
     fn graph_settings_have_sensible_defaults() {
         let yaml = "name: g\nstart: x\nnodes:\n  x:\n    id: x\n    type: end\n    output: ok\n";
         let graph: Graph = serde_yaml::from_str(yaml).unwrap();

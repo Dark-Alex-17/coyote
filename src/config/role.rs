@@ -75,6 +75,12 @@ pub struct Role {
         deserialize_with = "super::deserialize_csv_or_vec"
     )]
     enabled_skills: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_csv_or_vec"
+    )]
+    enabled_macros: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_continue: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,6 +135,7 @@ impl Role {
                     }
                     "skills_enabled" => role.skills_enabled = value.as_bool(),
                     "enabled_skills" => role.enabled_skills = parse_string_or_array(value),
+                    "enabled_macros" => role.enabled_macros = parse_string_or_array(value),
                     "auto_continue" => role.auto_continue = value.as_bool(),
                     "max_auto_continues" => {
                         role.max_auto_continues = value.as_u64().map(|v| v as usize)
@@ -195,6 +202,10 @@ impl Role {
         if let Some(enabled_skills) = &self.enabled_skills {
             let inline = serde_json::to_string(enabled_skills).unwrap_or_else(|_| "[]".to_string());
             metadata.push(format!("enabled_skills: {inline}"));
+        }
+        if let Some(enabled_macros) = &self.enabled_macros {
+            let inline = serde_json::to_string(enabled_macros).unwrap_or_else(|_| "[]".to_string());
+            metadata.push(format!("enabled_macros: {inline}"));
         }
         if let Some(auto_continue) = self.auto_continue {
             metadata.push(format!("auto_continue: {auto_continue}"));
@@ -586,6 +597,55 @@ mod tests {
         assert_eq!(role.top_p(), None);
         assert_eq!(role.enabled_tools(), None);
         assert_eq!(role.enabled_mcp_servers(), None);
+    }
+
+    #[test]
+    fn role_new_enabled_macros_absent_is_none() {
+        let role = Role::new("test", "---\ntemperature: 0.5\n---\nPrompt");
+        assert_eq!(role.enabled_macros, None);
+    }
+
+    #[test]
+    fn role_new_enabled_macros_empty_string_is_some_empty() {
+        let role = Role::new("test", "---\nenabled_macros: \"\"\n---\nPrompt");
+        assert_eq!(role.enabled_macros, Some(vec![]));
+    }
+
+    #[test]
+    fn role_new_enabled_macros_csv_string() {
+        let role = Role::new("test", "---\nenabled_macros: a, b\n---\nPrompt");
+        assert_eq!(
+            role.enabled_macros,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn role_new_enabled_macros_list() {
+        let role = Role::new("test", "---\nenabled_macros: [a, b]\n---\nPrompt");
+        assert_eq!(
+            role.enabled_macros,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn role_new_enabled_macros_null_is_none() {
+        let role = Role::new("test", "---\nenabled_macros: null\n---\nPrompt");
+        assert_eq!(role.enabled_macros, None);
+    }
+
+    #[test]
+    fn role_export_includes_enabled_macros() {
+        let role = Role::new("test", "---\nenabled_macros: [a]\n---\nPrompt");
+        let exported = role.export();
+        assert!(exported.contains("enabled_macros: [\"a\"]"));
+    }
+
+    #[test]
+    fn role_export_omits_enabled_macros_when_none() {
+        let role = Role::new("test", "Just a prompt");
+        assert!(!role.export().contains("enabled_macros"));
     }
 
     #[test]
