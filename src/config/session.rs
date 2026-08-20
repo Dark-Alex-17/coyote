@@ -113,6 +113,10 @@ impl Session {
         self.enabled_skills.as_deref()
     }
 
+    pub fn enabled_macros(&self) -> Option<&[String]> {
+        self.enabled_macros.as_deref()
+    }
+
     pub fn set_skills_enabled(&mut self, value: Option<bool>) {
         if self.skills_enabled != value {
             self.skills_enabled = value;

@@ -400,6 +400,10 @@ impl Agent {
         self.config.enabled_skills.as_deref()
     }
 
+    pub fn enabled_macros(&self) -> Option<&[String]> {
+        self.config.enabled_macros.as_deref()
+    }
+
     pub fn memory(&self) -> Option<bool> {
         self.config.memory
     }

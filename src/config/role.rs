@@ -368,6 +368,10 @@ impl Role {
         self.enabled_skills.as_deref()
     }
 
+    pub fn enabled_macros(&self) -> Option<&[String]> {
+        self.enabled_macros.as_deref()
+    }
+
     pub fn append_to_prompt(&mut self, text: &str) {
         self.prompt.push_str(text);
     }

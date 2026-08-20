@@ -214,6 +214,10 @@ pub fn workspace_skill_file(name: &str) -> PathBuf {
     workspace_skills_dir().join(name).join("SKILL.md")
 }
 
+pub fn workspace_macros_dir() -> PathBuf {
+    workspace_config_dir().join(MACROS_DIR_NAME)
+}
+
 pub fn workspace_mcp_config_file() -> Option<PathBuf> {
     workspace_mcp_config_file_in(&env::current_dir().unwrap_or_default())
 }

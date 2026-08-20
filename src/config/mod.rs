@@ -4,6 +4,7 @@ mod app_state;
 mod input;
 mod install_remote;
 pub(crate) mod instructions;
+mod macro_policy;
 mod macros;
 mod mcp_factory;
 pub(crate) mod memory;
@@ -30,6 +31,11 @@ pub use self::app_config::AppConfig;
 pub use self::app_state::AppState;
 pub use self::input::Input;
 pub use self::install_remote::{install_remote, install_remote_from_repl_args};
+#[allow(unused_imports)]
+pub use self::macro_policy::{
+    DiscoveredMacro, MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState,
+    RESERVED_MACRO_NAMES, ResolvedMacro, discover_macros,
+};
 #[allow(unused_imports)]
 pub use self::request_context::{RenderMode, RequestContext, should_inject_skill_instructions};
 pub use self::role::{
