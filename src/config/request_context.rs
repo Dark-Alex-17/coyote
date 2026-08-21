@@ -1,3 +1,4 @@
+use super::bundles::BundleStore;
 use super::rag_cache::{RagCache, RagKey};
 use super::session::Session;
 use super::skill::{SKILL_SCAFFOLD, Skill};
@@ -3265,6 +3266,18 @@ impl RequestContext {
                     values.push("remote".to_string());
                     super::map_completion_values(values)
                 }
+                ".uninstall" => {
+                    let values = BundleStore::load()
+                        .map(|store| {
+                            store
+                                .bundle_names()
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    super::map_completion_values(values)
+                }
                 ".macro" => {
                     let policy = self.macro_policy();
                     let mut values: Vec<(String, Option<String>)> = policy
@@ -4936,6 +4949,34 @@ mod tests {
     fn maybe_autoname_session_returns_false_when_no_session() {
         let mut ctx = create_test_ctx();
         assert!(!ctx.maybe_autoname_session());
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_uninstall_offers_installed_bundle_names() {
+        let _guard = TestConfigDirGuard::new();
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle(
+                "omc",
+                crate::config::bundles::InstallMetadata {
+                    source: "https://github.com/x/omc".to_string(),
+                    git_ref: None,
+                    commit: "abc123".to_string(),
+                    version: None,
+                    description: None,
+                    homepage: None,
+                },
+            )
+            .unwrap();
+        let ctx = create_test_ctx();
+
+        let values = ctx.repl_complete(".uninstall", &[""], "");
+
+        assert!(
+            values.iter().any(|(name, _)| name == "omc"),
+            "got: {values:?}"
+        );
     }
 
     #[test]

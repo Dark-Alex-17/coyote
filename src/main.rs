@@ -142,6 +142,10 @@ async fn main() -> Result<()> {
         return config::update_bundle(spec);
     }
 
+    if let Some(name) = cli.uninstall.as_deref() {
+        return config::uninstall_bundle(name, cli.yes);
+    }
+
     if let Some(client_arg) = &cli.authenticate {
         let cfg = Config::load_with_interpolation(true).await?;
         let app_config = AppConfig::from_config(cfg)?;

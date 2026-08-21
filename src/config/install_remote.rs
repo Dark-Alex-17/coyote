@@ -1,5 +1,6 @@
 use super::bundles::{
-    BundleStore, FileAction, FileRecord, InstallMetadata, McpAction, McpServerRecord, hash_file,
+    BundleStore, FileAction, FileRecord, InstallMetadata, McpAction, McpServerRecord, hash_bytes,
+    hash_file,
 };
 use crate::config::{InstallFilter, paths};
 #[cfg(not(windows))]
@@ -16,7 +17,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool) -> Result<()> {
     let (url, reference) = parse_url_with_ref(git_url)?;
@@ -304,6 +305,365 @@ fn apply_obsolete_action(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UninstallFileSummary {
+    deleted: usize,
+    kept: usize,
+    missing: usize,
+    failed: usize,
+    /// Set when a functions/tools file was found on disk; its compiled binary
+    /// lingers in the functions bin dir until the next --build-tools prune.
+    tools_seen: bool,
+}
+
+#[derive(Debug, Default)]
+struct UninstallMcpSummary {
+    removed: Vec<String>,
+    kept: Vec<String>,
+}
+
+/// Uninstall a bundle: delete the files it owns, remove its mcp.json entries,
+/// and drop its store record once nothing is left. `spec` is the bundle name
+/// or its source URL. Locally modified items are kept unless explicitly
+/// confirmed at a prompt; kept and failed items stay in the record, so a
+/// re-run offers them again.
+pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
+    let mut store = BundleStore::load()?;
+    let name = match store.get(spec) {
+        Some(_) => spec.to_string(),
+        None => match store.find_by_source(spec) {
+            Some((name, _)) => name.to_string(),
+            None => {
+                let installed = store.bundle_names();
+                if installed.is_empty() {
+                    bail!("no bundle named '{spec}' is installed; none are installed");
+                }
+                bail!(
+                    "no bundle named '{spec}' is installed; installed bundles: {}",
+                    installed.join(", ")
+                );
+            }
+        },
+    };
+    let record = store.get(&name).expect("resolved above").clone();
+
+    if !assume_yes {
+        if !*IS_STDOUT_TERMINAL {
+            bail!(
+                "refusing to uninstall bundle '{name}' non-interactively; \
+                 re-run with --yes to confirm"
+            );
+        }
+        println!(
+            "Bundle '{name}' owns {} file(s) and {} mcp.json server(s).",
+            record.files.len(),
+            record.mcp_servers.len()
+        );
+        let proceed = Confirm::new(&format!("Uninstall bundle '{name}'?"))
+            .with_default(false)
+            .prompt()
+            .with_context(|| "failed to read uninstall confirmation")?;
+        if !proceed {
+            println!("Uninstall of '{name}' aborted; nothing was changed.");
+            return Ok(());
+        }
+    }
+
+    let files = uninstall_owned_files(
+        &mut store,
+        &name,
+        &record.files,
+        &paths::config_dir(),
+        assume_yes,
+    )?;
+    if files.tools_seen {
+        println!(
+            "Note: compiled tool binaries remain in {} until the next --build-tools prune.",
+            paths::functions_bin_dir().display()
+        );
+    }
+    let mcp = uninstall_mcp_entries(
+        &mut store,
+        &name,
+        &record.mcp_servers,
+        &paths::mcp_config_file(),
+        assume_yes,
+    )?;
+
+    let empty = store
+        .get(&name)
+        .map(|record| record.files.is_empty() && record.mcp_servers.is_empty())
+        .unwrap_or(true);
+    if empty {
+        store.remove_bundle(&name)?;
+        println!("\nUninstalled bundle '{name}' and removed its record.");
+    } else {
+        println!(
+            "\nBundle '{name}' partially uninstalled; its record keeps the remaining \
+             items, so re-running --uninstall offers them again."
+        );
+    }
+    println!(
+        "  files: deleted={} kept={} missing={} failed={}",
+        files.deleted, files.kept, files.missing, files.failed
+    );
+    println!(
+        "  mcp servers: removed={} kept={}",
+        mcp.removed.len(),
+        mcp.kept.len()
+    );
+    if !mcp.removed.is_empty() {
+        println!("  - removed servers: {}", mcp.removed.join(", "));
+    }
+    if !mcp.kept.is_empty() {
+        println!("  = kept servers:    {}", mcp.kept.join(", "));
+    }
+    Ok(())
+}
+
+/// Process the files a bundle owns under `config_dir`. Intact files (content
+/// still matches the recorded hash) are deleted outright; missing files just
+/// drop out of the record; modified files are kept unless confirmed for
+/// deletion. A failed deletion keeps the record so a re-run can retry, and
+/// never aborts the remaining files. A recorded path that could escape
+/// `config_dir` (absolute, or containing anything but plain components) is
+/// never touched; its record survives.
+fn uninstall_owned_files(
+    store: &mut BundleStore,
+    bundle: &str,
+    files: &[FileRecord],
+    config_dir: &Path,
+    assume_yes: bool,
+) -> Result<UninstallFileSummary> {
+    let mut summary = UninstallFileSummary::default();
+    let mut sticky: Option<ObsoleteAction> = None;
+    for file in files {
+        let recorded = Path::new(&file.path);
+        if recorded.is_absolute()
+            || !recorded
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+        {
+            eprintln!(
+                "skipping suspicious recorded path {}; keeping its record",
+                file.path
+            );
+            summary.failed += 1;
+            continue;
+        }
+        let full = config_dir.join(recorded);
+        if !full.exists() {
+            println!(
+                "dropped record for missing file {} (already absent locally)",
+                file.path
+            );
+            store.remove_file_record(bundle, &file.path)?;
+            summary.missing += 1;
+            continue;
+        }
+        summary.tools_seen |= file.category == "functions/tools";
+        if matches!(hash_file(&full), Ok(hash) if hash == file.sha256) {
+            delete_owned_file(store, bundle, &file.path, &full, config_dir, &mut summary)?;
+            continue;
+        }
+        let prompt = format!("File {} was modified locally after install", file.path);
+        let action = resolve_uninstall_action(&prompt, assume_yes, &mut sticky)?;
+        apply_uninstall_file_action(
+            store,
+            bundle,
+            &file.path,
+            &full,
+            config_dir,
+            action,
+            &mut summary,
+        )?;
+    }
+    Ok(summary)
+}
+
+fn apply_uninstall_file_action(
+    store: &mut BundleStore,
+    bundle: &str,
+    path: &str,
+    full: &Path,
+    config_dir: &Path,
+    action: ObsoleteAction,
+    summary: &mut UninstallFileSummary,
+) -> Result<()> {
+    match action {
+        ObsoleteAction::Keep => {
+            println!("kept modified file {path}");
+            summary.kept += 1;
+        }
+        ObsoleteAction::Delete => {
+            delete_owned_file(store, bundle, path, full, config_dir, summary)?;
+        }
+    }
+    Ok(())
+}
+
+fn delete_owned_file(
+    store: &mut BundleStore,
+    bundle: &str,
+    path: &str,
+    full: &Path,
+    config_dir: &Path,
+    summary: &mut UninstallFileSummary,
+) -> Result<()> {
+    match fs::remove_file(full) {
+        Ok(()) => {
+            store.remove_file_record(bundle, path)?;
+            println!("deleted {path}");
+            summary.deleted += 1;
+            prune_empty_dirs(full, config_dir);
+        }
+        Err(err) => {
+            eprintln!(
+                "failed to delete {}: {err}; keeping its record",
+                full.display()
+            );
+            summary.failed += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Remove now-empty ancestors of a deleted file, climbing strictly below
+/// `config_dir`. `fs::remove_dir` fails on a non-empty directory, which is
+/// the stop condition.
+fn prune_empty_dirs(full: &Path, config_dir: &Path) {
+    let mut current = full.parent();
+    while let Some(dir) = current {
+        if dir == config_dir || !dir.starts_with(config_dir) {
+            break;
+        }
+        if fs::remove_dir(dir).is_err() {
+            break;
+        }
+        current = dir.parent();
+    }
+}
+
+fn resolve_uninstall_action(
+    prompt: &str,
+    assume_yes: bool,
+    sticky: &mut Option<ObsoleteAction>,
+) -> Result<ObsoleteAction> {
+    if assume_yes || !*IS_STDOUT_TERMINAL {
+        return Ok(ObsoleteAction::Keep);
+    }
+    if let Some(action) = *sticky {
+        return Ok(action);
+    }
+    let choice = Select::new(prompt, vec!["keep", "delete", "keep-all", "delete-all"])
+        .prompt()
+        .with_context(|| "failed to read uninstall choice")?;
+    match choice {
+        "keep" => Ok(ObsoleteAction::Keep),
+        "delete" => Ok(ObsoleteAction::Delete),
+        "keep-all" => {
+            *sticky = Some(ObsoleteAction::Keep);
+            Ok(ObsoleteAction::Keep)
+        }
+        "delete-all" => {
+            *sticky = Some(ObsoleteAction::Delete);
+            Ok(ObsoleteAction::Delete)
+        }
+        _ => unreachable!("inquire::Select returned an unexpected option"),
+    }
+}
+
+/// Remove a bundle's entries from mcp.json. An entry is removed outright only
+/// when its current content still matches the recorded hash; a modified (or
+/// legacy, hash-less) entry is kept unless confirmed for deletion, and a
+/// pre-existing server the bundle replaced is never removed. Keys the bundle
+/// does not own are never touched. mcp.json is written before any ownership
+/// record is dropped, so a failed write leaves every record intact for a
+/// retry, while a crash after it leaves stale records the absent-server
+/// branch cleans up on re-run.
+fn uninstall_mcp_entries(
+    store: &mut BundleStore,
+    bundle: &str,
+    servers: &[McpServerRecord],
+    mcp_path: &Path,
+    assume_yes: bool,
+) -> Result<UninstallMcpSummary> {
+    let mut summary = UninstallMcpSummary::default();
+    if servers.is_empty() {
+        return Ok(summary);
+    }
+    let mut config = if mcp_path.exists() {
+        let content = fs::read_to_string(mcp_path)
+            .with_context(|| format!("failed to read {}", mcp_path.display()))?;
+        Some(
+            serde_json::from_str::<McpServersConfig>(&content)
+                .with_context(|| format!("failed to parse {}", mcp_path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    let mut changed = false;
+    let mut released = Vec::new();
+    let mut sticky: Option<ObsoleteAction> = None;
+    for server in servers {
+        let key = server.effective_key().to_string();
+        if server.action == McpAction::Replaced {
+            println!("kept pre-existing server '{key}'");
+            released.push(key.clone());
+            summary.kept.push(key);
+            continue;
+        }
+        let Some(entry) = config.as_ref().and_then(|cfg| cfg.mcp_servers.get(&key)) else {
+            println!("dropped record for absent server '{key}'");
+            released.push(key);
+            continue;
+        };
+        let serialized = serde_json::to_string(entry)
+            .with_context(|| format!("failed to serialize MCP server '{key}'"))?;
+        let intact = server.sha256.as_deref() == Some(hash_bytes(serialized.as_bytes()).as_str());
+        let action = if intact {
+            ObsoleteAction::Delete
+        } else {
+            let reason = if server.sha256.is_none() {
+                "predates entry hashing"
+            } else {
+                "was modified locally after install"
+            };
+            let prompt = format!("MCP server '{key}' {reason}");
+            resolve_uninstall_action(&prompt, assume_yes, &mut sticky)?
+        };
+        match action {
+            ObsoleteAction::Keep => {
+                println!("kept server '{key}'");
+                summary.kept.push(key);
+            }
+            ObsoleteAction::Delete => {
+                config
+                    .as_mut()
+                    .expect("entry was found in the config above")
+                    .mcp_servers
+                    .shift_remove(&key);
+                changed = true;
+                println!("removed server '{key}'");
+                released.push(key.clone());
+                summary.removed.push(key);
+            }
+        }
+    }
+
+    if changed {
+        let config = config.expect("changed implies a parsed config");
+        let serialized = serde_json::to_string_pretty(&config)
+            .context("failed to serialize mcp.json after uninstall")?;
+        write_atomically(mcp_path, &serialized)?;
+    }
+    for key in &released {
+        store.remove_mcp_record(bundle, key)?;
+    }
+    Ok(summary)
 }
 
 fn parse_filter(name: &str) -> Result<InstallFilter> {
@@ -1084,11 +1444,13 @@ fn record_mcp_merge(store: &mut BundleStore, bundle: &str, report: &McpMergeRepo
         name: name.clone(),
         action: McpAction::Added,
         renamed_to: None,
+        sha256: report.entry_hashes.get(name).cloned(),
     }));
     entries.extend(report.replaced.iter().map(|name| McpServerRecord {
         name: name.clone(),
         action: McpAction::Replaced,
         renamed_to: None,
+        sha256: report.entry_hashes.get(name).cloned(),
     }));
     entries.extend(
         report
@@ -1098,6 +1460,7 @@ fn record_mcp_merge(store: &mut BundleStore, bundle: &str, report: &McpMergeRepo
                 name: name.clone(),
                 action: McpAction::Renamed,
                 renamed_to: Some(renamed_to.clone()),
+                sha256: report.entry_hashes.get(renamed_to).cloned(),
             }),
     );
     if entries.is_empty() {
@@ -1186,6 +1549,9 @@ struct McpMergeReport {
     kept_local: Vec<String>,
     replaced: Vec<String>,
     renamed: Vec<(String, String)>,
+    /// Hash of each entry this merge wrote, by its final key in mcp.json, so
+    /// uninstall can tell the entry apart from a later local edit.
+    entry_hashes: HashMap<String, String>,
     final_path: PathBuf,
     missing_secrets: Vec<String>,
 }
@@ -1226,6 +1592,7 @@ fn merge_mcp_json(
         kept_local: Vec::new(),
         replaced: Vec::new(),
         renamed: Vec::new(),
+        entry_hashes: HashMap::new(),
         final_path: final_path.clone(),
         missing_secrets: Vec::new(),
     };
@@ -1265,6 +1632,11 @@ fn merge_mcp_json(
         spec.validate(key).with_context(|| {
             format!("MCP server '{key}' failed validation; refusing to write merged mcp.json")
         })?;
+        let serialized = serde_json::to_string(spec)
+            .with_context(|| format!("failed to serialize MCP server '{key}'"))?;
+        report
+            .entry_hashes
+            .insert(key.clone(), hash_bytes(serialized.as_bytes()));
     }
 
     let serialized =
@@ -2640,6 +3012,7 @@ mod tests {
                     name: "srv".to_string(),
                     action: McpAction::Added,
                     renamed_to: None,
+                    sha256: None,
                 }],
             )
             .unwrap();
@@ -2648,6 +3021,7 @@ mod tests {
             kept_local: vec!["srv".to_string()],
             replaced: Vec::new(),
             renamed: Vec::new(),
+            entry_hashes: HashMap::new(),
             final_path: dir.join("mcp.json"),
             missing_secrets: Vec::new(),
         };
@@ -3085,5 +3459,462 @@ mod tests {
             "2\n"
         );
         let _ = fs::remove_dir_all(&src_root);
+    }
+
+    fn owned_file_record(path: &str, contents: &str) -> FileRecord {
+        FileRecord {
+            path: path.to_string(),
+            category: "macros".to_string(),
+            sha256: hash_bytes(contents.as_bytes()),
+            action: FileAction::New,
+        }
+    }
+
+    fn mcp_server_record(name: &str, action: McpAction, sha256: Option<String>) -> McpServerRecord {
+        McpServerRecord {
+            name: name.to_string(),
+            action,
+            renamed_to: None,
+            sha256,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn uninstall_deletes_intact_files_and_removes_the_bundle_record() {
+        let _guard = TestVaultConfigGuard::new("uninst-intact");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("gone", test_metadata("https://github.com/x/gone"))
+            .unwrap();
+        let dst = paths::macros_dir().join("hello.yaml");
+        fs::create_dir_all(paths::macros_dir()).unwrap();
+        fs::write(&dst, "hi\n").unwrap();
+        store
+            .record_file("gone", owned_file_record("macros/hello.yaml", "hi\n"))
+            .unwrap();
+
+        uninstall_bundle("gone", true).unwrap();
+
+        assert!(!dst.exists());
+        assert!(
+            !paths::macros_dir().exists(),
+            "emptied macros dir should be pruned"
+        );
+        assert!(BundleStore::load().unwrap().get("gone").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn uninstall_keeps_modified_files_and_retains_the_record() {
+        let _guard = TestVaultConfigGuard::new("uninst-modified");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("mods", test_metadata("https://github.com/x/mods"))
+            .unwrap();
+        let dst = paths::macros_dir().join("edited.yaml");
+        fs::create_dir_all(paths::macros_dir()).unwrap();
+        fs::write(&dst, "user edit\n").unwrap();
+        store
+            .record_file(
+                "mods",
+                owned_file_record("macros/edited.yaml", "original\n"),
+            )
+            .unwrap();
+
+        uninstall_bundle("mods", true).unwrap();
+
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "user edit\n");
+        let store = BundleStore::load().unwrap();
+        let record = store.get("mods").unwrap();
+        assert_eq!(record.files.len(), 1);
+        assert_eq!(record.files[0].path, "macros/edited.yaml");
+    }
+
+    #[test]
+    fn apply_uninstall_delete_removes_file_record_and_empty_dirs() {
+        let dir = fresh_temp_dir("uninst-apply-delete-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let dst = dir.join("macros/gone.yaml");
+        write_src(&dir, "macros/gone.yaml", "user edit");
+        store
+            .record_file("omc", owned_file_record("macros/gone.yaml", "original"))
+            .unwrap();
+        let mut summary = UninstallFileSummary::default();
+
+        apply_uninstall_file_action(
+            &mut store,
+            "omc",
+            "macros/gone.yaml",
+            &dst,
+            &dir,
+            ObsoleteAction::Delete,
+            &mut summary,
+        )
+        .unwrap();
+
+        assert!(!dst.exists());
+        assert!(!dir.join("macros").exists());
+        assert_eq!(summary.deleted, 1);
+        assert!(store.get("omc").unwrap().files.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uninstall_files_drop_records_for_missing_files() {
+        let dir = fresh_temp_dir("uninst-missing-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        store
+            .record_file("omc", owned_file_record("macros/ghost.yaml", "gone"))
+            .unwrap();
+        let files = store.get("omc").unwrap().files.clone();
+
+        let summary = uninstall_owned_files(&mut store, "omc", &files, &dir, true).unwrap();
+
+        assert_eq!(
+            summary,
+            UninstallFileSummary {
+                missing: 1,
+                ..UninstallFileSummary::default()
+            }
+        );
+        assert!(store.get("omc").unwrap().files.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uninstall_files_never_touch_unowned_files() {
+        let dir = fresh_temp_dir("uninst-unowned-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        write_src(&dir, "macros/owned.yaml", "a");
+        write_src(&dir, "macros/user.yaml", "mine");
+        store
+            .record_file("omc", owned_file_record("macros/owned.yaml", "a"))
+            .unwrap();
+        let files = store.get("omc").unwrap().files.clone();
+
+        let summary = uninstall_owned_files(&mut store, "omc", &files, &dir, true).unwrap();
+
+        assert_eq!(summary.deleted, 1);
+        assert!(!dir.join("macros/owned.yaml").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("macros/user.yaml")).unwrap(),
+            "mine"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_files_keep_records_when_deletion_fails_and_continue() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePerms(PathBuf);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let dir = fresh_temp_dir("uninst-fail-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        write_src(&dir, "locked/stuck.yaml", "a");
+        write_src(&dir, "macros/ok.yaml", "b");
+        store
+            .record_file("omc", owned_file_record("locked/stuck.yaml", "a"))
+            .unwrap();
+        store
+            .record_file("omc", owned_file_record("macros/ok.yaml", "b"))
+            .unwrap();
+        let locked = dir.join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let restore = RestorePerms(locked.clone());
+        let probe = locked.join(".write-probe");
+        if fs::write(&probe, "x").is_ok() {
+            // A privileged user bypasses permission bits; the failure path
+            // cannot be provoked this way.
+            let _ = fs::remove_file(&probe);
+            drop(restore);
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let files = store.get("omc").unwrap().files.clone();
+
+        let summary = uninstall_owned_files(&mut store, "omc", &files, &dir, true).unwrap();
+        drop(restore);
+
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.deleted, 1);
+        assert!(dir.join("locked/stuck.yaml").exists());
+        assert!(!dir.join("macros/ok.yaml").exists());
+        let paths: Vec<&str> = store
+            .get("omc")
+            .unwrap()
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["locked/stuck.yaml"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uninstall_files_skip_suspicious_recorded_paths() {
+        let dir = fresh_temp_dir("uninst-suspicious-");
+        let config_dir = dir.join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        write_src(&dir, "evil.yaml", "outside");
+        let abs_victim = dir.join("abs.yaml");
+        fs::write(&abs_victim, "outside").unwrap();
+        store
+            .record_file("omc", owned_file_record("../evil.yaml", "outside"))
+            .unwrap();
+        store
+            .record_file(
+                "omc",
+                owned_file_record(abs_victim.to_str().unwrap(), "outside"),
+            )
+            .unwrap();
+        let files = store.get("omc").unwrap().files.clone();
+
+        let summary = uninstall_owned_files(&mut store, "omc", &files, &config_dir, true).unwrap();
+
+        assert_eq!(summary.failed, 2);
+        assert_eq!(summary.deleted, 0);
+        assert!(dir.join("evil.yaml").exists());
+        assert!(abs_victim.exists());
+        assert_eq!(store.get("omc").unwrap().files.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uninstall_mcp_keeps_replaced_entries_and_drops_the_record() {
+        let dir = fresh_temp_dir("uninst-mcp-replaced-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![mcp_server_record("srv", McpAction::Replaced, None)],
+            )
+            .unwrap();
+        let mcp = dir.join("mcp.json");
+        write_mcp(
+            &mcp,
+            r#"{"mcpServers": {"srv": {"type": "stdio", "command": "echo"}}}"#,
+        );
+        let servers = store.get("omc").unwrap().mcp_servers.clone();
+
+        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+
+        assert_eq!(summary.kept, vec!["srv"]);
+        assert!(summary.removed.is_empty());
+        let written: McpServersConfig =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert!(written.mcp_servers.contains_key("srv"));
+        assert!(store.get("omc").unwrap().mcp_servers.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uninstall_mcp_removes_intact_entries_and_leaves_unowned_keys() {
+        let dir = fresh_temp_dir("uninst-mcp-intact-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let mcp = dir.join("mcp.json");
+        write_mcp(
+            &mcp,
+            r#"{"mcpServers": {
+                "srv": {"type": "stdio", "command": "echo"},
+                "user-srv": {"type": "stdio", "command": "mine"}
+            }}"#,
+        );
+        let parsed: McpServersConfig =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        let hash = hash_bytes(
+            serde_json::to_string(parsed.mcp_servers.get("srv").unwrap())
+                .unwrap()
+                .as_bytes(),
+        );
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![mcp_server_record("srv", McpAction::Added, Some(hash))],
+            )
+            .unwrap();
+        let servers = store.get("omc").unwrap().mcp_servers.clone();
+
+        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+
+        assert_eq!(summary.removed, vec!["srv"]);
+        assert!(summary.kept.is_empty());
+        let written: McpServersConfig =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert!(!written.mcp_servers.contains_key("srv"));
+        assert!(written.mcp_servers.contains_key("user-srv"));
+        assert!(store.get("omc").unwrap().mcp_servers.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uninstall_mcp_keeps_modified_entries_and_their_records() {
+        let dir = fresh_temp_dir("uninst-mcp-modified-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let mcp = dir.join("mcp.json");
+        write_mcp(
+            &mcp,
+            r#"{"mcpServers": {"srv": {"type": "stdio", "command": "edited"}}}"#,
+        );
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![mcp_server_record(
+                    "srv",
+                    McpAction::Added,
+                    Some("0".repeat(64)),
+                )],
+            )
+            .unwrap();
+        let servers = store.get("omc").unwrap().mcp_servers.clone();
+
+        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+
+        assert_eq!(summary.kept, vec!["srv"]);
+        assert!(summary.removed.is_empty());
+        let written: McpServersConfig =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert!(written.mcp_servers.contains_key("srv"));
+        assert_eq!(store.get("omc").unwrap().mcp_servers.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uninstall_mcp_keeps_legacy_records_without_a_hash() {
+        let dir = fresh_temp_dir("uninst-mcp-legacy-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let mcp = dir.join("mcp.json");
+        write_mcp(
+            &mcp,
+            r#"{"mcpServers": {"srv": {"type": "stdio", "command": "echo"}}}"#,
+        );
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![mcp_server_record("srv", McpAction::Added, None)],
+            )
+            .unwrap();
+        let servers = store.get("omc").unwrap().mcp_servers.clone();
+
+        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+
+        assert_eq!(summary.kept, vec!["srv"]);
+        let written: McpServersConfig =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert!(written.mcp_servers.contains_key("srv"));
+        assert_eq!(store.get("omc").unwrap().mcp_servers.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn uninstall_unknown_name_lists_installed_and_url_spelling_resolves() {
+        let _guard = TestVaultConfigGuard::new("uninst-unknown");
+
+        let err = uninstall_bundle("nope", true).unwrap_err();
+        assert!(err.to_string().contains("none are installed"), "got: {err}");
+
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let err = uninstall_bundle("nope", true).unwrap_err();
+        assert!(
+            err.to_string().contains("installed bundles: omc"),
+            "got: {err}"
+        );
+
+        uninstall_bundle("git@github.com:x/omc.git", true).unwrap();
+
+        assert!(BundleStore::load().unwrap().get("omc").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn uninstall_refuses_non_interactive_without_yes() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping uninstall_refuses_non_interactive_without_yes: requires non-TTY stdout"
+            );
+            return;
+        }
+        let _guard = TestVaultConfigGuard::new("uninst-non-tty");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+
+        let err = uninstall_bundle("omc", false).unwrap_err();
+
+        assert!(err.to_string().contains("--yes"), "got: {err}");
+        assert!(BundleStore::load().unwrap().get("omc").is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn record_mcp_merge_stores_entry_hashes() {
+        let _guard = TestVaultConfigGuard::new("uninst-merge-hash");
+        let dir = fresh_temp_dir("uninst-merge-hash-");
+        let remote = dir.join("remote.json");
+        let target = dir.join("target.json");
+        write_mcp(&remote, FIXTURE_REMOTE);
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+
+        let report = merge_mcp_json(None, &remote, &target, false).unwrap();
+        record_mcp_merge(&mut store, "omc", &report).unwrap();
+
+        let written: McpServersConfig =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        let expected = hash_bytes(
+            serde_json::to_string(written.mcp_servers.get("alpha").unwrap())
+                .unwrap()
+                .as_bytes(),
+        );
+        let record = store.get("omc").unwrap();
+        let alpha = record
+            .mcp_servers
+            .iter()
+            .find(|s| s.name == "alpha")
+            .unwrap();
+        assert_eq!(alpha.sha256.as_deref(), Some(expected.as_str()));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

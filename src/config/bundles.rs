@@ -43,6 +43,10 @@ pub(crate) struct McpServerRecord {
     pub(crate) name: String,
     pub(crate) action: McpAction,
     pub(crate) renamed_to: Option<String>,
+    /// Hash of the mcp.json entry as written; a later mismatch means the user
+    /// modified it. Absent on records made before entry hashing existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sha256: Option<String>,
 }
 
 impl McpServerRecord {
@@ -171,7 +175,6 @@ impl BundleStore {
 
     /// Look up the record installed from `url`, comparing canonical source URLs
     /// so https/scp/`.git` spellings of the same remote all match.
-    #[allow(dead_code)]
     pub(crate) fn find_by_source(&self, url: &str) -> Option<(&str, &BundleRecord)> {
         let canonical = canonical_source_url(url);
         self.bundles
@@ -342,6 +345,28 @@ impl BundleStore {
         self.save()
     }
 
+    /// Drop one mcp.json entry from a bundle's owned servers, matched by the
+    /// key it occupies in mcp.json, and persist.
+    pub(crate) fn remove_mcp_record(&mut self, bundle: &str, effective_key: &str) -> Result<()> {
+        self.ensure_bundle_exists(bundle)?;
+        let record = self
+            .bundles
+            .get_mut(bundle)
+            .expect("bundle existence checked above");
+        record
+            .mcp_servers
+            .retain(|owned| owned.effective_key() != effective_key);
+        self.save()
+    }
+
+    /// Remove a bundle's record entirely and persist. Used once an uninstall
+    /// has released everything the record owned.
+    pub(crate) fn remove_bundle(&mut self, name: &str) -> Result<()> {
+        self.ensure_bundle_exists(name)?;
+        self.bundles.remove(name);
+        self.save()
+    }
+
     /// Record one written file and persist immediately, so an install aborted
     /// partway through still has provenance for everything already on disk.
     /// A path owned by another bundle transfers to `bundle`.
@@ -362,10 +387,11 @@ impl BundleStore {
     }
 
     /// Record the mcp.json entries an install wrote, in one persisted flush.
-    /// An entry whose key another bundle owns transfers to `bundle`: the old
-    /// owner drops it, and a `replaced` action is upgraded to `transferred`
-    /// (removable at uninstall — plain `replaced` marks a pre-existing user
-    /// entry that uninstall must never delete).
+    /// An entry whose key any bundle already owns — including `bundle` itself
+    /// on an update — transfers to `bundle`: the old owner drops it, and a
+    /// `replaced` action is upgraded to `transferred` (removable at uninstall
+    /// — plain `replaced` marks a pre-existing user entry that uninstall must
+    /// never delete).
     pub(crate) fn record_mcp_servers(
         &mut self,
         bundle: &str,
@@ -375,10 +401,7 @@ impl BundleStore {
         for mut entry in entries {
             let key = entry.effective_key().to_string();
             let mut previously_owned = false;
-            for (name, record) in self.bundles.iter_mut() {
-                if name == bundle {
-                    continue;
-                }
+            for record in self.bundles.values_mut() {
                 let before = record.mcp_servers.len();
                 record
                     .mcp_servers
@@ -388,14 +411,11 @@ impl BundleStore {
             if previously_owned && entry.action == McpAction::Replaced {
                 entry.action = McpAction::Transferred;
             }
-            let record = self
-                .bundles
+            self.bundles
                 .get_mut(bundle)
-                .expect("bundle existence checked above");
-            record
+                .expect("bundle existence checked above")
                 .mcp_servers
-                .retain(|owned| owned.effective_key() != key);
-            record.mcp_servers.push(entry);
+                .push(entry);
         }
         self.save()
     }
@@ -624,6 +644,7 @@ mod tests {
             name: name.to_string(),
             action,
             renamed_to: renamed_to.map(str::to_string),
+            sha256: None,
         }
     }
 
@@ -809,6 +830,27 @@ mod tests {
             store.get("omc").unwrap().mcp_servers[0].action,
             McpAction::Replaced
         );
+    }
+
+    #[test]
+    fn mcp_rerecord_of_own_entry_upgrades_replaced_to_transferred() {
+        let dir = TempStoreDir::new("bundles-mcp-self-update");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("omc", metadata("https://github.com/x/omc", "abc123"))
+            .unwrap();
+        store
+            .record_mcp_servers("omc", vec![mcp_record("srv", McpAction::Added, None)])
+            .unwrap();
+
+        let mut updated = mcp_record("srv", McpAction::Replaced, None);
+        updated.sha256 = Some("deadbeef".to_string());
+        store.record_mcp_servers("omc", vec![updated]).unwrap();
+
+        let servers = &store.get("omc").unwrap().mcp_servers;
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].action, McpAction::Transferred);
+        assert_eq!(servers[0].sha256.as_deref(), Some("deadbeef"));
     }
 
     #[test]
@@ -1054,6 +1096,61 @@ mod tests {
         let mut store = dir.store();
 
         let result = store.remove_file_record("ghost", "macros/a.yaml");
+
+        assert!(result.unwrap_err().to_string().contains("ghost"));
+    }
+
+    #[test]
+    fn remove_mcp_record_drops_only_the_named_effective_key() {
+        let dir = TempStoreDir::new("bundles-remove-mcp");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("omc", metadata("https://github.com/x/omc", "abc123"))
+            .unwrap();
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![
+                    mcp_record("srv", McpAction::Renamed, Some("srv-remote")),
+                    mcp_record("other", McpAction::Added, None),
+                ],
+            )
+            .unwrap();
+
+        store.remove_mcp_record("omc", "srv-remote").unwrap();
+
+        let reloaded = dir.store();
+        let keys: Vec<&str> = reloaded
+            .get("omc")
+            .unwrap()
+            .mcp_servers
+            .iter()
+            .map(|s| s.effective_key())
+            .collect();
+        assert_eq!(keys, vec!["other"]);
+    }
+
+    #[test]
+    fn remove_bundle_deletes_the_record_and_persists() {
+        let dir = TempStoreDir::new("bundles-remove-bundle");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("omc", metadata("https://github.com/x/omc", "abc123"))
+            .unwrap();
+
+        store.remove_bundle("omc").unwrap();
+
+        let reloaded = dir.store();
+        assert!(reloaded.get("omc").is_none());
+        assert!(reloaded.bundle_names().is_empty());
+    }
+
+    #[test]
+    fn remove_bundle_unknown_name_fails() {
+        let dir = TempStoreDir::new("bundles-remove-bundle-unknown");
+        let mut store = dir.store();
+
+        let result = store.remove_bundle("ghost");
 
         assert!(result.unwrap_err().to_string().contains("ghost"));
     }

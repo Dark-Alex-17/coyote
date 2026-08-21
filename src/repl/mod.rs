@@ -53,7 +53,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 60]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 61]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -318,6 +318,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 60]> = LazyLock::new(|| {
         ReplCommand::new(
             ".install",
             "Reinstall bundled assets, or install assets from a remote git repo (.install remote <url>)",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".uninstall",
+            "Uninstall an installed bundle (delete its owned files and MCP entries)",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -1202,6 +1207,12 @@ pub async fn run_repl_command(
                     println!("Usage: .delete <role|session|rag|macro|skill|agent-data>")
                 }
             },
+            ".uninstall" => match args {
+                Some(args) => {
+                    config::uninstall_bundle(args.trim(), false)?;
+                }
+                _ => println!("Usage: .uninstall <bundle-name>"),
+            },
             ".list" => match args {
                 Some(args) => {
                     ctx.list_assets(args.trim())?;
@@ -1791,8 +1802,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_60_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 60);
+    fn repl_commands_has_61_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 61);
     }
 
     #[test]

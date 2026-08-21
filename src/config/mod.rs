@@ -32,7 +32,9 @@ pub use self::app_config::AppConfig;
 pub use self::app_state::AppState;
 pub use self::bundles::list_installed_bundles;
 pub use self::input::Input;
-pub use self::install_remote::{install_remote, install_remote_from_repl_args, update_bundle};
+pub use self::install_remote::{
+    install_remote, install_remote_from_repl_args, uninstall_bundle, update_bundle,
+};
 pub use self::macro_policy::{
     MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, ResolvedMacro,
 };
