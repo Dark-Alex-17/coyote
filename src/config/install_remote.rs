@@ -1,3 +1,6 @@
+use super::bundles::{
+    BundleStore, FileAction, FileRecord, InstallMetadata, McpAction, McpServerRecord, hash_file,
+};
 use crate::config::{InstallFilter, paths};
 #[cfg(not(windows))]
 use crate::function::Language;
@@ -31,16 +34,31 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
         return Ok(());
     }
 
+    let mut store = BundleStore::load()?;
+    let bundle = register_bundle(
+        &mut store,
+        &url,
+        reference.as_deref(),
+        layout.manifest.as_ref(),
+        temp.head_sha(),
+    )?;
+
     let plan = plan_changes(&layout)?;
 
     if !plan.files.is_empty() {
         print_plan_summary(&plan);
-        apply_plan(&plan, force)?;
+        let sticky = if force {
+            StickyMode::ReplaceAll
+        } else {
+            StickyMode::None
+        };
+        apply_plan(&plan, sticky, &mut store, &bundle)?;
     }
 
     if let Some((remote_mcp, local_mcp)) = &plan.mcp_json {
         let local = local_mcp.exists().then_some(local_mcp.as_path());
         let report = merge_mcp_json(local, remote_mcp, local_mcp, force)?;
+        record_mcp_merge(&mut store, &bundle, &report)?;
         print_mcp_merge_report(&report);
         handle_missing_secrets(&report.missing_secrets)?;
     }
@@ -293,12 +311,36 @@ const BUNDLE_MANIFEST_FILE: &str = "coyote-bundle.yaml";
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct BundleManifest {
     pub(crate) name: String,
-    #[allow(dead_code)]
     pub(crate) version: Option<String>,
-    #[allow(dead_code)]
     pub(crate) description: Option<String>,
-    #[allow(dead_code)]
     pub(crate) homepage: Option<String>,
+}
+
+/// Resolve the bundle's identity for this install and create or refresh its
+/// provenance record. Returns the record key subsequent recording uses.
+fn register_bundle(
+    store: &mut BundleStore,
+    url: &str,
+    git_ref: Option<&str>,
+    manifest: Option<&BundleManifest>,
+    commit: &str,
+) -> Result<String> {
+    let resolved = store.resolve_bundle_name(url, manifest.map(|m| m.name.as_str()))?;
+    let version = manifest
+        .and_then(|m| m.version.clone())
+        .unwrap_or_else(|| commit.chars().take(7).collect());
+    store.upsert_bundle(
+        &resolved.name,
+        InstallMetadata {
+            source: url.to_string(),
+            git_ref: git_ref.map(str::to_string),
+            commit: commit.to_string(),
+            version: Some(version),
+            description: manifest.and_then(|m| m.description.clone()),
+            homepage: manifest.and_then(|m| m.homepage.clone()),
+        },
+    )?;
+    Ok(resolved.name)
 }
 
 fn parse_bundle_manifest(root: &Path) -> Result<Option<BundleManifest>> {
@@ -719,6 +761,7 @@ enum ConflictAction {
     Replace,
 }
 
+#[derive(Debug)]
 struct ApplyReport {
     new_count: usize,
     identical_count: usize,
@@ -726,23 +769,25 @@ struct ApplyReport {
     kept_count: usize,
 }
 
-fn apply_plan(plan: &InstallPlan, force: bool) -> Result<ApplyReport> {
+fn apply_plan(
+    plan: &InstallPlan,
+    initial_mode: StickyMode,
+    store: &mut BundleStore,
+    bundle: &str,
+) -> Result<ApplyReport> {
     let mut report = ApplyReport {
         new_count: 0,
         identical_count: 0,
         replaced_count: 0,
         kept_count: 0,
     };
-    let mut sticky = if force {
-        StickyMode::ReplaceAll
-    } else {
-        StickyMode::None
-    };
+    let mut sticky = initial_mode;
 
     for planned in &plan.files {
         match planned.kind {
             PlannedKind::New => {
                 write_file(&planned.src, &planned.dst)?;
+                record_written_file(store, bundle, planned, FileAction::New)?;
                 report.new_count += 1;
             }
             PlannedKind::Identical => {
@@ -752,6 +797,7 @@ fn apply_plan(plan: &InstallPlan, force: bool) -> Result<ApplyReport> {
                 ConflictAction::Keep => report.kept_count += 1,
                 ConflictAction::Replace => {
                     write_file(&planned.src, &planned.dst)?;
+                    record_written_file(store, bundle, planned, FileAction::Replaced)?;
                     report.replaced_count += 1;
                 }
             },
@@ -764,6 +810,67 @@ fn apply_plan(plan: &InstallPlan, force: bool) -> Result<ApplyReport> {
     );
 
     Ok(report)
+}
+
+/// Provenance is recorded per written file, not at the end of the loop: a
+/// conflict prompt can abort the install after earlier files already landed
+/// on disk, and those must not become untracked orphans. Files the user kept
+/// (or that were identical) are never recorded — ownership means "this
+/// content exists because of this bundle" — so a kept file that another
+/// bundle's record already owns stays with that owner.
+fn record_written_file(
+    store: &mut BundleStore,
+    bundle: &str,
+    planned: &PlannedFile,
+    action: FileAction,
+) -> Result<()> {
+    store.record_file(
+        bundle,
+        FileRecord {
+            path: provenance_path(&planned.dst),
+            category: planned.top_category.label().to_string(),
+            sha256: hash_file(&planned.dst)?,
+            action,
+        },
+    )
+}
+
+fn provenance_path(dst: &Path) -> String {
+    dst.strip_prefix(paths::config_dir())
+        .unwrap_or(dst)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Record the mcp.json entries the merge actually wrote, in one flush right
+/// after the merged file itself. Entries the merge kept local are deliberately
+/// absent: an entry another bundle already owns stays with that owner.
+fn record_mcp_merge(store: &mut BundleStore, bundle: &str, report: &McpMergeReport) -> Result<()> {
+    let mut entries: Vec<McpServerRecord> = Vec::new();
+    entries.extend(report.added.iter().map(|name| McpServerRecord {
+        name: name.clone(),
+        action: McpAction::Added,
+        renamed_to: None,
+    }));
+    entries.extend(report.replaced.iter().map(|name| McpServerRecord {
+        name: name.clone(),
+        action: McpAction::Replaced,
+        renamed_to: None,
+    }));
+    entries.extend(
+        report
+            .renamed
+            .iter()
+            .map(|(name, renamed_to)| McpServerRecord {
+                name: name.clone(),
+                action: McpAction::Renamed,
+                renamed_to: Some(renamed_to.clone()),
+            }),
+    );
+    if entries.is_empty() {
+        return Ok(());
+    }
+    store.record_mcp_servers(bundle, entries)
 }
 
 fn resolve_conflict(planned: &PlannedFile, sticky: &mut StickyMode) -> Result<ConflictAction> {
@@ -2021,5 +2128,318 @@ mod tests {
 
         assert_eq!(temp.head_sha(), first);
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    fn write_src(root: &Path, rel: &str, content: &str) {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    fn init_bundle_repo(dir: &Path) -> String {
+        run_git(vec!["init".into(), "-q".into(), dir.as_os_str().into()]).unwrap();
+        commit_file(dir, ".seed", "seed")
+    }
+
+    fn test_metadata(source: &str) -> InstallMetadata {
+        InstallMetadata {
+            source: source.to_string(),
+            git_ref: None,
+            commit: "abc123".to_string(),
+            version: None,
+            description: None,
+            homepage: None,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn install_remote_records_files_mcp_entries_and_metadata() {
+        use crate::config::bundles::hash_bytes;
+
+        let _guard = TestVaultConfigGuard::new("prov-full");
+        let src_root = fresh_temp_dir("prov-full-src-");
+        let repo = src_root.join("my-bundle");
+        write_src(
+            &repo,
+            BUNDLE_MANIFEST_FILE,
+            "name: my-bundle\n\
+             version: \"2.0\"\n\
+             description: Test bundle\n\
+             homepage: https://example.com/my-bundle\n",
+        );
+        write_src(&repo, "macros/hello.yaml", "name: hello\n");
+        write_src(
+            &repo,
+            "functions/mcp.json",
+            r#"{"mcpServers": {"srv": {"type": "stdio", "command": "echo"}}}"#,
+        );
+        let sha = init_bundle_repo(&repo);
+
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+
+        let store = BundleStore::load().unwrap();
+        let record = store.get("my-bundle").unwrap();
+        assert_eq!(record.source, repo.to_str().unwrap());
+        assert_eq!(record.git_ref, None);
+        assert_eq!(record.commit, sha);
+        assert_eq!(record.version.as_deref(), Some("2.0"));
+        assert_eq!(record.description.as_deref(), Some("Test bundle"));
+        assert_eq!(
+            record.homepage.as_deref(),
+            Some("https://example.com/my-bundle")
+        );
+        assert_eq!(record.files.len(), 1);
+        assert_eq!(record.files[0].path, "macros/hello.yaml");
+        assert_eq!(record.files[0].category, "macros");
+        assert_eq!(record.files[0].action, FileAction::New);
+        assert_eq!(record.files[0].sha256, hash_bytes(b"name: hello\n"));
+        assert_eq!(record.mcp_servers.len(), 1);
+        assert_eq!(record.mcp_servers[0].name, "srv");
+        assert_eq!(record.mcp_servers[0].action, McpAction::Added);
+        assert_eq!(record.mcp_servers[0].renamed_to, None);
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    #[serial]
+    fn install_remote_without_manifest_uses_repo_slug_and_short_sha_version() {
+        let _guard = TestVaultConfigGuard::new("prov-slug");
+        let src_root = fresh_temp_dir("prov-slug-src-");
+        let repo = src_root.join("plain.bundle");
+        write_src(&repo, "macros/m.yaml", "a: 1\n");
+        let sha = init_bundle_repo(&repo);
+
+        install_remote(&format!("{}#{sha}", repo.display()), None, false).unwrap();
+
+        let store = BundleStore::load().unwrap();
+        let record = store.get("plain-bundle").unwrap();
+        assert_eq!(record.git_ref.as_deref(), Some(sha.as_str()));
+        assert_eq!(record.commit, sha);
+        assert_eq!(record.version.as_deref(), Some(&sha[..7]));
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    #[serial]
+    fn apply_plan_records_files_written_before_a_mid_run_abort() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping apply_plan_records_files_written_before_a_mid_run_abort: requires non-TTY stdout"
+            );
+            return;
+        }
+        let _guard = TestVaultConfigGuard::new("prov-abort");
+        let src_dir = fresh_temp_dir("prov-abort-src-");
+        let src_new = src_dir.join("new.yaml");
+        let src_conflict = src_dir.join("conflict.yaml");
+        fs::write(&src_new, "new content").unwrap();
+        fs::write(&src_conflict, "remote content").unwrap();
+        let dst_new = paths::macros_dir().join("new.yaml");
+        let dst_conflict = paths::macros_dir().join("conflict.yaml");
+        fs::create_dir_all(paths::macros_dir()).unwrap();
+        fs::write(&dst_conflict, "local content").unwrap();
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("aborty", test_metadata("https://github.com/x/aborty"))
+            .unwrap();
+        let plan = InstallPlan {
+            files: vec![
+                PlannedFile {
+                    src: src_new,
+                    dst: dst_new.clone(),
+                    kind: PlannedKind::New,
+                    top_category: TopCategory::Macros,
+                },
+                PlannedFile {
+                    src: src_conflict,
+                    dst: dst_conflict.clone(),
+                    kind: PlannedKind::Conflict,
+                    top_category: TopCategory::Macros,
+                },
+            ],
+            mcp_json: None,
+        };
+
+        let err = apply_plan(&plan, StickyMode::None, &mut store, "aborty").unwrap_err();
+
+        assert!(
+            err.to_string().contains("Refusing to overwrite"),
+            "got: {err}"
+        );
+        assert_eq!(fs::read_to_string(&dst_new).unwrap(), "new content");
+        assert_eq!(fs::read_to_string(&dst_conflict).unwrap(), "local content");
+        let reloaded = BundleStore::load().unwrap();
+        let files = &reloaded.get("aborty").unwrap().files;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "macros/new.yaml");
+        assert_eq!(files[0].action, FileAction::New);
+        let _ = fs::remove_dir_all(&src_dir);
+    }
+
+    #[test]
+    fn apply_plan_keep_all_leaves_prior_owner_intact() {
+        let dir = fresh_temp_dir("prov-keep-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("alpha", test_metadata("https://github.com/a/alpha"))
+            .unwrap();
+        store
+            .upsert_bundle("beta", test_metadata("https://github.com/b/beta"))
+            .unwrap();
+        let dst = dir.join("macros/owned.yaml");
+        write_src(&dir, "macros/owned.yaml", "alpha content");
+        store
+            .record_file(
+                "alpha",
+                FileRecord {
+                    path: "macros/owned.yaml".to_string(),
+                    category: "macros".to_string(),
+                    sha256: hash_file(&dst).unwrap(),
+                    action: FileAction::New,
+                },
+            )
+            .unwrap();
+        let src = dir.join("beta-src/owned.yaml");
+        write_src(&dir, "beta-src/owned.yaml", "beta content");
+        let plan = InstallPlan {
+            files: vec![PlannedFile {
+                src,
+                dst: dst.clone(),
+                kind: PlannedKind::Conflict,
+                top_category: TopCategory::Macros,
+            }],
+            mcp_json: None,
+        };
+
+        apply_plan(&plan, StickyMode::KeepAll, &mut store, "beta").unwrap();
+
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "alpha content");
+        let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        assert_eq!(reloaded.get("alpha").unwrap().files.len(), 1);
+        assert!(reloaded.get("beta").unwrap().files.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn second_install_transfers_file_and_mcp_ownership() {
+        use crate::config::bundles::hash_bytes;
+
+        let _guard = TestVaultConfigGuard::new("prov-transfer");
+        let src_root = fresh_temp_dir("prov-transfer-src-");
+        let alpha = src_root.join("alpha");
+        write_src(&alpha, "macros/shared.yaml", "from: alpha\n");
+        write_src(
+            &alpha,
+            "functions/mcp.json",
+            r#"{"mcpServers": {"srv": {"type": "stdio", "command": "alpha"}}}"#,
+        );
+        init_bundle_repo(&alpha);
+        let beta = src_root.join("beta");
+        write_src(&beta, "macros/shared.yaml", "from: beta\n");
+        write_src(
+            &beta,
+            "functions/mcp.json",
+            r#"{"mcpServers": {"srv": {"type": "stdio", "command": "beta"}}}"#,
+        );
+        init_bundle_repo(&beta);
+
+        install_remote(alpha.to_str().unwrap(), None, false).unwrap();
+        install_remote(beta.to_str().unwrap(), None, true).unwrap();
+
+        let store = BundleStore::load().unwrap();
+        let alpha_record = store.get("alpha").unwrap();
+        assert!(alpha_record.files.is_empty());
+        assert!(alpha_record.mcp_servers.is_empty());
+        let beta_record = store.get("beta").unwrap();
+        assert_eq!(beta_record.files.len(), 1);
+        assert_eq!(beta_record.files[0].path, "macros/shared.yaml");
+        assert_eq!(beta_record.files[0].action, FileAction::Replaced);
+        assert_eq!(beta_record.files[0].sha256, hash_bytes(b"from: beta\n"));
+        assert_eq!(beta_record.mcp_servers.len(), 1);
+        assert_eq!(beta_record.mcp_servers[0].name, "srv");
+        assert_eq!(beta_record.mcp_servers[0].action, McpAction::Transferred);
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    #[serial]
+    fn filtered_installs_merge_into_one_record() {
+        let _guard = TestVaultConfigGuard::new("prov-filter");
+        let src_root = fresh_temp_dir("prov-filter-src-");
+        let repo = src_root.join("combo");
+        write_src(&repo, "macros/m.yaml", "a: 1\n");
+        write_src(&repo, "skills/myskill/SKILL.md", "# skill\n");
+        let first_sha = init_bundle_repo(&repo);
+
+        install_remote(repo.to_str().unwrap(), Some(InstallFilter::Macros), false).unwrap();
+        let second_sha = commit_file(&repo, "extra.txt", "two");
+        install_remote(repo.to_str().unwrap(), Some(InstallFilter::Skills), false).unwrap();
+
+        let store = BundleStore::load().unwrap();
+        assert_eq!(store.bundle_names(), vec!["combo"]);
+        let record = store.get("combo").unwrap();
+        assert_ne!(first_sha, second_sha);
+        assert_eq!(record.commit, second_sha);
+        let mut owned: Vec<&str> = record.files.iter().map(|f| f.path.as_str()).collect();
+        owned.sort();
+        assert_eq!(owned, vec!["macros/m.yaml", "skills/myskill/SKILL.md"]);
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    fn record_mcp_merge_ignores_kept_local_entries() {
+        let dir = fresh_temp_dir("prov-mcp-keep-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("alpha", test_metadata("https://github.com/a/alpha"))
+            .unwrap();
+        store
+            .upsert_bundle("beta", test_metadata("https://github.com/b/beta"))
+            .unwrap();
+        store
+            .record_mcp_servers(
+                "alpha",
+                vec![McpServerRecord {
+                    name: "srv".to_string(),
+                    action: McpAction::Added,
+                    renamed_to: None,
+                }],
+            )
+            .unwrap();
+        let report = McpMergeReport {
+            added: Vec::new(),
+            kept_local: vec!["srv".to_string()],
+            replaced: Vec::new(),
+            renamed: Vec::new(),
+            final_path: dir.join("mcp.json"),
+            missing_secrets: Vec::new(),
+        };
+
+        record_mcp_merge(&mut store, "beta", &report).unwrap();
+
+        assert_eq!(store.get("alpha").unwrap().mcp_servers.len(), 1);
+        assert!(store.get("beta").unwrap().mcp_servers.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn builtin_asset_install_writes_no_provenance() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping builtin_asset_install_writes_no_provenance: requires non-TTY stdout"
+            );
+            return;
+        }
+        let _guard = TestVaultConfigGuard::new("prov-builtin");
+
+        crate::config::install_assets(crate::config::AssetCategory::Macros).unwrap();
+
+        assert!(fs::read_dir(paths::macros_dir()).unwrap().next().is_some());
+        assert!(!paths::installed_bundles_file().exists());
     }
 }

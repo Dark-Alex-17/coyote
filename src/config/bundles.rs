@@ -60,6 +60,10 @@ pub(crate) struct BundleRecord {
     pub(crate) commit: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) homepage: Option<String>,
     pub(crate) installed_at: String,
     #[serde(default)]
     pub(crate) files: Vec<FileRecord>,
@@ -73,6 +77,8 @@ pub(crate) struct InstallMetadata {
     pub(crate) git_ref: Option<String>,
     pub(crate) commit: String,
     pub(crate) version: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) homepage: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +87,7 @@ pub(crate) struct ResolvedBundleName {
     /// The unqualified name this install asked for, when it had to be owner-qualified.
     pub(crate) qualified_from: Option<String>,
     /// The record key this source was previously tracked under, when it changed.
+    #[allow(dead_code)]
     pub(crate) migrated_from: Option<String>,
     /// Source URL of the different-source bundle that already holds the unqualified name.
     pub(crate) same_name_other_source: Option<String>,
@@ -146,10 +153,12 @@ impl BundleStore {
             .with_context(|| format!("failed to write {}", self.path.display()))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get(&self, name: &str) -> Option<&BundleRecord> {
         self.bundles.get(name)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &BundleRecord)> {
         self.bundles
             .iter()
@@ -162,6 +171,7 @@ impl BundleStore {
 
     /// Look up the record installed from `url`, comparing canonical source URLs
     /// so https/scp/`.git` spellings of the same remote all match.
+    #[allow(dead_code)]
     pub(crate) fn find_by_source(&self, url: &str) -> Option<(&str, &BundleRecord)> {
         let canonical = canonical_source_url(url);
         self.bundles
@@ -285,6 +295,8 @@ impl BundleStore {
                 record.git_ref = metadata.git_ref;
                 record.commit = metadata.commit;
                 record.version = metadata.version;
+                record.description = metadata.description;
+                record.homepage = metadata.homepage;
             }
             None => {
                 self.bundles.insert(
@@ -294,6 +306,8 @@ impl BundleStore {
                         git_ref: metadata.git_ref,
                         commit: metadata.commit,
                         version: metadata.version,
+                        description: metadata.description,
+                        homepage: metadata.homepage,
                         installed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
                         files: Vec::new(),
                         mcp_servers: Vec::new(),
@@ -449,6 +463,8 @@ mod tests {
             git_ref: None,
             commit: commit.to_string(),
             version: None,
+            description: None,
+            homepage: None,
         }
     }
 
@@ -504,6 +520,8 @@ mod tests {
                     git_ref: Some("main".to_string()),
                     commit: "abc123".to_string(),
                     version: Some("1.4.0".to_string()),
+                    description: Some("Opinionated roles and macros".to_string()),
+                    homepage: Some("https://github.com/x/omc".to_string()),
                 },
             )
             .unwrap();
@@ -523,6 +541,11 @@ mod tests {
         let record = reloaded.get("omc").unwrap();
         assert_eq!(record.git_ref.as_deref(), Some("main"));
         assert_eq!(record.version.as_deref(), Some("1.4.0"));
+        assert_eq!(
+            record.description.as_deref(),
+            Some("Opinionated roles and macros")
+        );
+        assert_eq!(record.homepage.as_deref(), Some("https://github.com/x/omc"));
         assert_eq!(record.files.len(), 1);
         assert_eq!(record.mcp_servers.len(), 1);
     }
