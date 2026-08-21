@@ -24,6 +24,9 @@ enabled_skills:                       # Skills available when this role is activ
 inject_skill_instructions: true       # Inject a short hint pointing the model at `skill__list` when skills are enabled 
                                       # (default: true). Suppressed automatically when no skills are available.
 skill_instructions: null              # Custom text for the skill hint (optional; uses built-in default if null)
+enabled_macros:                       # Macros invocable when this role is active. Accepts a YAML list (preferred)
+  - generate-commit-message           # or a comma-separated string (e.g. `enabled_macros: generate-commit-message,review`).
+                                      # An empty list disables all macros. Omit to inherit the global default.
 memory: null                          # Per-role memory override (default: inherit). Set to `false` to disable memory
                                       # when this role is active. See the Memory wiki page.
 

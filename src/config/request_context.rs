@@ -7,7 +7,8 @@ use super::todo::TodoList;
 use super::tool_scope::{McpRuntime, ToolScope};
 use super::{
     AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
-    Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, RIGHT_PROMPT, Role,
+    Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, MacroAllowlistLevel,
+    MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT, ResolvedMacro, Role,
     RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
     TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
     list_agents_with_descriptions, memory, paths,
@@ -32,6 +33,7 @@ use crate::utils::{
     AbortSignal, abortable_run_with_spinner, edit_file, fuzzy_filter, get_env_name,
     list_file_names, now, render_prompt, temp_file,
 };
+use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 
 use super::instructions;
 use super::memory::{
@@ -110,6 +112,14 @@ fn print_asset_names(kind: &str, names: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn asset_table(header: &[&str]) -> Table {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(header.to_vec());
+    table
+}
+
 fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<String>)> {
     names
         .into_iter()
@@ -123,6 +133,95 @@ fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<
         .collect()
 }
 
+const SET_COMPLETION_KEYS: [&str; 26] = [
+    "auto_continue",
+    "continuation_prompt",
+    "temperature",
+    "top_p",
+    "enabled_macros",
+    "enabled_skills",
+    "enabled_tools",
+    "enabled_mcp_servers",
+    "inject_todo_instructions",
+    "inject_skill_instructions",
+    "skill_instructions",
+    "max_auto_continues",
+    "memory",
+    "save_session",
+    "compression_threshold",
+    "rag_reranker_model",
+    "rag_top_k",
+    "max_output_tokens",
+    "dry_run",
+    "function_calling_support",
+    "mcp_server_support",
+    "skills_enabled",
+    "stream",
+    "save",
+    "highlight",
+    "raw_markdown",
+];
+
+fn toggled_enabled_macros(
+    current: Option<&[String]>,
+    all_active: &[String],
+    name: &str,
+    enable: bool,
+) -> Option<Vec<String>> {
+    match (current, enable) {
+        (None, true) => None,
+        (Some(list), true) => {
+            if list.iter().any(|v| v == name) {
+                None
+            } else {
+                let mut list = list.to_vec();
+                list.push(name.to_string());
+                Some(list)
+            }
+        }
+        (None, false) => Some(
+            all_active
+                .iter()
+                .filter(|v| v.as_str() != name)
+                .cloned()
+                .collect(),
+        ),
+        (Some(list), false) => {
+            if list.iter().any(|v| v == name) {
+                Some(
+                    list.iter()
+                        .filter(|v| v.as_str() != name)
+                        .cloned()
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn macro_state_display(
+    row: &ResolvedMacro,
+    lock_owner: impl Fn(MacroAllowlistLevel) -> String,
+) -> String {
+    match &row.state {
+        MacroState::Enabled => "enabled".to_string(),
+        MacroState::DisabledRuntime => "disabled (runtime)".to_string(),
+        MacroState::Locked { level } => format!("locked ({} enabled_macros)", lock_owner(*level)),
+        MacroState::Missing => "missing".to_string(),
+        MacroState::ShadowedBuiltin => "shadowed (built-in)".to_string(),
+        MacroState::Invalid { reason } => format!("invalid ({reason})"),
+    }
+}
+
+fn macro_source_display(source: Option<MacroSource>) -> String {
+    match source {
+        Some(source) => source.to_string(),
+        None => "-".to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RenderMode {
     #[default]
@@ -134,6 +233,7 @@ pub struct RequestContext {
     pub app: Arc<AppState>,
 
     pub macro_flag: bool,
+    pub macro_non_isolated: bool,
     pub info_flag: bool,
     pub working_mode: WorkingMode,
 
@@ -171,6 +271,7 @@ impl RequestContext {
         Self {
             app,
             macro_flag: false,
+            macro_non_isolated: false,
             info_flag: false,
             working_mode,
             model: Default::default(),
@@ -225,6 +326,7 @@ impl RequestContext {
         Ok(Self {
             app,
             macro_flag: false,
+            macro_non_isolated: false,
             info_flag,
             working_mode,
             model,
@@ -274,6 +376,7 @@ impl RequestContext {
         Self {
             app: Arc::clone(&self.app),
             macro_flag: self.macro_flag,
+            macro_non_isolated: self.macro_non_isolated,
             info_flag: self.info_flag,
             working_mode: self.working_mode,
             model: self.model.clone(),
@@ -313,6 +416,7 @@ impl RequestContext {
         Self {
             app,
             macro_flag: parent.macro_flag,
+            macro_non_isolated: parent.macro_non_isolated,
             info_flag: parent.info_flag,
             working_mode: WorkingMode::Cmd,
             model: parent.model.clone(),
@@ -1578,6 +1682,10 @@ impl RequestContext {
                 super::format_option_value(&role.enabled_skills().map(|v| v.join(","))),
             ),
             (
+                "enabled_macros",
+                super::format_option_value(&role.enabled_macros().map(|v| v.join(","))),
+            ),
+            (
                 "max_output_tokens",
                 role.model()
                     .max_tokens_param()
@@ -2357,6 +2465,9 @@ impl RequestContext {
     }
 
     pub fn new_macro(&self, app: &AppConfig, name: &str) -> Result<()> {
+        if RESERVED_MACRO_NAMES.contains(&name) {
+            bail!("'{name}' is a reserved macro name");
+        }
         if self.macro_flag {
             bail!("No macro");
         }
@@ -2374,12 +2485,147 @@ impl RequestContext {
         Ok(())
     }
 
+    pub fn in_non_isolated_macro(&self) -> bool {
+        self.macro_flag && self.macro_non_isolated
+    }
+
+    pub fn macro_policy(&self) -> MacroPolicy {
+        MacroPolicy::effective(
+            &self.app.config,
+            self.role.as_ref(),
+            self.agent.as_ref(),
+            self.session.as_ref(),
+            &crate::repl::builtin_command_names(),
+            self.app.config.no_workspace_macros,
+        )
+    }
+
+    pub fn macro_lock_owner(&self, level: MacroAllowlistLevel) -> String {
+        let name = match level {
+            MacroAllowlistLevel::Session => self.session.as_ref().map(|s| s.name()),
+            MacroAllowlistLevel::Agent => self.agent.as_ref().map(|a| a.name()),
+            MacroAllowlistLevel::Role => self.role.as_ref().map(|r| r.name()),
+            MacroAllowlistLevel::Global => return "global config".to_string(),
+        };
+        match name {
+            Some(name) => format!("{level}:{name}"),
+            None => level.to_string(),
+        }
+    }
+
+    pub fn macro_toggle(&mut self, name: &str, enable: bool) -> Result<()> {
+        let restricting_level = if self
+            .session
+            .as_ref()
+            .and_then(|s| s.enabled_macros())
+            .is_some()
+        {
+            Some(MacroAllowlistLevel::Session)
+        } else if self
+            .agent
+            .as_ref()
+            .and_then(|a| a.enabled_macros())
+            .is_some()
+        {
+            Some(MacroAllowlistLevel::Agent)
+        } else if self
+            .role
+            .as_ref()
+            .and_then(|r| r.enabled_macros())
+            .is_some()
+        {
+            Some(MacroAllowlistLevel::Role)
+        } else {
+            None
+        };
+        if let Some(level) = restricting_level {
+            bail!(
+                "Macro toggles are restricted by {} enabled_macros; edit enabled_macros there",
+                self.macro_lock_owner(level)
+            );
+        }
+
+        let policy = self.macro_policy();
+        match policy.find(name).map(|row| &row.state) {
+            None => bail!("Unknown macro '{name}'"),
+            Some(MacroState::Invalid { reason }) => bail!("Macro '{name}' is invalid: {reason}"),
+            Some(_) => {}
+        }
+        let all_active: Vec<String> = policy
+            .macros
+            .iter()
+            .filter(|row| {
+                row.source.is_some()
+                    && !row.shadowed_by_workspace
+                    && !matches!(row.state, MacroState::Missing | MacroState::Invalid { .. })
+            })
+            .map(|row| row.name.clone())
+            .collect();
+
+        let action = if enable { "enabled" } else { "disabled" };
+
+        match toggled_enabled_macros(
+            self.app.config.enabled_macros.as_deref(),
+            &all_active,
+            name,
+            enable,
+        ) {
+            Some(list) => {
+                self.update_app_config(|app| app.enabled_macros = Some(list));
+                println!("Macro '{name}' {action}");
+            }
+            None => println!("Macro '{name}' is already {action}"),
+        }
+
+        Ok(())
+    }
+
+    pub fn visible_macro_completions(&self) -> Vec<(String, Option<String>)> {
+        self.macro_policy()
+            .macros
+            .into_iter()
+            .filter(|row| row.state == MacroState::Enabled && !row.shadowed_by_workspace)
+            .map(|row| (row.name, row.description))
+            .collect()
+    }
+
     pub fn list_assets(&self, kind: &str) -> Result<()> {
         match kind {
             "roles" => print_asset_names("roles", &paths::list_roles(true)),
             "sessions" => print_asset_names("sessions", &self.list_sessions()),
             "rags" => print_asset_names("RAGs", &paths::list_rags()),
-            "macros" => print_asset_names("macros", &paths::list_macros()),
+            "macros" => {
+                let policy = self.macro_policy();
+                if policy.macros.is_empty() {
+                    println!("No macros found.");
+                    return Ok(());
+                }
+
+                let mut table =
+                    asset_table(&["name", "source", "isolated", "state", "description"]);
+
+                for row in &policy.macros {
+                    let source = macro_source_display(row.source);
+                    let isolated = match row.isolated {
+                        Some(true) => "yes",
+                        Some(false) => "no",
+                        None => "-",
+                    };
+                    let state = macro_state_display(row, |level| self.macro_lock_owner(level));
+                    let description = row.description.as_deref().unwrap_or_default();
+                    table.add_row(vec![
+                        row.name.as_str(),
+                        &source,
+                        isolated,
+                        &state,
+                        description,
+                    ]);
+                }
+
+                println!("Macros:");
+                println!("{table}");
+                Ok(())
+            }
             "agents" => {
                 let entries = list_agents_with_descriptions();
                 if entries.is_empty() {
@@ -2387,15 +2633,13 @@ impl RequestContext {
                     return Ok(());
                 }
 
-                println!("Agents:");
+                let mut table = asset_table(&["name", "description"]);
                 for (name, description) in entries {
-                    if description.is_empty() {
-                        println!("  • {name}");
-                    } else {
-                        println!("  • {name} — {description}");
-                    }
+                    table.add_row(vec![name, description]);
                 }
 
+                println!("Agents:");
+                println!("{table}");
                 Ok(())
             }
             "skills" => {
@@ -2441,16 +2685,18 @@ impl RequestContext {
                     return Ok(());
                 }
 
-                println!("Skills:");
+                let mut table = asset_table(&["loaded", "name", "description"]);
                 for (name, description, loaded) in entries {
                     let marker = if loaded {
                         "✓".green().bold().to_string()
                     } else {
                         "✗".red().bold().to_string()
                     };
-                    println!("  {marker} {name} — {description}");
+                    table.add_row(vec![marker, name, description]);
                 }
 
+                println!("Skills:");
+                println!("{table}");
                 Ok(())
             }
             "tools" => {
@@ -2728,6 +2974,23 @@ impl RequestContext {
                 }
                 self.update_app_config(|app| app.enabled_skills = parsed.clone());
             }
+            "enabled_macros" => {
+                let raw: Option<String> = super::parse_value(value)?;
+                let parsed: Option<Vec<String>> = raw.map(|s| super::csv_to_vec(&s));
+                if let Some(names) = parsed.as_ref() {
+                    let policy = self.macro_policy();
+                    for name in names {
+                        if !policy
+                            .macros
+                            .iter()
+                            .any(|m| m.source.is_some() && &m.name == name)
+                        {
+                            bail!("macro '{name}' is not installed");
+                        }
+                    }
+                }
+                self.update_app_config(|app| app.enabled_macros = parsed.clone());
+            }
             "skills_enabled" => {
                 let value: Option<bool> = super::parse_value(value)?;
                 if let Some(session) = self.session.as_mut() {
@@ -3001,7 +3264,28 @@ impl RequestContext {
                     values.push("remote".to_string());
                     super::map_completion_values(values)
                 }
-                ".macro" => super::map_completion_values(paths::list_macros()),
+                ".macro" => {
+                    let policy = self.macro_policy();
+                    let mut values: Vec<(String, Option<String>)> = policy
+                        .macros
+                        .iter()
+                        .filter(|row| {
+                            row.source.is_some()
+                                && !row.shadowed_by_workspace
+                                && row.state.is_invocable()
+                        })
+                        .map(|row| (row.name.clone(), row.description.clone()))
+                        .collect();
+                    values.push((
+                        "enable ".to_string(),
+                        Some("Re-enable a runtime-disabled macro".to_string()),
+                    ));
+                    values.push((
+                        "disable ".to_string(),
+                        Some("Disable a macro for the rest of this process".to_string()),
+                    ));
+                    values
+                }
                 ".reasoning" => {
                     let levels = self.current_model().reasoning_levels();
                     levels.iter().map(|v| (v.clone(), None)).collect()
@@ -3016,32 +3300,7 @@ impl RequestContext {
                     None => vec![],
                 },
                 ".set" => {
-                    let mut values = vec![
-                        "auto_continue",
-                        "continuation_prompt",
-                        "temperature",
-                        "top_p",
-                        "enabled_tools",
-                        "enabled_mcp_servers",
-                        "inject_todo_instructions",
-                        "inject_skill_instructions",
-                        "skill_instructions",
-                        "max_auto_continues",
-                        "memory",
-                        "save_session",
-                        "compression_threshold",
-                        "rag_reranker_model",
-                        "rag_top_k",
-                        "max_output_tokens",
-                        "dry_run",
-                        "function_calling_support",
-                        "mcp_server_support",
-                        "skills_enabled",
-                        "stream",
-                        "save",
-                        "highlight",
-                        "raw_markdown",
-                    ];
+                    let mut values = SET_COMPLETION_KEYS.to_vec();
                     if !self.current_model().reasoning_levels().is_empty() {
                         values.push("reasoning_effort");
                     }
@@ -3185,6 +3444,25 @@ impl RequestContext {
                     .collect()
             };
             values = super::map_completion_values(candidates);
+        } else if cmd == ".macro"
+            && (args.first() == Some(&"enable") || args.first() == Some(&"disable"))
+            && args.len() == 2
+        {
+            let enable = args.first() == Some(&"enable");
+            values = self
+                .macro_policy()
+                .macros
+                .into_iter()
+                .filter(|row| row.source.is_some() && !row.shadowed_by_workspace)
+                .filter(|row| {
+                    if enable {
+                        row.state == MacroState::DisabledRuntime
+                    } else {
+                        row.state.is_invocable()
+                    }
+                })
+                .map(|row| (row.name, row.description))
+                .collect();
         } else if (cmd == ".edit" && args.first() == Some(&"skill") && args.len() == 2)
             || (cmd == ".skill" && args.first() == Some(&"load") && args.len() == 2)
         {
@@ -3740,8 +4018,11 @@ impl RequestContext {
 
         // Graph agents manage their own state; never engage a session,
         // not even an inherited app-level `agent_session` default.
+        // Isolated macros suppress an inherited default too: their forked
+        // context has no session to return to. A non-isolated macro's `.agent`
+        // step engages it exactly as if the user had typed the command.
         let session_name = session_name.map(|v| v.to_string()).or_else(|| {
-            if self.macro_flag || is_graph_agent {
+            if (self.macro_flag && !self.macro_non_isolated) || is_graph_agent {
                 None
             } else {
                 agent.agent_session().map(|v| v.to_string())
@@ -6290,6 +6571,73 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial]
+    fn use_agent_suppresses_inherited_session_in_isolated_macro() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.macro_flag = true;
+        ctx.update_app_config(|app| app.agent_session = Some("inherited".to_string()));
+
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        assert!(
+            ctx.session.is_none(),
+            "an isolated macro must keep suppressing the agent's default session"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_engages_inherited_session_in_non_isolated_macro() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.macro_flag = true;
+        ctx.macro_non_isolated = true;
+        ctx.update_app_config(|app| app.agent_session = Some("inherited".to_string()));
+
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        assert!(
+            ctx.session.is_some(),
+            "a non-isolated macro's agent step must engage the default session as if typed"
+        );
+    }
+
     fn first_file(dir: &Path) -> Option<PathBuf> {
         for entry in read_dir(dir).ok()?.flatten() {
             let path = entry.path();
@@ -6461,6 +6809,117 @@ mod tests {
         assert!(
             result.contains("github"),
             "install_mcp_config must add new bundled servers"
+        );
+    }
+
+    fn strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn toggled_enabled_macros_covers_all_transitions() {
+        let all_active = strings(&["a", "b", "c"]);
+        type ToggleCase = (Option<Vec<String>>, &'static str, bool, Option<Vec<String>>);
+        let cases: Vec<ToggleCase> = vec![
+            (None, "a", true, None),
+            (Some(strings(&["a"])), "a", true, None),
+            (Some(strings(&["a"])), "b", true, Some(strings(&["a", "b"]))),
+            (None, "b", false, Some(strings(&["a", "c"]))),
+            (
+                Some(strings(&["a", "b"])),
+                "b",
+                false,
+                Some(strings(&["a"])),
+            ),
+            (Some(strings(&["a"])), "b", false, None),
+        ];
+        for (current, name, enable, expected) in cases {
+            let result = toggled_enabled_macros(current.as_deref(), &all_active, name, enable);
+            assert_eq!(
+                result, expected,
+                "current={current:?} name={name} enable={enable}"
+            );
+        }
+    }
+
+    fn resolved(state: MacroState) -> ResolvedMacro {
+        ResolvedMacro {
+            name: "m".to_string(),
+            source: Some(MacroSource::Global),
+            description: None,
+            isolated: None,
+            shadowed_by_workspace: false,
+            state,
+        }
+    }
+
+    #[test]
+    fn macro_state_display_covers_all_states() {
+        let owner = |level: MacroAllowlistLevel| format!("{level}:test");
+        let cases = vec![
+            (MacroState::Enabled, "enabled"),
+            (MacroState::DisabledRuntime, "disabled (runtime)"),
+            (
+                MacroState::Locked {
+                    level: MacroAllowlistLevel::Agent,
+                },
+                "locked (agent:test enabled_macros)",
+            ),
+            (MacroState::Missing, "missing"),
+            (MacroState::ShadowedBuiltin, "shadowed (built-in)"),
+            (
+                MacroState::Invalid {
+                    reason: "boom".to_string(),
+                },
+                "invalid (boom)",
+            ),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(macro_state_display(&resolved(state), owner), expected);
+        }
+    }
+
+    #[test]
+    fn macro_source_display_names_source_or_dash() {
+        assert_eq!(
+            macro_source_display(Some(MacroSource::Workspace)),
+            "workspace"
+        );
+        assert_eq!(macro_source_display(Some(MacroSource::Global)), "global");
+        assert_eq!(macro_source_display(None), "-");
+    }
+
+    #[test]
+    fn set_completion_keys_include_enabled_skills_and_macros() {
+        assert!(SET_COMPLETION_KEYS.contains(&"enabled_skills"));
+        assert!(SET_COMPLETION_KEYS.contains(&"enabled_macros"));
+    }
+
+    #[test]
+    fn new_macro_rejects_reserved_names() {
+        let ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        for name in RESERVED_MACRO_NAMES {
+            let err = ctx.new_macro(&app, name).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("'{name}' is a reserved macro name")
+            );
+        }
+    }
+
+    #[test]
+    fn macro_lock_owner_names_the_owning_config() {
+        let mut ctx = create_test_ctx();
+        assert_eq!(ctx.macro_lock_owner(MacroAllowlistLevel::Role), "role");
+        ctx.role = Some(Role::new("coder", "prompt"));
+        assert_eq!(
+            ctx.macro_lock_owner(MacroAllowlistLevel::Role),
+            "role:coder"
+        );
+        assert_eq!(
+            ctx.macro_lock_owner(MacroAllowlistLevel::Global),
+            "global config"
         );
     }
 }

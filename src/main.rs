@@ -222,6 +222,9 @@ async fn main() -> Result<()> {
     if cli.no_workspace_mcp {
         app_config.no_workspace_mcp = true;
     }
+    if cli.no_workspace_macros {
+        app_config.no_workspace_macros = true;
+    }
     let app_config: Arc<AppConfig> = Arc::new(app_config);
     let app_state: Arc<AppState> = Arc::new(
         AppState::init(

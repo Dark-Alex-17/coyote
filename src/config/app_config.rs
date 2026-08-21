@@ -43,6 +43,8 @@ pub struct AppConfig {
     #[serde(default, deserialize_with = "super::deserialize_csv_or_vec")]
     pub enabled_skills: Option<Vec<String>>,
     pub visible_skills: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "super::deserialize_csv_or_vec")]
+    pub enabled_macros: Option<Vec<String>>,
 
     pub mcp_server_support: bool,
     pub mapping_mcp_servers: IndexMap<String, String>,
@@ -96,6 +98,7 @@ pub struct AppConfig {
     pub user_agent: Option<String>,
     pub save_shell_history: bool,
     pub no_workspace_mcp: bool,
+    pub no_workspace_macros: bool,
     pub sync_models_url: Option<String>,
 
     pub clients: Vec<ClientConfig>,
@@ -127,6 +130,7 @@ impl Default for AppConfig {
             skills_enabled: true,
             enabled_skills: None,
             visible_skills: None,
+            enabled_macros: None,
 
             mcp_server_support: true,
             mapping_mcp_servers: Default::default(),
@@ -178,6 +182,7 @@ impl Default for AppConfig {
             user_agent: None,
             save_shell_history: true,
             no_workspace_mcp: false,
+            no_workspace_macros: false,
             sync_models_url: None,
 
             clients: vec![],
@@ -211,6 +216,7 @@ impl AppConfig {
             skills_enabled: config.skills_enabled,
             enabled_skills: config.enabled_skills,
             visible_skills: config.visible_skills,
+            enabled_macros: config.enabled_macros,
 
             mcp_server_support: config.mcp_server_support,
             mapping_mcp_servers: config.mapping_mcp_servers,
@@ -262,6 +268,7 @@ impl AppConfig {
             user_agent: config.user_agent,
             save_shell_history: config.save_shell_history,
             no_workspace_mcp: false,
+            no_workspace_macros: false,
             sync_models_url: config.sync_models_url,
 
             clients: config.clients,
@@ -533,6 +540,10 @@ impl AppConfig {
             self.enabled_skills = v.map(|raw| super::csv_to_vec(&raw));
         }
 
+        if let Some(v) = super::read_env_value::<String>(&get_env_name("enabled_macros")) {
+            self.enabled_macros = v.map(|raw| super::csv_to_vec(&raw));
+        }
+
         if let Some(Some(v)) = super::read_env_bool(&get_env_name("mcp_server_support")) {
             self.mcp_server_support = v;
         }
@@ -767,6 +778,70 @@ mod tests {
             app.mapping_mcp_servers.get("gh"),
             Some(&"github-mcp".to_string())
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_config_copies_enabled_macros() {
+        let cfg = Config {
+            model_id: "provider:test".to_string(),
+            enabled_macros: Some(vec!["a".to_string()]),
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        assert_eq!(app.enabled_macros, Some(vec!["a".to_string()]));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_config_preserves_explicit_empty_enabled_macros() {
+        let cfg = Config {
+            model_id: "provider:test".to_string(),
+            enabled_macros: Some(vec![]),
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        assert_eq!(app.enabled_macros, Some(vec![]));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_envs_overrides_enabled_macros() {
+        let env_name = get_env_name("enabled_macros");
+        let prev = std::env::var_os(&env_name);
+
+        let mut app = AppConfig::default();
+
+        unsafe { std::env::set_var(&env_name, "a,b") };
+        app.load_envs();
+        assert_eq!(
+            app.enabled_macros,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+
+        unsafe { std::env::set_var(&env_name, "") };
+        app.load_envs();
+        assert_eq!(app.enabled_macros, Some(vec![]));
+
+        unsafe { std::env::set_var(&env_name, "null") };
+        app.load_envs();
+        assert_eq!(app.enabled_macros, None);
+
+        unsafe { std::env::remove_var(&env_name) };
+        app.enabled_macros = Some(vec!["keep".to_string()]);
+        app.load_envs();
+        assert_eq!(app.enabled_macros, Some(vec!["keep".to_string()]));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(&env_name, v),
+                None => std::env::remove_var(&env_name),
+            }
+        }
     }
 
     #[test]

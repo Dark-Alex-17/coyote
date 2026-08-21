@@ -400,6 +400,10 @@ impl Agent {
         self.config.enabled_skills.as_deref()
     }
 
+    pub fn enabled_macros(&self) -> Option<&[String]> {
+        self.config.enabled_macros.as_deref()
+    }
+
     pub fn memory(&self) -> Option<bool> {
         self.config.memory
     }
@@ -743,6 +747,8 @@ pub struct AgentConfig {
     pub skills_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled_skills: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_macros: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation_prompt: Option<String>,
     #[serde(default)]
@@ -1223,6 +1229,30 @@ variables:
         assert!(config.model_id.is_none());
         assert!(config.temperature.is_none());
         assert!(config.top_p.is_none());
+    }
+
+    #[test]
+    fn agent_config_enabled_macros_absent_is_none() {
+        let yaml = "name: minimal\ninstructions: hi\n";
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.enabled_macros, None);
+    }
+
+    #[test]
+    fn agent_config_enabled_macros_empty_list_is_some_empty() {
+        let yaml = "name: minimal\ninstructions: hi\nenabled_macros: []\n";
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.enabled_macros, Some(vec![]));
+    }
+
+    #[test]
+    fn agent_config_enabled_macros_list() {
+        let yaml = "name: minimal\ninstructions: hi\nenabled_macros:\n  - a\n";
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.enabled_macros, Some(vec!["a".to_string()]));
     }
 
     #[test]

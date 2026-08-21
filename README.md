@@ -36,7 +36,10 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
         * [Create Custom Bash Tools](https://github.com/Dark-Alex-17/coyote/wiki/Custom-Bash-Tools)
             * [Bash Prompt Utilities](https://github.com/Dark-Alex-17/coyote/wiki/Bash-Prompt-Helpers)
 * [First-Class MCP Server Support](https://github.com/Dark-Alex-17/coyote/wiki/MCP-Servers): Easily connect and interact with MCP servers for advanced functionality.
-* [Macros](https://github.com/Dark-Alex-17/coyote/wiki/Macros): Automate repetitive tasks and workflows with Coyote "scripts" (macros).
+* [Macros](https://github.com/Dark-Alex-17/coyote/wiki/Macros): Automate repetitive tasks and workflows with Coyote "scripts" (macros). Macros are Coyote's custom commands: invoke any macro directly by name (e.g. `.review main`), with tab-completion, right alongside the built-in REPL commands.
+    * Give a macro a `description` (shown in `.list macros` and completions) and set `isolated: false` to run its steps on the live session, exactly as if you typed them. Note that non-isolated steps are recorded in the session, and mutating steps (`.role`, `.model`, ...) persist after the macro ends — by design. Steps are fail-fast: an error aborts the remaining steps, but completed steps' effects remain. A non-isolated macro step cannot invoke another macro, and a `.exit` step never exits the REPL.
+    * Commit project-specific macros to `.coyote/macros/` in your repo — they shadow same-named global macros (opt out with `--no-workspace-macros`).
+    * Scope which macros are invocable with `enabled_macros` in the global config, a role, an agent, or a session (most specific wins; an empty list disables all macros), and toggle at runtime with `.macro enable|disable <name>`.
 * [RAG](https://github.com/Dark-Alex-17/coyote/wiki/RAG): Retrieval-Augmented Generation for enhanced information retrieval and generation.
 * [Sessions](https://github.com/Dark-Alex-17/coyote/wiki/Sessions): Manage and persist conversational contexts and settings across multiple interactions.
 * [Memory](https://github.com/Dark-Alex-17/coyote/wiki/Memory): Persistent file-based memory that survives across sessions. Bootstrap with `coyote --init-memory [global|workspace]`.

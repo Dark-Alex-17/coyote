@@ -4,6 +4,7 @@ mod app_state;
 mod input;
 mod install_remote;
 pub(crate) mod instructions;
+mod macro_policy;
 mod macros;
 mod mcp_factory;
 pub(crate) mod memory;
@@ -30,6 +31,9 @@ pub use self::app_config::AppConfig;
 pub use self::app_state::AppState;
 pub use self::input::Input;
 pub use self::install_remote::{install_remote, install_remote_from_repl_args};
+pub use self::macro_policy::{
+    MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, ResolvedMacro,
+};
 #[allow(unused_imports)]
 pub use self::request_context::{RenderMode, RequestContext, should_inject_skill_instructions};
 pub use self::role::{
@@ -221,6 +225,8 @@ pub struct Config {
     #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
     pub enabled_skills: Option<Vec<String>>,
     pub visible_skills: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
+    pub enabled_macros: Option<Vec<String>>,
 
     pub mcp_server_support: bool,
     pub mapping_mcp_servers: IndexMap<String, String>,
@@ -303,6 +309,7 @@ impl Default for Config {
             skills_enabled: true,
             enabled_skills: None,
             visible_skills: None,
+            enabled_macros: None,
 
             mcp_server_support: true,
             mapping_mcp_servers: Default::default(),
@@ -1125,8 +1132,49 @@ clients:
     }
 
     #[test]
+    fn config_enabled_macros_absent_is_none() {
+        let cfg: Config = serde_yaml::from_str("model: provider:test").unwrap();
+        assert_eq!(cfg.enabled_macros, None);
+    }
+
+    #[test]
+    fn config_enabled_macros_empty_string_is_some_empty() {
+        let cfg: Config = serde_yaml::from_str("enabled_macros: \"\"").unwrap();
+
+        assert_eq!(cfg.enabled_macros, Some(vec![]));
+    }
+
+    #[test]
+    fn config_enabled_macros_csv_string() {
+        let cfg: Config = serde_yaml::from_str("enabled_macros: \"a, b\"").unwrap();
+
+        assert_eq!(
+            cfg.enabled_macros,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn config_enabled_macros_list() {
+        let cfg: Config = serde_yaml::from_str("enabled_macros:\n  - a\n  - b").unwrap();
+
+        assert_eq!(
+            cfg.enabled_macros,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn config_enabled_macros_null_is_none() {
+        let cfg: Config = serde_yaml::from_str("enabled_macros: null").unwrap();
+
+        assert_eq!(cfg.enabled_macros, None);
+    }
+
+    #[test]
     fn assert_state_pass_always_true() {
         let pass = AssertState::pass();
+
         assert!(pass.assert(StateFlags::empty()));
         assert!(pass.assert(StateFlags::ROLE));
         assert!(pass.assert(StateFlags::SESSION | StateFlags::AGENT));
@@ -1136,6 +1184,7 @@ clients:
     #[test]
     fn assert_state_bare_only_empty() {
         let bare = AssertState::bare();
+
         assert!(bare.assert(StateFlags::empty()));
         assert!(!bare.assert(StateFlags::ROLE));
         assert!(!bare.assert(StateFlags::SESSION));
@@ -1144,6 +1193,7 @@ clients:
     #[test]
     fn assert_state_true_requires_flag_present() {
         let state = AssertState::True(StateFlags::ROLE);
+
         assert!(state.assert(StateFlags::ROLE));
         assert!(state.assert(StateFlags::ROLE | StateFlags::SESSION));
         assert!(!state.assert(StateFlags::empty()));
@@ -1153,6 +1203,7 @@ clients:
     #[test]
     fn assert_state_true_with_multiple_flags_any_match() {
         let state = AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION);
+
         assert!(state.assert(StateFlags::SESSION_EMPTY));
         assert!(state.assert(StateFlags::SESSION));
         assert!(state.assert(StateFlags::SESSION | StateFlags::ROLE));
@@ -1163,6 +1214,7 @@ clients:
     #[test]
     fn assert_state_false_requires_flag_absent() {
         let state = AssertState::False(StateFlags::AGENT);
+
         assert!(state.assert(StateFlags::empty()));
         assert!(state.assert(StateFlags::ROLE));
         assert!(!state.assert(StateFlags::AGENT));
@@ -1172,6 +1224,7 @@ clients:
     #[test]
     fn assert_state_false_with_multiple_flags() {
         let state = AssertState::False(StateFlags::SESSION | StateFlags::AGENT);
+
         assert!(state.assert(StateFlags::empty()));
         assert!(state.assert(StateFlags::ROLE));
         assert!(!state.assert(StateFlags::SESSION));
@@ -1182,6 +1235,7 @@ clients:
     #[test]
     fn assert_state_truefalse_requires_true_present_and_false_absent() {
         let state = AssertState::TrueFalse(StateFlags::ROLE, StateFlags::SESSION);
+
         assert!(state.assert(StateFlags::ROLE));
         assert!(state.assert(StateFlags::ROLE | StateFlags::RAG));
         assert!(!state.assert(StateFlags::empty()));
@@ -1192,6 +1246,7 @@ clients:
     #[test]
     fn assert_state_equal_exact_match() {
         let state = AssertState::Equal(StateFlags::ROLE | StateFlags::SESSION);
+
         assert!(state.assert(StateFlags::ROLE | StateFlags::SESSION));
         assert!(!state.assert(StateFlags::ROLE));
         assert!(!state.assert(StateFlags::SESSION));

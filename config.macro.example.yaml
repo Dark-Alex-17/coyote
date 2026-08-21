@@ -1,3 +1,13 @@
+description: Demonstrates every macro field       # Optional; shown in `.list macros` and in `.<name>` tab-completion.
+isolated: true                                    # Optional; 'true' by default. When true, steps run in a forked,
+                                                  # throwaway context: the exchange and any `.role`/`.model` switches
+                                                  # vanish when the macro ends. When false, steps run on the LIVE
+                                                  # session exactly as if you typed them: prompts are recorded, and
+                                                  # mutating steps (e.g. `.role`, `.model`) PERSIST after the macro
+                                                  # finishes -- by design. Steps are fail-fast in both modes: an error
+                                                  # aborts the remaining steps, but completed steps' effects remain.
+                                                  # A non-isolated macro step cannot invoke another macro, and a
+                                                  # `.exit` step never exits the REPL.
 variables:                                        # A list of positional variables that the macro uses
   - name: positional_1                            # The name of the positional variable.
     default: null                                 # Since no default value is provided, this argument is required; 'null' by default

@@ -60,6 +60,8 @@ enabled_skills:                  # Optional list of skills available when this a
 inject_skill_instructions: true  # Inject a short hint pointing the model at `skill__list` when skills are enabled
                                  # (default: true). Suppressed automatically when no skills are available.
 skill_instructions: null         # Custom text for the skill hint (optional; uses built-in default if null)
+enabled_macros:                  # Optional list of macros invocable when this agent is active in the REPL.
+  - generate-commit-message      # An empty list disables all macros. Omit to inherit the role/global default.
 memory: null                     # Per-agent memory override (default: inherit). Set to `false` to disable memory
                                  # for this agent regardless of workspace/global presence. See the Memory wiki page.
 
