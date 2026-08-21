@@ -1076,6 +1076,7 @@ fn strip_ref_suffix(url: &str) -> &str {
 
 fn split_host_and_path(url: &str) -> (String, String) {
     let url = strip_ref_suffix(url);
+    let url = &url.replace('\\', "/");
     if let Some((_, rest)) = url.split_once("://") {
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
@@ -1544,10 +1545,8 @@ fn record_written_file(
 }
 
 fn provenance_path(dst: &Path) -> String {
-    dst.strip_prefix(paths::config_dir())
-        .unwrap_or(dst)
-        .to_string_lossy()
-        .into_owned()
+    let rel = dst.strip_prefix(paths::config_dir()).unwrap_or(dst);
+    rel.to_string_lossy().replace('\\', "/")
 }
 
 /// Record the mcp.json entries the merge actually wrote, in one flush right
@@ -2807,6 +2806,7 @@ mod tests {
 
     fn init_git_repo(dir: &Path) -> String {
         run_git(vec!["init".into(), "-q".into(), dir.as_os_str().into()]).unwrap();
+        fs::write(dir.join(".gitattributes"), "* -text\n").unwrap();
         commit_file(dir, "seed.txt", "one")
     }
 
@@ -2860,6 +2860,7 @@ mod tests {
 
     fn init_bundle_repo(dir: &Path) -> String {
         run_git(vec!["init".into(), "-q".into(), dir.as_os_str().into()]).unwrap();
+        fs::write(dir.join(".gitattributes"), "* -text\n").unwrap();
         commit_file(dir, ".seed", "seed")
     }
 
