@@ -1,7 +1,6 @@
 mod agent;
 mod app_config;
 mod app_state;
-#[allow(dead_code)]
 mod bundles;
 mod input;
 mod install_remote;
