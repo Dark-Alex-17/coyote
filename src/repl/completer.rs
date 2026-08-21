@@ -81,7 +81,8 @@ impl Completer for ReplCompleter {
                 .into_iter()
                 .map(|(name, description)| (format!(".{name}"), description))
                 .filter(|(name, _)| {
-                    command_filter.len() == 1 || name.starts_with(&command_filter[..2])
+                    command_filter.len() == 1
+                        || name.starts_with(command_filter.get(..2).unwrap_or(&command_filter))
                 })
                 .collect();
             let macros = fuzzy_filter(macros, |(name, _)| name.as_str(), &command_filter);

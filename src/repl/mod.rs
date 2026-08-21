@@ -1086,7 +1086,7 @@ pub async fn run_repl_command(
                             macro_execute(ctx, name, extra, abort_signal.clone()).await?;
                         }
                         Some(MacroState::DisabledRuntime) => bail!(
-                            r#"Macro '{name}' is disabled. Enable it with ".macro enable {name}""#
+                            r#"Macro '{name}' is disabled. Re-enable it with ".macro enable {name}""#
                         ),
                         Some(MacroState::Locked { level }) => bail!(
                             "Macro '{name}' is restricted by {} enabled_macros",
