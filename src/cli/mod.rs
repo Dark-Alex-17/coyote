@@ -53,7 +53,7 @@ pub enum McpScopeArg {
 				"install_from", "sync_models", "list_models", "list_roles",
 				"list_sessions", "list_agents", "list_rags", "list_macros",
 				"list_skills", "list_bundles", "skill", "tail_logs", "completions",
-				"update", "update_bundle",
+				"update", "update_bundle", "uninstall",
 			])
 	),
 	group(
@@ -210,6 +210,12 @@ pub struct Cli {
     /// Update an installed bundle from its recorded source (NAME may be suffixed with #<ref> to move a pin)
     #[arg(long, value_name = "NAME", help_heading = "Installation & Updates")]
     pub update_bundle: Option<String>,
+    /// Uninstall a bundle: delete its owned files and remove its mcp.json entries
+    #[arg(long, value_name = "NAME", help_heading = "Installation & Updates")]
+    pub uninstall: Option<String>,
+    /// Skip uninstall confirmation prompts (locally modified items are still kept)
+    #[arg(long, requires = "uninstall", help_heading = "Installation & Updates")]
+    pub yes: bool,
     /// Sync models updates
     #[arg(long, help_heading = "Installation & Updates")]
     pub sync_models: bool,
@@ -517,6 +523,21 @@ mod tests {
             parse(&["--update-bundle", "foo"]).update_bundle.as_deref(),
             Some("foo")
         );
+    }
+
+    #[test]
+    fn parse_uninstall_flag_takes_name() {
+        assert_eq!(
+            parse(&["--uninstall", "foo"]).uninstall.as_deref(),
+            Some("foo")
+        );
+        assert!(!parse(&["--uninstall", "foo"]).yes);
+    }
+
+    #[test]
+    fn parse_yes_flag_requires_uninstall() {
+        assert!(parse(&["--uninstall", "foo", "--yes"]).yes);
+        assert!(Cli::try_parse_from(["coyote", "--yes"]).is_err());
     }
 
     #[test]
