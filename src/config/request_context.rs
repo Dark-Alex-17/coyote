@@ -33,6 +33,7 @@ use crate::utils::{
     AbortSignal, abortable_run_with_spinner, edit_file, fuzzy_filter, get_env_name,
     list_file_names, now, render_prompt, temp_file,
 };
+use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 
 use super::instructions;
 use super::memory::{
@@ -2592,12 +2593,10 @@ impl RequestContext {
                     return Ok(());
                 }
 
-                println!("Macros:");
-                let header = format!(
-                    "  {:<24} {:<10} {:<9} {:<40} {}",
-                    "name", "source", "isolated", "state", "description"
-                );
-                println!("{header}");
+                let mut table = Table::new();
+                table.load_preset(UTF8_FULL);
+                table.set_content_arrangement(ContentArrangement::Dynamic);
+                table.set_header(vec!["name", "source", "isolated", "state", "description"]);
 
                 for row in &policy.macros {
                     let source = macro_source_display(row.source);
@@ -2608,13 +2607,17 @@ impl RequestContext {
                     };
                     let state = macro_state_display(row, |level| self.macro_lock_owner(level));
                     let description = row.description.as_deref().unwrap_or_default();
-                    let line = format!(
-                        "  {:<24} {:<10} {:<9} {:<40} {}",
-                        row.name, source, isolated, state, description
-                    );
-                    println!("{}", line.trim_end());
+                    table.add_row(vec![
+                        row.name.as_str(),
+                        &source,
+                        isolated,
+                        &state,
+                        description,
+                    ]);
                 }
 
+                println!("Macros:");
+                println!("{table}");
                 Ok(())
             }
             "agents" => {
