@@ -290,7 +290,8 @@ mod tests {
     use crate::utils::get_env_name;
     use serial_test::serial;
     use std::path::Path;
-    use std::{env, fs, time};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{env, fs, process};
 
     fn valid_macro() -> Macro {
         Macro {
@@ -748,10 +749,12 @@ mod tests {
     }
 
     fn with_macro_dirs<F: FnOnce(&Path, &Path)>(f: F) {
-        let unique = time::SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let unique = format!(
+            "{}-{}",
+            process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
         let root = env::temp_dir().join(format!("coyote-macro-policy-test-{unique}"));
         let workspace = root.join("workspace-macros");
         let global = root.join("global-macros");
