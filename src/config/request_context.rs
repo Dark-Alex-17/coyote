@@ -112,6 +112,14 @@ fn print_asset_names(kind: &str, names: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn asset_table(header: &[&str]) -> Table {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(header.to_vec());
+    table
+}
+
 fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<String>)> {
     names
         .into_iter()
@@ -2593,10 +2601,8 @@ impl RequestContext {
                     return Ok(());
                 }
 
-                let mut table = Table::new();
-                table.load_preset(UTF8_FULL);
-                table.set_content_arrangement(ContentArrangement::Dynamic);
-                table.set_header(vec!["name", "source", "isolated", "state", "description"]);
+                let mut table =
+                    asset_table(&["name", "source", "isolated", "state", "description"]);
 
                 for row in &policy.macros {
                     let source = macro_source_display(row.source);
@@ -2627,15 +2633,13 @@ impl RequestContext {
                     return Ok(());
                 }
 
-                println!("Agents:");
+                let mut table = asset_table(&["name", "description"]);
                 for (name, description) in entries {
-                    if description.is_empty() {
-                        println!("  • {name}");
-                    } else {
-                        println!("  • {name} — {description}");
-                    }
+                    table.add_row(vec![name, description]);
                 }
 
+                println!("Agents:");
+                println!("{table}");
                 Ok(())
             }
             "skills" => {
@@ -2681,16 +2685,18 @@ impl RequestContext {
                     return Ok(());
                 }
 
-                println!("Skills:");
+                let mut table = asset_table(&["loaded", "name", "description"]);
                 for (name, description, loaded) in entries {
                     let marker = if loaded {
                         "✓".green().bold().to_string()
                     } else {
                         "✗".red().bold().to_string()
                     };
-                    println!("  {marker} {name} — {description}");
+                    table.add_row(vec![marker, name, description]);
                 }
 
+                println!("Skills:");
+                println!("{table}");
                 Ok(())
             }
             "tools" => {
