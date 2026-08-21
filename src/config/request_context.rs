@@ -112,7 +112,7 @@ fn print_asset_names(kind: &str, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn asset_table(header: &[&str]) -> Table {
+pub(crate) fn asset_table(header: &[&str]) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
     table.set_content_arrangement(ContentArrangement::Dynamic);
@@ -2786,8 +2786,9 @@ impl RequestContext {
                 }
                 Ok(())
             }
+            "bundles" => super::bundles::list_installed_bundles(),
             _ => bail!(
-                "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, tools, mcp-servers"
+                "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, tools, mcp-servers, bundles"
             ),
         }
     }
@@ -3327,6 +3328,7 @@ impl RequestContext {
                     "skills",
                     "tools",
                     "mcp-servers",
+                    "bundles",
                 ]),
                 ".vault" => {
                     let mut values = vec!["add", "get", "update", "delete", "list"];

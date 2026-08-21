@@ -158,7 +158,6 @@ impl BundleStore {
         self.bundles.get(name)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &BundleRecord)> {
         self.bundles
             .iter()
@@ -408,6 +407,124 @@ pub(crate) fn hash_file(path: &Path) -> Result<String> {
     let bytes =
         fs::read(path).with_context(|| format!("failed to read {} for hashing", path.display()))?;
     Ok(hash_bytes(&bytes))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DriftSummary {
+    pub(crate) intact: usize,
+    pub(crate) modified: usize,
+    pub(crate) missing: usize,
+}
+
+impl DriftSummary {
+    pub(crate) fn display(&self) -> String {
+        if self.intact + self.modified + self.missing == 0 {
+            return "-".to_string();
+        }
+        let mut parts = Vec::new();
+        if self.intact > 0 {
+            parts.push(format!("{} intact", self.intact));
+        }
+        if self.modified > 0 {
+            parts.push(format!("{} modified locally", self.modified));
+        }
+        if self.missing > 0 {
+            parts.push(format!("{} missing", self.missing));
+        }
+        parts.join(", ")
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BundleListRow {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) source: String,
+    pub(crate) git_ref: String,
+    pub(crate) installed_at: String,
+    pub(crate) file_counts: String,
+    pub(crate) drift: DriftSummary,
+}
+
+/// Build one listing row per installed bundle, hashing each owned file under
+/// `config_dir` against its recorded checksum: a match is intact, a mismatch
+/// (or unreadable file) counts as locally modified, and an absent file is
+/// missing. Read-only: the store is never mutated by listing.
+pub(crate) fn bundle_list_rows(store: &BundleStore, config_dir: &Path) -> Vec<BundleListRow> {
+    store
+        .iter()
+        .map(|(name, record)| {
+            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+            let mut drift = DriftSummary::default();
+            for file in &record.files {
+                *counts.entry(file.category.as_str()).or_default() += 1;
+                let path = config_dir.join(&file.path);
+                if !path.exists() {
+                    drift.missing += 1;
+                } else {
+                    match hash_file(&path) {
+                        Ok(hash) if hash == file.sha256 => drift.intact += 1,
+                        _ => drift.modified += 1,
+                    }
+                }
+            }
+            let file_counts = if counts.is_empty() {
+                "-".to_string()
+            } else {
+                counts
+                    .iter()
+                    .map(|(category, count)| format!("{category}: {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            BundleListRow {
+                name: name.to_string(),
+                version: record
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| record.commit.chars().take(7).collect()),
+                source: record.source.clone(),
+                git_ref: record.git_ref.clone().unwrap_or_else(|| "-".to_string()),
+                installed_at: record.installed_at.clone(),
+                file_counts,
+                drift,
+            }
+        })
+        .collect()
+}
+
+pub fn list_installed_bundles() -> Result<()> {
+    let store = BundleStore::load()?;
+    let rows = bundle_list_rows(&store, &paths::config_dir());
+    if rows.is_empty() {
+        println!("No bundles installed. Install one with `coyote --install-from <git-url>`.");
+        return Ok(());
+    }
+
+    let mut table = super::request_context::asset_table(&[
+        "name",
+        "version",
+        "source",
+        "ref",
+        "installed",
+        "files",
+        "drift",
+    ]);
+    for row in rows {
+        table.add_row(vec![
+            row.name.as_str(),
+            &row.version,
+            &row.source,
+            &row.git_ref,
+            &row.installed_at,
+            &row.file_counts,
+            &row.drift.display(),
+        ]);
+    }
+
+    println!("Bundles:");
+    println!("{table}");
+    Ok(())
 }
 
 fn sanitize_name_segment(segment: &str) -> String {
@@ -922,5 +1039,102 @@ mod tests {
             }
         }
         result.unwrap();
+    }
+
+    #[test]
+    fn bundle_rows_classify_drift_per_file() {
+        let dir = TempStoreDir::new("bundles-list-drift");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("omc", metadata("https://github.com/x/omc", "abc123"))
+            .unwrap();
+
+        fs::create_dir_all(dir.0.join("macros")).unwrap();
+        fs::write(dir.0.join("macros/intact.yaml"), "a").unwrap();
+        store
+            .record_file("omc", file_record("macros/intact.yaml", "a"))
+            .unwrap();
+
+        fs::create_dir_all(dir.0.join("skills")).unwrap();
+        fs::write(dir.0.join("skills/modified.md"), "changed").unwrap();
+        let mut modified = file_record("skills/modified.md", "original");
+        modified.category = "skills".to_string();
+        store.record_file("omc", modified).unwrap();
+
+        let mut missing = file_record("roles/missing.md", "gone");
+        missing.category = "roles".to_string();
+        store.record_file("omc", missing).unwrap();
+
+        let rows = bundle_list_rows(&store, &dir.0);
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.name, "omc");
+        assert_eq!(row.source, "https://github.com/x/omc");
+        assert_eq!(
+            row.drift,
+            DriftSummary {
+                intact: 1,
+                modified: 1,
+                missing: 1,
+            }
+        );
+        assert_eq!(row.file_counts, "macros: 1, roles: 1, skills: 1");
+        assert_eq!(
+            row.drift.display(),
+            "1 intact, 1 modified locally, 1 missing"
+        );
+    }
+
+    #[test]
+    fn bundle_rows_fall_back_to_the_short_commit_when_unversioned() {
+        let dir = TempStoreDir::new("bundles-list-fallback");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("omc", metadata("https://github.com/x/omc", "abc123def456"))
+            .unwrap();
+
+        let rows = bundle_list_rows(&store, &dir.0);
+
+        assert_eq!(rows[0].version, "abc123d");
+        assert_eq!(rows[0].git_ref, "-");
+        assert_eq!(rows[0].file_counts, "-");
+        assert_eq!(rows[0].drift, DriftSummary::default());
+        assert_eq!(rows[0].drift.display(), "-");
+    }
+
+    #[test]
+    fn bundle_rows_show_manifest_version_and_pinned_ref() {
+        let dir = TempStoreDir::new("bundles-list-versioned");
+        let mut store = dir.store();
+        store
+            .upsert_bundle(
+                "omc",
+                InstallMetadata {
+                    source: "git@github.com:x/omc.git".to_string(),
+                    git_ref: Some("v1.4.0".to_string()),
+                    commit: "abc123def456".to_string(),
+                    version: Some("1.4.0".to_string()),
+                    description: None,
+                    homepage: None,
+                },
+            )
+            .unwrap();
+
+        let rows = bundle_list_rows(&store, &dir.0);
+
+        assert_eq!(rows[0].version, "1.4.0");
+        assert_eq!(rows[0].git_ref, "v1.4.0");
+        assert_eq!(rows[0].source, "git@github.com:x/omc.git");
+        assert!(!rows[0].installed_at.is_empty());
+    }
+
+    #[test]
+    fn bundle_rows_are_empty_for_an_empty_store() {
+        let dir = TempStoreDir::new("bundles-list-empty");
+
+        let rows = bundle_list_rows(&dir.store(), &dir.0);
+
+        assert!(rows.is_empty());
     }
 }
