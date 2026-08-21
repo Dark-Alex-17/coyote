@@ -52,7 +52,8 @@ pub enum McpScopeArg {
 				"init_memory", "dry_run", "info", "build_tools", "install",
 				"install_from", "sync_models", "list_models", "list_roles",
 				"list_sessions", "list_agents", "list_rags", "list_macros",
-				"list_skills", "skill", "tail_logs", "completions", "update",
+				"list_skills", "list_bundles", "skill", "tail_logs", "completions",
+				"update",
 			])
 	),
 	group(
@@ -175,6 +176,9 @@ pub struct Cli {
     /// List all installed skills
     #[arg(long, help_heading = "List & Discovery")]
     pub list_skills: bool,
+    /// List installed bundles and their drift status
+    #[arg(long, help_heading = "List & Discovery")]
+    pub list_bundles: bool,
 
     /// Reinstall bundled assets, overwriting any local changes
     #[arg(
@@ -495,6 +499,7 @@ mod tests {
         assert!(parse(&["--list-rags"]).list_rags);
         assert!(parse(&["--list-macros"]).list_macros);
         assert!(parse(&["--list-skills"]).list_skills);
+        assert!(parse(&["--list-bundles"]).list_bundles);
     }
 
     #[test]

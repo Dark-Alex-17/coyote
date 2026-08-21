@@ -30,6 +30,7 @@ pub use self::agent::{
 pub use self::app_config::AppConfig;
 #[allow(unused_imports)]
 pub use self::app_state::AppState;
+pub use self::bundles::list_installed_bundles;
 pub use self::input::Input;
 pub use self::install_remote::{install_remote, install_remote_from_repl_args};
 pub use self::macro_policy::{

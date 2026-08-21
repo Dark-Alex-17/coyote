@@ -307,7 +307,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 60]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".list",
-            "List roles, sessions, agents, RAGs, macros, skills, tools, or MCP servers",
+            "List roles, sessions, agents, RAGs, macros, skills, tools, MCP servers, or bundles",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -1208,7 +1208,7 @@ pub async fn run_repl_command(
                 }
                 _ => {
                     println!(
-                        "Usage: .list <roles|sessions|agents|rags|macros|skills|tools|mcp-servers>"
+                        "Usage: .list <roles|sessions|agents|rags|macros|skills|tools|mcp-servers|bundles>"
                     )
                 }
             },

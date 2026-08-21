@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
         || cli.list_rags
         || cli.list_macros
         || cli.list_skills
+        || cli.list_bundles
         || cli.list_sessions;
     let vault_flags = cli.add_secret.is_some()
         || cli.get_secret.is_some()
@@ -308,6 +309,9 @@ async fn run(
         let skills = paths::list_skills().join("\n");
         println!("{skills}");
         return Ok(());
+    }
+    if cli.list_bundles {
+        return config::list_installed_bundles();
     }
     let skills = cli.skills();
     if skills.len() == 1 {
