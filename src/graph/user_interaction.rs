@@ -23,7 +23,7 @@ impl ApprovalNodeExecutor {
 
         let response = handle_user_tool(
             ctx,
-            &format!("{USER_FUNCTION_PREFIX}ask"),
+            &format!("{USER_FUNCTION_PREFIX}select"),
             &json!({ "question": question, "options": node.options }),
         )
         .await
