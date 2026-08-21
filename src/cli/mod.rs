@@ -53,7 +53,7 @@ pub enum McpScopeArg {
 				"install_from", "sync_models", "list_models", "list_roles",
 				"list_sessions", "list_agents", "list_rags", "list_macros",
 				"list_skills", "list_bundles", "skill", "tail_logs", "completions",
-				"update",
+				"update", "update_bundle",
 			])
 	),
 	group(
@@ -207,6 +207,9 @@ pub struct Cli {
         help_heading = "Installation & Updates"
     )]
     pub install_force: bool,
+    /// Update an installed bundle from its recorded source (NAME may be suffixed with #<ref> to move a pin)
+    #[arg(long, value_name = "NAME", help_heading = "Installation & Updates")]
+    pub update_bundle: Option<String>,
     /// Sync models updates
     #[arg(long, help_heading = "Installation & Updates")]
     pub sync_models: bool,
@@ -506,6 +509,14 @@ mod tests {
     fn parse_skill_flag_takes_name() {
         assert_eq!(parse(&["--skill", "git-master"]).skill, vec!["git-master"]);
         assert!(parse(&[]).skill.is_empty());
+    }
+
+    #[test]
+    fn parse_update_bundle_flag_takes_name() {
+        assert_eq!(
+            parse(&["--update-bundle", "foo"]).update_bundle.as_deref(),
+            Some("foo")
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, Select};
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -103,6 +104,208 @@ pub fn install_remote_from_repl_args(args: &str) -> Result<()> {
     install_remote(&url, filter, force)
 }
 
+/// Update an installed bundle from its recorded source. `spec` is the bundle
+/// name, optionally suffixed with `#<ref>` to move a pinned ref. The whole
+/// remote is always processed — including categories a filtered install
+/// excluded — because filtered installs merge into a single record and an
+/// update brings that record in line with everything the remote now ships.
+pub fn update_bundle(spec: &str) -> Result<()> {
+    let (name, ref_override) = parse_url_with_ref(spec)?;
+
+    let mut store = BundleStore::load()?;
+    let Some(record) = store.get(&name) else {
+        let installed = store.bundle_names();
+        if installed.is_empty() {
+            bail!("no bundle named '{name}' is installed; none are installed");
+        }
+        bail!(
+            "no bundle named '{name}' is installed; installed bundles: {}",
+            installed.join(", ")
+        );
+    };
+    let source = record.source.clone();
+    let recorded_ref = record.git_ref.clone();
+
+    let has_override = ref_override.is_some();
+    let effective_ref = ref_override.or(recorded_ref);
+    if !has_override
+        && let Some(pinned) = effective_ref.as_deref()
+        && is_commit_sha(pinned)
+    {
+        println!("Bundle '{name}' is pinned to commit {pinned}; pass #<ref> to move the pin.");
+    }
+
+    let temp = clone_to_temp(&source, effective_ref.as_deref())?;
+    println!("Cloned {source} to {}", temp.path().display());
+
+    let mut layout = scan_remote_layout(temp.path())?;
+    layout.head_sha = Some(temp.head_sha().to_string());
+    if layout.is_empty() {
+        println!(
+            "The source for '{name}' no longer contains recognized assets; \
+             leaving installed files and the bundle record untouched."
+        );
+        return Ok(());
+    }
+
+    let bundle = register_bundle(
+        &mut store,
+        &source,
+        effective_ref.as_deref(),
+        layout.manifest.as_ref(),
+        temp.head_sha(),
+    )?;
+
+    let plan = plan_changes(&layout)?;
+    let plan = reclassify_owned_unmodified(plan, &store, &bundle)?;
+
+    if !plan.files.is_empty() {
+        print_plan_summary(&plan);
+        apply_plan(&plan, StickyMode::None, &mut store, &bundle)?;
+    }
+
+    handle_obsolete_files(&mut store, &bundle, &plan)?;
+
+    if let Some((remote_mcp, local_mcp)) = &plan.mcp_json {
+        let local = local_mcp.exists().then_some(local_mcp.as_path());
+        let report = merge_mcp_json(local, remote_mcp, local_mcp, false)?;
+        record_mcp_merge(&mut store, &bundle, &report)?;
+        print_mcp_merge_report(&report);
+        handle_missing_secrets(&report.missing_secrets)?;
+    }
+
+    store.mark_updated(&bundle)?;
+
+    Ok(())
+}
+
+/// A conflict on a file this bundle owns whose on-disk content still matches
+/// the recorded hash is not a real conflict: the bundle wrote that content and
+/// the user never touched it, so an update refreshes it without prompting.
+/// Files the user modified — or that another bundle owns — keep the normal
+/// conflict semantics.
+fn reclassify_owned_unmodified(
+    mut plan: InstallPlan,
+    store: &BundleStore,
+    bundle: &str,
+) -> Result<InstallPlan> {
+    let owned: HashMap<&str, &str> = store
+        .get(bundle)
+        .map(|record| {
+            record
+                .files
+                .iter()
+                .map(|file| (file.path.as_str(), file.sha256.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for planned in &mut plan.files {
+        if planned.kind != PlannedKind::Conflict {
+            continue;
+        }
+        let Some(recorded) = owned.get(provenance_path(&planned.dst).as_str()) else {
+            continue;
+        };
+        if hash_file(&planned.dst)? == *recorded {
+            planned.kind = PlannedKind::Refresh;
+        }
+    }
+    Ok(plan)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObsoleteAction {
+    Keep,
+    Delete,
+}
+
+/// Reconcile owned files the remote no longer ships. A file already gone from
+/// disk just drops out of the record; a file still present is kept by default
+/// (the user may rely on it) and only deleted on explicit confirmation. Kept
+/// files stay in the record, so a later uninstall still offers to remove them.
+fn handle_obsolete_files(store: &mut BundleStore, bundle: &str, plan: &InstallPlan) -> Result<()> {
+    let planned: HashSet<String> = plan
+        .files
+        .iter()
+        .map(|planned| provenance_path(&planned.dst))
+        .collect();
+    let obsolete: Vec<String> = store
+        .get(bundle)
+        .map(|record| {
+            record
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .filter(|path| !planned.contains(path))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let config_dir = paths::config_dir();
+    let mut sticky: Option<ObsoleteAction> = None;
+    for path in obsolete {
+        let full = config_dir.join(&path);
+        if !full.exists() {
+            println!("dropped record for obsolete file {path} (already absent locally)");
+            store.remove_file_record(bundle, &path)?;
+            continue;
+        }
+        let action = resolve_obsolete(&path, &mut sticky)?;
+        apply_obsolete_action(store, bundle, &path, &full, action)?;
+    }
+    Ok(())
+}
+
+fn resolve_obsolete(path: &str, sticky: &mut Option<ObsoleteAction>) -> Result<ObsoleteAction> {
+    if let Some(action) = *sticky {
+        return Ok(action);
+    }
+    if !*IS_STDOUT_TERMINAL {
+        return Ok(ObsoleteAction::Keep);
+    }
+
+    let prompt = format!("Obsolete file {path} is no longer shipped by the bundle");
+    let choice = Select::new(&prompt, vec!["keep", "delete", "keep-all", "delete-all"])
+        .prompt()
+        .with_context(|| "failed to read obsolete-file choice")?;
+
+    match choice {
+        "keep" => Ok(ObsoleteAction::Keep),
+        "delete" => Ok(ObsoleteAction::Delete),
+        "keep-all" => {
+            *sticky = Some(ObsoleteAction::Keep);
+            Ok(ObsoleteAction::Keep)
+        }
+        "delete-all" => {
+            *sticky = Some(ObsoleteAction::Delete);
+            Ok(ObsoleteAction::Delete)
+        }
+        _ => unreachable!("inquire::Select returned an unexpected option"),
+    }
+}
+
+fn apply_obsolete_action(
+    store: &mut BundleStore,
+    bundle: &str,
+    path: &str,
+    full: &Path,
+    action: ObsoleteAction,
+) -> Result<()> {
+    match action {
+        ObsoleteAction::Keep => {
+            println!("kept obsolete file {path} (no longer shipped by the bundle)");
+        }
+        ObsoleteAction::Delete => {
+            fs::remove_file(full)
+                .with_context(|| format!("failed to delete obsolete file {}", full.display()))?;
+            store.remove_file_record(bundle, path)?;
+            println!("deleted obsolete file {path}");
+        }
+    }
+    Ok(())
+}
+
 fn parse_filter(name: &str) -> Result<InstallFilter> {
     InstallFilter::parse(name).with_context(|| {
         format!(
@@ -160,13 +363,17 @@ impl Drop for TempRepoDir {
     }
 }
 
+fn is_commit_sha(reference: &str) -> bool {
+    reference.len() >= 4
+        && reference.len() <= 40
+        && reference.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 fn clone_to_temp(url: &str, reference: Option<&str>) -> Result<TempRepoDir> {
     let dest = utils::temp_file("coyote-remote-install-", "");
     let dest_arg: OsString = dest.as_os_str().into();
 
-    let is_sha = reference
-        .map(|r| r.len() >= 4 && r.len() <= 40 && r.chars().all(|c| c.is_ascii_hexdigit()))
-        .unwrap_or(false);
+    let is_sha = reference.is_some_and(is_commit_sha);
 
     match reference {
         Some(r) if !is_sha => {
@@ -567,6 +774,9 @@ enum PlannedKind {
     New,
     Identical,
     Conflict,
+    /// A conflict downgraded because this bundle owns the file and the local
+    /// content still matches the recorded hash; applied without prompting.
+    Refresh,
 }
 
 struct PlannedFile {
@@ -733,11 +943,16 @@ fn print_plan_summary(plan: &InstallPlan) {
         let new_ = count_kind(plan, cat, PlannedKind::New);
         let identical = count_kind(plan, cat, PlannedKind::Identical);
         let conflict = count_kind(plan, cat, PlannedKind::Conflict);
-        if new_ + identical + conflict > 0 {
-            println!(
+        let refresh = count_kind(plan, cat, PlannedKind::Refresh);
+        if new_ + identical + conflict + refresh > 0 {
+            let mut line = format!(
                 "  {:<16} new={new_}  identical={identical}  conflict={conflict}",
                 cat.label()
             );
+            if refresh > 0 {
+                line.push_str(&format!("  refresh={refresh}"));
+            }
+            println!("{line}");
         }
     }
 }
@@ -766,6 +981,7 @@ struct ApplyReport {
     new_count: usize,
     identical_count: usize,
     replaced_count: usize,
+    refreshed_count: usize,
     kept_count: usize,
 }
 
@@ -779,6 +995,7 @@ fn apply_plan(
         new_count: 0,
         identical_count: 0,
         replaced_count: 0,
+        refreshed_count: 0,
         kept_count: 0,
     };
     let mut sticky = initial_mode;
@@ -793,6 +1010,11 @@ fn apply_plan(
             PlannedKind::Identical => {
                 report.identical_count += 1;
             }
+            PlannedKind::Refresh => {
+                write_file(&planned.src, &planned.dst)?;
+                record_written_file(store, bundle, planned, FileAction::Replaced)?;
+                report.refreshed_count += 1;
+            }
             PlannedKind::Conflict => match resolve_conflict(planned, &mut sticky)? {
                 ConflictAction::Keep => report.kept_count += 1,
                 ConflictAction::Replace => {
@@ -804,10 +1026,21 @@ fn apply_plan(
         }
     }
 
-    println!(
-        "\nInstalled: {} new, {} replaced, {} kept, {} identical.",
-        report.new_count, report.replaced_count, report.kept_count, report.identical_count
-    );
+    if report.refreshed_count > 0 {
+        println!(
+            "\nInstalled: {} new, {} refreshed, {} replaced, {} kept, {} identical.",
+            report.new_count,
+            report.refreshed_count,
+            report.replaced_count,
+            report.kept_count,
+            report.identical_count
+        );
+    } else {
+        println!(
+            "\nInstalled: {} new, {} replaced, {} kept, {} identical.",
+            report.new_count, report.replaced_count, report.kept_count, report.identical_count
+        );
+    }
 
     Ok(report)
 }
@@ -2441,5 +2674,416 @@ mod tests {
 
         assert!(fs::read_dir(paths::macros_dir()).unwrap().next().is_some());
         assert!(!paths::installed_bundles_file().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn update_silently_refreshes_owned_unmodified_files() {
+        use crate::config::bundles::hash_bytes;
+
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping update_silently_refreshes_owned_unmodified_files: requires non-TTY stdout"
+            );
+            return;
+        }
+        let _guard = TestVaultConfigGuard::new("upd-refresh");
+        let src_root = fresh_temp_dir("upd-refresh-src-");
+        let repo = src_root.join("bundle");
+        write_src(&repo, BUNDLE_MANIFEST_FILE, "name: refresh-bundle\n");
+        write_src(&repo, "macros/hello.yaml", "v1\n");
+        init_bundle_repo(&repo);
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        commit_file(&repo, "macros/hello.yaml", "v2\n");
+
+        update_bundle("refresh-bundle").unwrap();
+
+        let installed = paths::macros_dir().join("hello.yaml");
+        assert_eq!(fs::read_to_string(&installed).unwrap(), "v2\n");
+        let store = BundleStore::load().unwrap();
+        let files = &store.get("refresh-bundle").unwrap().files;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].sha256, hash_bytes(b"v2\n"));
+        assert_eq!(files[0].action, FileAction::Replaced);
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    fn apply_plan_keep_all_preserves_local_edit_and_stale_record() {
+        let dir = fresh_temp_dir("upd-keep-modified-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let dst = dir.join("macros/owned.yaml");
+        write_src(&dir, "macros/owned.yaml", "installed content");
+        let recorded_sha = hash_file(&dst).unwrap();
+        store
+            .record_file(
+                "omc",
+                FileRecord {
+                    path: provenance_path(&dst),
+                    category: "macros".to_string(),
+                    sha256: recorded_sha.clone(),
+                    action: FileAction::New,
+                },
+            )
+            .unwrap();
+        fs::write(&dst, "local edit").unwrap();
+        let src = dir.join("upstream/owned.yaml");
+        write_src(&dir, "upstream/owned.yaml", "upstream content");
+        let plan = InstallPlan {
+            files: vec![PlannedFile {
+                src,
+                dst: dst.clone(),
+                kind: PlannedKind::Conflict,
+                top_category: TopCategory::Macros,
+            }],
+            mcp_json: None,
+        };
+
+        apply_plan(&plan, StickyMode::KeepAll, &mut store, "omc").unwrap();
+
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "local edit");
+        let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        let files = &reloaded.get("omc").unwrap().files;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].sha256, recorded_sha);
+        assert_ne!(files[0].sha256, hash_file(&dst).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_plan_replace_all_takes_upstream_and_rerecords_hash() {
+        use crate::config::bundles::hash_bytes;
+
+        let dir = fresh_temp_dir("upd-replace-modified-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let dst = dir.join("macros/owned.yaml");
+        write_src(&dir, "macros/owned.yaml", "installed content");
+        store
+            .record_file(
+                "omc",
+                FileRecord {
+                    path: provenance_path(&dst),
+                    category: "macros".to_string(),
+                    sha256: hash_file(&dst).unwrap(),
+                    action: FileAction::New,
+                },
+            )
+            .unwrap();
+        fs::write(&dst, "local edit").unwrap();
+        let src = dir.join("upstream/owned.yaml");
+        write_src(&dir, "upstream/owned.yaml", "upstream content");
+        let plan = InstallPlan {
+            files: vec![PlannedFile {
+                src,
+                dst: dst.clone(),
+                kind: PlannedKind::Conflict,
+                top_category: TopCategory::Macros,
+            }],
+            mcp_json: None,
+        };
+
+        apply_plan(&plan, StickyMode::ReplaceAll, &mut store, "omc").unwrap();
+
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "upstream content");
+        let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        let files = &reloaded.get("omc").unwrap().files;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].sha256, hash_bytes(b"upstream content"));
+        assert_eq!(files[0].action, FileAction::Replaced);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn update_bails_non_interactively_on_unowned_conflict() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping update_bails_non_interactively_on_unowned_conflict: requires non-TTY stdout"
+            );
+            return;
+        }
+        let _guard = TestVaultConfigGuard::new("upd-unowned");
+        let src_root = fresh_temp_dir("upd-unowned-src-");
+        let repo = src_root.join("bundle");
+        write_src(&repo, BUNDLE_MANIFEST_FILE, "name: unowned-bundle\n");
+        write_src(&repo, "macros/a.yaml", "a\n");
+        init_bundle_repo(&repo);
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        commit_file(&repo, "macros/user.yaml", "upstream\n");
+        fs::create_dir_all(paths::macros_dir()).unwrap();
+        fs::write(paths::macros_dir().join("user.yaml"), "local\n").unwrap();
+
+        let err = update_bundle("unowned-bundle").unwrap_err();
+
+        assert!(
+            err.to_string().contains("Refusing to overwrite"),
+            "got: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(paths::macros_dir().join("user.yaml")).unwrap(),
+            "local\n"
+        );
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    fn apply_plan_replace_all_transfers_ownership_between_bundles() {
+        let dir = fresh_temp_dir("upd-transfer-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("alpha", test_metadata("https://github.com/a/alpha"))
+            .unwrap();
+        store
+            .upsert_bundle("beta", test_metadata("https://github.com/b/beta"))
+            .unwrap();
+        let dst = dir.join("macros/shared.yaml");
+        write_src(&dir, "macros/shared.yaml", "alpha content");
+        store
+            .record_file(
+                "alpha",
+                FileRecord {
+                    path: provenance_path(&dst),
+                    category: "macros".to_string(),
+                    sha256: hash_file(&dst).unwrap(),
+                    action: FileAction::New,
+                },
+            )
+            .unwrap();
+        let src = dir.join("beta-src/shared.yaml");
+        write_src(&dir, "beta-src/shared.yaml", "beta content");
+        let plan = InstallPlan {
+            files: vec![PlannedFile {
+                src,
+                dst: dst.clone(),
+                kind: PlannedKind::Conflict,
+                top_category: TopCategory::Macros,
+            }],
+            mcp_json: None,
+        };
+
+        apply_plan(&plan, StickyMode::ReplaceAll, &mut store, "beta").unwrap();
+
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "beta content");
+        let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        assert!(reloaded.get("alpha").unwrap().files.is_empty());
+        let beta_files = &reloaded.get("beta").unwrap().files;
+        assert_eq!(beta_files.len(), 1);
+        assert_eq!(beta_files[0].path, provenance_path(&dst));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn update_keeps_obsolete_files_non_interactively() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping update_keeps_obsolete_files_non_interactively: requires non-TTY stdout"
+            );
+            return;
+        }
+        let _guard = TestVaultConfigGuard::new("upd-obsolete-keep");
+        let src_root = fresh_temp_dir("upd-obsolete-keep-src-");
+        let repo = src_root.join("bundle");
+        write_src(&repo, BUNDLE_MANIFEST_FILE, "name: obs-keep\n");
+        write_src(&repo, "macros/keep.yaml", "k\n");
+        write_src(&repo, "macros/gone.yaml", "g\n");
+        init_bundle_repo(&repo);
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        fs::remove_file(repo.join("macros/gone.yaml")).unwrap();
+        commit_file(&repo, "macros/keep.yaml", "k2\n");
+
+        update_bundle("obs-keep").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(paths::macros_dir().join("gone.yaml")).unwrap(),
+            "g\n"
+        );
+        let store = BundleStore::load().unwrap();
+        let record = store.get("obs-keep").unwrap();
+        assert!(record.files.iter().any(|f| f.path == "macros/gone.yaml"));
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    fn apply_obsolete_delete_removes_file_and_record() {
+        let dir = fresh_temp_dir("upd-obsolete-delete-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let dst = dir.join("macros/gone.yaml");
+        write_src(&dir, "macros/gone.yaml", "g");
+        let path = provenance_path(&dst);
+        store
+            .record_file(
+                "omc",
+                FileRecord {
+                    path: path.clone(),
+                    category: "macros".to_string(),
+                    sha256: hash_file(&dst).unwrap(),
+                    action: FileAction::New,
+                },
+            )
+            .unwrap();
+
+        apply_obsolete_action(&mut store, "omc", &path, &dst, ObsoleteAction::Delete).unwrap();
+
+        assert!(!dst.exists());
+        let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        assert!(reloaded.get("omc").unwrap().files.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_obsolete_drops_records_for_missing_files() {
+        let dir = fresh_temp_dir("upd-obsolete-missing-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let ghost = dir.join("macros/ghost.yaml");
+        store
+            .record_file(
+                "omc",
+                FileRecord {
+                    path: provenance_path(&ghost),
+                    category: "macros".to_string(),
+                    sha256: "0".repeat(64),
+                    action: FileAction::New,
+                },
+            )
+            .unwrap();
+        let plan = InstallPlan {
+            files: Vec::new(),
+            mcp_json: None,
+        };
+
+        handle_obsolete_files(&mut store, "omc", &plan).unwrap();
+
+        assert!(store.get("omc").unwrap().files.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn update_refreshes_record_metadata_and_stamps_updated_at() {
+        let _guard = TestVaultConfigGuard::new("upd-meta");
+        let src_root = fresh_temp_dir("upd-meta-src-");
+        let repo = src_root.join("bundle");
+        write_src(
+            &repo,
+            BUNDLE_MANIFEST_FILE,
+            "name: meta-bundle\n\
+             version: \"1.0\"\n\
+             description: Old\n\
+             homepage: https://example.com/old\n",
+        );
+        write_src(&repo, "macros/m.yaml", "a: 1\n");
+        init_bundle_repo(&repo);
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        let installed_at = BundleStore::load()
+            .unwrap()
+            .get("meta-bundle")
+            .unwrap()
+            .installed_at
+            .clone();
+        let new_sha = commit_file(
+            &repo,
+            BUNDLE_MANIFEST_FILE,
+            "name: meta-bundle\n\
+             version: \"2.0\"\n\
+             description: New\n\
+             homepage: https://example.com/new\n",
+        );
+
+        update_bundle("meta-bundle").unwrap();
+
+        let store = BundleStore::load().unwrap();
+        let record = store.get("meta-bundle").unwrap();
+        assert_eq!(record.commit, new_sha);
+        assert_eq!(record.version.as_deref(), Some("2.0"));
+        assert_eq!(record.description.as_deref(), Some("New"));
+        assert_eq!(record.homepage.as_deref(), Some("https://example.com/new"));
+        assert!(record.updated_at.is_some());
+        assert_eq!(record.installed_at, installed_at);
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    #[serial]
+    fn update_unknown_bundle_lists_installed_names() {
+        let _guard = TestVaultConfigGuard::new("upd-unknown-name");
+
+        let err = update_bundle("nope").unwrap_err();
+        assert!(err.to_string().contains("none are installed"), "got: {err}");
+
+        let src_root = fresh_temp_dir("upd-unknown-src-");
+        let repo = src_root.join("bundle");
+        write_src(&repo, BUNDLE_MANIFEST_FILE, "name: known-bundle\n");
+        write_src(&repo, "macros/m.yaml", "a: 1\n");
+        init_bundle_repo(&repo);
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+
+        let err = update_bundle("nope").unwrap_err();
+
+        assert!(
+            err.to_string().contains("installed bundles: known-bundle"),
+            "got: {err}"
+        );
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    #[serial]
+    fn update_honors_recorded_sha_pin() {
+        let _guard = TestVaultConfigGuard::new("upd-pin");
+        let src_root = fresh_temp_dir("upd-pin-src-");
+        let repo = src_root.join("bundle");
+        write_src(&repo, BUNDLE_MANIFEST_FILE, "name: pin-bundle\n");
+        write_src(&repo, "macros/one.yaml", "1\n");
+        let pinned = init_bundle_repo(&repo);
+        install_remote(&format!("{}#{pinned}", repo.display()), None, false).unwrap();
+        let newer = commit_file(&repo, "macros/two.yaml", "2\n");
+        assert_ne!(pinned, newer);
+
+        update_bundle("pin-bundle").unwrap();
+
+        let store = BundleStore::load().unwrap();
+        let record = store.get("pin-bundle").unwrap();
+        assert_eq!(record.commit, pinned);
+        assert_eq!(record.git_ref.as_deref(), Some(pinned.as_str()));
+        assert!(!paths::macros_dir().join("two.yaml").exists());
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    #[serial]
+    fn update_ref_override_moves_the_pin() {
+        let _guard = TestVaultConfigGuard::new("upd-move-pin");
+        let src_root = fresh_temp_dir("upd-move-pin-src-");
+        let repo = src_root.join("bundle");
+        write_src(&repo, BUNDLE_MANIFEST_FILE, "name: move-bundle\n");
+        write_src(&repo, "macros/one.yaml", "1\n");
+        let pinned = init_bundle_repo(&repo);
+        install_remote(&format!("{}#{pinned}", repo.display()), None, false).unwrap();
+        let newer = commit_file(&repo, "macros/two.yaml", "2\n");
+
+        update_bundle(&format!("move-bundle#{newer}")).unwrap();
+
+        let store = BundleStore::load().unwrap();
+        let record = store.get("move-bundle").unwrap();
+        assert_eq!(record.commit, newer);
+        assert_eq!(record.git_ref.as_deref(), Some(newer.as_str()));
+        assert_eq!(
+            fs::read_to_string(paths::macros_dir().join("two.yaml")).unwrap(),
+            "2\n"
+        );
+        let _ = fs::remove_dir_all(&src_root);
     }
 }

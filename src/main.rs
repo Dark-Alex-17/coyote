@@ -138,6 +138,10 @@ async fn main() -> Result<()> {
         return config::install_remote(url, cli.filter, cli.install_force);
     }
 
+    if let Some(spec) = cli.update_bundle.as_deref() {
+        return config::update_bundle(spec);
+    }
+
     if let Some(client_arg) = &cli.authenticate {
         let cfg = Config::load_with_interpolation(true).await?;
         let app_config = AppConfig::from_config(cfg)?;
