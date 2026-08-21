@@ -1086,7 +1086,7 @@ pub async fn run_repl_command(
                             macro_execute(ctx, name, extra, abort_signal.clone()).await?;
                         }
                         Some(MacroState::DisabledRuntime) => bail!(
-                            r#"Macro '{name}' is disabled. Re-enable it with ".macro enable {name}""#
+                            r#"Macro '{name}' is disabled. Enable it with ".macro enable {name}""#
                         ),
                         Some(MacroState::Locked { level }) => bail!(
                             "Macro '{name}' is restricted by {} enabled_macros",
@@ -1567,9 +1567,6 @@ fn unknown_command() -> Result<()> {
     bail!(r#"Unknown command. Type ".help" for additional help."#);
 }
 
-/// The name of every built-in REPL command (first word, without the leading
-/// dot), sorted and deduplicated. Macros with one of these names are shadowed
-/// by the built-in and stay reachable only via `.macro <name>`.
 pub fn builtin_command_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = REPL_COMMANDS
         .iter()

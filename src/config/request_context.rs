@@ -124,8 +124,6 @@ fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<
         .collect()
 }
 
-/// Keys offered by `.set <TAB>` completion. `reasoning_effort` is appended at
-/// completion time only when the current model supports reasoning levels.
 const SET_COMPLETION_KEYS: [&str; 26] = [
     "auto_continue",
     "continuation_prompt",
@@ -155,10 +153,6 @@ const SET_COMPLETION_KEYS: [&str; 26] = [
     "raw_markdown",
 ];
 
-/// The new global-level `enabled_macros` list after toggling `name`, or
-/// `None` when the toggle is a no-op (already in the requested state).
-/// Disabling with no current list (all macros visible) materializes the list
-/// as every active macro name minus `name`.
 fn toggled_enabled_macros(
     current: Option<&[String]>,
     all_active: &[String],
@@ -198,7 +192,6 @@ fn toggled_enabled_macros(
     }
 }
 
-/// The `.list macros` state column for a resolved row.
 fn macro_state_display(
     row: &ResolvedMacro,
     lock_owner: impl Fn(MacroAllowlistLevel) -> String,
@@ -213,8 +206,6 @@ fn macro_state_display(
     }
 }
 
-/// The `.list macros` source column: where the definition file lives, or `-`
-/// for allowlist entries with no installed file.
 fn macro_source_display(source: Option<MacroSource>) -> String {
     match source {
         Some(source) => source.to_string(),
@@ -233,9 +224,6 @@ pub struct RequestContext {
     pub app: Arc<AppState>,
 
     pub macro_flag: bool,
-    /// Companion to `macro_flag`: true while a non-isolated macro is running
-    /// its steps directly on this live context. Isolated macros execute on a
-    /// forked context and leave this false.
     pub macro_non_isolated: bool,
     pub info_flag: bool,
     pub working_mode: WorkingMode,
@@ -2488,16 +2476,10 @@ impl RequestContext {
         Ok(())
     }
 
-    /// Whether a non-isolated macro is currently running its steps on this
-    /// context. Macro invocations are rejected in this mode: the nested
-    /// macro's steps would interleave with the outer macro's on the live
-    /// session.
     pub fn in_non_isolated_macro(&self) -> bool {
         self.macro_flag && self.macro_non_isolated
     }
 
-    /// The resolved macro set for the active context (workspace + global
-    /// discovery, effective `enabled_macros` allowlist, built-in shadowing).
     pub fn macro_policy(&self) -> MacroPolicy {
         MacroPolicy::effective(
             &self.app.config,
@@ -2509,8 +2491,6 @@ impl RequestContext {
         )
     }
 
-    /// A human-readable name for the config level whose `enabled_macros`
-    /// allowlist restricts a macro, e.g. `agent:oracle` or `role:coder`.
     pub fn macro_lock_owner(&self, level: MacroAllowlistLevel) -> String {
         let name = match level {
             MacroAllowlistLevel::Session => self.session.as_ref().map(|s| s.name()),
@@ -2524,9 +2504,6 @@ impl RequestContext {
         }
     }
 
-    /// Enables or disables a macro by editing the in-memory global-level
-    /// `enabled_macros` list. Errors when a role/agent/session allowlist is
-    /// active, since a global-level write would be silently shadowed.
     pub fn macro_toggle(&mut self, name: &str, enable: bool) -> Result<()> {
         let restricting_level = if self
             .session
@@ -2577,6 +2554,7 @@ impl RequestContext {
             .collect();
 
         let action = if enable { "enabled" } else { "disabled" };
+
         match toggled_enabled_macros(
             self.app.config.enabled_macros.as_deref(),
             &all_active,
@@ -2589,12 +2567,10 @@ impl RequestContext {
             }
             None => println!("Macro '{name}' is already {action}"),
         }
+
         Ok(())
     }
 
-    /// The macros offered by top-level `.<TAB>` completion: enabled rows
-    /// only. Macros shadowed by a built-in command never appear here; they
-    /// stay reachable via `.macro <name>`.
     pub fn visible_macro_completions(&self) -> Vec<(String, Option<String>)> {
         self.macro_policy()
             .macros
@@ -2622,6 +2598,7 @@ impl RequestContext {
                     "name", "source", "isolated", "state", "description"
                 );
                 println!("{header}");
+
                 for row in &policy.macros {
                     let source = macro_source_display(row.source);
                     let isolated = match row.isolated {
@@ -4032,7 +4009,7 @@ impl RequestContext {
 
         // Graph agents manage their own state; never engage a session,
         // not even an inherited app-level `agent_session` default.
-        // Isolated macros suppress an inherited default too — their forked
+        // Isolated macros suppress an inherited default too: their forked
         // context has no session to return to. A non-isolated macro's `.agent`
         // step engages it exactly as if the user had typed the command.
         let session_name = session_name.map(|v| v.to_string()).or_else(|| {

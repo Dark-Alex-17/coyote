@@ -942,6 +942,7 @@ mod tests {
     #[test]
     fn session_default_is_empty() {
         let session = Session::default();
+
         assert!(session.is_empty());
         assert_eq!(session.name(), "");
         assert_eq!(session.role_name(), None);
@@ -951,6 +952,7 @@ mod tests {
     #[test]
     fn session_enabled_macros_absent_is_none() {
         let session: Session = serde_yaml::from_str("model: provider:test\nmessages: []").unwrap();
+
         assert_eq!(session.enabled_macros, None);
     }
 
@@ -958,6 +960,7 @@ mod tests {
     fn session_enabled_macros_empty_list_is_some_empty() {
         let session: Session =
             serde_yaml::from_str("model: provider:test\nenabled_macros: []\nmessages: []").unwrap();
+
         assert_eq!(session.enabled_macros, Some(vec![]));
     }
 
@@ -966,6 +969,7 @@ mod tests {
         let session: Session =
             serde_yaml::from_str("model: provider:test\nenabled_macros: \"\"\nmessages: []")
                 .unwrap();
+
         assert_eq!(session.enabled_macros, Some(vec![]));
     }
 
@@ -974,6 +978,7 @@ mod tests {
         let session: Session =
             serde_yaml::from_str("model: provider:test\nenabled_macros: \"a,b\"\nmessages: []")
                 .unwrap();
+
         assert_eq!(
             session.enabled_macros,
             Some(vec!["a".to_string(), "b".to_string()])
@@ -984,6 +989,7 @@ mod tests {
     fn session_serialize_omits_enabled_macros_when_none() {
         let session = Session::default();
         let yaml = serde_yaml::to_string(&session).unwrap();
+
         assert!(!yaml.contains("enabled_macros"));
     }
 
@@ -1001,6 +1007,7 @@ mod tests {
             functions: Functions::default(),
         });
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+
         let session = Session::new_from_ctx(&ctx, &app_config, "test-session").unwrap();
 
         assert_eq!(session.name(), "test-session");
@@ -1040,25 +1047,30 @@ mod tests {
     #[test]
     fn session_guard_empty_passes_when_empty() {
         let session = Session::default();
+
         assert!(session.guard_empty().is_ok());
     }
 
     #[test]
     fn session_needs_compression_threshold() {
         let session = Session::default();
+
         assert!(!session.needs_compression(4000));
     }
 
     #[test]
     fn session_needs_compression_returns_false_when_compressing() {
         let mut session = Session::default();
+
         session.set_compressing(true);
+
         assert!(!session.needs_compression(0));
     }
 
     #[test]
     fn session_needs_compression_returns_false_when_threshold_zero() {
         let session = Session::default();
+
         assert!(!session.needs_compression(0));
     }
 
@@ -1130,13 +1142,16 @@ mod tests {
     #[test]
     fn session_need_autoname_default_false() {
         let session = Session::default();
+
         assert!(!session.need_autoname());
     }
 
     #[test]
     fn session_set_autonaming_doesnt_panic_without_autoname() {
         let mut session = Session::default();
+
         session.set_autonaming(true);
+
         assert!(!session.need_autoname());
     }
 

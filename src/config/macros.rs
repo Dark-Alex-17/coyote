@@ -41,6 +41,7 @@ pub async fn macro_execute(
             println!(">> {}", multiline_text(&command));
             run_repl_command(&mut live, abort_signal.clone(), &command).await?;
         }
+
         return Ok(());
     }
 
@@ -84,9 +85,6 @@ pub async fn macro_execute(
     Ok(())
 }
 
-/// Marks a live context as executing a non-isolated macro for the duration of
-/// its steps. Restores the previous flag and mode on drop, so every exit path
-/// — including a failing step — leaves the context as it found it.
 struct MacroModeGuard<'a> {
     ctx: &'a mut RequestContext,
     prev_flag: bool,
@@ -223,9 +221,11 @@ impl Macro {
 
     pub fn interpolate_command(command: &str, variables: &IndexMap<String, String>) -> String {
         let mut output = command.to_string();
+
         for (key, value) in variables {
             output = output.replace(&format!("{{{{{key}}}}}"), value);
         }
+
         output
     }
 }
@@ -416,21 +416,27 @@ mod tests {
     #[test]
     fn resolve_no_variables() {
         let m = macro_with_vars(vec![]);
+
         let result = m.resolve_variables(&[]).unwrap();
+
         assert!(result.is_empty());
     }
 
     #[test]
     fn resolve_required_variable_provided() {
         let m = macro_with_vars(vec![var("name", false, None)]);
+
         let result = m.resolve_variables(&["Alice".into()]).unwrap();
+
         assert_eq!(result["name"], "Alice");
     }
 
     #[test]
     fn resolve_required_variable_missing_errors() {
         let m = macro_with_vars(vec![var("name", false, None)]);
+
         let result = m.resolve_variables(&[]);
+
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("name"));
     }
@@ -438,23 +444,29 @@ mod tests {
     #[test]
     fn resolve_default_variable_uses_default() {
         let m = macro_with_vars(vec![var("color", false, Some("blue"))]);
+
         let result = m.resolve_variables(&[]).unwrap();
+
         assert_eq!(result["color"], "blue");
     }
 
     #[test]
     fn resolve_default_variable_overridden() {
         let m = macro_with_vars(vec![var("color", false, Some("blue"))]);
+
         let result = m.resolve_variables(&["red".into()]).unwrap();
+
         assert_eq!(result["color"], "red");
     }
 
     #[test]
     fn resolve_rest_variable_captures_all_remaining() {
         let m = macro_with_vars(vec![var("first", false, None), var("rest", true, None)]);
+
         let result = m
             .resolve_variables(&["a".into(), "b".into(), "c".into()])
             .unwrap();
+
         assert_eq!(result["first"], "a");
         assert_eq!(result["rest"], "b c");
     }
@@ -462,7 +474,9 @@ mod tests {
     #[test]
     fn resolve_rest_variable_with_default() {
         let m = macro_with_vars(vec![var("args", true, Some("default text"))]);
+
         let result = m.resolve_variables(&[]).unwrap();
+
         assert_eq!(result["args"], "default text");
     }
 
@@ -473,7 +487,9 @@ mod tests {
             var("b", false, None),
             var("c", false, Some("default_c")),
         ]);
+
         let result = m.resolve_variables(&["x".into(), "y".into()]).unwrap();
+
         assert_eq!(result["a"], "x");
         assert_eq!(result["b"], "y");
         assert_eq!(result["c"], "default_c");
@@ -482,30 +498,35 @@ mod tests {
     #[test]
     fn usage_no_variables() {
         let m = macro_with_vars(vec![]);
+
         assert_eq!(m.usage("my-macro"), "my-macro");
     }
 
     #[test]
     fn usage_required_variable() {
         let m = macro_with_vars(vec![var("name", false, None)]);
+
         assert_eq!(m.usage("greet"), "greet <name>");
     }
 
     #[test]
     fn usage_optional_variable() {
         let m = macro_with_vars(vec![var("color", false, Some("blue"))]);
+
         assert_eq!(m.usage("paint"), "paint [color]");
     }
 
     #[test]
     fn usage_rest_variable() {
         let m = macro_with_vars(vec![var("args", true, None)]);
+
         assert_eq!(m.usage("run"), "run <args>...");
     }
 
     #[test]
     fn usage_rest_with_default() {
         let m = macro_with_vars(vec![var("args", true, Some("default"))]);
+
         assert_eq!(m.usage("run"), "run [args]...");
     }
 
@@ -515,6 +536,7 @@ mod tests {
             var("target", false, None),
             var("flags", true, Some("")),
         ]);
+
         assert_eq!(m.usage("build"), "build <target> [flags]...");
     }
 
@@ -522,6 +544,7 @@ mod tests {
     fn interpolate_replaces_variables() {
         let vars = IndexMap::from([("name".to_string(), "world".to_string())]);
         let result = Macro::interpolate_command("hello {{name}}", &vars);
+
         assert_eq!(result, "hello world");
     }
 
@@ -532,6 +555,7 @@ mod tests {
             ("b".to_string(), "2".to_string()),
         ]);
         let result = Macro::interpolate_command("{{a}} + {{b}}", &vars);
+
         assert_eq!(result, "1 + 2");
     }
 
@@ -539,6 +563,7 @@ mod tests {
     fn interpolate_no_variables_passthrough() {
         let vars = IndexMap::new();
         let result = Macro::interpolate_command("no vars here", &vars);
+
         assert_eq!(result, "no vars here");
     }
 
@@ -546,6 +571,7 @@ mod tests {
     fn interpolate_variable_not_found_left_as_is() {
         let vars = IndexMap::new();
         let result = Macro::interpolate_command("hello {{missing}}", &vars);
+
         assert_eq!(result, "hello {{missing}}");
     }
 
@@ -578,7 +604,9 @@ variables:
     rest: true
     default: "none"
 "#;
+
         let m: Macro = serde_yaml::from_str(yaml).unwrap();
+
         assert_eq!(m.variables[0].default, Some("fast".to_string()));
         assert!(m.variables[1].rest);
         assert_eq!(m.variables[1].default, Some("none".to_string()));
@@ -590,7 +618,9 @@ variables:
 steps:
   - ".help"
 "#;
+
         let m: Macro = serde_yaml::from_str(yaml).unwrap();
+
         assert!(m.variables.is_empty());
         assert_eq!(m.steps.len(), 1);
     }
@@ -601,7 +631,9 @@ steps:
 steps:
   - ".help"
 "#;
+
         let m: Macro = serde_yaml::from_str(yaml).unwrap();
+
         assert!(m.description.is_none());
         assert!(m.isolated);
     }
@@ -617,7 +649,9 @@ variables:
   - name: base
     default: main
 "#;
+
         let m: Macro = serde_yaml::from_str(yaml).unwrap();
+
         assert_eq!(
             m.description.as_deref(),
             Some("Review WIP against a base branch")
@@ -634,8 +668,10 @@ variables:
             variables: vec![var("target", false, Some("all"))],
             steps: vec!["build {{target}}".to_string()],
         };
+
         let yaml = serde_yaml::to_string(&original).unwrap();
         let back: Macro = serde_yaml::from_str(&yaml).unwrap();
+
         assert_eq!(back.description.as_deref(), Some("does a thing"));
         assert!(!back.isolated);
         assert_eq!(back.variables.len(), 1);
@@ -648,6 +684,7 @@ variables:
     fn round_trip_defaults_survive() {
         let original = macro_with_vars(vec![]);
         let yaml = serde_yaml::to_string(&original).unwrap();
+
         assert!(!yaml.contains("description"));
         let back: Macro = serde_yaml::from_str(&yaml).unwrap();
         assert!(back.description.is_none());
@@ -659,8 +696,10 @@ variables:
         for file in MacroAssets::iter() {
             let embedded = MacroAssets::get(&file).unwrap();
             let content = std::str::from_utf8(&embedded.data).unwrap();
+
             let m: Macro = serde_yaml::from_str(content)
                 .unwrap_or_else(|e| panic!("asset '{}' failed to deserialize: {e}", file.as_ref()));
+
             assert!(m.description.is_none(), "asset '{}'", file.as_ref());
             assert!(m.isolated, "asset '{}'", file.as_ref());
             assert!(!m.steps.is_empty(), "asset '{}'", file.as_ref());

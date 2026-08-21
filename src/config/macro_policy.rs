@@ -11,11 +11,8 @@ use std::fmt;
 use std::fs::{read_dir, read_to_string};
 use std::path::PathBuf;
 
-/// Names that cannot be used as macro names because they are reserved for
-/// `.macro enable <name>` / `.macro disable <name>`.
 pub const RESERVED_MACRO_NAMES: [&str; 2] = ["enable", "disable"];
 
-/// Where a macro definition file was discovered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacroSource {
     Workspace,
@@ -52,25 +49,13 @@ impl fmt::Display for MacroAllowlistLevel {
     }
 }
 
-/// The effective state of a macro within the active context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MacroState {
-    /// Visible and invocable.
     Enabled,
-    /// Excluded by the GLOBAL-level `enabled_macros` list (config file or
-    /// runtime toggle — the two are indistinguishable by design). Can be
-    /// re-enabled at runtime with `.macro enable <name>`.
     DisabledRuntime,
-    /// Excluded by a role/agent/session `enabled_macros` allowlist. Not
-    /// enableable from the REPL; the owning config is the source of truth.
-    /// `level` is never `Global` — a global exclusion is `DisabledRuntime`.
     Locked { level: MacroAllowlistLevel },
-    /// Named by the effective allowlist, but no such macro is installed.
     Missing,
-    /// The macro name collides with a built-in REPL command; invocable only
-    /// via `.macro <name>`, never as a top-level `.name` command.
     ShadowedBuiltin,
-    /// The definition file failed to parse, or the name is reserved.
     Invalid { reason: String },
 }
 
@@ -80,34 +65,24 @@ impl MacroState {
     }
 }
 
-/// A macro definition file found on disk, before allowlist resolution.
 #[derive(Debug, Clone)]
 pub struct DiscoveredMacro {
     pub name: String,
     pub source: MacroSource,
-    /// The parsed definition, or the parse failure reason.
     pub definition: Result<Macro, String>,
-    /// True for a GLOBAL entry whose name is shadowed by a workspace entry.
     pub shadowed_by_workspace: bool,
 }
 
-/// One row of the resolved macro set. Missing allowlist entries produce rows
-/// with `source: None`.
 #[derive(Debug, Clone)]
 pub struct ResolvedMacro {
     pub name: String,
     pub source: Option<MacroSource>,
     pub description: Option<String>,
     pub isolated: Option<bool>,
-    /// True for a global entry shadowed by a workspace entry of the same
-    /// name; the row is kept for display but is never the invocation target.
     pub shadowed_by_workspace: bool,
     pub state: MacroState,
 }
 
-/// The visible macro set for the active context, resolved lazily on demand
-/// from the discovered definition files and the effective `enabled_macros`
-/// allowlist.
 #[derive(Debug)]
 pub struct MacroPolicy {
     pub macros: Vec<ResolvedMacro>,
@@ -181,6 +156,7 @@ impl MacroPolicy {
                     });
                 }
             }
+
             macros.extend(missing);
         }
 
@@ -193,9 +169,6 @@ impl MacroPolicy {
         Self { macros }
     }
 
-    /// The invocation target for `name`: the workspace entry when one shadows
-    /// a global entry, otherwise the single discovered entry. Missing rows
-    /// are never returned.
     pub fn find(&self, name: &str) -> Option<&ResolvedMacro> {
         self.macros
             .iter()
@@ -221,6 +194,7 @@ fn resolve_state(
             "Ignoring macro '{}': the name is reserved for '.macro {}'",
             discovered.name, discovered.name
         );
+
         return MacroState::Invalid {
             reason: format!("'{}' is a reserved macro name", discovered.name),
         };
@@ -248,14 +222,12 @@ fn resolve_state(
     MacroState::Enabled
 }
 
-/// Rescans the workspace and global macro directories. Workspace entries
-/// shadow global entries of the same name; the shadowed global entry is kept
-/// and flagged so both remain listable.
 pub fn discover_macros(no_workspace_macros: bool) -> Vec<DiscoveredMacro> {
     let mut dirs = vec![];
     if !no_workspace_macros {
         dirs.push((MacroSource::Workspace, paths::workspace_macros_dir()));
     }
+
     dirs.push((MacroSource::Global, paths::macros_dir()));
     discover_macros_in(&dirs)
 }
@@ -270,14 +242,17 @@ fn discover_macros_in(dirs: &[(MacroSource, PathBuf)]) -> Vec<DiscoveredMacro> {
         };
         let mut entries: Vec<_> = rd.flatten().collect();
         entries.sort_by_key(|entry| entry.file_name());
+
         for entry in entries {
             let is_file = entry
                 .file_type()
                 .map(|file_type| file_type.is_file())
                 .unwrap_or(false);
+
             if !is_file {
                 continue;
             }
+
             let Some(name) = entry
                 .file_name()
                 .to_str()
@@ -286,9 +261,11 @@ fn discover_macros_in(dirs: &[(MacroSource, PathBuf)]) -> Vec<DiscoveredMacro> {
             else {
                 continue;
             };
+
             if name.is_empty() {
                 continue;
             }
+
             let definition = read_to_string(entry.path())
                 .map_err(|err| err.to_string())
                 .and_then(|content| {
@@ -372,6 +349,7 @@ mod tests {
     #[test]
     fn all_none_enables_everything() {
         let policy = resolve(globals(&["a", "b"]), None, None, None, None);
+
         assert_eq!(state_of(&policy, "a"), &MacroState::Enabled);
         assert_eq!(state_of(&policy, "b"), &MacroState::Enabled);
     }
@@ -380,6 +358,7 @@ mod tests {
     fn global_empty_list_disables_all_as_runtime() {
         let l = list(&[]);
         let policy = resolve(globals(&["a", "b"]), None, None, None, Some(&l));
+
         assert_eq!(state_of(&policy, "a"), &MacroState::DisabledRuntime);
         assert_eq!(state_of(&policy, "b"), &MacroState::DisabledRuntime);
     }
@@ -388,6 +367,7 @@ mod tests {
     fn global_populated_partitions_enabled_and_disabled_runtime() {
         let l = list(&["a"]);
         let policy = resolve(globals(&["a", "b"]), None, None, None, Some(&l));
+
         assert_eq!(state_of(&policy, "a"), &MacroState::Enabled);
         assert_eq!(state_of(&policy, "b"), &MacroState::DisabledRuntime);
     }
@@ -395,7 +375,9 @@ mod tests {
     #[test]
     fn role_populated_locks_excluded_at_role_level() {
         let l = list(&["a"]);
+
         let policy = resolve(globals(&["a", "b"]), None, None, Some(&l), None);
+
         assert_eq!(state_of(&policy, "a"), &MacroState::Enabled);
         assert_eq!(
             state_of(&policy, "b"),
@@ -408,7 +390,9 @@ mod tests {
     #[test]
     fn agent_populated_locks_excluded_at_agent_level() {
         let l = list(&["a"]);
+
         let policy = resolve(globals(&["a", "b"]), None, Some(&l), None, None);
+
         assert_eq!(
             state_of(&policy, "b"),
             &MacroState::Locked {
@@ -420,7 +404,9 @@ mod tests {
     #[test]
     fn session_populated_locks_excluded_at_session_level() {
         let l = list(&["a"]);
+
         let policy = resolve(globals(&["a", "b"]), Some(&l), None, None, None);
+
         assert_eq!(
             state_of(&policy, "b"),
             &MacroState::Locked {
@@ -432,7 +418,9 @@ mod tests {
     #[test]
     fn role_empty_list_locks_everything_at_role_level() {
         let l = list(&[]);
+
         let policy = resolve(globals(&["a"]), None, None, Some(&l), None);
+
         assert_eq!(
             state_of(&policy, "a"),
             &MacroState::Locked {
@@ -444,7 +432,9 @@ mod tests {
     #[test]
     fn agent_empty_list_locks_everything_at_agent_level() {
         let l = list(&[]);
+
         let policy = resolve(globals(&["a"]), None, Some(&l), None, None);
+
         assert_eq!(
             state_of(&policy, "a"),
             &MacroState::Locked {
@@ -456,7 +446,9 @@ mod tests {
     #[test]
     fn session_empty_list_locks_everything_at_session_level() {
         let l = list(&[]);
+
         let policy = resolve(globals(&["a"]), Some(&l), None, None, None);
+
         assert_eq!(
             state_of(&policy, "a"),
             &MacroState::Locked {
@@ -469,6 +461,7 @@ mod tests {
     fn session_wins_over_agent() {
         let session = list(&["a"]);
         let agent = list(&["b"]);
+
         let policy = resolve(
             globals(&["a", "b"]),
             Some(&session),
@@ -476,6 +469,7 @@ mod tests {
             None,
             None,
         );
+
         assert_eq!(state_of(&policy, "a"), &MacroState::Enabled);
         assert_eq!(
             state_of(&policy, "b"),
@@ -489,7 +483,9 @@ mod tests {
     fn agent_wins_over_role() {
         let agent = list(&["a"]);
         let role = list(&["b"]);
+
         let policy = resolve(globals(&["a", "b"]), None, Some(&agent), Some(&role), None);
+
         assert_eq!(state_of(&policy, "a"), &MacroState::Enabled);
         assert_eq!(
             state_of(&policy, "b"),
@@ -503,7 +499,9 @@ mod tests {
     fn role_wins_over_global() {
         let role = list(&["a"]);
         let global = list(&["b"]);
+
         let policy = resolve(globals(&["a", "b"]), None, None, Some(&role), Some(&global));
+
         assert_eq!(state_of(&policy, "a"), &MacroState::Enabled);
         assert_eq!(
             state_of(&policy, "b"),
@@ -517,7 +515,9 @@ mod tests {
     fn empty_list_at_session_beats_populated_global() {
         let session = list(&[]);
         let global = list(&["a"]);
+
         let policy = resolve(globals(&["a"]), Some(&session), None, None, Some(&global));
+
         assert_eq!(
             state_of(&policy, "a"),
             &MacroState::Locked {
@@ -529,7 +529,9 @@ mod tests {
     #[test]
     fn unknown_allowlist_name_yields_missing_row_without_error() {
         let l = list(&["a", "ghost"]);
+
         let policy = resolve(globals(&["a"]), None, None, None, Some(&l));
+
         assert_eq!(state_of(&policy, "a"), &MacroState::Enabled);
         assert_eq!(state_of(&policy, "ghost"), &MacroState::Missing);
         let ghost = policy.macros.iter().find(|m| m.name == "ghost").unwrap();
@@ -539,7 +541,9 @@ mod tests {
     #[test]
     fn missing_row_deduplicated_for_repeated_allowlist_names() {
         let l = list(&["ghost", "ghost"]);
+
         let policy = resolve(vec![], None, None, None, Some(&l));
+
         assert_eq!(policy.macros.len(), 1);
         assert_eq!(state_of(&policy, "ghost"), &MacroState::Missing);
     }
@@ -547,6 +551,7 @@ mod tests {
     #[test]
     fn no_missing_rows_without_an_allowlist() {
         let policy = resolve(globals(&["a"]), None, None, None, None);
+
         assert_eq!(policy.macros.len(), 1);
     }
 
@@ -554,6 +559,7 @@ mod tests {
     fn builtin_name_collision_is_shadowed() {
         let policy =
             MacroPolicy::effective_with(globals(&["help", "a"]), None, None, None, None, &["help"]);
+
         assert_eq!(state_of(&policy, "help"), &MacroState::ShadowedBuiltin);
         assert_eq!(state_of(&policy, "a"), &MacroState::Enabled);
     }
@@ -561,6 +567,7 @@ mod tests {
     #[test]
     fn locked_wins_over_shadowed_builtin() {
         let l = list(&["a"]);
+
         let policy = MacroPolicy::effective_with(
             globals(&["help", "a"]),
             Some(&l),
@@ -569,6 +576,7 @@ mod tests {
             None,
             &["help"],
         );
+
         assert_eq!(
             state_of(&policy, "help"),
             &MacroState::Locked {
@@ -580,8 +588,10 @@ mod tests {
     #[test]
     fn allowlisted_builtin_collision_stays_shadowed() {
         let l = list(&["help"]);
+
         let policy =
             MacroPolicy::effective_with(globals(&["help"]), None, None, None, Some(&l), &["help"]);
+
         assert_eq!(state_of(&policy, "help"), &MacroState::ShadowedBuiltin);
     }
 
@@ -601,7 +611,9 @@ mod tests {
     #[test]
     fn reserved_name_invalid_even_when_allowlisted() {
         let l = list(&["enable"]);
+
         let policy = resolve(globals(&["enable"]), Some(&l), None, None, None);
+
         assert_eq!(
             state_of(&policy, "enable"),
             &MacroState::Invalid {
@@ -614,6 +626,7 @@ mod tests {
     fn reserved_name_invalid_wins_over_builtin_collision() {
         let policy =
             MacroPolicy::effective_with(globals(&["enable"]), None, None, None, None, &["enable"]);
+
         assert_eq!(
             state_of(&policy, "enable"),
             &MacroState::Invalid {
@@ -625,6 +638,7 @@ mod tests {
     #[test]
     fn parse_failure_is_invalid() {
         let policy = resolve(vec![disc_invalid("bad", "boom")], None, None, None, None);
+
         assert_eq!(
             state_of(&policy, "bad"),
             &MacroState::Invalid {
@@ -639,6 +653,7 @@ mod tests {
     #[test]
     fn invalid_wins_over_allowlist_exclusion() {
         let l = list(&["other"]);
+
         let policy = resolve(
             vec![disc_invalid("bad", "boom")],
             Some(&l),
@@ -646,6 +661,7 @@ mod tests {
             None,
             None,
         );
+
         assert_eq!(
             state_of(&policy, "bad"),
             &MacroState::Invalid {
@@ -663,7 +679,9 @@ mod tests {
                 ..disc("a", MacroSource::Global)
             },
         ];
+
         let policy = resolve(discovered, None, None, None, None);
+
         assert_eq!(policy.macros.len(), 2);
         assert_eq!(policy.macros[0].source, Some(MacroSource::Workspace));
         assert!(!policy.macros[0].shadowed_by_workspace);
@@ -676,13 +694,16 @@ mod tests {
     #[test]
     fn find_skips_missing_rows() {
         let l = list(&["ghost"]);
+
         let policy = resolve(vec![], None, None, None, Some(&l));
+
         assert!(policy.find("ghost").is_none());
     }
 
     #[test]
     fn rows_are_sorted_by_name() {
         let policy = resolve(globals(&["c", "a", "b"]), None, None, None, None);
+
         let names: Vec<&str> = policy.macros.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
     }
@@ -690,6 +711,7 @@ mod tests {
     #[test]
     fn resolved_rows_carry_description_and_isolated() {
         let policy = resolve(globals(&["a"]), None, None, None, None);
+
         let row = policy.macros.first().unwrap();
         assert_eq!(row.description.as_deref(), Some("a test macro"));
         assert_eq!(row.isolated, Some(true));

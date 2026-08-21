@@ -68,9 +68,6 @@ enabled_skills:
 inject_skill_instructions: true   # Inject a hint pointing the model at `skill__list`. Defaults to true; suppressed
                                   # automatically when no skills are available.
 skill_instructions: null          # Custom text for the skill hint (optional; uses the built-in default if omitted).
-# Note: `enabled_macros` is NOT a graph setting. Graph nodes never dispatch REPL
-# commands, so the field is silently ignored in graph configs; scope macros via
-# the global config, roles, agents, or sessions instead.
 
 conversation_starters:             # Suggested prompts surfaced in the UI
   - "Research the current state of WebAssembly outside the browser"

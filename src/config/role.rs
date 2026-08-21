@@ -558,6 +558,7 @@ mod tests {
     #[test]
     fn role_new_parses_prompt() {
         let role = Role::new("test", "You are a helpful assistant");
+
         assert_eq!(role.name(), "test");
         assert_eq!(role.prompt(), "You are a helpful assistant");
     }
@@ -566,7 +567,9 @@ mod tests {
     fn role_new_parses_metadata() {
         let content =
             "---\nmodel: openai:gpt-4\ntemperature: 0.7\ntop_p: 0.9\n---\nYou are helpful";
+
         let role = Role::new("test", content);
+
         assert_eq!(role.model_id(), Some("openai:gpt-4"));
         assert_eq!(role.temperature(), Some(0.7));
         assert_eq!(role.top_p(), Some(0.9));
@@ -576,7 +579,9 @@ mod tests {
     #[test]
     fn role_new_parses_enabled_tools() {
         let content = "---\nenabled_tools: tool1,tool2\n---\nPrompt";
+
         let role = Role::new("test", content);
+
         assert_eq!(
             role.enabled_tools(),
             Some(vec!["tool1".to_string(), "tool2".to_string()])
@@ -586,7 +591,9 @@ mod tests {
     #[test]
     fn role_new_parses_enabled_mcp_servers() {
         let content = "---\nenabled_mcp_servers: github,jira\n---\nPrompt";
+
         let role = Role::new("test", content);
+
         assert_eq!(
             role.enabled_mcp_servers(),
             Some(vec!["github".to_string(), "jira".to_string()])
@@ -596,6 +603,7 @@ mod tests {
     #[test]
     fn role_new_no_metadata_has_none_fields() {
         let role = Role::new("test", "Just a prompt");
+
         assert_eq!(role.model_id(), None);
         assert_eq!(role.temperature(), None);
         assert_eq!(role.top_p(), None);
@@ -606,18 +614,21 @@ mod tests {
     #[test]
     fn role_new_enabled_macros_absent_is_none() {
         let role = Role::new("test", "---\ntemperature: 0.5\n---\nPrompt");
+
         assert_eq!(role.enabled_macros, None);
     }
 
     #[test]
     fn role_new_enabled_macros_empty_string_is_some_empty() {
         let role = Role::new("test", "---\nenabled_macros: \"\"\n---\nPrompt");
+
         assert_eq!(role.enabled_macros, Some(vec![]));
     }
 
     #[test]
     fn role_new_enabled_macros_csv_string() {
         let role = Role::new("test", "---\nenabled_macros: a, b\n---\nPrompt");
+
         assert_eq!(
             role.enabled_macros,
             Some(vec!["a".to_string(), "b".to_string()])
@@ -627,6 +638,7 @@ mod tests {
     #[test]
     fn role_new_enabled_macros_list() {
         let role = Role::new("test", "---\nenabled_macros: [a, b]\n---\nPrompt");
+
         assert_eq!(
             role.enabled_macros,
             Some(vec!["a".to_string(), "b".to_string()])
@@ -636,25 +648,30 @@ mod tests {
     #[test]
     fn role_new_enabled_macros_null_is_none() {
         let role = Role::new("test", "---\nenabled_macros: null\n---\nPrompt");
+
         assert_eq!(role.enabled_macros, None);
     }
 
     #[test]
     fn role_export_includes_enabled_macros() {
         let role = Role::new("test", "---\nenabled_macros: [a]\n---\nPrompt");
+
         let exported = role.export();
+
         assert!(exported.contains("enabled_macros: [\"a\"]"));
     }
 
     #[test]
     fn role_export_omits_enabled_macros_when_none() {
         let role = Role::new("test", "Just a prompt");
+
         assert!(!role.export().contains("enabled_macros"));
     }
 
     #[test]
     fn role_builtin_shell_loads() {
         let role = Role::builtin("shell").unwrap();
+
         assert_eq!(role.name(), "shell");
         assert!(!role.prompt().is_empty());
     }
@@ -662,6 +679,7 @@ mod tests {
     #[test]
     fn role_builtin_code_loads() {
         let role = Role::builtin("code").unwrap();
+
         assert_eq!(role.name(), "code");
         assert!(!role.prompt().is_empty());
     }
@@ -669,12 +687,14 @@ mod tests {
     #[test]
     fn role_builtin_nonexistent_errors() {
         let result = Role::builtin("nonexistent_role_xyz");
+
         assert!(result.is_err());
     }
 
     #[test]
     fn role_default_has_empty_fields() {
         let role = Role::default();
+
         assert_eq!(role.name(), "");
         assert_eq!(role.prompt(), "");
         assert_eq!(role.model_id(), None);
@@ -684,14 +704,18 @@ mod tests {
     fn role_set_model_updates_model() {
         let mut role = Role::new("test", "prompt");
         let model = Model::default();
+
         role.set_model(model.clone());
+
         assert_eq!(role.model().id(), model.id());
     }
 
     #[test]
     fn role_set_temperature_works() {
         let mut role = Role::new("test", "prompt");
+
         role.set_temperature(Some(0.5));
+
         assert_eq!(role.temperature(), Some(0.5));
     }
 
@@ -699,7 +723,9 @@ mod tests {
     fn role_export_includes_metadata() {
         let content = "---\ntemperature: 0.8\n---\nMy prompt";
         let role = Role::new("test", content);
+
         let exported = role.export();
+
         assert!(exported.contains("temperature"));
         assert!(exported.contains("My prompt"));
     }
@@ -713,6 +739,7 @@ Input 1
 ### OUTPUT:
 Output 1
 "#;
+
         assert_eq!(
             parse_structure_prompt(prompt),
             ("System message", vec![("Input 1", "Output 1")])
@@ -727,6 +754,7 @@ Input 1
 ### OUTPUT:
 Output 1
 "#;
+
         assert_eq!(
             parse_structure_prompt(prompt),
             ("", vec![("Input 1", "Output 1")])
@@ -740,6 +768,7 @@ System message
 ### INPUT:
 Input 1
 "#;
+
         assert_eq!(parse_structure_prompt(prompt), (prompt, vec![]));
     }
 }
