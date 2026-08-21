@@ -1131,6 +1131,12 @@ struct AgentMetadataStub {
     description: String,
 }
 
+#[derive(Deserialize)]
+struct AgentVariablesStub {
+    #[serde(default)]
+    variables: Vec<AgentVariable>,
+}
+
 fn load_agent_description(name: &str) -> String {
     if let Ok(config) = AgentConfig::load(&paths::agent_config_file(name)) {
         return config.description;
@@ -1145,16 +1151,22 @@ fn load_agent_description(name: &str) -> String {
     String::new()
 }
 
-pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
-    let config_path = paths::agent_config_file(agent_name);
-    if !config_path.exists() {
-        return vec![];
+fn load_agent_variables(name: &str) -> Vec<AgentVariable> {
+    if let Ok(config) = AgentConfig::load(&paths::agent_config_file(name)) {
+        return config.variables;
     }
-    let Ok(config) = AgentConfig::load(&config_path) else {
-        return vec![];
-    };
-    config
-        .variables
+
+    if let Ok(contents) = read_to_string(paths::agent_graph_file(name))
+        && let Ok(stub) = serde_yaml::from_str::<AgentVariablesStub>(&contents)
+    {
+        return stub.variables;
+    }
+
+    Vec::new()
+}
+
+pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
+    load_agent_variables(agent_name)
         .iter()
         .map(|v| {
             let description = match &v.default {
@@ -1397,6 +1409,41 @@ version: "1.0"
         let meta: AgentMetadataStub = serde_yaml::from_str(yaml).unwrap();
 
         assert_eq!(meta.description, "");
+    }
+
+    #[test]
+    fn agent_variables_stub_extracts_variables_from_graph_yaml() {
+        let yaml = r#"
+name: coder
+description: Implementation agent.
+version: "1.0"
+variables:
+  - name: task
+    description: The task to implement
+  - name: scope
+    description: Directory scope
+    default: src/
+start: plan
+nodes: {}
+"#;
+
+        let stub: AgentVariablesStub = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(stub.variables.len(), 2);
+        assert_eq!(stub.variables[0].name, "task");
+        assert_eq!(stub.variables[0].description, "The task to implement");
+        assert_eq!(stub.variables[0].default, None);
+        assert_eq!(stub.variables[1].name, "scope");
+        assert_eq!(stub.variables[1].default.as_deref(), Some("src/"));
+    }
+
+    #[test]
+    fn agent_variables_stub_defaults_when_variables_missing() {
+        let yaml = "name: coder\nversion: \"1.0\"\nstart: plan\nnodes: {}\n";
+
+        let stub: AgentVariablesStub = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(stub.variables.is_empty());
     }
 
     #[test]
