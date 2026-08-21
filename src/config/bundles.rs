@@ -65,6 +65,8 @@ pub(crate) struct BundleRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) homepage: Option<String>,
     pub(crate) installed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) updated_at: Option<String>,
     #[serde(default)]
     pub(crate) files: Vec<FileRecord>,
     #[serde(default)]
@@ -153,7 +155,6 @@ impl BundleStore {
             .with_context(|| format!("failed to write {}", self.path.display()))
     }
 
-    #[allow(dead_code)]
     pub(crate) fn get(&self, name: &str) -> Option<&BundleRecord> {
         self.bundles.get(name)
     }
@@ -308,12 +309,36 @@ impl BundleStore {
                         description: metadata.description,
                         homepage: metadata.homepage,
                         installed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                        updated_at: None,
                         files: Vec::new(),
                         mcp_servers: Vec::new(),
                     },
                 );
             }
         }
+        self.save()
+    }
+
+    /// Stamp the record with the time of its most recent update from source.
+    pub(crate) fn mark_updated(&mut self, name: &str) -> Result<()> {
+        self.ensure_bundle_exists(name)?;
+        let record = self
+            .bundles
+            .get_mut(name)
+            .expect("bundle existence checked above");
+        record.updated_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+        self.save()
+    }
+
+    /// Drop one path from a bundle's owned files and persist. Used when the
+    /// bundle no longer ships the file and it is gone (or deleted) locally.
+    pub(crate) fn remove_file_record(&mut self, bundle: &str, path: &str) -> Result<()> {
+        self.ensure_bundle_exists(bundle)?;
+        let record = self
+            .bundles
+            .get_mut(bundle)
+            .expect("bundle existence checked above");
+        record.files.retain(|owned| owned.path != path);
         self.save()
     }
 
@@ -963,6 +988,72 @@ mod tests {
         let mut store = dir.store();
 
         let result = store.record_file("ghost", file_record("macros/a.yaml", "a"));
+
+        assert!(result.unwrap_err().to_string().contains("ghost"));
+    }
+
+    #[test]
+    fn mark_updated_stamps_and_round_trips() {
+        let dir = TempStoreDir::new("bundles-mark-updated");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("omc", metadata("https://github.com/x/omc", "abc123"))
+            .unwrap();
+        let raw_before = fs::read_to_string(dir.store_path()).unwrap();
+        assert!(!raw_before.contains("updated_at"), "{raw_before}");
+        assert_eq!(store.get("omc").unwrap().updated_at, None);
+
+        store.mark_updated("omc").unwrap();
+
+        let raw_after = fs::read_to_string(dir.store_path()).unwrap();
+        assert!(raw_after.contains("updated_at"), "{raw_after}");
+        let reloaded = dir.store();
+        assert!(reloaded.get("omc").unwrap().updated_at.is_some());
+    }
+
+    #[test]
+    fn mark_updated_unknown_bundle_fails() {
+        let dir = TempStoreDir::new("bundles-mark-unknown");
+        let mut store = dir.store();
+
+        let result = store.mark_updated("ghost");
+
+        assert!(result.unwrap_err().to_string().contains("ghost"));
+    }
+
+    #[test]
+    fn remove_file_record_drops_only_the_named_path() {
+        let dir = TempStoreDir::new("bundles-remove-file");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("omc", metadata("https://github.com/x/omc", "abc123"))
+            .unwrap();
+        store
+            .record_file("omc", file_record("macros/a.yaml", "a"))
+            .unwrap();
+        store
+            .record_file("omc", file_record("macros/b.yaml", "b"))
+            .unwrap();
+
+        store.remove_file_record("omc", "macros/a.yaml").unwrap();
+
+        let reloaded = dir.store();
+        let paths: Vec<&str> = reloaded
+            .get("omc")
+            .unwrap()
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["macros/b.yaml"]);
+    }
+
+    #[test]
+    fn remove_file_record_unknown_bundle_fails() {
+        let dir = TempStoreDir::new("bundles-remove-unknown");
+        let mut store = dir.store();
+
+        let result = store.remove_file_record("ghost", "macros/a.yaml");
 
         assert!(result.unwrap_err().to_string().contains("ghost"));
     }
