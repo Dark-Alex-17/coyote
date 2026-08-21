@@ -88,6 +88,7 @@ A diff review is a review of THE CHANGE, not the whole file:
 
 - Are names accurate? `get_user` that mutates is a lie; rename or split.
 - Could a competent reader understand this without comments?
+- Do NEW comments match the repo's comment register? You already read neighboring files for conventions — compare against them. Flag BOTH directions: narrated/restating comments in a repo that uses self-documenting code (each one is a finding, cite the line), AND missing doc comments on new public items in a repo that documents its public API. Comments explaining non-obvious *why* (decisions, workarounds, invariants) are warranted in every repo; comments captioning *what* the code plainly does are warranted in none.
 - Is there a simpler way to express the same logic?
 - Is the function doing one thing, or several things glued together?
 

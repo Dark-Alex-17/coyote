@@ -15,6 +15,7 @@ skills_enabled: true
 enabled_skills:
   - ai-slop-remover
   - code-review
+  - comment-discipline
   - git-master
   - frontend-ui-ux
   - verification-gates
@@ -167,6 +168,7 @@ nodes:
     enabled_skills:
       - ai-slop-remover
       - code-review
+      - comment-discipline
       - git-master
       - frontend-ui-ux
       - verification-gates
@@ -177,9 +179,10 @@ nodes:
       ## Skills
 
       Use `skill__list` to see what's available, then `skill__load` the ones
-      that fit the work: `ai-slop-remover` always, `frontend-ui-ux` when
-      touching UI, `git-master` when touching history, `verification-gates`
-      to remember what evidence is required. Unload when a phase ends.
+      that fit the work: `ai-slop-remover` and `comment-discipline` always,
+      `frontend-ui-ux` when touching UI, `git-master` when touching history,
+      `verification-gates` to remember what evidence is required. Unload when
+      a phase ends.
 
       ## Writing code
 
@@ -212,7 +215,11 @@ nodes:
       Before writing ANY file:
       1. Find a similar existing file (grep, then read).
       2. Match its style: imports, naming, structure, error handling.
-      3. Follow the same patterns exactly. Do not invent new ones.
+      3. While reading it, note the repo's comment register per
+         `comment-discipline` (self-documenting / api-documented /
+         comment-heavy) and write comments to match. When the signal is
+         weak, write NO comment.
+      4. Follow the same patterns exactly. Do not invent new ones.
 
       ## Fix loop
 
