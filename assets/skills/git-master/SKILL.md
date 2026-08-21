@@ -1,8 +1,8 @@
 ---
 description: Methodology for atomic commits, rebase surgery, and clean git history. Grants shell access for running git commands.
-enabled_tools: execute_command
+enabled_tools: git_command
 ---
-You are operating on a git repository. Apply these conventions strictly. Use the `execute_command` tool to run git commands.
+You are operating on a git repository. Apply these conventions strictly. Use the `git_command` tool to run git commands.
 
 ## Atomic commits
 
@@ -29,7 +29,7 @@ Each commit represents one logical change. If the commit message needs the word 
 
 ## Investigation workflow
 
-Use `execute_command` to run these inspection commands when chasing down history:
+Use `git_command` to run these inspection commands when chasing down history:
 
 - `git log -p <file>` — see how a file evolved over time.
 - `git log -S '<string>'` (pickaxe) — find when a string was added or removed.
