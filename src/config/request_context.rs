@@ -3264,6 +3264,17 @@ impl RequestContext {
                     let mut values: Vec<String> =
                         AssetCategory::NAMES.iter().map(|s| s.to_string()).collect();
                     values.push("remote".to_string());
+                    values.extend(
+                        BundleStore::load()
+                            .map(|store| {
+                                store
+                                    .bundle_names()
+                                    .into_iter()
+                                    .map(str::to_string)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                    );
                     super::map_completion_values(values)
                 }
                 ".uninstall" => {
@@ -4977,6 +4988,36 @@ mod tests {
             values.iter().any(|(name, _)| name == "omc"),
             "got: {values:?}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_install_offers_categories_remote_and_bundles() {
+        let _guard = TestConfigDirGuard::new();
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle(
+                "omc",
+                crate::config::bundles::InstallMetadata {
+                    source: "https://github.com/x/omc".to_string(),
+                    git_ref: None,
+                    commit: "abc123".to_string(),
+                    version: None,
+                    description: None,
+                    homepage: None,
+                },
+            )
+            .unwrap();
+        let ctx = create_test_ctx();
+
+        let values = ctx.repl_complete(".install", &[""], "");
+
+        for expected in ["agents", "remote", "omc"] {
+            assert!(
+                values.iter().any(|(name, _)| name == expected),
+                "missing '{expected}'; got: {values:?}"
+            );
+        }
     }
 
     #[test]

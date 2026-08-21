@@ -130,11 +130,18 @@ async fn main() -> Result<()> {
 
     install_builtins()?;
 
-    if let Some(category) = cli.install {
+    if let Some(category) = cli.install_builtins {
         return config::install_assets(category);
     }
 
+    if let Some(value) = cli.install.as_deref() {
+        return config::install_or_update(value, cli.filter, cli.install_force);
+    }
+
     if let Some(url) = cli.install_from.as_deref() {
+        eprintln!(
+            "warning: --install-from is deprecated and will be removed in a future release; use --install <GIT_URL>"
+        );
         return config::install_remote(url, cli.filter, cli.install_force);
     }
 

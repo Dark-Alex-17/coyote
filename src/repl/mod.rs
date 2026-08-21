@@ -317,7 +317,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 61]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".install",
-            "Reinstall bundled assets, or install assets from a remote git repo (.install remote <url>)",
+            "Reinstall bundled assets, install a bundle from a git repo, or update an installed bundle",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -870,27 +870,20 @@ pub async fn run_repl_command(
                     replay::render(app.as_ref(), &compressed, &active)?;
                 }
             }
-            ".install" => {
-                let trimmed = args.map(str::trim).unwrap_or("");
-                let mut parts = trimmed.splitn(2, char::is_whitespace);
-                match parts.next() {
-                    Some("remote") => {
-                        let rest = parts.next().unwrap_or("").trim();
-                        config::install_remote_from_repl_args(rest)?;
-                    }
-                    Some(name) if !name.is_empty() => match AssetCategory::parse(name) {
-                        Some(category) => config::install_assets(category)?,
-                        None => println!(
-                            "Unknown asset category '{name}'. Valid categories: {}",
-                            AssetCategory::NAMES.join(", ")
-                        ),
-                    },
-                    _ => println!(
-                        "Usage: .install <{}> | .install remote <git-url>",
-                        AssetCategory::NAMES.join("|")
-                    ),
+            ".install" => match parse_repl_install(args) {
+                ReplInstallDispatch::Builtins(category) => config::install_assets(category)?,
+                ReplInstallDispatch::Remote(rest) => {
+                    config::install_remote_from_repl_args(rest)?;
                 }
-            }
+                ReplInstallDispatch::Unified(value) => {
+                    config::install_or_update_from_repl_args(value)?;
+                }
+                ReplInstallDispatch::Usage => println!(
+                    "Usage: .install <{}> | .install <git-url|installed-bundle> | \
+                         .install remote <git-url> [--filter <cat>] [--force]",
+                    AssetCategory::NAMES.join("|")
+                ),
+            },
             ".update" => {
                 if ctx.macro_flag {
                     bail!("Cannot perform this operation because you are in a macro")
@@ -1581,6 +1574,27 @@ fn unknown_command() -> Result<()> {
     bail!(r#"Unknown command. Type ".help" for additional help."#);
 }
 
+#[derive(Debug, PartialEq)]
+enum ReplInstallDispatch<'a> {
+    Builtins(AssetCategory),
+    Remote(&'a str),
+    Unified(&'a str),
+    Usage,
+}
+
+fn parse_repl_install(args: Option<&str>) -> ReplInstallDispatch<'_> {
+    let trimmed = args.map(str::trim).unwrap_or("");
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    match parts.next() {
+        Some("remote") => ReplInstallDispatch::Remote(parts.next().unwrap_or("").trim()),
+        Some(name) if !name.is_empty() => match AssetCategory::parse(name) {
+            Some(category) => ReplInstallDispatch::Builtins(category),
+            None => ReplInstallDispatch::Unified(trimmed),
+        },
+        _ => ReplInstallDispatch::Usage,
+    }
+}
+
 pub fn builtin_command_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = REPL_COMMANDS
         .iter()
@@ -1804,6 +1818,36 @@ mod tests {
     #[test]
     fn repl_commands_has_61_entries() {
         assert_eq!(REPL_COMMANDS.len(), 61);
+    }
+
+    #[test]
+    fn parse_repl_install_keeps_category_and_remote_back_compat() {
+        assert_eq!(
+            parse_repl_install(Some("agents")),
+            ReplInstallDispatch::Builtins(AssetCategory::Agents)
+        );
+        assert_eq!(
+            parse_repl_install(Some("remote https://x --force")),
+            ReplInstallDispatch::Remote("https://x --force")
+        );
+    }
+
+    #[test]
+    fn parse_repl_install_routes_other_values_to_unified_dispatch() {
+        assert_eq!(
+            parse_repl_install(Some("https://github.com/x/y")),
+            ReplInstallDispatch::Unified("https://github.com/x/y")
+        );
+        assert_eq!(
+            parse_repl_install(Some("my-bundle")),
+            ReplInstallDispatch::Unified("my-bundle")
+        );
+    }
+
+    #[test]
+    fn parse_repl_install_empty_args_ask_for_usage() {
+        assert_eq!(parse_repl_install(None), ReplInstallDispatch::Usage);
+        assert_eq!(parse_repl_install(Some("  ")), ReplInstallDispatch::Usage);
     }
 
     #[test]
