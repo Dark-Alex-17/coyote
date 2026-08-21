@@ -26,8 +26,11 @@ flowchart TD
     broad_gate -->|"no"| spec_gate
     code_reviewer --> spec_gate{"Implements<br/>a spec / plan?"}
     spec_gate -->|"yes"| adversary[["adversary<br/>plan-conformance"]]
-    spec_gate -->|"no"| done
-    adversary --> done
+    spec_gate -->|"no"| sec_gate
+    adversary --> sec_gate{"Touches attack surface?<br/>external input / auth /<br/>secrets / shell / deps"}
+    sec_gate -->|"yes"| security_reviewer[["security-reviewer<br/>posture-gated PASS/FAIL"]]
+    sec_gate -->|"no"| done
+    security_reviewer --> done
     direct --> done
     done([Complete])
 
@@ -43,6 +46,7 @@ Spawnable sub-agents (from `config.yaml`):
 - **[coder](../coder/README.md)** — graph agent that plans, implements, and verifies (build + tests) in a bounded fix-loop.
 - **[code-reviewer](../code-reviewer/README.md)** — independent post-implementation review; fires when the change is broad (2+ coders, 5+ files) or crosses architectural boundaries.
 - **[adversary](../adversary/README.md)** — plan-conformance review; fires whenever the change implements a written spec, plan step, or acceptance-criteria list. Orthogonal to `code-reviewer` — both can run.
+- **[security-reviewer](../security-reviewer/README.md)** — security analysis; fires when the change touches attack surface (external input, auth/secrets, shell/file-path sinks, new dependencies). Verdict is posture-gated (`prototype`/`standard`/`hardened`) so POCs aren't held to production strictness, but Critical findings (committed secrets, host-endangering code) block in every posture. Orthogonal to both other reviewers — all three can run.
 - **[step-runner](../step-runner/README.md)** — graph agent that executes one step of a phased plan repo. Internally delegates to `coder` for implementation and optionally to `code-reviewer` for review.
 
 ## Features
