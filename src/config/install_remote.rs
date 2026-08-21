@@ -374,14 +374,12 @@ fn strip_git_suffix(segment: &str) -> &str {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn repo_name_slug(url: &str) -> String {
     let (_, path) = split_host_and_path(url);
     let last = path.rsplit('/').next().unwrap_or("");
     strip_git_suffix(last).to_string()
 }
 
-#[allow(dead_code)]
 pub(crate) fn owner_qualifier(url: &str) -> Option<String> {
     let (host, path) = split_host_and_path(url);
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -407,7 +405,6 @@ fn sanitize_host(host: &str) -> String {
         .to_string()
 }
 
-#[allow(dead_code)]
 pub(crate) fn canonical_source_url(url: &str) -> String {
     let (host, path) = split_host_and_path(url);
     let mut path = path.to_ascii_lowercase();
