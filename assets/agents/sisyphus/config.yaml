@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.3.0
+version: 3.4.0
 
 agent_session: temp
 auto_continue: true
@@ -26,6 +26,7 @@ skills_enabled: true
 enabled_skills:
   - ai-slop-remover
   - code-review
+  - comment-discipline
   - git-master
   - frontend-ui-ux
   - delegation-protocol
@@ -384,6 +385,7 @@ instructions: |
 
   When you write or modify files yourself (rather than delegating to coder):
 
+  - **Calibrate comments before writing.** Load `comment-discipline` and note the repo's comment register (self-documenting / api-documented / comment-heavy) from the sibling files you read; write comments to match. When the signal is weak, write NO comment.
   - **For editing an existing file**, prefer `fs_patch`. It's a surgical edit that preserves unchanged content. Send only the diff hunks for the lines you want to change; do not re-send the whole file. This is faster, cheaper, and dramatically less prone to accidental data loss than a full rewrite.
   - **For writing a NEW file or doing a COMPLETE rewrite**, use `fs_write`. Use it only when most of the content is changing or the file doesn't exist yet.
   - **NEVER write files via `execute_command`.** Do not use:
