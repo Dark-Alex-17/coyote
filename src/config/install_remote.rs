@@ -2,7 +2,7 @@ use super::bundles::{
     BundleStore, FileAction, FileRecord, InstallMetadata, McpAction, McpServerRecord, hash_bytes,
     hash_file,
 };
-use crate::config::{InstallFilter, paths};
+use crate::config::{AssetCategory, InstallFilter, paths};
 #[cfg(not(windows))]
 use crate::function::Language;
 use crate::mcp::{McpServer, McpServersConfig};
@@ -10,6 +10,7 @@ use crate::utils;
 use crate::utils::IS_STDOUT_TERMINAL;
 use crate::vault::{Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
+use clap::ValueEnum;
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, Select};
@@ -80,6 +81,14 @@ pub fn install_remote_from_repl_args(args: &str) -> Result<()> {
         )
     })?;
 
+    let (filter, force) = parse_repl_install_flags(".install remote", iter)?;
+    install_remote(&url, filter, force)
+}
+
+fn parse_repl_install_flags(
+    command: &str,
+    mut iter: impl Iterator<Item = String>,
+) -> Result<(Option<InstallFilter>, bool)> {
     let mut filter: Option<InstallFilter> = None;
     let mut force = false;
 
@@ -98,11 +107,117 @@ pub fn install_remote_from_repl_args(args: &str) -> Result<()> {
             s if s.starts_with("--filter=") => {
                 filter = Some(parse_filter(&s["--filter=".len()..])?);
             }
-            other => bail!("Unexpected argument to '.install remote': {other}"),
+            other => bail!("Unexpected argument to '{command}': {other}"),
         }
     }
 
-    install_remote(&url, filter, force)
+    Ok((filter, force))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum InstallTarget {
+    Category(AssetCategory),
+    InstalledBundle,
+    RemoteSource,
+    Unknown,
+}
+
+fn classify_install_target(value: &str, installed_names: &[String]) -> InstallTarget {
+    if let Some(category) = AssetCategory::parse(value) {
+        return InstallTarget::Category(category);
+    }
+    let name = strip_ref_suffix(value);
+    if installed_names.iter().any(|installed| installed == name) {
+        return InstallTarget::InstalledBundle;
+    }
+    if looks_like_remote_source(value) {
+        return InstallTarget::RemoteSource;
+    }
+    InstallTarget::Unknown
+}
+
+/// A value is treated as a source when it is a URL, an scp-style
+/// `[user@]host:path`, or an explicit local path. Bare names never are: they
+/// must match an installed bundle.
+fn looks_like_remote_source(value: &str) -> bool {
+    if value.contains("://")
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('/')
+        || value.starts_with('~')
+    {
+        return true;
+    }
+    match value.split_once(':') {
+        Some((host, _)) => {
+            !host.is_empty() && !host.contains('/') && !host.chars().any(char::is_whitespace)
+        }
+        None => false,
+    }
+}
+
+/// Unified entry point behind `--install` and the REPL's `.install <value>`:
+/// asset categories are redirected to `--install-builtins`, installed bundle
+/// names become updates, and anything shaped like a source is installed.
+pub fn install_or_update(value: &str, filter: Option<InstallFilter>, force: bool) -> Result<()> {
+    let store = BundleStore::load()?;
+    let installed: Vec<String> = store
+        .bundle_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    match classify_install_target(value, &installed) {
+        InstallTarget::Category(category) => {
+            let name = category
+                .to_possible_value()
+                .map_or_else(|| value.to_string(), |v| v.get_name().to_string());
+            let update_hint = if installed.iter().any(|installed| installed == value) {
+                format!(" To update the installed bundle '{value}', use `--update-bundle {value}`.")
+            } else {
+                String::new()
+            };
+            bail!(
+                "'{value}' is an asset category, not a bundle; did you mean \
+                 `--install-builtins {name}`? (categories are reinstalled from \
+                 the assets built into coyote, not from a remote){update_hint}"
+            );
+        }
+        InstallTarget::InstalledBundle => {
+            if filter.is_some() || force {
+                bail!("--filter/--install-force only apply to remote installs, not bundle updates");
+            }
+            update_bundle(value)
+        }
+        InstallTarget::RemoteSource => install_remote(value, filter, force),
+        InstallTarget::Unknown => {
+            let hint = "a remote source must be a git URL, an scp-style host:path, \
+                 or an explicit local path (./dir, /abs, ~)";
+            if installed.is_empty() {
+                bail!("no bundle named '{value}' is installed; none are installed ({hint})");
+            }
+            bail!(
+                "no bundle named '{value}' is installed; installed bundles: {} ({hint})",
+                installed.join(", ")
+            )
+        }
+    }
+}
+
+pub fn install_or_update_from_repl_args(args: &str) -> Result<()> {
+    let tokens = shell_words::split(args)
+        .with_context(|| format!("failed to parse '.install' args: {args}"))?;
+
+    let mut iter = tokens.into_iter();
+    let value = iter.next().with_context(|| {
+        format!(
+            "Usage: .install <git-url|installed-bundle> [--filter <{}>] [--force]",
+            InstallFilter::NAMES.join("|")
+        )
+    })?;
+
+    let (filter, force) = parse_repl_install_flags(".install", iter)?;
+    install_or_update(&value, filter, force)
 }
 
 /// Update an installed bundle from its recorded source. `spec` is the bundle
@@ -3457,6 +3572,160 @@ mod tests {
         assert_eq!(
             fs::read_to_string(paths::macros_dir().join("two.yaml")).unwrap(),
             "2\n"
+        );
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    fn owned_names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn classify_urls_and_paths_as_remote_sources() {
+        for value in [
+            "https://github.com/x/y",
+            "git@github.com:x/y.git",
+            "./bundle-dir",
+            "../up",
+            "/abs/path",
+            "~/home-rel",
+        ] {
+            assert_eq!(
+                classify_install_target(value, &[]),
+                InstallTarget::RemoteSource,
+                "value: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_categories_win_over_installed_names() {
+        assert_eq!(
+            classify_install_target("agents", &owned_names(&["agents"])),
+            InstallTarget::Category(AssetCategory::Agents)
+        );
+        assert_eq!(
+            classify_install_target("mcp_config", &[]),
+            InstallTarget::Category(AssetCategory::McpConfig)
+        );
+    }
+
+    #[test]
+    fn classify_installed_names_with_optional_ref() {
+        let installed = owned_names(&["omc"]);
+        assert_eq!(
+            classify_install_target("omc", &installed),
+            InstallTarget::InstalledBundle
+        );
+        assert_eq!(
+            classify_install_target("omc#v2", &installed),
+            InstallTarget::InstalledBundle
+        );
+    }
+
+    #[test]
+    fn classify_bare_names_without_a_match_as_unknown() {
+        assert_eq!(classify_install_target("omc", &[]), InstallTarget::Unknown);
+        assert_eq!(
+            classify_install_target("not-a-bundle", &owned_names(&["omc"])),
+            InstallTarget::Unknown
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_or_update_redirects_categories_to_install_builtins() {
+        let _guard = TestVaultConfigGuard::new("iou-category");
+
+        let err = install_or_update("agents", None, false).unwrap_err();
+
+        assert!(
+            err.to_string().contains("--install-builtins agents"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_or_update_unknown_name_lists_installed_bundles() {
+        let _guard = TestVaultConfigGuard::new("iou-unknown");
+
+        let err = install_or_update("not-a-bundle", None, false).unwrap_err();
+        assert!(err.to_string().contains("none are installed"), "got: {err}");
+
+        let src_root = fresh_temp_dir("iou-unknown-src-");
+        let repo = src_root.join("bundle");
+        write_src(&repo, BUNDLE_MANIFEST_FILE, "name: known-bundle\n");
+        write_src(&repo, "macros/m.yaml", "a: 1\n");
+        init_bundle_repo(&repo);
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+
+        let err = install_or_update("not-a-bundle", None, false).unwrap_err();
+
+        assert!(
+            err.to_string().contains("no bundle named 'not-a-bundle'"),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("installed bundles: known-bundle"),
+            "got: {err}"
+        );
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    #[serial]
+    fn install_or_update_category_error_hints_update_for_shadowed_bundle() {
+        let _guard = TestVaultConfigGuard::new("iou-shadow");
+
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle(
+                "agents",
+                InstallMetadata {
+                    source: "https://github.com/x/agents".to_string(),
+                    git_ref: None,
+                    commit: "abc123".to_string(),
+                    version: None,
+                    description: None,
+                    homepage: None,
+                },
+            )
+            .unwrap();
+
+        let err = install_or_update("agents", None, false).unwrap_err();
+
+        assert!(
+            err.to_string().contains("--install-builtins agents"),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("--update-bundle agents"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_or_update_rejects_remote_flags_for_updates() {
+        let _guard = TestVaultConfigGuard::new("iou-flags");
+        let src_root = fresh_temp_dir("iou-flags-src-");
+        let repo = src_root.join("bundle");
+        write_src(&repo, BUNDLE_MANIFEST_FILE, "name: flag-bundle\n");
+        write_src(&repo, "macros/m.yaml", "a: 1\n");
+        init_bundle_repo(&repo);
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+
+        let err = install_or_update("flag-bundle", Some(InstallFilter::Macros), false).unwrap_err();
+        assert!(
+            err.to_string().contains("only apply to remote installs"),
+            "got: {err}"
+        );
+
+        let err = install_or_update("flag-bundle", None, true).unwrap_err();
+        assert!(
+            err.to_string().contains("only apply to remote installs"),
+            "got: {err}"
         );
         let _ = fs::remove_dir_all(&src_root);
     }

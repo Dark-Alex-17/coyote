@@ -50,7 +50,7 @@ pub enum McpScopeArg {
 				"model", "prompt", "role", "session", "agent", "rag", "rebuild_rag",
 				"macro_name", "execute", "code", "file", "no_stream", "no_memory",
 				"init_memory", "dry_run", "info", "build_tools", "install",
-				"install_from", "sync_models", "list_models", "list_roles",
+				"install_from", "install_builtins", "sync_models", "list_models", "list_roles",
 				"list_sessions", "list_agents", "list_rags", "list_macros",
 				"list_skills", "list_bundles", "skill", "tail_logs", "completions",
 				"update", "update_bundle", "uninstall",
@@ -59,6 +59,11 @@ pub enum McpScopeArg {
 	group(
 		ArgGroup::new("mcp-action")
 			.args(["mcp_add", "mcp_remove", "mcp_list", "mcp_get"])
+			.multiple(false)
+	),
+	group(
+		ArgGroup::new("remote-install")
+			.args(["install", "install_from"])
 			.multiple(false)
 	),
 )]
@@ -180,30 +185,43 @@ pub struct Cli {
     #[arg(long, help_heading = "List & Discovery")]
     pub list_bundles: bool,
 
+    /// Install assets from a remote git repository (URL may be suffixed with #<ref>), or update an already-installed bundle by name
+    #[arg(
+        long,
+        value_name = "GIT_URL|NAME",
+        help_heading = "Installation & Updates"
+    )]
+    pub install: Option<String>,
     /// Reinstall bundled assets, overwriting any local changes
     #[arg(
         long,
         value_name = "CATEGORY",
         value_enum,
+        conflicts_with_all = ["install", "install_from"],
         help_heading = "Installation & Updates"
     )]
-    pub install: Option<AssetCategory>,
+    pub install_builtins: Option<AssetCategory>,
     /// Install assets from a remote git repository (URL may be suffixed with #<ref>)
-    #[arg(long, value_name = "GIT_URL", help_heading = "Installation & Updates")]
+    #[arg(
+        long,
+        value_name = "GIT_URL",
+        hide = true,
+        help_heading = "Installation & Updates"
+    )]
     pub install_from: Option<String>,
-    /// Restrict --install-from to a single asset category
+    /// Restrict a remote install to a single asset category
     #[arg(
         long,
         value_name = "CATEGORY",
         value_enum,
-        requires = "install_from",
+        requires = "remote-install",
         help_heading = "Installation & Updates"
     )]
     pub filter: Option<InstallFilter>,
-    /// Overwrite all conflicts without prompting (used with --install-from)
+    /// Overwrite all conflicts without prompting (used with --install)
     #[arg(
         long,
-        requires = "install_from",
+        requires = "remote-install",
         help_heading = "Installation & Updates"
     )]
     pub install_force: bool,
@@ -538,6 +556,94 @@ mod tests {
     fn parse_yes_flag_requires_uninstall() {
         assert!(parse(&["--uninstall", "foo", "--yes"]).yes);
         assert!(Cli::try_parse_from(["coyote", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn parse_install_flag_takes_url_or_name() {
+        assert_eq!(
+            parse(&["--install", "https://github.com/x/y"])
+                .install
+                .as_deref(),
+            Some("https://github.com/x/y")
+        );
+    }
+
+    #[test]
+    fn parse_install_builtins_flag_takes_category() {
+        assert_eq!(
+            parse(&["--install-builtins", "agents"]).install_builtins,
+            Some(AssetCategory::Agents)
+        );
+        assert_eq!(
+            parse(&["--install-builtins", "mcp_config"]).install_builtins,
+            Some(AssetCategory::McpConfig)
+        );
+    }
+
+    #[test]
+    fn parse_install_from_flag_still_works() {
+        assert_eq!(
+            parse(&["--install-from", "https://github.com/x/y"])
+                .install_from
+                .as_deref(),
+            Some("https://github.com/x/y")
+        );
+    }
+
+    #[test]
+    fn parse_install_conflicts_with_install_from() {
+        assert!(Cli::try_parse_from(["coyote", "--install", "x", "--install-from", "y"]).is_err());
+    }
+
+    #[test]
+    fn parse_install_builtins_conflicts_with_remote_install_flags() {
+        assert!(
+            Cli::try_parse_from(["coyote", "--install-builtins", "agents", "--install", "x"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "coyote",
+                "--install-builtins",
+                "agents",
+                "--install-from",
+                "y"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_filter_requires_a_remote_install_flag() {
+        assert!(Cli::try_parse_from(["coyote", "--filter", "agents"]).is_err());
+        assert_eq!(
+            parse(&["--install", "https://github.com/x/y", "--filter", "agents"]).filter,
+            Some(InstallFilter::Agents)
+        );
+        assert_eq!(
+            parse(&[
+                "--install-from",
+                "https://github.com/x/y",
+                "--filter",
+                "agents"
+            ])
+            .filter,
+            Some(InstallFilter::Agents)
+        );
+    }
+
+    #[test]
+    fn parse_install_force_requires_a_remote_install_flag() {
+        assert!(Cli::try_parse_from(["coyote", "--install-force"]).is_err());
+        assert!(parse(&["--install", "https://github.com/x/y", "--install-force"]).install_force);
+    }
+
+    #[test]
+    fn help_hides_install_from_and_shows_install_builtins() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--install-from"), "help: {help}");
+        assert!(help.contains("--install-builtins"));
     }
 
     #[test]
