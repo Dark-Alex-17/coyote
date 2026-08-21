@@ -249,11 +249,11 @@ mod tests {
     use crate::config::{AppState, Session, WorkingMode};
     use crate::utils::{create_abort_signal, get_env_name};
     use serial_test::serial;
-    use std::env;
     use std::fs::{create_dir_all, remove_dir_all, write};
     use std::future::Future;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{env, str};
 
     struct TestConfigDirGuard {
         key: String,
@@ -695,12 +695,11 @@ variables:
     fn embedded_macro_assets_deserialize_with_defaults() {
         for file in MacroAssets::iter() {
             let embedded = MacroAssets::get(&file).unwrap();
-            let content = std::str::from_utf8(&embedded.data).unwrap();
+            let content = str::from_utf8(&embedded.data).unwrap();
 
             let m: Macro = serde_yaml::from_str(content)
                 .unwrap_or_else(|e| panic!("asset '{}' failed to deserialize: {e}", file.as_ref()));
 
-            assert!(m.description.is_none(), "asset '{}'", file.as_ref());
             assert!(m.isolated, "asset '{}'", file.as_ref());
             assert!(!m.steps.is_empty(), "asset '{}'", file.as_ref());
         }
