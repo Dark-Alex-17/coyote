@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, Select};
+use serde::Deserialize;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,8 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
     let temp = clone_to_temp(&url, reference.as_deref())?;
     println!("Cloned {git_url} to {}", temp.path().display());
 
-    let layout = scan_remote_layout(temp.path())?;
+    let mut layout = scan_remote_layout(temp.path())?;
+    layout.head_sha = Some(temp.head_sha().to_string());
     let layout = apply_filter(layout, filter);
 
     if layout.is_empty() {
@@ -121,11 +123,16 @@ fn parse_url_with_ref(input: &str) -> Result<(String, Option<String>)> {
 
 struct TempRepoDir {
     path: PathBuf,
+    head_sha: String,
 }
 
 impl TempRepoDir {
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn head_sha(&self) -> &str {
+        &self.head_sha
     }
 }
 
@@ -170,7 +177,17 @@ fn clone_to_temp(url: &str, reference: Option<&str>) -> Result<TempRepoDir> {
         }
     }
 
-    Ok(TempRepoDir { path: dest })
+    let head_sha = run_git_capture(vec![
+        "-C".into(),
+        dest.as_os_str().into(),
+        "rev-parse".into(),
+        "HEAD".into(),
+    ])?;
+
+    Ok(TempRepoDir {
+        path: dest,
+        head_sha,
+    })
 }
 
 fn run_git(args: Vec<OsString>) -> Result<()> {
@@ -189,7 +206,24 @@ fn run_git(args: Vec<OsString>) -> Result<()> {
     Ok(())
 }
 
-#[derive(Default)]
+fn run_git_capture(args: Vec<OsString>) -> Result<String> {
+    let output = duct::cmd("git", &args)
+        .stdout_capture()
+        .stderr_capture()
+        .unchecked()
+        .run()
+        .context("failed to spawn git (is it installed and on PATH?)")?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git failed: {}", format!("{stdout} {stderr}").trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[derive(Debug, Default)]
 struct RemoteLayout {
     agents: Option<PathBuf>,
     roles: Option<PathBuf>,
@@ -197,6 +231,8 @@ struct RemoteLayout {
     macros: Option<PathBuf>,
     functions_tools: Option<PathBuf>,
     mcp_json: Option<PathBuf>,
+    manifest: Option<BundleManifest>,
+    head_sha: Option<String>,
 }
 
 impl RemoteLayout {
@@ -211,7 +247,10 @@ impl RemoteLayout {
 }
 
 fn scan_remote_layout(root: &Path) -> Result<RemoteLayout> {
-    let mut layout = RemoteLayout::default();
+    let mut layout = RemoteLayout {
+        manifest: parse_bundle_manifest(root)?,
+        ..RemoteLayout::default()
+    };
 
     let agents = root.join("agents");
     if agents.is_dir() {
@@ -249,34 +288,178 @@ fn scan_remote_layout(root: &Path) -> Result<RemoteLayout> {
     Ok(layout)
 }
 
+const BUNDLE_MANIFEST_FILE: &str = "coyote-bundle.yaml";
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub(crate) struct BundleManifest {
+    pub(crate) name: String,
+    #[allow(dead_code)]
+    pub(crate) version: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) description: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) homepage: Option<String>,
+}
+
+fn parse_bundle_manifest(root: &Path) -> Result<Option<BundleManifest>> {
+    let path = root.join(BUNDLE_MANIFEST_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read bundle manifest at {}", path.display()))?;
+    let manifest: BundleManifest = serde_yaml::from_str(&content)
+        .with_context(|| format!("invalid bundle manifest at {}", path.display()))?;
+    validate_bundle_name(&manifest.name)
+        .with_context(|| format!("invalid bundle name in manifest at {}", path.display()))?;
+    Ok(Some(manifest))
+}
+
+pub(crate) fn validate_bundle_name(name: &str) -> Result<()> {
+    let (owner, base) = match name.split_once('/') {
+        Some((owner, base)) => (Some(owner), base),
+        None => (None, name),
+    };
+    if base.contains('/') {
+        bail!(
+            "Invalid bundle name '{name}': at most one '/' is allowed \
+             (as the owner qualifier separator)"
+        );
+    }
+    for part in owner.into_iter().chain(std::iter::once(base)) {
+        if part.is_empty() {
+            bail!("Invalid bundle name '{name}': name segments cannot be empty");
+        }
+        if !part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            bail!(
+                "Invalid bundle name '{name}': only letters, digits, '-', and '_' are allowed \
+                 (plus a single '/' separating an owner qualifier)"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn strip_ref_suffix(url: &str) -> &str {
+    match url.rsplit_once('#') {
+        Some((base, _)) if !base.is_empty() => base,
+        _ => url,
+    }
+}
+
+fn split_host_and_path(url: &str) -> (String, String) {
+    let url = strip_ref_suffix(url);
+    if let Some((_, rest)) = url.split_once("://") {
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        (host.to_string(), path.trim_matches('/').to_string())
+    } else if let Some((prefix, path)) = url.split_once(':')
+        && !prefix.contains('/')
+    {
+        let host = prefix.rsplit_once('@').map_or(prefix, |(_, h)| h);
+        (host.to_string(), path.trim_matches('/').to_string())
+    } else {
+        (String::new(), url.trim_end_matches('/').to_string())
+    }
+}
+
+fn strip_git_suffix(segment: &str) -> &str {
+    if segment.len() > 4 && segment.to_ascii_lowercase().ends_with(".git") {
+        &segment[..segment.len() - 4]
+    } else {
+        segment
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn repo_name_slug(url: &str) -> String {
+    let (_, path) = split_host_and_path(url);
+    let last = path.rsplit('/').next().unwrap_or("");
+    strip_git_suffix(last).to_string()
+}
+
+#[allow(dead_code)]
+pub(crate) fn owner_qualifier(url: &str) -> Option<String> {
+    let (host, path) = split_host_and_path(url);
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() >= 2 {
+        return Some(segments[segments.len() - 2].to_string());
+    }
+    let sanitized = sanitize_host(&host);
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn sanitize_host(host: &str) -> String {
+    host.to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+#[allow(dead_code)]
+pub(crate) fn canonical_source_url(url: &str) -> String {
+    let (host, path) = split_host_and_path(url);
+    let mut path = path.to_ascii_lowercase();
+    if let Some(stripped) = path.strip_suffix(".git")
+        && !stripped.is_empty()
+        && !stripped.ends_with('/')
+    {
+        path = stripped.to_string();
+    }
+    let host = host.to_ascii_lowercase();
+    if host.is_empty() {
+        path
+    } else if path.is_empty() {
+        host
+    } else {
+        format!("{host}/{path}")
+    }
+}
+
 fn apply_filter(mut layout: RemoteLayout, filter: Option<InstallFilter>) -> RemoteLayout {
     let Some(filter) = filter else {
         return layout;
     };
+    let base = RemoteLayout {
+        manifest: layout.manifest.take(),
+        head_sha: layout.head_sha.take(),
+        ..RemoteLayout::default()
+    };
     match filter {
         InstallFilter::Agents => RemoteLayout {
             agents: layout.agents.take(),
-            ..RemoteLayout::default()
+            ..base
         },
         InstallFilter::Roles => RemoteLayout {
             roles: layout.roles.take(),
-            ..RemoteLayout::default()
+            ..base
         },
         InstallFilter::Skills => RemoteLayout {
             skills: layout.skills.take(),
-            ..RemoteLayout::default()
+            ..base
         },
         InstallFilter::Macros => RemoteLayout {
             macros: layout.macros.take(),
-            ..RemoteLayout::default()
+            ..base
         },
         InstallFilter::Functions => RemoteLayout {
             functions_tools: layout.functions_tools.take(),
-            ..RemoteLayout::default()
+            ..base
         },
         InstallFilter::McpConfig => RemoteLayout {
             mcp_json: layout.mcp_json.take(),
-            ..RemoteLayout::default()
+            ..base
         },
     }
 }
@@ -1104,6 +1287,7 @@ mod tests {
             macros: Some(PathBuf::from("m")),
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
+            ..RemoteLayout::default()
         };
 
         let out = apply_filter(l, None);
@@ -1121,6 +1305,7 @@ mod tests {
             macros: None,
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
+            ..RemoteLayout::default()
         };
 
         let out = apply_filter(l, Some(InstallFilter::Functions));
@@ -1140,6 +1325,7 @@ mod tests {
             macros: None,
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
+            ..RemoteLayout::default()
         };
 
         let out = apply_filter(l, Some(InstallFilter::McpConfig));
@@ -1157,6 +1343,7 @@ mod tests {
             macros: Some(PathBuf::from("m")),
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
+            ..RemoteLayout::default()
         };
 
         let out = apply_filter(l, Some(InstallFilter::Roles));
@@ -1175,6 +1362,7 @@ mod tests {
             macros: Some(PathBuf::from("m")),
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
+            ..RemoteLayout::default()
         };
 
         let out = apply_filter(l, Some(InstallFilter::Skills));
@@ -1492,5 +1680,349 @@ mod tests {
         ];
 
         assert!(handle_missing_secrets(&missing).is_ok());
+    }
+
+    fn write_manifest(root: &Path, yaml: &str) {
+        fs::write(root.join(BUNDLE_MANIFEST_FILE), yaml).unwrap();
+    }
+
+    #[test]
+    fn scan_remote_layout_without_manifest_has_none() {
+        let root = fresh_temp_dir("scan-no-manifest-");
+        fs::create_dir_all(root.join("macros")).unwrap();
+
+        let layout = scan_remote_layout(&root).unwrap();
+
+        assert_eq!(layout.manifest, None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_remote_layout_parses_full_manifest_and_ignores_unknown_fields() {
+        let root = fresh_temp_dir("scan-manifest-full-");
+        fs::create_dir_all(root.join("macros")).unwrap();
+        write_manifest(
+            &root,
+            "name: oh-my-coyote\n\
+             version: \"1.4.0\"\n\
+             description: Opinionated roles and macros\n\
+             homepage: https://github.com/x/oh-my-coyote\n\
+             future_field: ignored\n",
+        );
+
+        let manifest = scan_remote_layout(&root).unwrap().manifest.unwrap();
+
+        assert_eq!(manifest.name, "oh-my-coyote");
+        assert_eq!(manifest.version.as_deref(), Some("1.4.0"));
+        assert_eq!(
+            manifest.description.as_deref(),
+            Some("Opinionated roles and macros")
+        );
+        assert_eq!(
+            manifest.homepage.as_deref(),
+            Some("https://github.com/x/oh-my-coyote")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_remote_layout_parses_name_only_manifest() {
+        let root = fresh_temp_dir("scan-manifest-minimal-");
+        write_manifest(&root, "name: minimal\n");
+
+        let manifest = scan_remote_layout(&root).unwrap().manifest.unwrap();
+
+        assert_eq!(manifest.name, "minimal");
+        assert_eq!(manifest.version, None);
+        assert_eq!(manifest.description, None);
+        assert_eq!(manifest.homepage, None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_remote_layout_fails_on_malformed_manifest() {
+        let root = fresh_temp_dir("scan-manifest-malformed-");
+        write_manifest(&root, "name: [unclosed\n");
+
+        let err = scan_remote_layout(&root).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("invalid bundle manifest"),
+            "got: {err:#}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_remote_layout_fails_on_manifest_missing_name() {
+        let root = fresh_temp_dir("scan-manifest-no-name-");
+        write_manifest(&root, "version: \"1.0\"\n");
+
+        let err = scan_remote_layout(&root).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("invalid bundle manifest"),
+            "got: {err:#}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_remote_layout_fails_on_invalid_manifest_name() {
+        let root = fresh_temp_dir("scan-manifest-bad-name-");
+        write_manifest(&root, "name: not a valid name\n");
+
+        let err = scan_remote_layout(&root).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("Invalid bundle name"),
+            "got: {err:#}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_filter_carries_manifest_and_head_sha_through() {
+        let l = RemoteLayout {
+            macros: Some(PathBuf::from("m")),
+            manifest: Some(BundleManifest {
+                name: "bundle".to_string(),
+                version: None,
+                description: None,
+                homepage: None,
+            }),
+            head_sha: Some("abc123".to_string()),
+            ..RemoteLayout::default()
+        };
+
+        let out = apply_filter(l, Some(InstallFilter::Macros));
+
+        assert_eq!(out.macros, Some(PathBuf::from("m")));
+        assert_eq!(out.manifest.unwrap().name, "bundle");
+        assert_eq!(out.head_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn validate_bundle_name_accepts_simple_names() {
+        assert!(validate_bundle_name("oh-my-coyote").is_ok());
+        assert!(validate_bundle_name("under_score").is_ok());
+        assert!(validate_bundle_name("Abc123").is_ok());
+    }
+
+    #[test]
+    fn validate_bundle_name_accepts_owner_qualified_form() {
+        assert!(validate_bundle_name("x/oh-my-coyote").is_ok());
+    }
+
+    #[test]
+    fn validate_bundle_name_rejects_empty() {
+        assert!(validate_bundle_name("").is_err());
+    }
+
+    #[test]
+    fn validate_bundle_name_rejects_multiple_slashes() {
+        assert!(validate_bundle_name("a/b/c").is_err());
+    }
+
+    #[test]
+    fn validate_bundle_name_rejects_empty_segments() {
+        assert!(validate_bundle_name("/repo").is_err());
+        assert!(validate_bundle_name("owner/").is_err());
+        assert!(validate_bundle_name("/").is_err());
+    }
+
+    #[test]
+    fn validate_bundle_name_rejects_disallowed_characters() {
+        assert!(validate_bundle_name("bad name").is_err());
+        assert!(validate_bundle_name("dot.name").is_err());
+        assert!(validate_bundle_name("owner/bad!base").is_err());
+    }
+
+    #[test]
+    fn repo_name_slug_from_https_url() {
+        assert_eq!(
+            repo_name_slug("https://github.com/x/oh-my-coyote"),
+            "oh-my-coyote"
+        );
+    }
+
+    #[test]
+    fn repo_name_slug_strips_git_suffix() {
+        assert_eq!(
+            repo_name_slug("https://github.com/x/oh-my-coyote.git"),
+            "oh-my-coyote"
+        );
+    }
+
+    #[test]
+    fn repo_name_slug_from_scp_style_url() {
+        assert_eq!(
+            repo_name_slug("git@github.com:x/oh-my-coyote.git"),
+            "oh-my-coyote"
+        );
+    }
+
+    #[test]
+    fn repo_name_slug_ignores_ref_suffix() {
+        assert_eq!(
+            repo_name_slug("https://github.com/x/repo.git#release/v2"),
+            "repo"
+        );
+    }
+
+    #[test]
+    fn repo_name_slug_ignores_trailing_slash() {
+        assert_eq!(repo_name_slug("https://github.com/x/repo/"), "repo");
+    }
+
+    #[test]
+    fn owner_qualifier_from_https_url() {
+        assert_eq!(
+            owner_qualifier("https://github.com/x/repo.git").as_deref(),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn owner_qualifier_from_scp_style_url() {
+        assert_eq!(
+            owner_qualifier("git@github.com:x/repo.git").as_deref(),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn owner_qualifier_falls_back_to_sanitized_host() {
+        assert_eq!(
+            owner_qualifier("https://example.com/repo.git").as_deref(),
+            Some("example-com")
+        );
+    }
+
+    #[test]
+    fn owner_qualifier_scp_without_owner_falls_back_to_host() {
+        assert_eq!(
+            owner_qualifier("git@host.example.com:repo.git").as_deref(),
+            Some("host-example-com")
+        );
+    }
+
+    #[test]
+    fn owner_qualifier_none_without_owner_or_host() {
+        assert_eq!(owner_qualifier("repo"), None);
+    }
+
+    #[test]
+    fn canonical_source_url_treats_equivalent_forms_identically() {
+        let canonical = canonical_source_url("https://github.com/x/r");
+
+        assert_eq!(canonical, "github.com/x/r");
+        assert_eq!(
+            canonical_source_url("https://github.com/x/r.git"),
+            canonical
+        );
+        assert_eq!(canonical_source_url("git@github.com:x/r.git"), canonical);
+    }
+
+    #[test]
+    fn canonical_source_url_lowercases_host_and_path() {
+        assert_eq!(
+            canonical_source_url("https://GitHub.COM/X/R.git"),
+            "github.com/x/r"
+        );
+    }
+
+    #[test]
+    fn canonical_source_url_ignores_ref_suffix() {
+        assert_eq!(
+            canonical_source_url("https://github.com/x/r.git#main"),
+            "github.com/x/r"
+        );
+    }
+
+    #[test]
+    fn canonical_source_url_strips_userinfo() {
+        assert_eq!(
+            canonical_source_url("https://user@github.com/x/r.git"),
+            "github.com/x/r"
+        );
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let mut full: Vec<OsString> = vec!["-C".into(), dir.as_os_str().into()];
+        full.extend(args.iter().map(OsString::from));
+        run_git(full).unwrap();
+    }
+
+    fn commit_file(dir: &Path, name: &str, content: &str) -> String {
+        fs::write(dir.join(name), content).unwrap();
+        git_in(dir, &["add", "."]);
+        git_in(
+            dir,
+            &[
+                "-c",
+                "user.email=coyote-test@localhost",
+                "-c",
+                "user.name=coyote-test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                name,
+            ],
+        );
+        run_git_capture(vec![
+            "-C".into(),
+            dir.as_os_str().into(),
+            "rev-parse".into(),
+            "HEAD".into(),
+        ])
+        .unwrap()
+    }
+
+    fn init_git_repo(dir: &Path) -> String {
+        run_git(vec!["init".into(), "-q".into(), dir.as_os_str().into()]).unwrap();
+        commit_file(dir, "seed.txt", "one")
+    }
+
+    #[test]
+    fn clone_to_temp_captures_resolved_head_sha() {
+        let repo = fresh_temp_dir("clone-sha-");
+        let sha = init_git_repo(&repo);
+
+        let temp = clone_to_temp(repo.to_str().unwrap(), None).unwrap();
+
+        assert_eq!(temp.head_sha(), sha);
+        assert_eq!(temp.head_sha().len(), 40);
+        assert!(temp.head_sha().chars().all(|c| c.is_ascii_hexdigit()));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn clone_to_temp_respects_sha_ref_pinning() {
+        let repo = fresh_temp_dir("clone-pin-sha-");
+        let first = init_git_repo(&repo);
+        let second = commit_file(&repo, "next.txt", "two");
+        assert_ne!(first, second);
+
+        let temp = clone_to_temp(repo.to_str().unwrap(), Some(&first)).unwrap();
+
+        assert_eq!(temp.head_sha(), first);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn clone_to_temp_respects_branch_ref_pinning() {
+        let repo = fresh_temp_dir("clone-pin-branch-");
+        let first = init_git_repo(&repo);
+        git_in(&repo, &["branch", "pinned"]);
+        let second = commit_file(&repo, "next.txt", "two");
+        assert_ne!(first, second);
+
+        let temp = clone_to_temp(repo.to_str().unwrap(), Some("pinned")).unwrap();
+
+        assert_eq!(temp.head_sha(), first);
+        let _ = fs::remove_dir_all(&repo);
     }
 }
