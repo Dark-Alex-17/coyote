@@ -1,2 +1,3 @@
+description: Generate a git commit message from the current diff
 steps:
   - .file `git diff` -- generate a git commit message
