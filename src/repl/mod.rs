@@ -1337,6 +1337,9 @@ pub async fn run_repl_command(
                         "Macro '{name}' is restricted by {} enabled_macros",
                         ctx.macro_lock_owner(*level)
                     ),
+                    Some(MacroState::Invalid { reason }) => {
+                        bail!("Macro '{name}' is invalid: {reason}")
+                    }
                     _ => unknown_command()?,
                 }
             }
