@@ -107,7 +107,6 @@ async fn main() -> Result<()> {
         || cli.list_rags
         || cli.list_macros
         || cli.list_skills
-        || cli.list_bundles
         || cli.list_sessions;
     let vault_flags = cli.add_secret.is_some()
         || cli.get_secret.is_some()
@@ -126,6 +125,10 @@ async fn main() -> Result<()> {
 
     if let Some(name) = &cli.sandbox {
         return sandbox::launch(name.clone(), cli.fresh);
+    }
+
+    if cli.install_from.is_some() {
+        bail!("--install-from was removed; use --install <GIT_URL|OWNER/REPO> instead");
     }
 
     install_builtins()?;
@@ -149,6 +152,10 @@ async fn main() -> Result<()> {
 
     if let Some(name) = cli.uninstall.as_deref() {
         return config::uninstall_bundle(name, cli.yes);
+    }
+
+    if cli.list_bundles {
+        return config::list_installed_bundles();
     }
 
     if let Some(client_arg) = &cli.authenticate {
@@ -322,9 +329,6 @@ async fn run(
         let skills = paths::list_skills().join("\n");
         println!("{skills}");
         return Ok(());
-    }
-    if cli.list_bundles {
-        return config::list_installed_bundles();
     }
     let skills = cli.skills();
     if skills.len() == 1 {

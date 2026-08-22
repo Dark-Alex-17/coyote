@@ -3501,7 +3501,9 @@ impl RequestContext {
                     InstallFilter::NAMES.iter().map(|s| s.to_string()).collect(),
                 );
             } else if prev == "--git-host" {
-                values = super::map_completion_values(vec!["github.com".to_string()]);
+                values = super::map_completion_values(vec![
+                    super::install_remote::DEFAULT_GIT_HOST.to_string(),
+                ]);
             } else {
                 let has_filter = args.iter().enumerate().any(|(i, a)| {
                     a.starts_with("--filter=") || (*a == "--filter" && i < args.len() - 1)

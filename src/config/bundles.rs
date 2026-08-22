@@ -45,6 +45,7 @@ pub(crate) struct FileRecord {
 pub(crate) struct McpServerRecord {
     pub(crate) name: String,
     pub(crate) action: McpAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) renamed_to: Option<String>,
     /// Hash of the mcp.json entry as written; a later mismatch means the user
     /// modified it. Absent on records made before entry hashing existed.
@@ -299,6 +300,10 @@ impl BundleStore {
             );
         }
 
+        debug_assert!(
+            validate_bundle_name(&resolved.name).is_ok(),
+            "derived bundle names must satisfy validate_bundle_name"
+        );
         Ok(resolved)
     }
 
@@ -391,8 +396,10 @@ impl BundleStore {
     }
 
     /// An entry whose key any bundle already owns transfers to `bundle`, and
-    /// its `replaced` action upgrades to `transferred`; plain `replaced`
-    /// marks a pre-existing user entry that uninstall must never delete.
+    /// its `replaced` action upgrades to `transferred` only when the prior
+    /// record proves bundle origin. A prior `replaced` record marks a
+    /// pre-existing user entry that uninstall must never delete, and that
+    /// marker survives re-records and cross-bundle transfers.
     pub(crate) fn record_mcp_servers(
         &mut self,
         bundle: &str,
@@ -402,14 +409,21 @@ impl BundleStore {
         for mut entry in entries {
             let key = entry.effective_key().to_string();
             let mut previously_owned = false;
+            let mut prior_user_origin = false;
             for record in self.bundles.values_mut() {
                 let before = record.mcp_servers.len();
-                record
-                    .mcp_servers
-                    .retain(|owned| owned.effective_key() != key);
+                record.mcp_servers.retain(|owned| {
+                    if owned.effective_key() != key {
+                        return true;
+                    }
+                    if owned.action == McpAction::Replaced {
+                        prior_user_origin = true;
+                    }
+                    false
+                });
                 previously_owned |= record.mcp_servers.len() != before;
             }
-            if previously_owned && entry.action == McpAction::Replaced {
+            if previously_owned && !prior_user_origin && entry.action == McpAction::Replaced {
                 entry.action = McpAction::Transferred;
             }
             self.bundles
@@ -853,6 +867,64 @@ mod tests {
     }
 
     #[test]
+    fn mcp_rerecord_of_own_replaced_entry_stays_replaced() {
+        let dir = TempStoreDir::new("bundles-mcp-sticky-self");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("omc", metadata("https://github.com/x/omc", "abc123"))
+            .unwrap();
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![mcp_record("user-srv", McpAction::Replaced, None)],
+            )
+            .unwrap();
+
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![mcp_record("user-srv", McpAction::Replaced, None)],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get("omc").unwrap().mcp_servers[0].action,
+            McpAction::Replaced
+        );
+    }
+
+    #[test]
+    fn mcp_transfer_of_replaced_entry_keeps_user_origin_marker() {
+        let dir = TempStoreDir::new("bundles-mcp-sticky-transfer");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("alpha", metadata("https://github.com/a/alpha", "abc123"))
+            .unwrap();
+        store
+            .upsert_bundle("beta", metadata("https://github.com/b/beta", "def456"))
+            .unwrap();
+        store
+            .record_mcp_servers(
+                "alpha",
+                vec![mcp_record("user-srv", McpAction::Replaced, None)],
+            )
+            .unwrap();
+
+        store
+            .record_mcp_servers(
+                "beta",
+                vec![mcp_record("user-srv", McpAction::Replaced, None)],
+            )
+            .unwrap();
+
+        assert!(store.get("alpha").unwrap().mcp_servers.is_empty());
+        assert_eq!(
+            store.get("beta").unwrap().mcp_servers[0].action,
+            McpAction::Replaced
+        );
+    }
+
+    #[test]
     fn mcp_transfer_matches_renamed_entries_by_effective_key() {
         let dir = TempStoreDir::new("bundles-mcp-renamed");
         let mut store = dir.store();
@@ -893,7 +965,7 @@ mod tests {
             .unwrap();
 
         let resolved = store
-            .resolve_bundle_name("git@github.com:X/omc.git", None)
+            .resolve_bundle_name("git@github.com:x/omc.git", None)
             .unwrap();
 
         assert_eq!(resolved.name, "omc");
