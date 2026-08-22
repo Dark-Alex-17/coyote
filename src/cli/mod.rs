@@ -187,6 +187,14 @@ pub struct Cli {
         help_heading = "Installation & Updates"
     )]
     pub install: Option<String>,
+    /// Git host used to expand <owner>/<repo> shorthand values passed to --install
+    #[arg(
+        long,
+        value_name = "HOST",
+        requires = "install",
+        help_heading = "Installation & Updates"
+    )]
+    pub git_host: Option<String>,
     /// Reinstall bundled assets, overwriting any local changes
     #[arg(
         long,
@@ -591,6 +599,17 @@ mod tests {
     fn parse_install_force_requires_install() {
         assert!(Cli::try_parse_from(["coyote", "--install-force"]).is_err());
         assert!(parse(&["--install", "https://github.com/x/y", "--install-force"]).install_force);
+    }
+
+    #[test]
+    fn parse_git_host_requires_install() {
+        assert!(Cli::try_parse_from(["coyote", "--git-host", "git.x.com"]).is_err());
+        assert_eq!(
+            parse(&["--install", "someuser/omc", "--git-host", "git.x.com"])
+                .git_host
+                .as_deref(),
+            Some("git.x.com")
+        );
     }
 
     #[test]
