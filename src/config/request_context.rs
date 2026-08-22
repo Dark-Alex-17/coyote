@@ -3500,11 +3500,16 @@ impl RequestContext {
                 values = super::map_completion_values(
                     InstallFilter::NAMES.iter().map(|s| s.to_string()).collect(),
                 );
+            } else if prev == "--git-host" {
+                values = super::map_completion_values(vec!["github.com".to_string()]);
             } else {
                 let has_filter = args.iter().enumerate().any(|(i, a)| {
                     a.starts_with("--filter=") || (*a == "--filter" && i < args.len() - 1)
                 });
                 let has_force = args.contains(&"--force");
+                let has_git_host = args.iter().enumerate().any(|(i, a)| {
+                    a.starts_with("--git-host=") || (*a == "--git-host" && i < args.len() - 1)
+                });
                 let mut available: Vec<&str> = vec![];
 
                 if !has_filter {
@@ -3512,6 +3517,9 @@ impl RequestContext {
                 }
                 if !has_force {
                     available.push("--force");
+                }
+                if !has_git_host {
+                    available.push("--git-host");
                 }
 
                 values = super::map_completion_values(available);

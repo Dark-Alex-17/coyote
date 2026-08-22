@@ -135,7 +135,12 @@ async fn main() -> Result<()> {
     }
 
     if let Some(value) = cli.install.as_deref() {
-        return config::install_or_update(value, cli.filter, cli.install_force);
+        return config::install_or_update(
+            value,
+            cli.git_host.as_deref(),
+            cli.filter,
+            cli.install_force,
+        );
     }
 
     if let Some(spec) = cli.update_bundle.as_deref() {

@@ -876,8 +876,8 @@ pub async fn run_repl_command(
                     config::install_or_update_from_repl_args(value)?;
                 }
                 ReplInstallDispatch::Usage => println!(
-                    "Usage: .install <{}> | .install <git-url|installed-bundle> \
-                         [--filter <cat>] [--force]",
+                    "Usage: .install <{}> | .install <git-url|owner/repo|installed-bundle> \
+                         [--git-host <host>] [--filter <cat>] [--force]",
                     AssetCategory::NAMES.join("|")
                 ),
             },

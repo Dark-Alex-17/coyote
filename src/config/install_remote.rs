@@ -72,9 +72,10 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
 fn parse_repl_install_flags(
     command: &str,
     mut iter: impl Iterator<Item = String>,
-) -> Result<(Option<InstallFilter>, bool)> {
+) -> Result<(Option<InstallFilter>, bool, Option<String>)> {
     let mut filter: Option<InstallFilter> = None;
     let mut force = false;
+    let mut git_host: Option<String> = None;
 
     while let Some(tok) = iter.next() {
         match tok.as_str() {
@@ -91,11 +92,20 @@ fn parse_repl_install_flags(
             s if s.starts_with("--filter=") => {
                 filter = Some(parse_filter(&s["--filter=".len()..])?);
             }
+            "--git-host" => {
+                let val = iter
+                    .next()
+                    .with_context(|| "--git-host requires a value (e.g. git.somedomain.com)")?;
+                git_host = Some(val);
+            }
+            s if s.starts_with("--git-host=") => {
+                git_host = Some(s["--git-host=".len()..].to_string());
+            }
             other => bail!("Unexpected argument to '{command}': {other}"),
         }
     }
 
-    Ok((filter, force))
+    Ok((filter, force, git_host))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +113,7 @@ enum InstallTarget {
     Category(AssetCategory),
     InstalledBundle,
     RemoteSource,
+    Shorthand,
     Unknown,
 }
 
@@ -116,6 +127,9 @@ fn classify_install_target(value: &str, installed_names: &[String]) -> InstallTa
     }
     if looks_like_remote_source(value) {
         return InstallTarget::RemoteSource;
+    }
+    if is_repo_shorthand(value) {
+        return InstallTarget::Shorthand;
     }
     InstallTarget::Unknown
 }
@@ -137,7 +151,53 @@ fn looks_like_remote_source(value: &str) -> bool {
     }
 }
 
-pub fn install_or_update(value: &str, filter: Option<InstallFilter>, force: bool) -> Result<()> {
+const DEFAULT_GIT_HOST: &str = "github.com";
+
+fn is_repo_shorthand(value: &str) -> bool {
+    let path = strip_ref_suffix(value);
+    if path.contains("://")
+        || path.contains(':')
+        || path.contains('\\')
+        || path.contains(char::is_whitespace)
+        || path.starts_with(['/', '~', '.', '-'])
+    {
+        return false;
+    }
+    let mut segments = path.split('/');
+    segments.clone().count() >= 2 && segments.all(|segment| !segment.is_empty())
+}
+
+fn expand_repo_shorthand(value: &str, git_host: Option<&str>) -> Result<String> {
+    let raw = git_host.unwrap_or(DEFAULT_GIT_HOST);
+    let host = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))
+        .unwrap_or(raw)
+        .trim_matches('/');
+    if host.is_empty() || host.contains('/') || host.chars().any(char::is_whitespace) {
+        bail!("invalid --git-host '{raw}': expected a bare host like git.somedomain.com");
+    }
+    Ok(format!("https://{host}/{value}"))
+}
+
+pub fn install_or_update(
+    value: &str,
+    git_host: Option<&str>,
+    filter: Option<InstallFilter>,
+    force: bool,
+) -> Result<()> {
+    if let Some(host) = git_host {
+        if !is_repo_shorthand(value) {
+            bail!(
+                "--git-host only applies to <owner>/<repo> shorthand values; \
+                 '{value}' is not one"
+            );
+        }
+        let url = expand_repo_shorthand(value, Some(host))?;
+        println!("Resolved '{value}' to '{url}'");
+        return install_remote(&url, filter, force);
+    }
+
     let store = BundleStore::load()?;
     let installed: Vec<String> = store
         .bundle_names()
@@ -168,9 +228,15 @@ pub fn install_or_update(value: &str, filter: Option<InstallFilter>, force: bool
             update_bundle(value)
         }
         InstallTarget::RemoteSource => install_remote(value, filter, force),
+        InstallTarget::Shorthand => {
+            let url = expand_repo_shorthand(value, None)?;
+            println!("Resolved '{value}' to '{url}'");
+            install_remote(&url, filter, force)
+        }
         InstallTarget::Unknown => {
-            let hint = "a remote source must be a git URL, an scp-style host:path, \
-                 or an explicit local path (./dir, /abs, ~)";
+            let hint = "a remote source must be a git URL, an <owner>/<repo> shorthand \
+                 (expanded against --git-host, default github.com), an scp-style \
+                 host:path, or an explicit local path (./dir, /abs, ~)";
             if installed.is_empty() {
                 bail!("no bundle named '{value}' is installed; none are installed ({hint})");
             }
@@ -189,13 +255,14 @@ pub fn install_or_update_from_repl_args(args: &str) -> Result<()> {
     let mut iter = tokens.into_iter();
     let value = iter.next().with_context(|| {
         format!(
-            "Usage: .install <git-url|installed-bundle> [--filter <{}>] [--force]",
+            "Usage: .install <git-url|owner/repo|installed-bundle> \
+             [--git-host <host>] [--filter <{}>] [--force]",
             InstallFilter::NAMES.join("|")
         )
     })?;
 
-    let (filter, force) = parse_repl_install_flags(".install", iter)?;
-    install_or_update(&value, filter, force)
+    let (filter, force, git_host) = parse_repl_install_flags(".install", iter)?;
+    install_or_update(&value, git_host.as_deref(), filter, force)
 }
 
 /// The whole remote is always processed — including categories a filtered
@@ -414,16 +481,19 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
         Some(_) => spec.to_string(),
         None => match store.find_by_source(spec) {
             Some((name, _)) => name.to_string(),
-            None => {
-                let installed = store.bundle_names();
-                if installed.is_empty() {
-                    bail!("no bundle named '{spec}' is installed; none are installed");
+            None => match select_uninstall_candidate(&store, spec)? {
+                Some(name) => name,
+                None => {
+                    let installed = store.bundle_names();
+                    if installed.is_empty() {
+                        bail!("no bundle named '{spec}' is installed; none are installed");
+                    }
+                    bail!(
+                        "no bundle named '{spec}' is installed; installed bundles: {}",
+                        installed.join(", ")
+                    );
                 }
-                bail!(
-                    "no bundle named '{spec}' is installed; installed bundles: {}",
-                    installed.join(", ")
-                );
-            }
+            },
         },
     };
     let record = store.get(&name).expect("resolved above").clone();
@@ -500,6 +570,49 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
         println!("  = kept servers:    {}", mcp.kept.join(", "));
     }
     Ok(())
+}
+
+/// Never auto-picks between multiple matches: ambiguity is resolved by an
+/// interactive prompt, and non-interactive runs bail even under --yes.
+fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<String>> {
+    if !is_repo_shorthand(spec) {
+        return Ok(None);
+    }
+    let needle = format!("/{}", canonical_source_url(spec));
+    let candidates: Vec<(String, String)> = store
+        .iter()
+        .filter(|(_, record)| canonical_source_url(&record.source).ends_with(&needle))
+        .map(|(name, record)| (name.to_string(), record.source.clone()))
+        .collect();
+
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [(name, _)] => Ok(Some(name.clone())),
+        _ => {
+            let described: Vec<String> = candidates
+                .iter()
+                .map(|(name, source)| format!("{name} — {source}"))
+                .collect();
+            if !*IS_STDOUT_TERMINAL {
+                bail!(
+                    "'{spec}' matches multiple installed bundles: {}; re-run with the \
+                     exact bundle name or source URL",
+                    described.join(", ")
+                );
+            }
+            let picked = Select::new(
+                &format!("Multiple bundles match '{spec}'; which one should be uninstalled?"),
+                described.clone(),
+            )
+            .prompt()
+            .with_context(|| "failed to read uninstall selection")?;
+            let index = described
+                .iter()
+                .position(|option| option == &picked)
+                .expect("selection came from the presented options");
+            Ok(Some(candidates[index].0.clone()))
+        }
+    }
 }
 
 /// A recorded path that could escape `config_dir` (absolute, or containing
@@ -3588,7 +3701,7 @@ mod tests {
     fn install_or_update_redirects_categories_to_install_builtins() {
         let _guard = TestVaultConfigGuard::new("iou-category");
 
-        let err = install_or_update("agents", None, false).unwrap_err();
+        let err = install_or_update("agents", None, None, false).unwrap_err();
 
         assert!(
             err.to_string().contains("--install-builtins agents"),
@@ -3601,7 +3714,7 @@ mod tests {
     fn install_or_update_unknown_name_lists_installed_bundles() {
         let _guard = TestVaultConfigGuard::new("iou-unknown");
 
-        let err = install_or_update("not-a-bundle", None, false).unwrap_err();
+        let err = install_or_update("not-a-bundle", None, None, false).unwrap_err();
         assert!(err.to_string().contains("none are installed"), "got: {err}");
 
         let src_root = fresh_temp_dir("iou-unknown-src-");
@@ -3611,7 +3724,7 @@ mod tests {
         init_bundle_repo(&repo);
         install_remote(repo.to_str().unwrap(), None, false).unwrap();
 
-        let err = install_or_update("not-a-bundle", None, false).unwrap_err();
+        let err = install_or_update("not-a-bundle", None, None, false).unwrap_err();
 
         assert!(
             err.to_string().contains("no bundle named 'not-a-bundle'"),
@@ -3644,7 +3757,7 @@ mod tests {
             )
             .unwrap();
 
-        let err = install_or_update("agents", None, false).unwrap_err();
+        let err = install_or_update("agents", None, None, false).unwrap_err();
 
         assert!(
             err.to_string().contains("--install-builtins agents"),
@@ -3667,18 +3780,174 @@ mod tests {
         init_bundle_repo(&repo);
         install_remote(repo.to_str().unwrap(), None, false).unwrap();
 
-        let err = install_or_update("flag-bundle", Some(InstallFilter::Macros), false).unwrap_err();
+        let err =
+            install_or_update("flag-bundle", None, Some(InstallFilter::Macros), false).unwrap_err();
         assert!(
             err.to_string().contains("only apply to remote installs"),
             "got: {err}"
         );
 
-        let err = install_or_update("flag-bundle", None, true).unwrap_err();
+        let err = install_or_update("flag-bundle", None, None, true).unwrap_err();
         assert!(
             err.to_string().contains("only apply to remote installs"),
             "got: {err}"
         );
         let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    fn shorthand_accepts_owner_repo_and_deeper_paths() {
+        assert!(is_repo_shorthand("someuser/oh-my-coyote"));
+        assert!(is_repo_shorthand("group/subgroup/repo"));
+        assert!(is_repo_shorthand("someuser/repo#v2"));
+    }
+
+    #[test]
+    fn shorthand_rejects_urls_paths_and_bare_names() {
+        assert!(!is_repo_shorthand("https://github.com/x/y"));
+        assert!(!is_repo_shorthand("git@github.com:x/y.git"));
+        assert!(!is_repo_shorthand("./local/dir"));
+        assert!(!is_repo_shorthand("/abs/path"));
+        assert!(!is_repo_shorthand("~/home/path"));
+        assert!(!is_repo_shorthand("-flag/like"));
+        assert!(!is_repo_shorthand("bare-name"));
+        assert!(!is_repo_shorthand("a//b"));
+        assert!(!is_repo_shorthand("a/b/"));
+        assert!(!is_repo_shorthand("a\\b"));
+        assert!(!is_repo_shorthand("a b/c"));
+    }
+
+    #[test]
+    fn shorthand_expands_against_default_and_custom_hosts() {
+        assert_eq!(
+            expand_repo_shorthand("someuser/omc", None).unwrap(),
+            "https://github.com/someuser/omc"
+        );
+        assert_eq!(
+            expand_repo_shorthand("someuser/omc#v2", Some("git.somedomain.com")).unwrap(),
+            "https://git.somedomain.com/someuser/omc#v2"
+        );
+        assert_eq!(
+            expand_repo_shorthand("a/b", Some("https://git.x.com/")).unwrap(),
+            "https://git.x.com/a/b"
+        );
+        assert!(expand_repo_shorthand("a/b", Some("bad/host")).is_err());
+        assert!(expand_repo_shorthand("a/b", Some("")).is_err());
+    }
+
+    #[test]
+    fn classify_prefers_installed_names_over_shorthand() {
+        assert_eq!(
+            classify_install_target("someuser/omc", &[]),
+            InstallTarget::Shorthand
+        );
+        assert_eq!(
+            classify_install_target("someuser/omc", &["someuser/omc".to_string()]),
+            InstallTarget::InstalledBundle
+        );
+    }
+
+    #[test]
+    fn install_or_update_git_host_rejects_non_shorthand_values() {
+        let err = install_or_update("https://github.com/x/y", Some("git.x.com"), None, false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("--git-host only applies"),
+            "got: {err}"
+        );
+
+        let err = install_or_update("bare-name", Some("git.x.com"), None, false).unwrap_err();
+        assert!(
+            err.to_string().contains("--git-host only applies"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn repl_install_flags_parse_git_host() {
+        let (filter, force, host) = parse_repl_install_flags(
+            ".install",
+            vec!["--git-host".to_string(), "git.x.com".to_string()].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(host.as_deref(), Some("git.x.com"));
+        assert!(filter.is_none() && !force);
+
+        let (_, force, host) = parse_repl_install_flags(
+            ".install",
+            vec!["--git-host=git.y.com".to_string(), "--force".to_string()].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(host.as_deref(), Some("git.y.com"));
+        assert!(force);
+    }
+
+    #[test]
+    #[serial]
+    fn uninstall_shorthand_resolves_a_single_source_match() {
+        let _guard = TestVaultConfigGuard::new("uninst-short-one");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/someuser/omc"))
+            .unwrap();
+        drop(store);
+
+        uninstall_bundle("someuser/omc", true).unwrap();
+
+        let store = BundleStore::load().unwrap();
+        assert!(store.get("omc").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn uninstall_shorthand_with_multiple_matches_bails_non_interactively() {
+        let _guard = TestVaultConfigGuard::new("uninst-short-multi");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/someuser/omc"))
+            .unwrap();
+        store
+            .upsert_bundle(
+                "omc-fork",
+                test_metadata("https://git.somedomain.com/someuser/omc"),
+            )
+            .unwrap();
+        drop(store);
+
+        let err = uninstall_bundle("someuser/omc", true).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("matches multiple installed bundles"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("omc-fork"), "got: {err}");
+        let store = BundleStore::load().unwrap();
+        assert!(store.get("omc").is_some());
+        assert!(store.get("omc-fork").is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn uninstall_exact_name_wins_over_shorthand_source_matches() {
+        let _guard = TestVaultConfigGuard::new("uninst-short-name");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle(
+                "someuser/omc",
+                test_metadata("https://git.somedomain.com/other/repo"),
+            )
+            .unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/someuser/omc"))
+            .unwrap();
+        drop(store);
+
+        uninstall_bundle("someuser/omc", true).unwrap();
+
+        let store = BundleStore::load().unwrap();
+        assert!(store.get("someuser/omc").is_none());
+        assert!(store.get("omc").is_some());
     }
 
     fn owned_file_record(path: &str, contents: &str) -> FileRecord {
