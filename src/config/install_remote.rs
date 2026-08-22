@@ -265,8 +265,8 @@ pub fn install_or_update_from_repl_args(args: &str) -> Result<()> {
     install_or_update(&value, git_host.as_deref(), filter, force)
 }
 
-/// The whole remote is always processed — including categories a filtered
-/// install excluded — because filtered installs merge into a single record.
+/// The whole remote is always processed, including categories a filtered
+/// install excluded, because filtered installs merge into a single record.
 pub fn update_bundle(spec: &str) -> Result<()> {
     let (name, ref_override) = parse_url_with_ref(spec)?;
 
@@ -591,7 +591,7 @@ fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<
         _ => {
             let described: Vec<String> = candidates
                 .iter()
-                .map(|(name, source)| format!("{name} — {source}"))
+                .map(|(name, source)| format!("{name} ({source})"))
                 .collect();
             if !*IS_STDOUT_TERMINAL {
                 bail!(
@@ -1065,7 +1065,7 @@ pub(crate) struct BundleManifest {
     pub(crate) homepage: Option<String>,
 }
 
-/// Returns the record key — possibly migrated or owner-qualified — that all
+/// Returns the record key, possibly migrated or owner-qualified, that all
 /// subsequent recording must use in place of the requested name.
 fn register_bundle(
     store: &mut BundleStore,
@@ -1588,8 +1588,8 @@ fn apply_plan(
     Ok(report)
 }
 
-/// Kept and identical files are never recorded — ownership means "this
-/// content exists because of this bundle" — so a file another bundle's
+/// Kept and identical files are never recorded, because ownership means
+/// "this content exists because of this bundle": a file another bundle's
 /// record already owns stays with that owner.
 fn record_written_file(
     store: &mut BundleStore,
