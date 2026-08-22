@@ -120,9 +120,6 @@ fn classify_install_target(value: &str, installed_names: &[String]) -> InstallTa
     InstallTarget::Unknown
 }
 
-/// A value is treated as a source when it is a URL, an scp-style
-/// `[user@]host:path`, or an explicit local path. Bare names never are: they
-/// must match an installed bundle.
 fn looks_like_remote_source(value: &str) -> bool {
     if value.contains("://")
         || value.starts_with("./")
@@ -140,9 +137,6 @@ fn looks_like_remote_source(value: &str) -> bool {
     }
 }
 
-/// Unified entry point behind `--install` and the REPL's `.install <value>`:
-/// asset categories are redirected to `--install-builtins`, installed bundle
-/// names become updates, and anything shaped like a source is installed.
 pub fn install_or_update(value: &str, filter: Option<InstallFilter>, force: bool) -> Result<()> {
     let store = BundleStore::load()?;
     let installed: Vec<String> = store
@@ -204,11 +198,8 @@ pub fn install_or_update_from_repl_args(args: &str) -> Result<()> {
     install_or_update(&value, filter, force)
 }
 
-/// Update an installed bundle from its recorded source. `spec` is the bundle
-/// name, optionally suffixed with `#<ref>` to move a pinned ref. The whole
-/// remote is always processed — including categories a filtered install
-/// excluded — because filtered installs merge into a single record and an
-/// update brings that record in line with everything the remote now ships.
+/// The whole remote is always processed — including categories a filtered
+/// install excluded — because filtered installs merge into a single record.
 pub fn update_bundle(spec: &str) -> Result<()> {
     let (name, ref_override) = parse_url_with_ref(spec)?;
 
@@ -279,11 +270,6 @@ pub fn update_bundle(spec: &str) -> Result<()> {
     Ok(())
 }
 
-/// A conflict on a file this bundle owns whose on-disk content still matches
-/// the recorded hash is not a real conflict: the bundle wrote that content and
-/// the user never touched it, so an update refreshes it without prompting.
-/// Files the user modified — or that another bundle owns — keep the normal
-/// conflict semantics.
 fn reclassify_owned_unmodified(
     mut plan: InstallPlan,
     store: &BundleStore,
@@ -320,10 +306,8 @@ enum ObsoleteAction {
     Delete,
 }
 
-/// Reconcile owned files the remote no longer ships. A file already gone from
-/// disk just drops out of the record; a file still present is kept by default
-/// (the user may rely on it) and only deleted on explicit confirmation. Kept
-/// files stay in the record, so a later uninstall still offers to remove them.
+/// Kept files stay in the record, so a later uninstall still offers to
+/// remove them.
 fn handle_obsolete_files(store: &mut BundleStore, bundle: &str, plan: &InstallPlan) -> Result<()> {
     let planned: HashSet<String> = plan
         .files
@@ -423,11 +407,7 @@ struct UninstallMcpSummary {
     kept: Vec<String>,
 }
 
-/// Uninstall a bundle: delete the files it owns, remove its mcp.json entries,
-/// and drop its store record once nothing is left. `spec` is the bundle name
-/// or its source URL. Locally modified items are kept unless explicitly
-/// confirmed at a prompt; kept and failed items stay in the record, so a
-/// re-run offers them again.
+/// Kept and failed items stay in the record, so a re-run offers them again.
 pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
     let mut store = BundleStore::load()?;
     let name = match store.get(spec) {
@@ -522,13 +502,8 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// Process the files a bundle owns under `config_dir`. Intact files (content
-/// still matches the recorded hash) are deleted outright; missing files just
-/// drop out of the record; modified files are kept unless confirmed for
-/// deletion. A failed deletion keeps the record so a re-run can retry, and
-/// never aborts the remaining files. A recorded path that could escape
-/// `config_dir` (absolute, or containing anything but plain components) is
-/// never touched; its record survives.
+/// A recorded path that could escape `config_dir` (absolute, or containing
+/// anything but plain components) is never touched; its record survives.
 fn uninstall_owned_files(
     store: &mut BundleStore,
     bundle: &str,
@@ -674,14 +649,9 @@ fn resolve_uninstall_action(
     }
 }
 
-/// Remove a bundle's entries from mcp.json. An entry is removed outright only
-/// when its current content still matches the recorded hash; a modified (or
-/// legacy, hash-less) entry is kept unless confirmed for deletion, and a
-/// pre-existing server the bundle replaced is never removed. Keys the bundle
-/// does not own are never touched. mcp.json is written before any ownership
-/// record is dropped, so a failed write leaves every record intact for a
-/// retry, while a crash after it leaves stale records the absent-server
-/// branch cleans up on re-run.
+/// mcp.json is written before any ownership record is dropped: a failed write
+/// leaves every record intact for a retry, while a crash after it leaves
+/// stale records the absent-server branch cleans up on re-run.
 fn uninstall_mcp_entries(
     store: &mut BundleStore,
     bundle: &str,
@@ -982,8 +952,8 @@ pub(crate) struct BundleManifest {
     pub(crate) homepage: Option<String>,
 }
 
-/// Resolve the bundle's identity for this install and create or refresh its
-/// provenance record. Returns the record key subsequent recording uses.
+/// Returns the record key — possibly migrated or owner-qualified — that all
+/// subsequent recording must use in place of the requested name.
 fn register_bundle(
     store: &mut BundleStore,
     url: &str,
@@ -1505,12 +1475,9 @@ fn apply_plan(
     Ok(report)
 }
 
-/// Provenance is recorded per written file, not at the end of the loop: a
-/// conflict prompt can abort the install after earlier files already landed
-/// on disk, and those must not become untracked orphans. Files the user kept
-/// (or that were identical) are never recorded — ownership means "this
-/// content exists because of this bundle" — so a kept file that another
-/// bundle's record already owns stays with that owner.
+/// Kept and identical files are never recorded — ownership means "this
+/// content exists because of this bundle" — so a file another bundle's
+/// record already owns stays with that owner.
 fn record_written_file(
     store: &mut BundleStore,
     bundle: &str,
@@ -1533,9 +1500,8 @@ fn provenance_path(dst: &Path) -> String {
     rel.to_string_lossy().replace('\\', "/")
 }
 
-/// Record the mcp.json entries the merge actually wrote, in one flush right
-/// after the merged file itself. Entries the merge kept local are deliberately
-/// absent: an entry another bundle already owns stays with that owner.
+/// Entries the merge kept local are deliberately absent: an entry another
+/// bundle already owns stays with that owner.
 fn record_mcp_merge(store: &mut BundleStore, bundle: &str, report: &McpMergeReport) -> Result<()> {
     let mut entries: Vec<McpServerRecord> = Vec::new();
     entries.extend(report.added.iter().map(|name| McpServerRecord {

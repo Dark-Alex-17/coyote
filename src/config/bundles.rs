@@ -173,8 +173,6 @@ impl BundleStore {
         self.bundles.keys().map(String::as_str).collect()
     }
 
-    /// Look up the record installed from `url`, comparing canonical source URLs
-    /// so https/scp/`.git` spellings of the same remote all match.
     pub(crate) fn find_by_source(&self, url: &str) -> Option<(&str, &BundleRecord)> {
         let canonical = canonical_source_url(url);
         self.bundles
@@ -183,12 +181,9 @@ impl BundleStore {
             .map(|(name, record)| (name.as_str(), record))
     }
 
-    /// Decide the record key for an install from `url`, matching by canonical
-    /// source URL first and name second. If the URL is already tracked under a
-    /// different key (manifest name added, renamed, or removed since install),
-    /// the existing record is migrated to the new key — the same URL never gets
-    /// a second record. A name held by a different-source bundle is
-    /// owner-qualified instead. Both cases print a notice.
+    /// A URL already tracked under a different key migrates to the new key —
+    /// the same URL never gets a second record. A name held by a
+    /// different-source bundle is owner-qualified instead.
     pub(crate) fn resolve_bundle_name(
         &mut self,
         url: &str,
@@ -287,10 +282,6 @@ impl BundleStore {
         Ok(resolved)
     }
 
-    /// Create or update the record's metadata and persist it. Repeated installs
-    /// of the same bundle (e.g. with different filters) merge into one record:
-    /// metadata is refreshed, files accumulate, and the original install time
-    /// is kept.
     pub(crate) fn upsert_bundle(&mut self, name: &str, metadata: InstallMetadata) -> Result<()> {
         match self.bundles.get_mut(name) {
             Some(record) => {
@@ -322,7 +313,6 @@ impl BundleStore {
         self.save()
     }
 
-    /// Stamp the record with the time of its most recent update from source.
     pub(crate) fn mark_updated(&mut self, name: &str) -> Result<()> {
         self.ensure_bundle_exists(name)?;
         let record = self
@@ -333,8 +323,6 @@ impl BundleStore {
         self.save()
     }
 
-    /// Drop one path from a bundle's owned files and persist. Used when the
-    /// bundle no longer ships the file and it is gone (or deleted) locally.
     pub(crate) fn remove_file_record(&mut self, bundle: &str, path: &str) -> Result<()> {
         self.ensure_bundle_exists(bundle)?;
         let record = self
@@ -345,8 +333,6 @@ impl BundleStore {
         self.save()
     }
 
-    /// Drop one mcp.json entry from a bundle's owned servers, matched by the
-    /// key it occupies in mcp.json, and persist.
     pub(crate) fn remove_mcp_record(&mut self, bundle: &str, effective_key: &str) -> Result<()> {
         self.ensure_bundle_exists(bundle)?;
         let record = self
@@ -359,16 +345,14 @@ impl BundleStore {
         self.save()
     }
 
-    /// Remove a bundle's record entirely and persist. Used once an uninstall
-    /// has released everything the record owned.
     pub(crate) fn remove_bundle(&mut self, name: &str) -> Result<()> {
         self.ensure_bundle_exists(name)?;
         self.bundles.remove(name);
         self.save()
     }
 
-    /// Record one written file and persist immediately, so an install aborted
-    /// partway through still has provenance for everything already on disk.
+    /// Persists per call, so an install aborted partway through still has
+    /// provenance for everything already on disk.
     /// A path owned by another bundle transfers to `bundle`.
     pub(crate) fn record_file(&mut self, bundle: &str, file: FileRecord) -> Result<()> {
         self.ensure_bundle_exists(bundle)?;
@@ -386,12 +370,9 @@ impl BundleStore {
         self.save()
     }
 
-    /// Record the mcp.json entries an install wrote, in one persisted flush.
-    /// An entry whose key any bundle already owns — including `bundle` itself
-    /// on an update — transfers to `bundle`: the old owner drops it, and a
-    /// `replaced` action is upgraded to `transferred` (removable at uninstall
-    /// — plain `replaced` marks a pre-existing user entry that uninstall must
-    /// never delete).
+    /// An entry whose key any bundle already owns transfers to `bundle`, and
+    /// its `replaced` action upgrades to `transferred` — plain `replaced`
+    /// marks a pre-existing user entry that uninstall must never delete.
     pub(crate) fn record_mcp_servers(
         &mut self,
         bundle: &str,
@@ -491,10 +472,8 @@ pub(crate) struct BundleListRow {
     pub(crate) drift: DriftSummary,
 }
 
-/// Build one listing row per installed bundle, hashing each owned file under
-/// `config_dir` against its recorded checksum: a match is intact, a mismatch
-/// (or unreadable file) counts as locally modified, and an absent file is
-/// missing. Read-only: the store is never mutated by listing.
+/// An unreadable file counts as locally modified: it exists but its integrity
+/// cannot be verified.
 pub(crate) fn bundle_list_rows(store: &BundleStore, config_dir: &Path) -> Vec<BundleListRow> {
     store
         .iter()
