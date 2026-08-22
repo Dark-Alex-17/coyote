@@ -44,9 +44,11 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
         reference.as_deref(),
         layout.manifest.as_ref(),
         temp.head_sha(),
+        false,
     )?;
 
     let plan = plan_changes(&layout)?;
+    let plan = reclassify_owned_unmodified(plan, &store, &bundle)?;
 
     if !plan.files.is_empty() {
         print_plan_summary(&plan);
@@ -60,7 +62,7 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
 
     if let Some((remote_mcp, local_mcp)) = &plan.mcp_json {
         let local = local_mcp.exists().then_some(local_mcp.as_path());
-        let report = merge_mcp_json(local, remote_mcp, local_mcp, force)?;
+        let report = merge_mcp_json(local, remote_mcp, local_mcp, force, &HashSet::new(), false)?;
         record_mcp_merge(&mut store, &bundle, &report)?;
         print_mcp_merge_report(&report);
         handle_missing_secrets(&report.missing_secrets)?;
@@ -225,7 +227,7 @@ pub fn install_or_update(
             if filter.is_some() || force {
                 bail!("--filter/--install-force only apply to remote installs, not bundle updates");
             }
-            update_bundle(value)
+            update_bundle(value, false)
         }
         InstallTarget::RemoteSource => install_remote(value, filter, force),
         InstallTarget::Shorthand => {
@@ -267,7 +269,7 @@ pub fn install_or_update_from_repl_args(args: &str) -> Result<()> {
 
 /// The whole remote is always processed, including categories a filtered
 /// install excluded, because filtered installs merge into a single record.
-pub fn update_bundle(spec: &str) -> Result<()> {
+pub fn update_bundle(spec: &str, assume_yes: bool) -> Result<()> {
     let (name, ref_override) = parse_url_with_ref(spec)?;
 
     let mut store = BundleStore::load()?;
@@ -312,6 +314,7 @@ pub fn update_bundle(spec: &str) -> Result<()> {
         effective_ref.as_deref(),
         layout.manifest.as_ref(),
         temp.head_sha(),
+        true,
     )?;
 
     let plan = plan_changes(&layout)?;
@@ -319,19 +322,31 @@ pub fn update_bundle(spec: &str) -> Result<()> {
 
     if !plan.files.is_empty() {
         print_plan_summary(&plan);
-        apply_plan(&plan, StickyMode::None, &mut store, &bundle)?;
+        let sticky = if assume_yes {
+            StickyMode::KeepAll
+        } else {
+            StickyMode::None
+        };
+        apply_plan(&plan, sticky, &mut store, &bundle)?;
     }
 
-    handle_obsolete_files(&mut store, &bundle, &plan)?;
+    handle_obsolete_files(&mut store, &bundle, &plan, assume_yes)?;
 
     if let Some((remote_mcp, local_mcp)) = &plan.mcp_json {
         let local = local_mcp.exists().then_some(local_mcp.as_path());
-        let report = merge_mcp_json(local, remote_mcp, local_mcp, false)?;
+        let auto_take = owned_unmodified_mcp_keys(&store, &bundle, local)?;
+        let report = merge_mcp_json(local, remote_mcp, local_mcp, false, &auto_take, assume_yes)?;
         record_mcp_merge(&mut store, &bundle, &report)?;
         print_mcp_merge_report(&report);
         handle_missing_secrets(&report.missing_secrets)?;
     }
 
+    let version = layout
+        .manifest
+        .as_ref()
+        .and_then(|m| m.version.clone())
+        .unwrap_or_else(|| temp.head_sha().chars().take(7).collect());
+    store.set_bundle_versions(&bundle, temp.head_sha(), Some(version))?;
     store.mark_updated(&bundle)?;
 
     Ok(())
@@ -367,6 +382,39 @@ fn reclassify_owned_unmodified(
     Ok(plan)
 }
 
+/// Keys of this bundle's mcp entries whose recorded hash still matches the
+/// local entry: the bundle wrote them and the user never touched them, so an
+/// upstream change takes the remote side without prompting.
+fn owned_unmodified_mcp_keys(
+    store: &BundleStore,
+    bundle: &str,
+    local: Option<&Path>,
+) -> Result<HashSet<String>> {
+    let mut keys = HashSet::new();
+    let (Some(local_path), Some(record)) = (local, store.get(bundle)) else {
+        return Ok(keys);
+    };
+    let content = fs::read_to_string(local_path)
+        .with_context(|| format!("failed to read local mcp.json at {}", local_path.display()))?;
+    let config: McpServersConfig = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse local mcp.json at {}", local_path.display()))?;
+    for server in &record.mcp_servers {
+        let Some(recorded_hash) = server.sha256.as_deref() else {
+            continue;
+        };
+        let key = server.effective_key();
+        let Some(entry) = config.mcp_servers.get(key) else {
+            continue;
+        };
+        let serialized = serde_json::to_string(entry)
+            .with_context(|| format!("failed to serialize MCP server '{key}'"))?;
+        if hash_bytes(serialized.as_bytes()) == recorded_hash {
+            keys.insert(key.to_string());
+        }
+    }
+    Ok(keys)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObsoleteAction {
     Keep,
@@ -375,7 +423,12 @@ enum ObsoleteAction {
 
 /// Kept files stay in the record, so a later uninstall still offers to
 /// remove them.
-fn handle_obsolete_files(store: &mut BundleStore, bundle: &str, plan: &InstallPlan) -> Result<()> {
+fn handle_obsolete_files(
+    store: &mut BundleStore,
+    bundle: &str,
+    plan: &InstallPlan,
+    assume_yes: bool,
+) -> Result<()> {
     let planned: HashSet<String> = plan
         .files
         .iter()
@@ -394,8 +447,12 @@ fn handle_obsolete_files(store: &mut BundleStore, bundle: &str, plan: &InstallPl
         .unwrap_or_default();
 
     let config_dir = paths::config_dir();
-    let mut sticky: Option<ObsoleteAction> = None;
+    let mut sticky: Option<ObsoleteAction> = assume_yes.then_some(ObsoleteAction::Keep);
     for path in obsolete {
+        if !is_safe_relative_path(&path) {
+            eprintln!("skipping suspicious recorded path {path}; keeping its record");
+            continue;
+        }
         let full = config_dir.join(&path);
         if !full.exists() {
             println!("dropped record for obsolete file {path} (already absent locally)");
@@ -403,7 +460,7 @@ fn handle_obsolete_files(store: &mut BundleStore, bundle: &str, plan: &InstallPl
             continue;
         }
         let action = resolve_obsolete(&path, &mut sticky)?;
-        apply_obsolete_action(store, bundle, &path, &full, action)?;
+        apply_obsolete_action(store, bundle, &path, &full, &config_dir, action)?;
     }
     Ok(())
 }
@@ -441,6 +498,7 @@ fn apply_obsolete_action(
     bundle: &str,
     path: &str,
     full: &Path,
+    config_dir: &Path,
     action: ObsoleteAction,
 ) -> Result<()> {
     match action {
@@ -451,6 +509,7 @@ fn apply_obsolete_action(
             fs::remove_file(full)
                 .with_context(|| format!("failed to delete obsolete file {}", full.display()))?;
             store.remove_file_record(bundle, path)?;
+            prune_empty_dirs(full, config_dir);
             println!("deleted obsolete file {path}");
         }
     }
@@ -623,8 +682,17 @@ fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<
     }
 }
 
-/// A recorded path that could escape `config_dir` (absolute, or containing
-/// anything but plain components) is never touched; its record survives.
+/// True only when joining the path onto the config dir cannot escape it:
+/// relative and made of plain components. Anything else in a recorded path
+/// means a tampered store, and it must never become a file deletion.
+fn is_safe_relative_path(path: &str) -> bool {
+    let recorded = Path::new(path);
+    !recorded.is_absolute()
+        && recorded
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
 fn uninstall_owned_files(
     store: &mut BundleStore,
     bundle: &str,
@@ -635,12 +703,7 @@ fn uninstall_owned_files(
     let mut summary = UninstallFileSummary::default();
     let mut sticky: Option<ObsoleteAction> = None;
     for file in files {
-        let recorded = Path::new(&file.path);
-        if recorded.is_absolute()
-            || !recorded
-                .components()
-                .all(|c| matches!(c, Component::Normal(_)))
-        {
+        if !is_safe_relative_path(&file.path) {
             eprintln!(
                 "skipping suspicious recorded path {}; keeping its record",
                 file.path
@@ -648,7 +711,7 @@ fn uninstall_owned_files(
             summary.failed += 1;
             continue;
         }
-        let full = config_dir.join(recorded);
+        let full = config_dir.join(Path::new(&file.path));
         if !full.exists() {
             println!(
                 "dropped record for missing file {} (already absent locally)",
@@ -992,6 +1055,8 @@ fn clone_to_temp(url: &str, reference: Option<&str>) -> Result<TempRepoDir> {
 
 fn run_git(args: Vec<OsString>) -> Result<()> {
     let output = duct::cmd("git", &args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin_null()
         .stderr_to_stdout()
         .stdout_capture()
         .unchecked()
@@ -1008,6 +1073,8 @@ fn run_git(args: Vec<OsString>) -> Result<()> {
 
 fn run_git_capture(args: Vec<OsString>) -> Result<String> {
     let output = duct::cmd("git", &args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin_null()
         .stdout_capture()
         .stderr_capture()
         .unchecked()
@@ -1100,24 +1167,31 @@ pub(crate) struct BundleManifest {
 
 /// Returns the record key, possibly migrated or owner-qualified, that all
 /// subsequent recording must use in place of the requested name.
+/// An update passes `preserve_versions` so the record keeps claiming the old
+/// commit and version until the new content actually lands on disk.
 fn register_bundle(
     store: &mut BundleStore,
     url: &str,
     git_ref: Option<&str>,
     manifest: Option<&BundleManifest>,
     commit: &str,
+    preserve_versions: bool,
 ) -> Result<String> {
     let resolved = store.resolve_bundle_name(url, manifest.map(|m| m.name.as_str()))?;
     let version = manifest
         .and_then(|m| m.version.clone())
         .unwrap_or_else(|| commit.chars().take(7).collect());
+    let (commit, version) = match (preserve_versions, store.get(&resolved.name)) {
+        (true, Some(existing)) => (existing.commit.clone(), existing.version.clone()),
+        _ => (commit.to_string(), Some(version)),
+    };
     store.upsert_bundle(
         &resolved.name,
         InstallMetadata {
             source: url.to_string(),
             git_ref: git_ref.map(str::to_string),
-            commit: commit.to_string(),
-            version: Some(version),
+            commit,
+            version,
             description: manifest.and_then(|m| m.description.clone()),
             homepage: manifest.and_then(|m| m.homepage.clone()),
         },
@@ -1490,14 +1564,13 @@ fn files_equal(a: &Path, b: &Path) -> Result<bool> {
 }
 
 fn files_equal_streaming(a: &Path, b: &Path) -> Result<bool> {
-    use std::io::Read;
     let mut fa = fs::File::open(a).with_context(|| format!("open {}", a.display()))?;
     let mut fb = fs::File::open(b).with_context(|| format!("open {}", b.display()))?;
     let mut buf_a = [0u8; 8192];
     let mut buf_b = [0u8; 8192];
     loop {
-        let na = fa.read(&mut buf_a)?;
-        let nb = fb.read(&mut buf_b)?;
+        let na = read_full(&mut fa, &mut buf_a)?;
+        let nb = read_full(&mut fb, &mut buf_b)?;
         if na != nb {
             return Ok(false);
         }
@@ -1508,6 +1581,21 @@ fn files_equal_streaming(a: &Path, b: &Path) -> Result<bool> {
             return Ok(false);
         }
     }
+}
+
+/// `read` may return short counts without EOF; comparing partially filled
+/// buffers positionally would misreport identical files as different.
+fn read_full(file: &mut fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = file.read(&mut buf[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
 }
 
 fn print_plan_summary(plan: &InstallPlan) {
@@ -1692,7 +1780,8 @@ fn resolve_conflict(planned: &PlannedFile, sticky: &mut StickyMode) -> Result<Co
     if !*IS_STDOUT_TERMINAL {
         bail!(
             "Refusing to overwrite local file {} non-interactively. \
-             Re-run with --install-force or in a terminal.",
+             Re-run in a terminal, with --install-force (installs), \
+             or with --yes (updates).",
             planned.dst.display()
         );
     }
@@ -1780,6 +1869,8 @@ fn merge_mcp_json(
     remote: &Path,
     target: &Path,
     force: bool,
+    auto_take: &HashSet<String>,
+    assume_yes: bool,
 ) -> Result<McpMergeReport> {
     let remote_content = fs::read_to_string(remote)
         .with_context(|| format!("failed to read remote mcp.json at {}", remote.display()))?;
@@ -1816,7 +1907,12 @@ fn merge_mcp_json(
             if local_server == &remote_server {
                 continue;
             }
-            match resolve_mcp_conflict(&name, force)? {
+            let action = if auto_take.contains(&name) {
+                McpConflictAction::TakeRemote
+            } else {
+                resolve_mcp_conflict(&name, force, assume_yes)?
+            };
+            match action {
                 McpConflictAction::KeepLocal => report.kept_local.push(name),
                 McpConflictAction::TakeRemote => {
                     merged.mcp_servers.insert(name.clone(), remote_server);
@@ -1882,14 +1978,17 @@ fn merge_mcp_json(
     Ok(report)
 }
 
-fn resolve_mcp_conflict(name: &str, force: bool) -> Result<McpConflictAction> {
+fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<McpConflictAction> {
     if force {
         return Ok(McpConflictAction::TakeRemote);
+    }
+    if assume_yes {
+        return Ok(McpConflictAction::KeepLocal);
     }
     if !*IS_STDOUT_TERMINAL {
         bail!(
             "MCP server '{name}' already exists locally. Refusing to merge non-interactively. \
-             Re-run with --install-force or in a terminal."
+             Re-run in a terminal, with --install-force (installs), or with --yes (updates)."
         );
     }
     let rename_label = format!("rename remote as \"{name}-remote\"");
@@ -2461,7 +2560,7 @@ mod tests {
         let target = dir.join("target.json");
         write_mcp(&remote, FIXTURE_REMOTE);
 
-        let report = merge_mcp_json(None, &remote, &target, false).unwrap();
+        let report = merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap();
 
         assert_eq!(report.added, vec!["alpha", "beta"]);
         assert!(report.kept_local.is_empty());
@@ -2484,7 +2583,15 @@ mod tests {
         );
         write_mcp(&remote, FIXTURE_REMOTE);
 
-        let report = merge_mcp_json(Some(&target), &remote, &target, true).unwrap();
+        let report = merge_mcp_json(
+            Some(&target),
+            &remote,
+            &target,
+            true,
+            &HashSet::new(),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(report.added, vec!["beta"]);
         assert_eq!(report.replaced, vec!["alpha"]);
@@ -2513,7 +2620,15 @@ mod tests {
         );
         write_mcp(&remote, FIXTURE_REMOTE);
 
-        let err = merge_mcp_json(Some(&target), &remote, &target, false).unwrap_err();
+        let err = merge_mcp_json(
+            Some(&target),
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string()
@@ -2530,7 +2645,8 @@ mod tests {
         let target = dir.join("target.json");
         write_mcp(&remote, r#"{"mcpServers": {"broken": {"type": "stdio"}}}"#);
 
-        let err = merge_mcp_json(None, &remote, &target, false).unwrap_err();
+        let err =
+            merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap_err();
 
         assert!(
             format!("{err:#}").contains("missing a \"command\" field"),
@@ -2557,7 +2673,7 @@ mod tests {
             r#"{"mcpServers": {"x": {"type":"stdio","command":"echo","env":{"K":"{{COYOTE_TEST_MERGE_SECRET}}"}}}}"#,
         );
 
-        let report = merge_mcp_json(None, &remote, &target, false).unwrap();
+        let report = merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap();
 
         assert_eq!(report.missing_secrets, vec!["COYOTE_TEST_MERGE_SECRET"]);
         let _ = fs::remove_dir_all(&dir);
@@ -2572,10 +2688,18 @@ mod tests {
         let target = dir.join("target.json");
         write_mcp(&remote, FIXTURE_REMOTE);
 
-        merge_mcp_json(None, &remote, &target, false).unwrap();
+        merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap();
         let after_first = fs::read(&target).unwrap();
 
-        let report = merge_mcp_json(Some(&target), &remote, &target, false).unwrap();
+        let report = merge_mcp_json(
+            Some(&target),
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+        )
+        .unwrap();
         assert!(report.added.is_empty(), "got: {:?}", report.added);
         let after_second = fs::read(&target).unwrap();
 
@@ -3289,7 +3413,7 @@ mod tests {
         install_remote(repo.to_str().unwrap(), None, false).unwrap();
         commit_file(&repo, "macros/hello.yaml", "v2\n");
 
-        update_bundle("refresh-bundle").unwrap();
+        update_bundle("refresh-bundle", false).unwrap();
 
         let installed = paths::macros_dir().join("hello.yaml");
         assert_eq!(fs::read_to_string(&installed).unwrap(), "v2\n");
@@ -3298,6 +3422,82 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].sha256, hash_bytes(b"v2\n"));
         assert_eq!(files[0].action, FileAction::Replaced);
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    #[serial]
+    fn update_with_yes_keeps_modified_files_and_updates_the_rest() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping update_with_yes_keeps_modified_files_and_updates_the_rest: \
+                 requires non-TTY stdout"
+            );
+            return;
+        }
+        let _guard = TestVaultConfigGuard::new("upd-yes");
+        let src_root = fresh_temp_dir("upd-yes-src-");
+        let repo = src_root.join("bundle");
+        write_src(&repo, BUNDLE_MANIFEST_FILE, "name: yes-bundle\n");
+        write_src(&repo, "macros/edited.yaml", "v1\n");
+        write_src(&repo, "macros/pristine.yaml", "v1\n");
+        init_bundle_repo(&repo);
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        fs::write(paths::macros_dir().join("edited.yaml"), "local\n").unwrap();
+        commit_file(&repo, "macros/edited.yaml", "v2\n");
+        commit_file(&repo, "macros/pristine.yaml", "v2\n");
+
+        let err = update_bundle("yes-bundle", false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Refusing to overwrite"),
+            "err: {err:#}"
+        );
+
+        update_bundle("yes-bundle", true).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(paths::macros_dir().join("edited.yaml")).unwrap(),
+            "local\n"
+        );
+        assert_eq!(
+            fs::read_to_string(paths::macros_dir().join("pristine.yaml")).unwrap(),
+            "v2\n"
+        );
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    #[serial]
+    fn update_takes_remote_for_owned_unmodified_mcp_entries() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping update_takes_remote_for_owned_unmodified_mcp_entries: \
+                 requires non-TTY stdout"
+            );
+            return;
+        }
+        let _guard = TestVaultConfigGuard::new("upd-mcp-auto");
+        let src_root = fresh_temp_dir("upd-mcp-auto-src-");
+        let repo = src_root.join("bundle");
+        write_src(&repo, BUNDLE_MANIFEST_FILE, "name: mcp-auto-bundle\n");
+        write_src(
+            &repo,
+            "functions/mcp.json",
+            r#"{"mcpServers": {"srv": {"type": "stdio", "command": "echo"}}}"#,
+        );
+        init_bundle_repo(&repo);
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        commit_file(
+            &repo,
+            "functions/mcp.json",
+            r#"{"mcpServers": {"srv": {"type": "stdio", "command": "printf"}}}"#,
+        );
+
+        update_bundle("mcp-auto-bundle", false).unwrap();
+
+        let merged = fs::read_to_string(paths::mcp_config_file()).unwrap();
+        assert!(merged.contains("printf"), "merged mcp.json: {merged}");
+        assert!(!merged.contains("echo"), "merged mcp.json: {merged}");
         let _ = fs::remove_dir_all(&src_root);
     }
 
@@ -3412,7 +3612,7 @@ mod tests {
         fs::create_dir_all(paths::macros_dir()).unwrap();
         fs::write(paths::macros_dir().join("user.yaml"), "local\n").unwrap();
 
-        let err = update_bundle("unowned-bundle").unwrap_err();
+        let err = update_bundle("unowned-bundle", false).unwrap_err();
 
         assert!(
             err.to_string().contains("Refusing to overwrite"),
@@ -3491,7 +3691,7 @@ mod tests {
         fs::remove_file(repo.join("macros/gone.yaml")).unwrap();
         commit_file(&repo, "macros/keep.yaml", "k2\n");
 
-        update_bundle("obs-keep").unwrap();
+        update_bundle("obs-keep", false).unwrap();
 
         assert_eq!(
             fs::read_to_string(paths::macros_dir().join("gone.yaml")).unwrap(),
@@ -3525,7 +3725,8 @@ mod tests {
             )
             .unwrap();
 
-        apply_obsolete_action(&mut store, "omc", &path, &dst, ObsoleteAction::Delete).unwrap();
+        apply_obsolete_action(&mut store, "omc", &path, &dst, &dir, ObsoleteAction::Delete)
+            .unwrap();
 
         assert!(!dst.exists());
         let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -3540,12 +3741,11 @@ mod tests {
         store
             .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
             .unwrap();
-        let ghost = dir.join("macros/ghost.yaml");
         store
             .record_file(
                 "omc",
                 FileRecord {
-                    path: provenance_path(&ghost),
+                    path: "macros/ghost-bundle-test.yaml".to_string(),
                     category: "macros".to_string(),
                     sha256: "0".repeat(64),
                     action: FileAction::New,
@@ -3557,9 +3757,40 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan).unwrap();
+        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
 
         assert!(store.get("omc").unwrap().files.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_obsolete_never_touches_suspicious_recorded_paths() {
+        let dir = fresh_temp_dir("upd-obsolete-suspicious-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        for hostile in ["/etc/nonexistent-coyote-test", "../escape.yaml"] {
+            store
+                .record_file(
+                    "omc",
+                    FileRecord {
+                        path: hostile.to_string(),
+                        category: "macros".to_string(),
+                        sha256: "0".repeat(64),
+                        action: FileAction::New,
+                    },
+                )
+                .unwrap();
+        }
+        let plan = InstallPlan {
+            files: Vec::new(),
+            mcp_json: None,
+        };
+
+        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+
+        assert_eq!(store.get("omc").unwrap().files.len(), 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3595,7 +3826,7 @@ mod tests {
              homepage: https://example.com/new\n",
         );
 
-        update_bundle("meta-bundle").unwrap();
+        update_bundle("meta-bundle", false).unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("meta-bundle").unwrap();
@@ -3613,7 +3844,7 @@ mod tests {
     fn update_unknown_bundle_lists_installed_names() {
         let _guard = TestVaultConfigGuard::new("upd-unknown-name");
 
-        let err = update_bundle("nope").unwrap_err();
+        let err = update_bundle("nope", false).unwrap_err();
         assert!(err.to_string().contains("none are installed"), "got: {err}");
 
         let src_root = fresh_temp_dir("upd-unknown-src-");
@@ -3623,7 +3854,7 @@ mod tests {
         init_bundle_repo(&repo);
         install_remote(repo.to_str().unwrap(), None, false).unwrap();
 
-        let err = update_bundle("nope").unwrap_err();
+        let err = update_bundle("nope", false).unwrap_err();
 
         assert!(
             err.to_string().contains("installed bundles: known-bundle"),
@@ -3645,7 +3876,7 @@ mod tests {
         let newer = commit_file(&repo, "macros/two.yaml", "2\n");
         assert_ne!(pinned, newer);
 
-        update_bundle("pin-bundle").unwrap();
+        update_bundle("pin-bundle", false).unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("pin-bundle").unwrap();
@@ -3667,7 +3898,7 @@ mod tests {
         install_remote(&format!("{}#{pinned}", repo.display()), None, false).unwrap();
         let newer = commit_file(&repo, "macros/two.yaml", "2\n");
 
-        update_bundle(&format!("move-bundle#{newer}")).unwrap();
+        update_bundle(&format!("move-bundle#{newer}"), false).unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("move-bundle").unwrap();
@@ -4467,7 +4698,7 @@ mod tests {
             .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
             .unwrap();
 
-        let report = merge_mcp_json(None, &remote, &target, false).unwrap();
+        let report = merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap();
         record_mcp_merge(&mut store, "omc", &report).unwrap();
 
         let written: McpServersConfig =

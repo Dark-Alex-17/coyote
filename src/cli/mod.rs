@@ -216,7 +216,7 @@ pub struct Cli {
         help_heading = "Installation & Updates"
     )]
     pub filter: Option<InstallFilter>,
-    /// Overwrite all conflicts without prompting (used with --install)
+    /// Overwrite all conflicts without prompting (remote installs only)
     #[arg(
         long,
         requires = "install",
@@ -228,18 +228,24 @@ pub struct Cli {
     #[arg(
         long,
         value_name = "NAME",
+        group = "yes_scope",
         conflicts_with_all = ["uninstall"],
         help_heading = "Installation & Updates"
     )]
     pub update_bundle: Option<String>,
     /// Uninstall a bundle: delete its owned files and remove its mcp.json entries
-    #[arg(long, value_name = "NAME", help_heading = "Installation & Updates")]
-    pub uninstall: Option<String>,
-    /// Skip uninstall confirmation prompts (locally modified items are still kept)
     #[arg(
         long,
-        requires = "uninstall",
-        conflicts_with_all = ["install", "install_builtins", "update_bundle"],
+        value_name = "NAME",
+        group = "yes_scope",
+        help_heading = "Installation & Updates"
+    )]
+    pub uninstall: Option<String>,
+    /// Proceed without prompts for --uninstall and --update-bundle (locally modified items are always kept)
+    #[arg(
+        long,
+        requires = "yes_scope",
+        conflicts_with_all = ["install", "install_builtins"],
         help_heading = "Installation & Updates"
     )]
     pub yes: bool,
@@ -562,8 +568,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_yes_flag_requires_uninstall() {
+    fn parse_yes_flag_requires_uninstall_or_update_bundle() {
         assert!(parse(&["--uninstall", "foo", "--yes"]).yes);
+        assert!(parse(&["--update-bundle", "foo", "--yes"]).yes);
         assert!(Cli::try_parse_from(["coyote", "--yes"]).is_err());
     }
 

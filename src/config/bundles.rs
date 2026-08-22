@@ -100,14 +100,19 @@ pub(crate) struct ResolvedBundleName {
     pub(crate) same_name_other_source: Option<String>,
 }
 
+const STORE_VERSION: u32 = 1;
+
 #[derive(Debug, Default, Deserialize)]
 struct StoreContents {
+    #[serde(default)]
+    version: u32,
     #[serde(default)]
     bundles: BTreeMap<String, BundleRecord>,
 }
 
 #[derive(Serialize)]
 struct StoreContentsRef<'a> {
+    version: u32,
     bundles: &'a BTreeMap<String, BundleRecord>,
 }
 
@@ -137,10 +142,19 @@ impl BundleStore {
         let contents: StoreContents = serde_yaml::from_str(&content).with_context(|| {
             format!(
                 "failed to parse {}; refusing to treat it as empty. \
-                 Fix or remove the file to continue",
+                 Restore or repair the file to continue; removing it forfeits \
+                 uninstall tracking for every installed bundle",
                 path.display()
             )
         })?;
+        if contents.version > STORE_VERSION {
+            bail!(
+                "{} has store version {}, but this coyote build supports up to \
+                 {STORE_VERSION}; update coyote or restore a matching store",
+                path.display(),
+                contents.version
+            );
+        }
         Ok(Self {
             path,
             bundles: contents.bundles,
@@ -149,6 +163,7 @@ impl BundleStore {
 
     pub(crate) fn save(&self) -> Result<()> {
         let content = serde_yaml::to_string(&StoreContentsRef {
+            version: STORE_VERSION,
             bundles: &self.bundles,
         })
         .context("failed to serialize the installed-bundles store")?;
@@ -277,6 +292,13 @@ impl BundleStore {
         if let Some(old_key) = existing_key
             && !already_recorded
         {
+            if self.bundles.contains_key(&resolved.name) {
+                bail!(
+                    "records '{old_key}' and '{}' both track source '{url}'; \
+                     uninstall one or repair installed-bundles.yaml before continuing",
+                    resolved.name
+                );
+            }
             let record = self
                 .bundles
                 .remove(&old_key)
@@ -345,6 +367,25 @@ impl BundleStore {
             .get_mut(name)
             .expect("bundle existence checked above");
         record.updated_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+        self.save()
+    }
+
+    /// Written only after an update's files and mcp entries land, so an
+    /// aborted update cannot leave the record claiming a commit whose content
+    /// never finished applying.
+    pub(crate) fn set_bundle_versions(
+        &mut self,
+        name: &str,
+        commit: &str,
+        version: Option<String>,
+    ) -> Result<()> {
+        self.ensure_bundle_exists(name)?;
+        let record = self
+            .bundles
+            .get_mut(name)
+            .expect("bundle existence checked above");
+        record.commit = commit.to_string();
+        record.version = version;
         self.save()
     }
 
