@@ -197,14 +197,6 @@ pub struct Cli {
         help_heading = "Installation & Updates"
     )]
     pub git_host: Option<String>,
-    /// Removed; use --install <GIT_URL> instead
-    #[arg(
-        long,
-        hide = true,
-        value_name = "GIT_URL",
-        help_heading = "Installation & Updates"
-    )]
-    pub install_from: Option<String>,
     /// Reinstall bundled assets for a category (asks before overwriting your local changes)
     #[arg(
         long,
@@ -598,14 +590,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_install_from_is_a_tombstone() {
-        let cli = parse(&["--install-from", "https://github.com/x/y"]);
-        assert!(cli.install.is_none());
-        assert_eq!(cli.install_from.as_deref(), Some("https://github.com/x/y"));
-        assert!(cli.text.is_empty());
-    }
-
-    #[test]
     fn parse_install_builtins_conflicts_with_install() {
         assert!(
             Cli::try_parse_from(["coyote", "--install-builtins", "agents", "--install", "x"])
@@ -666,10 +650,9 @@ mod tests {
     }
 
     #[test]
-    fn help_omits_install_from_and_shows_install_builtins() {
+    fn help_shows_install_builtins() {
         use clap::CommandFactory;
         let help = Cli::command().render_long_help().to_string();
-        assert!(!help.contains("--install-from"), "help: {help}");
         assert!(help.contains("--install-builtins"));
     }
 
