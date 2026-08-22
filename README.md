@@ -23,7 +23,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [AIChat Migration Guide](https://github.com/Dark-Alex-17/coyote/wiki/AIChat-Migration): Coming from AIChat? Follow the migration guide to get started.
 * [Installation](#install): Install Coyote
 * [Getting Started](#getting-started): Get started with Coyote by doing first-run setup steps.
-* [Sharing Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Sharing-Configurations): Install bundles of agents, roles, macros, tools, and MCP servers from any git repo, and share your own. Bundles are Coyote's equivalent of plugins in other CLI agents.
+* [Sharing Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Sharing-Configurations): Install bundles of agents, roles, skills, macros, tools, and MCP servers from any git repo, and share your own. Bundles are Coyote's equivalent of plugins in other CLI agents.
 * [REPL](https://github.com/Dark-Alex-17/coyote/wiki/REPL): Interactive Read-Eval-Print Loop for conversational interactions with LLMs and Coyote.
   * [Custom REPL Prompt](https://github.com/Dark-Alex-17/coyote/wiki/REPL-Prompt): Customize the REPL prompt to provide useful contextual information.
 * [Vault](https://github.com/Dark-Alex-17/coyote/wiki/Vault): Securely store and manage sensitive information such as API keys and credentials.

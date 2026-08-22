@@ -165,7 +165,16 @@ pub(crate) fn write_file_atomic(
         std::process::id(),
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&tmp, content)?;
+    let write_synced = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()
+    };
+    if let Err(err) = write_synced() {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
 
     #[cfg(unix)]
     if let Some(mode) = mode {

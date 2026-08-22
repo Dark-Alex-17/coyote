@@ -151,7 +151,7 @@ fn looks_like_remote_source(value: &str) -> bool {
     }
 }
 
-const DEFAULT_GIT_HOST: &str = "github.com";
+pub(crate) const DEFAULT_GIT_HOST: &str = "github.com";
 
 fn is_repo_shorthand(value: &str) -> bool {
     let path = strip_ref_suffix(value);
@@ -174,7 +174,7 @@ fn expand_repo_shorthand(value: &str, git_host: Option<&str>) -> Result<String> 
         .or_else(|| raw.strip_prefix("http://"))
         .unwrap_or(raw)
         .trim_matches('/');
-    if host.is_empty() || host.contains('/') || host.chars().any(char::is_whitespace) {
+    if host.is_empty() || host.contains(['/', '#', '?']) || host.chars().any(char::is_whitespace) {
         bail!("invalid --git-host '{raw}': expected a bare host like git.somedomain.com");
     }
     Ok(format!("https://{host}/{value}"))
@@ -951,12 +951,18 @@ fn clone_to_temp(url: &str, reference: Option<&str>) -> Result<TempRepoDir> {
                 "1".into(),
                 "--branch".into(),
                 r.into(),
+                "--".into(),
                 url.into(),
                 dest_arg,
             ])?;
         }
         Some(r) => {
-            run_git(vec!["clone".into(), url.into(), dest_arg.clone()])?;
+            run_git(vec![
+                "clone".into(),
+                "--".into(),
+                url.into(),
+                dest_arg.clone(),
+            ])?;
             run_git(vec!["-C".into(), dest_arg, "checkout".into(), r.into()])?;
         }
         None => {
@@ -964,6 +970,7 @@ fn clone_to_temp(url: &str, reference: Option<&str>) -> Result<TempRepoDir> {
                 "clone".into(),
                 "--depth".into(),
                 "1".into(),
+                "--".into(),
                 url.into(),
                 dest_arg,
             ])?;
@@ -1223,14 +1230,17 @@ fn sanitize_host(host: &str) -> String {
         .to_string()
 }
 
+/// The host compares case-insensitively but the path keeps its case: many
+/// self-hosted forges treat repository paths as case-sensitive, and collapsing
+/// distinct repos into one record misdirects updates and uninstalls.
 pub(crate) fn canonical_source_url(url: &str) -> String {
     let (host, path) = split_host_and_path(url);
-    let mut path = path.to_ascii_lowercase();
-    if let Some(stripped) = path.strip_suffix(".git")
-        && !stripped.is_empty()
-        && !stripped.ends_with('/')
-    {
-        path = stripped.to_string();
+    let mut path = path;
+    if path.to_ascii_lowercase().ends_with(".git") {
+        let stripped = &path[..path.len() - 4];
+        if !stripped.is_empty() && !stripped.ends_with('/') {
+            path.truncate(path.len() - 4);
+        }
     }
     let host = host.to_ascii_lowercase();
     if host.is_empty() {
@@ -2837,10 +2847,14 @@ mod tests {
     }
 
     #[test]
-    fn canonical_source_url_lowercases_host_and_path() {
+    fn canonical_source_url_lowercases_host_but_not_path() {
         assert_eq!(
             canonical_source_url("https://GitHub.COM/X/R.git"),
-            "github.com/x/r"
+            "github.com/X/R"
+        );
+        assert_ne!(
+            canonical_source_url("https://gitlab.example.com/team/Repo"),
+            canonical_source_url("https://gitlab.example.com/team/repo")
         );
     }
 

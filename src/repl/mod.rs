@@ -875,6 +875,9 @@ pub async fn run_repl_command(
                 ReplInstallDispatch::Unified(value) => {
                     config::install_or_update_from_repl_args(value)?;
                 }
+                ReplInstallDispatch::RemovedRemote => println!(
+                    "'.install remote <git-url>' was removed; use '.install <git-url>' directly."
+                ),
                 ReplInstallDispatch::Usage => println!(
                     "Usage: .install <{}> | .install <git-url|owner/repo|installed-bundle> \
                          [--git-host <host>] [--filter <cat>] [--force]",
@@ -1197,12 +1200,20 @@ pub async fn run_repl_command(
                     println!("Usage: .delete <role|session|rag|macro|skill|agent-data>")
                 }
             },
-            ".uninstall" => match args {
-                Some(args) => {
-                    config::uninstall_bundle(args.trim(), false)?;
+            ".uninstall" => {
+                let mut assume_yes = false;
+                let mut names = Vec::new();
+                for token in args.unwrap_or("").split_whitespace() {
+                    match token {
+                        "--yes" | "-y" => assume_yes = true,
+                        other => names.push(other),
+                    }
                 }
-                _ => println!("Usage: .uninstall <bundle-name>"),
-            },
+                match names.as_slice() {
+                    [name] => config::uninstall_bundle(name, assume_yes)?,
+                    _ => println!("Usage: .uninstall <bundle-name> [--yes]"),
+                }
+            }
             ".list" => match args {
                 Some(args) => {
                     ctx.list_assets(args.trim())?;
@@ -1575,6 +1586,7 @@ fn unknown_command() -> Result<()> {
 enum ReplInstallDispatch<'a> {
     Builtins(AssetCategory),
     Unified(&'a str),
+    RemovedRemote,
     Usage,
 }
 
@@ -1582,10 +1594,15 @@ fn parse_repl_install(args: Option<&str>) -> ReplInstallDispatch<'_> {
     let trimmed = args.map(str::trim).unwrap_or("");
     let mut parts = trimmed.splitn(2, char::is_whitespace);
     match parts.next() {
-        Some(name) if !name.is_empty() => match AssetCategory::parse(name) {
-            Some(category) => ReplInstallDispatch::Builtins(category),
-            None => ReplInstallDispatch::Unified(trimmed),
-        },
+        Some(name) if !name.is_empty() => {
+            let rest = parts.next().map(str::trim).unwrap_or("");
+            match AssetCategory::parse(name) {
+                Some(category) if rest.is_empty() => ReplInstallDispatch::Builtins(category),
+                Some(_) => ReplInstallDispatch::Usage,
+                None if name == "remote" && !rest.is_empty() => ReplInstallDispatch::RemovedRemote,
+                None => ReplInstallDispatch::Unified(trimmed),
+            }
+        }
         _ => ReplInstallDispatch::Usage,
     }
 }
@@ -1839,6 +1856,30 @@ mod tests {
     fn parse_repl_install_empty_args_ask_for_usage() {
         assert_eq!(parse_repl_install(None), ReplInstallDispatch::Usage);
         assert_eq!(parse_repl_install(Some("  ")), ReplInstallDispatch::Usage);
+    }
+
+    #[test]
+    fn parse_repl_install_rejects_extra_tokens_after_a_category() {
+        assert_eq!(
+            parse_repl_install(Some("agents --force")),
+            ReplInstallDispatch::Usage
+        );
+        assert_eq!(
+            parse_repl_install(Some("agents extra")),
+            ReplInstallDispatch::Usage
+        );
+    }
+
+    #[test]
+    fn parse_repl_install_hints_on_removed_remote_form() {
+        assert_eq!(
+            parse_repl_install(Some("remote https://github.com/x/y")),
+            ReplInstallDispatch::RemovedRemote
+        );
+        assert_eq!(
+            parse_repl_install(Some("remote")),
+            ReplInstallDispatch::Unified("remote")
+        );
     }
 
     #[test]
