@@ -2,10 +2,13 @@ use super::install_remote::{
     canonical_source_url, owner_qualifier, repo_name_slug, validate_bundle_name,
 };
 use super::paths;
+use crate::config::AssetCategory;
 use crate::function::write_file_atomic;
+use crate::utils::IS_STDOUT_TERMINAL;
 
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
+use inquire::Confirm;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -92,9 +95,6 @@ pub(crate) struct ResolvedBundleName {
     pub(crate) name: String,
     /// The unqualified name this install asked for, when it had to be owner-qualified.
     pub(crate) qualified_from: Option<String>,
-    /// The record key this source was previously tracked under, when it changed.
-    #[allow(dead_code)]
-    pub(crate) migrated_from: Option<String>,
     /// Source URL of the different-source bundle that already holds the unqualified name.
     pub(crate) same_name_other_source: Option<String>,
 }
@@ -216,15 +216,21 @@ impl BundleStore {
         let mut resolved = ResolvedBundleName {
             name: base.clone(),
             qualified_from: None,
-            migrated_from: None,
             same_name_other_source: None,
         };
 
-        if let Some(other_source) = self.source_of_other_bundle(&base, &canonical) {
+        let reserved = AssetCategory::parse(&base).is_some();
+        let collision = self.source_of_other_bundle(&base, &canonical);
+        if reserved || collision.is_some() {
+            let reason = match &collision {
+                Some(other_source) => {
+                    format!("is already used by an install from '{other_source}'")
+                }
+                None => "is reserved for an asset category".to_string(),
+            };
             if base.contains('/') {
                 bail!(
-                    "bundle name '{base}' is already used by an install from \
-                     '{other_source}' and cannot be qualified further; \
+                    "bundle name '{base}' {reason} and cannot be qualified further; \
                      uninstall it or pick a different manifest name"
                 );
             }
@@ -233,21 +239,37 @@ impl BundleStore {
                 .filter(|owner| !owner.is_empty());
             let Some(owner) = owner else {
                 bail!(
-                    "bundle name '{base}' is already used by an install from \
-                     '{other_source}', and no owner qualifier can be derived from '{url}'"
+                    "bundle name '{base}' {reason}, and no owner qualifier \
+                     can be derived from '{url}'"
                 );
             };
             let qualified = format!("{owner}/{base}");
             if let Some(source) = self.source_of_other_bundle(&qualified, &canonical) {
                 bail!(
-                    "bundle names '{base}' and '{qualified}' are both used by installs \
-                     from other sources ('{other_source}', '{source}'); \
+                    "bundle name '{base}' {reason}, and '{qualified}' is already \
+                     used by an install from '{source}'; \
                      uninstall one or pick a different manifest name"
                 );
             }
+            if let Some(other_source) = &collision
+                && manifest_name.is_some()
+                && *IS_STDOUT_TERMINAL
+            {
+                let proceed = Confirm::new(&format!(
+                    "Bundle name '{base}' is already used by an install from \
+                     '{other_source}' (a fork or typo-squat?). Track this install \
+                     as '{qualified}'?"
+                ))
+                .with_default(false)
+                .prompt()
+                .with_context(|| "failed to read bundle name confirmation")?;
+                if !proceed {
+                    bail!("install aborted: bundle name '{base}' {reason}");
+                }
+            }
             resolved.name = qualified;
             resolved.qualified_from = Some(base);
-            resolved.same_name_other_source = Some(other_source);
+            resolved.same_name_other_source = collision;
         }
 
         let already_recorded = existing_key.as_deref() == Some(resolved.name.as_str());
@@ -263,18 +285,16 @@ impl BundleStore {
                 "Bundle '{old_key}' from {url} is now tracked as '{}'.",
                 resolved.name
             );
-            resolved.migrated_from = Some(old_key);
             self.save()?;
         }
 
         if let (Some(from), false) = (&resolved.qualified_from, already_recorded) {
-            let other = resolved
-                .same_name_other_source
-                .as_deref()
-                .unwrap_or_default();
+            let detail = match resolved.same_name_other_source.as_deref() {
+                Some(other) => format!("is already used by an install from '{other}'"),
+                None => "is reserved for an asset category".to_string(),
+            };
             println!(
-                "Bundle name '{from}' is already used by an install from '{other}'; \
-                 tracking this install as '{}'.",
+                "Bundle name '{from}' {detail}; tracking this install as '{}'.",
                 resolved.name
             );
         }
@@ -877,7 +897,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved.name, "omc");
-        assert_eq!(resolved.migrated_from, None);
         assert_eq!(resolved.qualified_from, None);
     }
 
@@ -897,7 +916,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved.name, "oh-my-coyote");
-        assert_eq!(resolved.migrated_from.as_deref(), Some("omc"));
         let reloaded = dir.store();
         assert!(reloaded.get("omc").is_none());
         assert_eq!(reloaded.get("oh-my-coyote").unwrap().files.len(), 1);
@@ -955,7 +973,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved.name, "b/repo");
-        assert_eq!(resolved.migrated_from, None);
+        assert_eq!(resolved.qualified_from.as_deref(), Some("repo"));
     }
 
     #[test]
@@ -968,6 +986,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved.name, "next-js");
+    }
+
+    #[test]
+    fn resolve_reserves_asset_category_names() {
+        let dir = TempStoreDir::new("bundles-reserved");
+        let mut store = dir.store();
+
+        let resolved = store
+            .resolve_bundle_name("https://github.com/x/agents", None)
+            .unwrap();
+
+        assert_eq!(resolved.name, "x/agents");
+        assert_eq!(resolved.qualified_from.as_deref(), Some("agents"));
+        assert!(resolved.same_name_other_source.is_none());
+
+        let resolved = store
+            .resolve_bundle_name("https://github.com/y/repo", Some("mcp_config"))
+            .unwrap();
+
+        assert_eq!(resolved.name, "y/mcp_config");
+        assert_eq!(resolved.qualified_from.as_deref(), Some("mcp_config"));
     }
 
     #[test]
