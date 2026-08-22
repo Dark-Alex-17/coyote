@@ -138,13 +138,6 @@ async fn main() -> Result<()> {
         return config::install_or_update(value, cli.filter, cli.install_force);
     }
 
-    if let Some(url) = cli.install_from.as_deref() {
-        eprintln!(
-            "warning: --install-from is deprecated and will be removed in a future release; use --install <GIT_URL>"
-        );
-        return config::install_remote(url, cli.filter, cli.install_force);
-    }
-
     if let Some(spec) = cli.update_bundle.as_deref() {
         return config::update_bundle(spec);
     }

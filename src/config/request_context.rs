@@ -3263,7 +3263,6 @@ impl RequestContext {
                 ".install" => {
                     let mut values: Vec<String> =
                         AssetCategory::NAMES.iter().map(|s| s.to_string()).collect();
-                    values.push("remote".to_string());
                     values.extend(
                         BundleStore::load()
                             .map(|store| {
@@ -3495,7 +3494,7 @@ impl RequestContext {
             values = complete_skills_with_descriptions(paths::list_skills());
         } else if cmd == ".skill" && args.first() == Some(&"unload") && args.len() == 2 {
             values = complete_skills_with_descriptions(self.skill_registry.loaded_names());
-        } else if cmd == ".install" && args.first() == Some(&"remote") && args.len() >= 2 {
+        } else if cmd == ".install" && args.len() >= 2 {
             let prev = args.get(args.len() - 2).copied().unwrap_or("");
             if prev == "--filter" {
                 values = super::map_completion_values(
@@ -4992,7 +4991,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn repl_complete_install_offers_categories_remote_and_bundles() {
+    fn repl_complete_install_offers_categories_and_bundles() {
         let _guard = TestConfigDirGuard::new();
         let mut store = BundleStore::load().unwrap();
         store
@@ -5012,7 +5011,7 @@ mod tests {
 
         let values = ctx.repl_complete(".install", &[""], "");
 
-        for expected in ["agents", "remote", "omc"] {
+        for expected in ["agents", "omc"] {
             assert!(
                 values.iter().any(|(name, _)| name == expected),
                 "missing '{expected}'; got: {values:?}"
