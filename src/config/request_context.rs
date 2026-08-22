@@ -1,3 +1,4 @@
+use super::bundles::BundleStore;
 use super::rag_cache::{RagCache, RagKey};
 use super::session::Session;
 use super::skill::{SKILL_SCAFFOLD, Skill};
@@ -58,6 +59,22 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs};
 
+/// Completion must degrade rather than break the prompt, but a corrupt store
+/// should not vanish silently: the failure is logged before returning empty.
+fn installed_bundle_names() -> Vec<String> {
+    match BundleStore::load() {
+        Ok(store) => store
+            .bundle_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        Err(e) => {
+            warn!("skipping bundle-name completion: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
 pub struct AutoContinueConfig {
     pub enabled: bool,
     pub max_continues: usize,
@@ -112,7 +129,7 @@ fn print_asset_names(kind: &str, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn asset_table(header: &[&str]) -> Table {
+pub(crate) fn asset_table(header: &[&str]) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
     table.set_content_arrangement(ContentArrangement::Dynamic);
@@ -2786,8 +2803,9 @@ impl RequestContext {
                 }
                 Ok(())
             }
+            "bundles" => super::bundles::list_installed_bundles(),
             _ => bail!(
-                "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, tools, mcp-servers"
+                "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, tools, mcp-servers, bundles"
             ),
         }
     }
@@ -3261,8 +3279,16 @@ impl RequestContext {
                 ".install" => {
                     let mut values: Vec<String> =
                         AssetCategory::NAMES.iter().map(|s| s.to_string()).collect();
-                    values.push("remote".to_string());
+                    values.extend(installed_bundle_names());
                     super::map_completion_values(values)
+                }
+                ".uninstall" => {
+                    let mut values = super::map_completion_values(installed_bundle_names());
+                    values.push((
+                        "--yes".to_string(),
+                        Some("Skip the uninstall confirmation".to_string()),
+                    ));
+                    values
                 }
                 ".macro" => {
                     let policy = self.macro_policy();
@@ -3327,6 +3353,7 @@ impl RequestContext {
                     "skills",
                     "tools",
                     "mcp-servers",
+                    "bundles",
                 ]),
                 ".vault" => {
                     let mut values = vec!["add", "get", "update", "delete", "list"];
@@ -3469,17 +3496,24 @@ impl RequestContext {
             values = complete_skills_with_descriptions(paths::list_skills());
         } else if cmd == ".skill" && args.first() == Some(&"unload") && args.len() == 2 {
             values = complete_skills_with_descriptions(self.skill_registry.loaded_names());
-        } else if cmd == ".install" && args.first() == Some(&"remote") && args.len() >= 2 {
+        } else if cmd == ".install" && args.len() >= 2 {
             let prev = args.get(args.len() - 2).copied().unwrap_or("");
             if prev == "--filter" {
                 values = super::map_completion_values(
                     InstallFilter::NAMES.iter().map(|s| s.to_string()).collect(),
                 );
+            } else if prev == "--git-host" {
+                values = super::map_completion_values(vec![
+                    super::install_remote::DEFAULT_GIT_HOST.to_string(),
+                ]);
             } else {
                 let has_filter = args.iter().enumerate().any(|(i, a)| {
                     a.starts_with("--filter=") || (*a == "--filter" && i < args.len() - 1)
                 });
                 let has_force = args.contains(&"--force");
+                let has_git_host = args.iter().enumerate().any(|(i, a)| {
+                    a.starts_with("--git-host=") || (*a == "--git-host" && i < args.len() - 1)
+                });
                 let mut available: Vec<&str> = vec![];
 
                 if !has_filter {
@@ -3487,6 +3521,9 @@ impl RequestContext {
                 }
                 if !has_force {
                     available.push("--force");
+                }
+                if !has_git_host {
+                    available.push("--git-host");
                 }
 
                 values = super::map_completion_values(available);
@@ -4934,6 +4971,64 @@ mod tests {
     fn maybe_autoname_session_returns_false_when_no_session() {
         let mut ctx = create_test_ctx();
         assert!(!ctx.maybe_autoname_session());
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_uninstall_offers_installed_bundle_names() {
+        let _guard = TestConfigDirGuard::new();
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle(
+                "omc",
+                crate::config::bundles::InstallMetadata {
+                    source: "https://github.com/x/omc".to_string(),
+                    git_ref: None,
+                    commit: "abc123".to_string(),
+                    version: None,
+                    description: None,
+                    homepage: None,
+                },
+            )
+            .unwrap();
+        let ctx = create_test_ctx();
+
+        let values = ctx.repl_complete(".uninstall", &[""], "");
+
+        assert!(
+            values.iter().any(|(name, _)| name == "omc"),
+            "got: {values:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_install_offers_categories_and_bundles() {
+        let _guard = TestConfigDirGuard::new();
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle(
+                "omc",
+                crate::config::bundles::InstallMetadata {
+                    source: "https://github.com/x/omc".to_string(),
+                    git_ref: None,
+                    commit: "abc123".to_string(),
+                    version: None,
+                    description: None,
+                    homepage: None,
+                },
+            )
+            .unwrap();
+        let ctx = create_test_ctx();
+
+        let values = ctx.repl_complete(".install", &[""], "");
+
+        for expected in ["agents", "omc"] {
+            assert!(
+                values.iter().any(|(name, _)| name == expected),
+                "missing '{expected}'; got: {values:?}"
+            );
+        }
     }
 
     #[test]

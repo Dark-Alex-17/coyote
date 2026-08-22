@@ -127,14 +127,31 @@ async fn main() -> Result<()> {
         return sandbox::launch(name.clone(), cli.fresh);
     }
 
+    if cli.list_bundles {
+        return config::list_installed_bundles();
+    }
+
     install_builtins()?;
 
-    if let Some(category) = cli.install {
+    if let Some(category) = cli.install_builtins {
         return config::install_assets(category);
     }
 
-    if let Some(url) = cli.install_from.as_deref() {
-        return config::install_remote(url, cli.filter, cli.install_force);
+    if let Some(value) = cli.install.as_deref() {
+        return config::install_or_update(
+            value,
+            cli.git_host.as_deref(),
+            cli.filter,
+            cli.install_force,
+        );
+    }
+
+    if let Some(spec) = cli.update_bundle.as_deref() {
+        return config::update_bundle(spec, cli.yes);
+    }
+
+    if let Some(name) = cli.uninstall.as_deref() {
+        return config::uninstall_bundle(name, cli.yes);
     }
 
     if let Some(client_arg) = &cli.authenticate {
