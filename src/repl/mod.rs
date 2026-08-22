@@ -875,9 +875,6 @@ pub async fn run_repl_command(
                 ReplInstallDispatch::Unified(value) => {
                     config::install_or_update_from_repl_args(value)?;
                 }
-                ReplInstallDispatch::RemovedRemote => println!(
-                    "'.install remote <git-url>' was removed; use '.install <git-url>' directly."
-                ),
                 ReplInstallDispatch::Usage => println!(
                     "Usage: .install <{}> | .install <git-url|owner/repo|installed-bundle> \
                          [--git-host <host>] [--filter <cat>] [--force]",
@@ -1586,7 +1583,6 @@ fn unknown_command() -> Result<()> {
 enum ReplInstallDispatch<'a> {
     Builtins(AssetCategory),
     Unified(&'a str),
-    RemovedRemote,
     Usage,
 }
 
@@ -1599,7 +1595,6 @@ fn parse_repl_install(args: Option<&str>) -> ReplInstallDispatch<'_> {
             match AssetCategory::parse(name) {
                 Some(category) if rest.is_empty() => ReplInstallDispatch::Builtins(category),
                 Some(_) => ReplInstallDispatch::Usage,
-                None if name == "remote" && !rest.is_empty() => ReplInstallDispatch::RemovedRemote,
                 None => ReplInstallDispatch::Unified(trimmed),
             }
         }
@@ -1867,18 +1862,6 @@ mod tests {
         assert_eq!(
             parse_repl_install(Some("agents extra")),
             ReplInstallDispatch::Usage
-        );
-    }
-
-    #[test]
-    fn parse_repl_install_hints_on_removed_remote_form() {
-        assert_eq!(
-            parse_repl_install(Some("remote https://github.com/x/y")),
-            ReplInstallDispatch::RemovedRemote
-        );
-        assert_eq!(
-            parse_repl_install(Some("remote")),
-            ReplInstallDispatch::Unified("remote")
         );
     }
 
