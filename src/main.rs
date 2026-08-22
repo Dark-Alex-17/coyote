@@ -127,6 +127,10 @@ async fn main() -> Result<()> {
         return sandbox::launch(name.clone(), cli.fresh);
     }
 
+    if cli.list_bundles {
+        return config::list_installed_bundles();
+    }
+
     install_builtins()?;
 
     if let Some(category) = cli.install_builtins {
@@ -143,15 +147,11 @@ async fn main() -> Result<()> {
     }
 
     if let Some(spec) = cli.update_bundle.as_deref() {
-        return config::update_bundle(spec);
+        return config::update_bundle(spec, cli.yes);
     }
 
     if let Some(name) = cli.uninstall.as_deref() {
         return config::uninstall_bundle(name, cli.yes);
-    }
-
-    if cli.list_bundles {
-        return config::list_installed_bundles();
     }
 
     if let Some(client_arg) = &cli.authenticate {

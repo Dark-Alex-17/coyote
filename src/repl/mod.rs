@@ -1197,20 +1197,10 @@ pub async fn run_repl_command(
                     println!("Usage: .delete <role|session|rag|macro|skill|agent-data>")
                 }
             },
-            ".uninstall" => {
-                let mut assume_yes = false;
-                let mut names = Vec::new();
-                for token in args.unwrap_or("").split_whitespace() {
-                    match token {
-                        "--yes" | "-y" => assume_yes = true,
-                        other => names.push(other),
-                    }
-                }
-                match names.as_slice() {
-                    [name] => config::uninstall_bundle(name, assume_yes)?,
-                    _ => println!("Usage: .uninstall <bundle-name> [--yes]"),
-                }
-            }
+            ".uninstall" => match parse_repl_uninstall(args) {
+                Some((name, assume_yes)) => config::uninstall_bundle(&name, assume_yes)?,
+                None => println!("Usage: .uninstall <bundle-name> [--yes]"),
+            },
             ".list" => match args {
                 Some(args) => {
                     ctx.list_assets(args.trim())?;
@@ -1599,6 +1589,22 @@ fn parse_repl_install(args: Option<&str>) -> ReplInstallDispatch<'_> {
             }
         }
         _ => ReplInstallDispatch::Usage,
+    }
+}
+
+fn parse_repl_uninstall(args: Option<&str>) -> Option<(String, bool)> {
+    let mut assume_yes = false;
+    let mut names = Vec::new();
+    for token in args.unwrap_or("").split_whitespace() {
+        match token {
+            "--yes" | "-y" => assume_yes = true,
+            other if other.starts_with('-') => return None,
+            other => names.push(other),
+        }
+    }
+    match names.as_slice() {
+        [name] => Some((name.to_string(), assume_yes)),
+        _ => None,
     }
 }
 

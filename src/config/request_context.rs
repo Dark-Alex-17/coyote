@@ -59,6 +59,22 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs};
 
+/// Completion must degrade rather than break the prompt, but a corrupt store
+/// should not vanish silently: the failure is logged before returning empty.
+fn installed_bundle_names() -> Vec<String> {
+    match BundleStore::load() {
+        Ok(store) => store
+            .bundle_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        Err(e) => {
+            warn!("skipping bundle-name completion: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
 pub struct AutoContinueConfig {
     pub enabled: bool,
     pub max_continues: usize,
@@ -3263,30 +3279,16 @@ impl RequestContext {
                 ".install" => {
                     let mut values: Vec<String> =
                         AssetCategory::NAMES.iter().map(|s| s.to_string()).collect();
-                    values.extend(
-                        BundleStore::load()
-                            .map(|store| {
-                                store
-                                    .bundle_names()
-                                    .into_iter()
-                                    .map(str::to_string)
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default(),
-                    );
+                    values.extend(installed_bundle_names());
                     super::map_completion_values(values)
                 }
                 ".uninstall" => {
-                    let values = BundleStore::load()
-                        .map(|store| {
-                            store
-                                .bundle_names()
-                                .into_iter()
-                                .map(str::to_string)
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    super::map_completion_values(values)
+                    let mut values = super::map_completion_values(installed_bundle_names());
+                    values.push((
+                        "--yes".to_string(),
+                        Some("Skip the uninstall confirmation".to_string()),
+                    ));
+                    values
                 }
                 ".macro" => {
                     let policy = self.macro_policy();
