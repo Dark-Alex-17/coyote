@@ -34,7 +34,6 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
       homepage: https://github.com/example/oh-my-coyote   # optional
       ```
     * `coyote --install-builtins <category>` reinstalls Coyote's bundled assets for a category, overwriting any local changes (built-in assets are not bundles).
-    * The old `--install-from <git-url>` flag still works but is deprecated; use `--install` instead.
 * [REPL](https://github.com/Dark-Alex-17/coyote/wiki/REPL): Interactive Read-Eval-Print Loop for conversational interactions with LLMs and Coyote.
   * [Custom REPL Prompt](https://github.com/Dark-Alex-17/coyote/wiki/REPL-Prompt): Customize the REPL prompt to provide useful contextual information.
 * [Vault](https://github.com/Dark-Alex-17/coyote/wiki/Vault): Securely store and manage sensitive information such as API keys and credentials.

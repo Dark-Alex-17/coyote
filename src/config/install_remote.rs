@@ -69,22 +69,6 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
     Ok(())
 }
 
-pub fn install_remote_from_repl_args(args: &str) -> Result<()> {
-    let tokens = shell_words::split(args)
-        .with_context(|| format!("failed to parse '.install remote' args: {args}"))?;
-
-    let mut iter = tokens.into_iter();
-    let url = iter.next().with_context(|| {
-        format!(
-            "Usage: .install remote <git-url> [--filter <{}>] [--force]",
-            InstallFilter::NAMES.join("|")
-        )
-    })?;
-
-    let (filter, force) = parse_repl_install_flags(".install remote", iter)?;
-    install_remote(&url, filter, force)
-}
-
 fn parse_repl_install_flags(
     command: &str,
     mut iter: impl Iterator<Item = String>,

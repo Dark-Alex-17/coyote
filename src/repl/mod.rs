@@ -872,15 +872,12 @@ pub async fn run_repl_command(
             }
             ".install" => match parse_repl_install(args) {
                 ReplInstallDispatch::Builtins(category) => config::install_assets(category)?,
-                ReplInstallDispatch::Remote(rest) => {
-                    config::install_remote_from_repl_args(rest)?;
-                }
                 ReplInstallDispatch::Unified(value) => {
                     config::install_or_update_from_repl_args(value)?;
                 }
                 ReplInstallDispatch::Usage => println!(
-                    "Usage: .install <{}> | .install <git-url|installed-bundle> | \
-                         .install remote <git-url> [--filter <cat>] [--force]",
+                    "Usage: .install <{}> | .install <git-url|installed-bundle> \
+                         [--filter <cat>] [--force]",
                     AssetCategory::NAMES.join("|")
                 ),
             },
@@ -1577,7 +1574,6 @@ fn unknown_command() -> Result<()> {
 #[derive(Debug, PartialEq)]
 enum ReplInstallDispatch<'a> {
     Builtins(AssetCategory),
-    Remote(&'a str),
     Unified(&'a str),
     Usage,
 }
@@ -1586,7 +1582,6 @@ fn parse_repl_install(args: Option<&str>) -> ReplInstallDispatch<'_> {
     let trimmed = args.map(str::trim).unwrap_or("");
     let mut parts = trimmed.splitn(2, char::is_whitespace);
     match parts.next() {
-        Some("remote") => ReplInstallDispatch::Remote(parts.next().unwrap_or("").trim()),
         Some(name) if !name.is_empty() => match AssetCategory::parse(name) {
             Some(category) => ReplInstallDispatch::Builtins(category),
             None => ReplInstallDispatch::Unified(trimmed),
@@ -1821,14 +1816,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_repl_install_keeps_category_and_remote_back_compat() {
+    fn parse_repl_install_routes_categories_to_builtins() {
         assert_eq!(
             parse_repl_install(Some("agents")),
             ReplInstallDispatch::Builtins(AssetCategory::Agents)
-        );
-        assert_eq!(
-            parse_repl_install(Some("remote https://x --force")),
-            ReplInstallDispatch::Remote("https://x --force")
         );
     }
 
