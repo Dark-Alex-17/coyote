@@ -181,7 +181,7 @@ impl BundleStore {
             .map(|(name, record)| (name.as_str(), record))
     }
 
-    /// A URL already tracked under a different key migrates to the new key —
+    /// A URL already tracked under a different key migrates to the new key, so
     /// the same URL never gets a second record. A name held by a
     /// different-source bundle is owner-qualified instead.
     pub(crate) fn resolve_bundle_name(
@@ -371,7 +371,7 @@ impl BundleStore {
     }
 
     /// An entry whose key any bundle already owns transfers to `bundle`, and
-    /// its `replaced` action upgrades to `transferred` — plain `replaced`
+    /// its `replaced` action upgrades to `transferred`; plain `replaced`
     /// marks a pre-existing user entry that uninstall must never delete.
     pub(crate) fn record_mcp_servers(
         &mut self,
