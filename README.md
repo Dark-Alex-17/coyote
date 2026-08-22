@@ -24,16 +24,6 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [Installation](#install): Install Coyote
 * [Getting Started](#getting-started): Get started with Coyote by doing first-run setup steps.
 * [Sharing Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Sharing-Configurations): Install bundles of agents, roles, macros, tools, and MCP servers from any git repo, and share your own. Bundles are Coyote's equivalent of plugins in other CLI agents.
-    * Manage the full bundle lifecycle from the CLI: `coyote --install <git-url|name>` installs a bundle from any git repository (suffix the URL with `#<ref>` to pin a branch, tag, or commit; passing an installed bundle's name updates it instead), `--list-bundles` lists installed bundles and their drift status, `--update-bundle <name>` updates a bundle from its recorded source (suffix `#<ref>` to move a pin), and `--uninstall <name>` deletes a bundle's owned files and removes its `mcp.json` entries (add `--yes` to skip confirmation prompts; locally modified items are still kept). `--filter <category>` restricts a remote install to a single asset category, and `--install-force` overwrites all conflicts without prompting.
-    * The same lifecycle is available in the REPL: `.install <url|name>`, `.list bundles`, and `.uninstall <name>`.
-    * Bundle authors can optionally add a `coyote-bundle.yaml` manifest to the repository root to give the bundle a stable identity. The manifest is identity-only — the bundle's contents are always discovered by scanning the repository, never declared. Without a manifest, the bundle is named after the repository.
-      ```yaml
-      name: oh-my-coyote          # required; the bundle's identity
-      version: "1.4.0"            # optional; informational
-      description: Opinionated roles, macros, and skills for Coyote
-      homepage: https://github.com/example/oh-my-coyote   # optional
-      ```
-    * `coyote --install-builtins <category>` reinstalls Coyote's bundled assets for a category, overwriting any local changes (built-in assets are not bundles).
 * [REPL](https://github.com/Dark-Alex-17/coyote/wiki/REPL): Interactive Read-Eval-Print Loop for conversational interactions with LLMs and Coyote.
   * [Custom REPL Prompt](https://github.com/Dark-Alex-17/coyote/wiki/REPL-Prompt): Customize the REPL prompt to provide useful contextual information.
 * [Vault](https://github.com/Dark-Alex-17/coyote/wiki/Vault): Securely store and manage sensitive information such as API keys and credentials.
