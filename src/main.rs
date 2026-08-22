@@ -127,10 +127,6 @@ async fn main() -> Result<()> {
         return sandbox::launch(name.clone(), cli.fresh);
     }
 
-    if cli.install_from.is_some() {
-        bail!("--install-from was removed; use --install <GIT_URL|OWNER/REPO> instead");
-    }
-
     install_builtins()?;
 
     if let Some(category) = cli.install_builtins {
