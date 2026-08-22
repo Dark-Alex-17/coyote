@@ -8,14 +8,14 @@ use crate::function::Language;
 use crate::mcp::{McpServer, McpServersConfig};
 use crate::utils;
 use crate::utils::IS_STDOUT_TERMINAL;
-use crate::vault::{Vault, create_vault_password_file, interpolate_secrets};
+use crate::vault::{SECRET_RE, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, Select};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -472,6 +472,7 @@ struct UninstallFileSummary {
 struct UninstallMcpSummary {
     removed: Vec<String>,
     kept: Vec<String>,
+    secrets: Vec<String>,
 }
 
 /// Kept and failed items stay in the record, so a re-run offers them again.
@@ -568,6 +569,13 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
     }
     if !mcp.kept.is_empty() {
         println!("  = kept servers:    {}", mcp.kept.join(", "));
+    }
+    if !mcp.secrets.is_empty() {
+        println!(
+            "  ~ vault secrets referenced by this bundle's servers \
+             (installed by this bundle, not removed): {}",
+            mcp.secrets.join(", ")
+        );
     }
     Ok(())
 }
@@ -786,6 +794,24 @@ fn uninstall_mcp_entries(
     } else {
         None
     };
+
+    let mut secret_names: BTreeSet<String> = BTreeSet::new();
+    for server in servers {
+        if let Some(entry) = config
+            .as_ref()
+            .and_then(|cfg| cfg.mcp_servers.get(server.effective_key()))
+            && let Ok(serialized) = serde_json::to_string(entry)
+        {
+            for capture in SECRET_RE.captures_iter(&serialized) {
+                if let Ok(capture) = capture
+                    && let Some(name) = capture.get(1)
+                {
+                    secret_names.insert(name.as_str().to_string());
+                }
+            }
+        }
+    }
+    summary.secrets = secret_names.into_iter().collect();
 
     let mut changed = false;
     let mut released = Vec::new();
@@ -4262,6 +4288,46 @@ mod tests {
         assert!(!written.mcp_servers.contains_key("srv"));
         assert!(written.mcp_servers.contains_key("user-srv"));
         assert!(store.get("omc").unwrap().mcp_servers.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uninstall_mcp_reports_referenced_secrets_without_removing_them() {
+        let dir = fresh_temp_dir("uninst-mcp-secrets-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let mcp = dir.join("mcp.json");
+        write_mcp(
+            &mcp,
+            r#"{"mcpServers": {
+                "srv": {
+                    "type": "stdio",
+                    "command": "echo",
+                    "env": {"TOKEN": "{{OMC_TOKEN}}", "ORG": "{{OMC_ORG}}"}
+                }
+            }}"#,
+        );
+        let parsed: McpServersConfig =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        let hash = hash_bytes(
+            serde_json::to_string(parsed.mcp_servers.get("srv").unwrap())
+                .unwrap()
+                .as_bytes(),
+        );
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![mcp_server_record("srv", McpAction::Added, Some(hash))],
+            )
+            .unwrap();
+        let servers = store.get("omc").unwrap().mcp_servers.clone();
+
+        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+
+        assert_eq!(summary.removed, vec!["srv"]);
+        assert_eq!(summary.secrets, vec!["OMC_ORG", "OMC_TOKEN"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
