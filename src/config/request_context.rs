@@ -3278,16 +3278,29 @@ impl RequestContext {
                     .map(|(name, desc)| (name, if desc.is_empty() { None } else { Some(desc) }))
                     .collect(),
                 ".install" => {
-                    let mut values: Vec<String> =
+                    let mut names: Vec<String> =
                         AssetCategory::NAMES.iter().map(|s| s.to_string()).collect();
-                    values.extend(installed_bundle_names());
-                    super::map_completion_values(values)
+                    names.extend(installed_bundle_names());
+                    let mut values = super::map_completion_values(names);
+                    values.push((
+                        "--git-host".to_string(),
+                        Some("Host the owner/repo shorthand expands against".to_string()),
+                    ));
+                    values.push((
+                        "--help".to_string(),
+                        Some("Show usage for .install".to_string()),
+                    ));
+                    values
                 }
                 ".uninstall" => {
                     let mut values = super::map_completion_values(installed_bundle_names());
                     values.push((
                         "--yes".to_string(),
                         Some("Skip the uninstall confirmation".to_string()),
+                    ));
+                    values.push((
+                        "--help".to_string(),
+                        Some("Show usage for .uninstall".to_string()),
                     ));
 
                     values
@@ -3524,6 +3537,9 @@ impl RequestContext {
                 }
                 if !has_git_host {
                     available.push("--git-host");
+                }
+                if !args.contains(&"--help") {
+                    available.push("--help");
                 }
 
                 values = super::map_completion_values(available);

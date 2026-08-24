@@ -626,7 +626,10 @@ pub fn list_installed_bundles() -> Result<()> {
     let store = BundleStore::load()?;
     let rows = bundle_list_rows(&store, &paths::config_dir());
     if rows.is_empty() {
-        println!("No bundles installed. Install one with `coyote --install <git-url>`.");
+        println!(
+            "No bundles installed. Install one with `coyote --install <git-url|owner/repo>` \
+             or, from the REPL, `.install <git-url|owner/repo>` (see `.install --help`)."
+        );
         return Ok(());
     }
 

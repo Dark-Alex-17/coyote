@@ -875,9 +875,10 @@ pub async fn run_repl_command(
                 ReplInstallDispatch::Unified(value) => {
                     config::install_or_update_from_repl_args(value)?;
                 }
+                ReplInstallDispatch::Help => println!("{}", repl_install_help()),
                 ReplInstallDispatch::Usage => println!(
                     "Usage: .install <{}> | .install <git-url|owner/repo|installed-bundle> \
-                         [--git-host <host>] [--filter <cat>] [--force]",
+                         [--git-host <host>] [--filter <cat>] [--force] (see `.install --help`)",
                     AssetCategory::NAMES.join("|")
                 ),
             },
@@ -1198,8 +1199,13 @@ pub async fn run_repl_command(
                 }
             },
             ".uninstall" => match parse_repl_uninstall(args) {
-                Some((name, assume_yes)) => config::uninstall_bundle(&name, assume_yes)?,
-                None => println!("Usage: .uninstall <bundle-name> [--yes]"),
+                ReplUninstallDispatch::Run(name, assume_yes) => {
+                    config::uninstall_bundle(&name, assume_yes)?
+                }
+                ReplUninstallDispatch::Help => println!("{}", repl_uninstall_help()),
+                ReplUninstallDispatch::Usage => {
+                    println!("Usage: .uninstall <bundle-name> [--yes] (see `.uninstall --help`)")
+                }
             },
             ".list" => match args {
                 Some(args) => {
@@ -1573,11 +1579,18 @@ fn unknown_command() -> Result<()> {
 enum ReplInstallDispatch<'a> {
     Builtins(AssetCategory),
     Unified(&'a str),
+    Help,
     Usage,
 }
 
 fn parse_repl_install(args: Option<&str>) -> ReplInstallDispatch<'_> {
     let trimmed = args.map(str::trim).unwrap_or("");
+    if trimmed
+        .split_whitespace()
+        .any(|token| token == "--help" || token == "-h")
+    {
+        return ReplInstallDispatch::Help;
+    }
     let mut parts = trimmed.splitn(2, char::is_whitespace);
     match parts.next() {
         Some(name) if !name.is_empty() => {
@@ -1592,19 +1605,65 @@ fn parse_repl_install(args: Option<&str>) -> ReplInstallDispatch<'_> {
     }
 }
 
-fn parse_repl_uninstall(args: Option<&str>) -> Option<(String, bool)> {
+fn repl_install_help() -> String {
+    format!(
+        r#"Install built-in assets, install a bundle from a Git source, or update an installed bundle.
+
+Usage:
+  .install <category>                  Reinstall built-in assets ({categories})
+  .install <owner/repo>[#ref]          Install a bundle from {default_host} (change the host with --git-host)
+  .install <git-url>[#ref]             Install a bundle from any Git URL, scp-style path, or local path
+  .install <installed-bundle>[#ref]    Update an installed bundle from its recorded source
+
+Flags:
+  --git-host <host>   Host the <owner/repo> shorthand expands against (default {default_host})
+  --filter <cat>      Restrict a remote install to one category ({filters})
+  --force             Overwrite all conflicts without prompting (remote installs only)
+
+Suffix #<ref> to pin a branch, tag, or commit. List installed bundles with
+`.list bundles`; remove one with `.uninstall <name>`."#,
+        categories = AssetCategory::NAMES.join("|"),
+        default_host = config::DEFAULT_GIT_HOST,
+        filters = config::InstallFilter::NAMES.join("|"),
+    )
+}
+
+fn repl_uninstall_help() -> String {
+    r#"Remove an installed bundle: delete the files it owns and the mcp.json entries it added.
+
+Usage:
+  .uninstall <bundle-name> [--yes]
+
+Flags:
+  --yes, -y   Skip the confirmation prompt
+
+Files you modified after install are prompted for individually and kept by
+default; --yes never deletes modified files. List installed bundles with
+`.list bundles`."#
+        .to_string()
+}
+
+#[derive(Debug, PartialEq)]
+enum ReplUninstallDispatch {
+    Run(String, bool),
+    Help,
+    Usage,
+}
+
+fn parse_repl_uninstall(args: Option<&str>) -> ReplUninstallDispatch {
     let mut assume_yes = false;
     let mut names = Vec::new();
     for token in args.unwrap_or("").split_whitespace() {
         match token {
+            "--help" | "-h" => return ReplUninstallDispatch::Help,
             "--yes" | "-y" => assume_yes = true,
-            other if other.starts_with('-') => return None,
+            other if other.starts_with('-') => return ReplUninstallDispatch::Usage,
             other => names.push(other),
         }
     }
     match names.as_slice() {
-        [name] => Some((name.to_string(), assume_yes)),
-        _ => None,
+        [name] => ReplUninstallDispatch::Run(name.to_string(), assume_yes),
+        _ => ReplUninstallDispatch::Usage,
     }
 }
 
@@ -1869,6 +1928,70 @@ mod tests {
             parse_repl_install(Some("agents extra")),
             ReplInstallDispatch::Usage
         );
+    }
+
+    #[test]
+    fn parse_repl_install_routes_help_from_any_position() {
+        assert_eq!(
+            parse_repl_install(Some("--help")),
+            ReplInstallDispatch::Help
+        );
+        assert_eq!(parse_repl_install(Some("-h")), ReplInstallDispatch::Help);
+        assert_eq!(
+            parse_repl_install(Some("agents --help")),
+            ReplInstallDispatch::Help
+        );
+        assert_eq!(
+            parse_repl_install(Some("owner/repo --help")),
+            ReplInstallDispatch::Help
+        );
+    }
+
+    #[test]
+    fn parse_repl_uninstall_routes_run_help_and_usage() {
+        assert_eq!(
+            parse_repl_uninstall(Some("my-bundle --yes")),
+            ReplUninstallDispatch::Run("my-bundle".to_string(), true)
+        );
+        assert_eq!(
+            parse_repl_uninstall(Some("my-bundle")),
+            ReplUninstallDispatch::Run("my-bundle".to_string(), false)
+        );
+        assert_eq!(
+            parse_repl_uninstall(Some("--help")),
+            ReplUninstallDispatch::Help
+        );
+        assert_eq!(
+            parse_repl_uninstall(Some("my-bundle -h")),
+            ReplUninstallDispatch::Help
+        );
+        assert_eq!(
+            parse_repl_uninstall(Some("--force my-bundle")),
+            ReplUninstallDispatch::Usage
+        );
+        assert_eq!(parse_repl_uninstall(None), ReplUninstallDispatch::Usage);
+    }
+
+    #[test]
+    fn repl_install_and_uninstall_help_text_cover_the_full_surface() {
+        let install = repl_install_help();
+        for needle in [
+            "--git-host",
+            "--filter",
+            "--force",
+            "#ref",
+            "owner/repo",
+            ".list bundles",
+        ] {
+            assert!(install.contains(needle), "install help missing {needle}");
+        }
+        let uninstall = repl_uninstall_help();
+        for needle in ["--yes", ".list bundles", "<bundle-name>"] {
+            assert!(
+                uninstall.contains(needle),
+                "uninstall help missing {needle}"
+            );
+        }
     }
 
     #[test]

@@ -71,10 +71,21 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
     Ok(())
 }
 
+#[derive(Debug)]
+struct ReplInstallArgs {
+    value: Option<String>,
+    filter: Option<InstallFilter>,
+    force: bool,
+    git_host: Option<String>,
+}
+
+/// Flags may appear before or after the positional value, matching how the
+/// completer offers them at any argument position.
 fn parse_repl_install_flags(
     command: &str,
     mut iter: impl Iterator<Item = String>,
-) -> Result<(Option<InstallFilter>, bool, Option<String>)> {
+) -> Result<ReplInstallArgs> {
+    let mut value: Option<String> = None;
     let mut filter: Option<InstallFilter> = None;
     let mut force = false;
     let mut git_host: Option<String> = None;
@@ -103,11 +114,24 @@ fn parse_repl_install_flags(
             s if s.starts_with("--git-host=") => {
                 git_host = Some(s["--git-host=".len()..].to_string());
             }
-            other => bail!("Unexpected argument to '{command}': {other}"),
+            other if other.starts_with('-') => {
+                bail!("Unexpected argument to '{command}': {other}")
+            }
+            other => {
+                if value.is_some() {
+                    bail!("Unexpected argument to '{command}': {other}");
+                }
+                value = Some(other.to_string());
+            }
         }
     }
 
-    Ok((filter, force, git_host))
+    Ok(ReplInstallArgs {
+        value,
+        filter,
+        force,
+        git_host,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,7 +183,7 @@ fn looks_like_remote_source(value: &str) -> bool {
     }
 }
 
-pub(crate) const DEFAULT_GIT_HOST: &str = "github.com";
+pub const DEFAULT_GIT_HOST: &str = "github.com";
 
 fn is_repo_shorthand(value: &str) -> bool {
     let path = strip_ref_suffix(value);
@@ -266,17 +290,20 @@ pub fn install_or_update_from_repl_args(args: &str) -> Result<()> {
     let tokens = shell_words::split(args)
         .with_context(|| format!("failed to parse '.install' args: {args}"))?;
 
-    let mut iter = tokens.into_iter();
-    let value = iter.next().with_context(|| {
+    let parsed = parse_repl_install_flags(".install", tokens.into_iter())?;
+    let value = parsed.value.with_context(|| {
         format!(
             "Usage: .install <git-url|owner/repo|installed-bundle> \
              [--git-host <host>] [--filter <{}>] [--force]",
             InstallFilter::NAMES.join("|")
         )
     })?;
-
-    let (filter, force, git_host) = parse_repl_install_flags(".install", iter)?;
-    install_or_update(&value, git_host.as_deref(), filter, force)
+    install_or_update(
+        &value,
+        parsed.git_host.as_deref(),
+        parsed.filter,
+        parsed.force,
+    )
 }
 
 /// The whole remote is always processed, including categories a filtered
@@ -4194,21 +4221,50 @@ mod tests {
 
     #[test]
     fn repl_install_flags_parse_git_host() {
-        let (filter, force, host) = parse_repl_install_flags(
+        let parsed = parse_repl_install_flags(
             ".install",
             vec!["--git-host".to_string(), "git.x.com".to_string()].into_iter(),
         )
         .unwrap();
-        assert_eq!(host.as_deref(), Some("git.x.com"));
-        assert!(filter.is_none() && !force);
+        assert_eq!(parsed.git_host.as_deref(), Some("git.x.com"));
+        assert!(parsed.filter.is_none() && !parsed.force);
 
-        let (_, force, host) = parse_repl_install_flags(
+        let parsed = parse_repl_install_flags(
             ".install",
             vec!["--git-host=git.y.com".to_string(), "--force".to_string()].into_iter(),
         )
         .unwrap();
-        assert_eq!(host.as_deref(), Some("git.y.com"));
-        assert!(force);
+        assert_eq!(parsed.git_host.as_deref(), Some("git.y.com"));
+        assert!(parsed.force);
+    }
+
+    #[test]
+    fn repl_install_flags_accept_any_argument_order() {
+        let parsed = parse_repl_install_flags(
+            ".install",
+            vec![
+                "--git-host".to_string(),
+                "git.x.com".to_string(),
+                "owner/repo".to_string(),
+                "--force".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(parsed.value.as_deref(), Some("owner/repo"));
+        assert_eq!(parsed.git_host.as_deref(), Some("git.x.com"));
+        assert!(parsed.filter.is_none() && parsed.force);
+
+        let err = parse_repl_install_flags(
+            ".install",
+            vec!["one".to_string(), "two".to_string()].into_iter(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Unexpected argument"));
+
+        let err = parse_repl_install_flags(".install", vec!["--bogus".to_string()].into_iter())
+            .unwrap_err();
+        assert!(err.to_string().contains("Unexpected argument"));
     }
 
     #[test]
