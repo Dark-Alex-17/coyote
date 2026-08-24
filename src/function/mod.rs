@@ -18,7 +18,7 @@ use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
     MCP_META_FUNCTION_PREFIXES, MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
     MCP_READ_META_FUNCTION_NAME_PREFIX, MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpServerFeatures,
-    McpServersConfig, is_mcp_meta_function,
+    McpServersConfig, is_mcp_meta_function, render,
 };
 use crate::parsers::{bash, python, typescript};
 use anyhow::{Context, Result, anyhow, bail};
@@ -696,12 +696,70 @@ impl Functions {
             },
         );
 
+        let mut read_function_properties = IndexMap::new();
+        read_function_properties.insert(
+            "uri".to_string(),
+            JsonSchema {
+                type_value: Some("string".to_string()),
+                description: Some(
+                    "Resource URI, or a resource template with {var} placeholders".into(),
+                ),
+                ..Default::default()
+            },
+        );
+        read_function_properties.insert(
+            "arguments".to_string(),
+            JsonSchema {
+                type_value: Some("object".to_string()),
+                description: Some("Template variable values (RFC 6570 Level 1 only)".into()),
+                ..Default::default()
+            },
+        );
+        read_function_properties.insert(
+            "pattern".to_string(),
+            JsonSchema {
+                type_value: Some("string".to_string()),
+                description: Some(
+                    "Optional regex; returns only matching lines (with context) from text content"
+                        .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        read_function_properties.insert(
+            "offset".to_string(),
+            JsonSchema {
+                type_value: Some("integer".to_string()),
+                description: Some(
+                    "Byte offset for paging text. When pattern is set, offsets (and \
+                     next_offset/total_bytes in the result) refer to the filtered stream, not \
+                     the raw resource"
+                        .into(),
+                ),
+                default: Some(Value::from(0usize)),
+                ..Default::default()
+            },
+        );
+        read_function_properties.insert(
+            "max_bytes".to_string(),
+            JsonSchema {
+                type_value: Some("integer".to_string()),
+                description: Some(format!(
+                    "Max text bytes to return (clamped to {})",
+                    render::TEXT_MAX_BYTES_CLAMP
+                )),
+                default: Some(Value::from(render::DEFAULT_TEXT_MAX_BYTES)),
+                ..Default::default()
+            },
+        );
+
         for features in mcp_servers {
             let server = &features.name;
             let search_function_name = format!("{}_{server}", MCP_SEARCH_META_FUNCTION_NAME_PREFIX);
             let describe_function_name =
                 format!("{}_{server}", MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX);
             let invoke_function_name = format!("{}_{server}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
+            let read_function_name = format!("{}_{server}", MCP_READ_META_FUNCTION_NAME_PREFIX);
             for prefix in gated_meta_function_prefixes(&features) {
                 match prefix {
                     MCP_INVOKE_META_FUNCTION_NAME_PREFIX => {
@@ -756,8 +814,27 @@ impl Functions {
                             agent: false,
                         });
                     }
+                    MCP_READ_META_FUNCTION_NAME_PREFIX => {
+                        self.declarations.push(FunctionDeclaration {
+                            name: read_function_name.clone(),
+                            description: formatdoc!(
+                                r#"
+                                Read a resource, or expand a resource template, from the {server} MCP server. Call
+                                {describe_function_name} with kind "resource" or "resource_template" to find URIs and
+                                template variables. Text content is paged via offset/max_bytes and can be filtered
+                                with pattern; binary content is spilled to disk and its metadata returned.
+                                "#
+                            ),
+                            parameters: JsonSchema {
+                                type_value: Some("object".to_string()),
+                                properties: Some(read_function_properties.clone()),
+                                required: Some(vec!["uri".to_string()]),
+                                ..Default::default()
+                            },
+                            agent: false,
+                        });
+                    }
                     // The declaration is added alongside its handler.
-                    MCP_READ_META_FUNCTION_NAME_PREFIX => {}
                     MCP_PROMPT_META_FUNCTION_NAME_PREFIX => {}
                     _ => debug_assert!(false, "unhandled MCP meta-function prefix: {prefix}"),
                 }
@@ -1274,6 +1351,14 @@ impl ToolCall {
                     eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
                     json!({"tool_call_error": error_msg})
                 })
+        } else if cmd_name.starts_with(MCP_READ_META_FUNCTION_NAME_PREFIX) {
+            Self::read_mcp_resource(ctx, cmd_name, &json_data)
+                .await
+                .unwrap_or_else(|e| {
+                    let error_msg = format!("MCP read failed: {e}");
+                    eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    json!({"tool_call_error": error_msg})
+                })
         } else {
             Self::invoke_mcp_tool(ctx, cmd_name, &json_data)
                 .await
@@ -1331,6 +1416,15 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP describe failed: {e}");
+                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        json!({"tool_call_error": error_msg})
+                    })
+            }
+            _ if cmd_name.starts_with(MCP_READ_META_FUNCTION_NAME_PREFIX) => {
+                Self::read_mcp_resource(ctx, &cmd_name, &json_data)
+                    .await
+                    .unwrap_or_else(|e| {
+                        let error_msg = format!("MCP read failed: {e}");
                         eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
                         json!({"tool_call_error": error_msg})
                     })
@@ -1486,6 +1580,85 @@ impl ToolCall {
         Ok(serde_json::to_value(result)?)
     }
 
+    async fn read_mcp_resource(
+        ctx: &RequestContext,
+        cmd_name: &str,
+        json_data: &Value,
+    ) -> Result<Value> {
+        let server = cmd_name
+            .strip_prefix(&format!("{MCP_READ_META_FUNCTION_NAME_PREFIX}_"))
+            .ok_or_else(|| anyhow!("Malformed MCP read function name: {cmd_name}"))?;
+        let uri = json_data
+            .get("uri")
+            .ok_or_else(|| anyhow!("Missing 'uri' in arguments"))?
+            .as_str()
+            .ok_or_else(|| anyhow!("Invalid 'uri' in arguments"))?;
+        let pattern = match json_data.get("pattern") {
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Invalid 'pattern' in arguments"))?,
+            ),
+            None => None,
+        };
+        let offset = match json_data.get("offset") {
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| anyhow!("Invalid 'offset' in arguments"))?
+                as usize,
+            None => 0,
+        };
+        let max_bytes = match json_data.get("max_bytes") {
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("Invalid 'max_bytes' in arguments"))?
+                    as usize,
+            ),
+            None => None,
+        };
+        let uri = match json_data.get("arguments").and_then(Value::as_object) {
+            Some(args) if !args.is_empty() => expand_uri_template(uri, args)?,
+            _ => uri.to_string(),
+        };
+
+        let result = ctx.tool_scope.mcp_runtime.read(server, &uri).await?;
+        let items: Vec<Value> = result
+            .contents
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()?;
+
+        let mut rendered_items = Vec::with_capacity(items.len());
+        let mut total_size = 0usize;
+        for (index, item) in items.iter().enumerate() {
+            let rendered = render_resource_content(item, pattern, offset, max_bytes, server)?;
+            let size = rendered.to_string().len();
+            // Bound the overall response; the first item is always included.
+            if index > 0 && total_size + size > render::TEXT_MAX_BYTES_CLAMP {
+                let omitted = items.len() - index;
+                rendered_items.push(json!({
+                    "truncated": true,
+                    "omitted_items": omitted,
+                    "note": format!(
+                        "{omitted} content item(s) omitted: the combined response would exceed \
+                         {} bytes",
+                        render::TEXT_MAX_BYTES_CLAMP
+                    ),
+                }));
+                break;
+            }
+            total_size += size;
+            rendered_items.push(rendered);
+        }
+
+        if rendered_items.len() == 1 {
+            Ok(rendered_items.remove(0))
+        } else {
+            Ok(Value::Array(rendered_items))
+        }
+    }
+
     fn extract_call_config_from_agent(
         &self,
         functions: &Functions,
@@ -1527,6 +1700,146 @@ impl ToolCall {
             false => bail!("Unexpected call: {function_name} {}", self.arguments),
         }
     }
+}
+
+fn expand_uri_template(template: &str, args: &serde_json::Map<String, Value>) -> Result<String> {
+    let mut expanded = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        expanded.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(len) = after.find('}') else {
+            bail!("Unclosed '{{' in URI template: {template}");
+        };
+        expanded.push_str(&expand_uri_template_variable(&after[..len], args)?);
+        rest = &after[len + 1..];
+    }
+    expanded.push_str(rest);
+    Ok(expanded)
+}
+
+fn expand_uri_template_variable(
+    expr: &str,
+    args: &serde_json::Map<String, Value>,
+) -> Result<String> {
+    const LEVEL_1_ONLY: &str = "only RFC 6570 Level 1 simple substitution {var} is supported";
+    if let Some(operator) = expr.chars().next().filter(|c| "+#./;?&".contains(*c)) {
+        let name = match operator {
+            '+' => "reserved-expansion",
+            '#' => "fragment-expansion",
+            '.' => "label-expansion",
+            '/' => "path-segment-expansion",
+            ';' => "path-style-parameter-expansion",
+            '?' => "form-style-query-expansion",
+            _ => "form-style-query-continuation",
+        };
+        bail!(
+            "The '{operator}' {name} operator in '{{{expr}}}' requires RFC 6570 Level 2 or \
+             higher; {LEVEL_1_ONLY}"
+        );
+    }
+    if expr.contains(',') {
+        bail!(
+            "The ',' multi-variable expression '{{{expr}}}' requires RFC 6570 Level 3; {LEVEL_1_ONLY}"
+        );
+    }
+    if expr.contains(':') {
+        bail!("The ':' prefix modifier in '{{{expr}}}' requires RFC 6570 Level 4; {LEVEL_1_ONLY}");
+    }
+    if expr.ends_with('*') {
+        bail!("The '*' explode modifier in '{{{expr}}}' requires RFC 6570 Level 4; {LEVEL_1_ONLY}");
+    }
+    if expr.is_empty()
+        || !expr
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    {
+        bail!("Invalid variable name '{{{expr}}}' in URI template; expected [A-Za-z0-9_.]+");
+    }
+    let value = args
+        .get(expr)
+        .ok_or_else(|| anyhow!("URI template variable '{expr}' is missing from 'arguments'"))?;
+    let text = match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(boolean) => boolean.to_string(),
+        other => bail!(
+            "URI template variable '{expr}' must be a string, number, or boolean; got {other}"
+        ),
+    };
+    Ok(urlencoding::encode(&text).into_owned())
+}
+
+#[derive(Debug)]
+enum ResourceContentBody {
+    Text(String),
+    Blob(String),
+}
+
+// rmcp's untagged ResourceContents enum cannot represent malformed items
+// (both or neither of text/blob), so classification happens on the raw Value.
+fn parse_resource_content(item: &Value) -> Result<ResourceContentBody> {
+    let text = item.get("text");
+    let blob = item.get("blob");
+    match (text, blob) {
+        (Some(text), None) => Ok(ResourceContentBody::Text(
+            text.as_str()
+                .ok_or_else(|| anyhow!("Resource content 'text' is not a string"))?
+                .to_string(),
+        )),
+        (None, Some(blob)) => Ok(ResourceContentBody::Blob(
+            blob.as_str()
+                .ok_or_else(|| anyhow!("Resource content 'blob' is not a string"))?
+                .to_string(),
+        )),
+        (Some(_), Some(_)) => {
+            bail!("Resource content item has both 'text' and 'blob'; expected exactly one")
+        }
+        (None, None) => {
+            bail!("Resource content item has neither 'text' nor 'blob'; expected exactly one")
+        }
+    }
+}
+
+fn render_resource_content(
+    item: &Value,
+    pattern: Option<&str>,
+    offset: usize,
+    max_bytes: Option<usize>,
+    server: &str,
+) -> Result<Value> {
+    let uri = item.get("uri").and_then(Value::as_str);
+    let mime_type = item.get("mimeType").and_then(Value::as_str);
+    let text = match parse_resource_content(item)? {
+        ResourceContentBody::Text(text) => text,
+        ResourceContentBody::Blob(blob) => match render::render_blob(&blob, mime_type, server)? {
+            render::RenderedBlob::Text(text) => text,
+            render::RenderedBlob::Spilled(meta) => {
+                let mut value = serde_json::to_value(meta)?;
+                if let Some(map) = value.as_object_mut() {
+                    map.insert("uri".to_string(), json!(uri));
+                }
+                return Ok(value);
+            }
+        },
+    };
+    let rendered = render::render_text(&text, pattern, offset, max_bytes)?;
+    let mut value = json!({
+        "uri": uri,
+        "mime_type": mime_type,
+        "text": rendered.text,
+        "truncated": rendered.truncated,
+        "total_bytes": rendered.total_bytes,
+        "next_offset": rendered.next_offset,
+    });
+    if let Some(next_offset) = rendered.next_offset {
+        value["note"] = json!(format!(
+            "Content truncated; re-call with offset={next_offset} to continue (max_bytes is \
+             clamped to {})",
+            render::TEXT_MAX_BYTES_CLAMP
+        ));
+    }
+    Ok(value)
 }
 
 pub fn run_llm_function(
@@ -1872,10 +2185,14 @@ fn format_json_colored_keys(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::test_fixtures::{FixtureServer, fixture_runtime};
+    use crate::config::test_fixtures::{
+        FIXTURE_BLOB_BYTES, FIXTURE_BLOB_URI, FIXTURE_LOG_TEXT, FIXTURE_LOG_URI, FixtureServer,
+        fixture_runtime,
+    };
     use crate::config::{AppState, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use serde_json::json;
+    use serial_test::serial;
     use std::sync::Arc;
 
     fn call(name: &str, id: Option<&str>) -> ToolCall {
@@ -2298,20 +2615,22 @@ mod tests {
     fn functions_append_mcp_meta_resources_only_omits_invoke() {
         let mut f = Functions::default();
         f.append_mcp_meta_functions(vec![mcp_features("res", false, true, false)]);
-        assert_eq!(f.declarations().len(), 2);
+        assert_eq!(f.declarations().len(), 3);
         assert!(!f.contains("mcp_invoke_res"));
         assert!(f.contains("mcp_search_res"));
         assert!(f.contains("mcp_describe_res"));
+        assert!(f.contains("mcp_read_res"));
     }
 
     #[test]
-    fn functions_append_mcp_meta_all_capabilities_emits_three() {
+    fn functions_append_mcp_meta_all_capabilities_emits_four() {
         let mut f = Functions::default();
         f.append_mcp_meta_functions(vec![mcp_features("srv", true, true, true)]);
-        assert_eq!(f.declarations().len(), 3);
+        assert_eq!(f.declarations().len(), 4);
         assert!(f.contains("mcp_invoke_srv"));
         assert!(f.contains("mcp_search_srv"));
         assert!(f.contains("mcp_describe_srv"));
+        assert!(f.contains("mcp_read_srv"));
     }
 
     #[test]
@@ -2515,6 +2834,333 @@ mod tests {
                 }
             })
         );
+    }
+
+    fn template_args(pairs: &[(&str, Value)]) -> serde_json::Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect()
+    }
+
+    fn resources_fixture() -> FixtureServer {
+        FixtureServer {
+            resources_capability: true,
+            ..Default::default()
+        }
+    }
+
+    async fn eval_mcp_read(args: Value) -> Result<Value> {
+        let (runtime, _server) = fixture_runtime(resources_fixture()).await;
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope.mcp_runtime = runtime;
+        call_with_args("mcp_read_fixture", args)
+            .eval_mcp(&ctx)
+            .await
+    }
+
+    #[test]
+    fn expand_uri_template_substitutes_simple_vars() {
+        let args = template_args(&[("path", json!("docs")), ("name", json!("readme"))]);
+        assert_eq!(
+            expand_uri_template("file:///{path}/{name}", &args).unwrap(),
+            "file:///docs/readme"
+        );
+    }
+
+    #[test]
+    fn expand_uri_template_stringifies_numbers_and_bools() {
+        let args = template_args(&[("id", json!(42)), ("flag", json!(true))]);
+        assert_eq!(
+            expand_uri_template("item://{id}/{flag}", &args).unwrap(),
+            "item://42/true"
+        );
+    }
+
+    #[test]
+    fn expand_uri_template_percent_encodes_values() {
+        let args = template_args(&[("q", json!("a b/c✓"))]);
+        assert_eq!(
+            expand_uri_template("search://{q}", &args).unwrap(),
+            "search://a%20b%2Fc%E2%9C%93"
+        );
+    }
+
+    #[test]
+    fn expand_uri_template_without_placeholders_is_noop() {
+        let args = template_args(&[("unused", json!("x"))]);
+        assert_eq!(
+            expand_uri_template("file:///static", &args).unwrap(),
+            "file:///static"
+        );
+    }
+
+    #[test]
+    fn expand_uri_template_missing_variable_names_it() {
+        let err = expand_uri_template("file:///{path}", &template_args(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'path'"), "{err}");
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn expand_uri_template_rejects_higher_level_operators() {
+        let args = template_args(&[("var", json!("v"))]);
+        for operator in ["+", "#", ".", "/", ";", "?", "&"] {
+            let err = expand_uri_template(&format!("x://{{{operator}var}}"), &args)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("'{operator}'")), "{err}");
+            assert!(err.contains("Level 1 simple substitution"), "{err}");
+        }
+    }
+
+    #[test]
+    fn expand_uri_template_rejects_modifiers_and_multi_vars() {
+        let args = template_args(&[("a", json!("v")), ("b", json!("w")), ("var", json!("v"))]);
+        for (template, construct) in [
+            ("x://{var*}", "'*' explode modifier"),
+            ("x://{var:3}", "':' prefix modifier"),
+            ("x://{a,b}", "',' multi-variable"),
+        ] {
+            let err = expand_uri_template(template, &args)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(construct), "{err}");
+            assert!(err.contains("Level 1 simple substitution"), "{err}");
+        }
+    }
+
+    #[test]
+    fn expand_uri_template_unclosed_brace_errors() {
+        let err = expand_uri_template("file:///{path", &template_args(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unclosed"), "{err}");
+    }
+
+    #[test]
+    fn expand_uri_template_rejects_invalid_variable_names() {
+        let err = expand_uri_template("x://{va r}", &template_args(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid variable name"), "{err}");
+    }
+
+    #[test]
+    fn expand_uri_template_rejects_non_scalar_values() {
+        for value in [json!(null), json!(["a"]), json!({"k": "v"})] {
+            let args = template_args(&[("v", value)]);
+            let err = expand_uri_template("x://{v}", &args)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("string, number, or boolean"), "{err}");
+        }
+    }
+
+    #[test]
+    fn parse_resource_content_classifies_by_field_presence() {
+        assert!(matches!(
+            parse_resource_content(&json!({"uri": "u", "text": "hi"})).unwrap(),
+            ResourceContentBody::Text(text) if text == "hi"
+        ));
+        assert!(matches!(
+            parse_resource_content(&json!({"uri": "u", "blob": "aGk="})).unwrap(),
+            ResourceContentBody::Blob(blob) if blob == "aGk="
+        ));
+    }
+
+    #[test]
+    fn parse_resource_content_rejects_both_and_neither() {
+        let err = parse_resource_content(&json!({"text": "t", "blob": "b"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("both"), "{err}");
+
+        let err = parse_resource_content(&json!({"uri": "u"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("neither"), "{err}");
+    }
+
+    #[test]
+    fn functions_mcp_read_declaration_has_paging_params() {
+        let mut f = Functions::default();
+        f.append_mcp_meta_functions(vec![mcp_features("srv", false, true, false)]);
+        let decl = f.find("mcp_read_srv").unwrap();
+        let props = decl.parameters.properties.as_ref().unwrap();
+        for param in ["uri", "arguments", "pattern", "offset", "max_bytes"] {
+            assert!(props.contains_key(param), "missing {param}");
+        }
+        assert_eq!(props.len(), 5);
+        assert_eq!(props["offset"].default, Some(Value::from(0usize)));
+        assert_eq!(
+            props["max_bytes"].default,
+            Some(Value::from(render::DEFAULT_TEXT_MAX_BYTES))
+        );
+        assert_eq!(decl.parameters.required, Some(vec!["uri".to_string()]));
+    }
+
+    #[test]
+    fn mcp_read_routes_through_the_concurrent_mcp_path() {
+        assert!(is_mcp_meta_function("mcp_read_x"));
+    }
+
+    #[test]
+    fn eval_mcp_read_returns_rendered_text() {
+        let output = run_async(eval_mcp_read(json!({"uri": FIXTURE_LOG_URI}))).unwrap();
+
+        assert_eq!(output["uri"], FIXTURE_LOG_URI);
+        assert_eq!(output["mime_type"], "text/plain");
+        assert_eq!(output["text"], FIXTURE_LOG_TEXT);
+        assert_eq!(output["truncated"], false);
+        assert_eq!(output["next_offset"], Value::Null);
+    }
+
+    #[test]
+    fn eval_routes_mcp_read_to_resource_handler() {
+        let output = run_async(async {
+            let (runtime, _server) = fixture_runtime(resources_fixture()).await;
+            let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+            ctx.tool_scope
+                .functions
+                .append_mcp_meta_functions(vec![mcp_features("fixture", true, true, false)]);
+            ctx.tool_scope.mcp_runtime = runtime;
+            let call = call_with_args("mcp_read_fixture", json!({"uri": FIXTURE_LOG_URI}));
+            call.eval(&mut ctx).await
+        })
+        .unwrap();
+
+        assert_eq!(output["text"], FIXTURE_LOG_TEXT);
+    }
+
+    #[test]
+    fn eval_mcp_read_pages_text_with_offset() {
+        let (page1, page2) = run_async(async {
+            let (runtime, _server) = fixture_runtime(resources_fixture()).await;
+            let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+            ctx.tool_scope.mcp_runtime = runtime;
+            let call = call_with_args(
+                "mcp_read_fixture",
+                json!({"uri": FIXTURE_LOG_URI, "max_bytes": 20}),
+            );
+            let page1 = call.eval_mcp(&ctx).await.unwrap();
+            let call = call_with_args(
+                "mcp_read_fixture",
+                json!({"uri": FIXTURE_LOG_URI, "offset": page1["next_offset"], "max_bytes": 20}),
+            );
+            let page2 = call.eval_mcp(&ctx).await.unwrap();
+            (page1, page2)
+        });
+
+        assert_eq!(page1["truncated"], true);
+        assert!(page1["note"].as_str().unwrap().contains("204800"));
+        let text1 = page1["text"].as_str().unwrap();
+        let text2 = page2["text"].as_str().unwrap();
+        assert!(!text2.is_empty());
+        assert!(FIXTURE_LOG_TEXT.starts_with(&format!("{text1}{text2}")));
+    }
+
+    #[test]
+    fn eval_mcp_read_pattern_filters_lines_with_context() {
+        let output = run_async(eval_mcp_read(
+            json!({"uri": FIXTURE_LOG_URI, "pattern": "café"}),
+        ))
+        .unwrap();
+
+        let text = output["text"].as_str().unwrap();
+        assert!(text.contains("6:ERROR: café overheated"), "{text}");
+        assert!(text.contains("4-fourth line"), "{text}");
+        assert!(!text.contains("disk full"), "{text}");
+        assert_eq!(output["total_bytes"], text.len());
+    }
+
+    #[test]
+    fn eval_mcp_read_invalid_pattern_returns_teaching_error() {
+        let output = run_async(eval_mcp_read(
+            json!({"uri": FIXTURE_LOG_URI, "pattern": "("}),
+        ))
+        .unwrap();
+
+        let err = output["tool_call_error"].as_str().unwrap();
+        assert!(err.contains("Invalid filter pattern"), "{err}");
+    }
+
+    #[test]
+    #[serial]
+    fn eval_mcp_read_blob_spills_with_metadata() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let cache_dir = env::temp_dir().join(format!(
+            "coyote-read-blob-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&cache_dir).unwrap();
+        let env_name = get_env_name("cache_dir");
+        let previous = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, &cache_dir) };
+
+        let output = run_async(eval_mcp_read(json!({"uri": FIXTURE_BLOB_URI}))).unwrap();
+
+        unsafe {
+            match previous {
+                Some(value) => env::set_var(&env_name, value),
+                None => env::remove_var(&env_name),
+            }
+        }
+
+        assert_eq!(output["spilled"], true);
+        assert_eq!(output["uri"], FIXTURE_BLOB_URI);
+        assert_eq!(output["mime_type"], "application/pdf");
+        assert_eq!(output["sha256"].as_str().unwrap().len(), 64);
+        let path = PathBuf::from(output["path"].as_str().unwrap());
+        assert!(path.starts_with(&cache_dir));
+        assert_eq!(fs::read(&path).unwrap(), FIXTURE_BLOB_BYTES);
+
+        fs::remove_dir_all(&cache_dir).unwrap();
+    }
+
+    #[test]
+    fn eval_mcp_read_multi_content_returns_array() {
+        let output = run_async(eval_mcp_read(json!({"uri": "file:///multi"}))).unwrap();
+
+        let items = output.as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["text"], "first");
+        assert_eq!(items[1]["text"], "second");
+        assert_eq!(items[2]["text"], "third");
+        assert_eq!(items[1]["uri"], "file:///multi/1");
+    }
+
+    #[test]
+    fn eval_mcp_read_multi_content_enforces_overall_ceiling() {
+        let output = run_async(eval_mcp_read(
+            json!({"uri": "file:///huge", "max_bytes": render::TEXT_MAX_BYTES_CLAMP}),
+        ))
+        .unwrap();
+
+        let items = output.as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["text"].as_str().unwrap().len(), 150 * 1024);
+        let marker = &items[1];
+        assert_eq!(marker["truncated"], true);
+        assert_eq!(marker["omitted_items"], 2);
+        let note = marker["note"].as_str().unwrap();
+        assert!(note.contains("2 content item(s) omitted"), "{note}");
+        assert!(note.contains("204800"), "{note}");
+    }
+
+    #[test]
+    fn eval_mcp_read_expands_template_end_to_end() {
+        let output = run_async(eval_mcp_read(json!({
+            "uri": "file:///{path}/{name}",
+            "arguments": {"path": "docs", "name": "readme"},
+        })))
+        .unwrap();
+
+        assert_eq!(output["uri"], "file:///docs/readme");
+        assert_eq!(output["text"], "readme body");
     }
 
     #[test]

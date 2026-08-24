@@ -1526,9 +1526,10 @@ mod tests {
         sync_agent_functions_to_ctx(&mut ctx).unwrap();
 
         let functions = &ctx.tool_scope.functions;
-        assert_eq!(functions.declarations().len(), 2);
+        assert_eq!(functions.declarations().len(), 3);
         assert!(functions.contains("mcp_search_fixture"));
         assert!(functions.contains("mcp_describe_fixture"));
+        assert!(functions.contains("mcp_read_fixture"));
         assert!(!functions.contains("mcp_invoke_fixture"));
     }
 

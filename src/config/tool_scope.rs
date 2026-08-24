@@ -4,7 +4,8 @@ use crate::mcp::{CatalogItem, CatalogItemKind, ConnectedServer, McpRegistry, Mcp
 use anyhow::{Context, Result, anyhow};
 use bm25::{Document, Language, SearchEngineBuilder};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Prompt, Resource, ResourceTemplate, Tool,
+    CallToolRequestParams, CallToolResult, Prompt, ReadResourceRequestParams, ReadResourceResult,
+    Resource, ResourceTemplate, Tool,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -278,6 +279,18 @@ impl McpRuntime {
 
         server_handle.call_tool(request).await.map_err(Into::into)
     }
+
+    pub async fn read(&self, server: &str, uri: &str) -> Result<ReadResourceResult> {
+        let server_handle = self
+            .get(server)
+            .cloned()
+            .with_context(|| format!("Read MCP server does not exist: {server}"))?;
+
+        server_handle
+            .read_resource(ReadResourceRequestParams::new(uri))
+            .await
+            .map_err(Into::into)
+    }
 }
 
 fn catalog_key(item: &CatalogItem) -> String {
@@ -354,14 +367,29 @@ fn uri_template_variables(template: &str) -> Vec<String> {
 #[cfg(test)]
 pub(crate) mod test_fixtures {
     use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use rmcp::model::{
         ErrorData, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
         ListToolsResult, PaginatedRequestParams, PromptArgument, PromptsCapability,
-        ResourcesCapability, ServerCapabilities, ServerInfo,
+        ReadResourceResponse, ResourceContents, ResourcesCapability, ServerCapabilities,
+        ServerInfo,
     };
     use rmcp::service::{RequestContext, RunningService};
     use rmcp::{RoleServer, ServerHandler, ServiceExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(crate) const FIXTURE_LOG_URI: &str = "file:///app.log";
+    pub(crate) const FIXTURE_LOG_TEXT: &str = "début of the log\n\
+        second line\n\
+        ERROR: disk full\n\
+        fourth line\n\
+        fifth line\n\
+        ERROR: café overheated\n\
+        seventh line\n\
+        eighth line";
+    pub(crate) const FIXTURE_BLOB_URI: &str = "file:///report.pdf";
+    pub(crate) const FIXTURE_BLOB_BYTES: &[u8] = &[0xff, 0xfe, 0x00, 0x88, 0x01];
 
     #[derive(Clone)]
     pub(crate) struct FixtureServer {
@@ -447,6 +475,41 @@ pub(crate) mod test_fixtures {
                     .with_description("Read a file")
                     .with_mime_type("text/plain"),
             ]))
+        }
+
+        async fn read_resource(
+            &self,
+            request: ReadResourceRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ReadResourceResponse, ErrorData> {
+            let uri = request.uri.as_str();
+            let contents = match uri {
+                FIXTURE_LOG_URI => vec![ResourceContents::text(FIXTURE_LOG_TEXT, uri)],
+                FIXTURE_BLOB_URI => vec![
+                    ResourceContents::blob(STANDARD.encode(FIXTURE_BLOB_BYTES), uri)
+                        .with_mime_type("application/pdf"),
+                ],
+                "file:///multi" => vec![
+                    ResourceContents::text("first", "file:///multi/0"),
+                    ResourceContents::text("second", "file:///multi/1"),
+                    ResourceContents::text("third", "file:///multi/2"),
+                ],
+                "file:///huge" => (0..3)
+                    .map(|i| {
+                        ResourceContents::text("x".repeat(150 * 1024), format!("file:///huge/{i}"))
+                    })
+                    .collect(),
+                "file:///docs/readme" => vec![ResourceContents::text("readme body", uri)],
+                _ => {
+                    return Err(ErrorData::resource_not_found(
+                        format!("Unknown resource: {uri}"),
+                        None,
+                    ));
+                }
+            };
+            Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+                contents,
+            )))
         }
 
         async fn list_prompts(
@@ -561,10 +624,11 @@ mod tests {
 
         let mut functions = Functions::default();
         functions.append_mcp_meta_functions(features);
-        assert_eq!(functions.declarations().len(), 3);
+        assert_eq!(functions.declarations().len(), 4);
         assert!(functions.contains("mcp_invoke_fixture"));
         assert!(functions.contains("mcp_search_fixture"));
         assert!(functions.contains("mcp_describe_fixture"));
+        assert!(functions.contains("mcp_read_fixture"));
     }
 
     #[tokio::test]
@@ -589,10 +653,11 @@ mod tests {
 
         let mut functions = Functions::default();
         functions.append_mcp_meta_functions(features);
-        assert_eq!(functions.declarations().len(), 2);
+        assert_eq!(functions.declarations().len(), 3);
         assert!(!functions.contains("mcp_invoke_fixture"));
         assert!(functions.contains("mcp_search_fixture"));
         assert!(functions.contains("mcp_describe_fixture"));
+        assert!(functions.contains("mcp_read_fixture"));
     }
 
     #[test]

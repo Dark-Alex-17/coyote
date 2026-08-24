@@ -1,8 +1,6 @@
 //! Content policy for MCP resource and tool content: UTF-8-boundary-safe text
 //! paging, grep-style pattern filtering, and spill-to-disk for binary blobs.
 
-#![allow(dead_code)]
-
 use crate::config::paths;
 use base64::engine::general_purpose::STANDARD;
 use base64::read::DecoderReader;
@@ -135,6 +133,14 @@ pub fn render_text(
     let mut end = start.saturating_add(max_bytes).min(total_bytes);
     while !stream.is_char_boundary(end) {
         end -= 1;
+    }
+    // A max_bytes smaller than one codepoint would produce an empty page with
+    // next_offset == offset, stalling paging; always advance by at least one.
+    if end == start && start < total_bytes {
+        end += 1;
+        while !stream.is_char_boundary(end) {
+            end += 1;
+        }
     }
     let truncated = end < total_bytes;
     Ok(RenderedText {
@@ -426,6 +432,17 @@ mod tests {
 
         assert_eq!(rest.text, "é");
         assert!(!rest.truncated);
+    }
+
+    #[test]
+    fn max_bytes_below_one_codepoint_still_advances() {
+        // 'é' is 2 bytes; max_bytes 1 must not stall at next_offset == offset.
+        let rendered = render_text("éa", None, 0, Some(1)).unwrap();
+
+        assert_eq!(rendered.text, "é");
+        assert!(rendered.truncated);
+        assert_eq!(rendered.total_bytes, 3);
+        assert_eq!(rendered.next_offset, Some(2));
     }
 
     #[test]
