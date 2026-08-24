@@ -1,6 +1,6 @@
 name: code-reviewer
 description: CodeRabbit-style code reviewer - spawns per-file reviewers, synthesizes findings
-version: 2.0.0
+version: 2.1.0
 
 auto_continue: true
 max_auto_continues: 20
@@ -14,11 +14,15 @@ skills_enabled: true
 enabled_skills:
   - delegation-protocol
   - parallel-research
+  - incident-prior-art
 
 variables:
   - name: project_dir
     description: Project directory to review
     default: '.'
+  - name: prior_art_agent
+    description: Optional agent that can search the incident record (Slack/Jira/postmortems) for operational prior art. Empty disables the delegation lane; git archaeology still runs.
+    default: ''
   - name: auto_confirm
     description: Auto-confirm command execution
     default: '1'
@@ -46,11 +50,12 @@ instructions: |
 
   1. **Get the diff:** Run `get_diff` to get the git diff (defaults to staged changes, falls back to unstaged)
   2. **Parse changed files:** Extract the list of files from the diff
-  3. **Create todos:** One todo per phase (get diff, spawn reviewers, collect results, synthesize report)
+  3. **Create todos:** One todo per phase (get diff, spawn reviewers, operational-history lane, collect results, synthesize report)
   4. **Spawn file-reviewers:** One `file-reviewer` agent per changed file, in parallel. Apply the `delegation-protocol` structured prompt format.
   5. **Broadcast sibling roster:** Send each file-reviewer a message with all sibling IDs and their file assignments
-  6. **Collect all results:** Per `parallel-research`, do not poll. End your response after spawns + roster; the system will notify you when agents complete.
-  7. **Synthesize:** Combine all findings into a CodeRabbit-style report
+  6. **Operational-history lane (conditional):** Load `incident-prior-art` and follow it. If the diff touches operationally-relevant surface (per the skill's trigger list), run its git-archaeology pass yourself, and — if `prior_art_agent` is set (currently: '{{prior_art_agent}}') — spawn that agent in REVIEW MODE alongside the file-reviewers using the skill's prompt template. If the surface is not operationally relevant, skip with a one-line note.
+  7. **Collect all results:** Per `parallel-research`, do not poll. End your response after spawns + roster; the system will notify you when agents complete.
+  8. **Synthesize:** Combine all findings into a CodeRabbit-style report. Prior-art findings go under an "Operational history" section using the skill's severity folding (reintroduction of a past incident's failure mode = CRITICAL).
 
   ## Spawning File Reviewers
 
@@ -137,6 +142,9 @@ instructions: |
 
   ## Cross-File Concerns
   <any cross-cutting issues identified by the teammate pattern>
+
+  ## Operational history
+  <only when the lane ran: archaeology + prior-art findings with incident/commit references, or "no relevant incident history found">
 
   ---
   *Reviewed N files, found X critical, Y warnings, Z suggestions, W nitpicks*

@@ -12,6 +12,31 @@ agents while handling coordination and final reporting.
 - 🔄 **Cross-File Context**: Broadcasts sibling rosters so reviewers can alert each other about cross-cutting changes.
 - 📊 **Unified Reporting**: Synthesizes findings into a structured, easy-to-read summary with severity levels.
 - ⚡ **Parallel Execution**: Runs reviews concurrently for maximum speed.
+- 🚨 **Operational History (optional)**: Checks the change against past production incidents via the [`incident-prior-art`](../../skills/incident-prior-art/SKILL.md) skill.
+
+## Operational History Lane
+
+Code review answers "is this code good?" — this lane answers "did we already get burned by this?"
+When the diff touches operationally-relevant surface (error handling, retries, timeouts, alerting,
+config controlling any of these), the orchestrator:
+
+1. **Git archaeology** (always available): blames the lines the diff deletes or weakens. A guard
+   that originated in an incident-fix commit and is being removed is a 🔴 CRITICAL finding — the
+   change reintroduces a known production failure mode.
+2. **Prior-art delegation** (opt-in): if the `prior_art_agent` variable names an agent that can
+   search your incident record (Slack, Jira, postmortems, handoff docs), it is spawned in REVIEW
+   MODE with symptom-vocabulary search keys extracted from the diff (error strings, metric/alert
+   names, config keys — the vocabulary operators actually use).
+
+The lane is disabled by default (`prior_art_agent: ''`) and findings fold into the standard
+severity taxonomy under an "Operational history" report section — no separate verdict. Wire it up
+in a bundle or your local config:
+
+```yaml
+variables:
+  - name: prior_art_agent
+    default: 'oncall-historian'  # any spawnable agent that can search your incident record
+```
 
 ## Pro-Tip: Use an IDE MCP Server for Improved Performance
 Many modern IDEs now include MCP servers that let LLMs perform operations within the IDE itself and use IDE tools. Using
