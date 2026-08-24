@@ -97,6 +97,7 @@ A diff review is a review of THE CHANGE, not the whole file:
 - Does this change increase coupling between modules unnecessarily?
 - Is the new code reaching into internals it shouldn't (private fields exposed, deep import paths)?
 - Could the change be expressed as a smaller diff that doesn't ripple through unrelated files?
+- New helper/utility/constant introduced? `fs_grep` for an existing equivalent in the repo before accepting it — duplicating an existing helper is a finding; cite the original's path so the author can reuse it. (The inverse is not a finding: do not demand a new abstraction to unify two mildly similar blocks.)
 
 ## 5. Footguns
 
