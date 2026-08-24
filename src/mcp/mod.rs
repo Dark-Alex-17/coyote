@@ -16,6 +16,7 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use http::{HeaderName, HeaderValue};
 use indexmap::IndexMap;
 use indoc::formatdoc;
+use rmcp::model::ServerCapabilities;
 use rmcp::service::RunningService;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::TokioChildProcess;
@@ -60,6 +61,28 @@ pub fn mcp_meta_function_names(server: &str) -> Vec<String> {
 }
 
 pub type ConnectedServer = RunningService<RoleClient, ()>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerFeatures {
+    pub name: String,
+    pub tools: bool,
+    pub resources: bool,
+    pub prompts: bool,
+}
+
+impl McpServerFeatures {
+    pub fn from_capabilities(
+        name: impl Into<String>,
+        capabilities: Option<&ServerCapabilities>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            tools: capabilities.is_none_or(|c| c.tools.is_some()),
+            resources: capabilities.is_some_and(|c| c.resources.is_some()),
+            prompts: capabilities.is_some_and(|c| c.prompts.is_some()),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -417,8 +440,20 @@ impl McpRegistry {
         &self.servers
     }
 
-    pub fn list_started_servers(&self) -> Vec<String> {
-        self.servers.keys().cloned().collect()
+    pub fn server_features(&self) -> Vec<McpServerFeatures> {
+        let mut features: Vec<McpServerFeatures> = self
+            .servers
+            .iter()
+            .map(|(name, handle)| {
+                let info = handle.peer_info();
+                McpServerFeatures::from_capabilities(
+                    name.as_str(),
+                    info.as_ref().map(|info| &info.capabilities),
+                )
+            })
+            .collect();
+        features.sort_by(|a, b| a.name.cmp(&b.name));
+        features
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1180,7 +1215,7 @@ mod tests {
         let registry = McpRegistry::default();
 
         assert!(registry.is_empty());
-        assert!(registry.list_started_servers().is_empty());
+        assert!(registry.server_features().is_empty());
         assert!(registry.mcp_config().is_none());
         assert!(registry.log_path().is_none());
     }

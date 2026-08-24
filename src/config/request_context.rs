@@ -23,7 +23,7 @@ use crate::function::{
     user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::mcp::{
-    MCP_INVOKE_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired, is_auth_required_error,
+    MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired, is_auth_required_error,
     is_mcp_meta_function, mcp_meta_function_names,
 };
 use crate::rag::Rag;
@@ -2167,8 +2167,8 @@ impl RequestContext {
                                 continue;
                             }
 
-                            let item_invoke_name =
-                                format!("{}_{item}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
+                            let item_search_name =
+                                format!("{}_{item}", MCP_SEARCH_META_FUNCTION_NAME_PREFIX);
                             if let Some(values) = app.mapping_mcp_servers.get(item) {
                                 server_names.extend(
                                     values
@@ -2176,7 +2176,7 @@ impl RequestContext {
                                         .flat_map(mcp_meta_function_names)
                                         .filter(|v| mcp_declaration_names.contains(v)),
                                 )
-                            } else if mcp_declaration_names.contains(&item_invoke_name) {
+                            } else if mcp_declaration_names.contains(&item_search_name) {
                                 server_names.extend(mcp_meta_function_names(item));
                             }
                         }
@@ -3779,7 +3779,7 @@ impl RequestContext {
             functions.append_todo_functions();
         }
         if !mcp_runtime.is_empty() {
-            functions.append_mcp_meta_functions(mcp_runtime.server_names());
+            functions.append_mcp_meta_functions(mcp_runtime.server_features());
         }
         if app.function_calling_support && policy.skills_enabled {
             functions.append_skill_functions();
@@ -4628,7 +4628,7 @@ mod tests {
     use crate::config::AppState;
     use crate::config::agent::AgentConfig;
     use crate::function::{ToolCall, skill};
-    use crate::mcp::{McpServer, McpServersConfig, McpTransportType};
+    use crate::mcp::{McpServer, McpServerFeatures, McpServersConfig, McpTransportType};
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
@@ -4687,6 +4687,15 @@ mod tests {
 
     fn create_test_ctx() -> RequestContext {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
+    }
+
+    fn tools_only_features(name: &str) -> McpServerFeatures {
+        McpServerFeatures {
+            name: name.to_string(),
+            tools: true,
+            resources: false,
+            prompts: false,
+        }
     }
 
     #[test]
@@ -5696,9 +5705,10 @@ mod tests {
     #[test]
     fn select_enabled_mcp_servers_all_returns_all_mcp_functions() {
         let mut ctx = create_test_ctx();
-        ctx.tool_scope
-            .functions
-            .append_mcp_meta_functions(vec!["github".into(), "slack".into()]);
+        ctx.tool_scope.functions.append_mcp_meta_functions(vec![
+            tools_only_features("github"),
+            tools_only_features("slack"),
+        ]);
 
         let mut role = Role::new("r", "p");
         role.set_enabled_mcp_servers(Some(vec!["all".to_string()]));
@@ -5713,9 +5723,10 @@ mod tests {
     #[test]
     fn select_enabled_mcp_servers_comma_filters() {
         let mut ctx = create_test_ctx();
-        ctx.tool_scope
-            .functions
-            .append_mcp_meta_functions(vec!["github".into(), "slack".into()]);
+        ctx.tool_scope.functions.append_mcp_meta_functions(vec![
+            tools_only_features("github"),
+            tools_only_features("slack"),
+        ]);
 
         let mut role = Role::new("r", "p");
         role.set_enabled_mcp_servers(Some(vec!["github".to_string()]));
@@ -5724,6 +5735,28 @@ mod tests {
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains(&"mcp_invoke_github"));
         assert!(!names.contains(&"mcp_invoke_slack"));
+    }
+
+    #[test]
+    fn select_enabled_mcp_servers_keeps_resources_only_server() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope
+            .functions
+            .append_mcp_meta_functions(vec![McpServerFeatures {
+                name: "res".to_string(),
+                tools: false,
+                resources: true,
+                prompts: false,
+            }]);
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_mcp_servers(Some(vec!["res".to_string()]));
+
+        let fns = ctx.select_enabled_mcp_servers(&role);
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"mcp_search_res"));
+        assert!(names.contains(&"mcp_describe_res"));
+        assert!(!names.contains(&"mcp_invoke_res"));
     }
 
     #[test]

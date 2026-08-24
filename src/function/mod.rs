@@ -16,7 +16,9 @@ use crate::config::ensure_parent_exists;
 use crate::config::paths;
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
-    MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpServersConfig, is_mcp_meta_function,
+    MCP_META_FUNCTION_PREFIXES, MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
+    MCP_READ_META_FUNCTION_NAME_PREFIX, MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpServerFeatures,
+    McpServersConfig, is_mcp_meta_function,
 };
 use crate::parsers::{bash, python, typescript};
 use anyhow::{Context, Result, anyhow, bail};
@@ -409,6 +411,18 @@ impl ToolResult {
     }
 }
 
+fn gated_meta_function_prefixes(features: &McpServerFeatures) -> Vec<&'static str> {
+    MCP_META_FUNCTION_PREFIXES
+        .into_iter()
+        .filter(|&prefix| match prefix {
+            MCP_INVOKE_META_FUNCTION_NAME_PREFIX => features.tools,
+            MCP_READ_META_FUNCTION_NAME_PREFIX => features.resources,
+            MCP_PROMPT_META_FUNCTION_NAME_PREFIX => features.prompts,
+            _ => true,
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Functions {
     declarations: Vec<FunctionDeclaration>,
@@ -624,7 +638,7 @@ impl Functions {
             .retain(|f| !f.name.starts_with(RAG_FUNCTION_PREFIX));
     }
 
-    pub fn append_mcp_meta_functions(&mut self, mcp_servers: Vec<String>) {
+    pub fn append_mcp_meta_functions(&mut self, mcp_servers: Vec<McpServerFeatures>) {
         let mut invoke_function_properties = IndexMap::new();
         invoke_function_properties.insert(
             "tool".to_string(),
@@ -682,59 +696,72 @@ impl Functions {
             },
         );
 
-        for server in mcp_servers {
+        for features in mcp_servers {
+            let server = &features.name;
             let search_function_name = format!("{}_{server}", MCP_SEARCH_META_FUNCTION_NAME_PREFIX);
             let describe_function_name =
                 format!("{}_{server}", MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX);
             let invoke_function_name = format!("{}_{server}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
-            let invoke_function_declaration = FunctionDeclaration {
-                name: invoke_function_name.clone(),
-                description: formatdoc!(
-                    r#"
+            for prefix in gated_meta_function_prefixes(&features) {
+                match prefix {
+                    MCP_INVOKE_META_FUNCTION_NAME_PREFIX => {
+                        self.declarations.push(FunctionDeclaration {
+                            name: invoke_function_name.clone(),
+                            description: formatdoc!(
+                                r#"
 										Invoke the specified tool on the {server} MCP server. Always call {describe_function_name} first to
 										find the correct invocation schema for the given tool.
 										"#
-                ),
-                parameters: JsonSchema {
-                    type_value: Some("object".to_string()),
-                    properties: Some(invoke_function_properties.clone()),
-                    required: Some(vec!["tool".to_string()]),
-                    ..Default::default()
-                },
-                agent: false,
-            };
-            let search_functions_declaration = FunctionDeclaration {
-                name: search_function_name.clone(),
-                description: formatdoc!(
-                    r#"
-                    Find candidate tools by keywords for the {server} MCP server. Returns small suggestions; fetch
-                    schemas with {describe_function_name}.
-                    "#
-                ),
-                parameters: JsonSchema {
-                    type_value: Some("object".to_string()),
-                    properties: Some(search_function_properties.clone()),
-                    required: Some(vec!["query".to_string()]),
-                    ..Default::default()
-                },
-                agent: false,
-            };
-            let describe_functions_declaration = FunctionDeclaration {
-                name: describe_function_name.clone(),
-                description: "Get the full schema or metadata for exactly one MCP catalog item: \
-                              a tool, resource, resource template, or prompt."
-                    .to_string(),
-                parameters: JsonSchema {
-                    type_value: Some("object".to_string()),
-                    properties: Some(describe_function_properties.clone()),
-                    required: Some(vec!["tool".to_string()]),
-                    ..Default::default()
-                },
-                agent: false,
-            };
-            self.declarations.push(invoke_function_declaration);
-            self.declarations.push(search_functions_declaration);
-            self.declarations.push(describe_functions_declaration);
+                            ),
+                            parameters: JsonSchema {
+                                type_value: Some("object".to_string()),
+                                properties: Some(invoke_function_properties.clone()),
+                                required: Some(vec!["tool".to_string()]),
+                                ..Default::default()
+                            },
+                            agent: false,
+                        });
+                    }
+                    MCP_SEARCH_META_FUNCTION_NAME_PREFIX => {
+                        self.declarations.push(FunctionDeclaration {
+                            name: search_function_name.clone(),
+                            description: formatdoc!(
+                                r#"
+                                Find candidate tools by keywords for the {server} MCP server. Returns small suggestions; fetch
+                                schemas with {describe_function_name}.
+                                "#
+                            ),
+                            parameters: JsonSchema {
+                                type_value: Some("object".to_string()),
+                                properties: Some(search_function_properties.clone()),
+                                required: Some(vec!["query".to_string()]),
+                                ..Default::default()
+                            },
+                            agent: false,
+                        });
+                    }
+                    MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX => {
+                        self.declarations.push(FunctionDeclaration {
+                            name: describe_function_name.clone(),
+                            description: "Get the full schema or metadata for exactly one MCP \
+                                          catalog item: a tool, resource, resource template, or \
+                                          prompt."
+                                .to_string(),
+                            parameters: JsonSchema {
+                                type_value: Some("object".to_string()),
+                                properties: Some(describe_function_properties.clone()),
+                                required: Some(vec!["tool".to_string()]),
+                                ..Default::default()
+                            },
+                            agent: false,
+                        });
+                    }
+                    // The declaration is added alongside its handler.
+                    MCP_READ_META_FUNCTION_NAME_PREFIX => {}
+                    MCP_PROMPT_META_FUNCTION_NAME_PREFIX => {}
+                    _ => debug_assert!(false, "unhandled MCP meta-function prefix: {prefix}"),
+                }
+            }
         }
     }
 
@@ -1859,6 +1886,19 @@ mod tests {
         ToolCall::new(name.to_string(), args, Some("id1".to_string()))
     }
 
+    fn mcp_features(name: &str, tools: bool, resources: bool, prompts: bool) -> McpServerFeatures {
+        McpServerFeatures {
+            name: name.to_string(),
+            tools,
+            resources,
+            prompts,
+        }
+    }
+
+    fn tools_only(name: &str) -> McpServerFeatures {
+        mcp_features(name, true, false, false)
+    }
+
     fn run_async<F: Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2231,7 +2271,7 @@ mod tests {
     #[test]
     fn functions_append_mcp_meta_creates_three_per_server() {
         let mut f = Functions::default();
-        f.append_mcp_meta_functions(vec!["github".to_string()]);
+        f.append_mcp_meta_functions(vec![tools_only("github")]);
         assert_eq!(f.declarations().len(), 3);
         assert!(f.contains("mcp_invoke_github"));
         assert!(f.contains("mcp_search_github"));
@@ -2241,7 +2281,7 @@ mod tests {
     #[test]
     fn functions_append_mcp_meta_multiple_servers() {
         let mut f = Functions::default();
-        f.append_mcp_meta_functions(vec!["github".into(), "slack".into()]);
+        f.append_mcp_meta_functions(vec![tools_only("github"), tools_only("slack")]);
         assert_eq!(f.declarations().len(), 6);
         assert!(f.contains("mcp_invoke_github"));
         assert!(f.contains("mcp_invoke_slack"));
@@ -2252,6 +2292,132 @@ mod tests {
         let mut f = Functions::default();
         f.append_mcp_meta_functions(vec![]);
         assert!(f.is_empty());
+    }
+
+    #[test]
+    fn functions_append_mcp_meta_resources_only_omits_invoke() {
+        let mut f = Functions::default();
+        f.append_mcp_meta_functions(vec![mcp_features("res", false, true, false)]);
+        assert_eq!(f.declarations().len(), 2);
+        assert!(!f.contains("mcp_invoke_res"));
+        assert!(f.contains("mcp_search_res"));
+        assert!(f.contains("mcp_describe_res"));
+    }
+
+    #[test]
+    fn functions_append_mcp_meta_all_capabilities_emits_three() {
+        let mut f = Functions::default();
+        f.append_mcp_meta_functions(vec![mcp_features("srv", true, true, true)]);
+        assert_eq!(f.declarations().len(), 3);
+        assert!(f.contains("mcp_invoke_srv"));
+        assert!(f.contains("mcp_search_srv"));
+        assert!(f.contains("mcp_describe_srv"));
+    }
+
+    #[test]
+    fn features_from_missing_capabilities_fail_open_for_tools() {
+        let features = McpServerFeatures::from_capabilities("srv", None);
+        assert!(features.tools);
+        assert!(!features.resources);
+        assert!(!features.prompts);
+
+        let mut f = Functions::default();
+        f.append_mcp_meta_functions(vec![features]);
+        assert!(f.contains("mcp_invoke_srv"));
+    }
+
+    #[test]
+    fn gated_prefixes_tools_only() {
+        assert_eq!(
+            gated_meta_function_prefixes(&mcp_features("srv", true, false, false)),
+            vec![
+                MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
+                MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+                MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
+            ]
+        );
+    }
+
+    #[test]
+    fn gated_prefixes_tools_and_resources_include_read() {
+        assert_eq!(
+            gated_meta_function_prefixes(&mcp_features("srv", true, true, false)),
+            vec![
+                MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
+                MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+                MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
+                MCP_READ_META_FUNCTION_NAME_PREFIX,
+            ]
+        );
+    }
+
+    #[test]
+    fn gated_prefixes_tools_and_prompts_include_prompt() {
+        assert_eq!(
+            gated_meta_function_prefixes(&mcp_features("srv", true, false, true)),
+            vec![
+                MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
+                MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+                MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
+                MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
+            ]
+        );
+    }
+
+    #[test]
+    fn gated_prefixes_all_capabilities_include_all() {
+        assert_eq!(
+            gated_meta_function_prefixes(&mcp_features("srv", true, true, true)),
+            MCP_META_FUNCTION_PREFIXES.to_vec()
+        );
+    }
+
+    #[test]
+    fn gated_prefixes_resources_only_omit_invoke() {
+        assert_eq!(
+            gated_meta_function_prefixes(&mcp_features("srv", false, true, false)),
+            vec![
+                MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+                MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
+                MCP_READ_META_FUNCTION_NAME_PREFIX,
+            ]
+        );
+    }
+
+    #[test]
+    fn gated_prefixes_prompts_only_omit_invoke_and_read() {
+        assert_eq!(
+            gated_meta_function_prefixes(&mcp_features("srv", false, false, true)),
+            vec![
+                MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+                MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
+                MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
+            ]
+        );
+    }
+
+    #[test]
+    fn gated_prefixes_resources_and_prompts_omit_invoke() {
+        assert_eq!(
+            gated_meta_function_prefixes(&mcp_features("srv", false, true, true)),
+            vec![
+                MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+                MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
+                MCP_READ_META_FUNCTION_NAME_PREFIX,
+                MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
+            ]
+        );
+    }
+
+    #[test]
+    fn gated_prefixes_no_capabilities_keep_search_and_describe() {
+        assert_eq!(
+            gated_meta_function_prefixes(&mcp_features("srv", false, false, false)),
+            vec![
+                MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+                MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
+            ]
+        );
     }
 
     #[test]
@@ -2285,7 +2451,7 @@ mod tests {
     #[test]
     fn functions_mcp_invoke_declaration_has_tool_and_arguments_params() {
         let mut f = Functions::default();
-        f.append_mcp_meta_functions(vec!["srv".to_string()]);
+        f.append_mcp_meta_functions(vec![tools_only("srv")]);
         let decl = f.find("mcp_invoke_srv").unwrap();
         let props = decl.parameters.properties.as_ref().unwrap();
         assert!(props.contains_key("tool"));
@@ -2297,7 +2463,7 @@ mod tests {
     #[test]
     fn functions_mcp_search_declaration_has_query_and_top_k_params() {
         let mut f = Functions::default();
-        f.append_mcp_meta_functions(vec!["srv".to_string()]);
+        f.append_mcp_meta_functions(vec![tools_only("srv")]);
         let decl = f.find("mcp_search_srv").unwrap();
         let props = decl.parameters.properties.as_ref().unwrap();
         assert!(props.contains_key("query"));
@@ -2307,7 +2473,7 @@ mod tests {
     #[test]
     fn functions_mcp_describe_declaration_has_tool_param() {
         let mut f = Functions::default();
-        f.append_mcp_meta_functions(vec!["srv".to_string()]);
+        f.append_mcp_meta_functions(vec![tools_only("srv")]);
         let decl = f.find("mcp_describe_srv").unwrap();
         let props = decl.parameters.properties.as_ref().unwrap();
         assert!(props.contains_key("tool"));
@@ -2316,7 +2482,7 @@ mod tests {
     #[test]
     fn functions_mcp_describe_declaration_has_optional_kind_param() {
         let mut f = Functions::default();
-        f.append_mcp_meta_functions(vec!["srv".to_string()]);
+        f.append_mcp_meta_functions(vec![tools_only("srv")]);
         let decl = f.find("mcp_describe_srv").unwrap();
         let props = decl.parameters.properties.as_ref().unwrap();
         let kind = props.get("kind").unwrap();

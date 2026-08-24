@@ -1,5 +1,5 @@
 use crate::function::{Functions, ToolCallTracker};
-use crate::mcp::{CatalogItem, CatalogItemKind, ConnectedServer, McpRegistry};
+use crate::mcp::{CatalogItem, CatalogItemKind, ConnectedServer, McpRegistry, McpServerFeatures};
 
 use anyhow::{Context, Result, anyhow};
 use bm25::{Document, Language, SearchEngineBuilder};
@@ -49,8 +49,20 @@ impl McpRuntime {
         self.servers.get(name)
     }
 
-    pub fn server_names(&self) -> Vec<String> {
-        self.servers.keys().cloned().collect()
+    pub fn server_features(&self) -> Vec<McpServerFeatures> {
+        let mut features: Vec<McpServerFeatures> = self
+            .servers
+            .iter()
+            .map(|(name, handle)| {
+                let info = handle.peer_info();
+                McpServerFeatures::from_capabilities(
+                    name.as_str(),
+                    info.as_ref().map(|info| &info.capabilities),
+                )
+            })
+            .collect();
+        features.sort_by(|a, b| a.name.cmp(&b.name));
+        features
     }
 
     pub fn sync_from_registry(&mut self, registry: &McpRegistry) {
@@ -65,12 +77,14 @@ impl McpRuntime {
             .get(server)
             .cloned()
             .with_context(|| format!("{server} MCP server not found in runtime"))?;
-        let capabilities = server_handle
-            .peer_info()
-            .map(|info| info.capabilities.clone());
+        let info = server_handle.peer_info();
+        let features = McpServerFeatures::from_capabilities(
+            server,
+            info.as_ref().map(|info| &info.capabilities),
+        );
         let mut items = HashMap::new();
 
-        if capabilities.as_ref().is_none_or(|c| c.tools.is_some()) {
+        if features.tools {
             match server_handle.list_all_tools().await {
                 Ok(tools) => merge_catalog_items(
                     &mut items,
@@ -82,7 +96,7 @@ impl McpRuntime {
             }
         }
 
-        if capabilities.as_ref().is_some_and(|c| c.resources.is_some()) {
+        if features.resources {
             match server_handle.list_all_resources().await {
                 Ok(resources) => merge_catalog_items(
                     &mut items,
@@ -105,7 +119,7 @@ impl McpRuntime {
             }
         }
 
-        if capabilities.as_ref().is_some_and(|c| c.prompts.is_some()) {
+        if features.prompts {
             match server_handle.list_all_prompts().await {
                 Ok(prompts) => merge_catalog_items(
                     &mut items,
@@ -349,8 +363,9 @@ pub(crate) mod test_fixtures {
     use rmcp::{RoleServer, ServerHandler, ServiceExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     pub(crate) struct FixtureServer {
+        pub(crate) tools_capability: bool,
         pub(crate) resources_capability: bool,
         pub(crate) prompts_capability: bool,
         pub(crate) fail_resource_listings: bool,
@@ -358,9 +373,26 @@ pub(crate) mod test_fixtures {
         pub(crate) list_prompts_calls: Arc<AtomicUsize>,
     }
 
+    impl Default for FixtureServer {
+        fn default() -> Self {
+            Self {
+                tools_capability: true,
+                resources_capability: false,
+                prompts_capability: false,
+                fail_resource_listings: false,
+                list_resources_calls: Arc::default(),
+                list_prompts_calls: Arc::default(),
+            }
+        }
+    }
+
     impl ServerHandler for FixtureServer {
         fn get_info(&self) -> ServerInfo {
-            let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+            let mut capabilities = if self.tools_capability {
+                ServerCapabilities::builder().enable_tools().build()
+            } else {
+                ServerCapabilities::builder().build()
+            };
             capabilities.resources = self.resources_capability.then(ResourcesCapability::default);
             capabilities.prompts = self.prompts_capability.then(PromptsCapability::default);
             ServerInfo::new(capabilities)
@@ -493,7 +525,7 @@ mod tests {
     fn mcp_runtime_new_is_empty() {
         let runtime = McpRuntime::new();
         assert!(runtime.is_empty());
-        assert!(runtime.server_names().is_empty());
+        assert!(runtime.server_features().is_empty());
     }
 
     #[test]
@@ -506,6 +538,61 @@ mod tests {
     fn mcp_runtime_get_returns_none_for_missing_server() {
         let runtime = McpRuntime::new();
         assert!(runtime.get("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn server_features_reports_fixture_capabilities() {
+        let (runtime, _server) = fixture_runtime(FixtureServer {
+            resources_capability: true,
+            ..Default::default()
+        })
+        .await;
+
+        let features = runtime.server_features();
+        assert_eq!(
+            features,
+            vec![McpServerFeatures {
+                name: "fixture".to_string(),
+                tools: true,
+                resources: true,
+                prompts: false,
+            }]
+        );
+
+        let mut functions = Functions::default();
+        functions.append_mcp_meta_functions(features);
+        assert_eq!(functions.declarations().len(), 3);
+        assert!(functions.contains("mcp_invoke_fixture"));
+        assert!(functions.contains("mcp_search_fixture"));
+        assert!(functions.contains("mcp_describe_fixture"));
+    }
+
+    #[tokio::test]
+    async fn server_features_without_tools_capability_gates_invoke() {
+        let (runtime, _server) = fixture_runtime(FixtureServer {
+            tools_capability: false,
+            resources_capability: true,
+            ..Default::default()
+        })
+        .await;
+
+        let features = runtime.server_features();
+        assert_eq!(
+            features,
+            vec![McpServerFeatures {
+                name: "fixture".to_string(),
+                tools: false,
+                resources: true,
+                prompts: false,
+            }]
+        );
+
+        let mut functions = Functions::default();
+        functions.append_mcp_meta_functions(features);
+        assert_eq!(functions.declarations().len(), 2);
+        assert!(!functions.contains("mcp_invoke_fixture"));
+        assert!(functions.contains("mcp_search_fixture"));
+        assert!(functions.contains("mcp_describe_fixture"));
     }
 
     #[test]

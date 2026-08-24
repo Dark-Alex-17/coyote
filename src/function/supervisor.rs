@@ -630,14 +630,14 @@ async fn populate_agent_mcp_runtime(ctx: &mut RequestContext, server_ids: &[Stri
 }
 
 fn sync_agent_functions_to_ctx(ctx: &mut RequestContext) -> Result<()> {
-    let server_names = ctx.tool_scope.mcp_runtime.server_names();
+    let server_features = ctx.tool_scope.mcp_runtime.server_features();
     let functions = {
         let agent = ctx
             .agent
             .as_mut()
             .with_context(|| "Agent should be initialized")?;
-        if !server_names.is_empty() {
-            agent.append_mcp_meta_functions(server_names);
+        if !server_features.is_empty() {
+            agent.append_mcp_meta_functions(server_features);
         }
         agent.functions().clone()
     };
@@ -1453,7 +1453,8 @@ async fn summarize_output(ctx: &RequestContext, agent_name: &str, output: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppState, WorkingMode};
+    use crate::config::test_fixtures::{FixtureServer, fixture_runtime};
+    use crate::config::{AgentConfig, AppState, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use serde_json::json;
     use serial_test::serial;
@@ -1508,6 +1509,27 @@ mod tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    #[tokio::test]
+    async fn sync_agent_functions_gates_meta_functions_on_live_capabilities() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let (runtime, _server) = fixture_runtime(FixtureServer {
+            tools_capability: false,
+            resources_capability: true,
+            ..FixtureServer::default()
+        })
+        .await;
+        ctx.tool_scope.mcp_runtime = runtime;
+
+        sync_agent_functions_to_ctx(&mut ctx).unwrap();
+
+        let functions = &ctx.tool_scope.functions;
+        assert_eq!(functions.declarations().len(), 2);
+        assert!(functions.contains("mcp_search_fixture"));
+        assert!(functions.contains("mcp_describe_fixture"));
+        assert!(!functions.contains("mcp_invoke_fixture"));
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub(crate) mod todo;
 mod tool_scope;
 mod update;
 
+#[cfg(test)]
+pub(crate) use self::agent::AgentConfig;
 pub use self::agent::{
     Agent, AgentVariable, AgentVariables, complete_agent_variables, list_agents,
     list_agents_with_descriptions,
