@@ -106,6 +106,29 @@ A diff review is a review of THE CHANGE, not the whole file:
 - Are error types specific enough to be actionable?
 - Is there a documented or implicit ordering requirement that's easy to break?
 
+## 6. Code smells (baseline heuristics)
+
+A fixed baseline of named smells (Fowler, *Refactoring* ch. 3) that applies even when the repo documents no standards. Three calibration rules bind it:
+
+1. **The repo overrides.** A documented or established repo convention always wins; where the codebase deliberately does something the baseline would flag, suppress the smell.
+2. **Always a judgment call.** Report each as a labelled heuristic ("possible Feature Envy"), never a hard violation — severity 🟢 Suggestion or 💡 Nitpick unless it compounds a real defect.
+3. **Skip anything tooling already enforces.** Linters and formatters own their territory.
+
+Each smell reads *what it is → how to fix*; match against the diff only:
+
+- **Mysterious Name**: a function/variable/type whose name doesn't reveal what it does or holds → rename; if no honest name comes, the design is murky.
+- **Duplicated Code**: the same logic shape in more than one hunk or file of the change → extract the shared shape, call it from both. (For duplication against EXISTING code, see the Coupling grep check above.)
+- **Feature Envy**: a method reaching into another object's data more than its own → move the method onto the data it envies.
+- **Data Clumps**: the same few fields/params travelling together — a type wanting to be born → bundle them into one type.
+- **Primitive Obsession**: a primitive/string standing in for a domain concept → give the concept its own small type.
+- **Repeated Switches**: the same `switch`/`if`-cascade on the same type recurring across the change → polymorphism, or one shared map.
+- **Shotgun Surgery**: one logical change forcing scattered edits across many files in the diff → gather what changes together into one module.
+- **Divergent Change**: one file edited for several unrelated reasons → split so each module changes for one reason.
+- **Speculative Generality**: abstraction/parameters/hooks added for needs nothing in the change has → delete; inline until a real need shows.
+- **Message Chains**: long `a.b().c().d()` navigation the caller shouldn't depend on → hide the walk behind one method on the first object.
+- **Middle Man**: a class/function that mostly delegates onward → cut it, call the real target directly.
+- **Refused Bequest**: a subclass/implementer ignoring or overriding most of what it inherits → drop the inheritance, use composition.
+
 ## What to flag
 
 - Correctness bugs.
