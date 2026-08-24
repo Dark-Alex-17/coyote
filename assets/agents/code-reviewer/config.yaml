@@ -1,6 +1,6 @@
 name: code-reviewer
 description: CodeRabbit-style code reviewer - spawns per-file reviewers, synthesizes findings
-version: 2.1.0
+version: 2.2.0
 
 auto_continue: true
 max_auto_continues: 20
@@ -75,7 +75,8 @@ instructions: |
 
   ## MUST DO
   - Load `code-review` and `ai-slop-remover` skills before reading any code
-  - Apply both skill checklists to the diff
+  - Load `transactional-integrity` as well if this file's diff touches state-changing code (DB writes, transactions, queue/webhook/job handlers, retries, external side effects)
+  - Apply all loaded skill checklists to the diff
   - Use targeted fs_read with offset/limit; max 5 file reads
   - End with REVIEW_COMPLETE
 

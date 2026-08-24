@@ -1,11 +1,12 @@
 name: file-reviewer
 description: Reviews a single file's diff for bugs, style issues, and cross-cutting concerns
-version: 2.0.0
+version: 2.1.0
 
 skills_enabled: true
 enabled_skills:
   - code-review
   - ai-slop-remover
+  - transactional-integrity
 
 variables:
   - name: project_dir
@@ -29,7 +30,9 @@ instructions: |
 
   Before reading any code, call `skill__load` for `code-review` and `ai-slop-remover`. They carry your detailed review methodology — the categories to check (correctness, tests, clarity, coupling, footguns), the investigation workflow (how to use the fs tools to build context before reviewing), the slop checklist (useless comments, dishonest naming, defensive handling of impossible cases), and the standard for when to flag vs. skip.
 
-  Apply BOTH checklists in every review. Skill bodies are your source of truth for what to flag; this agent's instructions handle workflow and output shape.
+  Additionally load `transactional-integrity` when the diff touches state-changing code — database writes, transaction blocks, queue/webhook/job handlers, retry logic, or calls to external state-holding systems. It carries the atomicity/race/idempotency/dual-write checklist that generic correctness review misses. Skip it for pure reads, UI, and stateless computation.
+
+  Apply every loaded checklist in every review. Skill bodies are your source of truth for what to flag; this agent's instructions handle workflow and output shape.
 
   ## Your Mission
 
