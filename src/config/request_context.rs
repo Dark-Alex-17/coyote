@@ -38,6 +38,7 @@ use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 
 use super::install_remote::DEFAULT_GIT_HOST;
 use super::instructions;
+use super::macros::Macro;
 use super::memory::{
     DEFAULT_MEMORY_CAP_WITH_TOOLS, DEFAULT_MEMORY_CAP_WITHOUT_TOOLS, MemoryStore, WorkspaceMemory,
 };
@@ -2518,6 +2519,27 @@ impl RequestContext {
         )
     }
 
+    fn macro_variable_completions(
+        &self,
+        cmd: &str,
+        completed_args: &[&str],
+    ) -> Vec<(String, Option<String>)> {
+        let Some(name) = cmd.strip_prefix('.') else {
+            return vec![];
+        };
+        if !self
+            .visible_macro_completions()
+            .iter()
+            .any(|(macro_name, _)| macro_name == name)
+        {
+            return vec![];
+        }
+        match Macro::load(name, self.app.config.no_workspace_macros) {
+            Ok(macro_value) => macro_value.variable_completions(completed_args),
+            Err(_) => vec![],
+        }
+    }
+
     pub fn macro_lock_owner(&self, level: MacroAllowlistLevel) -> String {
         let name = match level {
             MacroAllowlistLevel::Session => self.session.as_ref().map(|s| s.name()),
@@ -3378,7 +3400,7 @@ impl RequestContext {
                         .map(|v| (format!("{v} "), None))
                         .collect()
                 }
-                _ => vec![],
+                _ => self.macro_variable_completions(cmd, &[]),
             };
         } else if cmd == ".mcp" && args.first() == Some(&"auth") && args.len() == 2 {
             if let Some(mcp_config) = &self.app.mcp_config {
@@ -3505,6 +3527,14 @@ impl RequestContext {
                 })
                 .map(|row| (row.name, row.description))
                 .collect();
+        } else if cmd == ".macro"
+            && args.len() >= 2
+            && args.first() != Some(&"enable")
+            && args.first() != Some(&"disable")
+        {
+            if let Ok(macro_value) = Macro::load(args[0], app.no_workspace_macros) {
+                values = macro_value.variable_completions(&args[1..args.len() - 1]);
+            }
         } else if (cmd == ".edit" && args.first() == Some(&"skill") && args.len() == 2)
             || (cmd == ".skill" && args.first() == Some(&"load") && args.len() == 2)
         {
@@ -3676,6 +3706,8 @@ impl RequestContext {
                     .collect();
             }
             values.extend(super::complete_agent_variables(args[0]));
+        } else if args.len() >= 2 {
+            values = self.macro_variable_completions(cmd, &args[..args.len() - 1]);
         };
         fuzzy_filter(values, |v| v.0.as_str(), filter)
     }

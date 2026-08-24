@@ -26,13 +26,17 @@ pub async fn macro_execute(
         bail!("nested macros not allowed in non-isolated mode");
     }
     let macro_value = Macro::load(name, ctx.app.config.no_workspace_macros)?;
-    let (mut new_args, text) = split_args_text(args.unwrap_or_default(), cfg!(windows));
-    if !text.is_empty() {
-        new_args.push(text.to_string());
-    }
+    let (new_args, text) = split_args_text(args.unwrap_or_default(), cfg!(windows));
     let variables = macro_value
-        .resolve_variables(&new_args)
-        .map_err(|err| anyhow!("{err}. Usage: {}", macro_value.usage(name)))?;
+        .resolve_variables(&new_args, text)
+        .map_err(|err| {
+            let kv_hint = if macro_value.variables.is_empty() {
+                ""
+            } else {
+                " (variables can also be set by name: name=value, before any positional args)"
+            };
+            anyhow!("{err}. Usage: {}{kv_hint}", macro_value.usage(name))
+        })?;
 
     if !macro_value.isolated {
         let mut live = MacroModeGuard::new(ctx);
@@ -181,25 +185,104 @@ impl Macro {
         Ok(())
     }
 
-    pub fn resolve_variables(&self, args: &[String]) -> Result<IndexMap<String, String>> {
+    /// Leading `name=value` tokens assign declared variables by name; the
+    /// first token that is not such an assignment starts the positional
+    /// args, which fill the remaining unassigned variables in declaration
+    /// order. `trailing_text` (the free text after `--`) is always the last
+    /// positional and is never scanned for assignments.
+    pub fn resolve_variables(
+        &self,
+        args: &[String],
+        trailing_text: &str,
+    ) -> Result<IndexMap<String, String>> {
+        let (assignments, positional_start) = self.leading_assignments(args)?;
+        let mut positionals: Vec<&str> = args[positional_start..]
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        if !trailing_text.is_empty() {
+            positionals.push(trailing_text);
+        }
+
         let mut output = IndexMap::new();
+        let mut pos_index = 0;
         for (i, variable) in self.variables.iter().enumerate() {
-            let value = if variable.rest && i == self.variables.len() - 1 {
-                if args.len() > i {
-                    Some(args[i..].join(" "))
+            let is_rest = variable.rest && i == self.variables.len() - 1;
+            let value = if let Some(value) = assignments.get(variable.name.as_str()) {
+                Some(value.clone())
+            } else if is_rest {
+                if pos_index < positionals.len() {
+                    Some(positionals[pos_index..].join(" "))
                 } else {
                     variable.default.clone()
                 }
             } else {
-                args.get(i)
-                    .map(|v| v.to_string())
-                    .or_else(|| variable.default.clone())
+                let positional = positionals.get(pos_index).map(|v| v.to_string());
+                if positional.is_some() {
+                    pos_index += 1;
+                }
+                positional.or_else(|| variable.default.clone())
             };
             let value =
                 value.ok_or_else(|| anyhow!("Missing value for variable '{}'", variable.name))?;
             output.insert(variable.name.clone(), value);
         }
         Ok(output)
+    }
+
+    fn leading_assignments(&self, args: &[String]) -> Result<(IndexMap<String, String>, usize)> {
+        let mut assignments = IndexMap::new();
+        let mut positional_start = args.len();
+        for (i, arg) in args.iter().enumerate() {
+            let Some((key, value)) = parse_assignment(arg) else {
+                positional_start = i;
+                break;
+            };
+            if !self.variables.iter().any(|v| v.name == key) {
+                let declared: Vec<&str> = self.variables.iter().map(|v| v.name.as_str()).collect();
+                bail!(
+                    "Unknown variable '{key}' (declared variables: {})",
+                    declared.join(", ")
+                );
+            }
+            if assignments
+                .insert(key.to_string(), value.to_string())
+                .is_some()
+            {
+                bail!("Variable '{key}' was assigned more than once");
+            }
+        }
+        Ok((assignments, positional_start))
+    }
+
+    /// Completion candidates for the assignment prefix: one `name=` entry per
+    /// variable not yet assigned in `completed_args`. Empty once a
+    /// non-assignment token has ended the prefix.
+    pub fn variable_completions(&self, completed_args: &[&str]) -> Vec<(String, Option<String>)> {
+        let mut assigned: Vec<&str> = Vec::new();
+        for arg in completed_args {
+            match parse_assignment(arg) {
+                Some((key, _)) if self.variables.iter().any(|v| v.name == key) => {
+                    assigned.push(key);
+                }
+                _ => return vec![],
+            }
+        }
+        self.variables
+            .iter()
+            .filter(|v| !assigned.contains(&v.name.as_str()))
+            .map(|v| {
+                let requirement = match &v.default {
+                    Some(default) => format!("(default: {default})"),
+                    None => "(required)".to_string(),
+                };
+                let hint = match &v.description {
+                    Some(description) => format!("{description} {requirement}"),
+                    None => requirement,
+                };
+                (format!("{}=", v.name), Some(hint))
+            })
+            .collect()
     }
 
     pub fn usage(&self, name: &str) -> String {
@@ -233,10 +316,28 @@ impl Macro {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MacroVariable {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(default)]
     pub rest: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+}
+
+/// A token is an assignment only when the key before `=` is
+/// identifier-shaped: a letter or underscore followed by letters, digits,
+/// underscores, or hyphens. Anything else (paths, URLs, prose) is positional.
+pub(crate) fn parse_assignment(arg: &str) -> Option<(&str, &str)> {
+    let (key, value) = arg.split_once('=')?;
+    let mut chars = key.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return None;
+    }
+    Some((key, value))
 }
 
 fn default_true() -> bool {
@@ -399,6 +500,7 @@ mod tests {
     fn var(name: &str, rest: bool, default: Option<&str>) -> MacroVariable {
         MacroVariable {
             name: name.to_string(),
+            description: None,
             rest,
             default: default.map(String::from),
         }
@@ -417,7 +519,7 @@ mod tests {
     fn resolve_no_variables() {
         let m = macro_with_vars(vec![]);
 
-        let result = m.resolve_variables(&[]).unwrap();
+        let result = m.resolve_variables(&[], "").unwrap();
 
         assert!(result.is_empty());
     }
@@ -426,7 +528,7 @@ mod tests {
     fn resolve_required_variable_provided() {
         let m = macro_with_vars(vec![var("name", false, None)]);
 
-        let result = m.resolve_variables(&["Alice".into()]).unwrap();
+        let result = m.resolve_variables(&["Alice".into()], "").unwrap();
 
         assert_eq!(result["name"], "Alice");
     }
@@ -435,7 +537,7 @@ mod tests {
     fn resolve_required_variable_missing_errors() {
         let m = macro_with_vars(vec![var("name", false, None)]);
 
-        let result = m.resolve_variables(&[]);
+        let result = m.resolve_variables(&[], "");
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("name"));
@@ -445,7 +547,7 @@ mod tests {
     fn resolve_default_variable_uses_default() {
         let m = macro_with_vars(vec![var("color", false, Some("blue"))]);
 
-        let result = m.resolve_variables(&[]).unwrap();
+        let result = m.resolve_variables(&[], "").unwrap();
 
         assert_eq!(result["color"], "blue");
     }
@@ -454,7 +556,7 @@ mod tests {
     fn resolve_default_variable_overridden() {
         let m = macro_with_vars(vec![var("color", false, Some("blue"))]);
 
-        let result = m.resolve_variables(&["red".into()]).unwrap();
+        let result = m.resolve_variables(&["red".into()], "").unwrap();
 
         assert_eq!(result["color"], "red");
     }
@@ -464,7 +566,7 @@ mod tests {
         let m = macro_with_vars(vec![var("first", false, None), var("rest", true, None)]);
 
         let result = m
-            .resolve_variables(&["a".into(), "b".into(), "c".into()])
+            .resolve_variables(&["a".into(), "b".into(), "c".into()], "")
             .unwrap();
 
         assert_eq!(result["first"], "a");
@@ -475,7 +577,7 @@ mod tests {
     fn resolve_rest_variable_with_default() {
         let m = macro_with_vars(vec![var("args", true, Some("default text"))]);
 
-        let result = m.resolve_variables(&[]).unwrap();
+        let result = m.resolve_variables(&[], "").unwrap();
 
         assert_eq!(result["args"], "default text");
     }
@@ -488,11 +590,171 @@ mod tests {
             var("c", false, Some("default_c")),
         ]);
 
-        let result = m.resolve_variables(&["x".into(), "y".into()]).unwrap();
+        let result = m.resolve_variables(&["x".into(), "y".into()], "").unwrap();
 
         assert_eq!(result["a"], "x");
         assert_eq!(result["b"], "y");
         assert_eq!(result["c"], "default_c");
+    }
+
+    #[test]
+    fn resolve_assignment_skips_earlier_defaults() {
+        let m = macro_with_vars(vec![
+            var("a", false, Some("da")),
+            var("b", false, Some("db")),
+            var("c", false, None),
+        ]);
+
+        let result = m.resolve_variables(&["c=x".into()], "").unwrap();
+
+        assert_eq!(result["a"], "da");
+        assert_eq!(result["b"], "db");
+        assert_eq!(result["c"], "x");
+    }
+
+    #[test]
+    fn resolve_positionals_fill_unassigned_variables_after_assignments() {
+        let m = macro_with_vars(vec![
+            var("a", false, None),
+            var("b", false, None),
+            var("c", false, None),
+        ]);
+
+        let result = m
+            .resolve_variables(&["b=middle".into(), "first".into(), "last".into()], "")
+            .unwrap();
+
+        assert_eq!(result["a"], "first");
+        assert_eq!(result["b"], "middle");
+        assert_eq!(result["c"], "last");
+    }
+
+    #[test]
+    fn resolve_rest_variable_by_assignment_and_by_positionals() {
+        let m = macro_with_vars(vec![
+            var("scope", false, Some("all")),
+            var("text", true, None),
+        ]);
+
+        let result = m
+            .resolve_variables(&["text=hello world".into()], "")
+            .unwrap();
+        assert_eq!(result["scope"], "all");
+        assert_eq!(result["text"], "hello world");
+
+        let result = m
+            .resolve_variables(
+                &["scope=one".into(), "fix".into(), "the".into(), "bug".into()],
+                "",
+            )
+            .unwrap();
+        assert_eq!(result["scope"], "one");
+        assert_eq!(result["text"], "fix the bug");
+    }
+
+    #[test]
+    fn resolve_assignment_prefix_ends_at_first_positional() {
+        let m = macro_with_vars(vec![var("a", false, None), var("b", true, Some(""))]);
+
+        let result = m
+            .resolve_variables(&["value".into(), "a=literal".into()], "")
+            .unwrap();
+
+        assert_eq!(result["a"], "value");
+        assert_eq!(result["b"], "a=literal");
+    }
+
+    #[test]
+    fn resolve_trailing_text_is_never_scanned_for_assignments() {
+        let m = macro_with_vars(vec![var("text", true, None)]);
+
+        let result = m
+            .resolve_variables(&[], "text=looks like an assignment")
+            .unwrap();
+
+        assert_eq!(result["text"], "text=looks like an assignment");
+    }
+
+    #[test]
+    fn resolve_rejects_unknown_and_duplicate_assignments() {
+        let m = macro_with_vars(vec![var("scope", false, None)]);
+
+        let err = m.resolve_variables(&["scpe=all".into()], "").unwrap_err();
+        assert!(err.to_string().contains("Unknown variable 'scpe'"));
+        assert!(err.to_string().contains("scope"));
+
+        let err = m
+            .resolve_variables(&["scope=a".into(), "scope=b".into()], "")
+            .unwrap_err();
+        assert!(err.to_string().contains("assigned more than once"));
+    }
+
+    #[test]
+    fn resolve_non_identifier_equals_tokens_are_positional() {
+        let m = macro_with_vars(vec![var("a", false, None)]);
+
+        let result = m.resolve_variables(&["path/x=1".into()], "").unwrap();
+        assert_eq!(result["a"], "path/x=1");
+
+        let result = m.resolve_variables(&["1x=2".into()], "").unwrap();
+        assert_eq!(result["a"], "1x=2");
+    }
+
+    #[test]
+    fn parse_assignment_requires_an_identifier_shaped_key() {
+        assert_eq!(parse_assignment("scope=all"), Some(("scope", "all")));
+        assert_eq!(parse_assignment("_x-1=v"), Some(("_x-1", "v")));
+        assert_eq!(parse_assignment("k="), Some(("k", "")));
+        assert_eq!(parse_assignment("noequals"), None);
+        assert_eq!(parse_assignment("=v"), None);
+        assert_eq!(parse_assignment("1a=v"), None);
+        assert_eq!(parse_assignment("a/b=v"), None);
+    }
+
+    #[test]
+    fn variable_completions_list_unassigned_variables_with_hints() {
+        let mut m = macro_with_vars(vec![
+            var("scope", false, Some("all")),
+            var("text", true, None),
+        ]);
+        m.variables[0].description = Some("What to review".to_string());
+
+        let values = m.variable_completions(&[]);
+        assert_eq!(
+            values,
+            vec![
+                (
+                    "scope=".to_string(),
+                    Some("What to review (default: all)".to_string())
+                ),
+                ("text=".to_string(), Some("(required)".to_string())),
+            ]
+        );
+
+        let values = m.variable_completions(&["scope=one"]);
+        assert_eq!(
+            values,
+            vec![("text=".to_string(), Some("(required)".to_string()))]
+        );
+
+        assert!(m.variable_completions(&["positional"]).is_empty());
+        assert!(
+            m.variable_completions(&["scope=one", "free", "text=x"])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn macro_variable_description_parses_from_yaml_and_defaults_to_none() {
+        let parsed: Macro = serde_yaml::from_str(
+            "variables:\n  - name: scope\n    description: What to review\n    default: all\n  - name: text\n    rest: true\nsteps:\n  - .file {{scope}} -- {{text}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.variables[0].description.as_deref(),
+            Some("What to review")
+        );
+        assert!(parsed.variables[1].description.is_none());
     }
 
     #[test]
