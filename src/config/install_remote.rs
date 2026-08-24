@@ -2,7 +2,7 @@ use super::bundles::{
     BundleStore, FileAction, FileRecord, InstallMetadata, McpAction, McpServerRecord, hash_bytes,
     hash_file,
 };
-use crate::config::{AssetCategory, InstallFilter, paths};
+use crate::config::{AssetCategory, BUNDLE_MANIFEST_FILE, InstallFilter, paths};
 #[cfg(not(windows))]
 use crate::function::Language;
 use crate::mcp::{McpServer, McpServersConfig};
@@ -17,8 +17,8 @@ use inquire::{Confirm, Select};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::{fs, iter};
 
 pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool) -> Result<()> {
     let (url, reference) = parse_url_with_ref(git_url)?;
@@ -123,16 +123,21 @@ fn classify_install_target(value: &str, installed_names: &[String]) -> InstallTa
     if let Some(category) = AssetCategory::parse(value) {
         return InstallTarget::Category(category);
     }
+
     let name = strip_ref_suffix(value);
+
     if installed_names.iter().any(|installed| installed == name) {
         return InstallTarget::InstalledBundle;
     }
+
     if looks_like_remote_source(value) {
         return InstallTarget::RemoteSource;
     }
+
     if is_repo_shorthand(value) {
         return InstallTarget::Shorthand;
     }
+
     InstallTarget::Unknown
 }
 
@@ -145,6 +150,7 @@ fn looks_like_remote_source(value: &str) -> bool {
     {
         return true;
     }
+
     match value.split_once(':') {
         Some((host, _)) => {
             !host.is_empty() && !host.contains('/') && !host.chars().any(char::is_whitespace)
@@ -165,6 +171,7 @@ fn is_repo_shorthand(value: &str) -> bool {
     {
         return false;
     }
+
     let mut segments = path.split('/');
     segments.clone().count() >= 2 && segments.all(|segment| !segment.is_empty())
 }
@@ -176,9 +183,11 @@ fn expand_repo_shorthand(value: &str, git_host: Option<&str>) -> Result<String> 
         .or_else(|| raw.strip_prefix("http://"))
         .unwrap_or(raw)
         .trim_matches('/');
+
     if host.is_empty() || host.contains(['/', '#', '?']) || host.chars().any(char::is_whitespace) {
         bail!("invalid --git-host '{raw}': expected a bare host like git.somedomain.com");
     }
+
     Ok(format!("https://{host}/{value}"))
 }
 
@@ -195,6 +204,7 @@ pub fn install_or_update(
                  '{value}' is not one"
             );
         }
+
         let url = expand_repo_shorthand(value, Some(host))?;
         println!("Resolved '{value}' to '{url}'");
         return install_remote(&url, filter, force);
@@ -239,9 +249,11 @@ pub fn install_or_update(
             let hint = "a remote source must be a git URL, an <owner>/<repo> shorthand \
                  (expanded against --git-host, default github.com), an scp-style \
                  host:path, or an explicit local path (./dir, /abs, ~)";
+
             if installed.is_empty() {
                 bail!("no bundle named '{value}' is installed; none are installed ({hint})");
             }
+
             bail!(
                 "no bundle named '{value}' is installed; installed bundles: {} ({hint})",
                 installed.join(", ")
@@ -372,13 +384,16 @@ fn reclassify_owned_unmodified(
         if planned.kind != PlannedKind::Conflict {
             continue;
         }
+
         let Some(recorded) = owned.get(provenance_path(&planned.dst).as_str()) else {
             continue;
         };
+
         if hash_file(&planned.dst)? == *recorded {
             planned.kind = PlannedKind::Refresh;
         }
     }
+
     Ok(plan)
 }
 
@@ -398,6 +413,7 @@ fn owned_unmodified_mcp_keys(
         .with_context(|| format!("failed to read local mcp.json at {}", local_path.display()))?;
     let config: McpServersConfig = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse local mcp.json at {}", local_path.display()))?;
+
     for server in &record.mcp_servers {
         let Some(recorded_hash) = server.sha256.as_deref() else {
             continue;
@@ -408,10 +424,12 @@ fn owned_unmodified_mcp_keys(
         };
         let serialized = serde_json::to_string(entry)
             .with_context(|| format!("failed to serialize MCP server '{key}'"))?;
+
         if hash_bytes(serialized.as_bytes()) == recorded_hash {
             keys.insert(key.to_string());
         }
     }
+
     Ok(keys)
 }
 
@@ -453,15 +471,18 @@ fn handle_obsolete_files(
             eprintln!("skipping suspicious recorded path {path}; keeping its record");
             continue;
         }
+
         let full = config_dir.join(&path);
         if !full.exists() {
             println!("dropped record for obsolete file {path} (already absent locally)");
             store.remove_file_record(bundle, &path)?;
             continue;
         }
+
         let action = resolve_obsolete(&path, &mut sticky)?;
         apply_obsolete_action(store, bundle, &path, &full, &config_dir, action)?;
     }
+
     Ok(())
 }
 
@@ -469,6 +490,7 @@ fn resolve_obsolete(path: &str, sticky: &mut Option<ObsoleteAction>) -> Result<O
     if let Some(action) = *sticky {
         return Ok(action);
     }
+
     if !*IS_STDOUT_TERMINAL {
         return Ok(ObsoleteAction::Keep);
     }
@@ -513,6 +535,7 @@ fn apply_obsolete_action(
             println!("deleted obsolete file {path}");
         }
     }
+
     Ok(())
 }
 
@@ -548,6 +571,7 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
                     if installed.is_empty() {
                         bail!("no bundle named '{spec}' is installed; none are installed");
                     }
+
                     bail!(
                         "no bundle named '{spec}' is installed; installed bundles: {}",
                         installed.join(", ")
@@ -587,12 +611,14 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
         &paths::config_dir(),
         assume_yes,
     )?;
+
     if files.tools_seen {
         println!(
             "Note: compiled tool binaries remain in {} until the next --build-tools prune.",
             paths::functions_bin_dir().display()
         );
     }
+
     let mcp = uninstall_mcp_entries(
         &mut store,
         &name,
@@ -605,6 +631,7 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
         .get(&name)
         .map(|record| record.files.is_empty() && record.mcp_servers.is_empty())
         .unwrap_or(true);
+
     if empty {
         store.remove_bundle(&name)?;
         println!("\nUninstalled bundle '{name}' and removed its record.");
@@ -614,6 +641,7 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
              items, so re-running --uninstall offers them again."
         );
     }
+
     println!(
         "  files: deleted={} kept={} missing={} failed={}",
         files.deleted, files.kept, files.missing, files.failed
@@ -623,12 +651,15 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
         mcp.removed.len(),
         mcp.kept.len()
     );
+
     if !mcp.removed.is_empty() {
         println!("  - removed servers: {}", mcp.removed.join(", "));
     }
+
     if !mcp.kept.is_empty() {
         println!("  = kept servers:    {}", mcp.kept.join(", "));
     }
+
     if !mcp.secrets.is_empty() {
         println!(
             "  ~ vault secrets referenced by this bundle's servers \
@@ -636,6 +667,7 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
             mcp.secrets.join(", ")
         );
     }
+
     Ok(())
 }
 
@@ -645,6 +677,7 @@ fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<
     if !is_repo_shorthand(spec) {
         return Ok(None);
     }
+
     let needle = format!("/{}", canonical_source_url(spec));
     let candidates: Vec<(String, String)> = store
         .iter()
@@ -660,6 +693,7 @@ fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<
                 .iter()
                 .map(|(name, source)| format!("{name} ({source})"))
                 .collect();
+
             if !*IS_STDOUT_TERMINAL {
                 bail!(
                     "'{spec}' matches multiple installed bundles: {}; re-run with the \
@@ -667,16 +701,19 @@ fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<
                     described.join(", ")
                 );
             }
+
             let picked = Select::new(
                 &format!("Multiple bundles match '{spec}'; which one should be uninstalled?"),
                 described.clone(),
             )
             .prompt()
             .with_context(|| "failed to read uninstall selection")?;
+
             let index = described
                 .iter()
                 .position(|option| option == &picked)
                 .expect("selection came from the presented options");
+
             Ok(Some(candidates[index].0.clone()))
         }
     }
@@ -711,6 +748,7 @@ fn uninstall_owned_files(
             summary.failed += 1;
             continue;
         }
+
         let full = config_dir.join(Path::new(&file.path));
         if !full.exists() {
             println!(
@@ -721,11 +759,14 @@ fn uninstall_owned_files(
             summary.missing += 1;
             continue;
         }
+
         summary.tools_seen |= file.category == "functions/tools";
+
         if matches!(hash_file(&full), Ok(hash) if hash == file.sha256) {
             delete_owned_file(store, bundle, &file.path, &full, config_dir, &mut summary)?;
             continue;
         }
+
         let prompt = format!("File {} was modified locally after install", file.path);
         let action = resolve_uninstall_action(&prompt, assume_yes, &mut sticky)?;
         apply_uninstall_file_action(
@@ -738,6 +779,7 @@ fn uninstall_owned_files(
             &mut summary,
         )?;
     }
+
     Ok(summary)
 }
 
@@ -759,6 +801,7 @@ fn apply_uninstall_file_action(
             delete_owned_file(store, bundle, path, full, config_dir, summary)?;
         }
     }
+
     Ok(())
 }
 
@@ -797,9 +840,11 @@ fn prune_empty_dirs(full: &Path, config_dir: &Path) {
         if dir == config_dir || !dir.starts_with(config_dir) {
             break;
         }
+
         if fs::remove_dir(dir).is_err() {
             break;
         }
+
         current = dir.parent();
     }
 }
@@ -812,9 +857,11 @@ fn resolve_uninstall_action(
     if assume_yes || !*IS_STDOUT_TERMINAL {
         return Ok(ObsoleteAction::Keep);
     }
+
     if let Some(action) = *sticky {
         return Ok(action);
     }
+
     let choice = Select::new(prompt, vec!["keep", "delete", "keep-all", "delete-all"])
         .prompt()
         .with_context(|| "failed to read uninstall choice")?;
@@ -847,6 +894,7 @@ fn uninstall_mcp_entries(
     if servers.is_empty() {
         return Ok(summary);
     }
+
     let mut config = if mcp_path.exists() {
         let content = fs::read_to_string(mcp_path)
             .with_context(|| format!("failed to read {}", mcp_path.display()))?;
@@ -887,6 +935,7 @@ fn uninstall_mcp_entries(
             summary.kept.push(key);
             continue;
         }
+
         let Some(entry) = config.as_ref().and_then(|cfg| cfg.mcp_servers.get(&key)) else {
             println!("dropped record for absent server '{key}'");
             released.push(key);
@@ -934,6 +983,7 @@ fn uninstall_mcp_entries(
     for key in &released {
         store.remove_mcp_record(bundle, key)?;
     }
+
     Ok(summary)
 }
 
@@ -1155,8 +1205,6 @@ fn scan_remote_layout(root: &Path) -> Result<RemoteLayout> {
     Ok(layout)
 }
 
-const BUNDLE_MANIFEST_FILE: &str = "coyote-bundle.yaml";
-
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct BundleManifest {
     pub(crate) name: String,
@@ -1196,6 +1244,7 @@ fn register_bundle(
             homepage: manifest.and_then(|m| m.homepage.clone()),
         },
     )?;
+
     Ok(resolved.name)
 }
 
@@ -1204,12 +1253,14 @@ fn parse_bundle_manifest(root: &Path) -> Result<Option<BundleManifest>> {
     if !path.is_file() {
         return Ok(None);
     }
+
     let content = fs::read_to_string(&path)
         .with_context(|| format!("failed to read bundle manifest at {}", path.display()))?;
     let manifest: BundleManifest = serde_yaml::from_str(&content)
         .with_context(|| format!("invalid bundle manifest at {}", path.display()))?;
     validate_bundle_name(&manifest.name)
         .with_context(|| format!("invalid bundle name in manifest at {}", path.display()))?;
+
     Ok(Some(manifest))
 }
 
@@ -1224,7 +1275,8 @@ pub(crate) fn validate_bundle_name(name: &str) -> Result<()> {
              (as the owner qualifier separator)"
         );
     }
-    for part in owner.into_iter().chain(std::iter::once(base)) {
+
+    for part in owner.into_iter().chain(iter::once(base)) {
         if part.is_empty() {
             bail!("Invalid bundle name '{name}': name segments cannot be empty");
         }
@@ -1238,6 +1290,7 @@ pub(crate) fn validate_bundle_name(name: &str) -> Result<()> {
             );
         }
     }
+
     Ok(())
 }
 
@@ -1285,6 +1338,7 @@ pub(crate) fn owner_qualifier(url: &str) -> Option<String> {
     if segments.len() >= 2 {
         return Some(segments[segments.len() - 2].to_string());
     }
+
     let sanitized = sanitize_host(&host);
     (!sanitized.is_empty()).then_some(sanitized)
 }
@@ -1595,6 +1649,7 @@ fn read_full(file: &mut fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
         }
         filled += n;
     }
+
     Ok(filled)
 }
 
@@ -1619,6 +1674,7 @@ fn print_plan_summary(plan: &InstallPlan) {
             if refresh > 0 {
                 line.push_str(&format!("  refresh={refresh}"));
             }
+
             println!("{line}");
         }
     }
@@ -1764,9 +1820,11 @@ fn record_mcp_merge(store: &mut BundleStore, bundle: &str, report: &McpMergeRepo
                 sha256: report.entry_hashes.get(renamed_to).cloned(),
             }),
     );
+
     if entries.is_empty() {
         return Ok(());
     }
+
     store.record_mcp_servers(bundle, entries)
 }
 

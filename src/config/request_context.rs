@@ -11,7 +11,7 @@ use super::{
     Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, MacroAllowlistLevel,
     MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT, ResolvedMacro, Role,
     RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
-    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
+    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, bundles, ensure_parent_exists,
     list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
@@ -36,6 +36,7 @@ use crate::utils::{
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 
+use super::install_remote::DEFAULT_GIT_HOST;
 use super::instructions;
 use super::memory::{
     DEFAULT_MEMORY_CAP_WITH_TOOLS, DEFAULT_MEMORY_CAP_WITHOUT_TOOLS, MemoryStore, WorkspaceMemory,
@@ -2803,7 +2804,7 @@ impl RequestContext {
                 }
                 Ok(())
             }
-            "bundles" => super::bundles::list_installed_bundles(),
+            "bundles" => bundles::list_installed_bundles(),
             _ => bail!(
                 "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, tools, mcp-servers, bundles"
             ),
@@ -3288,6 +3289,7 @@ impl RequestContext {
                         "--yes".to_string(),
                         Some("Skip the uninstall confirmation".to_string()),
                     ));
+
                     values
                 }
                 ".macro" => {
@@ -3503,9 +3505,7 @@ impl RequestContext {
                     InstallFilter::NAMES.iter().map(|s| s.to_string()).collect(),
                 );
             } else if prev == "--git-host" {
-                values = super::map_completion_values(vec![
-                    super::install_remote::DEFAULT_GIT_HOST.to_string(),
-                ]);
+                values = super::map_completion_values(vec![DEFAULT_GIT_HOST.to_string()]);
             } else {
                 let has_filter = args.iter().enumerate().any(|(i, a)| {
                     a.starts_with("--filter=") || (*a == "--filter" && i < args.len() - 1)
@@ -4981,7 +4981,7 @@ mod tests {
         store
             .upsert_bundle(
                 "omc",
-                crate::config::bundles::InstallMetadata {
+                bundles::InstallMetadata {
                     source: "https://github.com/x/omc".to_string(),
                     git_ref: None,
                     commit: "abc123".to_string(),
@@ -5009,7 +5009,7 @@ mod tests {
         store
             .upsert_bundle(
                 "omc",
-                crate::config::bundles::InstallMetadata {
+                bundles::InstallMetadata {
                     source: "https://github.com/x/omc".to_string(),
                     git_ref: None,
                     commit: "abc123".to_string(),

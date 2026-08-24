@@ -165,9 +165,9 @@ pub(crate) fn write_file_atomic(
         std::process::id(),
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    let write_synced = || -> std::io::Result<()> {
+    let write_synced = || -> io::Result<()> {
         use std::io::Write;
-        let mut file = fs::File::create(&tmp)?;
+        let mut file = File::create(&tmp)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()
     };

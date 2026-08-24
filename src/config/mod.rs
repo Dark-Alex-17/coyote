@@ -160,6 +160,7 @@ const SBX_KIT_HASH_FILE: &str = "kit.sha256";
 const SBX_MIXIN_FILE_NAME: &str = "sbx-mixin.yaml";
 pub(crate) const VAULT_DATA_FILE_NAME: &str = "vault.yml";
 const INSTALLED_BUNDLES_FILE_NAME: &str = "installed-bundles.yaml";
+const BUNDLE_MANIFEST_FILE: &str = "coyote-bundle.yaml";
 const SBX_MIXIN_KITS_DIR_NAME: &str = "sbx-mixin-kits";
 const GIT_DIR_NAME: &str = ".git";
 const GITIGNORE_FILE_NAME: &str = ".gitignore";

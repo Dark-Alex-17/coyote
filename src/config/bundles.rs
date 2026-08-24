@@ -1,7 +1,7 @@
 use super::install_remote::{
     canonical_source_url, owner_qualifier, repo_name_slug, validate_bundle_name,
 };
-use super::paths;
+use super::{paths, request_context};
 use crate::config::AssetCategory;
 use crate::function::write_file_atomic;
 use crate::utils::IS_STDOUT_TERMINAL;
@@ -137,6 +137,7 @@ impl BundleStore {
                 bundles: BTreeMap::new(),
             });
         }
+
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let contents: StoreContents = serde_yaml::from_str(&content).with_context(|| {
@@ -147,6 +148,7 @@ impl BundleStore {
                 path.display()
             )
         })?;
+
         if contents.version > STORE_VERSION {
             bail!(
                 "{} has store version {}, but this coyote build supports up to \
@@ -155,6 +157,7 @@ impl BundleStore {
                 contents.version
             );
         }
+
         Ok(Self {
             path,
             bundles: contents.bundles,
@@ -167,10 +170,12 @@ impl BundleStore {
             bundles: &self.bundles,
         })
         .context("failed to serialize the installed-bundles store")?;
+
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create directory {}", parent.display()))?;
         }
+
         write_file_atomic(&self.path, &content, None)
             .with_context(|| format!("failed to write {}", self.path.display()))
     }
@@ -244,12 +249,14 @@ impl BundleStore {
                 }
                 None => "is reserved for an asset category".to_string(),
             };
+
             if base.contains('/') {
                 bail!(
                     "bundle name '{base}' {reason} and cannot be qualified further; \
                      uninstall it or pick a different manifest name"
                 );
             }
+
             let owner = owner_qualifier(url)
                 .map(|owner| sanitize_name_segment(&owner))
                 .filter(|owner| !owner.is_empty());
@@ -260,6 +267,7 @@ impl BundleStore {
                 );
             };
             let qualified = format!("{owner}/{base}");
+
             if let Some(source) = self.source_of_other_bundle(&qualified, &canonical) {
                 bail!(
                     "bundle name '{base}' {reason}, and '{qualified}' is already \
@@ -267,6 +275,7 @@ impl BundleStore {
                      uninstall one or pick a different manifest name"
                 );
             }
+
             if let Some(other_source) = &collision
                 && manifest_name.is_some()
                 && *IS_STDOUT_TERMINAL
@@ -357,6 +366,7 @@ impl BundleStore {
                 );
             }
         }
+
         self.save()
     }
 
@@ -366,7 +376,9 @@ impl BundleStore {
             .bundles
             .get_mut(name)
             .expect("bundle existence checked above");
+
         record.updated_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+
         self.save()
     }
 
@@ -384,8 +396,10 @@ impl BundleStore {
             .bundles
             .get_mut(name)
             .expect("bundle existence checked above");
+
         record.commit = commit.to_string();
         record.version = version;
+
         self.save()
     }
 
@@ -395,7 +409,9 @@ impl BundleStore {
             .bundles
             .get_mut(bundle)
             .expect("bundle existence checked above");
+
         record.files.retain(|owned| owned.path != path);
+
         self.save()
     }
 
@@ -405,9 +421,11 @@ impl BundleStore {
             .bundles
             .get_mut(bundle)
             .expect("bundle existence checked above");
+
         record
             .mcp_servers
             .retain(|owned| owned.effective_key() != effective_key);
+
         self.save()
     }
 
@@ -431,8 +449,10 @@ impl BundleStore {
             .bundles
             .get_mut(bundle)
             .expect("bundle existence checked above");
+
         record.files.retain(|owned| owned.path != file.path);
         record.files.push(file);
+
         self.save()
     }
 
@@ -457,22 +477,27 @@ impl BundleStore {
                     if owned.effective_key() != key {
                         return true;
                     }
+
                     if owned.action == McpAction::Replaced {
                         prior_user_origin = true;
                     }
+
                     false
                 });
                 previously_owned |= record.mcp_servers.len() != before;
             }
+
             if previously_owned && !prior_user_origin && entry.action == McpAction::Replaced {
                 entry.action = McpAction::Transferred;
             }
+
             self.bundles
                 .get_mut(bundle)
                 .expect("bundle existence checked above")
                 .mcp_servers
                 .push(entry);
         }
+
         self.save()
     }
 
@@ -487,6 +512,7 @@ impl BundleStore {
                 }
             );
         }
+
         Ok(())
     }
 
@@ -523,15 +549,19 @@ impl DriftSummary {
             return "-".to_string();
         }
         let mut parts = Vec::new();
+
         if self.intact > 0 {
             parts.push(format!("{} intact", self.intact));
         }
+
         if self.modified > 0 {
             parts.push(format!("{} modified locally", self.modified));
         }
+
         if self.missing > 0 {
             parts.push(format!("{} missing", self.missing));
         }
+
         parts.join(", ")
     }
 }
@@ -600,7 +630,7 @@ pub fn list_installed_bundles() -> Result<()> {
         return Ok(());
     }
 
-    let mut table = super::request_context::asset_table(&[
+    let mut table = request_context::asset_table(&[
         "name",
         "version",
         "source",
