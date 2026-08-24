@@ -34,6 +34,29 @@ use tokio::process::Command;
 pub const MCP_INVOKE_META_FUNCTION_NAME_PREFIX: &str = "mcp_invoke";
 pub const MCP_SEARCH_META_FUNCTION_NAME_PREFIX: &str = "mcp_search";
 pub const MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX: &str = "mcp_describe";
+pub const MCP_READ_META_FUNCTION_NAME_PREFIX: &str = "mcp_read";
+pub const MCP_PROMPT_META_FUNCTION_NAME_PREFIX: &str = "mcp_prompt";
+
+pub const MCP_META_FUNCTION_PREFIXES: [&str; 5] = [
+    MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
+    MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+    MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
+    MCP_READ_META_FUNCTION_NAME_PREFIX,
+    MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
+];
+
+pub fn is_mcp_meta_function(name: &str) -> bool {
+    MCP_META_FUNCTION_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+pub fn mcp_meta_function_names(server: &str) -> Vec<String> {
+    MCP_META_FUNCTION_PREFIXES
+        .iter()
+        .map(|prefix| format!("{prefix}_{server}"))
+        .collect()
+}
 
 pub type ConnectedServer = RunningService<RoleClient, ()>;
 
@@ -347,11 +370,11 @@ impl McpRegistry {
             Err(e) => return Err(e),
         };
 
-        let tools = service.list_tools(None).await?;
+        let tools = service.list_all_tools().await?;
         debug!("Available tools for MCP server {id}: {tools:?}");
 
         let mut items_vec = Vec::new();
-        for t in tools.tools {
+        for t in tools {
             let name = t.name.to_string();
             let description = t.description.unwrap_or_default().to_string();
             items_vec.push(CatalogItem {
@@ -1185,6 +1208,51 @@ mod tests {
         assert_eq!(MCP_INVOKE_META_FUNCTION_NAME_PREFIX, "mcp_invoke");
         assert_eq!(MCP_SEARCH_META_FUNCTION_NAME_PREFIX, "mcp_search");
         assert_eq!(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, "mcp_describe");
+        assert_eq!(MCP_READ_META_FUNCTION_NAME_PREFIX, "mcp_read");
+        assert_eq!(MCP_PROMPT_META_FUNCTION_NAME_PREFIX, "mcp_prompt");
+    }
+
+    #[test]
+    fn is_mcp_meta_function_classifies_names() {
+        assert!(is_mcp_meta_function("mcp_invoke_github"));
+        assert!(is_mcp_meta_function("mcp_search_github"));
+        assert!(is_mcp_meta_function("mcp_describe_github"));
+        assert!(is_mcp_meta_function("mcp_read_github"));
+        assert!(is_mcp_meta_function("mcp_prompt_github"));
+        assert!(!is_mcp_meta_function("mcp_gateway_tool"));
+        assert!(!is_mcp_meta_function("fs_read"));
+        assert!(!is_mcp_meta_function(""));
+        assert!(!is_mcp_meta_function("mcp_"));
+    }
+
+    #[test]
+    fn meta_function_prefixes_are_not_prefixes_of_each_other() {
+        for (i, a) in MCP_META_FUNCTION_PREFIXES.iter().enumerate() {
+            for (j, b) in MCP_META_FUNCTION_PREFIXES.iter().enumerate() {
+                if i != j {
+                    assert!(!b.starts_with(a), "{a} is a prefix of {b}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn is_mcp_meta_function_preserves_lax_prefix_matching() {
+        assert!(is_mcp_meta_function("mcp_invoker_x"));
+    }
+
+    #[test]
+    fn mcp_meta_function_names_returns_all_prefixes_in_order() {
+        assert_eq!(
+            mcp_meta_function_names("github"),
+            vec![
+                "mcp_invoke_github",
+                "mcp_search_github",
+                "mcp_describe_github",
+                "mcp_read_github",
+                "mcp_prompt_github",
+            ]
+        );
     }
 
     #[test]

@@ -63,10 +63,10 @@ impl McpRuntime {
             .get(server)
             .cloned()
             .with_context(|| format!("{server} MCP server not found in runtime"))?;
-        let tools = server_handle.list_tools(None).await?;
+        let tools = server_handle.list_all_tools().await?;
         let mut items = HashMap::new();
 
-        for tool in tools.tools {
+        for tool in tools {
             let item = CatalogItem {
                 name: tool.name.to_string(),
                 server: server.to_string(),
@@ -110,9 +110,8 @@ impl McpRuntime {
             .with_context(|| format!("{server} MCP server not found in runtime"))?;
 
         let tool_schema = server_handle
-            .list_tools(None)
+            .list_all_tools()
             .await?
-            .tools
             .into_iter()
             .find(|item| item.name == tool)
             .ok_or_else(|| anyhow!("{tool} not found in {server} MCP server catalog"))?

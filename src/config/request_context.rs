@@ -23,8 +23,8 @@ use crate::function::{
     user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::mcp::{
-    MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
-    MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired, is_auth_required_error,
+    MCP_INVOKE_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired, is_auth_required_error,
+    is_mcp_meta_function, mcp_meta_function_names,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -2011,11 +2011,7 @@ impl RequestContext {
                     .functions
                     .declarations()
                     .iter()
-                    .filter(|v| {
-                        !v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                            && !v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                            && !v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                    })
+                    .filter(|v| !is_mcp_meta_function(&v.name))
                     .map(|v| v.name.to_string())
                     .collect();
 
@@ -2025,11 +2021,7 @@ impl RequestContext {
                             .functions()
                             .declarations()
                             .iter()
-                            .filter(|v| {
-                                !v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                                    && !v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                                    && !v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                            })
+                            .filter(|v| !is_mcp_meta_function(&v.name))
                             .map(|v| v.name.to_string()),
                     );
                 }
@@ -2102,11 +2094,7 @@ impl RequestContext {
                     .declarations()
                     .to_vec()
                     .into_iter()
-                    .filter(|v| {
-                        !v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                            && !v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                            && !v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                    })
+                    .filter(|v| !is_mcp_meta_function(&v.name))
                     .collect();
 
                 if let Some(ref tool_names) = role_filter {
@@ -2155,11 +2143,7 @@ impl RequestContext {
                         .functions
                         .declarations()
                         .iter()
-                        .filter(|v| {
-                            v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                                || v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                                || v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                        })
+                        .filter(|v| is_mcp_meta_function(&v.name))
                         .map(|v| v.name.to_string())
                         .collect();
                     if let Some(agent) = &self.agent {
@@ -2168,12 +2152,7 @@ impl RequestContext {
                                 .functions()
                                 .declarations()
                                 .iter()
-                                .filter(|v| {
-                                    v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                                        || v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                                        || v.name
-                                            .starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                                })
+                                .filter(|v| is_mcp_meta_function(&v.name))
                                 .map(|v| v.name.to_string()),
                         );
                     }
@@ -2190,39 +2169,15 @@ impl RequestContext {
 
                             let item_invoke_name =
                                 format!("{}_{item}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
-                            let item_search_name =
-                                format!("{}_{item}", MCP_SEARCH_META_FUNCTION_NAME_PREFIX);
-                            let item_describe_name =
-                                format!("{}_{item}", MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX);
                             if let Some(values) = app.mapping_mcp_servers.get(item) {
                                 server_names.extend(
                                     values
                                         .split(',')
-                                        .flat_map(|v| {
-                                            vec![
-                                                format!(
-                                                    "{}_{}",
-                                                    MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
-                                                    v.to_string()
-                                                ),
-                                                format!(
-                                                    "{}_{}",
-                                                    MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
-                                                    v.to_string()
-                                                ),
-                                                format!(
-                                                    "{}_{}",
-                                                    MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
-                                                    v.to_string()
-                                                ),
-                                            ]
-                                        })
+                                        .flat_map(mcp_meta_function_names)
                                         .filter(|v| mcp_declaration_names.contains(v)),
                                 )
                             } else if mcp_declaration_names.contains(&item_invoke_name) {
-                                server_names.insert(item_invoke_name);
-                                server_names.insert(item_search_name);
-                                server_names.insert(item_describe_name);
+                                server_names.extend(mcp_meta_function_names(item));
                             }
                         }
                     }
@@ -2251,11 +2206,7 @@ impl RequestContext {
                     .declarations()
                     .to_vec()
                     .into_iter()
-                    .filter(|v| {
-                        v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                            || v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                            || v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                    })
+                    .filter(|v| is_mcp_meta_function(&v.name))
                     .collect();
 
                 if let Some(ref server_names) = role_filter {

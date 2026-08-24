@@ -16,7 +16,7 @@ use crate::config::ensure_parent_exists;
 use crate::config::paths;
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
-    MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpServersConfig,
+    MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpServersConfig, is_mcp_meta_function,
 };
 use crate::parsers::{bash, python, typescript};
 use anyhow::{Context, Result, anyhow, bail};
@@ -284,14 +284,9 @@ pub async fn eval_tool_calls(
         }
     }
 
-    let (mcp_calls, sequential_calls): (Vec<_>, Vec<_>) =
-        to_execute.into_iter().partition(|(_, call)| {
-            call.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                || call.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                || call
-                    .name
-                    .starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-        });
+    let (mcp_calls, sequential_calls): (Vec<_>, Vec<_>) = to_execute
+        .into_iter()
+        .partition(|(_, call)| is_mcp_meta_function(&call.name));
 
     if !mcp_calls.is_empty() {
         let ctx_ref: &RequestContext = ctx;
@@ -2128,6 +2123,11 @@ mod tests {
         assert_eq!(MCP_INVOKE_META_FUNCTION_NAME_PREFIX, "mcp_invoke");
         assert_eq!(MCP_SEARCH_META_FUNCTION_NAME_PREFIX, "mcp_search");
         assert_eq!(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, "mcp_describe");
+        assert_eq!(crate::mcp::MCP_READ_META_FUNCTION_NAME_PREFIX, "mcp_read");
+        assert_eq!(
+            crate::mcp::MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
+            "mcp_prompt"
+        );
     }
 
     #[test]
