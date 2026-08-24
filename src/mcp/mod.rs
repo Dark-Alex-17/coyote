@@ -1,6 +1,7 @@
 mod auth_client;
 pub(crate) mod manage;
 pub(crate) mod oauth;
+pub(crate) mod render;
 mod sse_transport;
 
 use crate::config::AppConfig;
