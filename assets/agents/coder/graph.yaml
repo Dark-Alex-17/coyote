@@ -16,6 +16,7 @@ enabled_skills:
   - ai-slop-remover
   - code-review
   - comment-discipline
+  - diagnosing-bugs
   - git-master
   - frontend-ui-ux
   - verification-gates
@@ -169,6 +170,7 @@ nodes:
       - ai-slop-remover
       - code-review
       - comment-discipline
+      - diagnosing-bugs
       - git-master
       - frontend-ui-ux
       - verification-gates
@@ -226,6 +228,11 @@ nodes:
       If the "Fix loop status" section in your user prompt is non-empty,
       the previous attempt failed verification. Read the error, identify
       the minimal fix, apply it. Do not refactor while fixing.
+
+      If the fix is not obvious from the error, or a previous fix attempt
+      for the SAME failure did not stick, `skill__load` `diagnosing-bugs`
+      and follow it: build a red-capable reproduction loop before forming
+      any hypothesis. Do not spend a second attempt on a blind retry.
 
       ## Rules
 

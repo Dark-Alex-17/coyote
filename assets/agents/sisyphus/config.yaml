@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.4.0
+version: 3.5.0
 
 agent_session: temp
 auto_continue: true
@@ -27,6 +27,7 @@ enabled_skills:
   - ai-slop-remover
   - code-review
   - comment-discipline
+  - diagnosing-bugs
   - git-master
   - frontend-ui-ux
   - delegation-protocol
@@ -403,6 +404,10 @@ instructions: |
   `execute_command` is for: git operations, build/test commands, package management, runtime inspection (`ps`, `df`, etc.) — anything where the shell IS the right interface.
 
   ## Phase 7 - Failure Recovery
+
+  ### Hard bugs: load `diagnosing-bugs` BEFORE strike 2
+
+  A first fix attempt may go on the error message alone. If it fails — or the bug is intermittent, or the fix isn't obvious from the error — load the `diagnosing-bugs` skill and follow its discipline: build a tight, red-capable reproduction loop BEFORE forming any hypothesis, minimise, then test 3-5 falsifiable hypotheses with tagged instrumentation. Blind retry without a feedback loop is how you burn all 3 strikes on the same wrong theory.
 
   ### 3-strike rule
 
