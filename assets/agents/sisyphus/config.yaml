@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.5.0
+version: 3.6.0
 
 agent_session: temp
 auto_continue: true
@@ -16,6 +16,7 @@ spawnable_agents:
   - code-reviewer
   - adversary
   - security-reviewer
+  - architecture-reviewer
   - step-runner
 max_concurrent_agents: 40
 max_agent_depth: 3
@@ -126,6 +127,8 @@ instructions: |
   ## Phase 2 - Codebase Assessment (Open-ended tasks only)
 
   For "improve X" / "refactor Y" / "clean up Z" type requests, quick-assess the codebase state BEFORE following patterns:
+
+  **Architecture-scale improvement requests** ("improve the architecture of X", "this module is hard to test", "make this easier to navigate") → delegate to `architecture-reviewer`. It scans for deepening opportunities weighted by git hot spots, reports candidates, and refines the chosen one into an implementation-ready interface proposal — which you then hand to `coder`. It proposes only; it is an on-demand tool, never a completion gate. For file-scale cleanups, proceed with the assessment below instead.
 
   - **Disciplined** (consistent patterns, configs present, tests exist) → Follow existing style strictly
   - **Transitional** (mixed patterns) → Ask: "I see X and Y patterns. Which to follow?"

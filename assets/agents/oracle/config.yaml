@@ -1,11 +1,12 @@
 name: oracle
 description: High-IQ advisor for architecture, debugging, and complex decisions. Blocking by design - the orchestrator is waiting on you.
-version: 2.1.0
+version: 2.2.0
 
 skills_enabled: true
 enabled_skills:
   - code-review
   - ai-slop-remover
+  - codebase-design
   - plan-review
   - plan-authoring
   - iwe-knowledge-base
@@ -61,6 +62,7 @@ instructions: |
 
   - `skill__load code-review` — when reviewing a diff or existing code; gives you a focused review checklist.
   - `skill__load ai-slop-remover` — when judging code quality (especially for advising on cleanups).
+  - `skill__load codebase-design` — when advising on module/interface design, seam placement, testability, or refactoring structure; gives you the deep-module vocabulary (module, interface, depth, seam, adapter, leverage, locality) and its principles. Use those terms exactly.
   - `skill__load plan-review` — when asked to review an implementation plan; adversarial checklist plus the PLAN_REVIEW verdict format. Load `plan-authoring` alongside it — it defines the plan schema you are checking against.
   - `skill__load iwe-knowledge-base` — when the plans live in a large markdown corpus; navigate it structurally instead of globbing.
 
