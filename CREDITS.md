@@ -1,5 +1,13 @@
 # Credits
 
+## Matt Pocock's Skills
+
+The bundled `diagnosing-bugs` skill and the code smell baseline in the bundled
+`code-review` skill are adapted from
+[mattpocock/skills](https://github.com/mattpocock/skills) by Matt Pocock,
+licensed under the MIT License. The smell definitions themselves trace back to
+Martin Fowler's *Refactoring* (ch. 3).
+
 ## AIChat
 Coyote originally started as a fork of the fantastic
 [AIChat CLI](https://github.com/sigoden/aichat). The initial goal was simply
