@@ -669,6 +669,18 @@ impl Functions {
                 ..Default::default()
             },
         );
+        describe_function_properties.insert(
+            "kind".to_string(),
+            JsonSchema {
+                type_value: Some("string".to_string()),
+                description: Some(
+                    "Catalog item kind: tool (default), resource, resource_template, or prompt"
+                        .into(),
+                ),
+                default: Some(Value::from("tool")),
+                ..Default::default()
+            },
+        );
 
         for server in mcp_servers {
             let search_function_name = format!("{}_{server}", MCP_SEARCH_META_FUNCTION_NAME_PREFIX);
@@ -709,7 +721,9 @@ impl Functions {
             };
             let describe_functions_declaration = FunctionDeclaration {
                 name: describe_function_name.clone(),
-                description: "Get the full JSON schema for exactly one MCP tool.".to_string(),
+                description: "Get the full schema or metadata for exactly one MCP catalog item: \
+                              a tool, resource, resource template, or prompt."
+                    .to_string(),
                 parameters: JsonSchema {
                     type_value: Some("object".to_string()),
                     properties: Some(describe_function_properties.clone()),
@@ -1378,10 +1392,16 @@ impl ToolCall {
             .ok_or_else(|| anyhow!("Missing 'tool' in arguments"))?
             .as_str()
             .ok_or_else(|| anyhow!("Invalid 'tool' in arguments"))?;
+        let kind = match json_data.get("kind") {
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| anyhow!("Invalid 'kind' in arguments"))?,
+            None => "tool",
+        };
         let result = ctx
             .tool_scope
             .mcp_runtime
-            .describe(&server_id, tool)
+            .describe(&server_id, kind, tool)
             .await?;
         Ok(serde_json::to_value(result)?)
     }
@@ -1825,6 +1845,7 @@ fn format_json_colored_keys(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_fixtures::{FixtureServer, fixture_runtime};
     use crate::config::{AppState, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use serde_json::json;
@@ -2290,6 +2311,44 @@ mod tests {
         let decl = f.find("mcp_describe_srv").unwrap();
         let props = decl.parameters.properties.as_ref().unwrap();
         assert!(props.contains_key("tool"));
+    }
+
+    #[test]
+    fn functions_mcp_describe_declaration_has_optional_kind_param() {
+        let mut f = Functions::default();
+        f.append_mcp_meta_functions(vec!["srv".to_string()]);
+        let decl = f.find("mcp_describe_srv").unwrap();
+        let props = decl.parameters.properties.as_ref().unwrap();
+        let kind = props.get("kind").unwrap();
+        assert_eq!(kind.default, Some(Value::from("tool")));
+        let required = decl.parameters.required.as_ref().unwrap();
+        assert_eq!(required, &vec!["tool".to_string()]);
+    }
+
+    #[test]
+    fn eval_mcp_describe_without_kind_defaults_to_tool() {
+        let output = run_async(async {
+            let (runtime, _server) = fixture_runtime(FixtureServer::default()).await;
+            let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+            ctx.tool_scope.mcp_runtime = runtime;
+            let call = call_with_args("mcp_describe_fixture", json!({"tool": "dup"}));
+            call.eval_mcp(&ctx).await
+        })
+        .unwrap();
+
+        assert_eq!(
+            output,
+            json!({
+                "type": "object",
+                "properties": {
+                    "tool": { "type": "string" },
+                    "arguments": {
+                        "type": "object",
+                        "properties": { "q": { "type": "string" } }
+                    }
+                }
+            })
+        );
     }
 
     #[test]

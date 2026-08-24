@@ -60,24 +60,45 @@ pub fn mcp_meta_function_names(server: &str) -> Vec<String> {
 
 pub type ConnectedServer = RunningService<RoleClient, ()>;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogItemKind {
+    #[default]
+    Tool,
+    Resource,
+    ResourceTemplate,
+    Prompt,
+}
+
+impl CatalogItemKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tool => "tool",
+            Self::Resource => "resource",
+            Self::ResourceTemplate => "resource_template",
+            Self::Prompt => "prompt",
+        }
+    }
+}
+
+impl Display for CatalogItemKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CatalogItem {
+    pub kind: CatalogItemKind,
     pub name: String,
     pub server: String,
     pub description: String,
-}
-
-#[derive(Debug)]
-struct ServerCatalog {
-    items: HashMap<String, CatalogItem>,
-}
-
-impl Clone for ServerCatalog {
-    fn clone(&self) -> Self {
-        Self {
-            items: self.items.clone(),
-        }
-    }
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -183,7 +204,6 @@ pub struct McpRegistry {
     log_path: Option<PathBuf>,
     config: Option<McpServersConfig>,
     servers: HashMap<String, Arc<ConnectedServer>>,
-    catalogs: HashMap<String, ServerCatalog>,
 }
 
 impl McpRegistry {
@@ -326,7 +346,7 @@ impl McpRegistry {
 
         debug!("Starting selected MCP servers: {:?}", ids_to_start);
 
-        let results: Vec<Option<(String, Arc<ConnectedServer>, ServerCatalog)>> = stream::iter(
+        let results: Vec<Option<(String, Arc<ConnectedServer>)>> = stream::iter(
             ids_to_start
                 .into_iter()
                 .map(|id| async { self.start_server(id).await }),
@@ -335,18 +355,14 @@ impl McpRegistry {
         .try_collect()
         .await?;
 
-        for (id, server, catalog) in results.into_iter().flatten() {
-            self.servers.insert(id.clone(), server);
-            self.catalogs.insert(id, catalog);
+        for (id, server) in results.into_iter().flatten() {
+            self.servers.insert(id, server);
         }
 
         Ok(())
     }
 
-    async fn start_server(
-        &self,
-        id: String,
-    ) -> Result<Option<(String, Arc<ConnectedServer>, ServerCatalog)>> {
+    async fn start_server(&self, id: String) -> Result<Option<(String, Arc<ConnectedServer>)>> {
         let spec = self
             .config
             .as_ref()
@@ -370,30 +386,9 @@ impl McpRegistry {
             Err(e) => return Err(e),
         };
 
-        let tools = service.list_all_tools().await?;
-        debug!("Available tools for MCP server {id}: {tools:?}");
-
-        let mut items_vec = Vec::new();
-        for t in tools {
-            let name = t.name.to_string();
-            let description = t.description.unwrap_or_default().to_string();
-            items_vec.push(CatalogItem {
-                name,
-                server: id.clone(),
-                description,
-            });
-        }
-
-        let mut items_map = HashMap::new();
-        items_vec.into_iter().for_each(|it| {
-            items_map.insert(it.name.clone(), it);
-        });
-
-        let catalog = ServerCatalog { items: items_map };
-
         info!("Started MCP server: {id}");
 
-        Ok(Some((id.to_string(), service, catalog)))
+        Ok(Some((id, service)))
     }
 
     fn resolve_server_ids(&self, enabled_mcp_servers: Option<Vec<String>>) -> Vec<String> {

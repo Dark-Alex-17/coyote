@@ -51,6 +51,8 @@ pub use self::skill::Skill;
 pub use self::skill_policy::SkillPolicy;
 #[allow(unused_imports)]
 pub use self::skill_registry::SkillRegistry;
+#[cfg(test)]
+pub(crate) use self::tool_scope::test_fixtures;
 pub use self::update::run_self_update;
 use crate::client::{
     self, ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
