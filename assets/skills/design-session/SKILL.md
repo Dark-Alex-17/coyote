@@ -21,7 +21,7 @@ Plans written from memory rot on contact with the code. Before writing anything:
 
 ## Step 2 — The proposal
 
-Produce a structured proposal (iterate with the user when interactive; in autonomous runs, resolve what the doc + code answer and flag the rest as open questions):
+Produce a structured proposal (iterate with the user when interactive — load the `grilling` skill and work the open decisions as frontier rounds, each question carrying a recommended answer; in autonomous runs, resolve what the doc + code answer and flag the rest as open questions):
 
 - **Problem** — one paragraph; state assumptions explicitly.
 - **Scope** — In / Out. Call out tempting adjacent work being deferred.

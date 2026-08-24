@@ -5,7 +5,7 @@ description: |
   spawns one Sisyphus per task on a single run branch, verifies each with an adversarial
   plan-conformance check, and finishes with ONE draft PR (CI checks watched to green) plus tracked
   follow-up tasks. Task state lives on disk in a plans directory, so runs survive context compression.
-version: 2.0.0
+version: 2.1.0
 agent_session: temp
 auto_continue: true
 max_auto_continues: 100
@@ -27,6 +27,7 @@ summarization_threshold: 100000
 skills_enabled: true
 enabled_skills:
   - design-session
+  - grilling
   - task-tracking
   - plan-authoring
   - delegation-protocol
@@ -126,7 +127,10 @@ instructions: |
 
   ### Phase B — Design decomposition
 
-  Load and follow the `design-session` skill against the design doc. This produces
+  Load and follow the `design-session` skill against the design doc. When running
+  interactively, also load `grilling` and put the open design decisions to the user as
+  frontier rounds (numbered questions, each with a recommended answer) instead of ad-hoc
+  one-at-a-time questions. This produces
   `{{plans_dir}}/PLAN-<slug>.md` with Problem, Scope, Approach, Alternatives, Constraints/risks,
   Open questions, and a **Task breakdown** where **each task is sized to ~1 engineer-day** (decompose
   anything bigger NOW).

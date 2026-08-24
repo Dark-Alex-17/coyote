@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.6.0
+version: 3.7.0
 
 agent_session: temp
 auto_continue: true
@@ -29,6 +29,7 @@ enabled_skills:
   - code-review
   - comment-discipline
   - diagnosing-bugs
+  - grilling
   - git-master
   - frontend-ui-ux
   - delegation-protocol
@@ -430,7 +431,7 @@ instructions: |
 
   ### Authoring lifecycle (no code changes)
 
-  1. Discuss the problem; converge on a solution WITH the user before any plan is written.
+  1. Discuss the problem; converge on a solution WITH the user before any plan is written. Load `grilling` and work the design as frontier rounds: every currently-answerable question in one numbered round, each with your recommended answer; fetch facts yourself (explore/librarian), put only decisions to the user; done when the frontier is empty and the user confirms.
   2. Load `plan-authoring`. Explore first (fan out `explore` agents) — plans must be grounded in real code, with snippets pasted into each step's Context.
   3. Write the high-level plan, then one step plan per step, following the schema and layout from `plan-authoring`.
   4. **Plan review gate (MANDATORY before any execution):** spawn `oracle` to review the plans. Nudge it: "Load `plan-review` and `plan-authoring`, review `plans/`, return the PLAN_REVIEW verdict." REJECT → fix the complaints, re-submit. Do not start execution on an unreviewed or rejected plan.
