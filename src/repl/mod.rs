@@ -53,7 +53,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 60]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 61]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -307,7 +307,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 60]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".list",
-            "List roles, sessions, agents, RAGs, macros, skills, tools, or MCP servers",
+            "List roles, sessions, agents, RAGs, macros, skills, tools, MCP servers, or bundles",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -317,7 +317,12 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 60]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".install",
-            "Reinstall bundled assets, or install assets from a remote git repo (.install remote <url>)",
+            "Reinstall bundled assets, install a bundle from a git repo, or update an installed bundle",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".uninstall",
+            "Uninstall an installed bundle (delete its owned files and MCP entries)",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -865,27 +870,17 @@ pub async fn run_repl_command(
                     replay::render(app.as_ref(), &compressed, &active)?;
                 }
             }
-            ".install" => {
-                let trimmed = args.map(str::trim).unwrap_or("");
-                let mut parts = trimmed.splitn(2, char::is_whitespace);
-                match parts.next() {
-                    Some("remote") => {
-                        let rest = parts.next().unwrap_or("").trim();
-                        config::install_remote_from_repl_args(rest)?;
-                    }
-                    Some(name) if !name.is_empty() => match AssetCategory::parse(name) {
-                        Some(category) => config::install_assets(category)?,
-                        None => println!(
-                            "Unknown asset category '{name}'. Valid categories: {}",
-                            AssetCategory::NAMES.join(", ")
-                        ),
-                    },
-                    _ => println!(
-                        "Usage: .install <{}> | .install remote <git-url>",
-                        AssetCategory::NAMES.join("|")
-                    ),
+            ".install" => match parse_repl_install(args) {
+                ReplInstallDispatch::Builtins(category) => config::install_assets(category)?,
+                ReplInstallDispatch::Unified(value) => {
+                    config::install_or_update_from_repl_args(value)?;
                 }
-            }
+                ReplInstallDispatch::Usage => println!(
+                    "Usage: .install <{}> | .install <git-url|owner/repo|installed-bundle> \
+                         [--git-host <host>] [--filter <cat>] [--force]",
+                    AssetCategory::NAMES.join("|")
+                ),
+            },
             ".update" => {
                 if ctx.macro_flag {
                     bail!("Cannot perform this operation because you are in a macro")
@@ -1202,13 +1197,17 @@ pub async fn run_repl_command(
                     println!("Usage: .delete <role|session|rag|macro|skill|agent-data>")
                 }
             },
+            ".uninstall" => match parse_repl_uninstall(args) {
+                Some((name, assume_yes)) => config::uninstall_bundle(&name, assume_yes)?,
+                None => println!("Usage: .uninstall <bundle-name> [--yes]"),
+            },
             ".list" => match args {
                 Some(args) => {
                     ctx.list_assets(args.trim())?;
                 }
                 _ => {
                     println!(
-                        "Usage: .list <roles|sessions|agents|rags|macros|skills|tools|mcp-servers>"
+                        "Usage: .list <roles|sessions|agents|rags|macros|skills|tools|mcp-servers|bundles>"
                     )
                 }
             },
@@ -1570,6 +1569,45 @@ fn unknown_command() -> Result<()> {
     bail!(r#"Unknown command. Type ".help" for additional help."#);
 }
 
+#[derive(Debug, PartialEq)]
+enum ReplInstallDispatch<'a> {
+    Builtins(AssetCategory),
+    Unified(&'a str),
+    Usage,
+}
+
+fn parse_repl_install(args: Option<&str>) -> ReplInstallDispatch<'_> {
+    let trimmed = args.map(str::trim).unwrap_or("");
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    match parts.next() {
+        Some(name) if !name.is_empty() => {
+            let rest = parts.next().map(str::trim).unwrap_or("");
+            match AssetCategory::parse(name) {
+                Some(category) if rest.is_empty() => ReplInstallDispatch::Builtins(category),
+                Some(_) => ReplInstallDispatch::Usage,
+                None => ReplInstallDispatch::Unified(trimmed),
+            }
+        }
+        _ => ReplInstallDispatch::Usage,
+    }
+}
+
+fn parse_repl_uninstall(args: Option<&str>) -> Option<(String, bool)> {
+    let mut assume_yes = false;
+    let mut names = Vec::new();
+    for token in args.unwrap_or("").split_whitespace() {
+        match token {
+            "--yes" | "-y" => assume_yes = true,
+            other if other.starts_with('-') => return None,
+            other => names.push(other),
+        }
+    }
+    match names.as_slice() {
+        [name] => Some((name.to_string(), assume_yes)),
+        _ => None,
+    }
+}
+
 pub fn builtin_command_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = REPL_COMMANDS
         .iter()
@@ -1791,8 +1829,46 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_60_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 60);
+    fn repl_commands_has_61_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 61);
+    }
+
+    #[test]
+    fn parse_repl_install_routes_categories_to_builtins() {
+        assert_eq!(
+            parse_repl_install(Some("agents")),
+            ReplInstallDispatch::Builtins(AssetCategory::Agents)
+        );
+    }
+
+    #[test]
+    fn parse_repl_install_routes_other_values_to_unified_dispatch() {
+        assert_eq!(
+            parse_repl_install(Some("https://github.com/x/y")),
+            ReplInstallDispatch::Unified("https://github.com/x/y")
+        );
+        assert_eq!(
+            parse_repl_install(Some("my-bundle")),
+            ReplInstallDispatch::Unified("my-bundle")
+        );
+    }
+
+    #[test]
+    fn parse_repl_install_empty_args_ask_for_usage() {
+        assert_eq!(parse_repl_install(None), ReplInstallDispatch::Usage);
+        assert_eq!(parse_repl_install(Some("  ")), ReplInstallDispatch::Usage);
+    }
+
+    #[test]
+    fn parse_repl_install_rejects_extra_tokens_after_a_category() {
+        assert_eq!(
+            parse_repl_install(Some("agents --force")),
+            ReplInstallDispatch::Usage
+        );
+        assert_eq!(
+            parse_repl_install(Some("agents extra")),
+            ReplInstallDispatch::Usage
+        );
     }
 
     #[test]

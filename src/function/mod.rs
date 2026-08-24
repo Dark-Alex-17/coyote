@@ -165,7 +165,16 @@ pub(crate) fn write_file_atomic(
         std::process::id(),
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&tmp, content)?;
+    let write_synced = || -> io::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()
+    };
+    if let Err(err) = write_synced() {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
 
     #[cfg(unix)]
     if let Some(mode) = mode {
@@ -484,9 +493,8 @@ impl Functions {
 
         let serialized =
             serde_json::to_string_pretty(&merged).context("failed to serialize merged mcp.json")?;
-        let tmp = file_path.with_extension("json.tmp");
-        fs::write(&tmp, &serialized).context("failed to write temporary mcp.json")?;
-        fs::rename(&tmp, &file_path).context("failed to finalize mcp.json")?;
+        write_file_atomic(&file_path, &serialized, None)
+            .context("failed to write merged mcp.json")?;
 
         if !added.is_empty() {
             println!("  + new MCP servers: {}", added.join(", "));

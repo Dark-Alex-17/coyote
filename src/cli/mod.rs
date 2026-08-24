@@ -50,9 +50,10 @@ pub enum McpScopeArg {
 				"model", "prompt", "role", "session", "agent", "rag", "rebuild_rag",
 				"macro_name", "execute", "code", "file", "no_stream", "no_memory",
 				"init_memory", "dry_run", "info", "build_tools", "install",
-				"install_from", "sync_models", "list_models", "list_roles",
+				"install_builtins", "sync_models", "list_models", "list_roles",
 				"list_sessions", "list_agents", "list_rags", "list_macros",
-				"list_skills", "skill", "tail_logs", "completions", "update",
+				"list_skills", "list_bundles", "skill", "tail_logs", "completions",
+				"update", "update_bundle", "uninstall",
 			])
 	),
 	group(
@@ -175,34 +176,79 @@ pub struct Cli {
     /// List all installed skills
     #[arg(long, help_heading = "List & Discovery")]
     pub list_skills: bool,
+    /// List installed bundles and their drift status
+    #[arg(long, help_heading = "List & Discovery")]
+    pub list_bundles: bool,
 
-    /// Reinstall bundled assets, overwriting any local changes
+    /// Install assets from a remote git repository (a URL or <owner>/<repo> shorthand, optionally suffixed with #<ref>), or update an already-installed bundle by name
     #[arg(
         long,
-        value_name = "CATEGORY",
-        value_enum,
+        value_name = "GIT_URL|OWNER/REPO|NAME",
+        conflicts_with_all = ["install_builtins", "update_bundle", "uninstall"],
         help_heading = "Installation & Updates"
     )]
-    pub install: Option<AssetCategory>,
-    /// Install assets from a remote git repository (URL may be suffixed with #<ref>)
-    #[arg(long, value_name = "GIT_URL", help_heading = "Installation & Updates")]
-    pub install_from: Option<String>,
-    /// Restrict --install-from to a single asset category
+    pub install: Option<String>,
+    /// Git host used to expand <owner>/<repo> shorthand values passed to --install (also forces the value to be treated as a source when it matches an installed bundle name)
+    #[arg(
+        long,
+        value_name = "HOST",
+        requires = "install",
+        conflicts_with_all = ["install_builtins", "update_bundle", "uninstall"],
+        help_heading = "Installation & Updates"
+    )]
+    pub git_host: Option<String>,
+    /// Reinstall bundled assets for a category (asks before overwriting your local changes)
     #[arg(
         long,
         value_name = "CATEGORY",
         value_enum,
-        requires = "install_from",
+        conflicts_with_all = ["update_bundle", "uninstall"],
+        help_heading = "Installation & Updates"
+    )]
+    pub install_builtins: Option<AssetCategory>,
+    /// Restrict a remote install to a single asset category
+    #[arg(
+        long,
+        value_name = "CATEGORY",
+        value_enum,
+        requires = "install",
+        conflicts_with_all = ["install_builtins", "update_bundle", "uninstall"],
         help_heading = "Installation & Updates"
     )]
     pub filter: Option<InstallFilter>,
-    /// Overwrite all conflicts without prompting (used with --install-from)
+    /// Overwrite all conflicts without prompting (remote installs only)
     #[arg(
         long,
-        requires = "install_from",
+        requires = "install",
+        conflicts_with_all = ["install_builtins", "update_bundle", "uninstall"],
         help_heading = "Installation & Updates"
     )]
     pub install_force: bool,
+    /// Update an installed bundle from its recorded source (NAME may be suffixed with #<ref> to move a pin)
+    #[arg(
+        long,
+        value_name = "NAME",
+        group = "yes_scope",
+        conflicts_with_all = ["uninstall"],
+        help_heading = "Installation & Updates"
+    )]
+    pub update_bundle: Option<String>,
+    /// Uninstall a bundle: delete its owned files and remove its mcp.json entries
+    #[arg(
+        long,
+        value_name = "NAME",
+        group = "yes_scope",
+        help_heading = "Installation & Updates"
+    )]
+    pub uninstall: Option<String>,
+    /// Proceed without prompts for --uninstall and --update-bundle (locally modified items are always kept)
+    #[arg(
+        long,
+        requires = "yes_scope",
+        conflicts_with_all = ["install", "install_builtins"],
+        help_heading = "Installation & Updates"
+    )]
+    pub yes: bool,
     /// Sync models updates
     #[arg(long, help_heading = "Installation & Updates")]
     pub sync_models: bool,
@@ -495,12 +541,126 @@ mod tests {
         assert!(parse(&["--list-rags"]).list_rags);
         assert!(parse(&["--list-macros"]).list_macros);
         assert!(parse(&["--list-skills"]).list_skills);
+        assert!(parse(&["--list-bundles"]).list_bundles);
     }
 
     #[test]
     fn parse_skill_flag_takes_name() {
         assert_eq!(parse(&["--skill", "git-master"]).skill, vec!["git-master"]);
         assert!(parse(&[]).skill.is_empty());
+    }
+
+    #[test]
+    fn parse_update_bundle_flag_takes_name() {
+        assert_eq!(
+            parse(&["--update-bundle", "foo"]).update_bundle.as_deref(),
+            Some("foo")
+        );
+    }
+
+    #[test]
+    fn parse_uninstall_flag_takes_name() {
+        assert_eq!(
+            parse(&["--uninstall", "foo"]).uninstall.as_deref(),
+            Some("foo")
+        );
+        assert!(!parse(&["--uninstall", "foo"]).yes);
+    }
+
+    #[test]
+    fn parse_yes_flag_requires_uninstall_or_update_bundle() {
+        assert!(parse(&["--uninstall", "foo", "--yes"]).yes);
+        assert!(parse(&["--update-bundle", "foo", "--yes"]).yes);
+        assert!(Cli::try_parse_from(["coyote", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn parse_install_flag_takes_url_or_name() {
+        assert_eq!(
+            parse(&["--install", "https://github.com/x/y"])
+                .install
+                .as_deref(),
+            Some("https://github.com/x/y")
+        );
+    }
+
+    #[test]
+    fn parse_install_builtins_flag_takes_category() {
+        assert_eq!(
+            parse(&["--install-builtins", "agents"]).install_builtins,
+            Some(AssetCategory::Agents)
+        );
+        assert_eq!(
+            parse(&["--install-builtins", "mcp_config"]).install_builtins,
+            Some(AssetCategory::McpConfig)
+        );
+    }
+
+    #[test]
+    fn parse_install_builtins_conflicts_with_install() {
+        assert!(
+            Cli::try_parse_from(["coyote", "--install-builtins", "agents", "--install", "x"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_lifecycle_flags_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["coyote", "--install", "x", "--uninstall", "y"]).is_err());
+        assert!(
+            Cli::try_parse_from(["coyote", "--update-bundle", "x", "--uninstall", "y"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["coyote", "--install-builtins", "agents", "--uninstall", "y"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["coyote", "--install", "x", "--update-bundle", "y"]).is_err());
+    }
+
+    #[test]
+    fn parse_companion_flags_conflict_with_other_lifecycle_actions() {
+        assert!(
+            Cli::try_parse_from(["coyote", "--update-bundle", "x", "--filter", "agents"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["coyote", "--uninstall", "x", "--install-force"]).is_err());
+        assert!(Cli::try_parse_from(["coyote", "--install", "x", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn parse_filter_requires_install() {
+        assert!(Cli::try_parse_from(["coyote", "--filter", "agents"]).is_err());
+        assert_eq!(
+            parse(&["--install", "https://github.com/x/y", "--filter", "agents"]).filter,
+            Some(InstallFilter::Agents)
+        );
+    }
+
+    #[test]
+    fn parse_install_force_requires_install() {
+        assert!(Cli::try_parse_from(["coyote", "--install-force"]).is_err());
+        assert!(parse(&["--install", "https://github.com/x/y", "--install-force"]).install_force);
+    }
+
+    #[test]
+    fn parse_git_host_requires_install() {
+        assert!(Cli::try_parse_from(["coyote", "--git-host", "git.x.com"]).is_err());
+        assert!(
+            Cli::try_parse_from(["coyote", "--git-host", "gitlab.com", "--update-bundle", "x"])
+                .is_err()
+        );
+        assert_eq!(
+            parse(&["--install", "someuser/omc", "--git-host", "git.x.com"])
+                .git_host
+                .as_deref(),
+            Some("git.x.com")
+        );
+    }
+
+    #[test]
+    fn help_shows_install_builtins() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--install-builtins"));
     }
 
     #[test]
