@@ -2,11 +2,14 @@
 
 ## Matt Pocock's Skills
 
-The bundled `diagnosing-bugs` skill and the code smell baseline in the bundled
+The bundled `diagnosing-bugs` and `codebase-design` skills, the
+`architecture-reviewer` agent, and the code smell baseline in the bundled
 `code-review` skill are adapted from
 [mattpocock/skills](https://github.com/mattpocock/skills) by Matt Pocock,
-licensed under the MIT License. The smell definitions themselves trace back to
-Martin Fowler's *Refactoring* (ch. 3).
+licensed under the MIT License. The smell definitions trace back to Martin
+Fowler's *Refactoring* (ch. 3); the deep-module vocabulary builds on John
+Ousterhout's *A Philosophy of Software Design* and Michael Feathers'
+*Working Effectively with Legacy Code*.
 
 ## AIChat
 Coyote originally started as a fork of the fantastic
