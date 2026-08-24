@@ -2,7 +2,7 @@
 
 ## Matt Pocock's Skills
 
-The bundled `diagnosing-bugs` and `codebase-design` skills, the
+The bundled `diagnosing-bugs`, `codebase-design`, and `grilling` skills, the
 `architecture-reviewer` agent, and the code smell baseline in the bundled
 `code-review` skill are adapted from
 [mattpocock/skills](https://github.com/mattpocock/skills) by Matt Pocock,
