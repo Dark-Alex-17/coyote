@@ -5,14 +5,14 @@ use crate::config::{
     jobs_enabled, list_agents_with_descriptions,
 };
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
-use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor};
+use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor, TaskKind};
 use crate::utils::{AbortSignal, create_abort_signal, wait_abort_signal};
 
 use crate::graph;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use indexmap::IndexMap;
-use log::debug;
+use log::{debug, warn};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
 use std::pin::Pin;
@@ -52,38 +52,87 @@ pub enum GuardrailAction {
     ForceTerminate(Vec<String>),
 }
 
-pub fn pending_agent_ids(ctx: &RequestContext) -> Vec<String> {
+pub struct PendingTask {
+    pub id: String,
+    pub kind: TaskKind,
+    pub finished: bool,
+}
+
+pub fn pending_tasks(ctx: &RequestContext) -> Vec<PendingTask> {
     let Some(sup) = ctx.supervisor.as_ref() else {
         return Vec::new();
     };
-    let sup = sup.read();
-    sup.list_agents()
+    let mut tasks: Vec<PendingTask> = sup
+        .read()
+        .list_tasks()
         .into_iter()
-        .filter_map(|(id, _)| match sup.is_finished(id) {
-            Some(false) => Some(id.to_string()),
-            _ => None,
+        .map(|(id, kind, finished)| PendingTask {
+            id: id.to_string(),
+            kind,
+            finished,
         })
-        .collect()
+        .collect();
+    tasks.sort_by(|a, b| a.id.cmp(&b.id));
+    tasks
 }
 
-pub fn build_pending_agents_guardrail_prompt(ids: &[String]) -> String {
-    let count = ids.len();
-    let id_list = ids
-        .iter()
-        .map(|id| format!("- {id}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+pub fn build_pending_agents_guardrail_prompt(tasks: &[PendingTask]) -> String {
+    let running: Vec<&PendingTask> = tasks.iter().filter(|t| !t.finished).collect();
+    let finished: Vec<&PendingTask> = tasks.iter().filter(|t| t.finished).collect();
+
+    let mut sections = Vec::new();
+    if !running.is_empty() {
+        let id_list = running
+            .iter()
+            .map(|t| {
+                let (kind, collect, cancel) = match t.kind {
+                    TaskKind::Agent => ("agent", "agent__collect", "agent__cancel"),
+                    TaskKind::Job => ("job", "job__collect", "job__cancel"),
+                };
+                format!(
+                    "- {id} ({kind}): call `{collect}` (blocks until done, returns output) or \
+                     `{cancel}` (discards)",
+                    id = t.id
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!(
+            "Still running ({count}):\n{id_list}\n\nThese will be abandoned if your turn ends \
+             now. You MUST reclaim each one before ending your turn. Do NOT emit a text-only \
+             response expecting them to 'report back' — they will not.",
+            count = running.len()
+        ));
+    }
+    if !finished.is_empty() {
+        let cmd_list = finished
+            .iter()
+            .map(|t| {
+                let collect = match t.kind {
+                    TaskKind::Agent => "agent__collect",
+                    TaskKind::Job => "job__collect",
+                };
+                format!("- `{collect} --id {id}`", id = t.id)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!(
+            "Completed but UNCOLLECTED — collect NOW ({count}):\n{cmd_list}\n\nCollect returns \
+             instantly on a finished task. Their results are LOST if your turn ends without \
+             collecting.",
+            count = finished.len()
+        ));
+    }
     format!(
-        "[SYSTEM GUARDRAIL] You attempted to end your turn while {count} spawned background agent(s) \
-         are still running:\n{id_list}\n\nThese agents will be abandoned if your turn ends now. You MUST \
-         reclaim each one before ending your turn. For each agent: call `agent__collect` (blocks until \
-         done, returns output) or `agent__cancel` (discards). Do NOT emit a text-only response \
-         expecting them to 'report back' — they will not."
+        "[SYSTEM GUARDRAIL] You attempted to end your turn with {count} unreclaimed background \
+         task(s).\n\n{body}",
+        count = tasks.len(),
+        body = sections.join("\n\n")
     )
 }
 
 pub fn check_pending_agents_guardrail(ctx: &mut RequestContext) -> GuardrailAction {
-    let pending = pending_agent_ids(ctx);
+    let pending = pending_tasks(ctx);
     if pending.is_empty() {
         ctx.pending_agents_guardrail_count = 0;
         return GuardrailAction::NoAction;
@@ -92,10 +141,29 @@ pub fn check_pending_agents_guardrail(ctx: &mut RequestContext) -> GuardrailActi
     if ctx.pending_agents_guardrail_count >= PENDING_AGENTS_GUARDRAIL_MAX {
         if let Some(sup) = ctx.supervisor.as_ref().cloned() {
             sup.read().cancel_recursive();
+            let finished: Vec<&PendingTask> = pending.iter().filter(|t| t.finished).collect();
+            if !finished.is_empty() {
+                let ids: Vec<&str> = finished.iter().map(|t| t.id.as_str()).collect();
+                warn!(
+                    "Turn-end guardrail: discarding uncollected result(s) for finished task(s) \
+                     after max reminders: {ids:?}"
+                );
+                let mut sup = sup.write();
+                for task in &finished {
+                    match task.kind {
+                        TaskKind::Agent => {
+                            let _ = sup.take(&task.id);
+                        }
+                        TaskKind::Job => {
+                            let _ = sup.take_job(&task.id);
+                        }
+                    }
+                }
+            }
         }
         ctx.pending_agents_guardrail_count = 0;
 
-        return GuardrailAction::ForceTerminate(pending);
+        return GuardrailAction::ForceTerminate(pending.into_iter().map(|t| t.id).collect());
     }
 
     ctx.pending_agents_guardrail_count += 1;
@@ -2396,25 +2464,108 @@ mod tests {
         assert_eq!(ctx.pending_agents_guardrail_count, 0);
     }
 
-    /// Pins current behavior: a finished-but-uncollected agent is not counted
-    /// as pending (only still-running agents are), so the turn-end guardrail
-    /// takes no action and the finished agent's result can be silently dropped.
+    /// A finished-but-uncollected agent counts as pending: the turn-end
+    /// guardrail tells the model to collect it instead of letting the result
+    /// be silently dropped, and the handle stays registered.
     #[test]
-    fn guardrail_ignores_finished_but_uncollected_agents() {
+    fn guardrail_surfaces_finished_but_uncollected_agents() {
         let mut ctx = ctx_with_supervisor(4, 3);
         register_fake_agent(&mut ctx, "a1", "explore");
         wait_until_finished(&ctx, "a1");
         ctx.pending_agents_guardrail_count = 2;
 
-        assert!(matches!(
-            check_pending_agents_guardrail(&mut ctx),
-            GuardrailAction::NoAction
-        ));
-        assert_eq!(ctx.pending_agents_guardrail_count, 0);
+        match check_pending_agents_guardrail(&mut ctx) {
+            GuardrailAction::Inject(prompt) => {
+                assert!(prompt.contains("a1"));
+                assert!(prompt.contains("agent__collect --id a1"));
+                assert!(prompt.contains("Completed but UNCOLLECTED"));
+            }
+            _ => panic!("expected Inject action"),
+        }
+        assert_eq!(ctx.pending_agents_guardrail_count, 3);
         assert_eq!(
             ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
             Some(true)
         );
+    }
+
+    #[test]
+    fn guardrail_force_terminate_discards_finished_uncollected_handles() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        register_fake_agent(&mut ctx, "a1", "explore");
+        wait_until_finished(&ctx, "a1");
+        ctx.pending_agents_guardrail_count = PENDING_AGENTS_GUARDRAIL_MAX;
+
+        match check_pending_agents_guardrail(&mut ctx) {
+            GuardrailAction::ForceTerminate(ids) => {
+                assert_eq!(ids, vec!["a1".to_string()]);
+            }
+            _ => panic!("expected ForceTerminate action"),
+        }
+        assert_eq!(ctx.pending_agents_guardrail_count, 0);
+        assert_eq!(
+            ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
+            None
+        );
+    }
+
+    #[test]
+    fn guardrail_prompt_renders_running_and_finished_sections() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+            register_fake_agent(&mut ctx, "a1", "explore");
+            wait_until_finished(&ctx, "a1");
+
+            match check_pending_agents_guardrail(&mut ctx) {
+                GuardrailAction::Inject(prompt) => {
+                    assert!(prompt.contains("Still running"));
+                    assert!(prompt.contains("slow (agent)"));
+                    assert!(prompt.contains("Completed but UNCOLLECTED"));
+                    assert!(prompt.contains("agent__collect --id a1"));
+                }
+                _ => panic!("expected Inject action"),
+            }
+        });
+    }
+
+    #[test]
+    fn guardrail_prompt_is_kind_aware_for_jobs() {
+        let tasks = vec![
+            PendingTask {
+                id: "job_1".into(),
+                kind: TaskKind::Job,
+                finished: false,
+            },
+            PendingTask {
+                id: "job_2".into(),
+                kind: TaskKind::Job,
+                finished: true,
+            },
+        ];
+
+        let prompt = build_pending_agents_guardrail_prompt(&tasks);
+
+        assert!(prompt.contains("job_1 (job)"));
+        assert!(prompt.contains("job__cancel"));
+        assert!(prompt.contains("job__collect --id job_2"));
+    }
+
+    #[test]
+    fn pending_tasks_includes_registered_jobs() {
+        let mut ctx = ctx_with_job_capable_supervisor();
+        register_fake_job(&mut ctx, "job_1");
+
+        let tasks = pending_tasks(&ctx);
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "job_1");
+        assert_eq!(tasks[0].kind, TaskKind::Job);
     }
 
     #[test]

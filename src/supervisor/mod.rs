@@ -101,6 +101,12 @@ pub enum TaskHandle {
     Job(JobHandle),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Agent,
+    Job,
+}
+
 impl From<AgentHandle> for TaskHandle {
     fn from(handle: AgentHandle) -> Self {
         Self::Agent(handle)
@@ -236,7 +242,6 @@ impl Supervisor {
         }
     }
 
-    #[allow(dead_code)]
     pub fn take_job(&mut self, id: &str) -> Option<JobHandle> {
         if !self.has_job(id) {
             return None;
@@ -266,6 +271,24 @@ impl Supervisor {
     pub fn list_agents(&self) -> Vec<(&str, &str)> {
         self.agents()
             .map(|h| (h.id.as_str(), h.agent_name.as_str()))
+            .collect()
+    }
+
+    pub fn list_tasks(&self) -> Vec<(&str, TaskKind, bool)> {
+        self.handles
+            .values()
+            .map(|handle| match handle {
+                TaskHandle::Agent(agent) => (
+                    agent.id.as_str(),
+                    TaskKind::Agent,
+                    agent.join_handle.is_finished(),
+                ),
+                TaskHandle::Job(job) => (
+                    job.id.as_str(),
+                    TaskKind::Job,
+                    job.join_handle.is_finished(),
+                ),
+            })
             .collect()
     }
 
