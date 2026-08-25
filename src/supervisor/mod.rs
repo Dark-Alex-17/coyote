@@ -1,5 +1,6 @@
 pub mod escalation;
 pub mod mailbox;
+pub mod notification;
 pub mod taskqueue;
 
 use crate::function::jobs::RingBuf;

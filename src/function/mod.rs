@@ -341,12 +341,17 @@ pub async fn eval_tool_calls(
         }
     }
 
-    if ctx.current_depth == 0
-        && let Some(queue) = ctx.root_escalation_queue()
-        && queue.has_pending()
-        && let Some(last) = output.last_mut()
-    {
-        inject_escalation_notification(last, queue.pending_summary());
+    if let Some(last) = output.last_mut() {
+        let escalations = if ctx.current_depth == 0 {
+            ctx.root_escalation_queue()
+                .filter(|queue| queue.has_pending())
+                .map(|queue| queue.pending_summary())
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+        let notifications = drain_live_notifications(ctx);
+        merge_system_channel(last, escalations, notifications);
     }
 
     Ok(output)
@@ -365,22 +370,75 @@ fn normalize_tool_result(result: Value) -> Value {
     }
 }
 
-fn inject_escalation_notification(last: &mut ToolResult, summary: Vec<Value>) {
-    let instruction = "Child agents are BLOCKED waiting for your reply. \
-        Call agent__reply_escalation for each pending escalation to unblock them.";
-    match &mut last.output {
-        Value::Object(map) => {
-            map.insert("pending_escalations".into(), json!(summary));
-            map.insert("escalation_instruction".into(), json!(instruction));
-        }
-        other => {
-            *other = json!({
-                "output": other.take(),
-                "pending_escalations": summary,
-                "escalation_instruction": instruction,
-            });
-        }
+/// Drains this context's own notification queue and drops events whose
+/// handle is no longer registered with the supervisor (already collected or
+/// cancelled), so the model is never pointed at a dead id.
+fn drain_live_notifications(ctx: &RequestContext) -> Vec<Value> {
+    let events = ctx.notification_queue.drain();
+    if events.is_empty() {
+        return vec![];
     }
+    let Some(supervisor) = ctx.supervisor.as_ref() else {
+        return vec![];
+    };
+    let sup = supervisor.read();
+    events
+        .into_iter()
+        .filter(|event| sup.has_job(&event.id) || sup.has_agent(&event.id))
+        .map(|event| event.to_value())
+        .collect()
+}
+
+/// Single-pass merge of both system channels onto the last tool result of a
+/// batch: pending escalations (children are blocked; listed first) and
+/// background-task completion notifications. A single pass is mandatory —
+/// two independent mergers would each apply the non-object wrap and nest the
+/// output twice. With both channels empty this is a no-op, and with only
+/// escalations it produces exactly the pre-notification output shape.
+fn merge_system_channel(last: &mut ToolResult, escalations: Vec<Value>, notifications: Vec<Value>) {
+    if escalations.is_empty() && notifications.is_empty() {
+        return;
+    }
+    let escalation_instruction = "Child agents are BLOCKED waiting for your reply. \
+        Call agent__reply_escalation for each pending escalation to unblock them.";
+    let notification_instruction =
+        "Background tasks have finished; collect each result with its next_action command.";
+
+    let map = match &mut last.output {
+        Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("output".into(), other.take());
+            *other = Value::Object(map);
+            match other {
+                Value::Object(map) => map,
+                _ => unreachable!(),
+            }
+        }
+    };
+    if !escalations.is_empty() {
+        map.insert("pending_escalations".into(), json!(escalations));
+        map.insert(
+            "escalation_instruction".into(),
+            json!(escalation_instruction),
+        );
+    }
+    if !notifications.is_empty() {
+        map.insert("system_notifications".into(), json!(notifications));
+        map.insert(
+            "notification_instruction".into(),
+            json!(notification_instruction),
+        );
+    }
+}
+
+/// Escalation-only entry point retained so the characterization tests that
+/// pinned the pre-merger output shape keep proving, unmodified, that
+/// `merge_system_channel` with no notifications is byte-identical to the
+/// injection behavior they were written against.
+#[cfg(test)]
+fn inject_escalation_notification(last: &mut ToolResult, summary: Vec<Value>) {
+    merge_system_channel(last, summary, vec![]);
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2495,6 +2553,7 @@ mod tests {
     };
     use crate::config::{Agent, AgentConfig, AppConfig, AppState, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
+    use crate::supervisor::notification::job_notification;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use rmcp::model::{CallToolResult, ContentBlock};
@@ -2577,6 +2636,189 @@ mod tests {
             json!([{"escalation_id": "esc_2"}])
         );
         assert!(result.output["escalation_instruction"].is_string());
+    }
+
+    fn ctx_with_registered_job(id: &str) -> RequestContext {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let join_handle = rt.spawn(async {
+            Ok(crate::supervisor::JobResult {
+                output: Value::Null,
+                exit_code: Some(0),
+                output_bytes_captured: 0,
+            })
+        });
+        std::mem::forget(rt);
+        let handle = crate::supervisor::JobHandle {
+            id: id.to_string(),
+            tool: "execute_command".to_string(),
+            started_at: std::time::Instant::now(),
+            join_handle,
+            abort_signal: crate::utils::create_abort_signal(),
+            state: Arc::new(parking_lot::Mutex::new(crate::supervisor::JobState {
+                status: crate::supervisor::JobStatus::Completed,
+                pgid: None,
+            })),
+            output_buf: Arc::new(parking_lot::Mutex::new(jobs::RingBuf::default())),
+            no_change_checks: 0,
+        };
+        let mut sup = crate::supervisor::Supervisor::new(0, 3).with_max_concurrent_jobs(4);
+        sup.register(handle).unwrap();
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.supervisor = Some(Arc::new(parking_lot::RwLock::new(sup)));
+        ctx
+    }
+
+    #[test]
+    fn merge_system_channel_noop_when_both_channels_empty() {
+        let mut object_result = ToolResult::new(call("t", Some("id-1")), json!({"status": "ok"}));
+        merge_system_channel(&mut object_result, vec![], vec![]);
+        assert_eq!(object_result.output, json!({"status": "ok"}));
+
+        let mut plain_result = ToolResult::new(call("t", Some("id-1")), json!("DONE"));
+        merge_system_channel(&mut plain_result, vec![], vec![]);
+        assert_eq!(plain_result.output, json!("DONE"));
+    }
+
+    #[test]
+    fn merge_system_channel_escalations_only_matches_legacy_wrap_bytes() {
+        let summary = vec![json!({"escalation_id": "esc_1"})];
+        let expected = json!({
+            "output": "DONE",
+            "pending_escalations": summary,
+            "escalation_instruction": "Child agents are BLOCKED waiting for your reply. \
+                Call agent__reply_escalation for each pending escalation to unblock them.",
+        });
+
+        let mut result = ToolResult::new(call("t", Some("id-1")), json!("DONE"));
+        merge_system_channel(&mut result, summary, vec![]);
+
+        assert_eq!(
+            serde_json::to_string(&result.output).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn merge_system_channel_adds_notifications_without_escalation_keys() {
+        let mut result = ToolResult::new(call("t", Some("id-1")), json!({"status": "ok"}));
+        merge_system_channel(&mut result, vec![], vec![json!({"id": "job_1"})]);
+        assert_eq!(result.output["status"], "ok");
+        assert_eq!(
+            result.output["system_notifications"],
+            json!([{"id": "job_1"}])
+        );
+        assert!(
+            result.output["notification_instruction"]
+                .as_str()
+                .unwrap()
+                .contains("next_action")
+        );
+        assert!(result.output.get("pending_escalations").is_none());
+        assert!(result.output.get("escalation_instruction").is_none());
+    }
+
+    #[test]
+    fn merge_system_channel_wraps_non_object_once_with_both_channels() {
+        let mut result = ToolResult::new(call("t", Some("id-1")), json!("DONE"));
+        merge_system_channel(
+            &mut result,
+            vec![json!({"escalation_id": "esc_1"})],
+            vec![json!({"id": "job_1"})],
+        );
+        assert_eq!(result.output["output"], json!("DONE"));
+        assert_eq!(
+            result.output["pending_escalations"][0]["escalation_id"],
+            "esc_1"
+        );
+        assert_eq!(result.output["system_notifications"][0]["id"], "job_1");
+        let keys: Vec<&str> = result
+            .output
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "output",
+                "pending_escalations",
+                "escalation_instruction",
+                "system_notifications",
+                "notification_instruction"
+            ]
+        );
+    }
+
+    #[test]
+    fn drain_live_notifications_drops_unregistered_ids() {
+        let ctx = ctx_with_registered_job("job_live");
+        ctx.notification_queue
+            .push(job_notification("job_live", "execute_command", true));
+        ctx.notification_queue
+            .push(job_notification("job_gone", "execute_command", true));
+
+        let live = drain_live_notifications(&ctx);
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0]["id"], "job_live");
+        assert!(
+            ctx.notification_queue.drain().is_empty(),
+            "drain must consume the queue"
+        );
+    }
+
+    #[test]
+    fn drain_live_notifications_without_supervisor_drops_everything() {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.notification_queue
+            .push(job_notification("job_x", "execute_command", true));
+        assert!(drain_live_notifications(&ctx).is_empty());
+    }
+
+    #[test]
+    fn eval_tool_calls_merges_notifications_at_depth_without_escalations() {
+        let mut ctx = ctx_with_registered_job("job_n1");
+        ctx.current_depth = 1;
+        let queue = ctx.ensure_root_escalation_queue();
+        submit_escalation(&queue, "esc_1");
+        ctx.notification_queue
+            .push(job_notification("job_n1", "execute_command", true));
+
+        let calls = vec![call("unknown_tool", Some("id-1"))];
+        let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+
+        let out = &results[0].output;
+        assert_eq!(out["system_notifications"][0]["id"], "job_n1");
+        assert_eq!(out["system_notifications"][0]["event"], "job_completed");
+        assert!(out["notification_instruction"].is_string());
+        assert!(
+            out.get("pending_escalations").is_none(),
+            "escalations are root-only"
+        );
+    }
+
+    #[test]
+    fn eval_tool_calls_merges_both_channels_onto_last_result() {
+        let mut ctx = ctx_with_registered_job("job_n1");
+        let queue = ctx.ensure_root_escalation_queue();
+        submit_escalation(&queue, "esc_1");
+        ctx.notification_queue
+            .push(job_notification("job_n1", "execute_command", false));
+
+        let calls = vec![call("unknown_tool", Some("id-1"))];
+        let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+
+        let out = &results[0].output;
+        assert_eq!(out["pending_escalations"][0]["escalation_id"], "esc_1");
+        assert_eq!(out["system_notifications"][0]["event"], "job_failed");
+        assert!(
+            out.get("output").is_none(),
+            "object outputs are extended in place, never wrapped"
+        );
     }
 
     #[test]

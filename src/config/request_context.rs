@@ -34,6 +34,7 @@ use crate::rag::Rag;
 use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::Inbox;
+use crate::supervisor::notification::NotificationQueue;
 use crate::utils::{
     AbortSignal, abortable_run_with_spinner, edit_file, fuzzy_filter, get_env_name,
     list_file_names, now, render_prompt, temp_file,
@@ -330,6 +331,7 @@ pub struct RequestContext {
     pub self_agent_id: Option<String>,
     pub inbox: Option<Arc<Inbox>>,
     pub escalation_queue: Option<Arc<EscalationQueue>>,
+    pub notification_queue: Arc<NotificationQueue>,
     pub current_depth: usize,
     pub auto_continue_count: usize,
     pub pending_agents_guardrail_count: u32,
@@ -364,6 +366,7 @@ impl RequestContext {
             self_agent_id: None,
             inbox: None,
             escalation_queue: None,
+            notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
             auto_continue_count: 0,
             pending_agents_guardrail_count: 0,
@@ -424,6 +427,7 @@ impl RequestContext {
             self_agent_id: None,
             inbox: None,
             escalation_queue: None,
+            notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
             auto_continue_count: 0,
             pending_agents_guardrail_count: 0,
@@ -471,6 +475,7 @@ impl RequestContext {
             self_agent_id: self.self_agent_id.clone(),
             inbox: self.inbox.clone(),
             escalation_queue: self.escalation_queue.clone(),
+            notification_queue: self.notification_queue.clone(),
             current_depth: self.current_depth,
             auto_continue_count: 0,
             pending_agents_guardrail_count: 0,
@@ -516,6 +521,7 @@ impl RequestContext {
             self_agent_id: Some(self_agent_id),
             inbox: Some(inbox),
             escalation_queue: parent.escalation_queue.clone(),
+            notification_queue: Arc::new(NotificationQueue::new()),
             current_depth,
             auto_continue_count: 0,
             pending_agents_guardrail_count: 0,
@@ -4202,6 +4208,7 @@ impl RequestContext {
         self.supervisor = supervisor;
         self.inbox = None;
         self.escalation_queue = None;
+        self.notification_queue = Arc::new(NotificationQueue::new());
         self.self_agent_id = None;
         self.parent_supervisor = None;
         self.current_depth = 0;
@@ -4244,6 +4251,7 @@ impl RequestContext {
             self.self_agent_id = None;
             self.inbox = None;
             self.escalation_queue = None;
+            self.notification_queue = Arc::new(NotificationQueue::new());
             self.current_depth = 0;
             self.auto_continue_count = 0;
             self.pending_agents_guardrail_count = 0;
@@ -5461,6 +5469,32 @@ mod tests {
     fn escalation_queue_defaults_to_none() {
         let ctx = create_test_ctx();
         assert!(ctx.root_escalation_queue().is_none());
+    }
+
+    #[test]
+    fn new_for_child_gets_fresh_notification_queue() {
+        let parent = create_test_ctx();
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert!(
+            !Arc::ptr_eq(&parent.notification_queue, &child.notification_queue),
+            "each child owns its notifications; a shared queue would race drains"
+        );
+    }
+
+    #[test]
+    fn fork_for_branch_shares_notification_queue() {
+        let ctx = create_test_ctx();
+        let branch = ctx.fork_for_branch();
+        assert!(Arc::ptr_eq(
+            &ctx.notification_queue,
+            &branch.notification_queue
+        ));
     }
 
     fn app_state_with_mcp_config(mcp_server_support: bool, server_names: &[&str]) -> Arc<AppState> {

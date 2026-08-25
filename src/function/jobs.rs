@@ -14,6 +14,7 @@ use crate::mcp::{
     MCP_PROMPT_META_FUNCTION_NAME_PREFIX, MCP_READ_META_FUNCTION_NAME_PREFIX,
     MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
 };
+use crate::supervisor::notification::job_notification;
 use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor};
 use crate::utils::{create_abort_signal, muted_warning_text, temp_file, wait_abort_signal};
 
@@ -432,27 +433,39 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             current_depth: ctx.current_depth,
         };
         let task_state = Arc::clone(&state);
+        let task_notifications = Arc::clone(&ctx.notification_queue);
+        let notify_id = job_id.clone();
+        let notify_tool = tool.clone();
         tokio::spawn(async move {
             let result = run_mcp_job(job_ctx, server, inner_tool, inner_args).await;
-            task_state.lock().status = match &result {
-                Ok(_) => JobStatus::Completed,
-                Err(_) => JobStatus::Failed,
+            let success = result.is_ok();
+            task_state.lock().status = if success {
+                JobStatus::Completed
+            } else {
+                JobStatus::Failed
             };
+            task_notifications.push(job_notification(&notify_id, &notify_tool, success));
             result
         })
     } else {
         let snapshot = build_env_snapshot(ctx, &tool, &arguments)?;
         let task_state = Arc::clone(&state);
         let task_buf = Arc::clone(&output_buf);
+        let task_notifications = Arc::clone(&ctx.notification_queue);
+        let notify_id = job_id.clone();
+        let notify_tool = tool.clone();
         tokio::spawn(async move {
             let result = run_process_job(snapshot, Arc::clone(&task_state), task_buf).await;
+            let success = matches!(&result, Ok(job_result) if job_result.exit_code == Some(0));
             let mut job_state = task_state.lock();
             job_state.pgid = None;
-            job_state.status = match &result {
-                Ok(job_result) if job_result.exit_code == Some(0) => JobStatus::Completed,
-                _ => JobStatus::Failed,
+            job_state.status = if success {
+                JobStatus::Completed
+            } else {
+                JobStatus::Failed
             };
             drop(job_state);
+            task_notifications.push(job_notification(&notify_id, &notify_tool, success));
             result
         })
     };
@@ -1530,6 +1543,132 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("No job 'job_x' is registered")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_completion_pushes_notification_for_own_context() {
+        run_async(async {
+            let mut ctx = plain_ctx();
+            ctx.declared_function_names.insert("echo".into());
+
+            let started = handle_start(&mut ctx, &json!({"tool": "echo", "arguments": {}}))
+                .await
+                .unwrap();
+            let job_id = started["job_id"].as_str().unwrap().to_string();
+
+            let supervisor = ctx.supervisor.clone().unwrap();
+            let deadline = time::Instant::now() + Duration::from_secs(5);
+            while time::Instant::now() < deadline {
+                let finished = supervisor
+                    .read()
+                    .job(&job_id)
+                    .is_none_or(|job| job.join_handle.is_finished());
+                if finished {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let events = ctx.notification_queue.drain();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event, "job_completed");
+            assert_eq!(events[0].id, job_id);
+            assert_eq!(events[0].tool_or_agent, "echo");
+            assert_eq!(events[0].status, "success");
+            assert_eq!(
+                events[0].next_action,
+                format!("job__collect --id {job_id} for output")
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_failure_pushes_failed_notification() {
+        run_async(async {
+            let mut ctx = plain_ctx();
+            ctx.declared_function_names.insert("false".into());
+
+            let started = handle_start(&mut ctx, &json!({"tool": "false", "arguments": {}}))
+                .await
+                .unwrap();
+            let job_id = started["job_id"].as_str().unwrap().to_string();
+
+            let supervisor = ctx.supervisor.clone().unwrap();
+            let deadline = time::Instant::now() + Duration::from_secs(5);
+            while time::Instant::now() < deadline {
+                let finished = supervisor
+                    .read()
+                    .job(&job_id)
+                    .is_none_or(|job| job.join_handle.is_finished());
+                if finished {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let events = ctx.notification_queue.drain();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event, "job_failed");
+            assert_eq!(events[0].status, "failed");
+        });
+    }
+
+    #[test]
+    fn cancelled_job_notification_is_suppressed_at_drain() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            let join_handle = tokio::spawn(async {
+                time::sleep(Duration::from_secs(30)).await;
+                Ok(JobResult {
+                    output: Value::Null,
+                    exit_code: Some(0),
+                    output_bytes_captured: 0,
+                })
+            });
+            let handle = JobHandle {
+                id: "j1".to_string(),
+                tool: "execute_command".to_string(),
+                started_at: Instant::now(),
+                join_handle,
+                abort_signal: create_abort_signal(),
+                state: Arc::new(Mutex::new(JobState {
+                    status: JobStatus::Running,
+                    pgid: None,
+                })),
+                output_buf: Arc::new(Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+            ctx.notification_queue
+                .push(job_notification("j1", "execute_command", false));
+
+            let result = handle_cancel(&ctx, &json!({"id": "j1"})).await.unwrap();
+
+            assert_eq!(result["status"], "cancelled");
+            assert!(
+                super::super::drain_live_notifications(&ctx).is_empty(),
+                "events for a cancelled job must never reach the model"
+            );
+        });
+    }
+
+    #[test]
+    fn already_collected_job_notification_is_suppressed_at_drain() {
+        let ctx = ctx_with_job_supervisor(4);
+        ctx.notification_queue
+            .push(job_notification("j1", "execute_command", true));
+
+        assert!(
+            super::super::drain_live_notifications(&ctx).is_empty(),
+            "events for an already-collected job must be dropped"
         );
     }
 
