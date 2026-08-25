@@ -3,15 +3,19 @@ use super::*;
 use crate::{
     client::Model,
     config::memory,
-    function::{Functions, jobs::DEFAULT_MAX_CONCURRENT_JOBS, run_llm_function},
+    function::{
+        Functions,
+        jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX},
+        run_llm_function,
+    },
     graph, rag,
 };
 
 use super::rag_cache::RagKey;
 use crate::config::paths;
 use crate::config::prompts::{
-    DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS, DEFAULT_TODO_INSTRUCTIONS,
-    DEFAULT_USER_INTERACTION_INSTRUCTIONS,
+    DEFAULT_JOB_INSTRUCTIONS, DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS,
+    DEFAULT_TODO_INSTRUCTIONS, DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
 use crate::graph::types::RagNode;
 use crate::graph::{Graph, GraphParser, NodeType};
@@ -448,6 +452,17 @@ impl Agent {
 
         if self.config.can_spawn_agents && self.config.inject_spawn_instructions {
             output.push_str(DEFAULT_SPAWN_INSTRUCTIONS);
+        }
+
+        // Job declarations are appended at init iff jobs are enabled for this
+        // agent, so their presence doubles as the jobs_enabled predicate.
+        if self
+            .functions
+            .declarations()
+            .iter()
+            .any(|f| f.name.starts_with(JOB_FUNCTION_PREFIX))
+        {
+            output.push_str(DEFAULT_JOB_INSTRUCTIONS);
         }
 
         output.push_str(DEFAULT_TEAMMATE_INSTRUCTIONS);

@@ -190,6 +190,16 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     4. **Respond promptly**; the child agent is blocked and waiting (5-minute timeout).
 "};
 
+pub(in crate::config) const DEFAULT_JOB_INSTRUCTIONS: &str = indoc! {"
+    ## Background Jobs
+
+    For long-running tool calls (builds, test suites, slow commands), call `job__start` and keep
+    working instead of blocking. Check progress with `job__check` (sparingly), block on the result
+    with `job__collect`, cancel with `job__cancel`, and list jobs with `job__list`. Collect or
+    cancel every job you started before ending your turn. Jobs run against a snapshot of the
+    current config/environment and do not survive coyote exiting."
+};
+
 pub(in crate::config) const DEFAULT_TEAMMATE_INSTRUCTIONS: &str = indoc! {"
     ## Teammate Messaging
 
