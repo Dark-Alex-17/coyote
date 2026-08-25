@@ -3305,6 +3305,14 @@ impl RequestContext {
                     names.extend(installed_bundle_names());
                     let mut values = super::map_completion_values(names);
                     values.push((
+                        "--filter".to_string(),
+                        Some("Restrict a remote install to one category".to_string()),
+                    ));
+                    values.push((
+                        "--force".to_string(),
+                        Some("Overwrite all conflicts without prompting".to_string()),
+                    ));
+                    values.push((
                         "--git-host".to_string(),
                         Some("Host the owner/repo shorthand expands against".to_string()),
                     ));
