@@ -82,7 +82,7 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     | Tool | Purpose |
     |------|----------|
     | `agent__spawn` | Spawn a subagent in the background. Returns an `id` immediately. |
-    | `agent__check` | Non-blocking check: is the agent done yet? Returns PENDING or result. |
+    | `agent__check` | Non-blocking status probe: running or finished. Never returns/consumes the result — use `agent__collect`. |
     | `agent__collect` | Blocking wait: wait for an agent to finish, return its output. |
     | `agent__list_available` | List all agent types you can spawn (name + description). Use this to discover specialists before calling `agent__spawn`. |
     | `agent__list_running` | List all subagents YOU have spawned, with their status. |

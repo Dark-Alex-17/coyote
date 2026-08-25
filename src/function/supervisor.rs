@@ -255,7 +255,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{SUPERVISOR_FUNCTION_PREFIX}check"),
-            description: "Check if a spawned agent has finished. Non-blocking; returns PENDING if still running, or the result if complete.".to_string(),
+            description: "Non-blocking status probe: reports whether a spawned agent is still running or finished. NEVER returns or consumes the result — when finished, call agent__collect to retrieve it.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([(
@@ -934,7 +934,15 @@ async fn handle_check(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     };
 
     match is_finished {
-        Some(true) => handle_collect(ctx, args).await,
+        Some(true) => Ok(json!({
+            "status": "finished",
+            "id": id,
+            "message": format!(
+                "Agent '{id}' has finished; its result is ready and has NOT been consumed. \
+                 Call `agent__collect --id {id}` to retrieve it (returns instantly on a \
+                 finished agent). The handle stays registered until collected."
+            ),
+        })),
         Some(false) => {
             let mut result = json!({
                 "status": "pending",
@@ -2711,23 +2719,34 @@ mod tests {
         assert!(err.to_string().contains("No supervisor active"));
     }
 
-    /// Pins current behavior: checking a finished agent does not report a
-    /// "finished, ready to collect" status; it silently delegates to collect,
-    /// returning the full result and consuming the handle.
+    /// Checking a finished agent is a pure status probe: it reports the
+    /// agent as finished, points at agent__collect, and leaves the handle
+    /// registered so a subsequent collect still returns the result.
     #[test]
-    fn handle_check_finished_agent_delegates_to_collect_and_consumes_handle() {
+    fn handle_check_finished_agent_reports_status_and_keeps_handle() {
         let mut ctx = ctx_with_supervisor(4, 3);
         register_fake_agent(&mut ctx, "a1", "explore");
         wait_until_finished(&ctx, "a1");
 
         let result = run_async(handle_check(&mut ctx, &json!({"id": "a1"}))).unwrap();
 
-        assert_eq!(result["status"], "completed");
-        assert_eq!(result["output"], "fake output");
+        assert_eq!(result["status"], "finished");
+        assert_eq!(result["id"], "a1");
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("agent__collect")
+        );
         assert_eq!(
             ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
-            None
+            Some(true)
         );
+
+        let collected = run_async(handle_collect(&mut ctx, &json!({"id": "a1"}))).unwrap();
+
+        assert_eq!(collected["status"], "completed");
+        assert_eq!(collected["output"], "fake output");
     }
 
     #[test]
