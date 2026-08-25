@@ -2031,7 +2031,7 @@ mod tests {
     }
 
     #[test]
-    fn jobs_only_supervisor_guardrail_takes_no_action() {
+    fn jobs_only_supervisor_guardrail_surfaces_running_job() {
         let mut ctx = ctx_with_job_supervisor(5);
         ctx.supervisor
             .as_ref()
@@ -2040,8 +2040,18 @@ mod tests {
             .register(make_running_job("j1"))
             .unwrap();
 
+        match check_pending_agents_guardrail(&mut ctx) {
+            GuardrailAction::Inject(prompt) => {
+                assert!(prompt.contains("j1"));
+                assert!(prompt.contains("job__collect"));
+            }
+            _ => panic!("expected Inject for a running job"),
+        }
+        assert_eq!(ctx.pending_agents_guardrail_count, 1);
+
+        let empty_ctx = &mut ctx_with_job_supervisor(5);
         assert!(matches!(
-            check_pending_agents_guardrail(&mut ctx),
+            check_pending_agents_guardrail(empty_ctx),
             GuardrailAction::NoAction
         ));
     }
