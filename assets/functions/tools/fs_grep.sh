@@ -25,7 +25,11 @@ main() {
         exit 1
     fi
 
-    local grep_args=(-nH --color=never)
+    # --binary-files=text: GNU grep's binary heuristic false-positives on valid
+    # UTF-8 source files >=128KiB when a multibyte character straddles an
+    # internal read-buffer boundary, silently returning zero matches. This tool
+    # only searches text, so always force text mode.
+    local grep_args=(-nH --color=never --binary-files=text)
 
     if [[ -d "$search_path" ]]; then
         # Use -r (not -R) so symlinks to directories are NOT followed - this avoids
