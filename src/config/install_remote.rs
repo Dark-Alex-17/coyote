@@ -4286,6 +4286,12 @@ mod tests {
     #[test]
     #[serial]
     fn uninstall_shorthand_with_multiple_matches_bails_non_interactively() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping uninstall_shorthand_with_multiple_matches_bails_non_interactively: requires non-TTY stdout"
+            );
+            return;
+        }
         let _guard = TestVaultConfigGuard::new("uninst-short-multi");
         let mut store = BundleStore::load().unwrap();
         store
