@@ -13,6 +13,7 @@ use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 use std::{fmt, io};
 
@@ -186,12 +187,11 @@ pub fn render_blob_at(
     // file at the final path is always complete and the dedup check below is
     // race-safe across processes (same sha means same content).
     if !path.exists() {
-        static TEMP_COUNTER: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
+        static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
         let temp = dir.join(format!(
             "{sha256}.tmp-{}-{}",
             std::process::id(),
-            TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
