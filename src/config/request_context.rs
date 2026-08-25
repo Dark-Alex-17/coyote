@@ -5,7 +5,7 @@ use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
 use super::skill_registry::SkillRegistry;
 use super::todo::TodoList;
-use super::tool_scope::{McpRuntime, ToolScope};
+use super::tool_scope::{McpPromptCompletion, McpRuntime, ToolScope, format_prompt_arguments};
 use super::{
     AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
     Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, MacroAllowlistLevel,
@@ -23,8 +23,8 @@ use crate::function::{
     user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::mcp::{
-    MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
-    MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired, is_auth_required_error,
+    CatalogItem, MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired,
+    McpServersConfig, is_auth_required_error, is_mcp_meta_function, mcp_meta_function_names,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -75,6 +75,31 @@ fn installed_bundle_names() -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+pub(crate) fn expand_enabled_mcp_server_ids(
+    app: &AppConfig,
+    mcp_config: &McpServersConfig,
+    enabled_mcp_servers: &[String],
+) -> Vec<String> {
+    if enabled_mcp_servers.iter().any(|s| s.trim() == "all") {
+        return mcp_config.mcp_servers.keys().cloned().collect();
+    }
+
+    let mut ids = Vec::new();
+    for item in enabled_mcp_servers.iter().map(|s| s.trim()) {
+        if mcp_config.mcp_servers.contains_key(item) {
+            ids.push(item.to_string());
+        } else if let Some(mapped) = app.mapping_mcp_servers.get(item) {
+            for mapped_id in mapped.split(',').map(|s| s.trim()) {
+                if mcp_config.mcp_servers.contains_key(mapped_id) {
+                    ids.push(mapped_id.to_string());
+                }
+            }
+        }
+    }
+
+    ids
 }
 
 pub struct AutoContinueConfig {
@@ -137,6 +162,20 @@ pub(crate) fn asset_table(header: &[&str]) -> Table {
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(header.to_vec());
     table
+}
+
+fn mcp_prompt_rows(items: &[CatalogItem]) -> Vec<[String; 4]> {
+    items
+        .iter()
+        .map(|item| {
+            [
+                item.server.clone(),
+                item.name.clone(),
+                item.description.clone(),
+                format_prompt_arguments(item.arguments.as_deref().unwrap_or_default()),
+            ]
+        })
+        .collect()
 }
 
 fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<String>)> {
@@ -2011,11 +2050,7 @@ impl RequestContext {
                     .functions
                     .declarations()
                     .iter()
-                    .filter(|v| {
-                        !v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                            && !v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                            && !v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                    })
+                    .filter(|v| !is_mcp_meta_function(&v.name))
                     .map(|v| v.name.to_string())
                     .collect();
 
@@ -2025,11 +2060,7 @@ impl RequestContext {
                             .functions()
                             .declarations()
                             .iter()
-                            .filter(|v| {
-                                !v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                                    && !v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                                    && !v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                            })
+                            .filter(|v| !is_mcp_meta_function(&v.name))
                             .map(|v| v.name.to_string()),
                     );
                 }
@@ -2102,11 +2133,7 @@ impl RequestContext {
                     .declarations()
                     .to_vec()
                     .into_iter()
-                    .filter(|v| {
-                        !v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                            && !v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                            && !v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                    })
+                    .filter(|v| !is_mcp_meta_function(&v.name))
                     .collect();
 
                 if let Some(ref tool_names) = role_filter {
@@ -2155,11 +2182,7 @@ impl RequestContext {
                         .functions
                         .declarations()
                         .iter()
-                        .filter(|v| {
-                            v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                                || v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                                || v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                        })
+                        .filter(|v| is_mcp_meta_function(&v.name))
                         .map(|v| v.name.to_string())
                         .collect();
                     if let Some(agent) = &self.agent {
@@ -2168,12 +2191,7 @@ impl RequestContext {
                                 .functions()
                                 .declarations()
                                 .iter()
-                                .filter(|v| {
-                                    v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                                        || v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                                        || v.name
-                                            .starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                                })
+                                .filter(|v| is_mcp_meta_function(&v.name))
                                 .map(|v| v.name.to_string()),
                         );
                     }
@@ -2188,41 +2206,17 @@ impl RequestContext {
                                 continue;
                             }
 
-                            let item_invoke_name =
-                                format!("{}_{item}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
                             let item_search_name =
                                 format!("{}_{item}", MCP_SEARCH_META_FUNCTION_NAME_PREFIX);
-                            let item_describe_name =
-                                format!("{}_{item}", MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX);
                             if let Some(values) = app.mapping_mcp_servers.get(item) {
                                 server_names.extend(
                                     values
                                         .split(',')
-                                        .flat_map(|v| {
-                                            vec![
-                                                format!(
-                                                    "{}_{}",
-                                                    MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
-                                                    v.to_string()
-                                                ),
-                                                format!(
-                                                    "{}_{}",
-                                                    MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
-                                                    v.to_string()
-                                                ),
-                                                format!(
-                                                    "{}_{}",
-                                                    MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
-                                                    v.to_string()
-                                                ),
-                                            ]
-                                        })
+                                        .flat_map(mcp_meta_function_names)
                                         .filter(|v| mcp_declaration_names.contains(v)),
                                 )
-                            } else if mcp_declaration_names.contains(&item_invoke_name) {
-                                server_names.insert(item_invoke_name);
-                                server_names.insert(item_search_name);
-                                server_names.insert(item_describe_name);
+                            } else if mcp_declaration_names.contains(&item_search_name) {
+                                server_names.extend(mcp_meta_function_names(item));
                             }
                         }
                     }
@@ -2251,11 +2245,7 @@ impl RequestContext {
                     .declarations()
                     .to_vec()
                     .into_iter()
-                    .filter(|v| {
-                        v.name.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX)
-                            || v.name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX)
-                            || v.name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX)
-                    })
+                    .filter(|v| is_mcp_meta_function(&v.name))
                     .collect();
 
                 if let Some(ref server_names) = role_filter {
@@ -2351,7 +2341,7 @@ impl RequestContext {
         Ok(())
     }
 
-    pub fn use_prompt(&mut self, _app: &AppConfig, prompt: &str) -> Result<()> {
+    pub fn use_temp_role(&mut self, _app: &AppConfig, prompt: &str) -> Result<()> {
         let mut role = Role::new(TEMP_ROLE_NAME, prompt);
         role.set_model(self.current_model().clone());
         self.use_role_obj(role)
@@ -2828,7 +2818,7 @@ impl RequestContext {
             }
             "bundles" => bundles::list_installed_bundles(),
             _ => bail!(
-                "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, tools, mcp-servers, bundles"
+                "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, prompts, tools, mcp-servers, bundles"
             ),
         }
     }
@@ -3396,6 +3386,7 @@ impl RequestContext {
                     "rags",
                     "macros",
                     "skills",
+                    "prompts",
                     "tools",
                     "mcp-servers",
                     "bundles",
@@ -3720,6 +3711,40 @@ impl RequestContext {
         fuzzy_filter(values, |v| v.0.as_str(), filter)
     }
 
+    pub fn mcp_prompt_completion(&self, args: &[&str]) -> McpPromptCompletion {
+        let app = self.app.config.as_ref();
+        let enabled_ids = match &self.app.mcp_config {
+            Some(mcp_config) => {
+                let mut servers = self
+                    .enabled_mcp_servers_for_current_scope(app, true)
+                    .unwrap_or_default();
+                servers.extend(self.skill_registry.loaded_mcp_servers());
+                expand_enabled_mcp_server_ids(app, mcp_config, &servers)
+            }
+            None => vec![],
+        };
+        self.tool_scope
+            .mcp_runtime
+            .prompt_completion(&enabled_ids, args)
+    }
+
+    pub async fn list_mcp_prompts(&self) -> Result<()> {
+        let items = self.tool_scope.mcp_runtime.prompt_catalog().await;
+        if items.is_empty() {
+            println!("No prompts found.");
+            return Ok(());
+        }
+
+        let mut table = asset_table(&["server", "name", "description", "args"]);
+        for row in mcp_prompt_rows(&items) {
+            table.add_row(row.to_vec());
+        }
+
+        println!("Prompts:");
+        println!("{table}");
+        Ok(())
+    }
+
     async fn rebuild_tool_scope(
         &mut self,
         app: &AppConfig,
@@ -3763,24 +3788,7 @@ impl RequestContext {
             && let Some(mcp_config) = &self.app.mcp_config
         {
             let server_ids: Vec<String> = match &enabled_mcp_servers {
-                Some(servers) if servers.iter().any(|s| s.trim() == "all") => {
-                    mcp_config.mcp_servers.keys().cloned().collect()
-                }
-                Some(servers) => {
-                    let mut ids = Vec::new();
-                    for item in servers.iter().map(|s| s.trim()) {
-                        if mcp_config.mcp_servers.contains_key(item) {
-                            ids.push(item.to_string());
-                        } else if let Some(mapped) = app.mapping_mcp_servers.get(item) {
-                            for mapped_id in mapped.split(',').map(|s| s.trim()) {
-                                if mcp_config.mcp_servers.contains_key(mapped_id) {
-                                    ids.push(mapped_id.to_string());
-                                }
-                            }
-                        }
-                    }
-                    ids
-                }
+                Some(servers) => expand_enabled_mcp_server_ids(app, mcp_config, servers),
                 None => vec![],
             };
 
@@ -3836,7 +3844,7 @@ impl RequestContext {
             functions.append_todo_functions();
         }
         if !mcp_runtime.is_empty() {
-            functions.append_mcp_meta_functions(mcp_runtime.server_names());
+            functions.append_mcp_meta_functions(mcp_runtime.server_features());
         }
         if app.function_calling_support && policy.skills_enabled {
             functions.append_skill_functions();
@@ -4685,10 +4693,11 @@ mod tests {
     use crate::config::AppState;
     use crate::config::agent::AgentConfig;
     use crate::function::{ToolCall, skill};
-    use crate::mcp::{McpServer, McpServersConfig, McpTransportType};
+    use crate::mcp::{McpServer, McpServerFeatures, McpServersConfig, McpTransportType};
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
+    use rmcp::model::PromptArgument;
     use serde_json::json;
     use serial_test::serial;
     use std::env;
@@ -4744,6 +4753,15 @@ mod tests {
 
     fn create_test_ctx() -> RequestContext {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
+    }
+
+    fn tools_only_features(name: &str) -> McpServerFeatures {
+        McpServerFeatures {
+            name: name.to_string(),
+            tools: true,
+            resources: false,
+            prompts: false,
+        }
     }
 
     #[test]
@@ -4834,10 +4852,10 @@ mod tests {
     }
 
     #[test]
-    fn use_prompt_creates_temp_role() {
+    fn use_temp_role_creates_temp_role() {
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
-        ctx.use_prompt(&app, "you are a pirate").unwrap();
+        ctx.use_temp_role(&app, "you are a pirate").unwrap();
         assert!(ctx.role.is_some());
         assert_eq!(ctx.role.as_ref().unwrap().name(), "temp");
         assert!(
@@ -4847,6 +4865,41 @@ mod tests {
                 .prompt()
                 .contains("you are a pirate")
         );
+    }
+
+    #[test]
+    fn mcp_prompt_rows_assembles_columns() {
+        let items = vec![
+            CatalogItem {
+                name: "summarize".to_string(),
+                server: "docs".to_string(),
+                description: "Summarize a document".to_string(),
+                arguments: Some(vec![
+                    PromptArgument::new("path").with_required(true),
+                    PromptArgument::new("style"),
+                ]),
+                ..Default::default()
+            },
+            CatalogItem {
+                name: "greet".to_string(),
+                server: "misc".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let rows = mcp_prompt_rows(&items);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            [
+                "docs",
+                "summarize",
+                "Summarize a document",
+                "path (required), style"
+            ]
+        );
+        assert_eq!(rows[1], ["misc", "greet", "", ""]);
     }
 
     #[test]
@@ -5753,9 +5806,10 @@ mod tests {
     #[test]
     fn select_enabled_mcp_servers_all_returns_all_mcp_functions() {
         let mut ctx = create_test_ctx();
-        ctx.tool_scope
-            .functions
-            .append_mcp_meta_functions(vec!["github".into(), "slack".into()]);
+        ctx.tool_scope.functions.append_mcp_meta_functions(vec![
+            tools_only_features("github"),
+            tools_only_features("slack"),
+        ]);
 
         let mut role = Role::new("r", "p");
         role.set_enabled_mcp_servers(Some(vec!["all".to_string()]));
@@ -5770,9 +5824,10 @@ mod tests {
     #[test]
     fn select_enabled_mcp_servers_comma_filters() {
         let mut ctx = create_test_ctx();
-        ctx.tool_scope
-            .functions
-            .append_mcp_meta_functions(vec!["github".into(), "slack".into()]);
+        ctx.tool_scope.functions.append_mcp_meta_functions(vec![
+            tools_only_features("github"),
+            tools_only_features("slack"),
+        ]);
 
         let mut role = Role::new("r", "p");
         role.set_enabled_mcp_servers(Some(vec!["github".to_string()]));
@@ -5781,6 +5836,28 @@ mod tests {
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains(&"mcp_invoke_github"));
         assert!(!names.contains(&"mcp_invoke_slack"));
+    }
+
+    #[test]
+    fn select_enabled_mcp_servers_keeps_resources_only_server() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope
+            .functions
+            .append_mcp_meta_functions(vec![McpServerFeatures {
+                name: "res".to_string(),
+                tools: false,
+                resources: true,
+                prompts: false,
+            }]);
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_mcp_servers(Some(vec!["res".to_string()]));
+
+        let fns = ctx.select_enabled_mcp_servers(&role);
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"mcp_search_res"));
+        assert!(names.contains(&"mcp_describe_res"));
+        assert!(!names.contains(&"mcp_invoke_res"));
     }
 
     #[test]

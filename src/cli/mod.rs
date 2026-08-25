@@ -47,7 +47,7 @@ pub enum McpScopeArg {
 			.args(["sandbox", "fresh"])
 			.multiple(true)
 			.conflicts_with_all([
-				"model", "prompt", "role", "session", "agent", "rag", "rebuild_rag",
+				"model", "temp_role", "role", "session", "agent", "rag", "rebuild_rag",
 				"macro_name", "execute", "code", "file", "no_stream", "no_memory",
 				"init_memory", "dry_run", "info", "build_tools", "install",
 				"install_builtins", "sync_models", "list_models", "list_roles",
@@ -70,9 +70,9 @@ pub struct Cli {
     /// Select a LLM model
     #[arg(short, long, add = ArgValueCompleter::new(model_completer))]
     pub model: Option<String>,
-    /// Use the system prompt
+    /// Set a temporary role (an ad-hoc system prompt) for this invocation
     #[arg(long)]
-    pub prompt: Option<String>,
+    pub temp_role: Option<String>,
     /// Select a role
     #[arg(short, long, add = ArgValueCompleter::new(role_completer))]
     pub role: Option<String>,
@@ -705,9 +705,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_prompt_flag() {
-        let cli = parse(&["--prompt", "be a pirate"]);
-        assert_eq!(cli.prompt, Some("be a pirate".to_string()));
+    fn parse_temp_role_flag() {
+        let cli = parse(&["--temp-role", "be a pirate"]);
+        assert_eq!(cli.temp_role, Some("be a pirate".to_string()));
     }
 
     #[test]

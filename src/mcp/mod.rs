@@ -1,6 +1,7 @@
 mod auth_client;
 pub(crate) mod manage;
 pub(crate) mod oauth;
+pub(crate) mod render;
 mod sse_transport;
 
 use crate::config::AppConfig;
@@ -15,6 +16,7 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use http::{HeaderName, HeaderValue};
 use indexmap::IndexMap;
 use indoc::formatdoc;
+use rmcp::model::{PromptArgument, ServerCapabilities};
 use rmcp::service::RunningService;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::TokioChildProcess;
@@ -34,27 +36,97 @@ use tokio::process::Command;
 pub const MCP_INVOKE_META_FUNCTION_NAME_PREFIX: &str = "mcp_invoke";
 pub const MCP_SEARCH_META_FUNCTION_NAME_PREFIX: &str = "mcp_search";
 pub const MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX: &str = "mcp_describe";
+pub const MCP_READ_META_FUNCTION_NAME_PREFIX: &str = "mcp_read";
+pub const MCP_PROMPT_META_FUNCTION_NAME_PREFIX: &str = "mcp_prompt";
+
+pub const MCP_META_FUNCTION_PREFIXES: [&str; 5] = [
+    MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
+    MCP_SEARCH_META_FUNCTION_NAME_PREFIX,
+    MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX,
+    MCP_READ_META_FUNCTION_NAME_PREFIX,
+    MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
+];
+
+pub fn is_mcp_meta_function(name: &str) -> bool {
+    MCP_META_FUNCTION_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+pub fn mcp_meta_function_names(server: &str) -> Vec<String> {
+    MCP_META_FUNCTION_PREFIXES
+        .iter()
+        .map(|prefix| format!("{prefix}_{server}"))
+        .collect()
+}
 
 pub type ConnectedServer = RunningService<RoleClient, ()>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerFeatures {
+    pub name: String,
+    pub tools: bool,
+    pub resources: bool,
+    pub prompts: bool,
+}
+
+impl McpServerFeatures {
+    pub fn from_capabilities(
+        name: impl Into<String>,
+        capabilities: Option<&ServerCapabilities>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            tools: capabilities.is_none_or(|c| c.tools.is_some()),
+            resources: capabilities.is_some_and(|c| c.resources.is_some()),
+            prompts: capabilities.is_some_and(|c| c.prompts.is_some()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogItemKind {
+    #[default]
+    Tool,
+    Resource,
+    ResourceTemplate,
+    Prompt,
+}
+
+impl CatalogItemKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tool => "tool",
+            Self::Resource => "resource",
+            Self::ResourceTemplate => "resource_template",
+            Self::Prompt => "prompt",
+        }
+    }
+}
+
+impl Display for CatalogItemKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CatalogItem {
+    pub kind: CatalogItemKind,
     pub name: String,
     pub server: String,
     pub description: String,
-}
-
-#[derive(Debug)]
-struct ServerCatalog {
-    items: HashMap<String, CatalogItem>,
-}
-
-impl Clone for ServerCatalog {
-    fn clone(&self) -> Self {
-        Self {
-            items: self.items.clone(),
-        }
-    }
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Vec<PromptArgument>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -160,7 +232,6 @@ pub struct McpRegistry {
     log_path: Option<PathBuf>,
     config: Option<McpServersConfig>,
     servers: HashMap<String, Arc<ConnectedServer>>,
-    catalogs: HashMap<String, ServerCatalog>,
 }
 
 impl McpRegistry {
@@ -303,7 +374,7 @@ impl McpRegistry {
 
         debug!("Starting selected MCP servers: {:?}", ids_to_start);
 
-        let results: Vec<Option<(String, Arc<ConnectedServer>, ServerCatalog)>> = stream::iter(
+        let results: Vec<Option<(String, Arc<ConnectedServer>)>> = stream::iter(
             ids_to_start
                 .into_iter()
                 .map(|id| async { self.start_server(id).await }),
@@ -312,18 +383,14 @@ impl McpRegistry {
         .try_collect()
         .await?;
 
-        for (id, server, catalog) in results.into_iter().flatten() {
-            self.servers.insert(id.clone(), server);
-            self.catalogs.insert(id, catalog);
+        for (id, server) in results.into_iter().flatten() {
+            self.servers.insert(id, server);
         }
 
         Ok(())
     }
 
-    async fn start_server(
-        &self,
-        id: String,
-    ) -> Result<Option<(String, Arc<ConnectedServer>, ServerCatalog)>> {
+    async fn start_server(&self, id: String) -> Result<Option<(String, Arc<ConnectedServer>)>> {
         let spec = self
             .config
             .as_ref()
@@ -347,30 +414,9 @@ impl McpRegistry {
             Err(e) => return Err(e),
         };
 
-        let tools = service.list_tools(None).await?;
-        debug!("Available tools for MCP server {id}: {tools:?}");
-
-        let mut items_vec = Vec::new();
-        for t in tools.tools {
-            let name = t.name.to_string();
-            let description = t.description.unwrap_or_default().to_string();
-            items_vec.push(CatalogItem {
-                name,
-                server: id.clone(),
-                description,
-            });
-        }
-
-        let mut items_map = HashMap::new();
-        items_vec.into_iter().for_each(|it| {
-            items_map.insert(it.name.clone(), it);
-        });
-
-        let catalog = ServerCatalog { items: items_map };
-
         info!("Started MCP server: {id}");
 
-        Ok(Some((id.to_string(), service, catalog)))
+        Ok(Some((id, service)))
     }
 
     fn resolve_server_ids(&self, enabled_mcp_servers: Option<Vec<String>>) -> Vec<String> {
@@ -398,8 +444,21 @@ impl McpRegistry {
         &self.servers
     }
 
-    pub fn list_started_servers(&self) -> Vec<String> {
-        self.servers.keys().cloned().collect()
+    pub fn server_features(&self) -> Vec<McpServerFeatures> {
+        let mut features: Vec<McpServerFeatures> = self
+            .servers
+            .iter()
+            .map(|(name, handle)| {
+                let info = handle.peer_info();
+                McpServerFeatures::from_capabilities(
+                    name.as_str(),
+                    info.as_ref().map(|info| &info.capabilities),
+                )
+            })
+            .collect();
+
+        features.sort_by(|a, b| a.name.cmp(&b.name));
+        features
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1161,7 +1220,7 @@ mod tests {
         let registry = McpRegistry::default();
 
         assert!(registry.is_empty());
-        assert!(registry.list_started_servers().is_empty());
+        assert!(registry.server_features().is_empty());
         assert!(registry.mcp_config().is_none());
         assert!(registry.log_path().is_none());
     }
@@ -1185,6 +1244,51 @@ mod tests {
         assert_eq!(MCP_INVOKE_META_FUNCTION_NAME_PREFIX, "mcp_invoke");
         assert_eq!(MCP_SEARCH_META_FUNCTION_NAME_PREFIX, "mcp_search");
         assert_eq!(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, "mcp_describe");
+        assert_eq!(MCP_READ_META_FUNCTION_NAME_PREFIX, "mcp_read");
+        assert_eq!(MCP_PROMPT_META_FUNCTION_NAME_PREFIX, "mcp_prompt");
+    }
+
+    #[test]
+    fn is_mcp_meta_function_classifies_names() {
+        assert!(is_mcp_meta_function("mcp_invoke_github"));
+        assert!(is_mcp_meta_function("mcp_search_github"));
+        assert!(is_mcp_meta_function("mcp_describe_github"));
+        assert!(is_mcp_meta_function("mcp_read_github"));
+        assert!(is_mcp_meta_function("mcp_prompt_github"));
+        assert!(!is_mcp_meta_function("mcp_gateway_tool"));
+        assert!(!is_mcp_meta_function("fs_read"));
+        assert!(!is_mcp_meta_function(""));
+        assert!(!is_mcp_meta_function("mcp_"));
+    }
+
+    #[test]
+    fn meta_function_prefixes_are_not_prefixes_of_each_other() {
+        for (i, a) in MCP_META_FUNCTION_PREFIXES.iter().enumerate() {
+            for (j, b) in MCP_META_FUNCTION_PREFIXES.iter().enumerate() {
+                if i != j {
+                    assert!(!b.starts_with(a), "{a} is a prefix of {b}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn is_mcp_meta_function_preserves_lax_prefix_matching() {
+        assert!(is_mcp_meta_function("mcp_invoker_x"));
+    }
+
+    #[test]
+    fn mcp_meta_function_names_returns_all_prefixes_in_order() {
+        assert_eq!(
+            mcp_meta_function_names("github"),
+            vec![
+                "mcp_invoke_github",
+                "mcp_search_github",
+                "mcp_describe_github",
+                "mcp_read_github",
+                "mcp_prompt_github",
+            ]
+        );
     }
 
     #[test]

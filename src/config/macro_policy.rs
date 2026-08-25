@@ -287,6 +287,7 @@ fn discover_macros_in(dirs: &[(MacroSource, PathBuf)]) -> Vec<DiscoveredMacro> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repl;
     use crate::utils::get_env_name;
     use serial_test::serial;
     use std::path::Path;
@@ -563,6 +564,34 @@ mod tests {
 
         assert_eq!(state_of(&policy, "help"), &MacroState::ShadowedBuiltin);
         assert_eq!(state_of(&policy, "a"), &MacroState::Enabled);
+    }
+
+    #[test]
+    fn prompt_macro_is_shadowed_by_builtin() {
+        let policy = MacroPolicy::effective_with(
+            globals(&["prompt"]),
+            None,
+            None,
+            None,
+            None,
+            &repl::builtin_command_names(),
+        );
+
+        assert_eq!(state_of(&policy, "prompt"), &MacroState::ShadowedBuiltin);
+    }
+
+    #[test]
+    fn temp_role_macro_is_shadowed_by_builtin() {
+        let policy = MacroPolicy::effective_with(
+            globals(&["temp-role"]),
+            None,
+            None,
+            None,
+            None,
+            &repl::builtin_command_names(),
+        );
+
+        assert_eq!(state_of(&policy, "temp-role"), &MacroState::ShadowedBuiltin);
     }
 
     #[test]

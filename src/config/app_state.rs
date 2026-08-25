@@ -70,7 +70,7 @@ impl AppState {
 
         let mut functions = Functions::init(config.visible_tools.as_ref().unwrap_or(&Vec::new()))?;
         if !mcp_registry.is_empty() && config.mcp_server_support {
-            functions.append_mcp_meta_functions(mcp_registry.list_started_servers());
+            functions.append_mcp_meta_functions(mcp_registry.server_features());
         }
 
         let mcp_registry = if mcp_registry.is_empty() {

@@ -752,9 +752,29 @@ fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<
 fn is_safe_relative_path(path: &str) -> bool {
     let recorded = Path::new(path);
     !recorded.is_absolute()
-        && recorded
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
+        && recorded.components().all(|c| match c {
+            Component::Normal(name) => is_safe_component(&name.to_string_lossy()),
+            _ => false,
+        })
+}
+
+/// Rejects names Windows refuses or silently rewrites (alternate data stream
+/// colons, reserved device names, trailing dots or spaces) so a recorded path
+/// denotes the same regular file on every platform.
+fn is_safe_component(name: &str) -> bool {
+    !name.contains(':')
+        && !name.ends_with('.')
+        && !name.ends_with(' ')
+        && !is_windows_reserved_name(name)
+}
+
+fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("");
+    let lower = stem.to_ascii_lowercase();
+    matches!(lower.as_str(), "con" | "prn" | "aux" | "nul")
+        || (lower.len() == 4
+            && (lower.starts_with("com") || lower.starts_with("lpt"))
+            && matches!(lower.as_bytes()[3], b'1'..=b'9'))
 }
 
 fn uninstall_owned_files(
@@ -1067,7 +1087,12 @@ impl TempRepoDir {
 
 impl Drop for TempRepoDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            log::warn!(
+                "failed to remove temp clone {}: {error}",
+                self.path.display()
+            );
+        }
     }
 }
 
@@ -1079,13 +1104,37 @@ fn is_commit_sha(reference: &str) -> bool {
 
 fn clone_to_temp(url: &str, reference: Option<&str>) -> Result<TempRepoDir> {
     let dest = utils::temp_file("coyote-remote-install-", "");
+    match clone_into(&dest, url, reference) {
+        Ok(head_sha) => Ok(TempRepoDir {
+            path: dest,
+            head_sha,
+        }),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&dest);
+            Err(error)
+        }
+    }
+}
+
+/// Checked-out bytes must not depend on the machine's git configuration:
+/// recorded sha256 provenance would otherwise drift with autocrlf settings.
+/// Long paths are opted into for deep bundle trees on Windows.
+fn git_content_config() -> Vec<OsString> {
+    ["core.autocrlf=false", "core.eol=lf", "core.longpaths=true"]
+        .iter()
+        .flat_map(|setting| ["-c".into(), (*setting).into()])
+        .collect()
+}
+
+fn clone_into(dest: &Path, url: &str, reference: Option<&str>) -> Result<String> {
     let dest_arg: OsString = dest.as_os_str().into();
 
     let is_sha = reference.is_some_and(is_commit_sha);
 
     match reference {
         Some(r) if !is_sha => {
-            run_git(vec![
+            let mut args = git_content_config();
+            args.extend([
                 "clone".into(),
                 "--depth".into(),
                 "1".into(),
@@ -1094,26 +1143,28 @@ fn clone_to_temp(url: &str, reference: Option<&str>) -> Result<TempRepoDir> {
                 "--".into(),
                 url.into(),
                 dest_arg,
-            ])?;
+            ]);
+            run_git(args)?;
         }
         Some(r) => {
-            run_git(vec![
-                "clone".into(),
-                "--".into(),
-                url.into(),
-                dest_arg.clone(),
-            ])?;
-            run_git(vec!["-C".into(), dest_arg, "checkout".into(), r.into()])?;
+            let mut args = git_content_config();
+            args.extend(["clone".into(), "--".into(), url.into(), dest_arg.clone()]);
+            run_git(args)?;
+            let mut args = git_content_config();
+            args.extend(["-C".into(), dest_arg, "checkout".into(), r.into()]);
+            run_git(args)?;
         }
         None => {
-            run_git(vec![
+            let mut args = git_content_config();
+            args.extend([
                 "clone".into(),
                 "--depth".into(),
                 "1".into(),
                 "--".into(),
                 url.into(),
                 dest_arg,
-            ])?;
+            ]);
+            run_git(args)?;
         }
     }
 
@@ -1123,11 +1174,7 @@ fn clone_to_temp(url: &str, reference: Option<&str>) -> Result<TempRepoDir> {
         "rev-parse".into(),
         "HEAD".into(),
     ])?;
-
-    Ok(TempRepoDir {
-        path: dest,
-        head_sha,
-    })
+    Ok(head_sha)
 }
 
 fn run_git(args: Vec<OsString>) -> Result<()> {
@@ -1816,7 +1863,17 @@ fn record_written_file(
 }
 
 fn provenance_path(dst: &Path) -> String {
-    let rel = dst.strip_prefix(paths::config_dir()).unwrap_or(dst);
+    let rel = match dst.strip_prefix(paths::config_dir()) {
+        Ok(rel) => rel,
+        Err(_) => {
+            log::warn!(
+                "bundle file {} lies outside the config dir (an asset dir override?); \
+                 it will not be uninstallable and drift checks may misreport it",
+                dst.display()
+            );
+            dst
+        }
+    };
     rel.to_string_lossy().replace('\\', "/")
 }
 
@@ -2241,6 +2298,53 @@ mod tests {
     use serial_test::serial;
     use std::env;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn safe_relative_path_accepts_plain_portable_components() {
+        assert!(is_safe_relative_path("macros/a.yaml"));
+        assert!(is_safe_relative_path("skills/deep/nested/file.md"));
+        assert!(is_safe_relative_path("functions/tools/console.sh"));
+        assert!(is_safe_relative_path("roles/common.md"));
+    }
+
+    #[test]
+    fn safe_relative_path_rejects_escapes_and_windows_hazards() {
+        assert!(!is_safe_relative_path("../outside.yaml"));
+        assert!(!is_safe_relative_path("/abs/path.yaml"));
+        assert!(!is_safe_relative_path("macros/../../evil.yaml"));
+        assert!(!is_safe_relative_path("macros/a.yaml:stream"));
+        assert!(!is_safe_relative_path("macros/trailing."));
+        assert!(!is_safe_relative_path("macros/trailing "));
+        assert!(!is_safe_relative_path("macros/nul"));
+        assert!(!is_safe_relative_path("macros/NUL.yaml"));
+        assert!(!is_safe_relative_path("con/a.yaml"));
+        assert!(!is_safe_relative_path("macros/COM1.txt"));
+        assert!(!is_safe_relative_path("macros/lpt9"));
+    }
+
+    #[test]
+    fn windows_reserved_name_check_is_stem_based() {
+        assert!(is_windows_reserved_name("nul"));
+        assert!(is_windows_reserved_name("NUL.txt"));
+        assert!(is_windows_reserved_name("com1"));
+        assert!(!is_windows_reserved_name("com0"));
+        assert!(!is_windows_reserved_name("com10"));
+        assert!(!is_windows_reserved_name("console"));
+        assert!(!is_windows_reserved_name("nullable.yaml"));
+    }
+
+    #[test]
+    fn git_content_config_pins_line_endings_and_long_paths() {
+        let args = git_content_config();
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(rendered.len(), 6);
+        assert!(rendered.contains(&"core.autocrlf=false".to_string()));
+        assert!(rendered.contains(&"core.eol=lf".to_string()));
+        assert!(rendered.contains(&"core.longpaths=true".to_string()));
+    }
 
     struct TestVaultConfigGuard {
         dir_key: String,
@@ -4286,6 +4390,12 @@ mod tests {
     #[test]
     #[serial]
     fn uninstall_shorthand_with_multiple_matches_bails_non_interactively() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping uninstall_shorthand_with_multiple_matches_bails_non_interactively: requires non-TTY stdout"
+            );
+            return;
+        }
         let _guard = TestVaultConfigGuard::new("uninst-short-multi");
         let mut store = BundleStore::load().unwrap();
         store

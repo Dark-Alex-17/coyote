@@ -13,7 +13,7 @@ use crate::client::{
 };
 use crate::config::{
     AgentVariables, AppConfig, AssertState, Input, LastMessage, MacroState, RequestContext,
-    StateFlags, macro_execute,
+    StateFlags, flatten_prompt_messages, macro_execute, resolve_prompt_args, sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
 use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
@@ -29,6 +29,7 @@ use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
 use indoc::indoc;
+use inquire::Text;
 use log::warn;
 use parking_lot::RwLock;
 use reedline::CursorConfig;
@@ -38,6 +39,7 @@ use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
 };
 use reedline::{MenuBuilder, Signal};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::{env, process, sync::Arc};
 use tokio::task;
@@ -53,7 +55,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 61]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 62]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -105,6 +107,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 61]> = LazyLock::new(|| {
         ReplCommand::new(".model", "Switch LLM model", AssertState::pass()),
         ReplCommand::new(
             ".prompt",
+            "Invoke an MCP prompt and submit the result as chat input",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".temp-role",
             "Set a temporary role using a prompt",
             AssertState::False(StateFlags::SESSION | StateFlags::AGENT),
         ),
@@ -307,7 +314,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 61]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".list",
-            "List roles, sessions, agents, RAGs, macros, skills, tools, MCP servers, or bundles",
+            "List roles, sessions, agents, RAGs, macros, skills, prompts, tools, MCP servers, or bundles",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -774,12 +781,47 @@ pub async fn run_repl_command(
     .tool disable <name>            # Disable a single tool in the current context"#
                 ),
             },
-            ".prompt" => match args {
+            ".prompt" => {
+                let (words, _) = split_args_text(args.unwrap_or_default(), cfg!(windows));
+                match words.as_slice() {
+                    [server, name, rest @ ..] => {
+                        let provided = parse_prompt_call_args(rest)?;
+                        let prompts = ctx.tool_scope.mcp_runtime.list_prompts(server).await?;
+                        let declared = prompts
+                            .into_iter()
+                            .find(|prompt| prompt.name == *name)
+                            .with_context(|| {
+                                format!("Prompt '{name}' not found on MCP server '{server}'")
+                            })?
+                            .arguments
+                            .unwrap_or_default();
+                        let (mut arguments, missing) = resolve_prompt_args(&declared, provided);
+                        for key in missing {
+                            let value = Text::new(&prompt_arg_inquire_label(server, name, &key))
+                                .prompt()
+                                .with_context(|| {
+                                    format!("Failed to read prompt argument '{key}'")
+                                })?;
+                            arguments.insert(key, value);
+                        }
+                        let result = ctx
+                            .tool_scope
+                            .mcp_runtime
+                            .prompt(server, name, arguments)
+                            .await?;
+                        let flattened = flatten_prompt_messages(&result.messages);
+                        let input = Input::from_str(ctx, &flattened, None)?;
+                        ask(ctx, abort_signal.clone(), input, true).await?;
+                    }
+                    _ => println!("Usage: .prompt <server> <name> [key=value ...]"),
+                }
+            }
+            ".temp-role" => match args {
                 Some(text) => {
                     let app = Arc::clone(&ctx.app.config);
-                    ctx.use_prompt(app.as_ref(), text)?;
+                    ctx.use_temp_role(app.as_ref(), text)?;
                 }
-                None => println!("Usage: .prompt <text>..."),
+                None => println!("Usage: .temp-role <text>..."),
             },
             ".role" => match args {
                 Some(args) => match args.split_once(['\n', ' ']) {
@@ -1207,13 +1249,16 @@ pub async fn run_repl_command(
                     println!("Usage: .uninstall <bundle-name> [--yes] (see `.uninstall --help`)")
                 }
             },
-            ".list" => match args {
+            ".list" => match args.map(str::trim) {
+                Some("prompts") => {
+                    ctx.list_mcp_prompts().await?;
+                }
                 Some(args) => {
-                    ctx.list_assets(args.trim())?;
+                    ctx.list_assets(args)?;
                 }
                 _ => {
                     println!(
-                        "Usage: .list <roles|sessions|agents|rags|macros|skills|tools|mcp-servers|bundles>"
+                        "Usage: .list <roles|sessions|agents|rags|macros|skills|prompts|tools|mcp-servers|bundles>"
                     )
                 }
             },
@@ -1737,6 +1782,37 @@ fn split_first_arg(args: Option<&str>) -> Option<(&str, Option<&str>)> {
     })
 }
 
+fn parse_prompt_call_args(words: &[String]) -> Result<HashMap<String, String>> {
+    let mut args = HashMap::new();
+    for word in words {
+        let Some((key, value)) = word.split_once('=') else {
+            bail!("Invalid prompt argument '{word}': arguments must be key=value pairs");
+        };
+        args.insert(key.to_string(), unquote_prompt_value(value).to_string());
+    }
+    Ok(args)
+}
+
+fn unquote_prompt_value(value: &str) -> &str {
+    let quoted = value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')));
+    if quoted {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+fn prompt_arg_inquire_label(server: &str, prompt: &str, arg: &str) -> String {
+    format!(
+        "Prompt '{}' on '{}' requires '{}':",
+        sanitize_display_text(prompt),
+        sanitize_display_text(server),
+        sanitize_display_text(arg)
+    )
+}
+
 pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -1888,8 +1964,47 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_61_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 61);
+    fn repl_commands_has_62_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 62);
+    }
+
+    #[test]
+    fn parse_prompt_call_args_splits_on_first_equals_and_unquotes() {
+        let words = vec![
+            "path=notes.txt".to_string(),
+            r#"style="a b""#.to_string(),
+            "expr=a=b".to_string(),
+        ];
+
+        let args = parse_prompt_call_args(&words).unwrap();
+
+        assert_eq!(args["path"], "notes.txt");
+        assert_eq!(args["style"], "a b");
+        assert_eq!(args["expr"], "a=b");
+    }
+
+    #[test]
+    fn parse_prompt_call_args_rejects_words_without_equals() {
+        let err = parse_prompt_call_args(&["positional".to_string()])
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "Invalid prompt argument 'positional': arguments must be key=value pairs"
+        );
+    }
+
+    #[test]
+    fn prompt_arg_inquire_label_sanitizes_all_components() {
+        assert_eq!(
+            prompt_arg_inquire_label("srv", "summarize", "path"),
+            "Prompt 'summarize' on 'srv' requires 'path':"
+        );
+        assert_eq!(
+            prompt_arg_inquire_label("s\u{1b}[31mrv", "sum\u{1b}]0;x\u{7}marize", "pa\u{7}th"),
+            "Prompt 'summarize' on 'srv' requires 'pa th':"
+        );
     }
 
     #[test]
@@ -2105,8 +2220,20 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_prompt_blocked_in_session_or_agent() {
+    fn repl_commands_prompt_always_available() {
         let cmd = REPL_COMMANDS.iter().find(|c| c.name == ".prompt").unwrap();
+        assert!(cmd.is_valid(StateFlags::empty()));
+        assert!(cmd.is_valid(StateFlags::ROLE));
+        assert!(cmd.is_valid(StateFlags::SESSION));
+        assert!(cmd.is_valid(StateFlags::AGENT));
+    }
+
+    #[test]
+    fn repl_commands_temp_role_blocked_in_session_or_agent() {
+        let cmd = REPL_COMMANDS
+            .iter()
+            .find(|c| c.name == ".temp-role")
+            .unwrap();
         assert!(cmd.is_valid(StateFlags::empty()));
         assert!(cmd.is_valid(StateFlags::ROLE));
         assert!(!cmd.is_valid(StateFlags::SESSION));
