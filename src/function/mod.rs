@@ -405,7 +405,11 @@ impl ToolResult {
     pub fn truncate_if_needed(mut self, max_chars: usize) -> Self {
         let s = self.output.to_string();
         if s.len() > max_chars {
-            let prefix = s.get(..max_chars).unwrap_or(s.as_str());
+            let mut cut = max_chars;
+            while !s.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let prefix = &s[..cut];
             self.output = json!(format!(
                 "[truncated: tool output exceeded {max_chars} chars]\n{prefix}"
             ));
@@ -4179,23 +4183,54 @@ mod tests {
         assert!(!results[0].output.to_string().contains("[truncated"));
     }
 
-    /// Pins current behavior: when the char cap lands inside a multi-byte
-    /// UTF-8 character of the serialized output, no prefix can be taken, so
-    /// the truncation marker is prepended to the FULL original output and the
-    /// "truncated" result is longer than the input.
+    /// When the char cap lands inside a multi-byte UTF-8 character of the
+    /// serialized output, the cut is floored to the previous char boundary
+    /// so the output actually shrinks.
     #[test]
-    fn truncate_if_needed_utf8_boundary_returns_full_output_with_marker() {
+    fn truncate_if_needed_floors_cut_to_char_boundary() {
         let serialized = json!("aé").to_string();
         let result = ToolResult::new(call("t", Some("id-1")), json!("aé"));
 
         let truncated = result.truncate_if_needed(3);
 
         let out = truncated.output.as_str().unwrap();
+        assert_eq!(out, "[truncated: tool output exceeded 3 chars]\n\"a");
+        assert!(out.len() < "[truncated: tool output exceeded 3 chars]\n".len() + serialized.len());
+    }
+
+    #[test]
+    fn truncate_if_needed_cap_on_char_boundary_truncates_normally() {
+        let result = ToolResult::new(call("t", Some("id-1")), json!("aé"));
+
+        let truncated = result.truncate_if_needed(2);
+
         assert_eq!(
-            out,
-            format!("[truncated: tool output exceeded 3 chars]\n{serialized}")
+            truncated.output.as_str().unwrap(),
+            "[truncated: tool output exceeded 2 chars]\n\"a"
         );
-        assert!(out.len() > serialized.len());
+    }
+
+    #[test]
+    fn truncate_if_needed_cap_zero_yields_marker_and_empty_prefix() {
+        let result = ToolResult::new(call("t", Some("id-1")), json!("aé"));
+
+        let truncated = result.truncate_if_needed(0);
+
+        assert_eq!(
+            truncated.output.as_str().unwrap(),
+            "[truncated: tool output exceeded 0 chars]\n"
+        );
+    }
+
+    #[test]
+    fn truncate_if_needed_cap_at_or_above_length_leaves_output_unchanged() {
+        for cap in [5, 100] {
+            let result = ToolResult::new(call("t", Some("id-1")), json!("aé"));
+
+            let truncated = result.truncate_if_needed(cap);
+
+            assert_eq!(truncated.output, json!("aé"));
+        }
     }
 
     #[test]
