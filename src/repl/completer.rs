@@ -224,6 +224,7 @@ fn list_prompts_blocking(
         Some(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
         None => tokio::runtime::Runtime::new().ok()?.block_on(fut),
     };
+
     result.ok()?.ok()
 }
 

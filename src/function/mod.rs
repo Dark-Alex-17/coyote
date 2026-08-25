@@ -787,9 +787,9 @@ impl Functions {
                             name: invoke_function_name.clone(),
                             description: formatdoc!(
                                 r#"
-										Invoke the specified tool on the {server} MCP server. Always call {describe_function_name} first to
-										find the correct invocation schema for the given tool.
-										"#
+                                Invoke the specified tool on the {server} MCP server. Always call {describe_function_name} first to
+                                find the correct invocation schema for the given tool.
+                                "#
                             ),
                             parameters: JsonSchema {
                                 type_value: Some("object".to_string()),
@@ -1963,6 +1963,7 @@ fn render_resource_content(
         "total_bytes": rendered.total_bytes,
         "next_offset": rendered.next_offset,
     });
+
     if let Some(next_offset) = rendered.next_offset {
         value["note"] = json!(format!(
             "Content truncated; re-call with offset={next_offset} to continue (max_bytes is \
@@ -1970,6 +1971,7 @@ fn render_resource_content(
             render::TEXT_MAX_BYTES_CLAMP
         ));
     }
+
     Ok(value)
 }
 
@@ -2010,6 +2012,7 @@ fn render_tool_result(mut result: Value, server: &str) -> Result<Value> {
             }),
         );
     }
+
     Ok(result)
 }
 
@@ -2049,6 +2052,7 @@ fn render_tool_content_item(item: &mut Value, server: &str) -> Result<()> {
         }
         _ => {}
     }
+
     Ok(())
 }
 
@@ -2068,6 +2072,7 @@ fn render_tool_blob(
         // One undecodable item must not sink the rest of the result.
         Err(error) => json!({ "error": format!("Failed to render blob content: {error}") }),
     };
+
     if let Some(map) = value.as_object_mut() {
         if let Some(mime_type) = mime_type
             && !map.contains_key("mime_type")
@@ -2078,6 +2083,7 @@ fn render_tool_blob(
             map.insert("uri".to_string(), json!(uri));
         }
     }
+
     Ok(value)
 }
 
@@ -2085,9 +2091,11 @@ fn clamp_tool_text(container: &mut Value) {
     let Some(text) = container.get("text").and_then(Value::as_str) else {
         return;
     };
+
     if text.len() <= render::TEXT_MAX_BYTES_CLAMP {
         return;
     }
+
     let total_bytes = text.len();
     let clamped = render::truncate_utf8(text, render::TEXT_MAX_BYTES_CLAMP).to_string();
     let Some(map) = container.as_object_mut() else {
@@ -2110,9 +2118,11 @@ fn clamp_metadata_field(object: &mut Value, key: &str) {
     let Some(text) = object.get(key).and_then(Value::as_str) else {
         return;
     };
+
     if text.len() <= render::METADATA_MAX_BYTES {
         return;
     }
+
     let clamped = render::clamp_metadata(text);
     object[key] = json!(clamped);
 }
@@ -2471,6 +2481,7 @@ mod tests {
     use rmcp::model::{CallToolResult, ContentBlock};
     use serde_json::json;
     use serial_test::serial;
+    use std::process;
     use std::sync::Arc;
 
     fn call(name: &str, id: Option<&str>) -> ToolCall {
@@ -2779,11 +2790,8 @@ mod tests {
         assert_eq!(MCP_INVOKE_META_FUNCTION_NAME_PREFIX, "mcp_invoke");
         assert_eq!(MCP_SEARCH_META_FUNCTION_NAME_PREFIX, "mcp_search");
         assert_eq!(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, "mcp_describe");
-        assert_eq!(crate::mcp::MCP_READ_META_FUNCTION_NAME_PREFIX, "mcp_read");
-        assert_eq!(
-            crate::mcp::MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
-            "mcp_prompt"
-        );
+        assert_eq!(MCP_READ_META_FUNCTION_NAME_PREFIX, "mcp_read");
+        assert_eq!(MCP_PROMPT_META_FUNCTION_NAME_PREFIX, "mcp_prompt");
     }
 
     #[test]
@@ -2866,7 +2874,9 @@ mod tests {
     #[test]
     fn functions_append_mcp_meta_creates_three_per_server() {
         let mut f = Functions::default();
+
         f.append_mcp_meta_functions(vec![tools_only("github")]);
+
         assert_eq!(f.declarations().len(), 3);
         assert!(f.contains("mcp_invoke_github"));
         assert!(f.contains("mcp_search_github"));
@@ -2876,7 +2886,9 @@ mod tests {
     #[test]
     fn functions_append_mcp_meta_multiple_servers() {
         let mut f = Functions::default();
+
         f.append_mcp_meta_functions(vec![tools_only("github"), tools_only("slack")]);
+
         assert_eq!(f.declarations().len(), 6);
         assert!(f.contains("mcp_invoke_github"));
         assert!(f.contains("mcp_invoke_slack"));
@@ -2892,7 +2904,9 @@ mod tests {
     #[test]
     fn functions_append_mcp_meta_resources_only_omits_invoke() {
         let mut f = Functions::default();
+
         f.append_mcp_meta_functions(vec![mcp_features("res", false, true, false)]);
+
         assert_eq!(f.declarations().len(), 3);
         assert!(!f.contains("mcp_invoke_res"));
         assert!(!f.contains("mcp_prompt_res"));
@@ -2904,7 +2918,9 @@ mod tests {
     #[test]
     fn functions_append_mcp_meta_all_capabilities_emits_five() {
         let mut f = Functions::default();
+
         f.append_mcp_meta_functions(vec![mcp_features("srv", true, true, true)]);
+
         assert_eq!(f.declarations().len(), 5);
         assert!(f.contains("mcp_invoke_srv"));
         assert!(f.contains("mcp_search_srv"));
@@ -3485,7 +3501,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let cache_dir = env::temp_dir().join(format!(
             "coyote-read-blob-{}-{}",
-            std::process::id(),
+            process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&cache_dir).unwrap();
@@ -3623,7 +3639,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let cache_dir = env::temp_dir().join(format!(
             "coyote-tool-blob-{}-{}",
-            std::process::id(),
+            process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&cache_dir).unwrap();

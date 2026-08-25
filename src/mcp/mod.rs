@@ -456,6 +456,7 @@ impl McpRegistry {
                 )
             })
             .collect();
+
         features.sort_by(|a, b| a.name.cmp(&b.name));
         features
     }

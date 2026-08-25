@@ -287,6 +287,7 @@ fn discover_macros_in(dirs: &[(MacroSource, PathBuf)]) -> Vec<DiscoveredMacro> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repl;
     use crate::utils::get_env_name;
     use serial_test::serial;
     use std::path::Path;
@@ -573,7 +574,7 @@ mod tests {
             None,
             None,
             None,
-            &crate::repl::builtin_command_names(),
+            &repl::builtin_command_names(),
         );
 
         assert_eq!(state_of(&policy, "prompt"), &MacroState::ShadowedBuiltin);
@@ -587,7 +588,7 @@ mod tests {
             None,
             None,
             None,
-            &crate::repl::builtin_command_names(),
+            &repl::builtin_command_names(),
         );
 
         assert_eq!(state_of(&policy, "temp-role"), &MacroState::ShadowedBuiltin);

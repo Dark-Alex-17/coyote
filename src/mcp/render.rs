@@ -7,7 +7,7 @@ use base64::read::DecoderReader;
 use fancy_regex::Regex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::fmt;
+use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
@@ -15,6 +15,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use std::{fmt, io};
 
 /// Default page size when the caller does not specify `max_bytes`.
 pub const DEFAULT_TEXT_MAX_BYTES: usize = 51_200;
@@ -49,7 +50,7 @@ pub enum RenderError {
     InvalidPattern { pattern: String, error: String },
     DecodedSizeExceeded,
     InvalidBase64(String),
-    Io(std::io::Error),
+    Io(io::Error),
 }
 
 impl fmt::Display for RenderError {
@@ -71,8 +72,8 @@ impl fmt::Display for RenderError {
     }
 }
 
-impl std::error::Error for RenderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for RenderError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
             _ => None,
@@ -80,8 +81,8 @@ impl std::error::Error for RenderError {
     }
 }
 
-impl From<std::io::Error> for RenderError {
-    fn from(error: std::io::Error) -> Self {
+impl From<io::Error> for RenderError {
+    fn from(error: io::Error) -> Self {
         Self::Io(error)
     }
 }
@@ -145,6 +146,7 @@ pub fn render_text(
             end += 1;
         }
     }
+
     let truncated = end < total_bytes;
     Ok(RenderedText {
         text: stream[start..end].to_string(),
@@ -222,6 +224,7 @@ pub fn clamp_metadata(text: &str) -> String {
     if text.len() <= METADATA_MAX_BYTES {
         return text.to_string();
     }
+
     let clamped = truncate_utf8(text, METADATA_MAX_BYTES);
     format!("{clamped} [truncated: exceeds METADATA_MAX_BYTES ({METADATA_MAX_BYTES} bytes)]")
 }
@@ -259,6 +262,7 @@ fn filter_lines(text: &str, pattern: &str) -> Result<String, RenderError> {
         out.push(format!("{}{marker}{line}", i + 1));
         prev_kept = Some(i);
     }
+
     Ok(out.join("\n"))
 }
 
@@ -309,6 +313,7 @@ fn extension_for_mime(mime: Option<&str>) -> &'static str {
         && ext
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+
     if safe { ext } else { "bin" }
 }
 
@@ -354,9 +359,11 @@ fn evict_oldest(mut entries: Vec<SpillEntry>, max_total: u64, protect: &Path) {
         if total <= max_total {
             break;
         }
+
         if entry.path == *protect {
             continue;
         }
+
         match fs::remove_file(&entry.path) {
             Ok(()) => total -= entry.size,
             Err(error) if error.kind() == ErrorKind::NotFound => total -= entry.size,
