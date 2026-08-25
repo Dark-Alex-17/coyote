@@ -11,7 +11,6 @@ use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
-#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -183,15 +182,29 @@ pub fn render_blob_at(
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{sha256}.{}", extension_for_mime(claimed_mime)));
 
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    match options.open(&path) {
-        Ok(mut file) => file.write_all(&decoded)?,
-        // Same sha, same content: an existing spill file is already correct.
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(RenderError::Io(error)),
+    // Writes land in a temp file and are renamed into place, so a visible
+    // file at the final path is always complete and the dedup check below is
+    // race-safe across processes (same sha means same content).
+    if !path.exists() {
+        static TEMP_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let temp = dir.join(format!(
+            "{sha256}.tmp-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let written = options
+            .open(&temp)
+            .and_then(|mut file| file.write_all(&decoded))
+            .and_then(|()| fs::rename(&temp, &path));
+        if let Err(error) = written {
+            let _ = fs::remove_file(&temp);
+            return Err(RenderError::Io(error));
+        }
     }
     enforce_spill_bound(spill_base, SPILL_DIR_MAX_BYTES, &path);
 
@@ -318,7 +331,7 @@ fn extension_for_mime(mime: Option<&str>) -> &'static str {
 }
 
 fn sanitize_server(server: &str) -> String {
-    let sanitized: String = server
+    let mut sanitized: String = server
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
@@ -327,12 +340,30 @@ fn sanitize_server(server: &str) -> String {
                 '_'
             }
         })
+        .take(64)
         .collect();
-    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
-        "_".to_string()
-    } else {
-        sanitized
+    // Windows strips trailing dots at create time, which would make the
+    // constructed path disagree with the on-disk name.
+    while sanitized.ends_with('.') {
+        sanitized.pop();
     }
+    if sanitized.is_empty() {
+        return "_".to_string();
+    }
+    // Windows reserves device names (bare or with any extension).
+    let stem = sanitized.split('.').next().unwrap_or("");
+    if is_windows_reserved(stem) {
+        sanitized.insert(0, '_');
+    }
+    sanitized
+}
+
+fn is_windows_reserved(stem: &str) -> bool {
+    let lower = stem.to_ascii_lowercase();
+    matches!(lower.as_str(), "con" | "prn" | "aux" | "nul")
+        || (lower.len() == 4
+            && (lower.starts_with("com") || lower.starts_with("lpt"))
+            && matches!(lower.as_bytes()[3], b'1'..=b'9'))
 }
 
 struct SpillEntry {
@@ -360,7 +391,10 @@ fn evict_oldest(mut entries: Vec<SpillEntry>, max_total: u64, protect: &Path) {
             break;
         }
 
-        if entry.path == *protect {
+        // Filenames are content-hashed, so name equality is sufficient and
+        // survives filesystems that normalize directory names (case folding,
+        // trailing-dot stripping) where a full-path comparison would miss.
+        if entry.path.file_name() == protect.file_name() {
             continue;
         }
 
@@ -743,6 +777,27 @@ mod tests {
         assert_eq!(sanitize_server("."), "_");
         assert_eq!(sanitize_server(".."), "_");
         assert_eq!(sanitize_server("good-server_1.0"), "good-server_1.0");
+    }
+
+    #[test]
+    fn sanitize_server_escapes_windows_reserved_names() {
+        assert_eq!(sanitize_server("con"), "_con");
+        assert_eq!(sanitize_server("CON"), "_CON");
+        assert_eq!(sanitize_server("nul.txt"), "_nul.txt");
+        assert_eq!(sanitize_server("COM1"), "_COM1");
+        assert_eq!(sanitize_server("lpt9"), "_lpt9");
+        assert_eq!(sanitize_server("com0"), "com0");
+        assert_eq!(sanitize_server("com10"), "com10");
+        assert_eq!(sanitize_server("consul"), "consul");
+    }
+
+    #[test]
+    fn sanitize_server_strips_trailing_dots_and_caps_length() {
+        assert_eq!(sanitize_server("srv."), "srv");
+        assert_eq!(sanitize_server("srv..."), "srv");
+        assert_eq!(sanitize_server("..."), "_");
+        let long = "a".repeat(100);
+        assert_eq!(sanitize_server(&long).len(), 64);
     }
 
     #[test]
