@@ -915,8 +915,8 @@ impl RequestContext {
     }
 
     pub fn before_chat_completion(&mut self, input: &Input) -> Result<()> {
-        // The R11 gate in `job__start` validates against exactly what was
-        // declared to the model for THIS request; refresh it every time.
+        // `job__start` validates against exactly what was declared to the
+        // model for THIS request; refresh it every time.
         self.declared_function_names = input.declared_function_names();
         self.last_message = Some(LastMessage::new(input.clone(), String::new()));
         Ok(())

@@ -197,7 +197,8 @@ pub(in crate::config) const DEFAULT_JOB_INSTRUCTIONS: &str = indoc! {"
     working instead of blocking. Check progress with `job__check` (sparingly), block on the result
     with `job__collect`, cancel with `job__cancel`, and list jobs with `job__list`. Collect or
     cancel every job you started before ending your turn. Jobs run against a snapshot of the
-    current config/environment and do not survive coyote exiting."
+    current config/environment and do not survive coyote exiting.
+"
 };
 
 pub(in crate::config) const DEFAULT_TEAMMATE_INSTRUCTIONS: &str = indoc! {"

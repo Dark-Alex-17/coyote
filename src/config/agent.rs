@@ -462,6 +462,9 @@ impl Agent {
             .iter()
             .any(|f| f.name.starts_with(JOB_FUNCTION_PREFIX))
         {
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
             output.push_str(DEFAULT_JOB_INSTRUCTIONS);
         }
 

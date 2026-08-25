@@ -39,6 +39,8 @@ const JOB_RESULT_TAIL_CAP_CHARS: usize = 50_000;
 
 const JOB_KILL_GRACE: Duration = Duration::from_secs(5);
 
+const JOB_PUMP_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 pub fn is_agent_task(supervisor: Option<&Arc<RwLock<Supervisor>>>, id: &str) -> bool {
     id.starts_with("agent_")
         || id.starts_with("graph_agent_")
@@ -314,6 +316,10 @@ fn whitelist_rejection(tool: &str) -> Option<Value> {
         Some(format!(
             "'{tool}' mutates agent/session state and must run in-turn. Call it directly."
         ))
+    } else if tool.starts_with("fs_") || tool == "ast_grep" {
+        Some(format!(
+            "'{tool}' is fast — invoke it directly instead of backgrounding it."
+        ))
     } else if non_invoke_mcp_prefixes
         .iter()
         .any(|prefix| tool.starts_with(prefix))
@@ -400,7 +406,10 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let output_buf = Arc::new(Mutex::new(RingBuf::default()));
 
     let join_handle = if tool.starts_with(MCP_INVOKE_META_FUNCTION_NAME_PREFIX) {
-        let server = tool.replace(&format!("{MCP_INVOKE_META_FUNCTION_NAME_PREFIX}_"), "");
+        let server = tool
+            .strip_prefix(&format!("{MCP_INVOKE_META_FUNCTION_NAME_PREFIX}_"))
+            .ok_or_else(|| anyhow!("Malformed MCP invoke function name: {tool}"))?
+            .to_string();
         let Some(server_handle) = ctx.tool_scope.mcp_runtime.get(&server) else {
             return Ok(json!({
                 "status": "error",
@@ -597,7 +606,25 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
         }));
     };
 
-    let joined = (&mut handle.join_handle).await;
+    // Ctrl-C/exit teardown SIGTERMs the group without escalating, so a
+    // TERM-ignoring process would hang this join forever. Bound it and
+    // escalate to a group SIGKILL, gated on the pgid still being set.
+    let joined = match time::timeout(JOB_KILL_GRACE, &mut handle.join_handle).await {
+        Ok(joined) => joined,
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pgid) = handle.state.lock().pgid {
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            }
+            match time::timeout(JOB_KILL_GRACE, &mut handle.join_handle).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    handle.join_handle.abort();
+                    (&mut handle.join_handle).await
+                }
+            }
+        }
+    };
     let tool = handle.tool.clone();
     let elapsed_secs = handle.started_at.elapsed().as_secs();
     let status = handle.state.lock().status;
@@ -692,7 +719,9 @@ async fn handle_cancel(ctx: &RequestContext, args: &Value) -> Result<Value> {
 /// group kill is gated on `state.pgid` still being set: the job task clears
 /// it right after `wait()` reaps the child, and killing after the reap could
 /// signal an innocent recycled pid. MCP jobs (no pgid) fall through to a
-/// plain task abort.
+/// plain task abort. Only the SIGKILL is re-gated; the SIGTERM fires after
+/// the pgid read drops the lock, so a reap in that window could still hit a
+/// recycled pid — accepted residual risk.
 async fn kill_job_with_grace(handle: &mut JobHandle) {
     #[cfg(unix)]
     {
@@ -835,11 +864,40 @@ async fn pump_into_ring(mut reader: impl AsyncReadExt + Unpin, output_buf: Arc<M
     }
 }
 
+/// Deletes the env snapshot's temp files however the job task exits,
+/// including a cancel/abort dropping the future mid-await.
+struct TempFileGuard(Vec<PathBuf>);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// A grandchild that inherits the pipes keeps them open past the child's
+/// exit; don't let that hold the job task past its own timeout.
+async fn drain_pump(mut pump: tokio::task::JoinHandle<()>) {
+    if time::timeout(JOB_PUMP_DRAIN_GRACE, &mut pump)
+        .await
+        .is_err()
+    {
+        pump.abort();
+    }
+}
+
 async fn run_process_job(
     snapshot: JobEnvSnapshot,
     state: Arc<Mutex<JobState>>,
     output_buf: Arc<Mutex<RingBuf>>,
 ) -> Result<JobResult> {
+    let mut temp_files = vec![snapshot.output_file.clone()];
+    if let Some(tool_data_file) = snapshot.envs.get("LLM_TOOL_DATA_FILE") {
+        temp_files.push(PathBuf::from(tool_data_file));
+    }
+    let _temp_guard = TempFileGuard(temp_files);
+
     let mut command = tokio::process::Command::new(&snapshot.cmd_name);
     command
         .args(&snapshot.cmd_args)
@@ -877,8 +935,8 @@ async fn run_process_job(
             Err(_) => {
                 kill_expired_job(&mut child, &state).await;
                 state.lock().pgid = None;
-                let _ = stdout_pump.await;
-                let _ = stderr_pump.await;
+                drain_pump(stdout_pump).await;
+                drain_pump(stderr_pump).await;
                 let output_bytes_captured = output_buf.lock().total_written();
                 let message = format!(
                     "Tool call '{}' timed out after {}s and was killed (set COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited)",
@@ -894,22 +952,33 @@ async fn run_process_job(
     } else {
         child.wait().await
     };
-    let status =
-        wait_result.map_err(|err| anyhow!("Unable to run {}, {err}", snapshot.display_name))?;
+    let status = match wait_result {
+        Ok(status) => status,
+        Err(err) => {
+            stdout_pump.abort();
+            stderr_pump.abort();
+            bail!("Unable to run {}, {err}", snapshot.display_name);
+        }
+    };
     // pid-reuse guard: the child is reaped, so a later group kill against
     // this pgid could hit an innocent recycled pid.
     state.lock().pgid = None;
-    let _ = stdout_pump.await;
-    let _ = stderr_pump.await;
+    drain_pump(stdout_pump).await;
+    drain_pump(stderr_pump).await;
     let output_bytes_captured = output_buf.lock().total_written();
 
     let exit_code = status.code();
-    if exit_code.unwrap_or_default() != 0 {
-        let message = format!(
-            "Tool call '{}' exited with code {}",
-            snapshot.display_name,
-            exit_code.unwrap_or_default()
-        );
+    if exit_code != Some(0) {
+        let message = match exit_code {
+            Some(code) => format!(
+                "Tool call '{}' exited with code {code}",
+                snapshot.display_name
+            ),
+            None => format!(
+                "Tool call '{}' was terminated by a signal",
+                snapshot.display_name
+            ),
+        };
         let mut error_json = json!({"tool_call_error": message});
         if let Ok(contents) = fs::read_to_string(&snapshot.output_file)
             && !contents.trim().is_empty()
@@ -941,6 +1010,9 @@ async fn run_process_job(
     })
 }
 
+/// Same kill discipline as `kill_job_with_grace`, driven through the owned
+/// `Child`. The SIGTERM here fires after the pgid read drops the lock and is
+/// not re-gated — the same accepted pid-reuse window.
 async fn kill_expired_job(child: &mut tokio::process::Child, state: &Arc<Mutex<JobState>>) {
     #[cfg(unix)]
     {
@@ -1268,9 +1340,42 @@ mod tests {
     }
 
     #[test]
+    fn whitelist_rejects_fast_file_builtins() {
+        for tool in ["fs_read", "fs_cat", "fs_grep", "ast_grep"] {
+            let message = whitelist_rejection(tool).unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                message.contains("is fast"),
+                "unexpected message for {tool}: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn whitelist_allows_external_and_mcp_invoke_tools() {
         assert!(whitelist_rejection("execute_command").is_none());
         assert!(whitelist_rejection("mcp_invoke_github").is_none());
+    }
+
+    #[test]
+    fn handle_start_rejects_fast_builtins_without_spawn() {
+        let mut ctx = plain_ctx();
+        ctx.declared_function_names.insert("fs_read".into());
+        ctx.declared_function_names.insert("ast_grep".into());
+
+        for tool in ["fs_read", "ast_grep"] {
+            let result = run_async(handle_start(
+                &mut ctx,
+                &json!({"tool": tool, "arguments": {}}),
+            ))
+            .unwrap();
+
+            assert_eq!(result["status"], "error");
+            assert!(result["message"].as_str().unwrap().contains("is fast"));
+        }
+        assert!(ctx.supervisor.is_none(), "no job may be spawned");
     }
 
     #[test]
@@ -1607,7 +1712,7 @@ mod tests {
             while state.lock().pgid.is_none() && time::Instant::now() < deadline {
                 time::sleep(Duration::from_millis(10)).await;
             }
-            assert!(state.lock().pgid.is_some(), "runner must record the pgid");
+            let pgid = state.lock().pgid.expect("runner must record the pgid");
 
             let handle = JobHandle {
                 id: "j1".to_string(),
@@ -1631,6 +1736,15 @@ mod tests {
             assert_eq!(result["status"], "cancelled");
             assert_eq!(result["tool"], "sleep");
             assert!(!ctx.supervisor.as_ref().unwrap().read().has_job("j1"));
+            assert_eq!(
+                unsafe { libc::killpg(pgid, 0) },
+                -1,
+                "process group must be dead after cancel"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
         });
     }
 
@@ -1774,6 +1888,125 @@ mod tests {
                     .contains("exited with code 3")
             );
             assert_eq!(result.output["output"], "partial");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_process_job_reports_signal_death_as_error() {
+        run_async(async {
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+            let snapshot = test_snapshot("sh", &["-c", "kill -KILL $$"], 0);
+
+            let result = run_process_job(snapshot, state, output_buf).await.unwrap();
+
+            assert_eq!(result.exit_code, None);
+            assert!(
+                result.output["tool_call_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("terminated by a signal")
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_process_job_removes_output_temp_file() {
+        run_async(async {
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+            let snapshot = test_snapshot("sh", &["-c", "printf hi > \"$LLM_OUTPUT\""], 0);
+            let output_file = snapshot.output_file.clone();
+
+            let result = run_process_job(snapshot, state, output_buf).await.unwrap();
+
+            assert_eq!(result.exit_code, Some(0));
+            assert_eq!(result.output, json!({"output": "hi"}));
+            assert!(!output_file.exists(), "temp file must be removed");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_collect_returns_after_term_ignoring_job_is_aborted() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+            let snapshot =
+                test_snapshot("sh", &["-c", "trap '' TERM; while :; do sleep 1; done"], 0);
+            let task_state = Arc::clone(&state);
+            let task_buf = Arc::clone(&output_buf);
+            let join_handle = tokio::spawn(async move {
+                let result = run_process_job(snapshot, Arc::clone(&task_state), task_buf).await;
+                let mut job_state = task_state.lock();
+                job_state.pgid = None;
+                job_state.status = match &result {
+                    Ok(job_result) if job_result.exit_code == Some(0) => JobStatus::Completed,
+                    _ => JobStatus::Failed,
+                };
+                drop(job_state);
+                result
+            });
+
+            let deadline = time::Instant::now() + Duration::from_secs(2);
+            while state.lock().pgid.is_none() && time::Instant::now() < deadline {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+            let pgid = state.lock().pgid.expect("runner must record the pgid");
+
+            let abort_signal = create_abort_signal();
+            let handle = JobHandle {
+                id: "j1".to_string(),
+                tool: "sh".to_string(),
+                started_at: Instant::now(),
+                join_handle,
+                abort_signal: abort_signal.clone(),
+                state: Arc::clone(&state),
+                output_buf,
+                no_change_checks: 0,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            // Mimic Ctrl-C teardown: SIGTERM the group and flag the abort
+            // signal, leaving the handle registered.
+            abort_signal.set_ctrlc();
+            unsafe { libc::killpg(pgid, libc::SIGTERM) };
+
+            let result = time::timeout(
+                Duration::from_secs(20),
+                handle_collect(&ctx, &json!({"id": "j1"})),
+            )
+            .await
+            .expect("collect must not hang on a TERM-ignoring job")
+            .unwrap();
+
+            assert_eq!(result["status"], "failed");
+            // killpg(pgid, 0) is unreliable here: the orphaned sleep
+            // grandchild lingers as an unreaped zombie and keeps the group
+            // id alive. Signal death proves the escalated SIGKILL landed.
+            assert!(
+                result["result"]["tool_call_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("terminated by a signal")
+            );
         });
     }
 
