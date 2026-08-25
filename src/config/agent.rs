@@ -15,6 +15,7 @@ use crate::config::prompts::{
 };
 use crate::graph::types::RagNode;
 use crate::graph::{Graph, GraphParser, NodeType};
+use crate::mcp::McpServerFeatures;
 use crate::rag::RagInitConfig;
 use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
@@ -380,7 +381,7 @@ impl Agent {
         self.graph_rags.get(node_id).cloned()
     }
 
-    pub fn append_mcp_meta_functions(&mut self, mcp_servers: Vec<String>) {
+    pub fn append_mcp_meta_functions(&mut self, mcp_servers: Vec<McpServerFeatures>) {
         self.functions.append_mcp_meta_functions(mcp_servers);
     }
 

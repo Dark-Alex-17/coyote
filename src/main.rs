@@ -380,8 +380,8 @@ async fn run(
             .await?;
     } else {
         let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
-        if let Some(prompt) = &cli.prompt {
-            ctx.use_prompt(app.as_ref(), prompt)?;
+        if let Some(prompt) = &cli.temp_role {
+            ctx.use_temp_role(app.as_ref(), prompt)?;
         } else if let Some(name) = &cli.role {
             ctx.use_role(app.as_ref(), name, abort_signal.clone())
                 .await?;

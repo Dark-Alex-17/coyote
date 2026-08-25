@@ -442,7 +442,9 @@ impl BundleStore {
         self.ensure_bundle_exists(bundle)?;
         for (name, record) in self.bundles.iter_mut() {
             if name != bundle {
-                record.files.retain(|owned| owned.path != file.path);
+                record
+                    .files
+                    .retain(|owned| !same_installed_path(&owned.path, &file.path));
             }
         }
         let record = self
@@ -450,7 +452,9 @@ impl BundleStore {
             .get_mut(bundle)
             .expect("bundle existence checked above");
 
-        record.files.retain(|owned| owned.path != file.path);
+        record
+            .files
+            .retain(|owned| !same_installed_path(&owned.path, &file.path));
         record.files.push(file);
 
         self.save()
@@ -575,6 +579,17 @@ pub(crate) struct BundleListRow {
     pub(crate) installed_at: String,
     pub(crate) file_counts: String,
     pub(crate) drift: DriftSummary,
+}
+
+/// NTFS and default APFS resolve file names case-insensitively, so records
+/// differing only in case denote the same physical file there. Linux keeps
+/// exact matching because case variants are genuinely distinct files.
+fn same_installed_path(a: &str, b: &str) -> bool {
+    if cfg!(any(windows, target_os = "macos")) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
 }
 
 /// An unreadable file counts as locally modified: it exists but its integrity
@@ -1488,5 +1503,54 @@ mod tests {
         let rows = bundle_list_rows(&dir.store(), &dir.0);
 
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn same_installed_path_matches_filesystem_case_semantics() {
+        assert!(same_installed_path("macros/a.yaml", "macros/a.yaml"));
+        assert!(!same_installed_path("macros/a.yaml", "macros/b.yaml"));
+        assert_eq!(
+            same_installed_path("macros/Foo.yaml", "macros/foo.yaml"),
+            cfg!(any(windows, target_os = "macos"))
+        );
+    }
+
+    #[test]
+    fn record_file_transfers_case_variant_ownership_on_case_insensitive_hosts() {
+        let dir = TempStoreDir::new("bundles-case-variant");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("alpha", metadata("https://x/a", "aaa"))
+            .unwrap();
+        store
+            .upsert_bundle("beta", metadata("https://x/b", "bbb"))
+            .unwrap();
+        store
+            .record_file("alpha", file_record("macros/Shared.yaml", "one"))
+            .unwrap();
+
+        store
+            .record_file("beta", file_record("macros/shared.yaml", "two"))
+            .unwrap();
+
+        let alpha_still_owns = store
+            .get("alpha")
+            .unwrap()
+            .files
+            .iter()
+            .any(|f| f.path == "macros/Shared.yaml");
+        assert_eq!(
+            alpha_still_owns,
+            !cfg!(any(windows, target_os = "macos")),
+            "case-variant paths are one physical file on case-insensitive hosts"
+        );
+        assert!(
+            store
+                .get("beta")
+                .unwrap()
+                .files
+                .iter()
+                .any(|f| f.path == "macros/shared.yaml")
+        );
     }
 }

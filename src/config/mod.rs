@@ -22,6 +22,8 @@ pub(crate) mod todo;
 mod tool_scope;
 mod update;
 
+#[cfg(test)]
+pub(crate) use self::agent::AgentConfig;
 pub use self::agent::{
     Agent, AgentVariable, AgentVariables, complete_agent_variables, list_agents,
     list_agents_with_descriptions,
@@ -51,6 +53,11 @@ pub use self::skill::Skill;
 pub use self::skill_policy::SkillPolicy;
 #[allow(unused_imports)]
 pub use self::skill_registry::SkillRegistry;
+#[cfg(test)]
+pub(crate) use self::tool_scope::test_fixtures;
+pub use self::tool_scope::{
+    McpPromptCompletion, flatten_prompt_messages, resolve_prompt_args, sanitize_display_text,
+};
 pub use self::update::run_self_update;
 use crate::client::{
     self, ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,

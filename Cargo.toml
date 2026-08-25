@@ -141,6 +141,7 @@ arboard = { version = "3.3.0", default-features = false }
 
 [dev-dependencies]
 pretty_assertions = "1.4.0"
+rmcp = { version = "3.1.2", features = ["server"] }
 serial_test = "3"
 
 [[bin]]
