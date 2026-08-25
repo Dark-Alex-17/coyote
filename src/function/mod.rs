@@ -1,3 +1,4 @@
+pub(crate) mod jobs;
 pub(crate) mod memory;
 pub(crate) mod rag_query;
 pub(crate) mod skill;

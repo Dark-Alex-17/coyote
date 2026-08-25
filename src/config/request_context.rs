@@ -138,6 +138,17 @@ pub fn should_inject_skill_instructions(app: &AppConfig, policy: &SkillPolicy) -
     app.function_calling_support && policy.skills_enabled && !policy.compatible_enabled.is_empty()
 }
 
+pub fn effective_max_concurrent_jobs(agent: Option<&Agent>, app: &AppConfig) -> usize {
+    agent
+        .and_then(|a| a.max_concurrent_jobs())
+        .or(app.max_concurrent_jobs)
+        .unwrap_or(5)
+}
+
+pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
+    app.function_calling_support && effective_max_concurrent_jobs(agent, app) > 0
+}
+
 fn print_asset_names(kind: &str, names: &[String]) -> Result<()> {
     if names.is_empty() {
         println!("No {kind} found.");
@@ -4046,6 +4057,11 @@ impl RequestContext {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub fn jobs_enabled(&self) -> bool {
+        jobs_enabled(self.agent.as_ref(), &self.app.config)
+    }
+
     pub async fn use_agent(
         &mut self,
         app: &AppConfig,
@@ -4136,11 +4152,20 @@ impl RequestContext {
             );
         }
 
-        let should_init_supervisor = agent.can_spawn_agents();
-        let max_concurrent = agent.max_concurrent_agents();
+        let jobs_enabled = jobs_enabled(Some(&agent), app);
+        let should_init_supervisor = agent.can_spawn_agents() || jobs_enabled;
+        let max_concurrent = if agent.can_spawn_agents() {
+            agent.max_concurrent_agents()
+        } else {
+            0
+        };
         let max_depth = agent.max_agent_depth();
-        let supervisor = should_init_supervisor
-            .then(|| Arc::new(RwLock::new(Supervisor::new(max_concurrent, max_depth))));
+        let max_jobs = effective_max_concurrent_jobs(Some(&agent), app);
+        let supervisor = should_init_supervisor.then(|| {
+            Arc::new(RwLock::new(
+                Supervisor::new(max_concurrent, max_depth).with_max_concurrent_jobs(max_jobs),
+            ))
+        });
 
         self.rag = agent.rag();
         // Keep `rag_key` in lockstep with `rag`. Agent RAGs are cached under
@@ -4152,6 +4177,9 @@ impl RequestContext {
             .is_some()
             .then(|| RagKey::Agent(agent.name().to_string()));
         self.agent = Some(agent);
+        if let Some(old) = self.supervisor.as_ref() {
+            old.read().cancel_recursive();
+        }
         self.supervisor = supervisor;
         self.inbox = None;
         self.escalation_queue = None;
@@ -5215,6 +5243,171 @@ mod tests {
 
         assert!(ctx.rag.is_none());
         assert_eq!(ctx.rag_key, None);
+    }
+
+    #[test]
+    fn effective_max_concurrent_jobs_resolution_precedence() {
+        let mut app = AppConfig::default();
+        assert_eq!(effective_max_concurrent_jobs(None, &app), 5);
+
+        app.max_concurrent_jobs = Some(9);
+        assert_eq!(effective_max_concurrent_jobs(None, &app), 9);
+
+        let agent = Agent::test_new(AgentConfig {
+            max_concurrent_jobs: Some(2),
+            ..AgentConfig::default()
+        });
+        assert_eq!(effective_max_concurrent_jobs(Some(&agent), &app), 2);
+    }
+
+    #[test]
+    fn jobs_enabled_requires_function_calling_and_nonzero_capacity() {
+        let mut app = AppConfig::default();
+        assert!(jobs_enabled(None, &app));
+
+        app.max_concurrent_jobs = Some(0);
+        assert!(!jobs_enabled(None, &app));
+
+        app.max_concurrent_jobs = None;
+        app.function_calling_support = false;
+        assert!(!jobs_enabled(None, &app));
+
+        app.function_calling_support = true;
+        let agent = Agent::test_new(AgentConfig {
+            max_concurrent_jobs: Some(0),
+            ..AgentConfig::default()
+        });
+        assert!(!jobs_enabled(Some(&agent), &app));
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_cancels_previous_supervisor() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let old_sig = utils::create_abort_signal();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let join_handle = tokio::spawn(async {
+                    Ok(crate::supervisor::AgentResult {
+                        id: "a1".into(),
+                        agent_name: "explore".into(),
+                        output: String::new(),
+                        exit_status: crate::supervisor::AgentExitStatus::Completed,
+                    })
+                });
+                let handle = crate::supervisor::AgentHandle {
+                    id: "a1".to_string(),
+                    agent_name: "explore".to_string(),
+                    depth: 1,
+                    inbox: Arc::new(Inbox::new()),
+                    abort_signal: old_sig.clone(),
+                    join_handle,
+                    child_supervisor: None,
+                };
+                let old_sup = Arc::new(RwLock::new(Supervisor::new(4, 3)));
+                old_sup.write().register(handle).unwrap();
+                ctx.supervisor = Some(old_sup);
+
+                ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())
+                    .await
+                    .unwrap();
+            });
+
+        assert!(old_sig.aborted());
+        assert!(ctx.supervisor.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_inits_job_capable_supervisor_without_spawning() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())
+                    .await
+                    .unwrap();
+            });
+
+        let supervisor = ctx.supervisor.as_ref().expect("supervisor for jobs");
+        let supervisor = supervisor.read();
+        assert_eq!(supervisor.max_concurrent(), 0);
+        assert_eq!(supervisor.max_concurrent_jobs(), 5);
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_skips_supervisor_when_jobs_disabled() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut app = ctx.app.config.as_ref().clone();
+        app.max_concurrent_jobs = Some(0);
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())
+                    .await
+                    .unwrap();
+            });
+
+        assert!(ctx.supervisor.is_none());
     }
 
     #[test]

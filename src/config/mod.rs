@@ -42,7 +42,10 @@ pub use self::macro_policy::{
     MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, ResolvedMacro,
 };
 #[allow(unused_imports)]
-pub use self::request_context::{RenderMode, RequestContext, should_inject_skill_instructions};
+pub use self::request_context::{
+    RenderMode, RequestContext, effective_max_concurrent_jobs, jobs_enabled,
+    should_inject_skill_instructions,
+};
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
@@ -264,6 +267,7 @@ pub struct Config {
     pub summarization_prompt: Option<String>,
     pub summary_context_prompt: Option<String>,
     pub max_tool_result_chars: Option<usize>,
+    pub max_concurrent_jobs: Option<usize>,
 
     pub memory: Option<bool>,
     pub memory_cap_with_tools: Option<usize>,
@@ -346,6 +350,7 @@ impl Default for Config {
             summarization_prompt: None,
             summary_context_prompt: None,
             max_tool_result_chars: None,
+            max_concurrent_jobs: None,
 
             memory: None,
             memory_cap_with_tools: None,

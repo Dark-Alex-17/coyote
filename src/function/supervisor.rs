@@ -1,7 +1,8 @@
 use super::{FunctionDeclaration, JsonSchema};
 use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::{
-    Agent, AppState, Input, RequestContext, Role, RoleLike, list_agents_with_descriptions,
+    Agent, AppState, Input, RequestContext, Role, RoleLike, effective_max_concurrent_jobs,
+    jobs_enabled, list_agents_with_descriptions,
 };
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor};
@@ -30,6 +31,19 @@ fn agent_permitted(whitelist: Option<&[String]>, target: &str) -> bool {
         None => true,
         Some(w) => w.iter().any(|a| a == target),
     }
+}
+
+fn is_job_task(supervisor: Option<&Arc<RwLock<Supervisor>>>, id: &str) -> bool {
+    id.starts_with("job_") || supervisor.is_some_and(|sup| sup.read().has_job(id))
+}
+
+fn job_id_teaching_error(id: &str) -> Value {
+    json!({
+        "status": "error",
+        "message": format!(
+            "'{id}' is a background job, not an agent — use job__check / job__collect / job__cancel"
+        ),
+    })
 }
 
 pub enum GuardrailAction {
@@ -557,9 +571,15 @@ pub async fn run_agent_for_graph(
 
     let agent_mcp_servers = agent.mcp_server_names().to_vec();
     let session = agent.agent_session().map(|v| v.to_string());
-    let should_init_supervisor = agent.can_spawn_agents();
-    let agent_max_concurrent = agent.max_concurrent_agents();
+    let child_jobs_enabled = jobs_enabled(Some(&agent), app_config.as_ref());
+    let should_init_supervisor = agent.can_spawn_agents() || child_jobs_enabled;
+    let agent_max_concurrent = if agent.can_spawn_agents() {
+        agent.max_concurrent_agents()
+    } else {
+        0
+    };
     let agent_max_depth = agent.max_agent_depth();
+    let agent_max_jobs = effective_max_concurrent_jobs(Some(&agent), app_config.as_ref());
 
     let mut child_ctx = RequestContext::new_for_child(
         Arc::clone(&child_app_state),
@@ -571,10 +591,10 @@ pub async fn run_agent_for_graph(
     child_ctx.rag = agent.rag();
     child_ctx.agent = Some(agent);
     if should_init_supervisor {
-        child_ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(
-            agent_max_concurrent,
-            agent_max_depth,
-        ))));
+        child_ctx.supervisor = Some(Arc::new(RwLock::new(
+            Supervisor::new(agent_max_concurrent, agent_max_depth)
+                .with_max_concurrent_jobs(agent_max_jobs),
+        )));
     }
 
     if let Some(session) = session {
@@ -736,9 +756,15 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
 
     let agent_mcp_servers = agent.mcp_server_names().to_vec();
     let session = agent.agent_session().map(|v| v.to_string());
-    let should_init_supervisor = agent.can_spawn_agents();
-    let max_concurrent = agent.max_concurrent_agents();
+    let child_jobs_enabled = jobs_enabled(Some(&agent), app_config.as_ref());
+    let should_init_supervisor = agent.can_spawn_agents() || child_jobs_enabled;
+    let max_concurrent = if agent.can_spawn_agents() {
+        agent.max_concurrent_agents()
+    } else {
+        0
+    };
     let max_depth = agent.max_agent_depth();
+    let max_jobs = effective_max_concurrent_jobs(Some(&agent), app_config.as_ref());
     let mut child_ctx = RequestContext::new_for_child(
         Arc::clone(&child_app_state),
         ctx,
@@ -749,10 +775,9 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     child_ctx.rag = agent.rag();
     child_ctx.agent = Some(agent);
     if should_init_supervisor {
-        child_ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(
-            max_concurrent,
-            max_depth,
-        ))));
+        child_ctx.supervisor = Some(Arc::new(RwLock::new(
+            Supervisor::new(max_concurrent, max_depth).with_max_concurrent_jobs(max_jobs),
+        )));
     }
 
     if let Some(session) = session {
@@ -861,10 +886,15 @@ async fn handle_check(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
 
             Ok(result)
         }
-        None => Ok(json!({
-            "status": "error",
-            "message": format!("No agent found with id '{id}'")
-        })),
+        None => {
+            if is_job_task(ctx.supervisor.as_ref(), id) {
+                return Ok(job_id_teaching_error(id));
+            }
+            Ok(json!({
+                "status": "error",
+                "message": format!("No agent found with id '{id}'")
+            }))
+        }
     }
 }
 
@@ -883,6 +913,9 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
     let target_abort = {
         let sup = supervisor.read();
         if sup.is_finished(id).is_none() {
+            if id.starts_with("job_") || sup.has_job(id) {
+                return Ok(job_id_teaching_error(id));
+            }
             return Ok(json!({
                 "status": "error",
                 "message": format!("Agent '{id}' not found. Use agent__check to verify it exists and is finished.")
@@ -1065,10 +1098,15 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
                 "message": message,
             }))
         }
-        None => Ok(json!({
-            "status": "error",
-            "message": format!("No agent found with id '{id}'"),
-        })),
+        None => {
+            if is_job_task(ctx.supervisor.as_ref(), id) {
+                return Ok(job_id_teaching_error(id));
+            }
+            Ok(json!({
+                "status": "error",
+                "message": format!("No agent found with id '{id}'"),
+            }))
+        }
     }
 }
 
@@ -1115,10 +1153,17 @@ fn handle_send_message(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
                 "message": format!("Message delivered to agent '{id}'"),
             }))
         }
-        None => Ok(json!({
-            "status": "error",
-            "message": format!("No agent found with id '{id}'. Agent may not exist or may have already completed."),
-        })),
+        None => {
+            if is_job_task(ctx.supervisor.as_ref(), id)
+                || is_job_task(ctx.parent_supervisor.as_ref(), id)
+            {
+                return Ok(job_id_teaching_error(id));
+            }
+            Ok(json!({
+                "status": "error",
+                "message": format!("No agent found with id '{id}'. Agent may not exist or may have already completed."),
+            }))
+        }
     }
 }
 
@@ -1455,7 +1500,10 @@ mod tests {
     use super::*;
     use crate::config::test_fixtures::{FixtureServer, fixture_runtime};
     use crate::config::{AgentConfig, AppState, WorkingMode};
+    use crate::function::jobs::RingBuf;
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
+    use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus};
+    use parking_lot::Mutex;
     use serde_json::json;
     use serial_test::serial;
 
@@ -1470,6 +1518,59 @@ mod tests {
             max_depth,
         ))));
         ctx
+    }
+
+    fn ctx_with_job_capable_supervisor() -> RequestContext {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.supervisor = Some(Arc::new(RwLock::new(
+            Supervisor::new(4, 3).with_max_concurrent_jobs(4),
+        )));
+        ctx
+    }
+
+    fn make_fake_job(id: &str) -> JobHandle {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let join_handle = rt.spawn(async {
+            Ok(JobResult {
+                output: json!(null),
+                exit_code: Some(0),
+                output_bytes_captured: 0,
+            })
+        });
+        std::mem::forget(rt);
+        JobHandle {
+            id: id.to_string(),
+            tool: "execute_command".to_string(),
+            started_at: std::time::Instant::now(),
+            join_handle,
+            abort_signal: create_abort_signal(),
+            state: Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            })),
+            output_buf: Arc::new(Mutex::new(RingBuf::default())),
+            no_change_checks: 0,
+        }
+    }
+
+    fn register_fake_job(ctx: &mut RequestContext, id: &str) {
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(make_fake_job(id))
+            .unwrap();
+    }
+
+    fn assert_job_teaching_error(result: &Value, id: &str) {
+        assert_eq!(result["status"], "error");
+        let message = result["message"].as_str().unwrap();
+        assert_eq!(
+            message,
+            format!(
+                "'{id}' is a background job, not an agent — use job__check / job__collect / job__cancel"
+            )
+        );
     }
 
     fn register_fake_agent(ctx: &mut RequestContext, id: &str, name: &str) {
@@ -2531,6 +2632,103 @@ mod tests {
                 None
             );
             assert_eq!(ctx.pending_agents_guardrail_count, 0);
+        });
+    }
+
+    #[test]
+    fn handle_check_registered_job_id_teaches_job_tools() {
+        run_async(async {
+            let mut ctx = ctx_with_job_capable_supervisor();
+            register_fake_job(&mut ctx, "bg_1");
+
+            let result = handle_check(&mut ctx, &json!({"id": "bg_1"}))
+                .await
+                .unwrap();
+
+            assert_job_teaching_error(&result, "bg_1");
+        });
+    }
+
+    #[test]
+    fn handle_check_job_prefixed_id_teaches_job_tools() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+
+            let result = handle_check(&mut ctx, &json!({"id": "job_deadbeef"}))
+                .await
+                .unwrap();
+
+            assert_job_teaching_error(&result, "job_deadbeef");
+        });
+    }
+
+    #[test]
+    fn handle_collect_registered_job_id_teaches_job_tools() {
+        run_async(async {
+            let mut ctx = ctx_with_job_capable_supervisor();
+            register_fake_job(&mut ctx, "bg_1");
+
+            let result = handle_collect(&mut ctx, &json!({"id": "bg_1"}))
+                .await
+                .unwrap();
+
+            assert_job_teaching_error(&result, "bg_1");
+        });
+    }
+
+    #[test]
+    fn handle_collect_job_prefixed_id_teaches_job_tools() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+
+            let result = handle_collect(&mut ctx, &json!({"id": "job_deadbeef"}))
+                .await
+                .unwrap();
+
+            assert_job_teaching_error(&result, "job_deadbeef");
+        });
+    }
+
+    #[test]
+    fn handle_cancel_registered_job_id_teaches_job_tools_and_keeps_job() {
+        run_async(async {
+            let mut ctx = ctx_with_job_capable_supervisor();
+            register_fake_job(&mut ctx, "bg_1");
+
+            let result = handle_cancel(&mut ctx, &json!({"id": "bg_1"}))
+                .await
+                .unwrap();
+
+            assert_job_teaching_error(&result, "bg_1");
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_job("bg_1"));
+        });
+    }
+
+    #[test]
+    fn handle_send_message_registered_job_id_teaches_job_tools() {
+        run_async(async {
+            let mut ctx = ctx_with_job_capable_supervisor();
+            register_fake_job(&mut ctx, "bg_1");
+
+            let result =
+                handle_send_message(&mut ctx, &json!({"id": "bg_1", "message": "hi"})).unwrap();
+
+            assert_job_teaching_error(&result, "bg_1");
+        });
+    }
+
+    #[test]
+    fn handle_send_message_job_in_parent_supervisor_teaches_job_tools() {
+        run_async(async {
+            let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+            let mut parent_sup = Supervisor::new(4, 3).with_max_concurrent_jobs(4);
+            parent_sup.register(make_fake_job("bg_p")).unwrap();
+            ctx.parent_supervisor = Some(Arc::new(RwLock::new(parent_sup)));
+
+            let result =
+                handle_send_message(&mut ctx, &json!({"id": "bg_p", "message": "hi"})).unwrap();
+
+            assert_job_teaching_error(&result, "bg_p");
         });
     }
 }

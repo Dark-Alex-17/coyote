@@ -68,6 +68,7 @@ pub struct AppConfig {
     pub summarization_prompt: Option<String>,
     pub summary_context_prompt: Option<String>,
     pub max_tool_result_chars: Option<usize>,
+    pub max_concurrent_jobs: Option<usize>,
 
     pub memory: Option<bool>,
     pub memory_cap_with_tools: Option<usize>,
@@ -153,6 +154,7 @@ impl Default for AppConfig {
             summarization_prompt: None,
             summary_context_prompt: None,
             max_tool_result_chars: None,
+            max_concurrent_jobs: None,
 
             memory: None,
             memory_cap_with_tools: None,
@@ -239,6 +241,7 @@ impl AppConfig {
             summarization_prompt: config.summarization_prompt,
             summary_context_prompt: config.summary_context_prompt,
             max_tool_result_chars: config.max_tool_result_chars,
+            max_concurrent_jobs: config.max_concurrent_jobs,
 
             memory: config.memory,
             memory_cap_with_tools: config.memory_cap_with_tools,
@@ -574,6 +577,9 @@ impl AppConfig {
         {
             self.compression_threshold = v;
         }
+        if let Some(v) = super::read_env_value::<usize>(&get_env_name("max_concurrent_jobs")) {
+            self.max_concurrent_jobs = v;
+        }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("summarization_prompt")) {
             self.summarization_prompt = v;
         }
@@ -835,6 +841,49 @@ mod tests {
         app.enabled_macros = Some(vec!["keep".to_string()]);
         app.load_envs();
         assert_eq!(app.enabled_macros, Some(vec!["keep".to_string()]));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(&env_name, v),
+                None => std::env::remove_var(&env_name),
+            }
+        }
+    }
+
+    #[test]
+    fn from_config_copies_max_concurrent_jobs() {
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            max_concurrent_jobs: Some(3),
+            clients: vec![ClientConfig::default()],
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        assert_eq!(app.max_concurrent_jobs, Some(3));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_envs_overrides_max_concurrent_jobs() {
+        let env_name = get_env_name("max_concurrent_jobs");
+        let prev = std::env::var_os(&env_name);
+
+        let mut app = AppConfig::default();
+
+        unsafe { std::env::set_var(&env_name, "7") };
+        app.load_envs();
+        assert_eq!(app.max_concurrent_jobs, Some(7));
+
+        unsafe { std::env::set_var(&env_name, "0") };
+        app.load_envs();
+        assert_eq!(app.max_concurrent_jobs, Some(0));
+
+        unsafe { std::env::remove_var(&env_name) };
+        app.max_concurrent_jobs = Some(2);
+        app.load_envs();
+        assert_eq!(app.max_concurrent_jobs, Some(2));
 
         unsafe {
             match prev {

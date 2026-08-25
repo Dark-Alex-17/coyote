@@ -1703,6 +1703,7 @@ dependencies = [
  "inquire",
  "is-terminal",
  "json-patch",
+ "libc",
  "log",
  "log4rs",
  "nu-ansi-term",

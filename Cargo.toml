@@ -139,6 +139,9 @@ arboard = { version = "3.3.0", default-features = false, features = [
 [target.'cfg(not(any(target_os = "linux", target_os = "android", target_os = "emscripten")))'.dependencies]
 arboard = { version = "3.3.0", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 pretty_assertions = "1.4.0"
 rmcp = { version = "3.1.2", features = ["server"] }
