@@ -13,7 +13,7 @@ use crate::client::{
 };
 use crate::config::{
     AgentVariables, AppConfig, AssertState, Input, LastMessage, MacroState, RequestContext,
-    StateFlags, flatten_prompt_messages, macro_execute,
+    StateFlags, flatten_prompt_messages, macro_execute, resolve_prompt_args, sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
 use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
@@ -39,7 +39,6 @@ use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
 };
 use reedline::{MenuBuilder, Signal};
-use rmcp::model::PromptArgument;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::{env, process, sync::Arc};
@@ -798,8 +797,9 @@ pub async fn run_repl_command(
                             .unwrap_or_default();
                         let (mut arguments, missing) = resolve_prompt_args(&declared, provided);
                         for key in missing {
-                            let value =
-                                Text::new(&format!("{key}:")).prompt().with_context(|| {
+                            let value = Text::new(&prompt_arg_inquire_label(server, name, &key))
+                                .prompt()
+                                .with_context(|| {
                                     format!("Failed to read prompt argument '{key}'")
                                 })?;
                             arguments.insert(key, value);
@@ -1804,16 +1804,13 @@ fn unquote_prompt_value(value: &str) -> &str {
     }
 }
 
-fn resolve_prompt_args(
-    declared: &[PromptArgument],
-    provided: HashMap<String, String>,
-) -> (HashMap<String, String>, Vec<String>) {
-    let missing = declared
-        .iter()
-        .filter(|arg| arg.required == Some(true) && !provided.contains_key(&arg.name))
-        .map(|arg| arg.name.clone())
-        .collect();
-    (provided, missing)
+fn prompt_arg_inquire_label(server: &str, prompt: &str, arg: &str) -> String {
+    format!(
+        "Prompt '{}' on '{}' requires '{}':",
+        sanitize_display_text(prompt),
+        sanitize_display_text(server),
+        sanitize_display_text(arg)
+    )
 }
 
 pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
@@ -1999,20 +1996,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_prompt_args_reports_missing_required_only() {
-        let declared = vec![
-            PromptArgument::new("path").with_required(true),
-            PromptArgument::new("style"),
-        ];
-
-        let (resolved, missing) = resolve_prompt_args(&declared, HashMap::new());
-        assert!(resolved.is_empty());
-        assert_eq!(missing, vec!["path".to_string()]);
-
-        let provided = HashMap::from([("path".to_string(), "notes.txt".to_string())]);
-        let (resolved, missing) = resolve_prompt_args(&declared, provided);
-        assert_eq!(resolved["path"], "notes.txt");
-        assert!(missing.is_empty());
+    fn prompt_arg_inquire_label_sanitizes_all_components() {
+        assert_eq!(
+            prompt_arg_inquire_label("srv", "summarize", "path"),
+            "Prompt 'summarize' on 'srv' requires 'path':"
+        );
+        assert_eq!(
+            prompt_arg_inquire_label("s\u{1b}[31mrv", "sum\u{1b}]0;x\u{7}marize", "pa\u{7}th"),
+            "Prompt 'summarize' on 'srv' requires 'pa th':"
+        );
     }
 
     #[test]

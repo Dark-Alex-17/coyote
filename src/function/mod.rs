@@ -7,7 +7,7 @@ pub(crate) mod user_interaction;
 
 use crate::{
     client::ThinkingBlock,
-    config::{Agent, RequestContext},
+    config::{Agent, RequestContext, flatten_prompt_messages, resolve_prompt_args},
     graph,
     utils::*,
 };
@@ -753,6 +753,23 @@ impl Functions {
             },
         );
 
+        let mut prompt_function_properties = IndexMap::new();
+        prompt_function_properties.insert(
+            "prompt".to_string(),
+            JsonSchema {
+                type_value: Some("string".to_string()),
+                ..Default::default()
+            },
+        );
+        prompt_function_properties.insert(
+            "arguments".to_string(),
+            JsonSchema {
+                type_value: Some("object".to_string()),
+                description: Some("String values only; prompt arguments have no schemas".into()),
+                ..Default::default()
+            },
+        );
+
         for features in mcp_servers {
             let server = &features.name;
             let search_function_name = format!("{}_{server}", MCP_SEARCH_META_FUNCTION_NAME_PREFIX);
@@ -760,6 +777,7 @@ impl Functions {
                 format!("{}_{server}", MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX);
             let invoke_function_name = format!("{}_{server}", MCP_INVOKE_META_FUNCTION_NAME_PREFIX);
             let read_function_name = format!("{}_{server}", MCP_READ_META_FUNCTION_NAME_PREFIX);
+            let prompt_function_name = format!("{}_{server}", MCP_PROMPT_META_FUNCTION_NAME_PREFIX);
             for prefix in gated_meta_function_prefixes(&features) {
                 match prefix {
                     MCP_INVOKE_META_FUNCTION_NAME_PREFIX => {
@@ -834,8 +852,26 @@ impl Functions {
                             agent: false,
                         });
                     }
-                    // The declaration is added alongside its handler.
-                    MCP_PROMPT_META_FUNCTION_NAME_PREFIX => {}
+                    MCP_PROMPT_META_FUNCTION_NAME_PREFIX => {
+                        self.declarations.push(FunctionDeclaration {
+                            name: prompt_function_name.clone(),
+                            description: formatdoc!(
+                                r#"
+                                Fetch a prompt from the {server} MCP server, rendered with the given arguments. Call
+                                {describe_function_name} with kind "prompt" to discover prompt names and their
+                                arguments. The result is the prompt text, labeled per message; fold it into your
+                                reasoning.
+                                "#
+                            ),
+                            parameters: JsonSchema {
+                                type_value: Some("object".to_string()),
+                                properties: Some(prompt_function_properties.clone()),
+                                required: Some(vec!["prompt".to_string()]),
+                                ..Default::default()
+                            },
+                            agent: false,
+                        });
+                    }
                     _ => debug_assert!(false, "unhandled MCP meta-function prefix: {prefix}"),
                 }
             }
@@ -1359,6 +1395,14 @@ impl ToolCall {
                     eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
                     json!({"tool_call_error": error_msg})
                 })
+        } else if cmd_name.starts_with(MCP_PROMPT_META_FUNCTION_NAME_PREFIX) {
+            Self::get_mcp_prompt(ctx, cmd_name, &json_data)
+                .await
+                .unwrap_or_else(|e| {
+                    let error_msg = format!("MCP prompt failed: {e}");
+                    eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    json!({"tool_call_error": error_msg})
+                })
         } else {
             Self::invoke_mcp_tool(ctx, cmd_name, &json_data)
                 .await
@@ -1425,6 +1469,15 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP read failed: {e}");
+                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        json!({"tool_call_error": error_msg})
+                    })
+            }
+            _ if cmd_name.starts_with(MCP_PROMPT_META_FUNCTION_NAME_PREFIX) => {
+                Self::get_mcp_prompt(ctx, &cmd_name, &json_data)
+                    .await
+                    .unwrap_or_else(|e| {
+                        let error_msg = format!("MCP prompt failed: {e}");
                         eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
                         json!({"tool_call_error": error_msg})
                     })
@@ -1657,6 +1710,66 @@ impl ToolCall {
         } else {
             Ok(Value::Array(rendered_items))
         }
+    }
+
+    async fn get_mcp_prompt(
+        ctx: &RequestContext,
+        cmd_name: &str,
+        json_data: &Value,
+    ) -> Result<Value> {
+        let server = cmd_name
+            .strip_prefix(&format!("{MCP_PROMPT_META_FUNCTION_NAME_PREFIX}_"))
+            .ok_or_else(|| anyhow!("Malformed MCP prompt function name: {cmd_name}"))?;
+        let prompt = json_data
+            .get("prompt")
+            .ok_or_else(|| anyhow!("Missing 'prompt' in arguments"))?
+            .as_str()
+            .ok_or_else(|| anyhow!("Invalid 'prompt' in arguments"))?;
+        let mut provided = HashMap::new();
+        if let Some(value) = json_data.get("arguments") {
+            let entries = value
+                .as_object()
+                .ok_or_else(|| anyhow!("Invalid 'arguments' in arguments"))?;
+            for (key, value) in entries {
+                let value = value.as_str().ok_or_else(|| {
+                    anyhow!(
+                        "Invalid value for prompt argument '{key}': prompt arguments are strings"
+                    )
+                })?;
+                provided.insert(key.clone(), value.to_string());
+            }
+        }
+
+        let declared = ctx
+            .tool_scope
+            .mcp_runtime
+            .list_prompts(server)
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.name == prompt)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Prompt '{prompt}' not found on MCP server '{server}'; call the describe \
+                     meta-tool with kind \"prompt\" to list available prompts"
+                )
+            })?
+            .arguments
+            .unwrap_or_default();
+        let (arguments, missing) = resolve_prompt_args(&declared, provided);
+        if !missing.is_empty() {
+            bail!(
+                "Missing required prompt argument(s): {}. Provide them as string values in \
+                 'arguments'.",
+                missing.join(", ")
+            );
+        }
+
+        let result = ctx
+            .tool_scope
+            .mcp_runtime
+            .prompt(server, prompt, arguments)
+            .await?;
+        Ok(Value::String(flatten_prompt_messages(&result.messages)))
     }
 
     fn extract_call_config_from_agent(
@@ -2617,20 +2730,22 @@ mod tests {
         f.append_mcp_meta_functions(vec![mcp_features("res", false, true, false)]);
         assert_eq!(f.declarations().len(), 3);
         assert!(!f.contains("mcp_invoke_res"));
+        assert!(!f.contains("mcp_prompt_res"));
         assert!(f.contains("mcp_search_res"));
         assert!(f.contains("mcp_describe_res"));
         assert!(f.contains("mcp_read_res"));
     }
 
     #[test]
-    fn functions_append_mcp_meta_all_capabilities_emits_four() {
+    fn functions_append_mcp_meta_all_capabilities_emits_five() {
         let mut f = Functions::default();
         f.append_mcp_meta_functions(vec![mcp_features("srv", true, true, true)]);
-        assert_eq!(f.declarations().len(), 4);
+        assert_eq!(f.declarations().len(), 5);
         assert!(f.contains("mcp_invoke_srv"));
         assert!(f.contains("mcp_search_srv"));
         assert!(f.contains("mcp_describe_srv"));
         assert!(f.contains("mcp_read_srv"));
+        assert!(f.contains("mcp_prompt_srv"));
     }
 
     #[test]
@@ -2859,6 +2974,25 @@ mod tests {
             .await
     }
 
+    fn prompts_fixture() -> FixtureServer {
+        FixtureServer {
+            prompts_capability: true,
+            ..Default::default()
+        }
+    }
+
+    async fn eval_mcp_prompt(args: Value) -> Result<Value> {
+        let (runtime, _server) = fixture_runtime(prompts_fixture()).await;
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope.mcp_runtime = runtime;
+        call_with_args("mcp_prompt_fixture", args)
+            .eval_mcp(&ctx)
+            .await
+    }
+
+    const FLATTENED_SUMMARIZE_PROMPT: &str =
+        "[user]\nSummarize notes.txt\n\n[assistant]\nIn which style?\n\n[user]\nConcise.";
+
     #[test]
     fn expand_uri_template_substitutes_simple_vars() {
         let args = template_args(&[("path", json!("docs")), ("name", json!("readme"))]);
@@ -3033,6 +3167,99 @@ mod tests {
         .unwrap();
 
         assert_eq!(output["text"], FIXTURE_LOG_TEXT);
+    }
+
+    #[test]
+    fn functions_mcp_prompt_declaration_has_prompt_and_arguments_params() {
+        let mut f = Functions::default();
+        f.append_mcp_meta_functions(vec![mcp_features("srv", false, false, true)]);
+        let decl = f.find("mcp_prompt_srv").unwrap();
+        let props = decl.parameters.properties.as_ref().unwrap();
+        assert!(props.contains_key("prompt"));
+        assert!(props.contains_key("arguments"));
+        assert_eq!(props.len(), 2);
+        assert_eq!(decl.parameters.required, Some(vec!["prompt".to_string()]));
+    }
+
+    #[test]
+    fn eval_mcp_routes_mcp_prompt_to_prompt_handler() {
+        let fixture = prompts_fixture();
+        let get_prompt_calls = Arc::clone(&fixture.get_prompt_calls);
+        let call_tool_calls = Arc::clone(&fixture.call_tool_calls);
+        let output = run_async(async {
+            let (runtime, _server) = fixture_runtime(fixture).await;
+            let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+            ctx.tool_scope.mcp_runtime = runtime;
+            let call = call_with_args(
+                "mcp_prompt_fixture",
+                json!({"prompt": "summarize", "arguments": {"path": "notes.txt"}}),
+            );
+            call.eval_mcp(&ctx).await
+        })
+        .unwrap();
+
+        assert_eq!(output, Value::String(FLATTENED_SUMMARIZE_PROMPT.into()));
+        assert_eq!(get_prompt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(call_tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn eval_routes_mcp_prompt_to_prompt_handler() {
+        let fixture = prompts_fixture();
+        let get_prompt_calls = Arc::clone(&fixture.get_prompt_calls);
+        let call_tool_calls = Arc::clone(&fixture.call_tool_calls);
+        let output = run_async(async {
+            let (runtime, _server) = fixture_runtime(fixture).await;
+            let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+            ctx.tool_scope
+                .functions
+                .append_mcp_meta_functions(vec![mcp_features("fixture", true, false, true)]);
+            ctx.tool_scope.mcp_runtime = runtime;
+            let call = call_with_args(
+                "mcp_prompt_fixture",
+                json!({"prompt": "summarize", "arguments": {"path": "notes.txt"}}),
+            );
+            call.eval(&mut ctx).await
+        })
+        .unwrap();
+
+        assert_eq!(output, Value::String(FLATTENED_SUMMARIZE_PROMPT.into()));
+        assert_eq!(get_prompt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(call_tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn eval_mcp_prompt_missing_required_arg_returns_teaching_error() {
+        let output = run_async(eval_mcp_prompt(json!({"prompt": "summarize"}))).unwrap();
+
+        let err = output["tool_call_error"].as_str().unwrap();
+        assert!(
+            err.contains("Missing required prompt argument(s): path"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn eval_mcp_prompt_unknown_prompt_returns_teaching_error() {
+        let output = run_async(eval_mcp_prompt(json!({"prompt": "ghost"}))).unwrap();
+
+        let err = output["tool_call_error"].as_str().unwrap();
+        assert!(
+            err.contains("Prompt 'ghost' not found on MCP server 'fixture'"),
+            "{err}"
+        );
+        assert!(err.contains("kind \"prompt\""), "{err}");
+    }
+
+    #[test]
+    fn eval_mcp_prompt_rejects_non_string_argument_values() {
+        let output = run_async(eval_mcp_prompt(
+            json!({"prompt": "summarize", "arguments": {"path": 5}}),
+        ))
+        .unwrap();
+
+        let err = output["tool_call_error"].as_str().unwrap();
+        assert!(err.contains("prompt arguments are strings"), "{err}");
     }
 
     #[test]

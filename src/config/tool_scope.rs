@@ -420,14 +420,66 @@ pub fn format_prompt_arguments(arguments: &[PromptArgument]) -> String {
     arguments
         .iter()
         .map(|arg| {
+            let name = sanitize_display_text(&arg.name);
             if arg.required == Some(true) {
-                format!("{} (required)", arg.name)
+                format!("{name} (required)")
             } else {
-                arg.name.clone()
+                name
             }
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+pub fn resolve_prompt_args(
+    declared: &[PromptArgument],
+    provided: HashMap<String, String>,
+) -> (HashMap<String, String>, Vec<String>) {
+    let missing = declared
+        .iter()
+        .filter(|arg| arg.required == Some(true) && !provided.contains_key(&arg.name))
+        .map(|arg| arg.name.clone())
+        .collect();
+    (provided, missing)
+}
+
+pub fn sanitize_display_text(text: &str) -> String {
+    let mut sanitized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.next() {
+                // CSI: skip everything up to and including the final byte.
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if matches!(next, '\u{40}'..='\u{7e}') {
+                            break;
+                        }
+                    }
+                }
+                // OSC: skip until BEL or the ESC \ string terminator.
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\u{07}' {
+                            break;
+                        }
+                        if next == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if ch.is_control() {
+            sanitized.push(' ');
+        } else {
+            sanitized.push(ch);
+        }
+    }
+    sanitized
 }
 
 fn catalog_key(item: &CatalogItem) -> String {
@@ -483,9 +535,9 @@ fn resource_template_catalog_item(server: &str, template: ResourceTemplate) -> C
 fn prompt_catalog_item(server: &str, prompt: Prompt) -> CatalogItem {
     CatalogItem {
         kind: CatalogItemKind::Prompt,
-        name: prompt.name,
+        name: sanitize_display_text(&prompt.name),
         server: server.to_string(),
-        description: prompt.description.unwrap_or_default(),
+        description: sanitize_display_text(&prompt.description.unwrap_or_default()),
         arguments: prompt.arguments,
         ..Default::default()
     }
@@ -510,10 +562,10 @@ pub(crate) mod test_fixtures {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use rmcp::model::{
-        ErrorData, GetPromptResponse, ListPromptsResult, ListResourceTemplatesResult,
-        ListResourcesResult, ListToolsResult, PaginatedRequestParams, PromptsCapability,
-        ReadResourceResponse, ResourceContents, ResourcesCapability, ServerCapabilities,
-        ServerInfo,
+        CallToolResponse, ErrorData, GetPromptResponse, ListPromptsResult,
+        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+        PromptsCapability, ReadResourceResponse, ResourceContents, ResourcesCapability,
+        ServerCapabilities, ServerInfo,
     };
     use rmcp::service::{RequestContext, RunningService};
     use rmcp::{RoleServer, ServerHandler, ServiceExt};
@@ -537,6 +589,7 @@ pub(crate) mod test_fixtures {
         pub(crate) tools_capability: bool,
         pub(crate) resources_capability: bool,
         pub(crate) prompts_capability: bool,
+        pub(crate) hostile_prompt: bool,
         pub(crate) fail_resource_listings: bool,
         pub(crate) fail_prompt_listings: bool,
         pub(crate) fail_get_prompt: bool,
@@ -544,6 +597,7 @@ pub(crate) mod test_fixtures {
         pub(crate) list_resources_calls: Arc<AtomicUsize>,
         pub(crate) list_prompts_calls: Arc<AtomicUsize>,
         pub(crate) get_prompt_calls: Arc<AtomicUsize>,
+        pub(crate) call_tool_calls: Arc<AtomicUsize>,
     }
 
     impl Default for FixtureServer {
@@ -552,6 +606,7 @@ pub(crate) mod test_fixtures {
                 tools_capability: true,
                 resources_capability: false,
                 prompts_capability: false,
+                hostile_prompt: false,
                 fail_resource_listings: false,
                 fail_prompt_listings: false,
                 fail_get_prompt: false,
@@ -559,6 +614,7 @@ pub(crate) mod test_fixtures {
                 list_resources_calls: Arc::default(),
                 list_prompts_calls: Arc::default(),
                 get_prompt_calls: Arc::default(),
+                call_tool_calls: Arc::default(),
             }
         }
     }
@@ -592,6 +648,18 @@ pub(crate) mod test_fixtures {
                 "Duplicate-named tool",
                 schema,
             )]))
+        }
+
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            self.call_tool_calls.fetch_add(1, Ordering::SeqCst);
+            Err(ErrorData::internal_error(
+                "call_tool should not be reached",
+                None,
+            ))
         }
 
         async fn list_resources(
@@ -673,7 +741,7 @@ pub(crate) mod test_fixtures {
             if self.fail_prompt_listings {
                 return Err(ErrorData::internal_error("prompt listing exploded", None));
             }
-            Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
+            let mut prompts = vec![Prompt::new(
                 "summarize",
                 Some("Summarize a document"),
                 Some(vec![
@@ -682,7 +750,19 @@ pub(crate) mod test_fixtures {
                         .with_required(true),
                     PromptArgument::new("style"),
                 ]),
-            )]))
+            )];
+            if self.hostile_prompt {
+                prompts.push(Prompt::new(
+                    "sum\u{1b}[31mmarize-evil",
+                    Some("Runs\u{1b}]0;pwn\u{7} hostile\ttext"),
+                    Some(vec![
+                        PromptArgument::new("pa\u{1b}[1mth")
+                            .with_description("Doc\u{1b}[4m path")
+                            .with_required(true),
+                    ]),
+                ));
+            }
+            Ok(ListPromptsResult::with_all_items(prompts))
         }
 
         async fn get_prompt(
@@ -862,6 +942,32 @@ mod tests {
         assert!(functions.contains("mcp_search_fixture"));
         assert!(functions.contains("mcp_describe_fixture"));
         assert!(functions.contains("mcp_read_fixture"));
+    }
+
+    #[tokio::test]
+    async fn server_features_with_prompts_capability_emits_prompt_meta_function() {
+        let (runtime, _server) = fixture_runtime(FixtureServer {
+            resources_capability: true,
+            prompts_capability: true,
+            ..Default::default()
+        })
+        .await;
+
+        let features = runtime.server_features();
+        assert_eq!(
+            features,
+            vec![McpServerFeatures {
+                name: "fixture".to_string(),
+                tools: true,
+                resources: true,
+                prompts: true,
+            }]
+        );
+
+        let mut functions = Functions::default();
+        functions.append_mcp_meta_functions(features);
+        assert_eq!(functions.declarations().len(), 5);
+        assert!(functions.contains("mcp_prompt_fixture"));
     }
 
     #[test]
@@ -1245,6 +1351,47 @@ mod tests {
         assert_eq!(format_prompt_arguments(&[]), "");
     }
 
+    #[test]
+    fn resolve_prompt_args_reports_missing_required_only() {
+        let declared = vec![
+            PromptArgument::new("path").with_required(true),
+            PromptArgument::new("style"),
+        ];
+
+        let (resolved, missing) = resolve_prompt_args(&declared, HashMap::new());
+        assert!(resolved.is_empty());
+        assert_eq!(missing, vec!["path".to_string()]);
+
+        let provided = HashMap::from([("path".to_string(), "notes.txt".to_string())]);
+        let (resolved, missing) = resolve_prompt_args(&declared, provided);
+        assert_eq!(resolved["path"], "notes.txt");
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn sanitize_display_text_strips_csi_sequences_entirely() {
+        assert_eq!(sanitize_display_text("a\u{1b}[31mred\u{1b}[0mb"), "aredb");
+    }
+
+    #[test]
+    fn sanitize_display_text_strips_osc_sequences_entirely() {
+        assert_eq!(sanitize_display_text("a\u{1b}]0;title\u{7}b"), "ab");
+        assert_eq!(sanitize_display_text("a\u{1b}]0;title\u{1b}\\b"), "ab");
+    }
+
+    #[test]
+    fn sanitize_display_text_keeps_plain_text() {
+        assert_eq!(
+            sanitize_display_text("path (required), café"),
+            "path (required), café"
+        );
+    }
+
+    #[test]
+    fn sanitize_display_text_maps_control_chars_to_spaces() {
+        assert_eq!(sanitize_display_text("a\nb\tc\rd\u{7}e"), "a b c d e");
+    }
+
     #[tokio::test]
     async fn prompt_catalog_carries_arguments() {
         let fixture = FixtureServer {
@@ -1263,6 +1410,28 @@ mod tests {
         assert_eq!(item.description, "Summarize a document");
         let arguments = item.arguments.as_deref().unwrap();
         assert_eq!(format_prompt_arguments(arguments), "path (required), style");
+    }
+
+    #[tokio::test]
+    async fn prompt_catalog_sanitizes_hostile_display_strings() {
+        let fixture = FixtureServer {
+            prompts_capability: true,
+            hostile_prompt: true,
+            ..Default::default()
+        };
+        let (runtime, _server) = fixture_runtime(fixture).await;
+
+        let items = runtime.prompt_catalog().await;
+
+        let item = items
+            .iter()
+            .find(|item| item.name == "summarize-evil")
+            .unwrap();
+        assert_eq!(item.description, "Runs hostile text");
+        assert_eq!(
+            format_prompt_arguments(item.arguments.as_deref().unwrap()),
+            "path (required)"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use super::{REPL_COMMANDS, ReplCommand};
 
-use crate::config::{McpPromptCompletion, RequestContext};
+use crate::config::{McpPromptCompletion, RequestContext, sanitize_display_text};
 use crate::mcp::ConnectedServer;
 use crate::utils::fuzzy_filter;
 
@@ -173,7 +173,14 @@ fn complete_prompt_stage(
         McpPromptCompletion::PromptNames { server } => list_prompts_blocking(server, rpc_timeout)
             .unwrap_or_default()
             .into_iter()
-            .map(|prompt| (prompt.name, prompt.description))
+            .map(|prompt| {
+                (
+                    sanitize_display_text(&prompt.name),
+                    prompt
+                        .description
+                        .map(|description| sanitize_display_text(&description)),
+                )
+            })
             .collect(),
         McpPromptCompletion::ArgumentKeys {
             server,
@@ -188,12 +195,18 @@ fn complete_prompt_stage(
             .into_iter()
             .filter(|arg| !typed_keys.contains(&arg.name))
             .map(|arg| {
-                let description = match (arg.required == Some(true), arg.description) {
+                let description = arg
+                    .description
+                    .map(|description| sanitize_display_text(&description));
+                let description = match (arg.required == Some(true), description) {
                     (true, Some(description)) => Some(format!("{description} (required)")),
                     (true, None) => Some("(required)".to_string()),
                     (false, description) => description,
                 };
-                (format!("{}=", arg.name), description)
+                (
+                    format!("{}=", sanitize_display_text(&arg.name)),
+                    description,
+                )
             })
             .collect(),
     };
@@ -356,6 +369,45 @@ mod prompt_completion_tests {
         );
 
         assert!(values.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hostile_prompt_strings_are_sanitized_in_suggestions() {
+        let fixture = FixtureServer {
+            hostile_prompt: true,
+            ..prompts_fixture()
+        };
+        let (runtime, _server) = fixture_runtime(fixture).await;
+        let server = runtime.get("fixture").cloned().unwrap();
+
+        let values = complete_prompt_stage(
+            McpPromptCompletion::PromptNames {
+                server: Arc::clone(&server),
+            },
+            "evil",
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            values,
+            vec![(
+                "summarize-evil".to_string(),
+                Some("Runs hostile text".to_string())
+            )]
+        );
+
+        let values = complete_prompt_stage(
+            McpPromptCompletion::ArgumentKeys {
+                server,
+                prompt: "sum\u{1b}[31mmarize-evil".to_string(),
+                typed_keys: vec![],
+            },
+            "",
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            values,
+            vec![("path=".to_string(), Some("Doc path (required)".to_string()))]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
