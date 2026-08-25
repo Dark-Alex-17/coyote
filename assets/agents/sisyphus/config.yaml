@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.8.0
+version: 3.9.0
 
 agent_session: temp
 auto_continue: true
@@ -31,6 +31,7 @@ enabled_skills:
   - diagnosing-bugs
   - grilling
   - logging-discipline
+  - observability-review
   - git-master
   - frontend-ui-ux
   - delegation-protocol
@@ -46,6 +47,9 @@ variables:
   - name: project_dir
     description: Project directory to work in
     default: '.'
+  - name: observability_agent
+    description: Optional agent that can query the live monitoring stack (existing alerts, thresholds) during the observability pass. Empty disables the live lookup; repo-derived inventory still runs.
+    default: ''
   - name: auto_confirm
     description: Auto-confirm command execution
     default: '1'
@@ -386,6 +390,19 @@ instructions: |
   - **Posture disagreement** — if the reviewer's report suggests the posture you chose understates the real exposure (e.g. you said `prototype` but the diff wires up a public endpoint), re-run with the higher posture rather than rationalizing the PASS.
 
   Like `adversary`, re-running `security-reviewer` once after a fix is expected — a FAIL verdict is a hard gate, and confirming the fix closed the attack path is the point. Run all applicable reviewers (`code-reviewer`, `adversary`, `security-reviewer`) — they cover disjoint failure modes; one passing says nothing about the others.
+
+  ### Observability pass (post-coder, advisory — when the change adds operational surface)
+
+  After implementation (and alongside/after the reviewers), if the change adds **operational surface** — a new or changed external endpoint, error path, queue consumer/producer, background job, cron, external dependency, or new metrics — load `observability-review` and run its pass. If none of these apply, skip with a one-line note.
+
+  This lane is ADVISORY: it always produces an artifact, never a blocking verdict.
+
+  1. Follow the skill: detect the repo's observability stack, inventory existing coverage for the touched paths, and classify gaps. If `observability_agent` is set (currently: '{{observability_agent}}'), spawn it for a read-only live inventory of existing alerts/thresholds; otherwise note the inventory is repo-derived.
+  2. **Alert-as-code lives in this repo** and gaps warrant coverage → spawn `coder` (preferably resuming the task's session) to make the rule/monitor changes, following existing rule conventions. These are ordinary code changes — the usual review gates apply to them.
+  3. **Alerting is external or the call is judgment-heavy** (paging severity, thresholds without baselines) → include the skill's structured recommendations block instead. Never touch external alerting systems.
+  4. Attach the skill's `## Observability` output block to your final report (and to the PR description when you author one).
+
+  Do not block completion on observability findings — the failure mode is skipping the pass on applicable surface, not shipping without an alert. Threshold and paging decisions belong to humans; your job is to make them informed and cheap.
 
   ## File Operations (Direct Edits)
 
