@@ -5,7 +5,7 @@ use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
 use super::skill_registry::SkillRegistry;
 use super::todo::TodoList;
-use super::tool_scope::{McpRuntime, ToolScope};
+use super::tool_scope::{McpPromptCompletion, McpRuntime, ToolScope, format_prompt_arguments};
 use super::{
     AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
     Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, MacroAllowlistLevel,
@@ -23,8 +23,8 @@ use crate::function::{
     user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::mcp::{
-    MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired, is_auth_required_error,
-    is_mcp_meta_function, mcp_meta_function_names,
+    CatalogItem, MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired,
+    McpServersConfig, is_auth_required_error, is_mcp_meta_function, mcp_meta_function_names,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -75,6 +75,29 @@ fn installed_bundle_names() -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+pub(crate) fn expand_enabled_mcp_server_ids(
+    app: &AppConfig,
+    mcp_config: &McpServersConfig,
+    enabled_mcp_servers: &[String],
+) -> Vec<String> {
+    if enabled_mcp_servers.iter().any(|s| s.trim() == "all") {
+        return mcp_config.mcp_servers.keys().cloned().collect();
+    }
+    let mut ids = Vec::new();
+    for item in enabled_mcp_servers.iter().map(|s| s.trim()) {
+        if mcp_config.mcp_servers.contains_key(item) {
+            ids.push(item.to_string());
+        } else if let Some(mapped) = app.mapping_mcp_servers.get(item) {
+            for mapped_id in mapped.split(',').map(|s| s.trim()) {
+                if mcp_config.mcp_servers.contains_key(mapped_id) {
+                    ids.push(mapped_id.to_string());
+                }
+            }
+        }
+    }
+    ids
 }
 
 pub struct AutoContinueConfig {
@@ -137,6 +160,20 @@ pub(crate) fn asset_table(header: &[&str]) -> Table {
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(header.to_vec());
     table
+}
+
+fn prompt_asset_rows(items: &[CatalogItem]) -> Vec<[String; 4]> {
+    items
+        .iter()
+        .map(|item| {
+            [
+                item.server.clone(),
+                item.name.clone(),
+                item.description.clone(),
+                format_prompt_arguments(item.arguments.as_deref().unwrap_or_default()),
+            ]
+        })
+        .collect()
 }
 
 fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<String>)> {
@@ -2779,7 +2816,7 @@ impl RequestContext {
             }
             "bundles" => bundles::list_installed_bundles(),
             _ => bail!(
-                "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, tools, mcp-servers, bundles"
+                "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, prompts, tools, mcp-servers, bundles"
             ),
         }
     }
@@ -3663,6 +3700,40 @@ impl RequestContext {
         fuzzy_filter(values, |v| v.0.as_str(), filter)
     }
 
+    pub fn mcp_prompt_completion(&self, args: &[&str]) -> McpPromptCompletion {
+        let app = self.app.config.as_ref();
+        let enabled_ids = match &self.app.mcp_config {
+            Some(mcp_config) => {
+                let mut servers = self
+                    .enabled_mcp_servers_for_current_scope(app, true)
+                    .unwrap_or_default();
+                servers.extend(self.skill_registry.loaded_mcp_servers());
+                expand_enabled_mcp_server_ids(app, mcp_config, &servers)
+            }
+            None => vec![],
+        };
+        self.tool_scope
+            .mcp_runtime
+            .prompt_completion(&enabled_ids, args)
+    }
+
+    pub async fn list_prompt_assets(&self) -> Result<()> {
+        let items = self.tool_scope.mcp_runtime.prompt_catalog().await;
+        if items.is_empty() {
+            println!("No prompts found.");
+            return Ok(());
+        }
+
+        let mut table = asset_table(&["server", "name", "description", "args"]);
+        for row in prompt_asset_rows(&items) {
+            table.add_row(row.to_vec());
+        }
+
+        println!("Prompts:");
+        println!("{table}");
+        Ok(())
+    }
+
     async fn rebuild_tool_scope(
         &mut self,
         app: &AppConfig,
@@ -3706,24 +3777,7 @@ impl RequestContext {
             && let Some(mcp_config) = &self.app.mcp_config
         {
             let server_ids: Vec<String> = match &enabled_mcp_servers {
-                Some(servers) if servers.iter().any(|s| s.trim() == "all") => {
-                    mcp_config.mcp_servers.keys().cloned().collect()
-                }
-                Some(servers) => {
-                    let mut ids = Vec::new();
-                    for item in servers.iter().map(|s| s.trim()) {
-                        if mcp_config.mcp_servers.contains_key(item) {
-                            ids.push(item.to_string());
-                        } else if let Some(mapped) = app.mapping_mcp_servers.get(item) {
-                            for mapped_id in mapped.split(',').map(|s| s.trim()) {
-                                if mcp_config.mcp_servers.contains_key(mapped_id) {
-                                    ids.push(mapped_id.to_string());
-                                }
-                            }
-                        }
-                    }
-                    ids
-                }
+                Some(servers) => expand_enabled_mcp_server_ids(app, mcp_config, servers),
                 None => vec![],
             };
 
@@ -4632,6 +4686,7 @@ mod tests {
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
+    use rmcp::model::PromptArgument;
     use serde_json::json;
     use serial_test::serial;
     use std::env;
@@ -4799,6 +4854,41 @@ mod tests {
                 .prompt()
                 .contains("you are a pirate")
         );
+    }
+
+    #[test]
+    fn prompt_asset_rows_assembles_columns() {
+        let items = vec![
+            CatalogItem {
+                name: "summarize".to_string(),
+                server: "docs".to_string(),
+                description: "Summarize a document".to_string(),
+                arguments: Some(vec![
+                    PromptArgument::new("path").with_required(true),
+                    PromptArgument::new("style"),
+                ]),
+                ..Default::default()
+            },
+            CatalogItem {
+                name: "greet".to_string(),
+                server: "misc".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let rows = prompt_asset_rows(&items);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            [
+                "docs",
+                "summarize",
+                "Summarize a document",
+                "path (required), style"
+            ]
+        );
+        assert_eq!(rows[1], ["misc", "greet", "", ""]);
     }
 
     #[test]

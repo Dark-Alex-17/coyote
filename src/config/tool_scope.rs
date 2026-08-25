@@ -4,8 +4,9 @@ use crate::mcp::{CatalogItem, CatalogItemKind, ConnectedServer, McpRegistry, Mcp
 use anyhow::{Context, Result, anyhow};
 use bm25::{Document, Language, SearchEngineBuilder};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Prompt, ReadResourceRequestParams, ReadResourceResult,
-    Resource, ResourceTemplate, Tool,
+    CallToolRequestParams, CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResult,
+    Prompt, PromptArgument, PromptMessage, ReadResourceRequestParams, ReadResourceResult, Resource,
+    ResourceTemplate, Role, Tool,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -26,6 +27,18 @@ impl Default for ToolScope {
             tool_tracker: ToolCallTracker::default(),
         }
     }
+}
+
+pub enum McpPromptCompletion {
+    Ready(Vec<(String, Option<String>)>),
+    PromptNames {
+        server: Arc<ConnectedServer>,
+    },
+    ArgumentKeys {
+        server: Arc<ConnectedServer>,
+        prompt: String,
+        typed_keys: Vec<String>,
+    },
 }
 
 #[derive(Default, Clone)]
@@ -291,6 +304,130 @@ impl McpRuntime {
             .await
             .map_err(Into::into)
     }
+
+    pub async fn list_prompts(&self, server: &str) -> Result<Vec<Prompt>> {
+        let server_handle = self
+            .get(server)
+            .cloned()
+            .with_context(|| format!("Prompt MCP server does not exist: {server}"))?;
+
+        server_handle.list_all_prompts().await.map_err(Into::into)
+    }
+
+    pub async fn prompt(
+        &self,
+        server: &str,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> Result<GetPromptResult> {
+        let server_handle = self
+            .get(server)
+            .cloned()
+            .with_context(|| format!("Prompt MCP server does not exist: {server}"))?;
+
+        let mut request = GetPromptRequestParams::new(name.to_owned());
+        if !arguments.is_empty() {
+            request.arguments = Some(
+                arguments
+                    .into_iter()
+                    .map(|(key, value)| (key, Value::String(value)))
+                    .collect(),
+            );
+        }
+
+        server_handle.get_prompt(request).await.map_err(Into::into)
+    }
+
+    pub async fn prompt_catalog(&self) -> Vec<CatalogItem> {
+        let mut items = Vec::new();
+        for features in self.server_features() {
+            if !features.prompts {
+                continue;
+            }
+            let Some(server_handle) = self.get(&features.name) else {
+                continue;
+            };
+            match server_handle.list_all_prompts().await {
+                Ok(prompts) => items.extend(
+                    prompts
+                        .into_iter()
+                        .map(|prompt| prompt_catalog_item(&features.name, prompt)),
+                ),
+                Err(e) => warn!(
+                    "Failed to list prompts on MCP server {}: {e}",
+                    features.name
+                ),
+            }
+        }
+        items
+    }
+
+    pub fn prompt_completion(
+        &self,
+        enabled_servers: &[String],
+        args: &[&str],
+    ) -> McpPromptCompletion {
+        match args {
+            [] | [_] => McpPromptCompletion::Ready(
+                self.server_features()
+                    .into_iter()
+                    .filter(|features| features.prompts && enabled_servers.contains(&features.name))
+                    .map(|features| (features.name, None))
+                    .collect(),
+            ),
+            [server, _] => match self.get(server) {
+                Some(handle) => McpPromptCompletion::PromptNames {
+                    server: Arc::clone(handle),
+                },
+                None => McpPromptCompletion::Ready(vec![]),
+            },
+            [server, prompt, rest @ ..] => match self.get(server) {
+                Some(handle) => McpPromptCompletion::ArgumentKeys {
+                    server: Arc::clone(handle),
+                    prompt: (*prompt).to_string(),
+                    typed_keys: rest
+                        .iter()
+                        .filter_map(|arg| arg.split_once('=').map(|(key, _)| key.to_string()))
+                        .collect(),
+                },
+                None => McpPromptCompletion::Ready(vec![]),
+            },
+        }
+    }
+}
+
+pub fn flatten_prompt_messages(messages: &[PromptMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| {
+            let label = match message.role {
+                Role::User => "[user]",
+                Role::Assistant => "[assistant]",
+            };
+            let content = match &message.content {
+                ContentBlock::Text(text) => text.text.clone(),
+                ContentBlock::Image(_) => "[image content omitted]".to_string(),
+                ContentBlock::Audio(_) => "[audio content omitted]".to_string(),
+                _ => "[resource content omitted]".to_string(),
+            };
+            format!("{label}\n{content}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+pub fn format_prompt_arguments(arguments: &[PromptArgument]) -> String {
+    arguments
+        .iter()
+        .map(|arg| {
+            if arg.required == Some(true) {
+                format!("{} (required)", arg.name)
+            } else {
+                arg.name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn catalog_key(item: &CatalogItem) -> String {
@@ -326,6 +463,7 @@ fn resource_catalog_item(server: &str, resource: Resource) -> CatalogItem {
         uri: Some(resource.uri),
         mime_type: resource.mime_type,
         size: resource.size,
+        arguments: None,
     }
 }
 
@@ -338,6 +476,7 @@ fn resource_template_catalog_item(server: &str, template: ResourceTemplate) -> C
         uri: Some(template.uri_template),
         mime_type: template.mime_type,
         size: None,
+        arguments: None,
     }
 }
 
@@ -347,6 +486,7 @@ fn prompt_catalog_item(server: &str, prompt: Prompt) -> CatalogItem {
         name: prompt.name,
         server: server.to_string(),
         description: prompt.description.unwrap_or_default(),
+        arguments: prompt.arguments,
         ..Default::default()
     }
 }
@@ -370,14 +510,15 @@ pub(crate) mod test_fixtures {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use rmcp::model::{
-        ErrorData, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-        ListToolsResult, PaginatedRequestParams, PromptArgument, PromptsCapability,
+        ErrorData, GetPromptResponse, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListToolsResult, PaginatedRequestParams, PromptsCapability,
         ReadResourceResponse, ResourceContents, ResourcesCapability, ServerCapabilities,
         ServerInfo,
     };
     use rmcp::service::{RequestContext, RunningService};
     use rmcp::{RoleServer, ServerHandler, ServiceExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     pub(crate) const FIXTURE_LOG_URI: &str = "file:///app.log";
     pub(crate) const FIXTURE_LOG_TEXT: &str = "début of the log\n\
@@ -397,8 +538,12 @@ pub(crate) mod test_fixtures {
         pub(crate) resources_capability: bool,
         pub(crate) prompts_capability: bool,
         pub(crate) fail_resource_listings: bool,
+        pub(crate) fail_prompt_listings: bool,
+        pub(crate) fail_get_prompt: bool,
+        pub(crate) prompt_delay: Option<Duration>,
         pub(crate) list_resources_calls: Arc<AtomicUsize>,
         pub(crate) list_prompts_calls: Arc<AtomicUsize>,
+        pub(crate) get_prompt_calls: Arc<AtomicUsize>,
     }
 
     impl Default for FixtureServer {
@@ -408,8 +553,12 @@ pub(crate) mod test_fixtures {
                 resources_capability: false,
                 prompts_capability: false,
                 fail_resource_listings: false,
+                fail_prompt_listings: false,
+                fail_get_prompt: false,
+                prompt_delay: None,
                 list_resources_calls: Arc::default(),
                 list_prompts_calls: Arc::default(),
+                get_prompt_calls: Arc::default(),
             }
         }
     }
@@ -518,6 +667,12 @@ pub(crate) mod test_fixtures {
             _context: RequestContext<RoleServer>,
         ) -> Result<ListPromptsResult, ErrorData> {
             self.list_prompts_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(delay) = self.prompt_delay {
+                tokio::time::sleep(delay).await;
+            }
+            if self.fail_prompt_listings {
+                return Err(ErrorData::internal_error("prompt listing exploded", None));
+            }
             Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
                 "summarize",
                 Some("Summarize a document"),
@@ -529,22 +684,71 @@ pub(crate) mod test_fixtures {
                 ]),
             )]))
         }
+
+        async fn get_prompt(
+            &self,
+            request: GetPromptRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<GetPromptResponse, ErrorData> {
+            self.get_prompt_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(delay) = self.prompt_delay {
+                tokio::time::sleep(delay).await;
+            }
+            if self.fail_get_prompt {
+                return Err(ErrorData::internal_error("get_prompt exploded", None));
+            }
+            let messages = match request.name.as_str() {
+                "summarize" => {
+                    let path = request
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("path"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    vec![
+                        PromptMessage::new_text(Role::User, format!("Summarize {path}")),
+                        PromptMessage::new_text(Role::Assistant, "In which style?"),
+                        PromptMessage::new_text(Role::User, "Concise."),
+                    ]
+                }
+                "hostile" => vec![
+                    PromptMessage::new_text(Role::User, "!rm -rf /"),
+                    PromptMessage::new_text(Role::User, ".session hijack"),
+                ],
+                other => {
+                    return Err(ErrorData::invalid_params(
+                        format!("Unknown prompt: {other}"),
+                        None,
+                    ));
+                }
+            };
+            Ok(GetPromptResponse::Complete(GetPromptResult::new(messages)))
+        }
+    }
+
+    pub(crate) async fn add_fixture_server(
+        runtime: &mut McpRuntime,
+        name: &str,
+        fixture: FixtureServer,
+    ) -> RunningService<RoleServer, FixtureServer> {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (server, client) = tokio::join!(fixture.serve(server_io), ().serve(client_io));
+        runtime.insert(name.to_string(), Arc::new(client.unwrap()));
+        server.unwrap()
     }
 
     pub(crate) async fn fixture_runtime(
         fixture: FixtureServer,
     ) -> (McpRuntime, RunningService<RoleServer, FixtureServer>) {
-        let (client_io, server_io) = tokio::io::duplex(4096);
-        let (server, client) = tokio::join!(fixture.serve(server_io), ().serve(client_io));
         let mut runtime = McpRuntime::new();
-        runtime.insert("fixture".to_string(), Arc::new(client.unwrap()));
-        (runtime, server.unwrap())
+        let server = add_fixture_server(&mut runtime, "fixture", fixture).await;
+        (runtime, server)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_fixtures::{FixtureServer, fixture_runtime};
+    use super::test_fixtures::{FixtureServer, add_fixture_server, fixture_runtime};
     use super::*;
     use crate::function::ToolCall;
     use log::{Level, LevelFilter, Log, Metadata, Record};
@@ -907,5 +1111,270 @@ mod tests {
             err,
             "file:///missing not found in fixture MCP server resource catalog"
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_returns_result_and_counts_calls() {
+        let fixture = FixtureServer {
+            prompts_capability: true,
+            ..Default::default()
+        };
+        let get_prompt_calls = Arc::clone(&fixture.get_prompt_calls);
+        let (runtime, _server) = fixture_runtime(fixture).await;
+
+        let result = runtime
+            .prompt(
+                "fixture",
+                "summarize",
+                HashMap::from([("path".to_string(), "notes.txt".to_string())]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.messages.len(), 3);
+        assert_eq!(
+            result.messages[0]
+                .content
+                .as_text()
+                .map(|t| t.text.as_str()),
+            Some("Summarize notes.txt")
+        );
+        assert_eq!(get_prompt_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn prompt_missing_server_errors() {
+        let runtime = McpRuntime::new();
+
+        let err = runtime
+            .prompt("ghost", "summarize", HashMap::new())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(err, "Prompt MCP server does not exist: ghost");
+    }
+
+    #[tokio::test]
+    async fn prompt_surfaces_server_failure() {
+        let fixture = FixtureServer {
+            prompts_capability: true,
+            fail_get_prompt: true,
+            ..Default::default()
+        };
+        let (runtime, _server) = fixture_runtime(fixture).await;
+
+        let err = runtime
+            .prompt("fixture", "summarize", HashMap::new())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("get_prompt exploded"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn flatten_prompt_messages_labels_every_message() {
+        let messages = vec![
+            PromptMessage::new_text(Role::User, "Summarize notes.txt"),
+            PromptMessage::new_text(Role::Assistant, "In which style?"),
+            PromptMessage::new_text(Role::User, "Concise."),
+        ];
+
+        assert_eq!(
+            flatten_prompt_messages(&messages),
+            "[user]\nSummarize notes.txt\n\n[assistant]\nIn which style?\n\n[user]\nConcise."
+        );
+    }
+
+    #[test]
+    fn flatten_prompt_messages_labels_single_message() {
+        let messages = vec![PromptMessage::new_text(Role::User, "hello")];
+
+        assert_eq!(flatten_prompt_messages(&messages), "[user]\nhello");
+    }
+
+    #[test]
+    fn flatten_prompt_messages_replaces_non_text_content() {
+        let messages = vec![PromptMessage::new(
+            Role::User,
+            ContentBlock::image("aGk=", "image/png"),
+        )];
+
+        assert_eq!(
+            flatten_prompt_messages(&messages),
+            "[user]\n[image content omitted]"
+        );
+    }
+
+    #[tokio::test]
+    async fn flattened_hostile_prompt_cannot_start_a_command_line() {
+        let fixture = FixtureServer {
+            prompts_capability: true,
+            ..Default::default()
+        };
+        let (runtime, _server) = fixture_runtime(fixture).await;
+
+        let result = runtime
+            .prompt("fixture", "hostile", HashMap::new())
+            .await
+            .unwrap();
+        let flattened = flatten_prompt_messages(&result.messages);
+
+        assert!(flattened.starts_with("[user]"));
+        assert!(!flattened.starts_with('!'));
+        assert!(!flattened.starts_with('.'));
+        assert!(flattened.contains("!rm -rf /"));
+        assert!(flattened.contains(".session hijack"));
+    }
+
+    #[test]
+    fn format_prompt_arguments_marks_required() {
+        let arguments = vec![
+            PromptArgument::new("path").with_required(true),
+            PromptArgument::new("style"),
+        ];
+
+        assert_eq!(
+            format_prompt_arguments(&arguments),
+            "path (required), style"
+        );
+        assert_eq!(format_prompt_arguments(&[]), "");
+    }
+
+    #[tokio::test]
+    async fn prompt_catalog_carries_arguments() {
+        let fixture = FixtureServer {
+            prompts_capability: true,
+            ..Default::default()
+        };
+        let (runtime, _server) = fixture_runtime(fixture).await;
+
+        let items = runtime.prompt_catalog().await;
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.kind, CatalogItemKind::Prompt);
+        assert_eq!(item.server, "fixture");
+        assert_eq!(item.name, "summarize");
+        assert_eq!(item.description, "Summarize a document");
+        let arguments = item.arguments.as_deref().unwrap();
+        assert_eq!(format_prompt_arguments(arguments), "path (required), style");
+    }
+
+    #[tokio::test]
+    async fn prompt_catalog_degrades_when_one_server_fails() {
+        install_warn_collector();
+        let healthy = FixtureServer {
+            prompts_capability: true,
+            ..Default::default()
+        };
+        let failing = FixtureServer {
+            prompts_capability: true,
+            fail_prompt_listings: true,
+            ..Default::default()
+        };
+        let (mut runtime, _server) = fixture_runtime(healthy).await;
+        let _failing_server = add_fixture_server(&mut runtime, "broken", failing).await;
+
+        let items = runtime.prompt_catalog().await;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].server, "fixture");
+        let messages = warn_messages().lock().unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|msg| msg.contains("Failed to list prompts on MCP server broken")),
+            "missing prompt-listing warning in: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_catalog_skips_servers_without_prompts_capability() {
+        let fixture = FixtureServer::default();
+        let prompts_calls = Arc::clone(&fixture.list_prompts_calls);
+        let (runtime, _server) = fixture_runtime(fixture).await;
+
+        let items = runtime.prompt_catalog().await;
+
+        assert!(items.is_empty());
+        assert_eq!(prompts_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_stage_one_uses_local_state_only() {
+        let fixture = FixtureServer {
+            prompts_capability: true,
+            ..Default::default()
+        };
+        let list_prompts_calls = Arc::clone(&fixture.list_prompts_calls);
+        let get_prompt_calls = Arc::clone(&fixture.get_prompt_calls);
+        let (mut runtime, _server) = fixture_runtime(fixture).await;
+        let _tools_only =
+            add_fixture_server(&mut runtime, "tools-only", FixtureServer::default()).await;
+
+        let stage =
+            runtime.prompt_completion(&["fixture".to_string(), "tools-only".to_string()], &[""]);
+
+        let McpPromptCompletion::Ready(values) = stage else {
+            panic!("stage one must not require an RPC");
+        };
+        assert_eq!(values, vec![("fixture".to_string(), None)]);
+        assert_eq!(list_prompts_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(get_prompt_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_stage_one_excludes_disabled_servers() {
+        let fixture = FixtureServer {
+            prompts_capability: true,
+            ..Default::default()
+        };
+        let (runtime, _server) = fixture_runtime(fixture).await;
+
+        let McpPromptCompletion::Ready(values) = runtime.prompt_completion(&[], &[""]) else {
+            panic!("stage one must not require an RPC");
+        };
+
+        assert!(values.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_unknown_server_is_empty() {
+        let (runtime, _server) = fixture_runtime(FixtureServer::default()).await;
+
+        for args in [
+            ["ghost", ""].as_slice(),
+            ["ghost", "summarize", ""].as_slice(),
+        ] {
+            let McpPromptCompletion::Ready(values) = runtime.prompt_completion(&[], args) else {
+                panic!("unknown server must degrade to empty suggestions");
+            };
+            assert!(values.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_later_stages_carry_typed_keys() {
+        let fixture = FixtureServer {
+            prompts_capability: true,
+            ..Default::default()
+        };
+        let (runtime, _server) = fixture_runtime(fixture).await;
+
+        let stage = runtime.prompt_completion(&[], &["fixture", "summarize", "path=x", "sty"]);
+
+        let McpPromptCompletion::ArgumentKeys {
+            prompt, typed_keys, ..
+        } = stage
+        else {
+            panic!("expected the argument-key stage");
+        };
+        assert_eq!(prompt, "summarize");
+        assert_eq!(typed_keys, vec!["path".to_string()]);
     }
 }

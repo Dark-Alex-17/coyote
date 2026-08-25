@@ -16,7 +16,7 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use http::{HeaderName, HeaderValue};
 use indexmap::IndexMap;
 use indoc::formatdoc;
-use rmcp::model::ServerCapabilities;
+use rmcp::model::{PromptArgument, ServerCapabilities};
 use rmcp::service::RunningService;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::TokioChildProcess;
@@ -123,6 +123,8 @@ pub struct CatalogItem {
     pub mime_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Vec<PromptArgument>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

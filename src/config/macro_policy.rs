@@ -566,6 +566,34 @@ mod tests {
     }
 
     #[test]
+    fn prompt_macro_is_shadowed_by_builtin() {
+        let policy = MacroPolicy::effective_with(
+            globals(&["prompt"]),
+            None,
+            None,
+            None,
+            None,
+            &crate::repl::builtin_command_names(),
+        );
+
+        assert_eq!(state_of(&policy, "prompt"), &MacroState::ShadowedBuiltin);
+    }
+
+    #[test]
+    fn temp_role_macro_is_shadowed_by_builtin() {
+        let policy = MacroPolicy::effective_with(
+            globals(&["temp-role"]),
+            None,
+            None,
+            None,
+            None,
+            &crate::repl::builtin_command_names(),
+        );
+
+        assert_eq!(state_of(&policy, "temp-role"), &MacroState::ShadowedBuiltin);
+    }
+
+    #[test]
     fn locked_wins_over_shadowed_builtin() {
         let l = list(&["a"]);
 

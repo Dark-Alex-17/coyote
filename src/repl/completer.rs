@@ -1,11 +1,17 @@
 use super::{REPL_COMMANDS, ReplCommand};
 
-use crate::{config::RequestContext, utils::fuzzy_filter};
+use crate::config::{McpPromptCompletion, RequestContext};
+use crate::mcp::ConnectedServer;
+use crate::utils::fuzzy_filter;
 
 use parking_lot::RwLock;
 use reedline::{Completer, Span, Suggestion};
+use rmcp::model::Prompt;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+
+const PROMPT_COMPLETION_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Completer for ReplCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
@@ -27,6 +33,22 @@ impl Completer for ReplCompleter {
 
         if !cmd.starts_with('.') {
             return suggestions;
+        }
+
+        if cmd == ".prompt" && parts_len > 1 {
+            let span = Span::new(parts[parts_len - 1].1, pos);
+            let args: Vec<&str> = parts.iter().skip(1).map(|(v, _)| *v).collect();
+            let filter = args.last().copied().unwrap_or_default().to_string();
+            let stage = {
+                let ctx = self.ctx.read();
+                ctx.mcp_prompt_completion(&args)
+            };
+            return complete_prompt_stage(stage, &filter, PROMPT_COMPLETION_RPC_TIMEOUT)
+                .iter()
+                .map(|(value, description)| {
+                    create_suggestion(value, description.as_deref().unwrap_or_default(), span)
+                })
+                .collect();
         }
 
         let ctx = self.ctx.read();
@@ -141,6 +163,57 @@ fn create_suggestion(value: &str, description: &str, span: Span) -> Suggestion {
     }
 }
 
+fn complete_prompt_stage(
+    stage: McpPromptCompletion,
+    filter: &str,
+    rpc_timeout: Duration,
+) -> Vec<(String, Option<String>)> {
+    let values = match stage {
+        McpPromptCompletion::Ready(values) => values,
+        McpPromptCompletion::PromptNames { server } => list_prompts_blocking(server, rpc_timeout)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|prompt| (prompt.name, prompt.description))
+            .collect(),
+        McpPromptCompletion::ArgumentKeys {
+            server,
+            prompt,
+            typed_keys,
+        } => list_prompts_blocking(server, rpc_timeout)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|candidate| candidate.name == prompt)
+            .and_then(|candidate| candidate.arguments)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|arg| !typed_keys.contains(&arg.name))
+            .map(|arg| {
+                let description = match (arg.required == Some(true), arg.description) {
+                    (true, Some(description)) => Some(format!("{description} (required)")),
+                    (true, None) => Some("(required)".to_string()),
+                    (false, description) => description,
+                };
+                (format!("{}=", arg.name), description)
+            })
+            .collect(),
+    };
+    fuzzy_filter(values, |(value, _)| value.as_str(), filter)
+}
+
+fn list_prompts_blocking(
+    server: Arc<ConnectedServer>,
+    rpc_timeout: Duration,
+) -> Option<Vec<Prompt>> {
+    let fut = async move { tokio::time::timeout(rpc_timeout, server.list_all_prompts()).await };
+    // block_in_place is only sound because the REPL's read_line runs inside the
+    // main-thread block_on of the multi-thread runtime.
+    let result = match tokio::runtime::Handle::try_current().ok() {
+        Some(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        None => tokio::runtime::Runtime::new().ok()?.block_on(fut),
+    };
+    result.ok()?.ok()
+}
+
 fn split_line(line: &str) -> Vec<(&str, usize)> {
     let mut parts = vec![];
     let mut part_start = None;
@@ -177,4 +250,170 @@ fn test_split_line() {
         split_line(".set highlight t"),
         vec![(".set", 0), ("highlight", 5), ("t", 15)],
     );
+}
+
+#[cfg(test)]
+mod prompt_completion_tests {
+    use super::*;
+    use crate::config::test_fixtures::{FixtureServer, fixture_runtime};
+    use std::sync::atomic::Ordering;
+
+    fn prompts_fixture() -> FixtureServer {
+        FixtureServer {
+            prompts_capability: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stage_two_lists_prompt_names_with_descriptions() {
+        let (runtime, _server) = fixture_runtime(prompts_fixture()).await;
+        let server = runtime.get("fixture").cloned().unwrap();
+
+        let values = complete_prompt_stage(
+            McpPromptCompletion::PromptNames { server },
+            "",
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            values,
+            vec![(
+                "summarize".to_string(),
+                Some("Summarize a document".to_string())
+            )]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stage_three_suggests_argument_keys_with_required_marker() {
+        let (runtime, _server) = fixture_runtime(prompts_fixture()).await;
+        let server = runtime.get("fixture").cloned().unwrap();
+
+        let values = complete_prompt_stage(
+            McpPromptCompletion::ArgumentKeys {
+                server,
+                prompt: "summarize".to_string(),
+                typed_keys: vec![],
+            },
+            "",
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            values,
+            vec![
+                (
+                    "path=".to_string(),
+                    Some("Document path (required)".to_string())
+                ),
+                ("style=".to_string(), None),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stage_three_excludes_typed_keys_and_fuzzy_filters() {
+        let (runtime, _server) = fixture_runtime(prompts_fixture()).await;
+        let server = runtime.get("fixture").cloned().unwrap();
+
+        let values = complete_prompt_stage(
+            McpPromptCompletion::ArgumentKeys {
+                server: Arc::clone(&server),
+                prompt: "summarize".to_string(),
+                typed_keys: vec!["path".to_string()],
+            },
+            "",
+            Duration::from_secs(2),
+        );
+        assert_eq!(values, vec![("style=".to_string(), None)]);
+
+        let values = complete_prompt_stage(
+            McpPromptCompletion::ArgumentKeys {
+                server,
+                prompt: "summarize".to_string(),
+                typed_keys: vec![],
+            },
+            "sty",
+            Duration::from_secs(2),
+        );
+        assert_eq!(values, vec![("style=".to_string(), None)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stage_three_unknown_prompt_is_empty() {
+        let (runtime, _server) = fixture_runtime(prompts_fixture()).await;
+        let server = runtime.get("fixture").cloned().unwrap();
+
+        let values = complete_prompt_stage(
+            McpPromptCompletion::ArgumentKeys {
+                server,
+                prompt: "ghost".to_string(),
+                typed_keys: vec![],
+            },
+            "",
+            Duration::from_secs(2),
+        );
+
+        assert!(values.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_listing_times_out_to_empty() {
+        let fixture = FixtureServer {
+            prompt_delay: Some(Duration::from_millis(200)),
+            ..prompts_fixture()
+        };
+        let (runtime, _server) = fixture_runtime(fixture).await;
+        let server = runtime.get("fixture").cloned().unwrap();
+
+        let values = complete_prompt_stage(
+            McpPromptCompletion::PromptNames { server },
+            "",
+            Duration::from_millis(20),
+        );
+
+        assert!(values.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_listing_is_swallowed_without_retry() {
+        let fixture = FixtureServer {
+            fail_prompt_listings: true,
+            ..prompts_fixture()
+        };
+        let list_prompts_calls = Arc::clone(&fixture.list_prompts_calls);
+        let (runtime, _server) = fixture_runtime(fixture).await;
+        let server = runtime.get("fixture").cloned().unwrap();
+
+        let values = complete_prompt_stage(
+            McpPromptCompletion::PromptNames { server },
+            "",
+            Duration::from_secs(2),
+        );
+
+        assert!(values.is_empty());
+        assert_eq!(list_prompts_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn bridge_without_ambient_runtime_uses_fallback_runtime() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (runtime, _server) = rt.block_on(fixture_runtime(prompts_fixture()));
+        let server = runtime.get("fixture").cloned().unwrap();
+
+        let values = complete_prompt_stage(
+            McpPromptCompletion::PromptNames { server },
+            "",
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            values,
+            vec![(
+                "summarize".to_string(),
+                Some("Summarize a document".to_string())
+            )]
+        );
+    }
 }
