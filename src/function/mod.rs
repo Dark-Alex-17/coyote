@@ -7,7 +7,9 @@ pub(crate) mod user_interaction;
 
 use crate::{
     client::ThinkingBlock,
-    config::{Agent, RequestContext, flatten_prompt_messages, resolve_prompt_args},
+    config::{
+        Agent, RequestContext, flatten_prompt_messages, resolve_prompt_args, sanitize_display_text,
+    },
     graph,
     utils::*,
 };
@@ -1376,7 +1378,7 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP search failed: {e}");
-                    eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
                     json!({"tool_call_error": error_msg})
                 })
         } else if cmd_name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX) {
@@ -1384,7 +1386,7 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP describe failed: {e}");
-                    eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
                     json!({"tool_call_error": error_msg})
                 })
         } else if cmd_name.starts_with(MCP_READ_META_FUNCTION_NAME_PREFIX) {
@@ -1392,7 +1394,7 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP read failed: {e}");
-                    eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
                     json!({"tool_call_error": error_msg})
                 })
         } else if cmd_name.starts_with(MCP_PROMPT_META_FUNCTION_NAME_PREFIX) {
@@ -1400,7 +1402,7 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP prompt failed: {e}");
-                    eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
                     json!({"tool_call_error": error_msg})
                 })
         } else {
@@ -1408,7 +1410,7 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP tool invocation failed: {e}");
-                    eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
                     json!({"tool_call_error": error_msg})
                 })
         };
@@ -1451,7 +1453,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP search failed: {e}");
-                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1460,7 +1462,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP describe failed: {e}");
-                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1469,7 +1471,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP read failed: {e}");
-                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1478,7 +1480,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP prompt failed: {e}");
-                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1487,7 +1489,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP tool invocation failed: {e}");
-                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1630,7 +1632,7 @@ impl ToolCall {
             .mcp_runtime
             .invoke(&server, tool, arguments)
             .await?;
-        Ok(serde_json::to_value(result)?)
+        render_tool_result(serde_json::to_value(result)?, &server)
     }
 
     async fn read_mcp_resource(
@@ -1676,6 +1678,11 @@ impl ToolCall {
         };
 
         let result = ctx.tool_scope.mcp_runtime.read(server, &uri).await?;
+        let audience = ctx
+            .tool_scope
+            .mcp_runtime
+            .resource_audience(server, &uri)
+            .await;
         let items: Vec<Value> = result
             .contents
             .iter()
@@ -1685,7 +1692,10 @@ impl ToolCall {
         let mut rendered_items = Vec::with_capacity(items.len());
         let mut total_size = 0usize;
         for (index, item) in items.iter().enumerate() {
-            let rendered = render_resource_content(item, pattern, offset, max_bytes, server)?;
+            let mut rendered = render_resource_content(item, pattern, offset, max_bytes, server)?;
+            if let (Some(audience), Some(map)) = (&audience, rendered.as_object_mut()) {
+                map.insert("audience".to_string(), json!(audience));
+            }
             let size = rendered.to_string().len();
             // Bound the overall response; the first item is always included.
             if index > 0 && total_size + size > render::TEXT_MAX_BYTES_CLAMP {
@@ -1921,20 +1931,28 @@ fn render_resource_content(
     max_bytes: Option<usize>,
     server: &str,
 ) -> Result<Value> {
-    let uri = item.get("uri").and_then(Value::as_str);
-    let mime_type = item.get("mimeType").and_then(Value::as_str);
+    let uri = item
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(render::clamp_metadata);
+    let mime_type = item
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .map(render::clamp_metadata);
     let text = match parse_resource_content(item)? {
         ResourceContentBody::Text(text) => text,
-        ResourceContentBody::Blob(blob) => match render::render_blob(&blob, mime_type, server)? {
-            render::RenderedBlob::Text(text) => text,
-            render::RenderedBlob::Spilled(meta) => {
-                let mut value = serde_json::to_value(meta)?;
-                if let Some(map) = value.as_object_mut() {
-                    map.insert("uri".to_string(), json!(uri));
+        ResourceContentBody::Blob(blob) => {
+            match render::render_blob(&blob, mime_type.as_deref(), server)? {
+                render::RenderedBlob::Text(text) => text,
+                render::RenderedBlob::Spilled(meta) => {
+                    let mut value = serde_json::to_value(meta)?;
+                    if let Some(map) = value.as_object_mut() {
+                        map.insert("uri".to_string(), json!(uri));
+                    }
+                    return Ok(value);
                 }
-                return Ok(value);
             }
-        },
+        }
     };
     let rendered = render::render_text(&text, pattern, offset, max_bytes)?;
     let mut value = json!({
@@ -1953,6 +1971,150 @@ fn render_resource_content(
         ));
     }
     Ok(value)
+}
+
+// Terminal-only rendering of an MCP dispatch error: escape sequences are
+// stripped so a hostile server cannot drive the terminal, while the JSON
+// payload keeps the raw message.
+fn mcp_error_display(error_msg: &str) -> String {
+    sanitize_display_text(&format!("⚠️ {error_msg} ⚠️"))
+}
+
+/// Bounds a raw `CallToolResult` JSON value: oversized text is sliced,
+/// base64 blob content is routed through the blob renderer instead of
+/// reaching model context, and oversized structured content is replaced with
+/// a truncation marker. In-bounds results pass through unchanged.
+fn render_tool_result(mut result: Value, server: &str) -> Result<Value> {
+    let Some(map) = result.as_object_mut() else {
+        return Ok(result);
+    };
+    if let Some(items) = map.get_mut("content").and_then(Value::as_array_mut) {
+        for item in items {
+            render_tool_content_item(item, server)?;
+        }
+    }
+    let oversized_structured = map
+        .get("structuredContent")
+        .is_some_and(|structured| structured.to_string().len() > render::TEXT_MAX_BYTES_CLAMP);
+    if oversized_structured {
+        map.insert(
+            "structuredContent".to_string(),
+            json!({
+                "truncated": true,
+                "note": format!(
+                    "structuredContent omitted: its serialized form exceeds \
+                     TEXT_MAX_BYTES_CLAMP ({} bytes); re-call the tool with narrower \
+                     arguments",
+                    render::TEXT_MAX_BYTES_CLAMP
+                ),
+            }),
+        );
+    }
+    Ok(result)
+}
+
+fn render_tool_content_item(item: &mut Value, server: &str) -> Result<()> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("text") => clamp_tool_text(item),
+        Some("image") | Some("audio") => {
+            let mime_type = item
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .map(render::clamp_metadata);
+            if let Some(data) = item.get("data").and_then(Value::as_str) {
+                let replacement = render_tool_blob(data, mime_type, None, server)?;
+                *item = replacement;
+            }
+        }
+        Some("resource") => {
+            let Some(resource) = item.get("resource") else {
+                return Ok(());
+            };
+            let uri = resource
+                .get("uri")
+                .and_then(Value::as_str)
+                .map(render::clamp_metadata);
+            let mime_type = resource
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .map(render::clamp_metadata);
+            if let Some(blob) = resource.get("blob").and_then(Value::as_str) {
+                let replacement = render_tool_blob(blob, mime_type, uri, server)?;
+                *item = replacement;
+            } else if let Some(resource) = item.get_mut("resource") {
+                clamp_tool_text(resource);
+                clamp_metadata_field(resource, "uri");
+                clamp_metadata_field(resource, "mimeType");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn render_tool_blob(
+    b64: &str,
+    mime_type: Option<String>,
+    uri: Option<String>,
+    server: &str,
+) -> Result<Value> {
+    let mut value = match render::render_blob(b64, mime_type.as_deref(), server) {
+        Ok(render::RenderedBlob::Text(text)) => {
+            let mut item = json!({ "type": "text", "text": text });
+            clamp_tool_text(&mut item);
+            item
+        }
+        Ok(render::RenderedBlob::Spilled(meta)) => serde_json::to_value(meta)?,
+        // One undecodable item must not sink the rest of the result.
+        Err(error) => json!({ "error": format!("Failed to render blob content: {error}") }),
+    };
+    if let Some(map) = value.as_object_mut() {
+        if let Some(mime_type) = mime_type
+            && !map.contains_key("mime_type")
+        {
+            map.insert("mime_type".to_string(), json!(mime_type));
+        }
+        if let Some(uri) = uri {
+            map.insert("uri".to_string(), json!(uri));
+        }
+    }
+    Ok(value)
+}
+
+fn clamp_tool_text(container: &mut Value) {
+    let Some(text) = container.get("text").and_then(Value::as_str) else {
+        return;
+    };
+    if text.len() <= render::TEXT_MAX_BYTES_CLAMP {
+        return;
+    }
+    let total_bytes = text.len();
+    let clamped = render::truncate_utf8(text, render::TEXT_MAX_BYTES_CLAMP).to_string();
+    let Some(map) = container.as_object_mut() else {
+        return;
+    };
+    map.insert("text".to_string(), json!(clamped));
+    map.insert("truncated".to_string(), json!(true));
+    map.insert("total_bytes".to_string(), json!(total_bytes));
+    map.insert(
+        "note".to_string(),
+        json!(format!(
+            "Text truncated; re-call the tool with narrower arguments (text is clamped to \
+             TEXT_MAX_BYTES_CLAMP = {} bytes)",
+            render::TEXT_MAX_BYTES_CLAMP
+        )),
+    );
+}
+
+fn clamp_metadata_field(object: &mut Value, key: &str) {
+    let Some(text) = object.get(key).and_then(Value::as_str) else {
+        return;
+    };
+    if text.len() <= render::METADATA_MAX_BYTES {
+        return;
+    }
+    let clamped = render::clamp_metadata(text);
+    object[key] = json!(clamped);
 }
 
 pub fn run_llm_function(
@@ -2299,11 +2461,14 @@ fn format_json_colored_keys(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::config::test_fixtures::{
-        FIXTURE_BLOB_BYTES, FIXTURE_BLOB_URI, FIXTURE_LOG_TEXT, FIXTURE_LOG_URI, FixtureServer,
-        fixture_runtime,
+        FIXTURE_ANNOTATED_TEXT, FIXTURE_ANNOTATED_URI, FIXTURE_BLOB_BYTES, FIXTURE_BLOB_URI,
+        FIXTURE_LOG_TEXT, FIXTURE_LOG_URI, FixtureServer, fixture_runtime,
     };
     use crate::config::{AppState, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use rmcp::model::{CallToolResult, ContentBlock};
     use serde_json::json;
     use serial_test::serial;
     use std::sync::Arc;
@@ -3388,6 +3553,224 @@ mod tests {
 
         assert_eq!(output["uri"], "file:///docs/readme");
         assert_eq!(output["text"], "readme body");
+    }
+
+    #[test]
+    fn eval_mcp_read_attaches_catalog_audience() {
+        let output = run_async(eval_mcp_read(json!({"uri": FIXTURE_ANNOTATED_URI}))).unwrap();
+
+        assert_eq!(output["audience"], json!(["user"]));
+        assert_eq!(output["text"], FIXTURE_ANNOTATED_TEXT);
+    }
+
+    #[test]
+    fn eval_mcp_read_omits_audience_for_unannotated_uri() {
+        let output = run_async(eval_mcp_read(json!({"uri": FIXTURE_LOG_URI}))).unwrap();
+
+        assert!(output.get("audience").is_none());
+    }
+
+    #[test]
+    fn mcp_error_display_strips_terminal_escapes() {
+        let hostile = "fail\u{1b}[31mred\u{1b}]0;pwn\u{7}end";
+
+        let display = mcp_error_display(hostile);
+
+        assert!(!display.contains('\u{1b}'));
+        assert_eq!(display, "⚠️ failredend ⚠️");
+        // The payload keeps the raw message; only the terminal string differs.
+        assert_ne!(display, format!("⚠️ {hostile} ⚠️"));
+    }
+
+    #[test]
+    fn render_tool_result_passes_in_bounds_result_through_unchanged() {
+        let mut result = CallToolResult::success(vec![ContentBlock::text("small text")]);
+        result.structured_content = Some(json!({"rows": [1, 2, 3]}));
+
+        let bounded = render_tool_result(serde_json::to_value(&result).unwrap(), "srv").unwrap();
+
+        assert_eq!(bounded, serde_json::to_value(&result).unwrap());
+        assert_eq!(bounded["isError"], false);
+    }
+
+    #[test]
+    fn render_tool_result_clamps_oversized_text() {
+        let result = CallToolResult::success(vec![ContentBlock::text(
+            "x".repeat(render::TEXT_MAX_BYTES_CLAMP + 10),
+        )]);
+
+        let bounded = render_tool_result(serde_json::to_value(&result).unwrap(), "srv").unwrap();
+
+        let item = &bounded["content"][0];
+        assert_eq!(
+            item["text"].as_str().unwrap().len(),
+            render::TEXT_MAX_BYTES_CLAMP
+        );
+        assert_eq!(item["truncated"], true);
+        assert_eq!(item["total_bytes"], render::TEXT_MAX_BYTES_CLAMP + 10);
+        assert!(
+            item["note"]
+                .as_str()
+                .unwrap()
+                .contains("TEXT_MAX_BYTES_CLAMP")
+        );
+        assert_eq!(bounded["isError"], false);
+    }
+
+    #[test]
+    #[serial]
+    fn render_tool_result_spills_blob_content_without_base64() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let cache_dir = env::temp_dir().join(format!(
+            "coyote-tool-blob-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&cache_dir).unwrap();
+        let env_name = get_env_name("cache_dir");
+        let previous = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, &cache_dir) };
+
+        let b64 = STANDARD.encode(FIXTURE_BLOB_BYTES);
+        let result = CallToolResult::success(vec![ContentBlock::image(b64.clone(), "image/png")]);
+        let bounded = render_tool_result(serde_json::to_value(&result).unwrap(), "srv");
+
+        unsafe {
+            match previous {
+                Some(value) => env::set_var(&env_name, value),
+                None => env::remove_var(&env_name),
+            }
+        }
+
+        let bounded = bounded.unwrap();
+        let item = &bounded["content"][0];
+        assert_eq!(item["spilled"], true);
+        assert_eq!(item["mime_type"], "image/png");
+        assert_eq!(item["sha256"].as_str().unwrap().len(), 64);
+        assert!(
+            !bounded.to_string().contains(&b64),
+            "base64 payload must not reach model context"
+        );
+
+        fs::remove_dir_all(&cache_dir).unwrap();
+    }
+
+    #[test]
+    fn render_tool_result_inlines_utf8_blob_as_text() {
+        let b64 = STANDARD.encode("hello ✓ world");
+        let result = CallToolResult::success(vec![ContentBlock::image(b64.clone(), "image/png")]);
+
+        let bounded = render_tool_result(serde_json::to_value(&result).unwrap(), "srv").unwrap();
+
+        let item = &bounded["content"][0];
+        assert_eq!(item["type"], "text");
+        assert_eq!(item["text"], "hello ✓ world");
+        assert!(item.get("spilled").is_none());
+        assert!(!bounded.to_string().contains(&b64));
+    }
+
+    #[test]
+    fn render_tool_result_degrades_undecodable_blob_item() {
+        let value = json!({
+            "content": [
+                {"type": "image", "data": "!!!not base64!!!", "mimeType": "image/png"},
+                {"type": "text", "text": "still here"},
+            ],
+        });
+
+        let bounded = render_tool_result(value, "srv").unwrap();
+
+        let error = bounded["content"][0]["error"].as_str().unwrap();
+        assert!(error.contains("base64"), "{error}");
+        assert_eq!(bounded["content"][0]["mime_type"], "image/png");
+        assert_eq!(bounded["content"][1]["text"], "still here");
+    }
+
+    #[test]
+    fn render_tool_result_replaces_oversized_structured_content() {
+        let mut result = CallToolResult::success(vec![]);
+        result.structured_content =
+            Some(json!({"blob": "x".repeat(render::TEXT_MAX_BYTES_CLAMP + 1)}));
+
+        let bounded = render_tool_result(serde_json::to_value(&result).unwrap(), "srv").unwrap();
+
+        let structured = &bounded["structuredContent"];
+        assert_eq!(structured["truncated"], true);
+        assert!(
+            structured["note"]
+                .as_str()
+                .unwrap()
+                .contains("TEXT_MAX_BYTES_CLAMP")
+        );
+        assert!(bounded.to_string().len() < render::TEXT_MAX_BYTES_CLAMP);
+    }
+
+    #[test]
+    fn render_tool_result_clamps_embedded_resource_metadata() {
+        let uri = "u".repeat(render::METADATA_MAX_BYTES + 1);
+        let value = json!({
+            "content": [{"type": "resource", "resource": {"uri": uri, "text": "hi"}}],
+        });
+
+        let bounded = render_tool_result(value, "srv").unwrap();
+
+        let resource = &bounded["content"][0]["resource"];
+        assert!(
+            resource["uri"]
+                .as_str()
+                .unwrap()
+                .contains("METADATA_MAX_BYTES")
+        );
+        assert_eq!(resource["text"], "hi");
+    }
+
+    #[test]
+    fn render_resource_content_clamps_metadata_strings() {
+        let uri = format!("file:///{}", "u".repeat(render::METADATA_MAX_BYTES));
+        let mime = format!("text/{}", "m".repeat(render::METADATA_MAX_BYTES));
+        let item = json!({"uri": uri, "mimeType": mime, "text": "hi"});
+
+        let value = render_resource_content(&item, None, 0, None, "srv").unwrap();
+
+        assert!(
+            value["uri"]
+                .as_str()
+                .unwrap()
+                .contains("METADATA_MAX_BYTES")
+        );
+        assert!(
+            value["mime_type"]
+                .as_str()
+                .unwrap()
+                .contains("METADATA_MAX_BYTES")
+        );
+        assert_eq!(value["text"], "hi");
+    }
+
+    #[test]
+    fn eval_mcp_invoke_bounds_tool_results_end_to_end() {
+        let mut result = CallToolResult::success(vec![ContentBlock::text("hi")]);
+        result.structured_content = Some(json!({"ok": true}));
+        let fixture = FixtureServer {
+            tool_result: Some(result),
+            ..Default::default()
+        };
+        let call_tool_calls = Arc::clone(&fixture.call_tool_calls);
+
+        let output = run_async(async {
+            let (runtime, _server) = fixture_runtime(fixture).await;
+            let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+            ctx.tool_scope.mcp_runtime = runtime;
+            call_with_args("mcp_invoke_fixture", json!({"tool": "dup"}))
+                .eval_mcp(&ctx)
+                .await
+        })
+        .unwrap();
+
+        assert_eq!(output["content"][0]["text"], "hi");
+        assert_eq!(output["structuredContent"], json!({"ok": true}));
+        assert_eq!(output["isError"], false);
+        assert_eq!(call_tool_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

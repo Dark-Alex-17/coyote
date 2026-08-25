@@ -4,9 +4,9 @@ use crate::mcp::{CatalogItem, CatalogItemKind, ConnectedServer, McpRegistry, Mcp
 use anyhow::{Context, Result, anyhow};
 use bm25::{Document, Language, SearchEngineBuilder};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResult,
-    Prompt, PromptArgument, PromptMessage, ReadResourceRequestParams, ReadResourceResult, Resource,
-    ResourceTemplate, Role, Tool,
+    Annotations, CallToolRequestParams, CallToolResult, ContentBlock, GetPromptRequestParams,
+    GetPromptResult, Prompt, PromptArgument, PromptMessage, ReadResourceRequestParams,
+    ReadResourceResult, Resource, ResourceTemplate, Role, Tool,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -175,6 +175,16 @@ impl McpRuntime {
             .take(top_k)
             .cloned()
             .collect())
+    }
+
+    /// Best-effort audience lookup for a catalog resource: a listing failure
+    /// or an unknown uri (e.g. template-expanded) yields `None`.
+    pub async fn resource_audience(&self, server: &str, uri: &str) -> Option<Vec<String>> {
+        let items = self.catalog_items(server).await.ok()?;
+        items
+            .into_values()
+            .find(|item| item.uri.as_deref() == Some(uri))
+            .and_then(|item| item.audience)
     }
 
     pub async fn describe(&self, server: &str, kind: &str, tool: &str) -> Result<Value> {
@@ -482,6 +492,19 @@ pub fn sanitize_display_text(text: &str) -> String {
     sanitized
 }
 
+fn audience_strings(annotations: Option<Annotations>) -> Option<Vec<String>> {
+    let audience = annotations?.audience?;
+    Some(
+        audience
+            .into_iter()
+            .map(|role| match role {
+                Role::User => "user".to_string(),
+                Role::Assistant => "assistant".to_string(),
+            })
+            .collect(),
+    )
+}
+
 fn catalog_key(item: &CatalogItem) -> String {
     let id = item.uri.as_deref().unwrap_or(&item.name);
     format!("{}:{id}", item.kind)
@@ -516,6 +539,7 @@ fn resource_catalog_item(server: &str, resource: Resource) -> CatalogItem {
         mime_type: resource.mime_type,
         size: resource.size,
         arguments: None,
+        audience: audience_strings(resource.annotations),
     }
 }
 
@@ -529,6 +553,7 @@ fn resource_template_catalog_item(server: &str, template: ResourceTemplate) -> C
         mime_type: template.mime_type,
         size: None,
         arguments: None,
+        audience: audience_strings(template.annotations),
     }
 }
 
@@ -583,6 +608,8 @@ pub(crate) mod test_fixtures {
         eighth line";
     pub(crate) const FIXTURE_BLOB_URI: &str = "file:///report.pdf";
     pub(crate) const FIXTURE_BLOB_BYTES: &[u8] = &[0xff, 0xfe, 0x00, 0x88, 0x01];
+    pub(crate) const FIXTURE_ANNOTATED_URI: &str = "file:///annotated";
+    pub(crate) const FIXTURE_ANNOTATED_TEXT: &str = "annotated body";
 
     #[derive(Clone)]
     pub(crate) struct FixtureServer {
@@ -594,6 +621,7 @@ pub(crate) mod test_fixtures {
         pub(crate) fail_prompt_listings: bool,
         pub(crate) fail_get_prompt: bool,
         pub(crate) prompt_delay: Option<Duration>,
+        pub(crate) tool_result: Option<CallToolResult>,
         pub(crate) list_resources_calls: Arc<AtomicUsize>,
         pub(crate) list_prompts_calls: Arc<AtomicUsize>,
         pub(crate) get_prompt_calls: Arc<AtomicUsize>,
@@ -611,6 +639,7 @@ pub(crate) mod test_fixtures {
                 fail_prompt_listings: false,
                 fail_get_prompt: false,
                 prompt_delay: None,
+                tool_result: None,
                 list_resources_calls: Arc::default(),
                 list_prompts_calls: Arc::default(),
                 get_prompt_calls: Arc::default(),
@@ -656,10 +685,13 @@ pub(crate) mod test_fixtures {
             _context: RequestContext<RoleServer>,
         ) -> Result<CallToolResponse, ErrorData> {
             self.call_tool_calls.fetch_add(1, Ordering::SeqCst);
-            Err(ErrorData::internal_error(
-                "call_tool should not be reached",
-                None,
-            ))
+            match &self.tool_result {
+                Some(result) => Ok(CallToolResponse::Complete(result.clone())),
+                None => Err(ErrorData::internal_error(
+                    "call_tool should not be reached",
+                    None,
+                )),
+            }
         }
 
         async fn list_resources(
@@ -676,6 +708,10 @@ pub(crate) mod test_fixtures {
                     .with_description("Duplicate-named resource")
                     .with_mime_type("text/plain")
                     .with_size(42),
+                Resource::new(FIXTURE_ANNOTATED_URI, "annotated-notes")
+                    .with_description("Notes with an audience annotation")
+                    .with_mime_type("text/plain")
+                    .with_annotations(Annotations::default().with_audience(vec![Role::User])),
             ]))
         }
 
@@ -706,6 +742,7 @@ pub(crate) mod test_fixtures {
                     ResourceContents::blob(STANDARD.encode(FIXTURE_BLOB_BYTES), uri)
                         .with_mime_type("application/pdf"),
                 ],
+                FIXTURE_ANNOTATED_URI => vec![ResourceContents::text(FIXTURE_ANNOTATED_TEXT, uri)],
                 "file:///multi" => vec![
                     ResourceContents::text("first", "file:///multi/0"),
                     ResourceContents::text("second", "file:///multi/1"),
@@ -828,7 +865,9 @@ pub(crate) mod test_fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::test_fixtures::{FixtureServer, add_fixture_server, fixture_runtime};
+    use super::test_fixtures::{
+        FIXTURE_ANNOTATED_URI, FixtureServer, add_fixture_server, fixture_runtime,
+    };
     use super::*;
     use crate::function::ToolCall;
     use log::{Level, LevelFilter, Log, Metadata, Record};
@@ -1098,6 +1137,64 @@ mod tests {
         assert_eq!(resource["uri"], "dup");
         assert_eq!(resource["mime_type"], "text/plain");
         assert_eq!(resource["size"], 42);
+        assert!(resource.get("audience").is_none());
+    }
+
+    #[tokio::test]
+    async fn search_results_carry_resource_audience() {
+        let fixture = FixtureServer {
+            resources_capability: true,
+            ..Default::default()
+        };
+        let (runtime, _server) = fixture_runtime(fixture).await;
+
+        let results = runtime
+            .search("fixture", "annotated notes", 10)
+            .await
+            .unwrap();
+
+        let values: Vec<Value> = results
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap())
+            .collect();
+        let resource = values
+            .iter()
+            .find(|v| v["uri"] == FIXTURE_ANNOTATED_URI)
+            .unwrap();
+        assert_eq!(resource["audience"], json!(["user"]));
+    }
+
+    #[tokio::test]
+    async fn resource_audience_returns_annotated_roles() {
+        let fixture = FixtureServer {
+            resources_capability: true,
+            ..Default::default()
+        };
+        let (runtime, _server) = fixture_runtime(fixture).await;
+
+        let audience = runtime
+            .resource_audience("fixture", FIXTURE_ANNOTATED_URI)
+            .await;
+
+        assert_eq!(audience, Some(vec!["user".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn resource_audience_is_none_for_unknown_uri_or_server() {
+        let fixture = FixtureServer {
+            resources_capability: true,
+            ..Default::default()
+        };
+        let (runtime, _server) = fixture_runtime(fixture).await;
+
+        assert!(runtime.resource_audience("fixture", "dup").await.is_none());
+        assert!(
+            runtime
+                .resource_audience("fixture", "file:///unknown")
+                .await
+                .is_none()
+        );
+        assert!(runtime.resource_audience("ghost", "dup").await.is_none());
     }
 
     #[tokio::test]

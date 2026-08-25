@@ -23,6 +23,8 @@ pub const TEXT_MAX_BYTES_CLAMP: usize = 204_800;
 pub const BLOB_DECODE_CEILING_BYTES: usize = 50 * 1024 * 1024;
 /// Total size bound for the spill tree; oldest files are evicted beyond it.
 pub const SPILL_DIR_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// Byte bound on server-supplied metadata strings (uri, mime type) copied into output.
+pub const METADATA_MAX_BYTES: usize = 4096;
 
 const PATTERN_CONTEXT_LINES: usize = 2;
 const HUNK_SEPARATOR: &str = "--";
@@ -198,6 +200,29 @@ pub fn render_blob_at(
         size_bytes: decoded.len() as u64,
         sha256,
     }))
+}
+
+/// Truncates `text` to at most `max_bytes`, rounding the cut point back to a
+/// UTF-8 character boundary.
+pub fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Bounds a server-supplied metadata string to [`METADATA_MAX_BYTES`],
+/// appending a marker citing the constant when the input is truncated.
+pub fn clamp_metadata(text: &str) -> String {
+    if text.len() <= METADATA_MAX_BYTES {
+        return text.to_string();
+    }
+    let clamped = truncate_utf8(text, METADATA_MAX_BYTES);
+    format!("{clamped} [truncated: exceeds METADATA_MAX_BYTES ({METADATA_MAX_BYTES} bytes)]")
 }
 
 fn filter_lines(text: &str, pattern: &str) -> Result<String, RenderError> {
@@ -484,6 +509,28 @@ mod tests {
         assert_eq!(rendered.text.len(), TEXT_MAX_BYTES_CLAMP);
         assert!(rendered.truncated);
         assert_eq!(rendered.next_offset, Some(TEXT_MAX_BYTES_CLAMP));
+    }
+
+    #[test]
+    fn truncate_utf8_rounds_back_to_char_boundary() {
+        // 'é' occupies bytes 1..3; a cut at byte 2 lands inside it.
+        assert_eq!(truncate_utf8("aé", 2), "a");
+        assert_eq!(truncate_utf8("aé", 3), "aé");
+        assert_eq!(truncate_utf8("abc", 10), "abc");
+        assert_eq!(truncate_utf8("abc", 0), "");
+    }
+
+    #[test]
+    fn clamp_metadata_appends_marker_only_when_oversized() {
+        assert_eq!(clamp_metadata("text/plain"), "text/plain");
+
+        let long = "u".repeat(METADATA_MAX_BYTES + 1);
+
+        let clamped = clamp_metadata(&long);
+
+        assert!(clamped.starts_with(&"u".repeat(METADATA_MAX_BYTES)));
+        assert!(clamped.contains("METADATA_MAX_BYTES"));
+        assert!(clamped.contains(&METADATA_MAX_BYTES.to_string()));
     }
 
     #[test]
