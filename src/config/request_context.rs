@@ -85,6 +85,7 @@ pub(crate) fn expand_enabled_mcp_server_ids(
     if enabled_mcp_servers.iter().any(|s| s.trim() == "all") {
         return mcp_config.mcp_servers.keys().cloned().collect();
     }
+
     let mut ids = Vec::new();
     for item in enabled_mcp_servers.iter().map(|s| s.trim()) {
         if mcp_config.mcp_servers.contains_key(item) {
@@ -97,6 +98,7 @@ pub(crate) fn expand_enabled_mcp_server_ids(
             }
         }
     }
+
     ids
 }
 
@@ -3292,6 +3294,14 @@ impl RequestContext {
                         AssetCategory::NAMES.iter().map(|s| s.to_string()).collect();
                     names.extend(installed_bundle_names());
                     let mut values = super::map_completion_values(names);
+                    values.push((
+                        "--filter".to_string(),
+                        Some("Restrict a remote install to one category".to_string()),
+                    ));
+                    values.push((
+                        "--force".to_string(),
+                        Some("Overwrite all conflicts without prompting".to_string()),
+                    ));
                     values.push((
                         "--git-host".to_string(),
                         Some("Host the owner/repo shorthand expands against".to_string()),
