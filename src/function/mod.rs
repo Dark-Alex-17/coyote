@@ -2553,7 +2553,7 @@ mod tests {
     };
     use crate::config::{Agent, AgentConfig, AppConfig, AppState, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
-    use crate::supervisor::notification::job_notification;
+    use crate::supervisor::notification::{agent_notification, job_notification};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use rmcp::model::{CallToolResult, ContentBlock};
@@ -2776,6 +2776,68 @@ mod tests {
         let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         ctx.notification_queue
             .push(job_notification("job_x", "execute_command", true));
+        assert!(drain_live_notifications(&ctx).is_empty());
+    }
+
+    fn ctx_with_registered_agent(id: &str) -> RequestContext {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let agent_id = id.to_string();
+        let join_handle = rt.spawn(async move {
+            Ok(crate::supervisor::AgentResult {
+                id: agent_id,
+                agent_name: "explore".into(),
+                output: String::new(),
+                exit_status: crate::supervisor::AgentExitStatus::Completed,
+            })
+        });
+        std::mem::forget(rt);
+        let handle = crate::supervisor::AgentHandle {
+            id: id.to_string(),
+            agent_name: "explore".to_string(),
+            depth: 1,
+            inbox: Arc::new(crate::supervisor::mailbox::Inbox::new()),
+            abort_signal: crate::utils::create_abort_signal(),
+            join_handle,
+            child_supervisor: None,
+        };
+        let mut sup = crate::supervisor::Supervisor::new(4, 3);
+        sup.register(handle).unwrap();
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.supervisor = Some(Arc::new(parking_lot::RwLock::new(sup)));
+        ctx
+    }
+
+    #[test]
+    fn drain_live_notifications_keeps_registered_agent_events() {
+        let ctx = ctx_with_registered_agent("agent_explore_1");
+        ctx.notification_queue
+            .push(agent_notification("agent_explore_1", "explore", true));
+
+        let live = drain_live_notifications(&ctx);
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0]["event"], "agent_completed");
+        assert_eq!(
+            live[0]["next_action"],
+            "agent__collect --id agent_explore_1 for output"
+        );
+    }
+
+    #[test]
+    fn drain_live_notifications_drops_collected_agent_events() {
+        let ctx = ctx_with_registered_agent("agent_explore_1");
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .take("agent_explore_1")
+            .unwrap();
+        ctx.notification_queue
+            .push(agent_notification("agent_explore_1", "explore", true));
+
         assert!(drain_live_notifications(&ctx).is_empty());
     }
 

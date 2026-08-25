@@ -5,6 +5,7 @@ use crate::config::{
     jobs_enabled, list_agents_with_descriptions,
 };
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
+use crate::supervisor::notification::agent_notification;
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor, TaskKind};
 use crate::utils::{AbortSignal, create_abort_signal, wait_abort_signal};
 
@@ -866,25 +867,33 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let spawn_agent_id = agent_id.clone();
     let spawn_agent_name = agent_name.clone();
     let spawn_abort = child_abort.clone();
+    let spawn_notifications = Arc::clone(&ctx.notification_queue);
     let child_supervisor = child_ctx.supervisor.clone();
 
     let join_handle = tokio::spawn(async move {
         let result = run_child_agent(child_ctx, input, spawn_abort).await;
 
-        match result {
-            Ok(output) => Ok(AgentResult {
+        let agent_result = match result {
+            Ok(output) => AgentResult {
                 id: spawn_agent_id,
                 agent_name: spawn_agent_name,
                 output,
                 exit_status: AgentExitStatus::Completed,
-            }),
-            Err(e) => Ok(AgentResult {
+            },
+            Err(e) => AgentResult {
                 id: spawn_agent_id,
                 agent_name: spawn_agent_name,
                 output: String::new(),
                 exit_status: AgentExitStatus::Failed(e.to_string()),
-            }),
-        }
+            },
+        };
+        let success = agent_result.exit_status == AgentExitStatus::Completed;
+        spawn_notifications.push(agent_notification(
+            &agent_result.id,
+            &agent_result.agent_name,
+            success,
+        ));
+        Ok(agent_result)
     });
 
     let handle = AgentHandle {

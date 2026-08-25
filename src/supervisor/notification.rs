@@ -40,6 +40,20 @@ pub fn job_notification(id: &str, tool: &str, success: bool) -> SystemNotificati
     }
 }
 
+pub fn agent_notification(id: &str, agent_name: &str, success: bool) -> SystemNotification {
+    SystemNotification {
+        event: if success {
+            "agent_completed"
+        } else {
+            "agent_failed"
+        },
+        id: id.to_string(),
+        tool_or_agent: agent_name.to_string(),
+        status: if success { "success" } else { "failed" },
+        next_action: format!("agent__collect --id {id} for output"),
+    }
+}
+
 /// Completion events for background work started by ONE context. Unlike the
 /// escalation queue (shared, root-owned), every context owns a fresh queue:
 /// a queue shared between parent and child would race their drains and
@@ -104,6 +118,32 @@ mod tests {
         assert_eq!(event.event, "job_failed");
         assert_eq!(event.status, "failed");
         assert_eq!(event.next_action, "job__collect --id job_a1b2 for output");
+    }
+
+    #[test]
+    fn agent_notification_success_shape() {
+        let event = agent_notification("agent_explore_a1b2", "explore", true);
+        assert_eq!(
+            event.to_value(),
+            json!({
+                "event": "agent_completed",
+                "id": "agent_explore_a1b2",
+                "tool_or_agent": "explore",
+                "status": "success",
+                "next_action": "agent__collect --id agent_explore_a1b2 for output",
+            })
+        );
+    }
+
+    #[test]
+    fn agent_notification_failure_shape() {
+        let event = agent_notification("agent_explore_a1b2", "explore", false);
+        assert_eq!(event.event, "agent_failed");
+        assert_eq!(event.status, "failed");
+        assert_eq!(
+            event.next_action,
+            "agent__collect --id agent_explore_a1b2 for output"
+        );
     }
 
     #[test]
