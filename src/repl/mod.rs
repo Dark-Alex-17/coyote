@@ -819,7 +819,7 @@ pub async fn run_repl_command(
             ".temp-role" => match args {
                 Some(text) => {
                     let app = Arc::clone(&ctx.app.config);
-                    ctx.use_prompt(app.as_ref(), text)?;
+                    ctx.use_temp_role(app.as_ref(), text)?;
                 }
                 None => println!("Usage: .temp-role <text>..."),
             },

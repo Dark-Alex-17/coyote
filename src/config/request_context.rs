@@ -2341,7 +2341,7 @@ impl RequestContext {
         Ok(())
     }
 
-    pub fn use_prompt(&mut self, _app: &AppConfig, prompt: &str) -> Result<()> {
+    pub fn use_temp_role(&mut self, _app: &AppConfig, prompt: &str) -> Result<()> {
         let mut role = Role::new(TEMP_ROLE_NAME, prompt);
         role.set_model(self.current_model().clone());
         self.use_role_obj(role)
@@ -4852,10 +4852,10 @@ mod tests {
     }
 
     #[test]
-    fn use_prompt_creates_temp_role() {
+    fn use_temp_role_creates_temp_role() {
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
-        ctx.use_prompt(&app, "you are a pirate").unwrap();
+        ctx.use_temp_role(&app, "you are a pirate").unwrap();
         assert!(ctx.role.is_some());
         assert_eq!(ctx.role.as_ref().unwrap().name(), "temp");
         assert!(
