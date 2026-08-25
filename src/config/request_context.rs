@@ -17,9 +17,13 @@ use super::{
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
-    FunctionDeclaration, Functions, ToolCallTracker, ToolResult, memory::MEMORY_FUNCTION_PREFIX,
-    rag_query::RAG_FUNCTION_PREFIX, skill::SKILL_FUNCTION_PREFIX,
-    supervisor::SUPERVISOR_FUNCTION_PREFIX, todo::TODO_FUNCTION_PREFIX,
+    FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
+    jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX},
+    memory::MEMORY_FUNCTION_PREFIX,
+    rag_query::RAG_FUNCTION_PREFIX,
+    skill::SKILL_FUNCTION_PREFIX,
+    supervisor::SUPERVISOR_FUNCTION_PREFIX,
+    todo::TODO_FUNCTION_PREFIX,
     user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::mcp::{
@@ -142,7 +146,7 @@ pub fn effective_max_concurrent_jobs(agent: Option<&Agent>, app: &AppConfig) -> 
     agent
         .and_then(|a| a.max_concurrent_jobs())
         .or(app.max_concurrent_jobs)
-        .unwrap_or(5)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_JOBS)
 }
 
 pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
@@ -319,6 +323,8 @@ pub struct RequestContext {
 
     pub tool_scope: ToolScope,
 
+    pub declared_function_names: HashSet<String>,
+
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub self_agent_id: Option<String>,
@@ -352,6 +358,7 @@ impl RequestContext {
             agent: None,
             last_message: None,
             tool_scope: ToolScope::default(),
+            declared_function_names: Default::default(),
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -411,6 +418,7 @@ impl RequestContext {
                 mcp_runtime,
                 tool_tracker: ToolCallTracker::default(),
             },
+            declared_function_names: Default::default(),
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -457,6 +465,7 @@ impl RequestContext {
             agent: self.agent.clone(),
             last_message: self.last_message.clone(),
             tool_scope: self.tool_scope.clone(),
+            declared_function_names: self.declared_function_names.clone(),
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -501,6 +510,7 @@ impl RequestContext {
                 mcp_runtime: McpRuntime::default(),
                 tool_tracker: tool_call_tracker,
             },
+            declared_function_names: Default::default(),
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -905,6 +915,9 @@ impl RequestContext {
     }
 
     pub fn before_chat_completion(&mut self, input: &Input) -> Result<()> {
+        // The R11 gate in `job__start` validates against exactly what was
+        // declared to the model for THIS request; refresh it every time.
+        self.declared_function_names = input.declared_function_names();
         self.last_message = Some(LastMessage::new(input.clone(), String::new()));
         Ok(())
     }
@@ -1313,6 +1326,7 @@ impl RequestContext {
                     && !v.name.starts_with("memory__")
                     && !v.name.starts_with("skill__")
                     && !v.name.starts_with("rag__")
+                    && !v.name.starts_with("job__")
             })
             .map(|v| v.name.clone())
             .collect()
@@ -2130,7 +2144,8 @@ impl RequestContext {
                                 && v.name.starts_with(SKILL_FUNCTION_PREFIX))
                             || (self.auto_continue_config().enabled
                                 && v.name.starts_with(TODO_FUNCTION_PREFIX))
-                            || v.name.starts_with(RAG_FUNCTION_PREFIX))
+                            || v.name.starts_with(RAG_FUNCTION_PREFIX)
+                            || v.name.starts_with(JOB_FUNCTION_PREFIX))
                             && !existing.contains(&v.name)
                     })
                     .cloned()
@@ -2157,6 +2172,7 @@ impl RequestContext {
                             || v.name.starts_with(SUPERVISOR_FUNCTION_PREFIX)
                             || v.name.starts_with(MEMORY_FUNCTION_PREFIX)
                             || v.name.starts_with(RAG_FUNCTION_PREFIX)
+                            || v.name.starts_with(JOB_FUNCTION_PREFIX)
                     });
                 }
 
@@ -3869,6 +3885,9 @@ impl RequestContext {
         {
             functions.append_rag_query_functions();
         }
+        if self.agent.is_none() && jobs_enabled(None, app) {
+            functions.append_job_functions();
+        }
 
         let tool_tracker = self.tool_scope.tool_tracker.clone();
         self.tool_scope = ToolScope {
@@ -4205,6 +4224,9 @@ impl RequestContext {
         let mut functions = Functions::init(app.visible_tools.as_ref().unwrap_or(&Vec::new()))?;
         if self.working_mode.is_repl() {
             functions.append_user_interaction_functions();
+        }
+        if jobs_enabled(None, app) {
+            functions.append_job_functions();
         }
         let tool_tracker = self.tool_scope.tool_tracker.clone();
         self.tool_scope = ToolScope {
@@ -5714,6 +5736,126 @@ mod tests {
     }
 
     #[test]
+    fn select_functions_returns_job_functions_even_with_no_enabled_tools() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+
+        let fns = ctx.select_functions(&Role::default()).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "job__start",
+                "job__check",
+                "job__collect",
+                "job__cancel",
+                "job__list"
+            ]
+        );
+    }
+
+    #[test]
+    fn select_functions_preserves_job_tools_under_role_filter() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        assert!(
+            fns.iter().any(|f| f.name == "job__start"),
+            "job__ tools must survive a role tool filter"
+        );
+    }
+
+    #[test]
+    fn concrete_tool_names_excludes_job_functions() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+
+        assert!(ctx.concrete_tool_names().is_empty());
+    }
+
+    #[test]
+    fn before_chat_completion_refreshes_declared_function_names() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+        ctx.before_chat_completion(&input).unwrap();
+
+        assert_eq!(ctx.declared_function_names.len(), 5);
+        assert!(ctx.declared_function_names.contains("job__start"));
+
+        ctx.tool_scope = ToolScope::default();
+        let input = Input::from_str(&ctx, "hello again", None).unwrap();
+        ctx.before_chat_completion(&input).unwrap();
+
+        assert!(
+            ctx.declared_function_names.is_empty(),
+            "stash must be refreshed on every request"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tool_scope_gates_job_functions_on_jobs_enabled() {
+        let _guard = TestConfigDirGuard::new();
+        let app_state = app_state_with_mcp_config(false, &[]);
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        run_async(ctx.rebuild_tool_scope(&app, None, abort.clone())).unwrap();
+        assert!(ctx.tool_scope.functions.contains("job__start"));
+
+        let jobs_off = AppConfig {
+            max_concurrent_jobs: Some(0),
+            ..(*app).clone()
+        };
+        run_async(ctx.rebuild_tool_scope(&jobs_off, None, abort.clone())).unwrap();
+        assert!(
+            !ctx.tool_scope
+                .functions
+                .declarations()
+                .iter()
+                .any(|f| f.name.starts_with("job__"))
+        );
+
+        let fc_off = AppConfig {
+            function_calling_support: false,
+            ..(*app).clone()
+        };
+        run_async(ctx.rebuild_tool_scope(&fc_off, None, abort)).unwrap();
+        assert!(
+            !ctx.tool_scope
+                .functions
+                .declarations()
+                .iter()
+                .any(|f| f.name.starts_with("job__"))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn exit_agent_rebuild_retains_job_functions_when_enabled() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        ctx.exit_agent(&app).unwrap();
+        assert!(ctx.tool_scope.functions.contains("job__start"));
+
+        let jobs_off = AppConfig {
+            max_concurrent_jobs: Some(0),
+            ..(*app).clone()
+        };
+        ctx.exit_agent(&jobs_off).unwrap();
+        assert!(!ctx.tool_scope.functions.contains("job__start"));
+    }
+
+    #[test]
     fn select_functions_all_enabled_tools_returns_all_non_mcp() {
         let mut ctx = create_test_ctx();
         ctx.tool_scope.functions.append_todo_functions();
@@ -5877,6 +6019,42 @@ mod tests {
             names.contains(&"user__select"),
             "user__ tools must survive an agent tool filter, got: {names:?}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn select_functions_preserves_job_tools_under_agent_filter() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_job_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            names.contains(&"job__start"),
+            "job__ tools must survive an agent tool filter, got: {names:?}"
+        );
+        assert!(names.contains(&"job__collect"));
     }
 
     #[test]

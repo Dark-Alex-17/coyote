@@ -28,6 +28,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future;
 use indexmap::IndexMap;
 use indoc::formatdoc;
+use jobs::JOB_FUNCTION_PREFIX;
 use memory::MEMORY_FUNCTION_PREFIX;
 use rag_query::RAG_FUNCTION_PREFIX;
 use rust_embed::Embed;
@@ -623,6 +624,10 @@ impl Functions {
             .extend(supervisor::supervisor_function_declarations());
         self.declarations
             .extend(supervisor::escalation_function_declarations());
+    }
+
+    pub fn append_job_functions(&mut self) {
+        self.declarations.extend(jobs::job_function_declarations());
     }
 
     pub fn append_teammate_functions(&mut self) {
@@ -1544,6 +1549,15 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("RAG query failed: {e}");
+                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        json!({"tool_call_error": error_msg})
+                    })
+            }
+            _ if cmd_name.starts_with(JOB_FUNCTION_PREFIX) => {
+                jobs::handle_job_tool(ctx, &cmd_name, &json_data)
+                    .await
+                    .unwrap_or_else(|e| {
+                        let error_msg = format!("Job tool failed: {e}");
                         eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
                         json!({"tool_call_error": error_msg})
                     })
@@ -2856,6 +2870,37 @@ mod tests {
         assert!(f.contains("agent__list_available"));
         assert!(f.contains("agent__cancel"));
         assert!(f.contains("agent__reply_escalation"));
+    }
+
+    #[test]
+    fn functions_append_job_adds_declarations() {
+        let mut f = Functions::default();
+        f.append_job_functions();
+        assert!(f.contains("job__start"));
+        assert!(f.contains("job__check"));
+        assert!(f.contains("job__collect"));
+        assert!(f.contains("job__cancel"));
+        assert!(f.contains("job__list"));
+    }
+
+    #[test]
+    fn eval_routes_declared_job_calls_to_job_handlers() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope.functions.append_job_functions();
+        let calls = vec![call("job__list", Some("id-1"))];
+        let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].output["active_jobs"], 0);
+        assert_eq!(results[0].output["jobs"], json!([]));
+    }
+
+    #[test]
+    fn eval_soft_fails_job_calls_when_jobs_not_declared() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let calls = vec![call("job__start", Some("id-1"))];
+        let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+        let err = results[0].output["tool_call_error"].as_str().unwrap();
+        assert!(err.contains("Unexpected call"));
     }
 
     #[test]

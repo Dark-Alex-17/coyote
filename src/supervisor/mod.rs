@@ -40,7 +40,6 @@ pub struct AgentHandle {
     pub child_supervisor: Option<Arc<RwLock<Supervisor>>>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
     Running,
@@ -49,12 +48,10 @@ pub enum JobStatus {
 }
 
 pub struct JobState {
-    #[allow(dead_code)]
     pub status: JobStatus,
     pub pgid: Option<i32>,
 }
 
-#[allow(dead_code)]
 pub struct JobResult {
     pub output: Value,
     pub exit_code: Option<i32>,
@@ -63,14 +60,11 @@ pub struct JobResult {
 
 pub struct JobHandle {
     pub id: String,
-    #[allow(dead_code)]
     pub tool: String,
-    #[allow(dead_code)]
     pub started_at: Instant,
     pub join_handle: JoinHandle<Result<JobResult>>,
     pub abort_signal: AbortSignal,
     pub state: Arc<Mutex<JobState>>,
-    #[allow(dead_code)]
     pub output_buf: Arc<Mutex<RingBuf>>,
     #[allow(dead_code)]
     pub no_change_checks: u32,
@@ -157,6 +151,20 @@ impl Supervisor {
         })
     }
 
+    pub fn job(&self, id: &str) -> Option<&JobHandle> {
+        match self.handles.get(id) {
+            Some(TaskHandle::Job(handle)) => Some(handle),
+            _ => None,
+        }
+    }
+
+    pub fn jobs(&self) -> impl Iterator<Item = &JobHandle> {
+        self.handles.values().filter_map(|handle| match handle {
+            TaskHandle::Job(handle) => Some(handle),
+            TaskHandle::Agent(_) => None,
+        })
+    }
+
     pub fn active_count(&self) -> usize {
         self.agents().count()
     }
@@ -182,7 +190,6 @@ impl Supervisor {
         self.max_depth
     }
 
-    #[allow(dead_code)]
     pub fn max_concurrent_jobs(&self) -> usize {
         self.max_concurrent_jobs
     }

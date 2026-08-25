@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     client::Model,
     config::memory,
-    function::{Functions, run_llm_function},
+    function::{Functions, jobs::DEFAULT_MAX_CONCURRENT_JOBS, run_llm_function},
     graph, rag,
 };
 
@@ -223,6 +223,16 @@ impl Agent {
 
         if agent_config.can_spawn_agents {
             functions.append_supervisor_functions();
+        }
+
+        if app.function_calling_support
+            && agent_config
+                .max_concurrent_jobs
+                .or(app.max_concurrent_jobs)
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_JOBS)
+                > 0
+        {
+            functions.append_job_functions();
         }
 
         functions.append_teammate_functions();

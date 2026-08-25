@@ -9,7 +9,12 @@ use crate::utils::{AbortSignal, base64_encode, is_loader_protocol, sha256};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexSet;
-use std::{collections::HashMap, fs::File, io::Read, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File,
+    io::Read,
+    sync::Arc,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
@@ -156,6 +161,14 @@ impl Input {
 
     pub fn data_urls(&self) -> HashMap<String, String> {
         self.data_urls.clone()
+    }
+
+    /// Names of the function declarations this request will send to the model.
+    pub fn declared_function_names(&self) -> HashSet<String> {
+        self.functions
+            .as_ref()
+            .map(|functions| functions.iter().map(|f| f.name.clone()).collect())
+            .unwrap_or_default()
     }
 
     pub fn tool_calls(&self) -> &Option<MessageContentToolCalls> {

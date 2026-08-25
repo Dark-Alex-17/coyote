@@ -59,7 +59,8 @@ pub use self::skill_registry::SkillRegistry;
 #[cfg(test)]
 pub(crate) use self::tool_scope::test_fixtures;
 pub use self::tool_scope::{
-    McpPromptCompletion, flatten_prompt_messages, resolve_prompt_args, sanitize_display_text,
+    McpPromptCompletion, McpRuntime, flatten_prompt_messages, resolve_prompt_args,
+    sanitize_display_text,
 };
 pub use self::update::run_self_update;
 use crate::client::{
