@@ -1251,7 +1251,7 @@ pub async fn run_repl_command(
             },
             ".list" => match args.map(str::trim) {
                 Some("prompts") => {
-                    ctx.list_prompt_assets().await?;
+                    ctx.list_mcp_prompts().await?;
                 }
                 Some(args) => {
                     ctx.list_assets(args)?;

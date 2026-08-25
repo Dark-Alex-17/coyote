@@ -164,7 +164,7 @@ pub(crate) fn asset_table(header: &[&str]) -> Table {
     table
 }
 
-fn prompt_asset_rows(items: &[CatalogItem]) -> Vec<[String; 4]> {
+fn mcp_prompt_rows(items: &[CatalogItem]) -> Vec<[String; 4]> {
     items
         .iter()
         .map(|item| {
@@ -3386,6 +3386,7 @@ impl RequestContext {
                     "rags",
                     "macros",
                     "skills",
+                    "prompts",
                     "tools",
                     "mcp-servers",
                     "bundles",
@@ -3727,7 +3728,7 @@ impl RequestContext {
             .prompt_completion(&enabled_ids, args)
     }
 
-    pub async fn list_prompt_assets(&self) -> Result<()> {
+    pub async fn list_mcp_prompts(&self) -> Result<()> {
         let items = self.tool_scope.mcp_runtime.prompt_catalog().await;
         if items.is_empty() {
             println!("No prompts found.");
@@ -3735,7 +3736,7 @@ impl RequestContext {
         }
 
         let mut table = asset_table(&["server", "name", "description", "args"]);
-        for row in prompt_asset_rows(&items) {
+        for row in mcp_prompt_rows(&items) {
             table.add_row(row.to_vec());
         }
 
@@ -4867,7 +4868,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_asset_rows_assembles_columns() {
+    fn mcp_prompt_rows_assembles_columns() {
         let items = vec![
             CatalogItem {
                 name: "summarize".to_string(),
@@ -4886,7 +4887,7 @@ mod tests {
             },
         ];
 
-        let rows = prompt_asset_rows(&items);
+        let rows = mcp_prompt_rows(&items);
 
         assert_eq!(rows.len(), 2);
         assert_eq!(
