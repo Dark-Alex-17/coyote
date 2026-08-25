@@ -11,6 +11,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -390,6 +391,7 @@ mod tests {
     use super::*;
     use base64::Engine;
     use std::env;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::process;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -642,8 +644,11 @@ mod tests {
             assert!(!meta.sniffed);
             assert!(meta.spilled);
             assert_eq!(fs::read(&meta.path).unwrap(), data);
-            let mode = fs::metadata(&meta.path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
+            #[cfg(unix)]
+            {
+                let mode = fs::metadata(&meta.path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
         });
     }
 
