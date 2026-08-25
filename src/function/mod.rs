@@ -517,7 +517,11 @@ impl Functions {
                 anyhow!("Failed to load embedded function file: {}", file.as_ref())
             })?;
             let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
-            let file_path = paths::functions_dir().join(file.as_ref());
+            let file_path = if file.as_ref() == "mcp.json" {
+                paths::mcp_config_file()
+            } else {
+                paths::functions_dir().join(file.as_ref())
+            };
             let is_script = file_path
                 .extension()
                 .and_then(OsStr::to_str)

@@ -1865,6 +1865,7 @@ impl RequestContext {
             ("rags_dir", display_path(&paths::rags_dir())),
             ("macros_dir", display_path(&paths::macros_dir())),
             ("functions_dir", display_path(&paths::functions_dir())),
+            ("mcp_config_file", display_path(&paths::mcp_config_file())),
             ("sbx_kit_dir", display_path(&paths::sbx_kit_dir())),
             ("messages_file", display_path(&self.messages_file())),
         ];

@@ -315,7 +315,7 @@ pub struct Cli {
     /// URL for http/sse MCP server (used with --mcp-add)
     #[arg(long, value_name = "URL", help_heading = "MCP Servers")]
     pub url: Option<String>,
-    /// Scope for MCP config: user (~/.config/coyote/functions/mcp.json) or workspace (./.coyote/mcp.json). Default: user
+    /// Scope for MCP config: user (~/.config/coyote/mcp.json) or workspace (./.coyote/mcp.json). Default: user
     #[arg(long, value_enum, value_name = "SCOPE", help_heading = "MCP Servers")]
     pub scope: Option<McpScopeArg>,
     /// Environment variable for stdio MCP server (repeatable): --env KEY=VALUE

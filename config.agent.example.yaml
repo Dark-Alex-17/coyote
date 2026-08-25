@@ -48,7 +48,7 @@ summarization_model: null        # Model to use for summarizing sub-agent output
 summarization_threshold: 4000    # Character threshold above which sub-agent output is summarized before returning to parent
 escalation_timeout: 300          # Seconds a sub-agent waits for a user interaction response before timing out (default: 5 minutes)
 mcp_servers:                     # Optional list of MCP servers that the agent utilizes
-  - github                       # Corresponds to the name of an MCP server in the `<coyote-config-dir>/functions/mcp.json` file
+  - github                       # Corresponds to the name of an MCP server in the `<coyote-config-dir>/mcp.json` file
 global_tools:                    # Optional list of additional global tools to enable for the agent; i.e. not tools specific to the agent
   - web_search
   - fs

@@ -287,6 +287,18 @@ pub fn functions_bin_dir() -> PathBuf {
 }
 
 pub fn mcp_config_file() -> PathBuf {
+    let preferred = local_dir(MCP_FILE_NAME);
+    if preferred.exists() {
+        return preferred;
+    }
+    let legacy = legacy_mcp_config_file();
+    if legacy.exists() {
+        return legacy;
+    }
+    preferred
+}
+
+pub fn legacy_mcp_config_file() -> PathBuf {
     functions_dir().join(MCP_FILE_NAME)
 }
 
@@ -833,6 +845,80 @@ mod tests {
                     workspace_mcp_config_file_in(root),
                     Some(ws_dir.join(".mcp.json"))
                 );
+            });
+        }
+    }
+
+    mod user_mcp_resolution {
+        use super::*;
+        use serial_test::serial;
+
+        fn with_config_dir<F: FnOnce(&Path)>(f: F) {
+            let unique = time::SystemTime::now()
+                .duration_since(time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = env::temp_dir().join(format!("coyote-user-mcp-test-{unique}"));
+            fs::create_dir_all(root.join(FUNCTIONS_DIR_NAME)).unwrap();
+            let config_env = get_env_name("config_dir");
+            let functions_env = get_env_name("functions_dir");
+            let prev_config = env::var_os(&config_env);
+            let prev_functions = env::var_os(&functions_env);
+            unsafe {
+                env::set_var(&config_env, &root);
+                env::set_var(&functions_env, root.join(FUNCTIONS_DIR_NAME));
+            }
+            f(&root);
+            unsafe {
+                match prev_config {
+                    Some(v) => env::set_var(&config_env, v),
+                    None => env::remove_var(&config_env),
+                }
+                match prev_functions {
+                    Some(v) => env::set_var(&functions_env, v),
+                    None => env::remove_var(&functions_env),
+                }
+            }
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        #[serial]
+        fn defaults_to_preferred_location_when_neither_exists() {
+            with_config_dir(|root| {
+                assert_eq!(mcp_config_file(), root.join(MCP_FILE_NAME));
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn falls_back_to_legacy_location_when_only_it_exists() {
+            with_config_dir(|root| {
+                let legacy = root.join(FUNCTIONS_DIR_NAME).join(MCP_FILE_NAME);
+                fs::write(&legacy, "{}").unwrap();
+                assert_eq!(mcp_config_file(), legacy);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn prefers_new_location_when_both_exist() {
+            with_config_dir(|root| {
+                let preferred = root.join(MCP_FILE_NAME);
+                let legacy = root.join(FUNCTIONS_DIR_NAME).join(MCP_FILE_NAME);
+                fs::write(&preferred, "{}").unwrap();
+                fs::write(&legacy, "{}").unwrap();
+                assert_eq!(mcp_config_file(), preferred);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn uses_preferred_location_when_only_it_exists() {
+            with_config_dir(|root| {
+                let preferred = root.join(MCP_FILE_NAME);
+                fs::write(&preferred, "{}").unwrap();
+                assert_eq!(mcp_config_file(), preferred);
             });
         }
     }
