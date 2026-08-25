@@ -17,6 +17,7 @@ enabled_skills:
   - code-review
   - comment-discipline
   - diagnosing-bugs
+  - logging-discipline
   - git-master
   - frontend-ui-ux
   - verification-gates
@@ -171,6 +172,7 @@ nodes:
       - code-review
       - comment-discipline
       - diagnosing-bugs
+      - logging-discipline
       - git-master
       - frontend-ui-ux
       - verification-gates
@@ -221,7 +223,12 @@ nodes:
          `comment-discipline` (self-documenting / api-documented /
          comment-heavy) and write comments to match. When the signal is
          weak, write NO comment.
-      4. Follow the same patterns exactly. Do not invent new ones.
+      4. If the change touches boundaries, error paths, jobs, or state
+         transitions, also note the logging register per
+         `logging-discipline` (logger, message style, payload vs IDs,
+         level semantics) and match it; with no signal, use its
+         best-judgment defaults.
+      5. Follow the same patterns exactly. Do not invent new ones.
 
       ## Fix loop
 
