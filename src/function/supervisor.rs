@@ -1473,14 +1473,24 @@ mod tests {
     }
 
     fn register_fake_agent(ctx: &mut RequestContext, id: &str, name: &str) {
+        register_fake_agent_with_output(ctx, id, name, "fake output");
+    }
+
+    fn register_fake_agent_with_output(
+        ctx: &mut RequestContext,
+        id: &str,
+        name: &str,
+        output: &str,
+    ) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let id_owned = id.to_string();
         let name_owned = name.to_string();
+        let output_owned = output.to_string();
         let join_handle = rt.spawn(async move {
             Ok(AgentResult {
                 id: id_owned,
                 agent_name: name_owned,
-                output: "fake output".into(),
+                output: output_owned,
                 exit_status: AgentExitStatus::Completed,
             })
         });
@@ -1509,6 +1519,48 @@ mod tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    fn register_running_agent(ctx: &mut RequestContext, id: &str, name: &str) -> AbortSignal {
+        let abort = create_abort_signal();
+        let id_owned = id.to_string();
+        let name_owned = name.to_string();
+        let join_handle = tokio::spawn(async move {
+            time::sleep(Duration::from_secs(60)).await;
+            Ok(AgentResult {
+                id: id_owned,
+                agent_name: name_owned,
+                output: String::new(),
+                exit_status: AgentExitStatus::Completed,
+            })
+        });
+        let handle = AgentHandle {
+            id: id.to_string(),
+            agent_name: name.to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: abort.clone(),
+            join_handle,
+            child_supervisor: None,
+        };
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(handle)
+            .unwrap();
+        abort
+    }
+
+    fn wait_until_finished(ctx: &RequestContext, id: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while ctx.supervisor.as_ref().unwrap().read().is_finished(id) != Some(true) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agent '{id}' never finished"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[tokio::test]
@@ -2125,6 +2177,360 @@ mod tests {
                 }
                 _ => panic!("expected Inject action"),
             }
+        });
+    }
+
+    #[test]
+    fn handle_collect_finished_agent_returns_output_and_consumes_handle() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        register_fake_agent(&mut ctx, "a1", "explore");
+        ctx.pending_agents_guardrail_count = 2;
+
+        let result = run_async(handle_collect(&mut ctx, &json!({"id": "a1"}))).unwrap();
+
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["id"], "a1");
+        assert_eq!(result["agent"], "explore");
+        assert_eq!(result["exit_status"], "Completed");
+        assert_eq!(result["output"], "fake output");
+        assert_eq!(ctx.pending_agents_guardrail_count, 0);
+        assert_eq!(
+            ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
+            None
+        );
+    }
+
+    #[test]
+    fn handle_collect_pending_escalations_early_out_keeps_handle() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+            let queue = ctx.ensure_root_escalation_queue();
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            queue.submit(EscalationRequest {
+                id: "esc_1".into(),
+                from_agent_id: "a1".into(),
+                from_agent_name: "explore".into(),
+                question: "What do?".into(),
+                options: None,
+                reply_tx: tx,
+            });
+
+            let result = handle_collect(&mut ctx, &json!({"id": "slow"}))
+                .await
+                .unwrap();
+
+            assert_eq!(result["status"], "pending");
+            assert!(result["pending_escalations"].is_array());
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished("slow"),
+                Some(false)
+            );
+        });
+    }
+
+    #[test]
+    fn handle_collect_unknown_agent_errors() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let result = run_async(handle_collect(&mut ctx, &json!({"id": "missing"}))).unwrap();
+        assert_eq!(result["status"], "error");
+        assert!(result["message"].as_str().unwrap().contains("not found"));
+    }
+
+    #[test]
+    fn handle_collect_without_agent_passes_long_output_through_verbatim() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let long_output = "x".repeat(10_000);
+        register_fake_agent_with_output(&mut ctx, "a1", "explore", &long_output);
+
+        let result = run_async(handle_collect(&mut ctx, &json!({"id": "a1"}))).unwrap();
+
+        assert_eq!(result["output"], long_output);
+    }
+
+    #[test]
+    fn handle_collect_output_below_agent_threshold_passes_through() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            summarization_threshold: 1_000_000,
+            ..Default::default()
+        }));
+        register_fake_agent(&mut ctx, "a1", "explore");
+
+        let result = run_async(handle_collect(&mut ctx, &json!({"id": "a1"}))).unwrap();
+
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["output"], "fake output");
+    }
+
+    #[test]
+    fn handle_collect_over_threshold_with_unknown_summarization_model_errors() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            summarization_threshold: 1,
+            summarization_model: Some("nonexistent_client:model".into()),
+            ..Default::default()
+        }));
+        register_fake_agent(&mut ctx, "a1", "explore");
+
+        let err = run_async(handle_collect(&mut ctx, &json!({"id": "a1"}))).unwrap_err();
+
+        assert!(err.to_string().contains("nonexistent_client"));
+    }
+
+    #[test]
+    fn guardrail_no_supervisor_is_no_action_and_resets_counter() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.pending_agents_guardrail_count = 2;
+
+        assert!(matches!(
+            check_pending_agents_guardrail(&mut ctx),
+            GuardrailAction::NoAction
+        ));
+        assert_eq!(ctx.pending_agents_guardrail_count, 0);
+    }
+
+    /// Pins current behavior: a finished-but-uncollected agent is not counted
+    /// as pending (only still-running agents are), so the turn-end guardrail
+    /// takes no action and the finished agent's result can be silently dropped.
+    #[test]
+    fn guardrail_ignores_finished_but_uncollected_agents() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        register_fake_agent(&mut ctx, "a1", "explore");
+        wait_until_finished(&ctx, "a1");
+        ctx.pending_agents_guardrail_count = 2;
+
+        assert!(matches!(
+            check_pending_agents_guardrail(&mut ctx),
+            GuardrailAction::NoAction
+        ));
+        assert_eq!(ctx.pending_agents_guardrail_count, 0);
+        assert_eq!(
+            ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn guardrail_force_terminates_at_max_and_cancels_agents() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let abort = register_running_agent(&mut ctx, "slow", "test");
+            ctx.pending_agents_guardrail_count = PENDING_AGENTS_GUARDRAIL_MAX;
+
+            match check_pending_agents_guardrail(&mut ctx) {
+                GuardrailAction::ForceTerminate(ids) => {
+                    assert_eq!(ids, vec!["slow".to_string()]);
+                }
+                _ => panic!("expected ForceTerminate action"),
+            }
+            assert_eq!(ctx.pending_agents_guardrail_count, 0);
+            assert!(abort.aborted());
+        });
+    }
+
+    #[test]
+    fn guardrail_injects_prompt_and_increments_counter_below_max() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let _abort = register_running_agent(&mut ctx, "slow", "test");
+            ctx.pending_agents_guardrail_count = 1;
+
+            match check_pending_agents_guardrail(&mut ctx) {
+                GuardrailAction::Inject(prompt) => {
+                    assert!(prompt.contains("slow"));
+                    assert!(prompt.contains("agent__collect"));
+                }
+                _ => panic!("expected Inject action"),
+            }
+            assert_eq!(ctx.pending_agents_guardrail_count, 2);
+        });
+    }
+
+    #[test]
+    fn handle_cancel_resets_guardrail_counter() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        register_fake_agent(&mut ctx, "a1", "explore");
+        ctx.pending_agents_guardrail_count = 2;
+
+        let result = run_async(handle_cancel(&mut ctx, &json!({"id": "a1"}))).unwrap();
+
+        assert_eq!(result["status"], "ok");
+        assert_eq!(ctx.pending_agents_guardrail_count, 0);
+    }
+
+    #[test]
+    fn handle_spawn_missing_agent_arg_errors() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let err = run_async(handle_spawn(&mut ctx, &json!({}))).unwrap_err();
+        assert!(err.to_string().contains("'agent' is required"));
+    }
+
+    #[test]
+    fn handle_spawn_missing_prompt_arg_errors() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let err = run_async(handle_spawn(&mut ctx, &json!({"agent": "explore"}))).unwrap_err();
+        assert!(err.to_string().contains("'prompt' is required"));
+    }
+
+    #[test]
+    fn handle_spawn_rejects_agent_outside_whitelist() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            spawnable_agents: Some(vec!["allowed".into()]),
+            ..Default::default()
+        }));
+
+        let result = run_async(handle_spawn(
+            &mut ctx,
+            &json!({"agent": "notallowed", "prompt": "p"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("spawnable_agents")
+        );
+    }
+
+    #[test]
+    fn handle_spawn_at_capacity_errors() {
+        let mut ctx = ctx_with_supervisor(1, 3);
+        register_fake_agent(&mut ctx, "a1", "explore");
+
+        let result = run_async(handle_spawn(
+            &mut ctx,
+            &json!({"agent": "x", "prompt": "p"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert_eq!(
+            result["message"],
+            "At capacity: 1/1 agents running. Wait for one to finish or cancel one."
+        );
+    }
+
+    #[test]
+    fn handle_spawn_exceeding_depth_errors() {
+        let mut ctx = ctx_with_supervisor(4, 0);
+
+        let result = run_async(handle_spawn(
+            &mut ctx,
+            &json!({"agent": "x", "prompt": "p"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("Max agent depth exceeded")
+        );
+    }
+
+    #[test]
+    fn handle_spawn_no_supervisor_errors() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let err = run_async(handle_spawn(
+            &mut ctx,
+            &json!({"agent": "x", "prompt": "p"}),
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("No supervisor active"));
+    }
+
+    /// Pins current behavior: checking a finished agent does not report a
+    /// "finished, ready to collect" status; it silently delegates to collect,
+    /// returning the full result and consuming the handle.
+    #[test]
+    fn handle_check_finished_agent_delegates_to_collect_and_consumes_handle() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        register_fake_agent(&mut ctx, "a1", "explore");
+        wait_until_finished(&ctx, "a1");
+
+        let result = run_async(handle_check(&mut ctx, &json!({"id": "a1"}))).unwrap();
+
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["output"], "fake output");
+        assert_eq!(
+            ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
+            None
+        );
+    }
+
+    #[test]
+    fn handle_cancel_running_agent_aborts_and_waits_for_cleanup() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let sig = create_abort_signal();
+            let sig2 = sig.clone();
+            let join_handle = tokio::spawn(async move {
+                loop {
+                    if sig2.aborted() {
+                        return Ok(AgentResult {
+                            id: "a1".into(),
+                            agent_name: "explore".into(),
+                            output: String::new(),
+                            exit_status: AgentExitStatus::Completed,
+                        });
+                    }
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+            let handle = AgentHandle {
+                id: "a1".into(),
+                agent_name: "explore".into(),
+                depth: 1,
+                inbox: Arc::new(Inbox::new()),
+                abort_signal: sig.clone(),
+                join_handle,
+                child_supervisor: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+            ctx.pending_agents_guardrail_count = 2;
+
+            let result = handle_cancel(&mut ctx, &json!({"id": "a1"})).await.unwrap();
+
+            assert_eq!(result["status"], "ok");
+            let message = result["message"].as_str().unwrap();
+            assert!(message.contains("Cancelled agent 'explore'"));
+            assert!(message.contains("waited for cleanup"));
+            assert!(sig.aborted());
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
+                None
+            );
+            assert_eq!(ctx.pending_agents_guardrail_count, 0);
         });
     }
 }

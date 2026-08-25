@@ -593,6 +593,8 @@ mod tests {
     use super::*;
     use crate::config::request_context::RequestContext;
     use crate::config::{AppState, WorkingMode};
+    use crate::function::ToolCall;
+    use serde_json::json;
     use std::fs;
     use std::sync::Arc;
     use std::time::SystemTime;
@@ -972,5 +974,71 @@ mod tests {
             None,
         ));
         assert!(result.is_err());
+    }
+
+    fn tool_result(id: &str, output: &str) -> ToolResult {
+        ToolResult::new(
+            ToolCall::new("t".into(), json!({}), Some(id.to_string())),
+            json!(output),
+        )
+    }
+
+    #[test]
+    fn merge_tool_results_first_merge_creates_container() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "test", None).unwrap();
+
+        let input =
+            input.merge_tool_results("assistant text".into(), vec![tool_result("id-1", "ok")]);
+
+        let tool_calls = input.tool_calls().as_ref().unwrap();
+        assert_eq!(tool_calls.text, "assistant text");
+        assert!(!tool_calls.sequence);
+        assert_eq!(tool_calls.tool_results.len(), 1);
+        assert!(tool_calls.tool_results[0].text.is_none());
+    }
+
+    #[test]
+    fn merge_tool_results_second_merge_marks_sequence_and_tags_text() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "test", None)
+            .unwrap()
+            .merge_tool_results("assistant text".into(), vec![tool_result("id-1", "ok")]);
+
+        let input =
+            input.merge_tool_results("second text".into(), vec![tool_result("id-2", "ok2")]);
+
+        let tool_calls = input.tool_calls().as_ref().unwrap();
+        assert!(tool_calls.sequence);
+        assert_eq!(tool_calls.tool_results.len(), 2);
+        assert_eq!(tool_calls.text, "assistant text");
+        assert!(tool_calls.tool_results[0].text.is_none());
+        assert_eq!(
+            tool_calls.tool_results[1].text,
+            Some("second text".to_string())
+        );
+    }
+
+    #[test]
+    fn build_messages_wraps_tool_results_in_single_assistant_message() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "test", None)
+            .unwrap()
+            .merge_tool_results("assistant text".into(), vec![tool_result("id-1", "ok")])
+            .merge_tool_results("second text".into(), vec![tool_result("id-2", "ok2")]);
+
+        let messages = input.build_messages().unwrap();
+
+        let tool_call_messages: Vec<_> = messages
+            .iter()
+            .filter(|m| matches!(m.content, MessageContent::ToolCalls(_)))
+            .collect();
+        assert_eq!(tool_call_messages.len(), 1);
+        let message = tool_call_messages[0];
+        assert!(matches!(message.role, MessageRole::Assistant));
+        let MessageContent::ToolCalls(tool_calls) = &message.content else {
+            unreachable!();
+        };
+        assert_eq!(tool_calls.tool_results.len(), 2);
     }
 }

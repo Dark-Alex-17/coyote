@@ -2474,7 +2474,7 @@ mod tests {
         FIXTURE_ANNOTATED_TEXT, FIXTURE_ANNOTATED_URI, FIXTURE_BLOB_BYTES, FIXTURE_BLOB_URI,
         FIXTURE_LOG_TEXT, FIXTURE_LOG_URI, FixtureServer, fixture_runtime,
     };
-    use crate::config::{AppState, WorkingMode};
+    use crate::config::{Agent, AgentConfig, AppConfig, AppState, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -4003,5 +4003,316 @@ mod tests {
         prune_stale_bin_entries(&dir, &HashSet::new(), None).unwrap();
         assert!(dir.is_dir());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn eval_tool_calls_partitions_mcp_and_sequential_then_resorts() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let calls = vec![
+            call("unknown_first", Some("id-1")),
+            ToolCall::new(
+                "mcp_search_foo".into(),
+                json!({"query": "q"}),
+                Some("id-2".into()),
+            ),
+            call("unknown_last", Some("id-3")),
+        ];
+
+        let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].call.name, "unknown_first");
+        assert_eq!(results[1].call.name, "mcp_search_foo");
+        assert_eq!(results[2].call.name, "unknown_last");
+
+        for sequential in [&results[0], &results[2]] {
+            let err = sequential.output["tool_call_error"].as_str().unwrap();
+            assert!(
+                err.contains("use only tools listed in your catalog"),
+                "{err}"
+            );
+        }
+        let mcp_err = results[1].output["tool_call_error"].as_str().unwrap();
+        assert!(mcp_err.starts_with("MCP search failed"), "{mcp_err}");
+        assert!(!mcp_err.contains("use only tools listed in your catalog"));
+    }
+
+    #[test]
+    fn eval_tool_calls_isolates_failures_within_a_batch() {
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                auto_continue: true,
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.tool_scope.functions.append_todo_functions();
+        let calls = vec![
+            ToolCall::new(
+                "todo__init".into(),
+                json!({"goal": "ship it"}),
+                Some("id-1".into()),
+            ),
+            call("unknown_tool", Some("id-2")),
+        ];
+
+        let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].call.name, "todo__init");
+        assert_eq!(results[0].output["status"], "ok");
+        assert!(results[0].output.get("tool_call_error").is_none());
+        let err = results[1].output["tool_call_error"].as_str().unwrap();
+        assert!(err.contains("Unexpected call"), "{err}");
+    }
+
+    #[test]
+    fn eval_tool_calls_reports_loop_alert_without_executing() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let looped = call_with_args("looped_tool", json!({"a": 1}));
+        ctx.tool_scope.tool_tracker.record_call(looped.clone());
+        ctx.tool_scope.tool_tracker.record_call(looped.clone());
+        let calls = vec![
+            looped,
+            ToolCall::new("other_tool".into(), json!({}), Some("id-2".into())),
+        ];
+
+        let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+
+        assert_eq!(results.len(), 2);
+        let alert = results[0].output.as_str().unwrap();
+        assert!(alert.starts_with("{\"tool_call_loop_alert\":"), "{alert}");
+        let err = results[1].output["tool_call_error"].as_str().unwrap();
+        assert!(err.contains("Unexpected call"), "{err}");
+    }
+
+    #[test]
+    fn eval_tool_calls_truncates_with_global_max_chars() {
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                max_tool_result_chars: Some(50),
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let calls = vec![ToolCall::new(
+            "unknown_tool".into(),
+            json!({"padding": "x".repeat(200)}),
+            Some("id-1".into()),
+        )];
+
+        let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+
+        let out = results[0].output.as_str().unwrap();
+        assert!(
+            out.starts_with("[truncated: tool output exceeded 50 chars]\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn eval_tool_calls_agent_max_chars_overrides_global() {
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                max_tool_result_chars: Some(5000),
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            max_tool_result_chars: Some(30),
+            ..Default::default()
+        }));
+        let calls = vec![ToolCall::new(
+            "unknown_tool".into(),
+            json!({"padding": "x".repeat(200)}),
+            Some("id-1".into()),
+        )];
+
+        let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+
+        let out = results[0].output.as_str().unwrap();
+        assert!(
+            out.starts_with("[truncated: tool output exceeded 30 chars]\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn eval_tool_calls_zero_max_chars_disables_truncation() {
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                max_tool_result_chars: Some(0),
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let calls = vec![ToolCall::new(
+            "unknown_tool".into(),
+            json!({"padding": "x".repeat(200)}),
+            Some("id-1".into()),
+        )];
+
+        let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+
+        assert!(results[0].output["tool_call_error"].is_string());
+        assert!(!results[0].output.to_string().contains("[truncated"));
+    }
+
+    #[test]
+    fn eval_tool_calls_no_max_chars_configured_never_truncates() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let calls = vec![ToolCall::new(
+            "unknown_tool".into(),
+            json!({"padding": "x".repeat(200)}),
+            Some("id-1".into()),
+        )];
+
+        let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+
+        assert!(results[0].output["tool_call_error"].is_string());
+        assert!(!results[0].output.to_string().contains("[truncated"));
+    }
+
+    /// Pins current behavior: when the char cap lands inside a multi-byte
+    /// UTF-8 character of the serialized output, no prefix can be taken, so
+    /// the truncation marker is prepended to the FULL original output and the
+    /// "truncated" result is longer than the input.
+    #[test]
+    fn truncate_if_needed_utf8_boundary_returns_full_output_with_marker() {
+        let serialized = json!("aé").to_string();
+        let result = ToolResult::new(call("t", Some("id-1")), json!("aé"));
+
+        let truncated = result.truncate_if_needed(3);
+
+        let out = truncated.output.as_str().unwrap();
+        assert_eq!(
+            out,
+            format!("[truncated: tool output exceeded 3 chars]\n{serialized}")
+        );
+        assert!(out.len() > serialized.len());
+    }
+
+    #[test]
+    fn eval_routes_agent_prefix_to_supervisor_handler() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope.functions.append_supervisor_functions();
+
+        let out =
+            run_async(call_with_args("agent__check", json!({"id": "x"})).eval(&mut ctx)).unwrap();
+
+        let err = out["tool_call_error"].as_str().unwrap();
+        assert!(err.starts_with("Supervisor tool failed"), "{err}");
+        assert!(err.contains("No supervisor active"), "{err}");
+    }
+
+    #[test]
+    fn eval_routes_todo_prefix_to_todo_handler() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope.functions.append_todo_functions();
+
+        let out = run_async(call_with_args("todo__list", json!({})).eval(&mut ctx)).unwrap();
+
+        let err = out["tool_call_error"].as_str().unwrap();
+        assert!(err.starts_with("Todo tool failed"), "{err}");
+        assert!(err.contains("Auto-continue is not enabled"), "{err}");
+    }
+
+    #[test]
+    fn eval_routes_memory_prefix_to_memory_handler() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope.functions.append_memory_functions();
+
+        let out = run_async(call_with_args("memory__read", json!({})).eval(&mut ctx)).unwrap();
+
+        let err = out["tool_call_error"].as_str().unwrap();
+        assert!(err.starts_with("Memory tool failed"), "{err}");
+        assert!(err.contains("name is required"), "{err}");
+    }
+
+    #[test]
+    fn eval_routes_skill_prefix_to_skill_handler() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope.functions.append_skill_functions();
+
+        let out = run_async(call_with_args("skill__load", json!({})).eval(&mut ctx)).unwrap();
+
+        assert_eq!(out["error"], "name is required");
+    }
+
+    #[test]
+    fn eval_routes_user_prefix_to_user_handler() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope.functions.append_user_interaction_functions();
+
+        let out = run_async(call_with_args("user__confirm", json!({})).eval(&mut ctx)).unwrap();
+
+        let err = out["tool_call_error"].as_str().unwrap();
+        assert!(err.starts_with("User interaction failed"), "{err}");
+        assert!(err.contains("'question' is required"), "{err}");
+    }
+
+    #[test]
+    fn eval_routes_rag_prefix_to_rag_handler() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope.functions.append_rag_query_functions();
+
+        let out =
+            run_async(call_with_args("rag__query", json!({"query": "x"})).eval(&mut ctx)).unwrap();
+
+        let err = out["tool_call_error"].as_str().unwrap();
+        assert!(err.starts_with("RAG query failed"), "{err}");
+        assert!(err.contains("No RAG is attached"), "{err}");
+    }
+
+    #[test]
+    fn eval_unknown_name_errors_with_unexpected_call() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+
+        let err = run_async(call_with_args("nope", json!({})).eval(&mut ctx)).unwrap_err();
+
+        assert!(err.to_string().contains("Unexpected call"), "{err}");
+    }
+
+    #[test]
+    fn eval_mcp_empty_runtime_returns_distinct_error_per_prefix() {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let cases = [
+            (
+                "mcp_invoke_ghost",
+                json!({"tool": "t"}),
+                "MCP tool invocation failed",
+            ),
+            (
+                "mcp_search_ghost",
+                json!({"query": "q"}),
+                "MCP search failed",
+            ),
+            (
+                "mcp_describe_ghost",
+                json!({"tool": "t"}),
+                "MCP describe failed",
+            ),
+            (
+                "mcp_read_ghost",
+                json!({"uri": "file:///x"}),
+                "MCP read failed",
+            ),
+            (
+                "mcp_prompt_ghost",
+                json!({"prompt": "p"}),
+                "MCP prompt failed",
+            ),
+        ];
+
+        for (name, args, expected) in cases {
+            let out = run_async(call_with_args(name, args).eval_mcp(&ctx)).unwrap();
+            let err = out["tool_call_error"].as_str().unwrap();
+            assert!(err.starts_with(expected), "{name}: {err}");
+        }
     }
 }

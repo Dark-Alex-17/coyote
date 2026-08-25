@@ -294,4 +294,25 @@ mod tests {
             AgentExitStatus::Failed("x".into())
         );
     }
+
+    #[test]
+    fn cancel_recursive_aborts_nested_supervisors() {
+        let child_sig = create_abort_signal();
+        let mut child_handle = make_handle("c1", "worker", 2);
+        child_handle.abort_signal = child_sig.clone();
+        let mut child_sup = Supervisor::new(4, 3);
+        child_sup.register(child_handle).unwrap();
+
+        let parent_sig = create_abort_signal();
+        let mut parent_handle = make_handle("a1", "explore", 1);
+        parent_handle.abort_signal = parent_sig.clone();
+        parent_handle.child_supervisor = Some(Arc::new(RwLock::new(child_sup)));
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(parent_handle).unwrap();
+
+        sup.cancel_recursive();
+
+        assert!(parent_sig.aborted());
+        assert!(child_sig.aborted());
+    }
 }
