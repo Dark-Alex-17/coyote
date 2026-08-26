@@ -32,7 +32,7 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
     if layout.is_empty() {
         println!(
             "No recognized assets found in {git_url}. Expected one or more of: \
-             agents/, roles/, skills/, macros/, functions/tools/, functions/mcp.json"
+             agents/, roles/, skills/, macros/, functions/tools/, mcp.json"
         );
         return Ok(());
     }
@@ -1263,6 +1263,11 @@ fn scan_remote_layout(root: &Path) -> Result<RemoteLayout> {
         layout.macros = Some(macros);
     }
 
+    let root_mcp = root.join("mcp.json");
+    if root_mcp.is_file() {
+        layout.mcp_json = Some(root_mcp);
+    }
+
     let functions = root.join("functions");
     if functions.is_dir() {
         let tools = functions.join("tools");
@@ -1270,8 +1275,9 @@ fn scan_remote_layout(root: &Path) -> Result<RemoteLayout> {
             layout.functions_tools = Some(tools);
         }
 
+        // Legacy bundle layout; a root-level mcp.json wins when both exist.
         let mcp = functions.join("mcp.json");
-        if mcp.is_file() {
+        if layout.mcp_json.is_none() && mcp.is_file() {
             layout.mcp_json = Some(mcp);
         }
     }
@@ -2639,6 +2645,30 @@ mod tests {
         assert!(layout.macros.is_some());
         assert!(layout.functions_tools.is_some());
         assert!(layout.mcp_json.is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_remote_layout_finds_root_mcp_json() {
+        let root = fresh_temp_dir("scan-root-mcp-test-");
+        touch(&root.join("mcp.json"));
+
+        let layout = scan_remote_layout(&root).unwrap();
+
+        assert_eq!(layout.mcp_json, Some(root.join("mcp.json")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_remote_layout_prefers_root_mcp_json_over_functions() {
+        let root = fresh_temp_dir("scan-mcp-precedence-test-");
+        touch(&root.join("mcp.json"));
+        fs::create_dir_all(root.join("functions")).unwrap();
+        touch(&root.join("functions/mcp.json"));
+
+        let layout = scan_remote_layout(&root).unwrap();
+
+        assert_eq!(layout.mcp_json, Some(root.join("mcp.json")));
         let _ = fs::remove_dir_all(&root);
     }
 
