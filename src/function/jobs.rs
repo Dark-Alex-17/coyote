@@ -1,7 +1,7 @@
+use super::agents::AGENT_FUNCTION_PREFIX;
 use super::memory::MEMORY_FUNCTION_PREFIX;
 use super::rag_query::RAG_FUNCTION_PREFIX;
 use super::skill::SKILL_FUNCTION_PREFIX;
-use super::supervisor::AGENT_FUNCTION_PREFIX;
 use super::todo::TODO_FUNCTION_PREFIX;
 use super::user_interaction::USER_FUNCTION_PREFIX;
 use super::{FunctionDeclaration, JsonSchema, PATH_SEP, mcp_error_display, render_tool_result};
@@ -1217,7 +1217,7 @@ fn tail_chars(text: &str, max_chars: usize) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{AppConfig, AppState, WorkingMode};
-    use crate::function::supervisor::{
+    use crate::function::agents::{
         GuardrailAction, check_pending_tasks_guardrail, handle_agent_tool,
     };
     use crate::supervisor::mailbox::Inbox;

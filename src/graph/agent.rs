@@ -2,7 +2,7 @@ use super::state::StateManager;
 use super::structured;
 use super::types::AgentNode;
 use crate::config::RequestContext;
-use crate::function::supervisor::run_agent_for_graph;
+use crate::function::agents::run_agent_for_graph;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::time::Duration;

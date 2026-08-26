@@ -29,7 +29,7 @@ use crate::config::{
     install_builtins, list_agents, load_env_file, macro_execute, sync_models,
 };
 use crate::config::{memory, paths};
-use crate::function::supervisor::{GuardrailAction, check_pending_tasks_guardrail};
+use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::mcp::McpServersConfig;
 use crate::render::{prompt_theme, render_error};
 use crate::repl::Repl;

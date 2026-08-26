@@ -6,9 +6,9 @@ use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use crate::config::{
     Input, RequestContext, Role, RoleLike, SkillPolicy, should_inject_skill_instructions,
 };
+use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::function::jobs::reap_jobs;
 use crate::function::skill::skill_function_declarations;
-use crate::function::supervisor::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::utils::create_abort_signal;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use log::warn;

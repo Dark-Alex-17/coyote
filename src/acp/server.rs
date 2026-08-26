@@ -1,7 +1,7 @@
 use super::types::{METHOD_NOT_FOUND, PARSE_ERROR, Request, Response};
 use crate::client::call_chat_completions_streaming;
 use crate::config::{Input, RenderMode, RequestContext};
-use crate::function::supervisor::{GuardrailAction, check_pending_tasks_guardrail};
+use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::utils;
 use crate::utils::AbortSignal;
 use anyhow::Result;

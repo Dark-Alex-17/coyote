@@ -16,7 +16,7 @@ use crate::config::{
     StateFlags, flatten_prompt_messages, macro_execute, resolve_prompt_args, sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
-use crate::function::supervisor::{GuardrailAction, check_pending_tasks_guardrail};
+use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::render::render_error;
 use crate::utils::{
     AbortSignal, SHELL, abortable_run_with_spinner, create_abort_signal, dimmed_text,

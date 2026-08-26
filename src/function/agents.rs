@@ -524,7 +524,7 @@ pub async fn handle_agent_tool(
         "task_complete" => handle_task_complete(ctx, args).await,
         "task_fail" => handle_task_fail(ctx, args),
         "reply_escalation" => handle_reply_escalation(ctx, args),
-        _ => bail!("Unknown supervisor action: {action}"),
+        _ => bail!("Unknown agent action: {action}"),
     }
 }
 
@@ -2150,7 +2150,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Unknown supervisor action")
+                .contains("Unknown agent action")
         );
     }
 

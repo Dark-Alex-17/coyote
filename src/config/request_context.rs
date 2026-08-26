@@ -18,11 +18,11 @@ use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
     FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
+    agents::AGENT_FUNCTION_PREFIX,
     jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX, is_backgroundable_tool},
     memory::MEMORY_FUNCTION_PREFIX,
     rag_query::RAG_FUNCTION_PREFIX,
     skill::SKILL_FUNCTION_PREFIX,
-    supervisor::AGENT_FUNCTION_PREFIX,
     todo::TODO_FUNCTION_PREFIX,
     user_interaction::USER_FUNCTION_PREFIX,
 };

@@ -1,8 +1,8 @@
+pub(crate) mod agents;
 pub(crate) mod jobs;
 pub(crate) mod memory;
 pub(crate) mod rag_query;
 pub(crate) mod skill;
-pub(crate) mod supervisor;
 pub(crate) mod todo;
 pub(crate) mod user_interaction;
 
@@ -24,6 +24,7 @@ use crate::mcp::{
     McpServersConfig, is_mcp_meta_function, render,
 };
 use crate::parsers::{bash, python, typescript};
+use agents::AGENT_FUNCTION_PREFIX;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future;
 use indexmap::IndexMap;
@@ -48,7 +49,6 @@ use std::{
     time::{Duration, Instant},
 };
 use strum_macros::AsRefStr;
-use supervisor::AGENT_FUNCTION_PREFIX;
 use todo::TODO_FUNCTION_PREFIX;
 use user_interaction::USER_FUNCTION_PREFIX;
 
@@ -684,9 +684,9 @@ impl Functions {
 
     pub fn append_supervisor_functions(&mut self) {
         self.declarations
-            .extend(supervisor::agent_function_declarations());
+            .extend(agents::agent_function_declarations());
         self.declarations
-            .extend(supervisor::escalation_function_declarations());
+            .extend(agents::escalation_function_declarations());
     }
 
     pub fn append_job_functions(&mut self) {
@@ -700,7 +700,7 @@ impl Functions {
 
     pub fn append_teammate_functions(&mut self) {
         self.declarations
-            .extend(supervisor::teammate_function_declarations());
+            .extend(agents::teammate_function_declarations());
     }
 
     pub fn append_user_interaction_functions(&mut self) {
@@ -1595,10 +1595,10 @@ impl ToolCall {
                     })
             }
             _ if cmd_name.starts_with(AGENT_FUNCTION_PREFIX) => {
-                supervisor::handle_agent_tool(ctx, &cmd_name, &json_data)
+                agents::handle_agent_tool(ctx, &cmd_name, &json_data)
                     .await
                     .unwrap_or_else(|e| {
-                        let error_msg = format!("Supervisor tool failed: {e}");
+                        let error_msg = format!("Agent tool failed: {e}");
                         eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
                         json!({"tool_call_error": error_msg})
                     })
@@ -4743,7 +4743,7 @@ mod tests {
             run_async(call_with_args("agent__check", json!({"id": "x"})).eval(&mut ctx)).unwrap();
 
         let err = out["tool_call_error"].as_str().unwrap();
-        assert!(err.starts_with("Supervisor tool failed"), "{err}");
+        assert!(err.starts_with("Agent tool failed"), "{err}");
         assert!(err.contains("No supervisor active"), "{err}");
     }
 
