@@ -844,8 +844,8 @@ mod tests {
 
         unsafe {
             match prev {
-                Some(v) => std::env::set_var(&env_name, v),
-                None => std::env::remove_var(&env_name),
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
             }
         }
     }
@@ -868,35 +868,35 @@ mod tests {
     #[serial_test::serial]
     fn load_envs_overrides_max_concurrent_jobs() {
         let env_name = get_env_name("max_concurrent_jobs");
-        let prev = std::env::var_os(&env_name);
+        let prev = env::var_os(&env_name);
 
         let mut app = AppConfig::default();
 
-        unsafe { std::env::set_var(&env_name, "7") };
+        unsafe { env::set_var(&env_name, "7") };
         app.load_envs();
         assert_eq!(app.max_concurrent_jobs, Some(7));
 
-        unsafe { std::env::set_var(&env_name, "0") };
+        unsafe { env::set_var(&env_name, "0") };
         app.load_envs();
         assert_eq!(app.max_concurrent_jobs, Some(0));
 
-        unsafe { std::env::remove_var(&env_name) };
+        unsafe { env::remove_var(&env_name) };
         app.max_concurrent_jobs = Some(2);
         app.load_envs();
         assert_eq!(app.max_concurrent_jobs, Some(2));
 
         unsafe {
             match prev {
-                Some(v) => std::env::set_var(&env_name, v),
-                None => std::env::remove_var(&env_name),
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
             }
         }
     }
 
     #[test]
     fn editor_returns_configured_value() {
-        let configured = cached_editor()
-            .unwrap_or_else(|| std::env::current_exe().unwrap().display().to_string());
+        let configured =
+            cached_editor().unwrap_or_else(|| env::current_exe().unwrap().display().to_string());
         let app = AppConfig {
             editor: Some(configured.clone()),
             ..AppConfig::default()
@@ -913,9 +913,9 @@ mod tests {
             return;
         }
 
-        let expected = std::env::current_exe().unwrap().display().to_string();
+        let expected = env::current_exe().unwrap().display().to_string();
         unsafe {
-            std::env::set_var("VISUAL", &expected);
+            env::set_var("VISUAL", &expected);
         }
 
         let app = AppConfig::default();
@@ -983,7 +983,7 @@ mod tests {
         let app = AppConfig::from_config(cfg).unwrap();
 
         let ua = app.user_agent.as_deref().unwrap();
-        assert!(ua != "auto", "user_agent should have been resolved");
+        assert_ne!(ua, "auto", "user_agent should have been resolved");
         assert!(ua.contains('/'), "user_agent should be '<name>/<version>'");
     }
 

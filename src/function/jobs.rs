@@ -70,17 +70,20 @@ impl RingBuf {
         if self.capacity == 0 {
             return;
         }
+
         let src = if bytes.len() > self.capacity {
             &bytes[bytes.len() - self.capacity..]
         } else {
             bytes
         };
+
         for &byte in src {
             if self.buf.len() < self.capacity {
                 self.buf.push(byte);
             } else {
                 self.buf[self.write_pos] = byte;
             }
+
             self.write_pos = (self.write_pos + 1) % self.capacity;
         }
     }
@@ -93,6 +96,7 @@ impl RingBuf {
         if self.buf.len() < self.capacity {
             return self.buf.clone();
         }
+
         let mut out = Vec::with_capacity(self.capacity);
         out.extend_from_slice(&self.buf[self.write_pos..]);
         out.extend_from_slice(&self.buf[..self.write_pos]);
@@ -367,7 +371,8 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         return Ok(json!({
             "status": "error",
             "message": format!(
-                "'{tool}' is not enabled in this context — job__start can only background tools declared to you in this request. Use the exact name of a tool from your current catalog."
+                "'{tool}' is not enabled in this context — job__start can only background tools declared to you in this \
+                 request. Use the exact name of a tool from your current catalog."
             ),
         }));
     }
@@ -464,7 +469,9 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             } else {
                 JobStatus::Failed
             };
+
             drop(job_state);
+
             task_notifications.push(job_notification(&notify_id, &notify_tool, success));
             result
         })
@@ -495,7 +502,8 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         "status": "ok",
         "job_id": job_id,
         "tool": tool,
-        "message": "Running in background. Check with job__check, block with job__collect, cancel with job__cancel. You will receive a system_notifications entry on completion. Jobs do not survive coyote exiting.",
+        "message": "Running in background. Check with job__check, block with job__collect, cancel with job__cancel. \
+                    You will receive a system_notifications entry on completion. Jobs do not survive coyote exiting.",
     }))
 }
 
@@ -520,12 +528,14 @@ fn handle_check(ctx: &RequestContext, args: &Value) -> Result<Value> {
         (buf.tail(), buf.total_written())
     };
     let check_state = (status, total_written);
+
     if job.last_check_state == Some(check_state) {
         job.no_change_checks += 1;
     } else {
         job.no_change_checks = 0;
         job.last_check_state = Some(check_state);
     }
+
     let tail_truncated = (tail.len() as u64) < total_written;
     let mut result = json!({
         "status": job_status_str(status),
@@ -536,10 +546,12 @@ fn handle_check(ctx: &RequestContext, args: &Value) -> Result<Value> {
         "output_bytes_captured": total_written,
         "tail_truncated": tail_truncated,
     });
+
     if matches!(status, JobStatus::Running) {
         result["message"] = json!(
             "Job is still running. Call job__collect to block for the result, or do other work — you will be notified on completion."
         );
+
         if job.no_change_checks >= 3 {
             result["hint"] = json!(
                 "No change across repeated checks — still running; call job__collect to block, or do other work — a system notification will fire on completion."
@@ -606,11 +618,14 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
                     let sup = supervisor.read();
                     sup.job(id).is_none_or(|job| job.join_handle.is_finished())
                 };
+
                 if is_finished {
                     break;
                 }
+
                 time::sleep(Duration::from_millis(50)).await;
             }
+
             break;
         }
 
@@ -642,6 +657,7 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
             if let Some(pgid) = handle.state.lock().pgid {
                 unsafe { libc::killpg(pgid, libc::SIGKILL) };
             }
+
             match time::timeout(JOB_KILL_GRACE, &mut handle.join_handle).await {
                 Ok(joined) => joined,
                 Err(_) => {
@@ -694,6 +710,7 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
         "output_tail": output_tail,
         "output_bytes_captured": job_result.output_bytes_captured,
     });
+
     if let Some(exit_code) = job_result.exit_code {
         response["exit_code"] = json!(exit_code);
     }
@@ -968,6 +985,7 @@ async fn run_process_job(
                     "Tool call '{}' timed out after {}s and was killed (set COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited)",
                     snapshot.display_name, snapshot.timeout_secs
                 );
+
                 return Ok(JobResult {
                     output: json!({"tool_call_error": message}),
                     exit_code: None,
@@ -1011,6 +1029,7 @@ async fn run_process_job(
         {
             error_json["output"] = json!(contents);
         }
+
         return Ok(JobResult {
             output: error_json,
             exit_code,
@@ -1075,6 +1094,7 @@ async fn run_mcp_job(
         }
     };
     let output = render_tool_result(serde_json::to_value(raw)?, &server)?;
+
     Ok(JobResult {
         output,
         exit_code: None,
@@ -1105,6 +1125,7 @@ fn cap_result(output: Value, tail_lines: Option<usize>) -> (Value, bool) {
         text = capped;
         truncated = true;
     }
+
     if truncated {
         (json!(text), true)
     } else {
@@ -1117,11 +1138,13 @@ fn tail_chars(text: &str, max_chars: usize) -> Option<String> {
     if total <= max_chars {
         return None;
     }
+
     let cut = text
         .char_indices()
         .nth(total - max_chars)
         .map(|(i, _)| i)
         .unwrap_or(0);
+
     Some(format!(
         "[truncated: kept last {max_chars} of {total} chars]\n{}",
         &text[cut..]
@@ -1133,11 +1156,12 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, AppState, WorkingMode};
     use crate::function::supervisor::{
-        GuardrailAction, check_pending_agents_guardrail, handle_supervisor_tool,
+        GuardrailAction, check_pending_tasks_guardrail, handle_supervisor_tool,
     };
     use crate::supervisor::mailbox::Inbox;
     use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
     use std::future::Future;
+    use std::mem;
 
     fn default_app_state() -> Arc<AppState> {
         Arc::new(AppState::test_default())
@@ -1175,7 +1199,7 @@ mod tests {
                 output_bytes_captured: 0,
             })
         });
-        std::mem::forget(rt);
+        mem::forget(rt);
         JobHandle {
             id: id.to_string(),
             tool: "execute_command".to_string(),
@@ -1219,8 +1243,10 @@ mod tests {
     #[test]
     fn ring_buf_returns_contents_below_capacity() {
         let mut buf = RingBuf::new(8);
+
         buf.push(b"abc");
         buf.push(b"de");
+
         assert_eq!(buf.tail(), b"abcde");
         assert_eq!(buf.total_written(), 5);
     }
@@ -1228,7 +1254,9 @@ mod tests {
     #[test]
     fn ring_buf_exact_fit_keeps_everything() {
         let mut buf = RingBuf::new(5);
+
         buf.push(b"abcde");
+
         assert_eq!(buf.tail(), b"abcde");
         assert_eq!(buf.total_written(), 5);
     }
@@ -1236,8 +1264,10 @@ mod tests {
     #[test]
     fn ring_buf_wrap_around_keeps_newest_bytes() {
         let mut buf = RingBuf::new(5);
+
         buf.push(b"abcde");
         buf.push(b"fg");
+
         assert_eq!(buf.tail(), b"cdefg");
         assert_eq!(buf.total_written(), 7);
     }
@@ -1245,7 +1275,9 @@ mod tests {
     #[test]
     fn ring_buf_oversize_push_keeps_last_capacity_bytes() {
         let mut buf = RingBuf::new(4);
+
         buf.push(b"abcdefghij");
+
         assert_eq!(buf.tail(), b"ghij");
         assert_eq!(buf.total_written(), 10);
     }
@@ -1254,7 +1286,9 @@ mod tests {
     fn ring_buf_default_capacity_is_64_kib() {
         let mut buf = RingBuf::default();
         let payload = vec![b'x'; 64 * 1024 + 1];
+
         buf.push(&payload);
+
         assert_eq!(buf.tail().len(), 64 * 1024);
         assert_eq!(buf.total_written(), 64 * 1024 + 1);
     }
@@ -1280,7 +1314,7 @@ mod tests {
                 exit_status: AgentExitStatus::Completed,
             })
         });
-        std::mem::forget(rt);
+        mem::forget(rt);
         let handle = AgentHandle {
             id: "a1".to_string(),
             agent_name: "explore".to_string(),
@@ -1304,6 +1338,7 @@ mod tests {
             .into_iter()
             .map(|d| d.name)
             .collect();
+
         assert_eq!(
             names,
             vec![
@@ -1320,6 +1355,7 @@ mod tests {
     fn whitelist_rejects_state_mutating_tools() {
         for tool in ["memory__write", "todo__add", "skill__load", "rag__query"] {
             let rejection = whitelist_rejection(tool).unwrap();
+
             let message = rejection["message"].as_str().unwrap();
             assert!(
                 message.contains("mutates agent/session state"),
@@ -1335,6 +1371,7 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .to_string();
+
             assert!(
                 message.contains("already asynchronous"),
                 "unexpected message for {tool}: {message}"
@@ -1359,6 +1396,7 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .to_string();
+
             assert!(
                 message.contains("sub-second"),
                 "unexpected message for {tool}: {message}"
@@ -1373,6 +1411,7 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .to_string();
+
             assert!(
                 message.contains("is fast"),
                 "unexpected message for {tool}: {message}"
@@ -1550,7 +1589,9 @@ mod tests {
     #[test]
     fn handle_check_unknown_id_teaches_job_list() {
         let ctx = ctx_with_job_supervisor(4);
+
         let result = handle_check(&ctx, &json!({"id": "job_x"})).unwrap();
+
         assert_eq!(result["status"], "error");
         assert!(
             result["message"]
@@ -1708,7 +1749,9 @@ mod tests {
     #[test]
     fn job_handlers_miss_without_supervisor() {
         let ctx = plain_ctx();
+
         let result = handle_check(&ctx, &json!({"id": "job_x"})).unwrap();
+
         assert_eq!(result["status"], "error");
         assert!(
             result["message"]
@@ -2049,7 +2092,9 @@ mod tests {
     #[test]
     fn handle_list_without_supervisor_reports_empty() {
         let ctx = plain_ctx();
+
         let result = handle_list(&ctx).unwrap();
+
         assert_eq!(result["active_jobs"], 0);
         assert_eq!(result["max_concurrent_jobs"], 5);
         assert_eq!(result["jobs"].as_array().unwrap().len(), 0);
@@ -2058,6 +2103,7 @@ mod tests {
     #[test]
     fn cap_result_normalizes_null_to_done() {
         let (value, truncated) = cap_result(Value::Null, None);
+
         assert_eq!(value, json!("DONE"));
         assert!(!truncated);
     }
@@ -2065,6 +2111,7 @@ mod tests {
     #[test]
     fn cap_result_preserves_small_values() {
         let (value, truncated) = cap_result(json!({"a": 1}), None);
+
         assert_eq!(value, json!({"a": 1}));
         assert!(!truncated);
     }
@@ -2085,6 +2132,7 @@ mod tests {
     #[test]
     fn tail_chars_floors_to_char_boundary() {
         let capped = tail_chars("aébc", 2).unwrap();
+
         assert!(capped.ends_with("bc"));
         assert!(capped.starts_with("[truncated: kept last 2 of 4 chars]"));
         assert!(tail_chars("abc", 3).is_none());
@@ -2321,18 +2369,18 @@ mod tests {
             .register(make_running_job("j1"))
             .unwrap();
 
-        match check_pending_agents_guardrail(&mut ctx) {
+        match check_pending_tasks_guardrail(&mut ctx) {
             GuardrailAction::Inject(prompt) => {
                 assert!(prompt.contains("j1"));
                 assert!(prompt.contains("job__collect"));
             }
             _ => panic!("expected Inject for a running job"),
         }
-        assert_eq!(ctx.pending_agents_guardrail_count, 1);
+        assert_eq!(ctx.pending_tasks_guardrail_count, 1);
 
         let empty_ctx = &mut ctx_with_job_supervisor(5);
         assert!(matches!(
-            check_pending_agents_guardrail(empty_ctx),
+            check_pending_tasks_guardrail(empty_ctx),
             GuardrailAction::NoAction
         ));
     }

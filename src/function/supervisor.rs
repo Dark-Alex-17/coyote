@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 pub const SUPERVISOR_FUNCTION_PREFIX: &str = "agent__";
 
-pub const PENDING_AGENTS_GUARDRAIL_MAX: u32 = 3;
+pub const PENDING_TASKS_GUARDRAIL_MAX: u32 = 3;
 
 fn agent_permitted(whitelist: Option<&[String]>, target: &str) -> bool {
     match whitelist {
@@ -73,11 +73,12 @@ pub fn pending_tasks(ctx: &RequestContext) -> Vec<PendingTask> {
             finished,
         })
         .collect();
+
     tasks.sort_by(|a, b| a.id.cmp(&b.id));
     tasks
 }
 
-pub fn build_pending_agents_guardrail_prompt(tasks: &[PendingTask]) -> String {
+pub fn build_pending_tasks_guardrail_prompt(tasks: &[PendingTask]) -> String {
     let running: Vec<&PendingTask> = tasks.iter().filter(|t| !t.finished).collect();
     let finished: Vec<&PendingTask> = tasks.iter().filter(|t| t.finished).collect();
 
@@ -105,6 +106,7 @@ pub fn build_pending_agents_guardrail_prompt(tasks: &[PendingTask]) -> String {
             count = running.len()
         ));
     }
+
     if !finished.is_empty() {
         let cmd_list = finished
             .iter()
@@ -124,6 +126,7 @@ pub fn build_pending_agents_guardrail_prompt(tasks: &[PendingTask]) -> String {
             count = finished.len()
         ));
     }
+
     format!(
         "[SYSTEM GUARDRAIL] You attempted to end your turn with {count} unreclaimed background \
          task(s).\n\n{body}",
@@ -132,14 +135,14 @@ pub fn build_pending_agents_guardrail_prompt(tasks: &[PendingTask]) -> String {
     )
 }
 
-pub fn check_pending_agents_guardrail(ctx: &mut RequestContext) -> GuardrailAction {
+pub fn check_pending_tasks_guardrail(ctx: &mut RequestContext) -> GuardrailAction {
     let pending = pending_tasks(ctx);
     if pending.is_empty() {
-        ctx.pending_agents_guardrail_count = 0;
+        ctx.pending_tasks_guardrail_count = 0;
         return GuardrailAction::NoAction;
     }
 
-    if ctx.pending_agents_guardrail_count >= PENDING_AGENTS_GUARDRAIL_MAX {
+    if ctx.pending_tasks_guardrail_count >= PENDING_TASKS_GUARDRAIL_MAX {
         if let Some(sup) = ctx.supervisor.as_ref().cloned() {
             sup.read().cancel_recursive();
             let finished: Vec<&PendingTask> = pending.iter().filter(|t| t.finished).collect();
@@ -162,13 +165,13 @@ pub fn check_pending_agents_guardrail(ctx: &mut RequestContext) -> GuardrailActi
                 }
             }
         }
-        ctx.pending_agents_guardrail_count = 0;
+        ctx.pending_tasks_guardrail_count = 0;
 
         return GuardrailAction::ForceTerminate(pending.into_iter().map(|t| t.id).collect());
     }
 
-    ctx.pending_agents_guardrail_count += 1;
-    let mut prompt = build_pending_agents_guardrail_prompt(&pending);
+    ctx.pending_tasks_guardrail_count += 1;
+    let mut prompt = build_pending_tasks_guardrail_prompt(&pending);
     if let Some(queue) = ctx.root_escalation_queue()
         && queue.has_pending()
     {
@@ -184,7 +187,8 @@ pub fn check_pending_agents_guardrail(ctx: &mut RequestContext) -> GuardrailActi
 pub fn escalation_function_declarations() -> Vec<FunctionDeclaration> {
     vec![FunctionDeclaration {
         name: format!("{SUPERVISOR_FUNCTION_PREFIX}reply_escalation"),
-        description: "Reply to a pending escalation from a child agent. The child is blocked waiting for this reply. Use this after seeing pending_escalations notifications.".to_string(),
+        description: "Reply to a pending escalation from a child agent. The child is blocked waiting for this reply. \
+                      Use this after seeing pending_escalations notifications.".to_string(),
         parameters: JsonSchema {
             type_value: Some("object".to_string()),
             properties: Some(IndexMap::from([
@@ -200,7 +204,8 @@ pub fn escalation_function_declarations() -> Vec<FunctionDeclaration> {
                     "reply".to_string(),
                     JsonSchema {
                         type_value: Some("string".to_string()),
-                        description: Some("Your answer to the child agent's question. For ask/confirm questions, use the exact option text. For input questions, provide the text response.".into()),
+                        description: Some("Your answer to the child agent's question. For ask/confirm questions, use \
+                                           the exact option text. For input questions, provide the text response.".into()),
                         ..Default::default()
                     },
                 ),
@@ -256,7 +261,8 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{SUPERVISOR_FUNCTION_PREFIX}check"),
-            description: "Non-blocking status probe: reports whether a spawned agent is still running or finished. NEVER returns or consumes the result — when finished, call agent__collect to retrieve it.".to_string(),
+            description: "Non-blocking status probe: reports whether a spawned agent is still running or finished. \
+                          NEVER returns or consumes the result — when finished, call agent__collect to retrieve it.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([(
@@ -558,10 +564,10 @@ pub fn run_child_agent(
             }
 
             if tool_results.is_empty() {
-                match check_pending_agents_guardrail(&mut child_ctx) {
+                match check_pending_tasks_guardrail(&mut child_ctx) {
                     GuardrailAction::NoAction => break,
                     GuardrailAction::ForceTerminate(ids) => {
-                        log::warn!(
+                        warn!(
                             "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
                             ids.len(),
                             ids
@@ -642,7 +648,7 @@ pub async fn run_agent_for_graph(
     let session = agent.agent_session().map(|v| v.to_string());
     let child_jobs_enabled = jobs_enabled(Some(&agent), app_config.as_ref());
     let should_init_supervisor = agent.can_spawn_agents() || child_jobs_enabled;
-    let agent_max_concurrent = if agent.can_spawn_agents() {
+    let agent_max_concurrent_subagents = if agent.can_spawn_agents() {
         agent.max_concurrent_agents()
     } else {
         0
@@ -661,7 +667,7 @@ pub async fn run_agent_for_graph(
     child_ctx.agent = Some(agent);
     if should_init_supervisor {
         child_ctx.supervisor = Some(Arc::new(RwLock::new(
-            Supervisor::new(agent_max_concurrent, agent_max_depth)
+            Supervisor::new(agent_max_concurrent_subagents, agent_max_depth)
                 .with_max_concurrent_jobs(agent_max_jobs),
         )));
     }
@@ -827,7 +833,7 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let session = agent.agent_session().map(|v| v.to_string());
     let child_jobs_enabled = jobs_enabled(Some(&agent), app_config.as_ref());
     let should_init_supervisor = agent.can_spawn_agents() || child_jobs_enabled;
-    let max_concurrent = if agent.can_spawn_agents() {
+    let max_concurrent_agents = if agent.can_spawn_agents() {
         agent.max_concurrent_agents()
     } else {
         0
@@ -845,7 +851,7 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     child_ctx.agent = Some(agent);
     if should_init_supervisor {
         child_ctx.supervisor = Some(Arc::new(RwLock::new(
-            Supervisor::new(max_concurrent, max_depth).with_max_concurrent_jobs(max_jobs),
+            Supervisor::new(max_concurrent_agents, max_depth).with_max_concurrent_jobs(max_jobs),
         )));
     }
 
@@ -893,6 +899,7 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             &agent_result.agent_name,
             success,
         ));
+
         Ok(agent_result)
     });
 
@@ -975,6 +982,7 @@ async fn handle_check(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             if is_job_task(ctx.supervisor.as_ref(), id) {
                 return Ok(job_id_teaching_error(id));
             }
+
             Ok(json!({
                 "status": "error",
                 "message": format!("No agent found with id '{id}'")
@@ -1001,6 +1009,7 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
             if id.starts_with("job_") || sup.has_job(id) {
                 return Ok(job_id_teaching_error(id));
             }
+
             return Ok(json!({
                 "status": "error",
                 "message": format!("Agent '{id}' not found. Use agent__check to verify it exists and is finished.")
@@ -1068,7 +1077,7 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
                 .map_err(|e| anyhow!("Agent failed: {e}"))?;
 
             let output = summarize_output(ctx, &result.agent_name, &result.output).await?;
-            ctx.pending_agents_guardrail_count = 0;
+            ctx.pending_tasks_guardrail_count = 0;
 
             Ok(json!({
                 "status": "completed",
@@ -1169,7 +1178,7 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
 
             let cleanup = tokio::time::timeout(Duration::from_secs(5), handle.join_handle).await;
 
-            ctx.pending_agents_guardrail_count = 0;
+            ctx.pending_tasks_guardrail_count = 0;
 
             let message = match cleanup {
                 Ok(_) => format!("Cancelled agent '{agent_name}' and waited for cleanup."),
@@ -1187,6 +1196,7 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
             if is_job_task(ctx.supervisor.as_ref(), id) {
                 return Ok(job_id_teaching_error(id));
             }
+
             Ok(json!({
                 "status": "error",
                 "message": format!("No agent found with id '{id}'"),
@@ -1244,6 +1254,7 @@ fn handle_send_message(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
             {
                 return Ok(job_id_teaching_error(id));
             }
+
             Ok(json!({
                 "status": "error",
                 "message": format!("No agent found with id '{id}'. Agent may not exist or may have already completed."),
@@ -1591,6 +1602,7 @@ mod tests {
     use parking_lot::Mutex;
     use serde_json::json;
     use serial_test::serial;
+    use std::mem;
 
     fn default_app_state() -> Arc<AppState> {
         Arc::new(AppState::test_default())
@@ -1622,7 +1634,7 @@ mod tests {
                 output_bytes_captured: 0,
             })
         });
-        std::mem::forget(rt);
+        mem::forget(rt);
         JobHandle {
             id: id.to_string(),
             tool: "execute_command".to_string(),
@@ -1681,7 +1693,7 @@ mod tests {
                 exit_status: AgentExitStatus::Completed,
             })
         });
-        std::mem::forget(rt);
+        mem::forget(rt);
 
         let handle = AgentHandle {
             id: id.to_string(),
@@ -2314,7 +2326,7 @@ mod tests {
                 reply_tx: tx,
             });
 
-            match check_pending_agents_guardrail(&mut ctx) {
+            match check_pending_tasks_guardrail(&mut ctx) {
                 GuardrailAction::Inject(prompt) => {
                     assert!(prompt.contains("agent__reply_escalation"));
                     assert!(prompt.contains("esc_9"));
@@ -2358,7 +2370,7 @@ mod tests {
                 .register(handle)
                 .unwrap();
 
-            match check_pending_agents_guardrail(&mut ctx) {
+            match check_pending_tasks_guardrail(&mut ctx) {
                 GuardrailAction::Inject(prompt) => {
                     assert!(!prompt.contains("agent__reply_escalation"));
                 }
@@ -2371,7 +2383,7 @@ mod tests {
     fn handle_collect_finished_agent_returns_output_and_consumes_handle() {
         let mut ctx = ctx_with_supervisor(4, 3);
         register_fake_agent(&mut ctx, "a1", "explore");
-        ctx.pending_agents_guardrail_count = 2;
+        ctx.pending_tasks_guardrail_count = 2;
 
         let result = run_async(handle_collect(&mut ctx, &json!({"id": "a1"}))).unwrap();
 
@@ -2380,7 +2392,7 @@ mod tests {
         assert_eq!(result["agent"], "explore");
         assert_eq!(result["exit_status"], "Completed");
         assert_eq!(result["output"], "fake output");
-        assert_eq!(ctx.pending_agents_guardrail_count, 0);
+        assert_eq!(ctx.pending_tasks_guardrail_count, 0);
         assert_eq!(
             ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
             None
@@ -2424,7 +2436,9 @@ mod tests {
     #[test]
     fn handle_collect_unknown_agent_errors() {
         let mut ctx = ctx_with_supervisor(4, 3);
+
         let result = run_async(handle_collect(&mut ctx, &json!({"id": "missing"}))).unwrap();
+
         assert_eq!(result["status"], "error");
         assert!(result["message"].as_str().unwrap().contains("not found"));
     }
@@ -2473,13 +2487,13 @@ mod tests {
     #[test]
     fn guardrail_no_supervisor_is_no_action_and_resets_counter() {
         let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
-        ctx.pending_agents_guardrail_count = 2;
+        ctx.pending_tasks_guardrail_count = 2;
 
         assert!(matches!(
-            check_pending_agents_guardrail(&mut ctx),
+            check_pending_tasks_guardrail(&mut ctx),
             GuardrailAction::NoAction
         ));
-        assert_eq!(ctx.pending_agents_guardrail_count, 0);
+        assert_eq!(ctx.pending_tasks_guardrail_count, 0);
     }
 
     /// A finished-but-uncollected agent counts as pending: the turn-end
@@ -2490,9 +2504,9 @@ mod tests {
         let mut ctx = ctx_with_supervisor(4, 3);
         register_fake_agent(&mut ctx, "a1", "explore");
         wait_until_finished(&ctx, "a1");
-        ctx.pending_agents_guardrail_count = 2;
+        ctx.pending_tasks_guardrail_count = 2;
 
-        match check_pending_agents_guardrail(&mut ctx) {
+        match check_pending_tasks_guardrail(&mut ctx) {
             GuardrailAction::Inject(prompt) => {
                 assert!(prompt.contains("a1"));
                 assert!(prompt.contains("agent__collect --id a1"));
@@ -2500,7 +2514,7 @@ mod tests {
             }
             _ => panic!("expected Inject action"),
         }
-        assert_eq!(ctx.pending_agents_guardrail_count, 3);
+        assert_eq!(ctx.pending_tasks_guardrail_count, 3);
         assert_eq!(
             ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
             Some(true)
@@ -2512,15 +2526,15 @@ mod tests {
         let mut ctx = ctx_with_supervisor(4, 3);
         register_fake_agent(&mut ctx, "a1", "explore");
         wait_until_finished(&ctx, "a1");
-        ctx.pending_agents_guardrail_count = PENDING_AGENTS_GUARDRAIL_MAX;
+        ctx.pending_tasks_guardrail_count = PENDING_TASKS_GUARDRAIL_MAX;
 
-        match check_pending_agents_guardrail(&mut ctx) {
+        match check_pending_tasks_guardrail(&mut ctx) {
             GuardrailAction::ForceTerminate(ids) => {
                 assert_eq!(ids, vec!["a1".to_string()]);
             }
             _ => panic!("expected ForceTerminate action"),
         }
-        assert_eq!(ctx.pending_agents_guardrail_count, 0);
+        assert_eq!(ctx.pending_tasks_guardrail_count, 0);
         assert_eq!(
             ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
             None
@@ -2540,7 +2554,7 @@ mod tests {
             register_fake_agent(&mut ctx, "a1", "explore");
             wait_until_finished(&ctx, "a1");
 
-            match check_pending_agents_guardrail(&mut ctx) {
+            match check_pending_tasks_guardrail(&mut ctx) {
                 GuardrailAction::Inject(prompt) => {
                     assert!(prompt.contains("Still running"));
                     assert!(prompt.contains("slow (agent)"));
@@ -2567,7 +2581,7 @@ mod tests {
             },
         ];
 
-        let prompt = build_pending_agents_guardrail_prompt(&tasks);
+        let prompt = build_pending_tasks_guardrail_prompt(&tasks);
 
         assert!(prompt.contains("job_1 (job)"));
         assert!(prompt.contains("job__cancel"));
@@ -2596,15 +2610,15 @@ mod tests {
         rt.block_on(async {
             let mut ctx = ctx_with_supervisor(4, 3);
             let abort = register_running_agent(&mut ctx, "slow", "test");
-            ctx.pending_agents_guardrail_count = PENDING_AGENTS_GUARDRAIL_MAX;
+            ctx.pending_tasks_guardrail_count = PENDING_TASKS_GUARDRAIL_MAX;
 
-            match check_pending_agents_guardrail(&mut ctx) {
+            match check_pending_tasks_guardrail(&mut ctx) {
                 GuardrailAction::ForceTerminate(ids) => {
                     assert_eq!(ids, vec!["slow".to_string()]);
                 }
                 _ => panic!("expected ForceTerminate action"),
             }
-            assert_eq!(ctx.pending_agents_guardrail_count, 0);
+            assert_eq!(ctx.pending_tasks_guardrail_count, 0);
             assert!(abort.aborted());
         });
     }
@@ -2619,16 +2633,16 @@ mod tests {
         rt.block_on(async {
             let mut ctx = ctx_with_supervisor(4, 3);
             let _abort = register_running_agent(&mut ctx, "slow", "test");
-            ctx.pending_agents_guardrail_count = 1;
+            ctx.pending_tasks_guardrail_count = 1;
 
-            match check_pending_agents_guardrail(&mut ctx) {
+            match check_pending_tasks_guardrail(&mut ctx) {
                 GuardrailAction::Inject(prompt) => {
                     assert!(prompt.contains("slow"));
                     assert!(prompt.contains("agent__collect"));
                 }
                 _ => panic!("expected Inject action"),
             }
-            assert_eq!(ctx.pending_agents_guardrail_count, 2);
+            assert_eq!(ctx.pending_tasks_guardrail_count, 2);
         });
     }
 
@@ -2636,12 +2650,12 @@ mod tests {
     fn handle_cancel_resets_guardrail_counter() {
         let mut ctx = ctx_with_supervisor(4, 3);
         register_fake_agent(&mut ctx, "a1", "explore");
-        ctx.pending_agents_guardrail_count = 2;
+        ctx.pending_tasks_guardrail_count = 2;
 
         let result = run_async(handle_cancel(&mut ctx, &json!({"id": "a1"}))).unwrap();
 
         assert_eq!(result["status"], "ok");
-        assert_eq!(ctx.pending_agents_guardrail_count, 0);
+        assert_eq!(ctx.pending_tasks_guardrail_count, 0);
     }
 
     #[test]
@@ -2798,7 +2812,7 @@ mod tests {
                 .write()
                 .register(handle)
                 .unwrap();
-            ctx.pending_agents_guardrail_count = 2;
+            ctx.pending_tasks_guardrail_count = 2;
 
             let result = handle_cancel(&mut ctx, &json!({"id": "a1"})).await.unwrap();
 
@@ -2811,7 +2825,7 @@ mod tests {
                 ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
                 None
             );
-            assert_eq!(ctx.pending_agents_guardrail_count, 0);
+            assert_eq!(ctx.pending_tasks_guardrail_count, 0);
         });
     }
 
@@ -2951,21 +2965,21 @@ mod tests {
                 .register(handle)
                 .unwrap();
 
-            for expected_count in 1..=PENDING_AGENTS_GUARDRAIL_MAX {
-                match check_pending_agents_guardrail(&mut ctx) {
+            for expected_count in 1..=PENDING_TASKS_GUARDRAIL_MAX {
+                match check_pending_tasks_guardrail(&mut ctx) {
                     GuardrailAction::Inject(prompt) => assert!(prompt.contains("job_1")),
                     _ => panic!("expected Inject below max"),
                 }
-                assert_eq!(ctx.pending_agents_guardrail_count, expected_count);
+                assert_eq!(ctx.pending_tasks_guardrail_count, expected_count);
             }
 
-            match check_pending_agents_guardrail(&mut ctx) {
+            match check_pending_tasks_guardrail(&mut ctx) {
                 GuardrailAction::ForceTerminate(ids) => {
                     assert_eq!(ids, vec!["job_1".to_string()]);
                 }
                 _ => panic!("expected ForceTerminate at max"),
             }
-            assert_eq!(ctx.pending_agents_guardrail_count, 0);
+            assert_eq!(ctx.pending_tasks_guardrail_count, 0);
             assert!(abort.aborted());
         });
     }
@@ -2982,15 +2996,15 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        ctx.pending_agents_guardrail_count = PENDING_AGENTS_GUARDRAIL_MAX;
+        ctx.pending_tasks_guardrail_count = PENDING_TASKS_GUARDRAIL_MAX;
 
-        match check_pending_agents_guardrail(&mut ctx) {
+        match check_pending_tasks_guardrail(&mut ctx) {
             GuardrailAction::ForceTerminate(ids) => {
                 assert_eq!(ids, vec!["job_1".to_string()]);
             }
             _ => panic!("expected ForceTerminate action"),
         }
-        assert_eq!(ctx.pending_agents_guardrail_count, 0);
+        assert_eq!(ctx.pending_tasks_guardrail_count, 0);
         assert!(!ctx.supervisor.as_ref().unwrap().read().has_job("job_1"));
     }
 }

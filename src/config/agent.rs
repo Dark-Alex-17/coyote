@@ -454,8 +454,6 @@ impl Agent {
             output.push_str(DEFAULT_SPAWN_INSTRUCTIONS);
         }
 
-        // Job declarations are appended at init iff jobs are enabled for this
-        // agent, so their presence doubles as the jobs_enabled predicate.
         if self
             .functions
             .declarations()

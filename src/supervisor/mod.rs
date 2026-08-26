@@ -352,6 +352,7 @@ mod tests {
     use super::*;
     use crate::utils::create_abort_signal;
     use anyhow::Error;
+    use std::mem;
     use tokio::runtime::Builder;
 
     fn make_handle(id: &str, agent_name: &str, depth: usize) -> AgentHandle {
@@ -386,7 +387,7 @@ mod tests {
                 output_bytes_captured: 0,
             })
         });
-        std::mem::forget(rt);
+        mem::forget(rt);
         JobHandle {
             id: id.to_string(),
             tool: "execute_command".to_string(),
@@ -545,7 +546,9 @@ mod tests {
     #[test]
     fn job_registration_rejects_when_job_capacity_zero() {
         let mut sup = Supervisor::new(4, 3);
+
         let result = sup.register(make_job("j1", create_abort_signal()));
+
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("at capacity"));
     }
@@ -554,7 +557,9 @@ mod tests {
     fn job_registration_rejects_at_job_capacity() {
         let mut sup = Supervisor::new(4, 3).with_max_concurrent_jobs(1);
         sup.register(make_job("j1", create_abort_signal())).unwrap();
+
         let result = sup.register(make_job("j2", create_abort_signal()));
+
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("at capacity"));
     }
@@ -562,8 +567,10 @@ mod tests {
     #[test]
     fn job_capacity_is_independent_of_agent_capacity() {
         let mut sup = Supervisor::new(1, 3).with_max_concurrent_jobs(1);
+
         sup.register(make_job("j1", create_abort_signal())).unwrap();
         sup.register(make_handle("a1", "explore", 1)).unwrap();
+
         assert_eq!(sup.active_job_count(), 1);
         assert_eq!(sup.active_count(), 1);
         assert_eq!(sup.max_concurrent_jobs(), 1);
@@ -572,6 +579,7 @@ mod tests {
     #[test]
     fn agent_accessors_ignore_jobs() {
         let mut sup = Supervisor::new(4, 3).with_max_concurrent_jobs(2);
+
         sup.register(make_job("j1", create_abort_signal())).unwrap();
 
         assert_eq!(sup.active_count(), 0);
@@ -589,6 +597,7 @@ mod tests {
     #[test]
     fn take_job_removes_job_but_not_agents() {
         let mut sup = Supervisor::new(4, 3).with_max_concurrent_jobs(2);
+
         sup.register(make_job("j1", create_abort_signal())).unwrap();
         sup.register(make_handle("a1", "explore", 1)).unwrap();
 

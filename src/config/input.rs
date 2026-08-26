@@ -163,7 +163,6 @@ impl Input {
         self.data_urls.clone()
     }
 
-    /// Names of the function declarations this request will send to the model.
     pub fn declared_function_names(&self) -> HashSet<String> {
         self.functions
             .as_ref()

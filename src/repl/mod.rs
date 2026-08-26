@@ -16,7 +16,7 @@ use crate::config::{
     StateFlags, flatten_prompt_messages, macro_execute, resolve_prompt_args, sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
-use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
+use crate::function::supervisor::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::render::render_error;
 use crate::utils::{
     AbortSignal, SHELL, abortable_run_with_spinner, create_abort_signal, dimmed_text,
@@ -602,7 +602,7 @@ pub async fn run_repl_command(
     abort_signal: AbortSignal,
     mut line: &str,
 ) -> Result<bool> {
-    ctx.pending_agents_guardrail_count = 0;
+    ctx.pending_tasks_guardrail_count = 0;
     if let Ok(Some(captures)) = MULTILINE_RE.captures(line)
         && let Some(text_match) = captures.get(1)
     {
@@ -1475,7 +1475,7 @@ async fn ask(
         )
         .await
     } else {
-        match check_pending_agents_guardrail(ctx) {
+        match check_pending_tasks_guardrail(ctx) {
             GuardrailAction::Inject(prompt) => {
                 let guardrail_input = Input::from_str(ctx, &prompt, None)?;
                 return ask(ctx, abort_signal, guardrail_input, false).await;

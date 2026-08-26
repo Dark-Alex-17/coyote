@@ -378,6 +378,7 @@ fn drain_live_notifications(ctx: &RequestContext) -> Vec<Value> {
     if events.is_empty() {
         return vec![];
     }
+
     let Some(supervisor) = ctx.supervisor.as_ref() else {
         return vec![];
     };
@@ -399,6 +400,7 @@ fn merge_system_channel(last: &mut ToolResult, escalations: Vec<Value>, notifica
     if escalations.is_empty() && notifications.is_empty() {
         return;
     }
+
     let escalation_instruction = "Child agents are BLOCKED waiting for your reply. \
         Call agent__reply_escalation for each pending escalation to unblock them.";
     let notification_instruction =
@@ -416,6 +418,7 @@ fn merge_system_channel(last: &mut ToolResult, escalations: Vec<Value>, notifica
             }
         }
     };
+
     if !escalations.is_empty() {
         map.insert("pending_escalations".into(), json!(escalations));
         map.insert(
@@ -423,6 +426,7 @@ fn merge_system_channel(last: &mut ToolResult, escalations: Vec<Value>, notifica
             json!(escalation_instruction),
         );
     }
+
     if !notifications.is_empty() {
         map.insert("system_notifications".into(), json!(notifications));
         map.insert(
@@ -468,6 +472,7 @@ impl ToolResult {
             while !s.is_char_boundary(cut) {
                 cut -= 1;
             }
+
             let prefix = &s[..cut];
             self.output = json!(format!(
                 "[truncated: tool output exceeded {max_chars} chars]\n{prefix}"
@@ -2446,6 +2451,7 @@ impl ToolCallTracker {
         if is_loop_tracker_exempt(&new_call.name) {
             return None;
         }
+
         if self.last_calls.len() < self.max_repeats {
             return None;
         }
@@ -2515,6 +2521,7 @@ impl ToolCallTracker {
         if is_loop_tracker_exempt(&call.name) {
             return;
         }
+
         if self.last_calls.len() >= self.chain_len * self.max_repeats {
             self.last_calls.pop_front();
         }
@@ -2572,14 +2579,20 @@ mod tests {
     };
     use crate::config::{Agent, AgentConfig, AppConfig, AppState, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
+    use crate::supervisor::mailbox::Inbox;
     use crate::supervisor::notification::{agent_notification, job_notification};
+    use crate::supervisor::{
+        AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
+        Supervisor,
+    };
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use jobs::RingBuf;
     use rmcp::model::{CallToolResult, ContentBlock};
     use serde_json::json;
     use serial_test::serial;
-    use std::process;
     use std::sync::Arc;
+    use std::{mem, process};
 
     fn call(name: &str, id: Option<&str>) -> ToolCall {
         ToolCall::new(name.to_string(), json!({}), id.map(|s| s.to_string()))
@@ -2663,28 +2676,28 @@ mod tests {
             .build()
             .unwrap();
         let join_handle = rt.spawn(async {
-            Ok(crate::supervisor::JobResult {
+            Ok(JobResult {
                 output: Value::Null,
                 exit_code: Some(0),
                 output_bytes_captured: 0,
             })
         });
-        std::mem::forget(rt);
-        let handle = crate::supervisor::JobHandle {
+        mem::forget(rt);
+        let handle = JobHandle {
             id: id.to_string(),
             tool: "execute_command".to_string(),
-            started_at: std::time::Instant::now(),
+            started_at: Instant::now(),
             join_handle,
-            abort_signal: crate::utils::create_abort_signal(),
-            state: Arc::new(parking_lot::Mutex::new(crate::supervisor::JobState {
-                status: crate::supervisor::JobStatus::Completed,
+            abort_signal: create_abort_signal(),
+            state: Arc::new(parking_lot::Mutex::new(JobState {
+                status: JobStatus::Completed,
                 pgid: None,
             })),
-            output_buf: Arc::new(parking_lot::Mutex::new(jobs::RingBuf::default())),
+            output_buf: Arc::new(parking_lot::Mutex::new(RingBuf::default())),
             no_change_checks: 0,
             last_check_state: None,
         };
-        let mut sup = crate::supervisor::Supervisor::new(0, 3).with_max_concurrent_jobs(4);
+        let mut sup = Supervisor::new(0, 3).with_max_concurrent_jobs(4);
         sup.register(handle).unwrap();
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         ctx.supervisor = Some(Arc::new(parking_lot::RwLock::new(sup)));
@@ -2724,7 +2737,9 @@ mod tests {
     #[test]
     fn merge_system_channel_adds_notifications_without_escalation_keys() {
         let mut result = ToolResult::new(call("t", Some("id-1")), json!({"status": "ok"}));
+
         merge_system_channel(&mut result, vec![], vec![json!({"id": "job_1"})]);
+
         assert_eq!(result.output["status"], "ok");
         assert_eq!(
             result.output["system_notifications"],
@@ -2743,11 +2758,13 @@ mod tests {
     #[test]
     fn merge_system_channel_wraps_non_object_once_with_both_channels() {
         let mut result = ToolResult::new(call("t", Some("id-1")), json!("DONE"));
+
         merge_system_channel(
             &mut result,
             vec![json!({"escalation_id": "esc_1"})],
             vec![json!({"id": "job_1"})],
         );
+
         assert_eq!(result.output["output"], json!("DONE"));
         assert_eq!(
             result.output["pending_escalations"][0]["escalation_id"],
@@ -2806,24 +2823,24 @@ mod tests {
             .unwrap();
         let agent_id = id.to_string();
         let join_handle = rt.spawn(async move {
-            Ok(crate::supervisor::AgentResult {
+            Ok(AgentResult {
                 id: agent_id,
                 agent_name: "explore".into(),
                 output: String::new(),
-                exit_status: crate::supervisor::AgentExitStatus::Completed,
+                exit_status: AgentExitStatus::Completed,
             })
         });
-        std::mem::forget(rt);
-        let handle = crate::supervisor::AgentHandle {
+        mem::forget(rt);
+        let handle = AgentHandle {
             id: id.to_string(),
             agent_name: "explore".to_string(),
             depth: 1,
-            inbox: Arc::new(crate::supervisor::mailbox::Inbox::new()),
-            abort_signal: crate::utils::create_abort_signal(),
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: create_abort_signal(),
             join_handle,
             child_supervisor: None,
         };
-        let mut sup = crate::supervisor::Supervisor::new(4, 3);
+        let mut sup = Supervisor::new(4, 3);
         sup.register(handle).unwrap();
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         ctx.supervisor = Some(Arc::new(parking_lot::RwLock::new(sup)));
@@ -2958,7 +2975,7 @@ mod tests {
             let job_id = started["job_id"].as_str().unwrap().to_string();
 
             let supervisor = ctx.supervisor.clone().unwrap();
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             while tokio::time::Instant::now() < deadline {
                 let finished = supervisor
                     .read()
@@ -2967,7 +2984,7 @@ mod tests {
                 if finished {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
 
             let calls = vec![call("unknown_tool", Some("id-2"))];
@@ -3172,9 +3189,8 @@ mod tests {
 
     #[test]
     fn loop_tracker_exempt_list_is_exactly_the_polling_tools() {
-        let actual: std::collections::HashSet<&str> =
-            LOOP_TRACKER_EXEMPT_TOOLS.iter().copied().collect();
-        let expected: std::collections::HashSet<&str> = [
+        let actual: HashSet<&str> = LOOP_TRACKER_EXEMPT_TOOLS.iter().copied().collect();
+        let expected: HashSet<&str> = [
             "job__check",
             "job__list",
             "agent__check",
@@ -3210,10 +3226,12 @@ mod tests {
     fn tracker_exempt_interleave_does_not_mask_real_loop() {
         let mut tracker = ToolCallTracker::default();
         let x = call_with_args("execute_command", json!({"command": "ls"}));
+
         tracker.record_call(call_with_args("job__check", json!({"id": "j1"})));
         tracker.record_call(x.clone());
         tracker.record_call(call_with_args("job__check", json!({"id": "j1"})));
         tracker.record_call(x.clone());
+
         assert!(tracker.check_loop(&x).is_some());
     }
 
@@ -3221,8 +3239,10 @@ mod tests {
     fn tracker_non_exempt_behavior_unchanged() {
         let mut tracker = ToolCallTracker::default();
         let c = call_with_args("fs_cat", json!({"path": "a.txt"}));
+
         tracker.record_call(c.clone());
         tracker.record_call(c.clone());
+
         assert!(tracker.check_loop(&c).is_some());
     }
 
@@ -3300,7 +3320,9 @@ mod tests {
     #[test]
     fn functions_append_job_adds_declarations() {
         let mut f = Functions::default();
+
         f.append_job_functions();
+
         assert!(f.contains("job__start"));
         assert!(f.contains("job__check"));
         assert!(f.contains("job__collect"));
@@ -3313,7 +3335,9 @@ mod tests {
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         ctx.tool_scope.functions.append_job_functions();
         let calls = vec![call("job__list", Some("id-1"))];
+
         let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].output["active_jobs"], 0);
         assert_eq!(results[0].output["jobs"], json!([]));
@@ -3323,7 +3347,9 @@ mod tests {
     fn eval_soft_fails_job_calls_when_jobs_not_declared() {
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         let calls = vec![call("job__start", Some("id-1"))];
+
         let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+
         let err = results[0].output["tool_call_error"].as_str().unwrap();
         assert!(err.contains("Unexpected call"));
     }

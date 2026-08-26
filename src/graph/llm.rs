@@ -7,7 +7,7 @@ use crate::config::{
     Input, RequestContext, Role, RoleLike, SkillPolicy, should_inject_skill_instructions,
 };
 use crate::function::skill::skill_function_declarations;
-use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
+use crate::function::supervisor::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::utils::create_abort_signal;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use log::warn;
@@ -268,7 +268,7 @@ async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -
         }
 
         if tool_results.is_empty() {
-            match check_pending_agents_guardrail(ctx) {
+            match check_pending_tasks_guardrail(ctx) {
                 GuardrailAction::NoAction => return Ok(accumulated),
                 GuardrailAction::ForceTerminate(ids) => {
                     warn!(

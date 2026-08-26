@@ -563,8 +563,10 @@ mod tests {
 mod integration_tests {
     use super::*;
     use crate::config::{AppState, WorkingMode};
+    use crate::function::jobs::RingBuf;
+    use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor, notification};
     use crate::utils::{create_abort_signal, temp_file};
-    use std::fs;
+    use std::{fs, mem};
 
     fn cmd_available(name: &str) -> bool {
         which::which(name).is_ok()
@@ -887,40 +889,37 @@ nodes:
             .build()
             .unwrap();
         let join_handle = rt.spawn(async {
-            Ok(crate::supervisor::JobResult {
+            Ok(JobResult {
                 output: Value::Null,
                 exit_code: Some(0),
                 output_bytes_captured: 0,
             })
         });
-        std::mem::forget(rt);
-        let handle = crate::supervisor::JobHandle {
+        mem::forget(rt);
+        let handle = JobHandle {
             id: "job_bg".to_string(),
             tool: "execute_command".to_string(),
             started_at: Instant::now(),
             join_handle,
             abort_signal: create_abort_signal(),
-            state: Arc::new(parking_lot::Mutex::new(crate::supervisor::JobState {
-                status: crate::supervisor::JobStatus::Completed,
+            state: Arc::new(parking_lot::Mutex::new(JobState {
+                status: JobStatus::Completed,
                 pgid: None,
             })),
-            output_buf: Arc::new(parking_lot::Mutex::new(
-                crate::function::jobs::RingBuf::default(),
-            )),
+            output_buf: Arc::new(parking_lot::Mutex::new(RingBuf::default())),
             no_change_checks: 0,
             last_check_state: None,
         };
-        let mut sup = crate::supervisor::Supervisor::new(0, 3).with_max_concurrent_jobs(4);
+        let mut sup = Supervisor::new(0, 3).with_max_concurrent_jobs(4);
         sup.register(handle).unwrap();
 
         let mut ctx = make_ctx();
         ctx.supervisor = Some(Arc::new(parking_lot::RwLock::new(sup)));
-        ctx.notification_queue
-            .push(crate::supervisor::notification::job_notification(
-                "job_bg",
-                "execute_command",
-                true,
-            ));
+        ctx.notification_queue.push(notification::job_notification(
+            "job_bg",
+            "execute_command",
+            true,
+        ));
 
         let abort = create_abort_signal();
         let result = GraphExecutor::new(graph, &ws.dir)

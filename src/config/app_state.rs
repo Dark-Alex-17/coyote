@@ -73,6 +73,7 @@ impl AppState {
         if !mcp_registry.is_empty() && config.mcp_server_support {
             functions.append_mcp_meta_functions(mcp_registry.server_features());
         }
+
         if jobs_enabled(None, &config) {
             functions.append_job_functions();
         }
