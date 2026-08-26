@@ -28,6 +28,9 @@ pub struct Graph {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_jobs: Option<usize>,
+
     #[serde(default)]
     pub global_tools: Vec<String>,
 
@@ -895,6 +898,7 @@ nodes:
         assert!(graph.model.is_none());
         assert!(graph.temperature.is_none());
         assert!(graph.top_p.is_none());
+        assert!(graph.max_concurrent_jobs.is_none());
         assert!(graph.global_tools.is_empty());
         assert!(graph.mcp_servers.is_empty());
         assert!(graph.conversation_starters.is_empty());

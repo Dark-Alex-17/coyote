@@ -854,6 +854,7 @@ impl AgentConfig {
             variables: graph.variables.clone(),
             can_spawn_agents: graph.has_agent_node(),
             max_concurrent_agents: default_max_concurrent_agents(),
+            max_concurrent_jobs: graph.max_concurrent_jobs,
             max_agent_depth: default_max_agent_depth(),
             escalation_timeout: default_escalation_timeout(),
             ..AgentConfig::default()
@@ -1328,6 +1329,7 @@ variables:
             model: claude:claude-sonnet-4-6
             temperature: 0.3
             top_p: 0.8
+            max_concurrent_jobs: 2
             global_tools:
               - fetch_pdf.sh
             mcp_servers:
@@ -1350,6 +1352,7 @@ variables:
         assert_eq!(config.model_id.as_deref(), Some("claude:claude-sonnet-4-6"));
         assert_eq!(config.temperature, Some(0.3));
         assert_eq!(config.top_p, Some(0.8));
+        assert_eq!(config.max_concurrent_jobs, Some(2));
         assert_eq!(config.global_tools, vec!["fetch_pdf.sh"]);
         assert_eq!(config.mcp_servers, vec!["pubmed-search"]);
         assert_eq!(config.conversation_starters, vec!["Start here"]);

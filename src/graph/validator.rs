@@ -998,6 +998,7 @@ mod tests {
             temperature: None,
             top_p: None,
             reasoning_effort: None,
+            max_concurrent_jobs: None,
             global_tools: Vec::new(),
             mcp_servers: Vec::new(),
             skills_enabled: None,
