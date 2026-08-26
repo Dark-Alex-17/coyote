@@ -479,6 +479,7 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         state,
         output_buf,
         no_change_checks: 0,
+        last_check_state: None,
     };
 
     // On a capacity race the handle is dropped here, which kills the process
@@ -507,8 +508,8 @@ fn handle_check(ctx: &RequestContext, args: &Value) -> Result<Value> {
     let Some(supervisor) = ctx.supervisor.as_ref() else {
         return Ok(job_miss_error(None, id));
     };
-    let sup = supervisor.read();
-    let Some(job) = sup.job(id) else {
+    let mut sup = supervisor.write();
+    let Some(job) = sup.job_mut(id) else {
         drop(sup);
         return Ok(job_miss_error(ctx.supervisor.as_ref(), id));
     };
@@ -518,6 +519,13 @@ fn handle_check(ctx: &RequestContext, args: &Value) -> Result<Value> {
         let buf = job.output_buf.lock();
         (buf.tail(), buf.total_written())
     };
+    let check_state = (status, total_written);
+    if job.last_check_state == Some(check_state) {
+        job.no_change_checks += 1;
+    } else {
+        job.no_change_checks = 0;
+        job.last_check_state = Some(check_state);
+    }
     let tail_truncated = (tail.len() as u64) < total_written;
     let mut result = json!({
         "status": job_status_str(status),
@@ -532,6 +540,11 @@ fn handle_check(ctx: &RequestContext, args: &Value) -> Result<Value> {
         result["message"] = json!(
             "Job is still running. Call job__collect to block for the result, or do other work — you will be notified on completion."
         );
+        if job.no_change_checks >= 3 {
+            result["hint"] = json!(
+                "No change across repeated checks — still running; call job__collect to block, or do other work — a system notification will fire on completion."
+            );
+        }
     } else {
         result["message"] = json!(format!(
             "Job finished — retrieve the result with job__collect --id {id}"
@@ -1175,6 +1188,7 @@ mod tests {
             })),
             output_buf: Arc::new(Mutex::new(RingBuf::default())),
             no_change_checks: 0,
+            last_check_state: None,
         }
     }
 
@@ -1640,6 +1654,7 @@ mod tests {
                 })),
                 output_buf: Arc::new(Mutex::new(RingBuf::default())),
                 no_change_checks: 0,
+                last_check_state: None,
             };
             ctx.supervisor
                 .as_ref()
@@ -1755,6 +1770,86 @@ mod tests {
     }
 
     #[test]
+    fn handle_check_hints_after_repeated_unchanged_checks() {
+        let ctx = ctx_with_job_supervisor(4);
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(make_running_job("j1"))
+            .unwrap();
+
+        for _ in 0..3 {
+            let result = handle_check(&ctx, &json!({"id": "j1"})).unwrap();
+            assert!(result.get("hint").is_none());
+        }
+        let result = handle_check(&ctx, &json!({"id": "j1"})).unwrap();
+        assert_eq!(
+            result["hint"],
+            "No change across repeated checks — still running; call job__collect to block, or do other work — a system notification will fire on completion."
+        );
+    }
+
+    #[test]
+    fn handle_check_no_change_counter_resets_on_output_change() {
+        let ctx = ctx_with_job_supervisor(4);
+        let job = make_running_job("j1");
+        let output_buf = Arc::clone(&job.output_buf);
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(job)
+            .unwrap();
+
+        for _ in 0..3 {
+            handle_check(&ctx, &json!({"id": "j1"})).unwrap();
+        }
+        assert!(
+            handle_check(&ctx, &json!({"id": "j1"}))
+                .unwrap()
+                .get("hint")
+                .is_some()
+        );
+
+        output_buf.lock().push(b"more");
+        for _ in 0..3 {
+            let result = handle_check(&ctx, &json!({"id": "j1"})).unwrap();
+            assert!(result.get("hint").is_none());
+        }
+        assert!(
+            handle_check(&ctx, &json!({"id": "j1"}))
+                .unwrap()
+                .get("hint")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn handle_check_finished_job_never_hints() {
+        let ctx = ctx_with_job_supervisor(4);
+        let job = make_running_job("j1");
+        job.state.lock().status = JobStatus::Completed;
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(job)
+            .unwrap();
+
+        for _ in 0..5 {
+            let result = handle_check(&ctx, &json!({"id": "j1"})).unwrap();
+            assert!(result.get("hint").is_none());
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("job__collect --id j1")
+            );
+        }
+    }
+
+    #[test]
     fn handle_collect_applies_tail_lines() {
         run_async(async {
             let ctx = ctx_with_job_supervisor(4);
@@ -1777,6 +1872,7 @@ mod tests {
                 })),
                 output_buf: Arc::new(Mutex::new(RingBuf::default())),
                 no_change_checks: 0,
+                last_check_state: None,
             };
             ctx.supervisor
                 .as_ref()
@@ -1815,6 +1911,7 @@ mod tests {
                 })),
                 output_buf,
                 no_change_checks: 0,
+                last_check_state: None,
             };
             ctx.supervisor
                 .as_ref()
@@ -1862,6 +1959,7 @@ mod tests {
                 state: Arc::clone(&state),
                 output_buf,
                 no_change_checks: 0,
+                last_check_state: None,
             };
             ctx.supervisor
                 .as_ref()
@@ -2115,6 +2213,7 @@ mod tests {
                 state: Arc::clone(&state),
                 output_buf,
                 no_change_checks: 0,
+                last_check_state: None,
             };
             ctx.supervisor
                 .as_ref()

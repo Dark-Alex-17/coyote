@@ -1635,6 +1635,7 @@ mod tests {
             })),
             output_buf: Arc::new(Mutex::new(RingBuf::default())),
             no_change_checks: 0,
+            last_check_state: None,
         }
     }
 

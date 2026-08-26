@@ -67,8 +67,8 @@ pub struct JobHandle {
     pub abort_signal: AbortSignal,
     pub state: Arc<Mutex<JobState>>,
     pub output_buf: Arc<Mutex<RingBuf>>,
-    #[allow(dead_code)]
     pub no_change_checks: u32,
+    pub last_check_state: Option<(JobStatus, u64)>,
 }
 
 impl JobHandle {
@@ -154,6 +154,13 @@ impl Supervisor {
 
     pub fn job(&self, id: &str) -> Option<&JobHandle> {
         match self.handles.get(id) {
+            Some(TaskHandle::Job(handle)) => Some(handle),
+            _ => None,
+        }
+    }
+
+    pub fn job_mut(&mut self, id: &str) -> Option<&mut JobHandle> {
+        match self.handles.get_mut(id) {
             Some(TaskHandle::Job(handle)) => Some(handle),
             _ => None,
         }
@@ -392,6 +399,7 @@ mod tests {
             })),
             output_buf: Arc::new(Mutex::new(RingBuf::default())),
             no_change_checks: 0,
+            last_check_state: None,
         }
     }
 

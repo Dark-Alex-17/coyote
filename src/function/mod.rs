@@ -2409,6 +2409,19 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
     cmd_name
 }
 
+// Polling tools are expected to repeat; recording them would also let them
+// break up detection of a real loop in the calls they interleave with.
+const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 4] = [
+    "job__check",
+    "job__list",
+    "agent__check",
+    "agent__list_running",
+];
+
+fn is_loop_tracker_exempt(name: &str) -> bool {
+    LOOP_TRACKER_EXEMPT_TOOLS.contains(&name)
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolCallTracker {
     last_calls: VecDeque<ToolCall>,
@@ -2430,6 +2443,9 @@ impl ToolCallTracker {
     }
 
     pub fn check_loop(&self, new_call: &ToolCall) -> Option<String> {
+        if is_loop_tracker_exempt(&new_call.name) {
+            return None;
+        }
         if self.last_calls.len() < self.max_repeats {
             return None;
         }
@@ -2496,6 +2512,9 @@ impl ToolCallTracker {
     }
 
     pub fn record_call(&mut self, call: ToolCall) {
+        if is_loop_tracker_exempt(&call.name) {
+            return;
+        }
         if self.last_calls.len() >= self.chain_len * self.max_repeats {
             self.last_calls.pop_front();
         }
@@ -2663,6 +2682,7 @@ mod tests {
             })),
             output_buf: Arc::new(parking_lot::Mutex::new(jobs::RingBuf::default())),
             no_change_checks: 0,
+            last_check_state: None,
         };
         let mut sup = crate::supervisor::Supervisor::new(0, 3).with_max_concurrent_jobs(4);
         sup.register(handle).unwrap();
@@ -3103,6 +3123,46 @@ mod tests {
         let msg = tracker.check_loop(&c).unwrap();
         assert!(msg.contains("call_history"));
         assert!(msg.contains("repeat_tool"));
+    }
+
+    #[test]
+    fn tracker_exempt_tools_never_trip() {
+        for name in LOOP_TRACKER_EXEMPT_TOOLS {
+            let mut tracker = ToolCallTracker::default();
+            let exempt = call_with_args(name, json!({"id": "j1"}));
+            tracker.record_call(exempt.clone());
+            tracker.record_call(exempt.clone());
+            assert!(tracker.check_loop(&exempt).is_none());
+
+            let other = call_with_args("execute_command", json!({"command": "ls"}));
+            tracker.record_call(other.clone());
+            assert!(
+                tracker.check_loop(&other).is_none(),
+                "exempt calls must not count toward the repeat threshold"
+            );
+            tracker.record_call(other.clone());
+            assert!(tracker.check_loop(&other).is_some());
+        }
+    }
+
+    #[test]
+    fn tracker_exempt_interleave_does_not_mask_real_loop() {
+        let mut tracker = ToolCallTracker::default();
+        let x = call_with_args("execute_command", json!({"command": "ls"}));
+        tracker.record_call(call_with_args("job__check", json!({"id": "j1"})));
+        tracker.record_call(x.clone());
+        tracker.record_call(call_with_args("job__check", json!({"id": "j1"})));
+        tracker.record_call(x.clone());
+        assert!(tracker.check_loop(&x).is_some());
+    }
+
+    #[test]
+    fn tracker_non_exempt_behavior_unchanged() {
+        let mut tracker = ToolCallTracker::default();
+        let c = call_with_args("fs_cat", json!({"path": "a.txt"}));
+        tracker.record_call(c.clone());
+        tracker.record_call(c.clone());
+        assert!(tracker.check_loop(&c).is_some());
     }
 
     #[test]
