@@ -693,6 +693,7 @@ impl Functions {
         self.declarations.extend(jobs::job_function_declarations());
     }
 
+    #[cfg(test)]
     pub fn append_declaration(&mut self, declaration: FunctionDeclaration) {
         self.declarations.push(declaration);
     }
