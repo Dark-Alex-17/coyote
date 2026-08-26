@@ -112,9 +112,10 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
 
     ### CRITICAL: Never end your turn with pending agents
 
-    Spawned agents do NOT report back on their own. They run in the background until you
-    actively reclaim them with `agent__collect` (to get their output) or `agent__cancel`
-    (to discard them). If you spawn agents and then emit a final message without reclaiming
+    Spawned agents do NOT deliver their results on their own. When one finishes, a
+    `system_notifications` entry appears on your next tool result naming the exact collect
+    command — but the output is only retrieved when you actively reclaim it with `agent__collect`
+    (or discard it with `agent__cancel`). If you spawn agents and then emit a final message without reclaiming
     them, the system will detect the unreclaimed agents and reject the turn-end, injecting
     a reminder forcing you to handle them. After several such reminders, the system will
     auto-cancel them and warn you that work was lost.
@@ -194,10 +195,14 @@ pub(in crate::config) const DEFAULT_JOB_INSTRUCTIONS: &str = indoc! {"
     ## Background Jobs
 
     For long-running tool calls (builds, test suites, slow commands), call `job__start` and keep
-    working instead of blocking. Check progress with `job__check` (sparingly), block on the result
-    with `job__collect`, cancel with `job__cancel`, and list jobs with `job__list`. Collect or
-    cancel every job you started before ending your turn. Jobs run against a snapshot of the
-    current config/environment and do not survive coyote exiting.
+    working instead of blocking — completion arrives as a `system_notifications` entry on your
+    next tool result. Check progress with `job__check` (sparingly), block on the result with
+    `job__collect` (only when you have nothing else to do), cancel with `job__cancel`, and list
+    jobs with `job__list`. Collect or cancel every job you started before ending your turn. In
+    graph LLM nodes, collect or cancel your jobs before ending your final node turn — an
+    uncollected job at node turn-end burns node iterations via the guardrail and can fail the
+    node. Jobs run against a snapshot of the current config/environment and do not survive
+    coyote exiting.
 "
 };
 

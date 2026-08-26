@@ -233,7 +233,7 @@ instructions: |
 
   1. Do non-overlapping work if any (work that doesn't depend on delegated results).
   2. If none → **end your response.** Do not call `agent__collect` immediately.
-  3. The system notifies you on completion.
+  3. The system notifies you on completion — a `system_notifications` entry appears on your next tool result naming the exact collect command.
   4. On notification, call `agent__collect` to retrieve results.
 
   ### Anti-duplication rule (BLOCKING)

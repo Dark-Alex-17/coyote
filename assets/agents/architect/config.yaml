@@ -261,7 +261,7 @@ instructions: |
 
   3. **Wait for Sisyphus.** Do not poll `agent__collect` on a running agent — do non-overlapping work
      (e.g. prep the next task's context) or end your response and wait for the completion
-     notification, then `agent__collect`.
+     notification (a `system_notifications` entry on your next tool result), then `agent__collect`.
 
   4. **Verify against the plan (divergence check).** When Sisyphus returns, do NOT trust its
      self-report — get an INDEPENDENT conformance verdict:
