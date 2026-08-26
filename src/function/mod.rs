@@ -2940,6 +2940,51 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn job_finished_earlier_drains_notification_on_later_batch() {
+        run_async(async {
+            let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+            ctx.declared_function_names.insert("echo".into());
+
+            let started = jobs::handle_job_tool(
+                &mut ctx,
+                "job__start",
+                &json!({"tool": "echo", "arguments": {}}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(started["status"], "ok");
+            let job_id = started["job_id"].as_str().unwrap().to_string();
+
+            let supervisor = ctx.supervisor.clone().unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while tokio::time::Instant::now() < deadline {
+                let finished = supervisor
+                    .read()
+                    .job(&job_id)
+                    .is_none_or(|job| job.join_handle.is_finished());
+                if finished {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            let calls = vec![call("unknown_tool", Some("id-2"))];
+            let results = eval_tool_calls(&mut ctx, calls).await.unwrap();
+
+            let out = &results.last().unwrap().output;
+            assert_eq!(out["system_notifications"][0]["id"], job_id);
+            assert_eq!(out["system_notifications"][0]["event"], "job_completed");
+            assert!(
+                out["notification_instruction"]
+                    .as_str()
+                    .unwrap()
+                    .contains("next_action")
+            );
+        });
+    }
+
     #[test]
     fn normalize_tool_result_preserves_non_null_values() {
         assert_eq!(
@@ -3123,6 +3168,22 @@ mod tests {
         let msg = tracker.check_loop(&c).unwrap();
         assert!(msg.contains("call_history"));
         assert!(msg.contains("repeat_tool"));
+    }
+
+    #[test]
+    fn loop_tracker_exempt_list_is_exactly_the_polling_tools() {
+        let actual: std::collections::HashSet<&str> =
+            LOOP_TRACKER_EXEMPT_TOOLS.iter().copied().collect();
+        let expected: std::collections::HashSet<&str> = [
+            "job__check",
+            "job__list",
+            "agent__check",
+            "agent__list_running",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 4);
+        assert_eq!(actual, expected);
     }
 
     #[test]

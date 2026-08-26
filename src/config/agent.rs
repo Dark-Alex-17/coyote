@@ -1515,4 +1515,51 @@ nodes: {}
         assert_eq!(config.top_k, Some(7));
         assert_eq!(config.embedding_model.as_deref(), Some("some:model"));
     }
+
+    #[test]
+    fn interpolated_instructions_without_job_declarations_is_byte_identical_across_job_settings() {
+        let agent = |max_concurrent_jobs| {
+            Agent::test_new(AgentConfig {
+                instructions: "hi".to_string(),
+                max_concurrent_jobs,
+                ..AgentConfig::default()
+            })
+        };
+
+        let baseline = agent(None).interpolated_instructions();
+        assert!(
+            !baseline.contains(DEFAULT_JOB_INSTRUCTIONS),
+            "no job guidance may be injected without job__ declarations"
+        );
+        assert_eq!(baseline, agent(Some(0)).interpolated_instructions());
+        assert_eq!(baseline, agent(Some(7)).interpolated_instructions());
+
+        let mut with_unrelated = agent(None);
+        with_unrelated.functions.append_todo_functions();
+        assert_eq!(
+            baseline,
+            with_unrelated.interpolated_instructions(),
+            "job guidance injection must key strictly on the job__ prefix"
+        );
+    }
+
+    #[test]
+    fn interpolated_instructions_with_job_declarations_appends_job_guidance() {
+        let config = AgentConfig {
+            instructions: "hi".to_string(),
+            ..AgentConfig::default()
+        };
+        let baseline = Agent::test_new(config.clone()).interpolated_instructions();
+
+        let mut agent = Agent::test_new(config);
+        agent.functions.append_job_functions();
+        let output = agent.interpolated_instructions();
+
+        assert!(output.contains(DEFAULT_JOB_INSTRUCTIONS));
+        let expected = format!(
+            "hi\n{DEFAULT_JOB_INSTRUCTIONS}{}",
+            baseline.strip_prefix("hi").unwrap()
+        );
+        assert_eq!(output, expected);
+    }
 }

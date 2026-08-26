@@ -2911,4 +2911,86 @@ mod tests {
             assert_job_teaching_error(&result, "bg_p");
         });
     }
+
+    #[test]
+    fn guardrail_burns_bounded_injects_then_force_terminates_running_job() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut ctx = ctx_with_job_capable_supervisor();
+            let abort = create_abort_signal();
+            let join_handle = tokio::spawn(async {
+                time::sleep(Duration::from_secs(60)).await;
+                Ok(JobResult {
+                    output: json!(null),
+                    exit_code: Some(0),
+                    output_bytes_captured: 0,
+                })
+            });
+            let handle = JobHandle {
+                id: "job_1".to_string(),
+                tool: "execute_command".to_string(),
+                started_at: std::time::Instant::now(),
+                join_handle,
+                abort_signal: abort.clone(),
+                state: Arc::new(Mutex::new(JobState {
+                    status: JobStatus::Running,
+                    pgid: None,
+                })),
+                output_buf: Arc::new(Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+                last_check_state: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            for expected_count in 1..=PENDING_AGENTS_GUARDRAIL_MAX {
+                match check_pending_agents_guardrail(&mut ctx) {
+                    GuardrailAction::Inject(prompt) => assert!(prompt.contains("job_1")),
+                    _ => panic!("expected Inject below max"),
+                }
+                assert_eq!(ctx.pending_agents_guardrail_count, expected_count);
+            }
+
+            match check_pending_agents_guardrail(&mut ctx) {
+                GuardrailAction::ForceTerminate(ids) => {
+                    assert_eq!(ids, vec!["job_1".to_string()]);
+                }
+                _ => panic!("expected ForceTerminate at max"),
+            }
+            assert_eq!(ctx.pending_agents_guardrail_count, 0);
+            assert!(abort.aborted());
+        });
+    }
+
+    #[test]
+    fn guardrail_force_terminate_discards_finished_uncollected_job() {
+        let mut ctx = ctx_with_job_capable_supervisor();
+        register_fake_job(&mut ctx, "job_1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !pending_tasks(&ctx).iter().any(|t| t.finished) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job 'job_1' never finished"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ctx.pending_agents_guardrail_count = PENDING_AGENTS_GUARDRAIL_MAX;
+
+        match check_pending_agents_guardrail(&mut ctx) {
+            GuardrailAction::ForceTerminate(ids) => {
+                assert_eq!(ids, vec!["job_1".to_string()]);
+            }
+            _ => panic!("expected ForceTerminate action"),
+        }
+        assert_eq!(ctx.pending_agents_guardrail_count, 0);
+        assert!(!ctx.supervisor.as_ref().unwrap().read().has_job("job_1"));
+    }
 }

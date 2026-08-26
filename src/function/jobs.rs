@@ -1928,6 +1928,49 @@ mod tests {
         });
     }
 
+    /// The completion notification is pushed from inside the job task, after
+    /// the run — a panic unwinds past the push, and neither the supervisor nor
+    /// collect synthesizes a notification for a panicked job.
+    #[test]
+    fn panicked_job_task_skips_the_completion_notification() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            let join_handle: tokio::task::JoinHandle<Result<JobResult>> =
+                tokio::spawn(async { panic!("boom") });
+            let handle = JobHandle {
+                id: "j1".to_string(),
+                tool: "execute_command".to_string(),
+                started_at: Instant::now(),
+                join_handle,
+                abort_signal: create_abort_signal(),
+                state: Arc::new(Mutex::new(JobState {
+                    // A panic never reaches the status update — the cell
+                    // stays Running, which is the real post-panic state.
+                    status: JobStatus::Running,
+                    pgid: None,
+                })),
+                output_buf: Arc::new(Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+                last_check_state: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            let result = handle_collect(&ctx, &json!({"id": "j1"})).await.unwrap();
+
+            assert_eq!(result["status"], "failed");
+            assert!(result["error"].as_str().unwrap().contains("panicked"));
+            assert!(
+                ctx.notification_queue.drain().is_empty(),
+                "a panicked job must never produce a completion notification"
+            );
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn handle_cancel_kills_running_process_job() {
@@ -2322,5 +2365,302 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(tasks["tasks"].as_array().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_cancel_kills_grandchild_process() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+            let snapshot = test_snapshot("sh", &["-c", "sleep 30 & echo CHILD:$!; wait"], 0);
+            let task_state = Arc::clone(&state);
+            let task_buf = Arc::clone(&output_buf);
+            let join_handle =
+                tokio::spawn(async move { run_process_job(snapshot, task_state, task_buf).await });
+
+            let deadline = time::Instant::now() + Duration::from_secs(5);
+            let grandchild_pid = loop {
+                let tail = String::from_utf8_lossy(&output_buf.lock().tail()).to_string();
+                if let Some(rest) = tail.split("CHILD:").nth(1)
+                    && let Some(line_end) = rest.find('\n')
+                {
+                    break rest[..line_end].trim().parse::<i32>().unwrap();
+                }
+                assert!(
+                    time::Instant::now() < deadline,
+                    "grandchild pid never appeared in the ring buffer"
+                );
+                time::sleep(Duration::from_millis(10)).await;
+            };
+
+            let handle = JobHandle {
+                id: "j1".to_string(),
+                tool: "sh".to_string(),
+                started_at: Instant::now(),
+                join_handle,
+                abort_signal: create_abort_signal(),
+                state: Arc::clone(&state),
+                output_buf,
+                no_change_checks: 0,
+                last_check_state: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            let result = handle_cancel(&ctx, &json!({"id": "j1"})).await.unwrap();
+
+            assert_eq!(result["status"], "cancelled");
+            // kill(pid, 0) alone can't observe the death: the orphaned
+            // grandchild lingers as an unreaped zombie under init/launchd,
+            // so a Z state also proves the group kill landed.
+            fn grandchild_is_dead(pid: i32) -> bool {
+                let esrch = unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                if esrch {
+                    return true;
+                }
+                let stat = std::process::Command::new("ps")
+                    .args(["-o", "stat=", "-p", &pid.to_string()])
+                    .output()
+                    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                    .unwrap_or_default();
+                stat.is_empty() || stat.starts_with('Z')
+            }
+            let deadline = time::Instant::now() + Duration::from_secs(5);
+            while !grandchild_is_dead(grandchild_pid) {
+                assert!(
+                    time::Instant::now() < deadline,
+                    "grandchild must die with the process group"
+                );
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_process_job_clears_pgid_after_normal_completion() {
+        run_async(async {
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+            let snapshot = test_snapshot("echo", &["done"], 0);
+
+            let result = run_process_job(snapshot, Arc::clone(&state), output_buf)
+                .await
+                .unwrap();
+
+            assert_eq!(result.exit_code, Some(0));
+            assert!(
+                state.lock().pgid.is_none(),
+                "pid-reuse guard must clear pgid"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_start_rejects_shell_and_path_shaped_names_without_spawn() {
+        let mut ctx = plain_ctx();
+
+        for tool in ["bash", "./script.sh", "/usr/bin/env", "ls"] {
+            let result = run_async(handle_start(
+                &mut ctx,
+                &json!({"tool": tool, "arguments": {}}),
+            ))
+            .unwrap();
+
+            assert_eq!(result["status"], "error");
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not enabled in this context")
+            );
+        }
+        assert!(ctx.supervisor.is_none(), "no job may be spawned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_start_rejects_context_filtered_tool_and_accepts_in_filter() {
+        run_async(async {
+            let mut ctx = plain_ctx();
+            ctx.declared_function_names.insert("echo".into());
+
+            let rejected = handle_start(&mut ctx, &json!({"tool": "git_command", "arguments": {}}))
+                .await
+                .unwrap();
+
+            assert_eq!(rejected["status"], "error");
+            assert!(
+                rejected["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not enabled in this context")
+            );
+            assert!(ctx.supervisor.is_none(), "no job may be spawned");
+
+            let started = handle_start(&mut ctx, &json!({"tool": "echo", "arguments": {}}))
+                .await
+                .unwrap();
+
+            assert_eq!(started["status"], "ok");
+            let job_id = started["job_id"].as_str().unwrap().to_string();
+            let collected = handle_collect(&ctx, &json!({"id": job_id})).await.unwrap();
+            assert_eq!(collected["status"], "completed");
+        });
+    }
+
+    #[test]
+    fn handle_start_rejects_undeclared_mcp_invoke_without_spawn() {
+        let mut ctx = plain_ctx();
+
+        let result = run_async(handle_start(
+            &mut ctx,
+            &json!({"tool": "mcp_invoke_someserver", "arguments": {"tool": "search"}}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("not enabled in this context")
+        );
+        assert!(ctx.supervisor.is_none(), "no job may be spawned");
+    }
+
+    #[test]
+    fn handle_start_rejects_declared_but_non_whitelisted_tools_without_spawn() {
+        let mut ctx = plain_ctx();
+        for tool in ["memory__write", "fs_read", "agent__spawn", "user__select"] {
+            ctx.declared_function_names.insert(tool.into());
+        }
+
+        for (tool, category) in [
+            ("memory__write", "mutates agent/session state"),
+            ("fs_read", "is fast"),
+            ("agent__spawn", "already asynchronous"),
+            ("user__select", "interactive"),
+        ] {
+            let result = run_async(handle_start(
+                &mut ctx,
+                &json!({"tool": tool, "arguments": {}}),
+            ))
+            .unwrap();
+
+            assert_eq!(result["status"], "error");
+            assert!(result["message"].as_str().unwrap().contains(category));
+        }
+        assert!(ctx.supervisor.is_none(), "no job may be spawned");
+    }
+
+    #[test]
+    fn handle_start_rejects_mapping_tools_alias() {
+        let app_state = app_state_with_config(|config| {
+            config
+                .mapping_tools
+                .insert("shell".into(), "execute_command".into());
+        });
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        ctx.declared_function_names.insert("execute_command".into());
+
+        let result = run_async(handle_start(
+            &mut ctx,
+            &json!({"tool": "shell", "arguments": {}}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("not enabled in this context")
+        );
+        assert!(ctx.supervisor.is_none(), "no job may be spawned");
+    }
+
+    #[test]
+    fn child_context_cannot_reach_parent_job_ids() {
+        run_async(async {
+            let parent = ctx_with_job_supervisor(4);
+            parent
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(make_running_job("job_p1"))
+                .unwrap();
+            let child = RequestContext::new_for_child(
+                default_app_state(),
+                &parent,
+                1,
+                Arc::new(Inbox::new()),
+                "c1".into(),
+            );
+            assert!(child.supervisor.is_none());
+
+            let checked = handle_check(&child, &json!({"id": "job_p1"})).unwrap();
+            let collected = handle_collect(&child, &json!({"id": "job_p1"}))
+                .await
+                .unwrap();
+            let cancelled = handle_cancel(&child, &json!({"id": "job_p1"}))
+                .await
+                .unwrap();
+
+            for result in [checked, collected, cancelled] {
+                assert_eq!(result["status"], "error");
+                assert!(
+                    result["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("No job 'job_p1' is registered")
+                );
+            }
+            assert!(parent.supervisor.as_ref().unwrap().read().has_job("job_p1"));
+        });
+    }
+
+    #[test]
+    fn handle_start_ignores_mid_batch_tool_scope_additions() {
+        let mut ctx = plain_ctx();
+        ctx.declared_function_names.insert("job__start".into());
+        ctx.tool_scope
+            .functions
+            .declarations
+            .push(FunctionDeclaration {
+                name: "late_external_tool".into(),
+                description: String::new(),
+                parameters: JsonSchema::default(),
+                agent: false,
+            });
+
+        let result = run_async(handle_start(
+            &mut ctx,
+            &json!({"tool": "late_external_tool", "arguments": {}}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("not enabled in this context")
+        );
+        assert!(ctx.supervisor.is_none(), "no job may be spawned");
     }
 }
