@@ -1,6 +1,7 @@
 use super::mcp_factory::{McpFactory, McpServerKey};
 use super::rag_cache::RagCache;
 use crate::config::AppConfig;
+use crate::config::jobs_enabled;
 use crate::function::Functions;
 use crate::mcp::{McpRegistry, McpServersConfig};
 use crate::utils::AbortSignal;
@@ -71,6 +72,10 @@ impl AppState {
         let mut functions = Functions::init(config.visible_tools.as_ref().unwrap_or(&Vec::new()))?;
         if !mcp_registry.is_empty() && config.mcp_server_support {
             functions.append_mcp_meta_functions(mcp_registry.server_features());
+        }
+
+        if jobs_enabled(None, &config) {
+            functions.append_job_functions();
         }
 
         let mcp_registry = if mcp_registry.is_empty() {

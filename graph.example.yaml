@@ -36,6 +36,14 @@ top_p: null                        # Default sampling top-p for `llm` nodes
 reasoning_effort: null             # Default reasoning effort for `llm` nodes that don't override it.
                                    # Only valid when the model declares reasoning_levels.
 
+max_concurrent_jobs: 5             # Max background jobs (`job__*` tools) running at once across the
+                                   # whole graph run: every `llm` node (including parallel branches)
+                                   # draws from this one pool, so the budget is graph-wide — there is
+                                   # no per-node override. Jobs themselves are node-local: the node
+                                   # that starts a job must collect or cancel it before it ends, and
+                                   # anything left running at node exit is cancelled. Overrides the
+                                   # global setting; 0 disables background jobs for this graph agent.
+
 global_tools:                      # Tool universe an `llm` node's `tools:` whitelist draws from
   - web_search_coyote.sh
   - fetch_url_via_curl.sh

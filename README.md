@@ -51,6 +51,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [Skills](https://github.com/Dark-Alex-17/coyote/wiki/Skills): Modular knowledge or capability packs the LLM can load and unload mid-conversation. Multiple skills compose; instructions stack, tools and MCPs union.
 * [Agents](https://github.com/Dark-Alex-17/coyote/wiki/Agents): Leverage AI agents to perform complex tasks and workflows, including sub-agent spawning, teammate messaging, and user interaction tools.
     * [Graph Agents](https://github.com/Dark-Alex-17/coyote/wiki/Graph-Agents): Define an agent as a declarative, YAML-driven workflow. A directed graph of typed nodes (LLM calls, scripts, approvals, user input, RAG retrieval, sub-agent spawns).
+* [Background Jobs](https://github.com/Dark-Alex-17/coyote/wiki/Background-Jobs): Run long tool calls (builds, test suites, slow MCP calls) in the background with the `job__*` tools while the model keeps working, and completion arrives as a push notification.
 * [Todo System](https://github.com/Dark-Alex-17/coyote/wiki/TODO-System): Built-in task tracking for improved LLM reliability with smaller models.
 * [Environment Variables](https://github.com/Dark-Alex-17/coyote/wiki/Environment-Variables): Override and customize your Coyote configuration at runtime with environment variables.
 * [Client Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Clients): Configuration instructions for various LLM providers.

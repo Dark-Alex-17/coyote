@@ -29,7 +29,7 @@ use crate::config::{
     install_builtins, list_agents, load_env_file, macro_execute, sync_models,
 };
 use crate::config::{memory, paths};
-use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
+use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::mcp::McpServersConfig;
 use crate::render::{prompt_theme, render_error};
 use crate::repl::Repl;
@@ -595,7 +595,7 @@ async fn start_directive(
         )
         .await?;
     } else {
-        match check_pending_agents_guardrail(ctx) {
+        match check_pending_tasks_guardrail(ctx) {
             GuardrailAction::Inject(prompt) => {
                 let guardrail_input = Input::from_str(ctx, &prompt, None)?;
                 return start_directive(ctx, guardrail_input, code_mode, abort_signal).await;

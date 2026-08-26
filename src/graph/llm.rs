@@ -6,8 +6,9 @@ use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use crate::config::{
     Input, RequestContext, Role, RoleLike, SkillPolicy, should_inject_skill_instructions,
 };
+use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
+use crate::function::jobs::reap_jobs;
 use crate::function::skill::skill_function_declarations;
-use crate::function::supervisor::{GuardrailAction, check_pending_agents_guardrail};
 use crate::utils::create_abort_signal;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use log::warn;
@@ -173,6 +174,9 @@ async fn run(
 
     let saved_role = parent_ctx.role.clone();
     parent_ctx.role = Some(composed_role);
+    // Jobs are node-local: everything job__start registers while this node
+    // runs is recorded here and reaped on every exit path below.
+    let saved_job_scope = parent_ctx.node_job_scope.replace(Vec::new());
     let result = match node.timeout {
         Some(secs) => match timeout(
             Duration::from_secs(secs),
@@ -186,6 +190,9 @@ async fn run(
         None => run_with_retries(node, &prompt, parent_ctx).await,
     };
     parent_ctx.role = saved_role;
+    let node_jobs =
+        std::mem::replace(&mut parent_ctx.node_job_scope, saved_job_scope).unwrap_or_default();
+    reap_jobs(parent_ctx.supervisor.as_ref(), &node_jobs).await;
     restore_agent_skill_policy(parent_ctx, saved_agent_skill_state);
     result
 }
@@ -268,7 +275,7 @@ async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -
         }
 
         if tool_results.is_empty() {
-            match check_pending_agents_guardrail(ctx) {
+            match check_pending_tasks_guardrail(ctx) {
                 GuardrailAction::NoAction => return Ok(accumulated),
                 GuardrailAction::ForceTerminate(ids) => {
                     warn!(

@@ -20,5 +20,12 @@ main() {
     trap "rm -f '$script'" EXIT
     # shellcheck disable=SC2154
     printf '%s\n' "$argc_command" > "$script"
-    bash -e -o pipefail "$script" >> "$LLM_OUTPUT"
+    # No -e: the command gets standard interactive-shell semantics — the last
+    # statement decides the exit code, so trailing guards like `; exit 0` work
+    # and an intermediate non-zero status (grep with no matches, a failing
+    # test run being inspected) cannot abort the script mid-way. pipefail is
+    # kept so a failing pipeline stage still surfaces in the exit code. 2>&1:
+    # the harness only returns $LLM_OUTPUT on success, so without it stderr
+    # (git push, cargo progress, curl -v) vanishes from successful calls.
+    bash -o pipefail "$script" >> "$LLM_OUTPUT" 2>&1
 }

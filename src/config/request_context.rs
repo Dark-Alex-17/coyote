@@ -17,9 +17,13 @@ use super::{
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
-    FunctionDeclaration, Functions, ToolCallTracker, ToolResult, memory::MEMORY_FUNCTION_PREFIX,
-    rag_query::RAG_FUNCTION_PREFIX, skill::SKILL_FUNCTION_PREFIX,
-    supervisor::SUPERVISOR_FUNCTION_PREFIX, todo::TODO_FUNCTION_PREFIX,
+    FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
+    agents::AGENT_FUNCTION_PREFIX,
+    jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX, is_backgroundable_tool},
+    memory::MEMORY_FUNCTION_PREFIX,
+    rag_query::RAG_FUNCTION_PREFIX,
+    skill::SKILL_FUNCTION_PREFIX,
+    todo::TODO_FUNCTION_PREFIX,
     user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::mcp::{
@@ -30,6 +34,7 @@ use crate::rag::Rag;
 use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::Inbox;
+use crate::supervisor::notification::NotificationQueue;
 use crate::utils::{
     AbortSignal, abortable_run_with_spinner, edit_file, fuzzy_filter, get_env_name,
     list_file_names, now, render_prompt, temp_file,
@@ -136,6 +141,17 @@ impl MemoryConfig {
 /// `mcp_server_support`), so an empty set means the hint has nothing to point at.
 pub fn should_inject_skill_instructions(app: &AppConfig, policy: &SkillPolicy) -> bool {
     app.function_calling_support && policy.skills_enabled && !policy.compatible_enabled.is_empty()
+}
+
+pub fn effective_max_concurrent_jobs(agent: Option<&Agent>, app: &AppConfig) -> usize {
+    agent
+        .and_then(|a| a.max_concurrent_jobs())
+        .or(app.max_concurrent_jobs)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_JOBS)
+}
+
+pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
+    app.function_calling_support && effective_max_concurrent_jobs(agent, app) > 0
 }
 
 fn print_asset_names(kind: &str, names: &[String]) -> Result<()> {
@@ -308,14 +324,24 @@ pub struct RequestContext {
 
     pub tool_scope: ToolScope,
 
+    pub declared_function_names: HashSet<String>,
+
+    /// Ids of jobs started by the currently executing graph LLM node.
+    /// `Some` only while a node runs: `job__start` records into it, the
+    /// turn-end guardrail scopes its nag to it, and the node executor reaps
+    /// whatever is left in it on exit. `None` outside graph nodes — there the
+    /// context owns every job in its supervisor.
+    pub node_job_scope: Option<Vec<String>>,
+
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub self_agent_id: Option<String>,
     pub inbox: Option<Arc<Inbox>>,
     pub escalation_queue: Option<Arc<EscalationQueue>>,
+    pub notification_queue: Arc<NotificationQueue>,
     pub current_depth: usize,
     pub auto_continue_count: usize,
-    pub pending_agents_guardrail_count: u32,
+    pub pending_tasks_guardrail_count: u32,
     pub todo_list: TodoList,
     pub skill_registry: SkillRegistry,
     pub last_continuation_response: Option<String>,
@@ -341,14 +367,17 @@ impl RequestContext {
             agent: None,
             last_message: None,
             tool_scope: ToolScope::default(),
+            declared_function_names: Default::default(),
+            node_job_scope: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
             inbox: None,
             escalation_queue: None,
+            notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
             auto_continue_count: 0,
-            pending_agents_guardrail_count: 0,
+            pending_tasks_guardrail_count: 0,
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
@@ -400,14 +429,17 @@ impl RequestContext {
                 mcp_runtime,
                 tool_tracker: ToolCallTracker::default(),
             },
+            declared_function_names: Default::default(),
+            node_job_scope: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
             inbox: None,
             escalation_queue: None,
+            notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
             auto_continue_count: 0,
-            pending_agents_guardrail_count: 0,
+            pending_tasks_guardrail_count: 0,
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
@@ -446,14 +478,17 @@ impl RequestContext {
             agent: self.agent.clone(),
             last_message: self.last_message.clone(),
             tool_scope: self.tool_scope.clone(),
+            declared_function_names: self.declared_function_names.clone(),
+            node_job_scope: None,
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
             inbox: self.inbox.clone(),
             escalation_queue: self.escalation_queue.clone(),
+            notification_queue: self.notification_queue.clone(),
             current_depth: self.current_depth,
             auto_continue_count: 0,
-            pending_agents_guardrail_count: 0,
+            pending_tasks_guardrail_count: 0,
             todo_list: self.todo_list.clone(),
             skill_registry: self.skill_registry.clone(),
             last_continuation_response: None,
@@ -490,14 +525,17 @@ impl RequestContext {
                 mcp_runtime: McpRuntime::default(),
                 tool_tracker: tool_call_tracker,
             },
+            declared_function_names: Default::default(),
+            node_job_scope: None,
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
             inbox: Some(inbox),
             escalation_queue: parent.escalation_queue.clone(),
+            notification_queue: Arc::new(NotificationQueue::new()),
             current_depth,
             auto_continue_count: 0,
-            pending_agents_guardrail_count: 0,
+            pending_tasks_guardrail_count: 0,
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
@@ -894,6 +932,15 @@ impl RequestContext {
     }
 
     pub fn before_chat_completion(&mut self, input: &Input) -> Result<()> {
+        // `job__start` validates against exactly what was declared to the
+        // model for THIS request; refresh it every time.
+        //
+        // This is necessary to prevent the model from invoking functions it
+        // otherwise wouldn't have access to by going through the free `tool`
+        // argument of `job__start`. If a function is disabled, the model
+        // shouldn't be able to invoke it at all in any way. This prevents
+        // that backdoor.
+        self.declared_function_names = input.declared_function_names();
         self.last_message = Some(LastMessage::new(input.clone(), String::new()));
         Ok(())
     }
@@ -1302,6 +1349,7 @@ impl RequestContext {
                     && !v.name.starts_with("memory__")
                     && !v.name.starts_with("skill__")
                     && !v.name.starts_with("rag__")
+                    && !v.name.starts_with("job__")
             })
             .map(|v| v.name.clone())
             .collect()
@@ -2119,7 +2167,8 @@ impl RequestContext {
                                 && v.name.starts_with(SKILL_FUNCTION_PREFIX))
                             || (self.auto_continue_config().enabled
                                 && v.name.starts_with(TODO_FUNCTION_PREFIX))
-                            || v.name.starts_with(RAG_FUNCTION_PREFIX))
+                            || v.name.starts_with(RAG_FUNCTION_PREFIX)
+                            || v.name.starts_with(JOB_FUNCTION_PREFIX))
                             && !existing.contains(&v.name)
                     })
                     .cloned()
@@ -2143,9 +2192,10 @@ impl RequestContext {
                                 && v.name.starts_with(SKILL_FUNCTION_PREFIX))
                             || v.name.starts_with(USER_FUNCTION_PREFIX)
                             || v.name.starts_with(TODO_FUNCTION_PREFIX)
-                            || v.name.starts_with(SUPERVISOR_FUNCTION_PREFIX)
+                            || v.name.starts_with(AGENT_FUNCTION_PREFIX)
                             || v.name.starts_with(MEMORY_FUNCTION_PREFIX)
                             || v.name.starts_with(RAG_FUNCTION_PREFIX)
+                            || v.name.starts_with(JOB_FUNCTION_PREFIX)
                     });
                 }
 
@@ -2278,11 +2328,44 @@ impl RequestContext {
         let mut functions = vec![];
         functions.extend(self.select_enabled_functions(role));
         functions.extend(self.select_enabled_mcp_servers(role));
+        self.apply_job_tool_visibility(&mut functions);
 
         if functions.is_empty() {
             None
         } else {
             Some(functions)
+        }
+    }
+
+    /// Node-local job-ownership visibility rule: the `job__*` family is only
+    /// declared where it can do something. `job__start` requires at least one
+    /// backgroundable tool among this request's declarations; the lifecycle
+    /// verbs (`check`/`collect`/`cancel`/`list`) additionally survive while
+    /// the context still owns registered jobs, so a job started before a
+    /// filter change stays reachable.
+    fn apply_job_tool_visibility(&self, functions: &mut Vec<FunctionDeclaration>) {
+        let has_backgroundable = functions.iter().any(|f| is_backgroundable_tool(&f.name));
+        if has_backgroundable {
+            return;
+        }
+        let owns_jobs = self.owns_active_jobs();
+        let start_name = format!("{JOB_FUNCTION_PREFIX}start");
+        functions.retain(|f| {
+            !f.name.starts_with(JOB_FUNCTION_PREFIX) || (owns_jobs && f.name != start_name)
+        });
+    }
+
+    /// Whether this context has registered jobs it is responsible for:
+    /// inside a graph LLM node, only the jobs that node started; everywhere
+    /// else, any job in the context's supervisor.
+    pub fn owns_active_jobs(&self) -> bool {
+        let Some(supervisor) = self.supervisor.as_ref() else {
+            return false;
+        };
+        let sup = supervisor.read();
+        match self.node_job_scope.as_ref() {
+            Some(ids) => ids.iter().any(|id| sup.job(id).is_some()),
+            None => sup.jobs().next().is_some(),
         }
     }
 
@@ -3858,6 +3941,9 @@ impl RequestContext {
         {
             functions.append_rag_query_functions();
         }
+        if self.agent.is_none() && jobs_enabled(None, app) {
+            functions.append_job_functions();
+        }
 
         let tool_tracker = self.tool_scope.tool_tracker.clone();
         self.tool_scope = ToolScope {
@@ -4136,11 +4222,21 @@ impl RequestContext {
             );
         }
 
-        let should_init_supervisor = agent.can_spawn_agents();
-        let max_concurrent = agent.max_concurrent_agents();
+        let jobs_enabled = jobs_enabled(Some(&agent), app);
+        let should_init_supervisor = agent.can_spawn_agents() || jobs_enabled;
+        let max_concurrent_agents = if agent.can_spawn_agents() {
+            agent.max_concurrent_agents()
+        } else {
+            0
+        };
         let max_depth = agent.max_agent_depth();
-        let supervisor = should_init_supervisor
-            .then(|| Arc::new(RwLock::new(Supervisor::new(max_concurrent, max_depth))));
+        let max_jobs = effective_max_concurrent_jobs(Some(&agent), app);
+        let supervisor = should_init_supervisor.then(|| {
+            Arc::new(RwLock::new(
+                Supervisor::new(max_concurrent_agents, max_depth)
+                    .with_max_concurrent_jobs(max_jobs),
+            ))
+        });
 
         self.rag = agent.rag();
         // Keep `rag_key` in lockstep with `rag`. Agent RAGs are cached under
@@ -4152,9 +4248,13 @@ impl RequestContext {
             .is_some()
             .then(|| RagKey::Agent(agent.name().to_string()));
         self.agent = Some(agent);
+        if let Some(old) = self.supervisor.as_ref() {
+            old.read().cancel_recursive();
+        }
         self.supervisor = supervisor;
         self.inbox = None;
         self.escalation_queue = None;
+        self.notification_queue = Arc::new(NotificationQueue::new());
         self.self_agent_id = None;
         self.parent_supervisor = None;
         self.current_depth = 0;
@@ -4178,6 +4278,9 @@ impl RequestContext {
         if self.working_mode.is_repl() {
             functions.append_user_interaction_functions();
         }
+        if jobs_enabled(None, app) {
+            functions.append_job_functions();
+        }
         let tool_tracker = self.tool_scope.tool_tracker.clone();
         self.tool_scope = ToolScope {
             functions,
@@ -4194,9 +4297,10 @@ impl RequestContext {
             self.self_agent_id = None;
             self.inbox = None;
             self.escalation_queue = None;
+            self.notification_queue = Arc::new(NotificationQueue::new());
             self.current_depth = 0;
             self.auto_continue_count = 0;
-            self.pending_agents_guardrail_count = 0;
+            self.pending_tasks_guardrail_count = 0;
             self.todo_list = TodoList::default();
             self.rag.take();
             // Cleared alongside `rag` so the pair never disagrees: an agent RAG is
@@ -4692,18 +4796,22 @@ mod tests {
     use super::*;
     use crate::config::AppState;
     use crate::config::agent::AgentConfig;
+    use crate::function::jobs::RingBuf;
     use crate::function::{ToolCall, skill};
     use crate::mcp::{McpServer, McpServerFeatures, McpServersConfig, McpTransportType};
+    use crate::supervisor::{
+        AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
+    };
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
     use rmcp::model::PromptArgument;
     use serde_json::json;
     use serial_test::serial;
-    use std::env;
     use std::fs::{create_dir_all, remove_dir_all, write};
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::{env, mem};
 
     struct TestConfigDirGuard {
         key: String,
@@ -4753,6 +4861,15 @@ mod tests {
 
     fn create_test_ctx() -> RequestContext {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
+    }
+
+    fn test_decl(name: &str) -> FunctionDeclaration {
+        FunctionDeclaration {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: Default::default(),
+            agent: false,
+        }
     }
 
     fn tools_only_features(name: &str) -> McpServerFeatures {
@@ -5218,6 +5335,171 @@ mod tests {
     }
 
     #[test]
+    fn effective_max_concurrent_jobs_resolution_precedence() {
+        let mut app = AppConfig::default();
+        assert_eq!(effective_max_concurrent_jobs(None, &app), 5);
+
+        app.max_concurrent_jobs = Some(9);
+        assert_eq!(effective_max_concurrent_jobs(None, &app), 9);
+
+        let agent = Agent::test_new(AgentConfig {
+            max_concurrent_jobs: Some(2),
+            ..AgentConfig::default()
+        });
+        assert_eq!(effective_max_concurrent_jobs(Some(&agent), &app), 2);
+    }
+
+    #[test]
+    fn jobs_enabled_requires_function_calling_and_nonzero_capacity() {
+        let mut app = AppConfig::default();
+        assert!(jobs_enabled(None, &app));
+
+        app.max_concurrent_jobs = Some(0);
+        assert!(!jobs_enabled(None, &app));
+
+        app.max_concurrent_jobs = None;
+        app.function_calling_support = false;
+        assert!(!jobs_enabled(None, &app));
+
+        app.function_calling_support = true;
+        let agent = Agent::test_new(AgentConfig {
+            max_concurrent_jobs: Some(0),
+            ..AgentConfig::default()
+        });
+        assert!(!jobs_enabled(Some(&agent), &app));
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_cancels_previous_supervisor() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let old_sig = utils::create_abort_signal();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let join_handle = tokio::spawn(async {
+                    Ok(AgentResult {
+                        id: "a1".into(),
+                        agent_name: "explore".into(),
+                        output: String::new(),
+                        exit_status: AgentExitStatus::Completed,
+                    })
+                });
+                let handle = AgentHandle {
+                    id: "a1".to_string(),
+                    agent_name: "explore".to_string(),
+                    depth: 1,
+                    inbox: Arc::new(Inbox::new()),
+                    abort_signal: old_sig.clone(),
+                    join_handle,
+                    child_supervisor: None,
+                };
+                let old_sup = Arc::new(RwLock::new(Supervisor::new(4, 3)));
+                old_sup.write().register(handle).unwrap();
+                ctx.supervisor = Some(old_sup);
+
+                ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())
+                    .await
+                    .unwrap();
+            });
+
+        assert!(old_sig.aborted());
+        assert!(ctx.supervisor.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_inits_job_capable_supervisor_without_spawning() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())
+                    .await
+                    .unwrap();
+            });
+
+        let supervisor = ctx.supervisor.as_ref().expect("supervisor for jobs");
+        let supervisor = supervisor.read();
+        assert_eq!(supervisor.max_concurrent(), 0);
+        assert_eq!(supervisor.max_concurrent_jobs(), 5);
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_skips_supervisor_when_jobs_disabled() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut app = ctx.app.config.as_ref().clone();
+        app.max_concurrent_jobs = Some(0);
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())
+                    .await
+                    .unwrap();
+            });
+
+        assert!(ctx.supervisor.is_none());
+    }
+
+    #[test]
     fn current_depth_default_is_zero() {
         let ctx = create_test_ctx();
         assert_eq!(ctx.current_depth, 0);
@@ -5246,6 +5528,32 @@ mod tests {
     fn escalation_queue_defaults_to_none() {
         let ctx = create_test_ctx();
         assert!(ctx.root_escalation_queue().is_none());
+    }
+
+    #[test]
+    fn new_for_child_gets_fresh_notification_queue() {
+        let parent = create_test_ctx();
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert!(
+            !Arc::ptr_eq(&parent.notification_queue, &child.notification_queue),
+            "each child owns its notifications; a shared queue would race drains"
+        );
+    }
+
+    #[test]
+    fn fork_for_branch_shares_notification_queue() {
+        let ctx = create_test_ctx();
+        let branch = ctx.fork_for_branch();
+        assert!(Arc::ptr_eq(
+            &ctx.notification_queue,
+            &branch.notification_queue
+        ));
     }
 
     fn app_state_with_mcp_config(mcp_server_support: bool, server_names: &[&str]) -> Arc<AppState> {
@@ -5521,6 +5829,146 @@ mod tests {
     }
 
     #[test]
+    fn select_functions_hides_job_functions_without_backgroundable_tools() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+
+        assert!(
+            ctx.select_functions(&Role::default()).is_none(),
+            "job__ tools must not be declared when nothing backgroundable is declared"
+        );
+    }
+
+    #[test]
+    fn select_functions_keeps_job_tools_when_filter_includes_backgroundable_tool() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("my_build_tool"));
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["my_build_tool".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        assert!(
+            fns.iter().any(|f| f.name == "job__start"),
+            "job__ tools must survive a role tool filter that declares a backgroundable tool"
+        );
+    }
+
+    #[test]
+    fn select_functions_hides_job_tools_when_filter_has_only_non_backgroundable_tools() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("fs_cat"));
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["fs_cat".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        assert!(
+            !fns.iter().any(|f| f.name.starts_with("job__")),
+            "job__ tools must be hidden when no declared tool is backgroundable"
+        );
+    }
+
+    #[test]
+    fn concrete_tool_names_excludes_job_functions() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+
+        assert!(ctx.concrete_tool_names().is_empty());
+    }
+
+    #[test]
+    fn before_chat_completion_refreshes_declared_function_names() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("echo"));
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["echo".to_string()]));
+        let input = Input::from_str(&ctx, "hello", Some(role)).unwrap();
+        ctx.before_chat_completion(&input).unwrap();
+
+        assert_eq!(ctx.declared_function_names.len(), 6);
+        assert!(ctx.declared_function_names.contains("job__start"));
+        assert!(ctx.declared_function_names.contains("echo"));
+
+        ctx.tool_scope = ToolScope::default();
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["echo".to_string()]));
+        let input = Input::from_str(&ctx, "hello again", Some(role)).unwrap();
+        ctx.before_chat_completion(&input).unwrap();
+
+        assert!(
+            ctx.declared_function_names.is_empty(),
+            "stash must be refreshed on every request"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tool_scope_gates_job_functions_on_jobs_enabled() {
+        let _guard = TestConfigDirGuard::new();
+        let app_state = app_state_with_mcp_config(false, &[]);
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        run_async(ctx.rebuild_tool_scope(&app, None, abort.clone())).unwrap();
+        assert!(ctx.tool_scope.functions.contains("job__start"));
+
+        let jobs_off = AppConfig {
+            max_concurrent_jobs: Some(0),
+            ..(*app).clone()
+        };
+        run_async(ctx.rebuild_tool_scope(&jobs_off, None, abort.clone())).unwrap();
+        assert!(
+            !ctx.tool_scope
+                .functions
+                .declarations()
+                .iter()
+                .any(|f| f.name.starts_with("job__"))
+        );
+
+        let fc_off = AppConfig {
+            function_calling_support: false,
+            ..(*app).clone()
+        };
+        run_async(ctx.rebuild_tool_scope(&fc_off, None, abort)).unwrap();
+        assert!(
+            !ctx.tool_scope
+                .functions
+                .declarations()
+                .iter()
+                .any(|f| f.name.starts_with("job__"))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn exit_agent_rebuild_retains_job_functions_when_enabled() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        ctx.exit_agent(&app).unwrap();
+        assert!(ctx.tool_scope.functions.contains("job__start"));
+
+        let jobs_off = AppConfig {
+            max_concurrent_jobs: Some(0),
+            ..(*app).clone()
+        };
+        ctx.exit_agent(&jobs_off).unwrap();
+        assert!(!ctx.tool_scope.functions.contains("job__start"));
+    }
+
+    #[test]
     fn select_functions_all_enabled_tools_returns_all_non_mcp() {
         let mut ctx = create_test_ctx();
         ctx.tool_scope.functions.append_todo_functions();
@@ -5684,6 +6132,45 @@ mod tests {
             names.contains(&"user__select"),
             "user__ tools must survive an agent tool filter, got: {names:?}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn select_functions_preserves_job_tools_under_agent_filter() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_job_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("foo"));
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            names.contains(&"job__start"),
+            "job__ tools must survive an agent tool filter that declares a backgroundable tool, got: {names:?}"
+        );
+        assert!(names.contains(&"job__collect"));
     }
 
     #[test]
@@ -7149,5 +7636,309 @@ mod tests {
             ctx.macro_lock_owner(MacroAllowlistLevel::Global),
             "global config"
         );
+    }
+
+    #[test]
+    fn select_functions_hides_job_tools_under_empty_role_filter() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec![]));
+
+        assert!(
+            ctx.select_functions(&role).is_none(),
+            "an empty tool filter declares nothing backgroundable, so job__ tools must be hidden"
+        );
+    }
+
+    #[test]
+    fn select_functions_keeps_lifecycle_job_tools_when_context_owns_jobs() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+        let sup = Arc::new(RwLock::new(
+            Supervisor::new(4, 3).with_max_concurrent_jobs(1),
+        ));
+        sup.write()
+            .register(make_running_job(utils::create_abort_signal()))
+            .unwrap();
+        ctx.supervisor = Some(sup);
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec![]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["job__check", "job__collect", "job__cancel", "job__list"],
+            "lifecycle verbs must stay reachable while the context owns a job; job__start must not"
+        );
+    }
+
+    #[test]
+    fn owns_active_jobs_respects_node_scope() {
+        let mut ctx = create_test_ctx();
+        let sup = Arc::new(RwLock::new(
+            Supervisor::new(4, 3).with_max_concurrent_jobs(1),
+        ));
+        sup.write()
+            .register(make_running_job(utils::create_abort_signal()))
+            .unwrap();
+        ctx.supervisor = Some(sup);
+
+        assert!(
+            ctx.owns_active_jobs(),
+            "outside a node, the context owns every registry job"
+        );
+
+        ctx.node_job_scope = Some(vec![]);
+        assert!(
+            !ctx.owns_active_jobs(),
+            "a node owns only jobs it started, not other registry entries"
+        );
+
+        ctx.node_job_scope = Some(vec!["j1".to_string()]);
+        assert!(ctx.owns_active_jobs());
+    }
+
+    #[test]
+    #[serial]
+    fn select_functions_hides_job_tools_under_empty_agent_filter() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_job_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec![]));
+
+        let names: Vec<String> = ctx
+            .select_functions(&role)
+            .unwrap_or_default()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("job__")),
+            "job__ tools must be hidden under an empty agent filter, got: {names:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn select_functions_when_jobs_disabled_is_byte_identical_to_no_jobs_baseline() {
+        let _guard = TestConfigDirGuard::new();
+        let app_state = app_state_with_mcp_config(false, &[]);
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Repl);
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["all".to_string()]));
+
+        let jobs_off = AppConfig {
+            max_concurrent_jobs: Some(0),
+            ..(*app).clone()
+        };
+        run_async(ctx.rebuild_tool_scope(&jobs_off, None, abort.clone())).unwrap();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("echo"));
+        let without_jobs = serde_json::to_string(&ctx.select_functions(&role)).unwrap();
+        assert!(
+            !without_jobs.contains("job__"),
+            "no job__ declarations may leak when jobs are disabled, got: {without_jobs}"
+        );
+
+        run_async(ctx.rebuild_tool_scope(&app, None, abort)).unwrap();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("echo"));
+        let with_jobs = ctx.select_functions(&role).unwrap();
+        assert!(with_jobs.iter().any(|f| f.name.starts_with("job__")));
+        let stripped: Vec<FunctionDeclaration> = with_jobs
+            .into_iter()
+            .filter(|f| !f.name.starts_with("job__"))
+            .collect();
+
+        assert_eq!(
+            without_jobs,
+            serde_json::to_string(&Some(stripped)).unwrap(),
+            "jobs-disabled tool list must be byte-identical to the jobs-enabled list minus job__ declarations"
+        );
+    }
+
+    #[test]
+    fn select_functions_returns_none_when_no_tools_enabled_and_jobs_disabled() {
+        let app_state = {
+            let config = AppConfig {
+                max_concurrent_jobs: Some(0),
+                ..AppConfig::default()
+            };
+            Arc::new(AppState {
+                config: Arc::new(config),
+                vault: Arc::new(Vault::default()),
+                mcp_factory: Arc::new(McpFactory::default()),
+                rag_cache: Arc::new(RagCache::default()),
+                mcp_config: None,
+                mcp_log_path: None,
+                mcp_registry: None,
+                functions: Functions::default(),
+            })
+        };
+        let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        assert!(ctx.select_functions(&Role::default()).is_none());
+    }
+
+    #[test]
+    fn tools_info_lists_job_tools_when_enabled() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("echo"));
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["echo".to_string()]));
+        ctx.role = Some(role);
+
+        let info = ctx.tools_info().unwrap();
+
+        for name in [
+            "job__start",
+            "job__check",
+            "job__collect",
+            "job__cancel",
+            "job__list",
+        ] {
+            assert!(
+                info.contains(name),
+                "expected {name} in output, got: {info}"
+            );
+        }
+    }
+
+    fn make_running_job(abort_signal: utils::AbortSignal) -> JobHandle {
+        // Leak the runtime so the spawned task is never polled and the job
+        // stays running for the duration of the test.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let join_handle = rt.spawn(async {
+            Ok(JobResult {
+                output: serde_json::Value::Null,
+                exit_code: Some(0),
+                output_bytes_captured: 0,
+            })
+        });
+        mem::forget(rt);
+        JobHandle {
+            id: "j1".to_string(),
+            tool: "execute_command".to_string(),
+            started_at: Instant::now(),
+            join_handle,
+            abort_signal,
+            state: Arc::new(parking_lot::Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            })),
+            output_buf: Arc::new(parking_lot::Mutex::new(RingBuf::default())),
+            no_change_checks: 0,
+            last_check_state: None,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_cancels_running_jobs_of_previous_supervisor() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let job_sig = utils::create_abort_signal();
+        let old_sup = Arc::new(RwLock::new(
+            Supervisor::new(4, 3).with_max_concurrent_jobs(1),
+        ));
+        old_sup
+            .write()
+            .register(make_running_job(job_sig.clone()))
+            .unwrap();
+        ctx.supervisor = Some(old_sup);
+
+        run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
+
+        assert!(
+            job_sig.aborted(),
+            "running jobs of the previous supervisor must be cancelled"
+        );
+        assert!(ctx.supervisor.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn exit_agent_cancels_running_jobs() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let job_sig = utils::create_abort_signal();
+        let sup = Arc::new(RwLock::new(
+            Supervisor::new(4, 3).with_max_concurrent_jobs(1),
+        ));
+        sup.write()
+            .register(make_running_job(job_sig.clone()))
+            .unwrap();
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        ctx.supervisor = Some(sup);
+
+        ctx.exit_agent(&app).unwrap();
+
+        assert!(job_sig.aborted(), "exit_agent must cancel running jobs");
+        assert!(ctx.supervisor.is_none());
+    }
+
+    #[test]
+    fn toggle_tool_rejects_job_tools_as_unknown() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+
+        for action in ["enable", "disable"] {
+            let err = ctx.toggle_tool(action, "job__start").unwrap_err();
+            assert!(
+                err.to_string().contains("Unknown tool 'job__start'"),
+                "expected job__start to be rejected on {action}, got: {err}"
+            );
+        }
     }
 }

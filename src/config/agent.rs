@@ -3,15 +3,19 @@ use super::*;
 use crate::{
     client::Model,
     config::memory,
-    function::{Functions, run_llm_function},
+    function::{
+        Functions,
+        jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX},
+        run_llm_function,
+    },
     graph, rag,
 };
 
 use super::rag_cache::RagKey;
 use crate::config::paths;
 use crate::config::prompts::{
-    DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS, DEFAULT_TODO_INSTRUCTIONS,
-    DEFAULT_USER_INTERACTION_INSTRUCTIONS,
+    DEFAULT_JOB_INSTRUCTIONS, DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS,
+    DEFAULT_TODO_INSTRUCTIONS, DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
 use crate::graph::types::RagNode;
 use crate::graph::{Graph, GraphParser, NodeType};
@@ -223,6 +227,16 @@ impl Agent {
 
         if agent_config.can_spawn_agents {
             functions.append_supervisor_functions();
+        }
+
+        if app.function_calling_support
+            && agent_config
+                .max_concurrent_jobs
+                .or(app.max_concurrent_jobs)
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_JOBS)
+                > 0
+        {
+            functions.append_job_functions();
         }
 
         functions.append_teammate_functions();
@@ -440,6 +454,18 @@ impl Agent {
             output.push_str(DEFAULT_SPAWN_INSTRUCTIONS);
         }
 
+        if self
+            .functions
+            .declarations()
+            .iter()
+            .any(|f| f.name.starts_with(JOB_FUNCTION_PREFIX))
+        {
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(DEFAULT_JOB_INSTRUCTIONS);
+        }
+
         output.push_str(DEFAULT_TEAMMATE_INSTRUCTIONS);
         output.push_str(DEFAULT_USER_INTERACTION_INSTRUCTIONS);
 
@@ -559,6 +585,10 @@ impl Agent {
 
     pub fn max_tool_result_chars(&self) -> Option<usize> {
         self.config.max_tool_result_chars
+    }
+
+    pub fn max_concurrent_jobs(&self) -> Option<usize> {
+        self.config.max_concurrent_jobs
     }
 
     pub fn compression_keep_last(&self) -> Option<usize> {
@@ -735,6 +765,8 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_result_chars: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_jobs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_keep_last: Option<usize>,
     #[serde(default)]
     pub description: String,
@@ -822,6 +854,7 @@ impl AgentConfig {
             variables: graph.variables.clone(),
             can_spawn_agents: graph.has_agent_node(),
             max_concurrent_agents: default_max_concurrent_agents(),
+            max_concurrent_jobs: graph.max_concurrent_jobs,
             max_agent_depth: default_max_agent_depth(),
             escalation_timeout: default_escalation_timeout(),
             ..AgentConfig::default()
@@ -1296,6 +1329,7 @@ variables:
             model: claude:claude-sonnet-4-6
             temperature: 0.3
             top_p: 0.8
+            max_concurrent_jobs: 2
             global_tools:
               - fetch_pdf.sh
             mcp_servers:
@@ -1318,6 +1352,7 @@ variables:
         assert_eq!(config.model_id.as_deref(), Some("claude:claude-sonnet-4-6"));
         assert_eq!(config.temperature, Some(0.3));
         assert_eq!(config.top_p, Some(0.8));
+        assert_eq!(config.max_concurrent_jobs, Some(2));
         assert_eq!(config.global_tools, vec!["fetch_pdf.sh"]);
         assert_eq!(config.mcp_servers, vec!["pubmed-search"]);
         assert_eq!(config.conversation_starters, vec!["Start here"]);
@@ -1480,5 +1515,52 @@ nodes: {}
         assert_eq!(config.chunk_overlap, Some(64));
         assert_eq!(config.top_k, Some(7));
         assert_eq!(config.embedding_model.as_deref(), Some("some:model"));
+    }
+
+    #[test]
+    fn interpolated_instructions_without_job_declarations_is_byte_identical_across_job_settings() {
+        let agent = |max_concurrent_jobs| {
+            Agent::test_new(AgentConfig {
+                instructions: "hi".to_string(),
+                max_concurrent_jobs,
+                ..AgentConfig::default()
+            })
+        };
+
+        let baseline = agent(None).interpolated_instructions();
+        assert!(
+            !baseline.contains(DEFAULT_JOB_INSTRUCTIONS),
+            "no job guidance may be injected without job__ declarations"
+        );
+        assert_eq!(baseline, agent(Some(0)).interpolated_instructions());
+        assert_eq!(baseline, agent(Some(7)).interpolated_instructions());
+
+        let mut with_unrelated = agent(None);
+        with_unrelated.functions.append_todo_functions();
+        assert_eq!(
+            baseline,
+            with_unrelated.interpolated_instructions(),
+            "job guidance injection must key strictly on the job__ prefix"
+        );
+    }
+
+    #[test]
+    fn interpolated_instructions_with_job_declarations_appends_job_guidance() {
+        let config = AgentConfig {
+            instructions: "hi".to_string(),
+            ..AgentConfig::default()
+        };
+        let baseline = Agent::test_new(config.clone()).interpolated_instructions();
+
+        let mut agent = Agent::test_new(config);
+        agent.functions.append_job_functions();
+        let output = agent.interpolated_instructions();
+
+        assert!(output.contains(DEFAULT_JOB_INSTRUCTIONS));
+        let expected = format!(
+            "hi\n{DEFAULT_JOB_INSTRUCTIONS}{}",
+            baseline.strip_prefix("hi").unwrap()
+        );
+        assert_eq!(output, expected);
     }
 }

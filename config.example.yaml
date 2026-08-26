@@ -204,6 +204,7 @@ summary_context_prompt: >        # The text prompt used for including the summar
   'This is a summary of the chat history as a recap: '
 compression_keep_last: 0         # Number of most-recent messages to keep visible after compression (0 = compress all messages)
 max_tool_result_chars: null      # Cap on tool result characters forwarded to the model per call (null = no cap)
+max_concurrent_jobs: 5           # Max background jobs (`job__*` tools) running at once per context (default: 5; 0 disables background jobs entirely)
 
 # ---- Memory ----
 # See the [Memory documentation](https://github.com/Dark-Alex-17/coyote/wiki/Memory) for more information.

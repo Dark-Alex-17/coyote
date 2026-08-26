@@ -563,8 +563,14 @@ mod tests {
 mod integration_tests {
     use super::*;
     use crate::config::{AppState, WorkingMode};
+    #[cfg(unix)]
+    use crate::function::jobs::RingBuf;
+    #[cfg(unix)]
+    use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor, notification};
     use crate::utils::{create_abort_signal, temp_file};
     use std::fs;
+    #[cfg(unix)]
+    use std::mem;
 
     fn cmd_available(name: &str) -> bool {
         which::which(name).is_ok()
@@ -855,5 +861,84 @@ nodes:
             "error should report during-super-step timeout: {err}"
         );
         assert!(err.contains("sleeper"), "error should name frontier: {err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_survives_graph_node_execution() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("noop.sh", "#!/bin/bash\necho '{}'\n");
+
+        let yaml = r#"
+name: background_job_survival_test
+start: noop
+nodes:
+  noop:
+    type: script
+    script: noop.sh
+    state_updates: {}
+    next: done
+  done:
+    type: end
+    output: "done"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let join_handle = rt.spawn(async {
+            Ok(JobResult {
+                output: Value::Null,
+                exit_code: Some(0),
+                output_bytes_captured: 0,
+            })
+        });
+        mem::forget(rt);
+        let handle = JobHandle {
+            id: "job_bg".to_string(),
+            tool: "execute_command".to_string(),
+            started_at: Instant::now(),
+            join_handle,
+            abort_signal: create_abort_signal(),
+            state: Arc::new(parking_lot::Mutex::new(JobState {
+                status: JobStatus::Completed,
+                pgid: None,
+            })),
+            output_buf: Arc::new(parking_lot::Mutex::new(RingBuf::default())),
+            no_change_checks: 0,
+            last_check_state: None,
+        };
+        let mut sup = Supervisor::new(0, 3).with_max_concurrent_jobs(4);
+        sup.register(handle).unwrap();
+
+        let mut ctx = make_ctx();
+        ctx.supervisor = Some(Arc::new(parking_lot::RwLock::new(sup)));
+        ctx.notification_queue.push(notification::job_notification(
+            "job_bg",
+            "execute_command",
+            true,
+        ));
+
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+        assert_eq!(result, "done");
+
+        assert!(
+            ctx.supervisor.as_ref().unwrap().read().has_job("job_bg"),
+            "graph execution must not touch registered job handles"
+        );
+        let events = ctx.notification_queue.drain();
+        assert_eq!(events.len(), 1, "queued notification must survive the run");
+        assert_eq!(events[0].id, "job_bg");
+        assert_eq!(events[0].event, "job_completed");
     }
 }

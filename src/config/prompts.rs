@@ -82,7 +82,7 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     | Tool | Purpose |
     |------|----------|
     | `agent__spawn` | Spawn a subagent in the background. Returns an `id` immediately. |
-    | `agent__check` | Non-blocking check: is the agent done yet? Returns PENDING or result. |
+    | `agent__check` | Non-blocking status probe: running or finished. Never returns/consumes the result — use `agent__collect`. |
     | `agent__collect` | Blocking wait: wait for an agent to finish, return its output. |
     | `agent__list_available` | List all agent types you can spawn (name + description). Use this to discover specialists before calling `agent__spawn`. |
     | `agent__list_running` | List all subagents YOU have spawned, with their status. |
@@ -112,9 +112,10 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
 
     ### CRITICAL: Never end your turn with pending agents
 
-    Spawned agents do NOT report back on their own. They run in the background until you
-    actively reclaim them with `agent__collect` (to get their output) or `agent__cancel`
-    (to discard them). If you spawn agents and then emit a final message without reclaiming
+    Spawned agents do NOT deliver their results on their own. When one finishes, a
+    `system_notifications` entry appears on your next tool result naming the exact collect
+    command — but the output is only retrieved when you actively reclaim it with `agent__collect`
+    (or discard it with `agent__cancel`). If you spawn agents and then emit a final message without reclaiming
     them, the system will detect the unreclaimed agents and reject the turn-end, injecting
     a reminder forcing you to handle them. After several such reminders, the system will
     auto-cancel them and warn you that work was lost.
@@ -189,6 +190,23 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     3. If you need the user's input, call the appropriate `user__*` tool yourself, then relay the answer via `agent__reply_escalation`.
     4. **Respond promptly**; the child agent is blocked and waiting (5-minute timeout).
 "};
+
+pub(in crate::config) const DEFAULT_JOB_INSTRUCTIONS: &str = indoc! {"
+    ## Background Jobs
+
+    For long-running tool calls (builds, test suites, slow commands), call `job__start` and keep
+    working instead of blocking — completion arrives as a `system_notifications` entry on your
+    next tool result. Check progress with `job__check` (sparingly), block on the result with
+    `job__collect` (only when you have nothing else to do), cancel with `job__cancel`, and list
+    jobs with `job__list`. Collected results over 50,000 chars are tail-capped; collecting is
+    consume-once, so when you need the complete output pass `full_result: true` (or have the
+    command write to a file). Collect or cancel every job you started before ending your turn. In
+    graph LLM nodes, jobs are node-local: collect or cancel every job you start before the node
+    ends — an uncollected job burns node iterations via the guardrail, and anything still
+    running when the node exits is cancelled with its result discarded. Jobs run against a
+    snapshot of the current config/environment and do not survive coyote exiting.
+"
+};
 
 pub(in crate::config) const DEFAULT_TEAMMATE_INSTRUCTIONS: &str = indoc! {"
     ## Teammate Messaging
