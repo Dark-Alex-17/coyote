@@ -140,7 +140,8 @@ pub fn job_function_declarations() -> Vec<FunctionDeclaration> {
                           tools cannot be backgrounded. The job runs against a snapshot of the current config and \
                           environment; later changes do not affect it. Process jobs honor COYOTE_TOOL_TIMEOUT; MCP \
                           jobs have NO timeout — cancel a hung one with `job__cancel`. Jobs do not survive coyote \
-                          exiting.".to_string(),
+                          exiting. In graph LLM nodes, jobs are node-local: collect or cancel every job you start \
+                          before the node ends — leftovers are cancelled at node exit.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([
@@ -359,6 +360,13 @@ fn whitelist_rejection(tool: &str) -> Option<Value> {
     })
 }
 
+/// Whether a declared tool could be run as a background job. This is the
+/// declare-side twin of `whitelist_rejection`: a tool is backgroundable
+/// exactly when `job__start` would not reject it by name.
+pub fn is_backgroundable_tool(tool: &str) -> bool {
+    whitelist_rejection(tool).is_none()
+}
+
 async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     if !jobs_enabled(ctx.agent.as_ref(), &ctx.app.config) {
         return Ok(json!({
@@ -509,6 +517,10 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             "status": "error",
             "message": format!("{e}"),
         }));
+    }
+
+    if let Some(scope) = ctx.node_job_scope.as_mut() {
+        scope.push(job_id.clone());
     }
 
     Ok(json!({
@@ -801,6 +813,36 @@ async fn kill_job_with_grace(handle: &mut JobHandle) {
     }
     handle.join_handle.abort();
     let _ = time::timeout(JOB_KILL_GRACE, &mut handle.join_handle).await;
+}
+
+/// Cancel and deregister the named jobs, if still registered. Used by graph
+/// LLM nodes to enforce node-local job ownership: any job the node started
+/// but did not collect or cancel by the time it exits is killed here, on
+/// every exit path. Returns the ids actually reaped.
+pub async fn reap_jobs(
+    supervisor: Option<&Arc<RwLock<Supervisor>>>,
+    ids: &[String],
+) -> Vec<String> {
+    let Some(supervisor) = supervisor else {
+        return Vec::new();
+    };
+    let mut reaped = Vec::new();
+    for id in ids {
+        let handle = {
+            let mut sup = supervisor.write();
+            sup.take_job(id)
+        };
+        if let Some(mut handle) = handle {
+            handle.abort_signal.set_ctrlc();
+            kill_job_with_grace(&mut handle).await;
+            warn!(
+                "Reaped background job '{id}' ({}): left unreclaimed at graph node exit",
+                handle.tool
+            );
+            reaped.push(id.clone());
+        }
+    }
+    reaped
 }
 
 fn handle_list(ctx: &RequestContext) -> Result<Value> {
@@ -1550,6 +1592,62 @@ mod tests {
             ctx.supervisor.as_ref().unwrap().read().active_job_count(),
             1
         );
+    }
+
+    #[test]
+    fn is_backgroundable_tool_matches_start_whitelist() {
+        assert!(is_backgroundable_tool("execute_command"));
+        assert!(is_backgroundable_tool("my_custom_tool.sh"));
+        assert!(is_backgroundable_tool("mcp_invoke_github"));
+        assert!(!is_backgroundable_tool("job__start"));
+        assert!(!is_backgroundable_tool("agent__spawn"));
+        assert!(!is_backgroundable_tool("user__confirm"));
+        assert!(!is_backgroundable_tool("todo__add"));
+        assert!(!is_backgroundable_tool("fs_read"));
+        assert!(!is_backgroundable_tool("ast_grep"));
+        assert!(!is_backgroundable_tool("mcp_search_github"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_start_records_job_in_node_scope() {
+        run_async(async {
+            let mut ctx = plain_ctx();
+            ctx.node_job_scope = Some(Vec::new());
+            ctx.declared_function_names.insert("echo".into());
+
+            let started = handle_start(&mut ctx, &json!({"tool": "echo", "arguments": {}}))
+                .await
+                .unwrap();
+
+            let job_id = started["job_id"].as_str().unwrap().to_string();
+            assert_eq!(ctx.node_job_scope.clone().unwrap(), vec![job_id.clone()]);
+
+            let collected = handle_collect(&ctx, &json!({"id": job_id})).await.unwrap();
+            assert_eq!(collected["status"], "completed");
+        });
+    }
+
+    #[test]
+    fn reap_jobs_kills_registered_jobs_and_reports_ids() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(make_running_job("j1"))
+                .unwrap();
+
+            let reaped = reap_jobs(
+                ctx.supervisor.as_ref(),
+                &["j1".to_string(), "missing".to_string()],
+            )
+            .await;
+
+            assert_eq!(reaped, vec!["j1".to_string()]);
+            assert!(!ctx.supervisor.as_ref().unwrap().read().has_job("j1"));
+        });
     }
 
     #[test]

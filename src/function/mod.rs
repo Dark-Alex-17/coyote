@@ -693,6 +693,10 @@ impl Functions {
         self.declarations.extend(jobs::job_function_declarations());
     }
 
+    pub fn append_declaration(&mut self, declaration: FunctionDeclaration) {
+        self.declarations.push(declaration);
+    }
+
     pub fn append_teammate_functions(&mut self) {
         self.declarations
             .extend(supervisor::teammate_function_declarations());

@@ -74,6 +74,13 @@ pub fn pending_tasks(ctx: &RequestContext) -> Vec<PendingTask> {
         })
         .collect();
 
+    // Inside a graph LLM node, jobs are node-owned: the guardrail must only
+    // nag about jobs this node started. Jobs belonging to a parallel branch
+    // live in the same shared registry but are that branch's to reclaim.
+    if let Some(scope) = ctx.node_job_scope.as_ref() {
+        tasks.retain(|t| t.kind != TaskKind::Job || scope.contains(&t.id));
+    }
+
     tasks.sort_by(|a, b| a.id.cmp(&b.id));
     tasks
 }
@@ -2594,6 +2601,22 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "job_1");
         assert_eq!(tasks[0].kind, TaskKind::Job);
+    }
+
+    #[test]
+    fn pending_tasks_scopes_jobs_to_node_scope() {
+        let mut ctx = ctx_with_job_capable_supervisor();
+        register_fake_job(&mut ctx, "job_mine");
+        register_fake_job(&mut ctx, "job_other");
+
+        ctx.node_job_scope = Some(vec!["job_mine".to_string()]);
+        let tasks = pending_tasks(&ctx);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "job_mine");
+        assert_eq!(tasks[0].kind, TaskKind::Job);
+
+        ctx.node_job_scope = None;
+        assert_eq!(pending_tasks(&ctx).len(), 2);
     }
 
     #[test]

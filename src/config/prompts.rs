@@ -201,10 +201,10 @@ pub(in crate::config) const DEFAULT_JOB_INSTRUCTIONS: &str = indoc! {"
     jobs with `job__list`. Collected results over 50,000 chars are tail-capped; collecting is
     consume-once, so when you need the complete output pass `full_result: true` (or have the
     command write to a file). Collect or cancel every job you started before ending your turn. In
-    graph LLM nodes, collect or cancel your jobs before ending your final node turn — an
-    uncollected job at node turn-end burns node iterations via the guardrail and can fail the
-    node. Jobs run against a snapshot of the current config/environment and do not survive
-    coyote exiting.
+    graph LLM nodes, jobs are node-local: collect or cancel every job you start before the node
+    ends — an uncollected job burns node iterations via the guardrail, and anything still
+    running when the node exits is cancelled with its result discarded. Jobs run against a
+    snapshot of the current config/environment and do not survive coyote exiting.
 "
 };
 

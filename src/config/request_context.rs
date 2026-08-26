@@ -18,7 +18,7 @@ use super::{MessageContentToolCalls, prompts};
 use crate::client::{Model, ModelType, list_models};
 use crate::function::{
     FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
-    jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX},
+    jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX, is_backgroundable_tool},
     memory::MEMORY_FUNCTION_PREFIX,
     rag_query::RAG_FUNCTION_PREFIX,
     skill::SKILL_FUNCTION_PREFIX,
@@ -326,6 +326,13 @@ pub struct RequestContext {
 
     pub declared_function_names: HashSet<String>,
 
+    /// Ids of jobs started by the currently executing graph LLM node.
+    /// `Some` only while a node runs: `job__start` records into it, the
+    /// turn-end guardrail scopes its nag to it, and the node executor reaps
+    /// whatever is left in it on exit. `None` outside graph nodes — there the
+    /// context owns every job in its supervisor.
+    pub node_job_scope: Option<Vec<String>>,
+
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub self_agent_id: Option<String>,
@@ -361,6 +368,7 @@ impl RequestContext {
             last_message: None,
             tool_scope: ToolScope::default(),
             declared_function_names: Default::default(),
+            node_job_scope: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -422,6 +430,7 @@ impl RequestContext {
                 tool_tracker: ToolCallTracker::default(),
             },
             declared_function_names: Default::default(),
+            node_job_scope: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -470,6 +479,7 @@ impl RequestContext {
             last_message: self.last_message.clone(),
             tool_scope: self.tool_scope.clone(),
             declared_function_names: self.declared_function_names.clone(),
+            node_job_scope: None,
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -516,6 +526,7 @@ impl RequestContext {
                 tool_tracker: tool_call_tracker,
             },
             declared_function_names: Default::default(),
+            node_job_scope: None,
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -2317,11 +2328,44 @@ impl RequestContext {
         let mut functions = vec![];
         functions.extend(self.select_enabled_functions(role));
         functions.extend(self.select_enabled_mcp_servers(role));
+        self.apply_job_tool_visibility(&mut functions);
 
         if functions.is_empty() {
             None
         } else {
             Some(functions)
+        }
+    }
+
+    /// Node-local job-ownership visibility rule: the `job__*` family is only
+    /// declared where it can do something. `job__start` requires at least one
+    /// backgroundable tool among this request's declarations; the lifecycle
+    /// verbs (`check`/`collect`/`cancel`/`list`) additionally survive while
+    /// the context still owns registered jobs, so a job started before a
+    /// filter change stays reachable.
+    fn apply_job_tool_visibility(&self, functions: &mut Vec<FunctionDeclaration>) {
+        let has_backgroundable = functions.iter().any(|f| is_backgroundable_tool(&f.name));
+        if has_backgroundable {
+            return;
+        }
+        let owns_jobs = self.owns_active_jobs();
+        let start_name = format!("{JOB_FUNCTION_PREFIX}start");
+        functions.retain(|f| {
+            !f.name.starts_with(JOB_FUNCTION_PREFIX) || (owns_jobs && f.name != start_name)
+        });
+    }
+
+    /// Whether this context has registered jobs it is responsible for:
+    /// inside a graph LLM node, only the jobs that node started; everywhere
+    /// else, any job in the context's supervisor.
+    pub fn owns_active_jobs(&self) -> bool {
+        let Some(supervisor) = self.supervisor.as_ref() else {
+            return false;
+        };
+        let sup = supervisor.read();
+        match self.node_job_scope.as_ref() {
+            Some(ids) => ids.iter().any(|id| sup.job(id).is_some()),
+            None => sup.jobs().next().is_some(),
         }
     }
 
@@ -4819,6 +4863,15 @@ mod tests {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
     }
 
+    fn test_decl(name: &str) -> FunctionDeclaration {
+        FunctionDeclaration {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: Default::default(),
+            agent: false,
+        }
+    }
+
     fn tools_only_features(name: &str) -> McpServerFeatures {
         McpServerFeatures {
             name: name.to_string(),
@@ -5776,37 +5829,49 @@ mod tests {
     }
 
     #[test]
-    fn select_functions_returns_job_functions_even_with_no_enabled_tools() {
+    fn select_functions_hides_job_functions_without_backgroundable_tools() {
         let mut ctx = create_test_ctx();
         ctx.tool_scope.functions.append_job_functions();
 
-        let fns = ctx.select_functions(&Role::default()).unwrap();
-        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
-
-        assert_eq!(
-            names,
-            vec![
-                "job__start",
-                "job__check",
-                "job__collect",
-                "job__cancel",
-                "job__list"
-            ]
+        assert!(
+            ctx.select_functions(&Role::default()).is_none(),
+            "job__ tools must not be declared when nothing backgroundable is declared"
         );
     }
 
     #[test]
-    fn select_functions_preserves_job_tools_under_role_filter() {
+    fn select_functions_keeps_job_tools_when_filter_includes_backgroundable_tool() {
         let mut ctx = create_test_ctx();
         ctx.tool_scope.functions.append_job_functions();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("my_build_tool"));
 
         let mut role = Role::new("r", "p");
-        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+        role.set_enabled_tools(Some(vec!["my_build_tool".to_string()]));
 
         let fns = ctx.select_functions(&role).unwrap();
         assert!(
             fns.iter().any(|f| f.name == "job__start"),
-            "job__ tools must survive a role tool filter"
+            "job__ tools must survive a role tool filter that declares a backgroundable tool"
+        );
+    }
+
+    #[test]
+    fn select_functions_hides_job_tools_when_filter_has_only_non_backgroundable_tools() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("fs_cat"));
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["fs_cat".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        assert!(
+            !fns.iter().any(|f| f.name.starts_with("job__")),
+            "job__ tools must be hidden when no declared tool is backgroundable"
         );
     }
 
@@ -5822,14 +5887,22 @@ mod tests {
     fn before_chat_completion_refreshes_declared_function_names() {
         let mut ctx = create_test_ctx();
         ctx.tool_scope.functions.append_job_functions();
-        let input = Input::from_str(&ctx, "hello", None).unwrap();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("echo"));
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["echo".to_string()]));
+        let input = Input::from_str(&ctx, "hello", Some(role)).unwrap();
         ctx.before_chat_completion(&input).unwrap();
 
-        assert_eq!(ctx.declared_function_names.len(), 5);
+        assert_eq!(ctx.declared_function_names.len(), 6);
         assert!(ctx.declared_function_names.contains("job__start"));
+        assert!(ctx.declared_function_names.contains("echo"));
 
         ctx.tool_scope = ToolScope::default();
-        let input = Input::from_str(&ctx, "hello again", None).unwrap();
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["echo".to_string()]));
+        let input = Input::from_str(&ctx, "hello again", Some(role)).unwrap();
         ctx.before_chat_completion(&input).unwrap();
 
         assert!(
@@ -6084,6 +6157,9 @@ mod tests {
 
         let abort = utils::create_abort_signal();
         run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("foo"));
 
         let mut role = Role::new("r", "p");
         role.set_enabled_tools(Some(vec!["foo".to_string()]));
@@ -6092,7 +6168,7 @@ mod tests {
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
         assert!(
             names.contains(&"job__start"),
-            "job__ tools must survive an agent tool filter, got: {names:?}"
+            "job__ tools must survive an agent tool filter that declares a backgroundable tool, got: {names:?}"
         );
         assert!(names.contains(&"job__collect"));
     }
@@ -7563,9 +7639,30 @@ mod tests {
     }
 
     #[test]
-    fn select_functions_preserves_job_tools_under_empty_role_filter() {
+    fn select_functions_hides_job_tools_under_empty_role_filter() {
         let mut ctx = create_test_ctx();
         ctx.tool_scope.functions.append_job_functions();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec![]));
+
+        assert!(
+            ctx.select_functions(&role).is_none(),
+            "an empty tool filter declares nothing backgroundable, so job__ tools must be hidden"
+        );
+    }
+
+    #[test]
+    fn select_functions_keeps_lifecycle_job_tools_when_context_owns_jobs() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+        let sup = Arc::new(RwLock::new(
+            Supervisor::new(4, 3).with_max_concurrent_jobs(1),
+        ));
+        sup.write()
+            .register(make_running_job(utils::create_abort_signal()))
+            .unwrap();
+        ctx.supervisor = Some(sup);
 
         let mut role = Role::new("r", "p");
         role.set_enabled_tools(Some(vec![]));
@@ -7574,20 +7671,40 @@ mod tests {
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             names,
-            vec![
-                "job__start",
-                "job__check",
-                "job__collect",
-                "job__cancel",
-                "job__list"
-            ],
-            "job__ tools must survive an empty role tool filter"
+            vec!["job__check", "job__collect", "job__cancel", "job__list"],
+            "lifecycle verbs must stay reachable while the context owns a job; job__start must not"
         );
     }
 
     #[test]
+    fn owns_active_jobs_respects_node_scope() {
+        let mut ctx = create_test_ctx();
+        let sup = Arc::new(RwLock::new(
+            Supervisor::new(4, 3).with_max_concurrent_jobs(1),
+        ));
+        sup.write()
+            .register(make_running_job(utils::create_abort_signal()))
+            .unwrap();
+        ctx.supervisor = Some(sup);
+
+        assert!(
+            ctx.owns_active_jobs(),
+            "outside a node, the context owns every registry job"
+        );
+
+        ctx.node_job_scope = Some(vec![]);
+        assert!(
+            !ctx.owns_active_jobs(),
+            "a node owns only jobs it started, not other registry entries"
+        );
+
+        ctx.node_job_scope = Some(vec!["j1".to_string()]);
+        assert!(ctx.owns_active_jobs());
+    }
+
+    #[test]
     #[serial]
-    fn select_functions_preserves_job_tools_under_empty_agent_filter() {
+    fn select_functions_hides_job_tools_under_empty_agent_filter() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
@@ -7612,13 +7729,16 @@ mod tests {
         let mut role = Role::new("r", "p");
         role.set_enabled_tools(Some(vec![]));
 
-        let fns = ctx.select_functions(&role).unwrap();
-        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        let names: Vec<String> = ctx
+            .select_functions(&role)
+            .unwrap_or_default()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
         assert!(
-            names.contains(&"job__start"),
-            "job__ tools must survive an empty agent tool filter, got: {names:?}"
+            !names.iter().any(|n| n.starts_with("job__")),
+            "job__ tools must be hidden under an empty agent filter, got: {names:?}"
         );
-        assert!(names.contains(&"job__collect"));
     }
 
     #[test]
@@ -7638,6 +7758,9 @@ mod tests {
             ..(*app).clone()
         };
         run_async(ctx.rebuild_tool_scope(&jobs_off, None, abort.clone())).unwrap();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("echo"));
         let without_jobs = serde_json::to_string(&ctx.select_functions(&role)).unwrap();
         assert!(
             !without_jobs.contains("job__"),
@@ -7645,6 +7768,9 @@ mod tests {
         );
 
         run_async(ctx.rebuild_tool_scope(&app, None, abort)).unwrap();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("echo"));
         let with_jobs = ctx.select_functions(&role).unwrap();
         assert!(with_jobs.iter().any(|f| f.name.starts_with("job__")));
         let stripped: Vec<FunctionDeclaration> = with_jobs
@@ -7685,6 +7811,12 @@ mod tests {
     fn tools_info_lists_job_tools_when_enabled() {
         let mut ctx = create_test_ctx();
         ctx.tool_scope.functions.append_job_functions();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("echo"));
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["echo".to_string()]));
+        ctx.role = Some(role);
 
         let info = ctx.tools_info().unwrap();
 
