@@ -15,6 +15,11 @@ set -e
 #   - vertexai:gemini-*
 #   - perplexity:*
 #   - ernie:*
+#   - claude:*                       (Anthropic native web_search server tool)
+#   - openai:gpt-4o-search-preview   (and -mini-; requires an api-key openai
+#                                     client — the codex OAuth path uses the
+#                                     Responses API where this parameter
+#                                     does not exist)
 # @env LLM_OUTPUT=/dev/stdout The output path
 
 # shellcheck disable=SC2154
@@ -30,6 +35,13 @@ main() {
 }'
     elif [[ "$client" == "ernie" ]]; then
         export COYOTE_PATCH_ERNIE_CHAT_COMPLETIONS='{".*":{"body":{"web_search":{"enable":true}}}}'
+    elif [[ "$client" == "claude" ]]; then
+        export COYOTE_PATCH_CLAUDE_CHAT_COMPLETIONS='{".*":{"body":{"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":5}]}}}'
+    elif [[ "$client" == "openai" ]]; then
+        # Chat Completions native search exists only on the search-preview
+        # models; the regex scopes the patch so other OpenAI models run
+        # unpatched instead of erroring on an unsupported parameter.
+        export COYOTE_PATCH_OPENAI_CHAT_COMPLETIONS='{"gpt-4o.*search-preview.*":{"body":{"web_search_options":{}}}}'
     fi
 
     coyote -m "$WEB_SEARCH_MODEL" "$argc_query" >> "$LLM_OUTPUT"
