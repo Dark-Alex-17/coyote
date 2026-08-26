@@ -563,10 +563,14 @@ mod tests {
 mod integration_tests {
     use super::*;
     use crate::config::{AppState, WorkingMode};
+    #[cfg(unix)]
     use crate::function::jobs::RingBuf;
+    #[cfg(unix)]
     use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor, notification};
     use crate::utils::{create_abort_signal, temp_file};
-    use std::{fs, mem};
+    use std::fs;
+    #[cfg(unix)]
+    use std::mem;
 
     fn cmd_available(name: &str) -> bool {
         which::which(name).is_ok()
