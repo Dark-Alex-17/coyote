@@ -171,7 +171,9 @@ pub fn job_function_declarations() -> Vec<FunctionDeclaration> {
             description: "Non-blocking status probe for a background job. Returns status, elapsed time, and a tail \
                           of the output captured so far; it NEVER consumes the result — use `job__collect` for \
                           that. Call sparingly: if repeated checks show no change, do other work instead — you \
-                          will be notified when the job completes.".to_string(),
+                          will be notified when the job completes. `output_bytes_captured` reports the total \
+                          output size so far — use it to decide how to collect (`tail_lines`, `full_result`, or \
+                          having the command write to a file).".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([(
@@ -191,7 +193,11 @@ pub fn job_function_declarations() -> Vec<FunctionDeclaration> {
             name: format!("{JOB_FUNCTION_PREFIX}collect"),
             description: "Block until the named background job finishes, then return its result and remove the \
                           job. The result keeps the LAST 50,000 chars by default (failures land at the tail of \
-                          build logs); pass `tail_lines` to keep only the last N lines instead.".to_string(),
+                          build logs); pass `tail_lines` to keep only the last N lines instead, or \
+                          `full_result: true` to skip the cap entirely (the session-wide tool-output limit still \
+                          applies). Collecting is consume-once — decide first via `job__check`'s \
+                          `output_bytes_captured`. For very large outputs, prefer having the command write to a \
+                          file and paging it with `fs_read`.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([
@@ -208,6 +214,14 @@ pub fn job_function_declarations() -> Vec<FunctionDeclaration> {
                         JsonSchema {
                             type_value: Some("number".to_string()),
                             description: Some("Keep only the last N lines of the result".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "full_result".to_string(),
+                        JsonSchema {
+                            type_value: Some("boolean".to_string()),
+                            description: Some("Return the complete result, skipping the default 50,000-char tail cap (default: false)".into()),
                             ..Default::default()
                         },
                     ),
@@ -303,8 +317,7 @@ fn whitelist_rejection(tool: &str) -> Option<Value> {
         MCP_READ_META_FUNCTION_NAME_PREFIX,
         MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
     ];
-    let reason = if tool.starts_with(AGENT_FUNCTION_PREFIX)
-        || tool.starts_with(JOB_FUNCTION_PREFIX)
+    let reason = if tool.starts_with(AGENT_FUNCTION_PREFIX) || tool.starts_with(JOB_FUNCTION_PREFIX)
     {
         Some(format!(
             "'{tool}' is already asynchronous — call it directly. Agents may start jobs, but jobs never start agents or other jobs."
@@ -575,6 +588,10 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
         .get("tail_lines")
         .and_then(Value::as_u64)
         .map(|n| n as usize);
+    let full_result = args
+        .get("full_result")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let Some(supervisor) = ctx.supervisor.as_ref().cloned() else {
         return Ok(job_miss_error(None, id));
@@ -700,7 +717,7 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
         Ok(Ok(job_result)) => job_result,
     };
 
-    let (result_value, result_truncated) = cap_result(job_result.output, tail_lines);
+    let (result_value, result_truncated) = cap_result(job_result.output, tail_lines, full_result);
     let mut response = json!({
         "status": job_status_str(status),
         "id": id,
@@ -1104,8 +1121,10 @@ async fn run_mcp_job(
 
 /// Tail-biased result capping owned by the collect handler: keeps the LAST
 /// `tail_lines`/50,000 chars (build failures land at the tail), always cutting
-/// on a char boundary.
-fn cap_result(output: Value, tail_lines: Option<usize>) -> (Value, bool) {
+/// on a char boundary. `full_result` lifts the 50,000-char ceiling (the
+/// session-wide tool-output limit still applies downstream); `tail_lines` is
+/// honored either way.
+fn cap_result(output: Value, tail_lines: Option<usize>, full_result: bool) -> (Value, bool) {
     if output.is_null() {
         return (json!("DONE"), false);
     }
@@ -1121,7 +1140,7 @@ fn cap_result(output: Value, tail_lines: Option<usize>) -> (Value, bool) {
             truncated = true;
         }
     }
-    if let Some(capped) = tail_chars(&text, JOB_RESULT_TAIL_CAP_CHARS) {
+    if !full_result && let Some(capped) = tail_chars(&text, JOB_RESULT_TAIL_CAP_CHARS) {
         text = capped;
         truncated = true;
     }
@@ -1146,7 +1165,8 @@ fn tail_chars(text: &str, max_chars: usize) -> Option<String> {
         .unwrap_or(0);
 
     Some(format!(
-        "[truncated: kept last {max_chars} of {total} chars]\n{}",
+        "[truncated: kept last {max_chars} of {total} chars — the rest was not retained; next time \
+         collect with full_result: true, or have the command write its output to a file]\n{}",
         &text[cut..]
     ))
 }
@@ -1935,6 +1955,50 @@ mod tests {
     }
 
     #[test]
+    fn handle_collect_full_result_returns_uncapped() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            let big = "x".repeat(JOB_RESULT_TAIL_CAP_CHARS + 10);
+            let payload = big.clone();
+            let join_handle = tokio::spawn(async move {
+                Ok(JobResult {
+                    output: json!(payload),
+                    exit_code: Some(0),
+                    output_bytes_captured: 0,
+                })
+            });
+            let handle = JobHandle {
+                id: "j1".to_string(),
+                tool: "execute_command".to_string(),
+                started_at: Instant::now(),
+                join_handle,
+                abort_signal: create_abort_signal(),
+                state: Arc::new(Mutex::new(JobState {
+                    status: JobStatus::Completed,
+                    pgid: None,
+                })),
+                output_buf: Arc::new(Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+                last_check_state: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            let result = handle_collect(&ctx, &json!({"id": "j1", "full_result": true}))
+                .await
+                .unwrap();
+
+            assert_eq!(result["status"], "completed");
+            assert_eq!(result["result"], json!(big));
+            assert!(result.get("result_truncated").is_none());
+        });
+    }
+
+    #[test]
     fn handle_collect_maps_panic_to_failed_with_ring_content() {
         run_async(async {
             let ctx = ctx_with_job_supervisor(4);
@@ -2102,7 +2166,7 @@ mod tests {
 
     #[test]
     fn cap_result_normalizes_null_to_done() {
-        let (value, truncated) = cap_result(Value::Null, None);
+        let (value, truncated) = cap_result(Value::Null, None, false);
 
         assert_eq!(value, json!("DONE"));
         assert!(!truncated);
@@ -2110,7 +2174,7 @@ mod tests {
 
     #[test]
     fn cap_result_preserves_small_values() {
-        let (value, truncated) = cap_result(json!({"a": 1}), None);
+        let (value, truncated) = cap_result(json!({"a": 1}), None, false);
 
         assert_eq!(value, json!({"a": 1}));
         assert!(!truncated);
@@ -2119,14 +2183,31 @@ mod tests {
     #[test]
     fn cap_result_keeps_last_chars_on_char_boundary() {
         let text = "é".repeat(JOB_RESULT_TAIL_CAP_CHARS + 10);
-        let (value, truncated) = cap_result(json!(text), None);
+        let (value, truncated) = cap_result(json!(text), None, false);
         assert!(truncated);
         let capped = value.as_str().unwrap();
         assert!(capped.starts_with(&format!(
-            "[truncated: kept last {} of {} chars]",
+            "[truncated: kept last {} of {} chars — ",
             JOB_RESULT_TAIL_CAP_CHARS,
             JOB_RESULT_TAIL_CAP_CHARS + 10
         )));
+    }
+
+    #[test]
+    fn cap_result_full_result_skips_char_cap() {
+        let text = "a".repeat(JOB_RESULT_TAIL_CAP_CHARS + 10);
+        let (value, truncated) = cap_result(json!(text), None, true);
+
+        assert!(!truncated);
+        assert_eq!(value, json!(text));
+    }
+
+    #[test]
+    fn cap_result_full_result_still_applies_tail_lines() {
+        let (value, truncated) = cap_result(json!("l1\nl2\nl3"), Some(2), true);
+
+        assert!(truncated);
+        assert_eq!(value, json!("l2\nl3"));
     }
 
     #[test]
@@ -2134,7 +2215,8 @@ mod tests {
         let capped = tail_chars("aébc", 2).unwrap();
 
         assert!(capped.ends_with("bc"));
-        assert!(capped.starts_with("[truncated: kept last 2 of 4 chars]"));
+        assert!(capped.starts_with("[truncated: kept last 2 of 4 chars — "));
+        assert!(capped.contains("full_result: true"));
         assert!(tail_chars("abc", 3).is_none());
     }
 
@@ -2406,12 +2488,7 @@ mod tests {
         .unwrap();
         assert_eq!(created["status"], "ok");
 
-        let tasks = run_async(handle_agent_tool(
-            &mut ctx,
-            "agent__task_list",
-            &json!({}),
-        ))
-        .unwrap();
+        let tasks = run_async(handle_agent_tool(&mut ctx, "agent__task_list", &json!({}))).unwrap();
         assert_eq!(tasks["tasks"].as_array().unwrap().len(), 1);
     }
 

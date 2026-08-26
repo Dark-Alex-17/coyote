@@ -198,7 +198,9 @@ pub(in crate::config) const DEFAULT_JOB_INSTRUCTIONS: &str = indoc! {"
     working instead of blocking — completion arrives as a `system_notifications` entry on your
     next tool result. Check progress with `job__check` (sparingly), block on the result with
     `job__collect` (only when you have nothing else to do), cancel with `job__cancel`, and list
-    jobs with `job__list`. Collect or cancel every job you started before ending your turn. In
+    jobs with `job__list`. Collected results over 50,000 chars are tail-capped; collecting is
+    consume-once, so when you need the complete output pass `full_result: true` (or have the
+    command write to a file). Collect or cancel every job you started before ending your turn. In
     graph LLM nodes, collect or cancel your jobs before ending your final node turn — an
     uncollected job at node turn-end burns node iterations via the guardrail and can fail the
     node. Jobs run against a snapshot of the current config/environment and do not survive
