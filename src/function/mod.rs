@@ -4730,7 +4730,11 @@ mod tests {
 
     #[test]
     fn eval_routes_memory_prefix_to_memory_handler() {
-        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let mut app_state = AppState::test_default();
+        let mut app_config = (*app_state.config).clone();
+        app_config.memory = Some(true);
+        app_state.config = Arc::new(app_config);
+        let mut ctx = RequestContext::new(Arc::new(app_state), WorkingMode::Cmd);
         ctx.tool_scope.functions.append_memory_functions();
 
         let out = run_async(call_with_args("memory__read", json!({})).eval(&mut ctx)).unwrap();
