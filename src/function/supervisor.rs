@@ -23,7 +23,7 @@ use tokio::time;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-pub const SUPERVISOR_FUNCTION_PREFIX: &str = "agent__";
+pub const AGENT_FUNCTION_PREFIX: &str = "agent__";
 
 pub const PENDING_TASKS_GUARDRAIL_MAX: u32 = 3;
 
@@ -186,7 +186,7 @@ pub fn check_pending_tasks_guardrail(ctx: &mut RequestContext) -> GuardrailActio
 
 pub fn escalation_function_declarations() -> Vec<FunctionDeclaration> {
     vec![FunctionDeclaration {
-        name: format!("{SUPERVISOR_FUNCTION_PREFIX}reply_escalation"),
+        name: format!("{AGENT_FUNCTION_PREFIX}reply_escalation"),
         description: "Reply to a pending escalation from a child agent. The child is blocked waiting for this reply. \
                       Use this after seeing pending_escalations notifications.".to_string(),
         parameters: JsonSchema {
@@ -217,10 +217,10 @@ pub fn escalation_function_declarations() -> Vec<FunctionDeclaration> {
     }]
 }
 
-pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
+pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}spawn"),
+            name: format!("{AGENT_FUNCTION_PREFIX}spawn"),
             description: "Spawn a subagent to run in the background. Returns an `id` immediately so you can continue \
                           working in parallel. CRITICAL: every spawned agent MUST be reclaimed before you end your \
                           turn — call `agent__collect` to retrieve its output, or `agent__cancel` if you no longer \
@@ -260,7 +260,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}check"),
+            name: format!("{AGENT_FUNCTION_PREFIX}check"),
             description: "Non-blocking status probe: reports whether a spawned agent is still running or finished. \
                           NEVER returns or consumes the result — when finished, call agent__collect to retrieve it.".to_string(),
             parameters: JsonSchema {
@@ -279,7 +279,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}collect"),
+            name: format!("{AGENT_FUNCTION_PREFIX}collect"),
             description: "Block until the named spawned agent finishes and return its result. This is your primary \
                           wait primitive — it pauses your execution until the agent completes (or you are interrupted). \
                           Call this for every agent you spawned before ending your turn. Do NOT end your turn assuming \
@@ -301,7 +301,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}list_running"),
+            name: format!("{AGENT_FUNCTION_PREFIX}list_running"),
             description: "List all subagents YOU have spawned that are still tracked by the supervisor, with their \
                           status. Use this to see which of your background agents are still active. To discover which \
                           agent types you can spawn in the first place, use `agent__list_available` instead.".to_string(),
@@ -313,7 +313,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}list_available"),
+            name: format!("{AGENT_FUNCTION_PREFIX}list_available"),
             description: "List all agent types installed and available to spawn (name + description). Use this to \
                           discover what specialists exist before calling `agent__spawn` — especially when you're unsure \
                           which agent to delegate to. This is the discovery counterpart to `agent__list_running` \
@@ -326,7 +326,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}cancel"),
+            name: format!("{AGENT_FUNCTION_PREFIX}cancel"),
             description: "Cancel a running subagent by its ID. Use this when an agent's output is no longer needed \
                           (e.g. you changed direction, or you're about to end your turn and don't want to wait). \
                           Cancellation cascades: all of the cancelled agent's own descendants are also cancelled. This \
@@ -347,7 +347,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}task_create"),
+            name: format!("{AGENT_FUNCTION_PREFIX}task_create"),
             description: "Create a task in the task queue. Returns the task ID.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -403,7 +403,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}task_list"),
+            name: format!("{AGENT_FUNCTION_PREFIX}task_list"),
             description: "List all tasks in the task queue with their status and dependencies.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -413,7 +413,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}task_complete"),
+            name: format!("{AGENT_FUNCTION_PREFIX}task_complete"),
             description: "Mark a task as completed. Returns any newly unblocked task IDs.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -431,7 +431,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}task_fail"),
+            name: format!("{AGENT_FUNCTION_PREFIX}task_fail"),
             description: "Mark a task as failed. Dependents will remain blocked.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -454,7 +454,7 @@ pub fn supervisor_function_declarations() -> Vec<FunctionDeclaration> {
 pub fn teammate_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}send_message"),
+            name: format!("{AGENT_FUNCTION_PREFIX}send_message"),
             description: "Send a text message to a sibling or child agent's inbox. Use to share cross-cutting findings or coordinate with teammates.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -482,7 +482,7 @@ pub fn teammate_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
-            name: format!("{SUPERVISOR_FUNCTION_PREFIX}check_inbox"),
+            name: format!("{AGENT_FUNCTION_PREFIX}check_inbox"),
             description: "Check for and drain all pending messages in your inbox from sibling agents or your parent.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -494,13 +494,13 @@ pub fn teammate_function_declarations() -> Vec<FunctionDeclaration> {
     ]
 }
 
-pub async fn handle_supervisor_tool(
+pub async fn handle_agent_tool(
     ctx: &mut RequestContext,
     cmd_name: &str,
     args: &Value,
 ) -> Result<Value> {
     let action = cmd_name
-        .strip_prefix(SUPERVISOR_FUNCTION_PREFIX)
+        .strip_prefix(AGENT_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
 
     match action {
@@ -2137,7 +2137,7 @@ mod tests {
     #[test]
     fn dispatch_unknown_action_errors() {
         let mut ctx = ctx_with_supervisor(4, 3);
-        let result = run_async(handle_supervisor_tool(&mut ctx, "agent__bogus", &json!({})));
+        let result = run_async(handle_agent_tool(&mut ctx, "agent__bogus", &json!({})));
         assert!(result.is_err());
         assert!(
             result
@@ -2150,7 +2150,7 @@ mod tests {
     #[test]
     fn dispatch_routes_list_running() {
         let mut ctx = ctx_with_supervisor(4, 3);
-        let result = run_async(handle_supervisor_tool(
+        let result = run_async(handle_agent_tool(
             &mut ctx,
             "agent__list_running",
             &json!({}),
@@ -2162,7 +2162,7 @@ mod tests {
     #[test]
     fn dispatch_routes_list_available() {
         let mut ctx = ctx_with_supervisor(4, 3);
-        let result = run_async(handle_supervisor_tool(
+        let result = run_async(handle_agent_tool(
             &mut ctx,
             "agent__list_available",
             &json!({}),
@@ -2175,12 +2175,8 @@ mod tests {
     #[test]
     fn dispatch_routes_task_list() {
         let mut ctx = ctx_with_supervisor(4, 3);
-        let result = run_async(handle_supervisor_tool(
-            &mut ctx,
-            "agent__task_list",
-            &json!({}),
-        ))
-        .unwrap();
+        let result =
+            run_async(handle_agent_tool(&mut ctx, "agent__task_list", &json!({}))).unwrap();
         assert!(result["tasks"].is_array());
     }
 

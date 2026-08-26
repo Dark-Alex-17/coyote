@@ -1,7 +1,7 @@
 use super::memory::MEMORY_FUNCTION_PREFIX;
 use super::rag_query::RAG_FUNCTION_PREFIX;
 use super::skill::SKILL_FUNCTION_PREFIX;
-use super::supervisor::SUPERVISOR_FUNCTION_PREFIX;
+use super::supervisor::AGENT_FUNCTION_PREFIX;
 use super::todo::TODO_FUNCTION_PREFIX;
 use super::user_interaction::USER_FUNCTION_PREFIX;
 use super::{FunctionDeclaration, JsonSchema, PATH_SEP, mcp_error_display, render_tool_result};
@@ -303,7 +303,7 @@ fn whitelist_rejection(tool: &str) -> Option<Value> {
         MCP_READ_META_FUNCTION_NAME_PREFIX,
         MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
     ];
-    let reason = if tool.starts_with(SUPERVISOR_FUNCTION_PREFIX)
+    let reason = if tool.starts_with(AGENT_FUNCTION_PREFIX)
         || tool.starts_with(JOB_FUNCTION_PREFIX)
     {
         Some(format!(
@@ -1156,7 +1156,7 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, AppState, WorkingMode};
     use crate::function::supervisor::{
-        GuardrailAction, check_pending_tasks_guardrail, handle_supervisor_tool,
+        GuardrailAction, check_pending_tasks_guardrail, handle_agent_tool,
     };
     use crate::supervisor::mailbox::Inbox;
     use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
@@ -2343,7 +2343,7 @@ mod tests {
     fn jobs_only_supervisor_rejects_agent_spawn_at_capacity_zero() {
         let mut ctx = ctx_with_job_supervisor(5);
 
-        let result = run_async(handle_supervisor_tool(
+        let result = run_async(handle_agent_tool(
             &mut ctx,
             "agent__spawn",
             &json!({"agent": "explore", "prompt": "x"}),
@@ -2389,7 +2389,7 @@ mod tests {
     fn jobs_only_supervisor_agent_surfaces_stay_functional() {
         let mut ctx = ctx_with_job_supervisor(5);
 
-        let listed = run_async(handle_supervisor_tool(
+        let listed = run_async(handle_agent_tool(
             &mut ctx,
             "agent__list_running",
             &json!({}),
@@ -2398,7 +2398,7 @@ mod tests {
         assert_eq!(listed["active_count"], 0);
         assert_eq!(listed["max_concurrent"], 0);
 
-        let created = run_async(handle_supervisor_tool(
+        let created = run_async(handle_agent_tool(
             &mut ctx,
             "agent__task_create",
             &json!({"subject": "research"}),
@@ -2406,7 +2406,7 @@ mod tests {
         .unwrap();
         assert_eq!(created["status"], "ok");
 
-        let tasks = run_async(handle_supervisor_tool(
+        let tasks = run_async(handle_agent_tool(
             &mut ctx,
             "agent__task_list",
             &json!({}),

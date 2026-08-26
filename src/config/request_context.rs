@@ -22,7 +22,7 @@ use crate::function::{
     memory::MEMORY_FUNCTION_PREFIX,
     rag_query::RAG_FUNCTION_PREFIX,
     skill::SKILL_FUNCTION_PREFIX,
-    supervisor::SUPERVISOR_FUNCTION_PREFIX,
+    supervisor::AGENT_FUNCTION_PREFIX,
     todo::TODO_FUNCTION_PREFIX,
     user_interaction::USER_FUNCTION_PREFIX,
 };
@@ -2181,7 +2181,7 @@ impl RequestContext {
                                 && v.name.starts_with(SKILL_FUNCTION_PREFIX))
                             || v.name.starts_with(USER_FUNCTION_PREFIX)
                             || v.name.starts_with(TODO_FUNCTION_PREFIX)
-                            || v.name.starts_with(SUPERVISOR_FUNCTION_PREFIX)
+                            || v.name.starts_with(AGENT_FUNCTION_PREFIX)
                             || v.name.starts_with(MEMORY_FUNCTION_PREFIX)
                             || v.name.starts_with(RAG_FUNCTION_PREFIX)
                             || v.name.starts_with(JOB_FUNCTION_PREFIX)

@@ -48,7 +48,7 @@ use std::{
     time::{Duration, Instant},
 };
 use strum_macros::AsRefStr;
-use supervisor::SUPERVISOR_FUNCTION_PREFIX;
+use supervisor::AGENT_FUNCTION_PREFIX;
 use todo::TODO_FUNCTION_PREFIX;
 use user_interaction::USER_FUNCTION_PREFIX;
 
@@ -684,7 +684,7 @@ impl Functions {
 
     pub fn append_supervisor_functions(&mut self) {
         self.declarations
-            .extend(supervisor::supervisor_function_declarations());
+            .extend(supervisor::agent_function_declarations());
         self.declarations
             .extend(supervisor::escalation_function_declarations());
     }
@@ -1589,8 +1589,8 @@ impl ToolCall {
                         json!({"tool_call_error": error_msg})
                     })
             }
-            _ if cmd_name.starts_with(SUPERVISOR_FUNCTION_PREFIX) => {
-                supervisor::handle_supervisor_tool(ctx, &cmd_name, &json_data)
+            _ if cmd_name.starts_with(AGENT_FUNCTION_PREFIX) => {
+                supervisor::handle_agent_tool(ctx, &cmd_name, &json_data)
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("Supervisor tool failed: {e}");
@@ -3249,7 +3249,7 @@ mod tests {
     #[test]
     fn prefix_constants_are_correct() {
         assert_eq!(TODO_FUNCTION_PREFIX, "todo__");
-        assert_eq!(SUPERVISOR_FUNCTION_PREFIX, "agent__");
+        assert_eq!(AGENT_FUNCTION_PREFIX, "agent__");
         assert_eq!(USER_FUNCTION_PREFIX, "user__");
         assert_eq!(MCP_INVOKE_META_FUNCTION_NAME_PREFIX, "mcp_invoke");
         assert_eq!(MCP_SEARCH_META_FUNCTION_NAME_PREFIX, "mcp_search");
