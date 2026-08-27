@@ -16,7 +16,7 @@ Coyote comes ready to use with built-in agents, roles, macros, and tools, so you
 stack from scratch. When you want to extend it, entire bundles of agents, roles, macros, tools, MCP servers, and other
 configurations can be installed directly from any Git repository.
 
-See [Sharing Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Sharing-Configurations) to learn how to create, install, and share Coyote configurations.
+See [Bundles](https://github.com/Dark-Alex-17/coyote/wiki/Bundles) to learn how to create, install, and share Coyote bundles.
 
 
 ![Agent example](https://raw.githubusercontent.com/wiki/Dark-Alex-17/coyote/images/agents/sql.gif)
