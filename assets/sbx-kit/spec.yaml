@@ -9,7 +9,7 @@ kind: sandbox
 name: coyote
 displayName: Coyote
 description: >
-  An all-in-one, batteries-included LLM runtime featuring Shell Assistant,
+  The batteries-included runtime for LLMs, featuring Shell Assistant,
   CLI & REPL mode, RAG, AI tools & agents, MCP servers, skills, and macros.
 
 sandbox:

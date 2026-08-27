@@ -1,4 +1,4 @@
-# Coyote: All-in-one, batteries-included LLM runtime
+# Coyote: The batteries-included runtime for LLMs
 
 ![Test](https://github.com/Dark-Alex-17/coyote/actions/workflows/ci.yaml/badge.svg)
 [![crates.io link](https://img.shields.io/crates/v/coyote-ai.svg)](https://crates.io/crates/coyote-ai)
@@ -8,12 +8,16 @@
 ![Docker pulls](https://img.shields.io/docker/pulls/darkalex17/coyote?label=Docker%20downloads)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://github.com/Dark-Alex-17/coyote/blob/main/LICENSE)
 
-Coyote is an all-in-one, batteries-included, LLM runtime featuring Shell Assistant, CLI & REPL Mode, RAG, AI Tools & 
-Agents, and more.
+Coyote is an **all-in-one, batteries-included LLM runtime** for building, running, and interacting with AI from your terminal.
+It brings together a Shell Assistant, CLI & REPL modes, RAG, tools, agents, MCP, skills, sandboxes, multi-agent workflows, and
+more in a single runtime.
 
-It is designed to include a number of useful agents, roles, macros, and more so users can get up and running with Coyote 
-in as little time as possible. You can also install entire bundles of agents, roles, macros, tools, and MCP servers from 
-any git repository. See [Sharing Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Sharing-Configurations) for more information.
+Coyote comes ready to use with built-in agents, roles, macros, and tools, so you can get started without assembling an AI
+stack from scratch. When you want to extend it, entire bundles of agents, roles, macros, tools, MCP servers, and other
+configurations can be installed directly from any Git repository.
+
+See [Sharing Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Sharing-Configurations) to learn how to create, install, and share Coyote configurations.
+
 
 ![Agent example](https://raw.githubusercontent.com/wiki/Dark-Alex-17/coyote/images/agents/sql.gif)
 
