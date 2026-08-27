@@ -506,6 +506,7 @@ mod tests {
             instructions: Some("sys".into()),
             prompt: "user".into(),
             tools: None,
+            mcp_tools: None,
             model: None,
             temperature: None,
             top_p: None,

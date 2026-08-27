@@ -251,6 +251,7 @@ pub struct Config {
     pub mapping_mcp_servers: IndexMap<String, String>,
     #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
     pub enabled_mcp_servers: Option<Vec<String>>,
+    pub mcp_tools: Option<IndexMap<String, Vec<String>>>,
 
     pub auto_continue: bool,
     pub max_auto_continues: usize,
@@ -334,6 +335,7 @@ impl Default for Config {
             mcp_server_support: true,
             mapping_mcp_servers: Default::default(),
             enabled_mcp_servers: None,
+            mcp_tools: None,
 
             auto_continue: false,
             max_auto_continues: 10,
@@ -1127,6 +1129,17 @@ clients:
     api_key: '{{OPENAI_KEY}}'
 ";
         assert!(validate_no_template_in_secrets_provider(yaml).is_ok());
+    }
+
+    #[test]
+    fn config_yaml_parses_mcp_tools() {
+        let cfg: Config = serde_yaml::from_str("mcp_tools:\n  github:\n    - get_*\n").unwrap();
+
+        assert_eq!(
+            cfg.mcp_tools.as_ref().unwrap().get("github"),
+            Some(&vec!["get_*".to_string()])
+        );
+        assert_eq!(Config::default().mcp_tools, None);
     }
 
     #[test]

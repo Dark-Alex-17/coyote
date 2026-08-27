@@ -50,6 +50,7 @@ pub struct AppConfig {
     pub mapping_mcp_servers: IndexMap<String, String>,
     #[serde(default, deserialize_with = "super::deserialize_csv_or_vec")]
     pub enabled_mcp_servers: Option<Vec<String>>,
+    pub mcp_tools: Option<IndexMap<String, Vec<String>>>,
 
     pub auto_continue: bool,
     pub max_auto_continues: usize,
@@ -136,6 +137,7 @@ impl Default for AppConfig {
             mcp_server_support: true,
             mapping_mcp_servers: Default::default(),
             enabled_mcp_servers: None,
+            mcp_tools: None,
 
             auto_continue: false,
             max_auto_continues: 10,
@@ -223,6 +225,7 @@ impl AppConfig {
             mcp_server_support: config.mcp_server_support,
             mapping_mcp_servers: config.mapping_mcp_servers,
             enabled_mcp_servers: config.enabled_mcp_servers,
+            mcp_tools: config.mcp_tools,
 
             auto_continue: config.auto_continue,
             max_auto_continues: config.max_auto_continues,
@@ -784,6 +787,22 @@ mod tests {
             app.mapping_mcp_servers.get("gh"),
             Some(&"github-mcp".to_string())
         );
+    }
+
+    #[test]
+    fn from_config_copies_mcp_tools() {
+        let mut mcp_tools = IndexMap::new();
+        mcp_tools.insert("github".to_string(), vec!["get_*".to_string()]);
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            clients: vec![ClientConfig::default()],
+            mcp_tools: Some(mcp_tools.clone()),
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        assert_eq!(app.mcp_tools, Some(mcp_tools));
     }
 
     #[test]
