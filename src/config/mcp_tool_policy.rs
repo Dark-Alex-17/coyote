@@ -8,7 +8,6 @@ use std::fmt;
 
 /// The configuration level that contributed a layer of tool patterns for an
 /// MCP server, as rendered in diagnostics.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayerSource {
     Global,
@@ -34,21 +33,18 @@ impl fmt::Display for LayerSource {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledPatterns {
     source: LayerSource,
     raw: Vec<String>,
     regexes: Vec<Regex>,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolFilter {
     layers: Vec<CompiledPatterns>,
 }
 
-#[allow(dead_code)]
 impl ToolFilter {
     pub fn push_layer(&mut self, source: LayerSource, patterns: &[String]) {
         self.layers.push(CompiledPatterns {
@@ -70,6 +66,7 @@ impl ToolFilter {
 
     /// The first matching raw pattern per layer, in layer order, or the
     /// source of the first layer with no match.
+    #[allow(dead_code)]
     pub fn allows_explain(&self, tool: &str) -> Result<Vec<(&LayerSource, &str)>, &LayerSource> {
         let mut matched = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
@@ -86,11 +83,48 @@ impl ToolFilter {
         }
         Ok(matched)
     }
+
+    /// Context-layer patterns that match none of the advertised tools
+    /// surviving the global layer — dead weight, usually a typo.
+    pub fn dead_context_patterns<'a>(
+        &'a self,
+        advertised: &[String],
+    ) -> Vec<(&'a LayerSource, &'a str)> {
+        let surviving: Vec<&String> = advertised
+            .iter()
+            .filter(|name| {
+                self.layers
+                    .iter()
+                    .filter(|layer| layer.source == LayerSource::Global)
+                    .all(|layer| {
+                        layer
+                            .regexes
+                            .iter()
+                            .any(|regex| regex.is_match(name).unwrap_or(false))
+                    })
+            })
+            .collect();
+        let mut dead = Vec::new();
+        for layer in self
+            .layers
+            .iter()
+            .filter(|l| l.source != LayerSource::Global)
+        {
+            for (raw, regex) in layer.raw.iter().zip(&layer.regexes) {
+                if !surviving
+                    .iter()
+                    .any(|name| regex.is_match(name).unwrap_or(false))
+                {
+                    dead.push((&layer.source, raw.as_str()));
+                }
+            }
+        }
+        dead
+    }
 }
 
 /// Translates a glob pattern (`*` = any run of characters, `?` = exactly one)
 /// into an anchored regex. Patterns that fail to compile match nothing.
-#[allow(dead_code)]
 fn compile_glob(pattern: &str) -> Regex {
     let translated = format!(
         "^{}$",
@@ -104,22 +138,18 @@ fn compile_glob(pattern: &str) -> Regex {
     })
 }
 
-#[allow(dead_code)]
 fn never_matching_regex() -> Regex {
     Regex::new("(?!)").expect("'(?!)' is a valid never-matching regex")
 }
 
-#[allow(dead_code)]
 pub struct SkillMcpLayer {
     pub name: String,
     pub enabled_servers: Vec<String>,
     pub mcp_tools: IndexMap<String, Vec<String>>,
 }
 
-#[allow(dead_code)]
 pub struct McpToolPolicy;
 
-#[allow(dead_code)]
 impl McpToolPolicy {
     #[allow(clippy::too_many_arguments)]
     pub fn effective(
@@ -208,7 +238,6 @@ impl McpToolPolicy {
     }
 }
 
-#[allow(dead_code)]
 fn push_level(
     filters: &mut HashMap<String, ToolFilter>,
     mcp_config: &McpServersConfig,
@@ -234,7 +263,6 @@ fn push_level(
 /// a key that is an alias expands to every configured id in its
 /// comma-separated value; anything else is dropped. Keys expanding to the
 /// same server merge their pattern lists.
-#[allow(dead_code)]
 fn expand_server_keys(
     mcp_config: &McpServersConfig,
     aliases: &IndexMap<String, String>,
@@ -248,11 +276,11 @@ fn expand_server_keys(
                 .entry(key.to_string())
                 .or_default()
                 .extend(patterns.iter().cloned());
-        } else if let Some(mapped) = aliases.get(key) {
-            for mapped_id in mapped.split(',').map(str::trim) {
-                if mcp_config.mcp_servers.contains_key(mapped_id) {
+        } else {
+            for mapped_id in expand_mcp_server_alias(aliases, key) {
+                if mcp_config.mcp_servers.contains_key(&mapped_id) {
                     expanded
-                        .entry(mapped_id.to_string())
+                        .entry(mapped_id)
                         .or_default()
                         .extend(patterns.iter().cloned());
                 }
@@ -260,6 +288,25 @@ fn expand_server_keys(
         }
     }
     expanded
+}
+
+/// Expands a `mapping_mcp_servers` alias key into its comma-separated server
+/// ids. A key with no alias entry expands to nothing.
+pub(crate) fn expand_mcp_server_alias(
+    aliases: &IndexMap<String, String>,
+    key: &str,
+) -> Vec<String> {
+    aliases
+        .get(key)
+        .map(|mapped| {
+            mapped
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -755,5 +802,49 @@ mod tests {
             "skill (review)"
         );
         assert_eq!(LayerSource::Node("n1".into()).to_string(), "node (n1)");
+    }
+
+    #[test]
+    fn dead_context_patterns_flags_patterns_matching_nothing() {
+        let filter = layered(&[
+            (LayerSource::Global, &["get_*"]),
+            (LayerSource::Role("dev".into()), &["get_issue", "set_*"]),
+        ]);
+
+        let advertised = vec!["get_issue".to_string(), "set_topic".to_string()];
+        let dead = filter.dead_context_patterns(&advertised);
+
+        // set_* only matches set_topic, which the global layer hides.
+        assert_eq!(dead, vec![(&LayerSource::Role("dev".into()), "set_*")]);
+    }
+
+    #[test]
+    fn dead_context_patterns_is_empty_when_every_pattern_is_live() {
+        let filter = layered(&[
+            (LayerSource::Global, &["get_*"]),
+            (LayerSource::Session, &["get_issue"]),
+        ]);
+
+        let advertised = vec!["get_issue".to_string()];
+        assert!(filter.dead_context_patterns(&advertised).is_empty());
+    }
+
+    #[test]
+    fn dead_context_patterns_ignores_the_global_layer_itself() {
+        let filter = layered(&[(LayerSource::Global, &["zzz_*"])]);
+
+        let advertised = vec!["get_issue".to_string()];
+        assert!(filter.dead_context_patterns(&advertised).is_empty());
+    }
+
+    #[test]
+    fn expand_mcp_server_alias_splits_and_trims() {
+        let aliases = aliases(&[("gh", "github, gitlab,")]);
+
+        assert_eq!(
+            expand_mcp_server_alias(&aliases, "gh"),
+            vec!["github".to_string(), "gitlab".to_string()]
+        );
+        assert!(expand_mcp_server_alias(&aliases, "nope").is_empty());
     }
 }

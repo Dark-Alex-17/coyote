@@ -686,6 +686,7 @@ pub async fn run_agent_for_graph(
         sync_agent_functions_to_ctx(&mut child_ctx)?;
     } else {
         populate_agent_mcp_runtime(&mut child_ctx, &agent_mcp_servers).await?;
+        child_ctx.refresh_mcp_tool_filters();
         sync_agent_functions_to_ctx(&mut child_ctx)?;
         child_ctx.init_agent_shared_variables()?;
     }
@@ -869,6 +870,7 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         sync_agent_functions_to_ctx(&mut child_ctx)?;
     } else {
         populate_agent_mcp_runtime(&mut child_ctx, &agent_mcp_servers).await?;
+        child_ctx.refresh_mcp_tool_filters();
         sync_agent_functions_to_ctx(&mut child_ctx)?;
         child_ctx.init_agent_shared_variables()?;
     }
@@ -1604,6 +1606,7 @@ mod tests {
     use crate::config::test_fixtures::{FixtureServer, fixture_runtime};
     use crate::config::{AgentConfig, AppState, WorkingMode};
     use crate::function::jobs::RingBuf;
+    use crate::mcp::{McpServer, McpServersConfig, McpTransportType};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus};
     use parking_lot::Mutex;
@@ -1789,6 +1792,61 @@ mod tests {
         assert!(functions.contains("mcp_describe_fixture"));
         assert!(functions.contains("mcp_read_fixture"));
         assert!(!functions.contains("mcp_invoke_fixture"));
+    }
+
+    fn app_state_with_fixture_mcp_config() -> Arc<AppState> {
+        let mut state = AppState::test_default();
+        state.mcp_config = Some(McpServersConfig {
+            mcp_servers: [(
+                "fixture".to_string(),
+                McpServer {
+                    transport_type: McpTransportType::Stdio,
+                    command: Some("echo".to_string()),
+                    args: None,
+                    env: None,
+                    cwd: None,
+                    url: None,
+                    headers: None,
+                    oauth: None,
+                    allowed_tools: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn spawned_child_runtime_enforces_child_agent_filters() {
+        use std::sync::atomic::Ordering;
+
+        let config = AgentConfig {
+            mcp_tools: Some(IndexMap::from([(
+                "fixture".to_string(),
+                vec!["get_*".to_string()],
+            )])),
+            ..Default::default()
+        };
+        let mut ctx = RequestContext::new(app_state_with_fixture_mcp_config(), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(config));
+        let fixture = FixtureServer::default();
+        let call_tool_calls = Arc::clone(&fixture.call_tool_calls);
+        let (runtime, _server) = fixture_runtime(fixture).await;
+        ctx.tool_scope.mcp_runtime = runtime;
+
+        populate_agent_mcp_runtime(&mut ctx, &[]).await.unwrap();
+        ctx.refresh_mcp_tool_filters();
+
+        let err = ctx
+            .tool_scope
+            .mcp_runtime
+            .invoke("fixture", "dup", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "dup not found in fixture MCP server catalog");
+        assert_eq!(call_tool_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

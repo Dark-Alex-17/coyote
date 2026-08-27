@@ -1,4 +1,5 @@
 use super::bundles::BundleStore;
+use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{INTERRUPTED_RESPONSE_TEXT, Session};
 use super::skill::{SKILL_SCAFFOLD, Skill};
@@ -51,7 +52,6 @@ use crate::graph;
 use anyhow::{Context, Error, Result, bail};
 use colored::Colorize;
 use gman::providers::SupportedProvider;
-#[cfg(test)]
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
@@ -95,10 +95,10 @@ pub(crate) fn expand_enabled_mcp_server_ids(
     for item in enabled_mcp_servers.iter().map(|s| s.trim()) {
         if mcp_config.mcp_servers.contains_key(item) {
             ids.push(item.to_string());
-        } else if let Some(mapped) = app.mapping_mcp_servers.get(item) {
-            for mapped_id in mapped.split(',').map(|s| s.trim()) {
-                if mcp_config.mcp_servers.contains_key(mapped_id) {
-                    ids.push(mapped_id.to_string());
+        } else {
+            for mapped_id in expand_mcp_server_alias(&app.mapping_mcp_servers, item) {
+                if mcp_config.mcp_servers.contains_key(&mapped_id) {
+                    ids.push(mapped_id);
                 }
             }
         }
@@ -333,6 +333,10 @@ pub struct RequestContext {
     /// context owns every job in its supervisor.
     pub node_job_scope: Option<Vec<String>>,
 
+    /// Set while a graph LLM node with `mcp_tools` is executing; re-applied as
+    /// the last filter layer by every `refresh_mcp_tool_filters` recompute.
+    pub active_node_mcp_tools: Option<(String, IndexMap<String, Vec<String>>)>,
+
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub self_agent_id: Option<String>,
@@ -369,6 +373,7 @@ impl RequestContext {
             tool_scope: ToolScope::default(),
             declared_function_names: Default::default(),
             node_job_scope: None,
+            active_node_mcp_tools: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -410,7 +415,7 @@ impl RequestContext {
             mcp_runtime.sync_from_registry(registry);
         }
 
-        Ok(Self {
+        let mut ctx = Self {
             app,
             macro_flag: false,
             macro_non_isolated: false,
@@ -431,6 +436,7 @@ impl RequestContext {
             },
             declared_function_names: Default::default(),
             node_job_scope: None,
+            active_node_mcp_tools: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -445,7 +451,9 @@ impl RequestContext {
             last_continuation_response: None,
             pending_prefill: None,
             render_mode: RenderMode::default(),
-        })
+        };
+        ctx.refresh_mcp_tool_filters();
+        Ok(ctx)
     }
 
     /// Forks the context for one parallel branch of a graph super-step.
@@ -480,6 +488,7 @@ impl RequestContext {
             tool_scope: self.tool_scope.clone(),
             declared_function_names: self.declared_function_names.clone(),
             node_job_scope: None,
+            active_node_mcp_tools: self.active_node_mcp_tools.clone(),
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -527,6 +536,7 @@ impl RequestContext {
             },
             declared_function_names: Default::default(),
             node_job_scope: None,
+            active_node_mcp_tools: None,
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -2440,7 +2450,9 @@ impl RequestContext {
     pub fn use_temp_role(&mut self, _app: &AppConfig, prompt: &str) -> Result<()> {
         let mut role = Role::new(TEMP_ROLE_NAME, prompt);
         role.set_model(self.current_model().clone());
-        self.use_role_obj(role)
+        self.use_role_obj(role)?;
+        self.refresh_mcp_tool_filters();
+        Ok(())
     }
 
     pub fn edit_config(&self) -> Result<()> {
@@ -3964,7 +3976,68 @@ impl RequestContext {
             mcp_runtime,
             tool_tracker,
         };
+        self.refresh_mcp_tool_filters();
         Ok(())
+    }
+
+    /// In-place full recompute of `tool_scope.mcp_runtime.tool_filters` from
+    /// the current declarative state: mcp.json `allowedTools`, app config,
+    /// active role, agent, session, one layer per loaded skill, and the
+    /// active graph-node layer (always applied last). Never incremental, so
+    /// detach and unload paths need no layer-removal logic.
+    pub fn refresh_mcp_tool_filters(&mut self) {
+        self.tool_scope.mcp_runtime.tool_filters = self.compute_mcp_tool_filters();
+    }
+
+    fn compute_mcp_tool_filters(&self) -> HashMap<String, ToolFilter> {
+        let Some(mcp_config) = self.app.mcp_config.as_ref() else {
+            return HashMap::new();
+        };
+        let app = &self.app.config;
+        let session_map = self.session.as_ref().and_then(|s| s.mcp_tools());
+        let agent_map = self.agent.as_ref().and_then(|a| a.mcp_tools());
+        let agent = self
+            .agent
+            .as_ref()
+            .zip(agent_map.as_ref())
+            .map(|(a, map)| (a.name(), map));
+        let role_map = self.role.as_ref().and_then(|r| r.mcp_tools());
+        let role = self
+            .role
+            .as_ref()
+            .zip(role_map.as_ref())
+            .map(|(r, map)| (r.name(), map));
+        let skills: Vec<SkillMcpLayer> = self
+            .skill_registry
+            .loaded_skills()
+            .filter_map(|skill| {
+                let mcp_tools = skill.mcp_tools()?.clone();
+                Some(SkillMcpLayer {
+                    name: skill.name().to_string(),
+                    enabled_servers: expand_enabled_mcp_server_ids(
+                        app,
+                        mcp_config,
+                        skill.enabled_mcp_servers().unwrap_or_default(),
+                    ),
+                    mcp_tools,
+                })
+            })
+            .collect();
+        let node = self
+            .active_node_mcp_tools
+            .as_ref()
+            .map(|(id, map)| (id.as_str(), map));
+
+        McpToolPolicy::effective(
+            mcp_config,
+            session_map.as_ref(),
+            agent,
+            role,
+            app.mcp_tools.as_ref(),
+            &skills,
+            node,
+            &app.mapping_mcp_servers,
+        )
     }
 
     pub async fn refresh_tool_scope(&mut self, abort_signal: AbortSignal) -> Result<()> {
@@ -4141,6 +4214,7 @@ impl RequestContext {
             }
         }
         self.session = session;
+        self.refresh_mcp_tool_filters();
         self.init_agent_session_variables(new_session)?;
         Ok(())
     }
@@ -4261,6 +4335,7 @@ impl RequestContext {
             .is_some()
             .then(|| RagKey::Agent(agent.name().to_string()));
         self.agent = Some(agent);
+        self.refresh_mcp_tool_filters();
         if let Some(old) = self.supervisor.as_ref() {
             old.read().cancel_recursive();
         }
@@ -8011,5 +8086,192 @@ mod tests {
                 "expected job__start to be rejected on {action}, got: {err}"
             );
         }
+    }
+
+    fn mcp_app_state(servers: &[&str]) -> Arc<AppState> {
+        let mcp_servers = servers
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    McpServer {
+                        transport_type: McpTransportType::Stdio,
+                        command: Some("echo".to_string()),
+                        args: None,
+                        env: None,
+                        cwd: None,
+                        url: None,
+                        headers: None,
+                        oauth: None,
+                        allowed_tools: None,
+                    },
+                )
+            })
+            .collect();
+        Arc::new(AppState {
+            config: Arc::new(AppConfig::default()),
+            vault: Arc::new(Vault::default()),
+            mcp_factory: Arc::new(McpFactory::default()),
+            rag_cache: Arc::new(RagCache::default()),
+            mcp_config: Some(McpServersConfig { mcp_servers }),
+            mcp_log_path: None,
+            mcp_registry: None,
+            functions: Functions::default(),
+        })
+    }
+
+    fn gh_get_only_map() -> IndexMap<String, Vec<String>> {
+        IndexMap::from([("gh".to_string(), vec!["get_*".to_string()])])
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tool_scope_populates_filters_from_a_filtered_role() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let mut role = Role::new("dev", "prompt");
+        role.set_mcp_tools(Some(gh_get_only_map()));
+        ctx.role = Some(role);
+
+        run_async(ctx.refresh_tool_scope(utils::create_abort_signal())).unwrap();
+
+        let filter = ctx
+            .tool_scope
+            .mcp_runtime
+            .tool_filters
+            .get("gh")
+            .expect("a rebuild must never leave a filtered role unfiltered");
+        assert!(filter.allows("get_issue"));
+        assert!(!filter.allows("delete_repo"));
+    }
+
+    #[test]
+    #[serial]
+    fn mid_node_skill_load_keeps_node_filter_layer() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        ctx.update_app_config(|app| app.mcp_server_support = false);
+        ctx.active_node_mcp_tools = Some(("n1".to_string(), gh_get_only_map()));
+        ctx.refresh_mcp_tool_filters();
+        assert!(!ctx.tool_scope.mcp_runtime.tool_filters["gh"].allows("list_prs"));
+
+        ctx.skill_registry
+            .insert(Skill::new(
+                "sec",
+                "---\nenabled_mcp_servers: gh\nmcp_tools:\n  gh: [get_*, list_*]\n---\nBody",
+            ))
+            .unwrap();
+        run_async(ctx.refresh_tool_scope(utils::create_abort_signal())).unwrap();
+
+        let filter = &ctx.tool_scope.mcp_runtime.tool_filters["gh"];
+        assert!(filter.allows("get_issue"));
+        assert!(
+            !filter.allows("list_prs"),
+            "the node layer must survive a mid-node skill load"
+        );
+
+        ctx.active_node_mcp_tools = None;
+        ctx.refresh_mcp_tool_filters();
+        let filter = &ctx.tool_scope.mcp_runtime.tool_filters["gh"];
+        assert!(
+            filter.allows("list_prs"),
+            "the node layer must not outlive the node"
+        );
+        assert!(!filter.allows("delete_repo"));
+    }
+
+    #[test]
+    #[serial]
+    fn set_skills_enabled_does_not_drop_filters() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let mut role = Role::new("dev", "prompt");
+        role.set_mcp_tools(Some(gh_get_only_map()));
+        ctx.role = Some(role);
+        ctx.refresh_mcp_tool_filters();
+        assert!(ctx.tool_scope.mcp_runtime.tool_filters.contains_key("gh"));
+
+        run_async(ctx.update("skills_enabled false", utils::create_abort_signal())).unwrap();
+
+        assert!(ctx.tool_scope.mcp_runtime.tool_filters.contains_key("gh"));
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_applies_persisted_mcp_tools_immediately() {
+        // Mirrors use_session's ordering hazard: the tool-scope rebuild runs
+        // before `self.session` is assigned, so a re-attached session's
+        // persisted map is only enforced by the post-assignment refresh.
+        // (Session::load_from_ctx needs live model resolution, so the
+        // persisted session is round-tripped through serde directly.)
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let mut persisted = Session::default();
+        persisted.set_mcp_tools(Some(gh_get_only_map()));
+        let yaml = serde_yaml::to_string(&persisted).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+
+        run_async(ctx.refresh_tool_scope(utils::create_abort_signal())).unwrap();
+        assert!(
+            !ctx.tool_scope.mcp_runtime.tool_filters.contains_key("gh"),
+            "the pre-assignment rebuild cannot see the session layer"
+        );
+        ctx.session = Some(reloaded);
+        ctx.refresh_mcp_tool_filters();
+
+        let filter = ctx
+            .tool_scope
+            .mcp_runtime
+            .tool_filters
+            .get("gh")
+            .expect("a re-attached session's persisted map must apply immediately");
+        assert!(filter.allows("get_issue"));
+        assert!(!filter.allows("delete_repo"));
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_applies_agent_filters_without_a_session() {
+        let _guard = TestConfigDirGuard::new();
+        let config_path = paths::agent_config_file("filterer");
+        ensure_parent_exists(&config_path).unwrap();
+        write(
+            &config_path,
+            "name: filterer\ninstructions: hi\nmcp_tools:\n  gh:\n    - get_*\n",
+        )
+        .unwrap();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_agent(&app, "filterer", None, utils::create_abort_signal())).unwrap();
+
+        let filter = ctx
+            .tool_scope
+            .mcp_runtime
+            .tool_filters
+            .get("gh")
+            .expect("the agent layer must apply on the no-session use_agent path");
+        assert!(filter.allows("get_issue"));
+        assert!(!filter.allows("delete_repo"));
+    }
+
+    #[test]
+    #[serial]
+    fn use_temp_role_recomputes_filters() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let mut role = Role::new("dev", "prompt");
+        role.set_mcp_tools(Some(gh_get_only_map()));
+        ctx.role = Some(role);
+        ctx.refresh_mcp_tool_filters();
+        assert!(ctx.tool_scope.mcp_runtime.tool_filters.contains_key("gh"));
+
+        let app = ctx.app.config.clone();
+        ctx.use_temp_role(&app, "temp prompt").unwrap();
+
+        assert!(
+            ctx.tool_scope.mcp_runtime.tool_filters.is_empty(),
+            "a temp role must clear the replaced role's filter layer"
+        );
     }
 }

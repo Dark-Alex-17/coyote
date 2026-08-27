@@ -85,9 +85,11 @@ impl MapNodeExecutor {
                 let mut ctx = sub_ctx;
 
                 let exec_result: Result<()> = match &branch_clone.node_type {
-                    NodeType::Llm(n) => LlmNodeExecutor::execute(n, &mut state, &mut ctx)
-                        .await
-                        .map(|_| ()),
+                    NodeType::Llm(n) => {
+                        LlmNodeExecutor::execute(&branch_clone.id, n, &mut state, &mut ctx)
+                            .await
+                            .map(|_| ())
+                    }
                     NodeType::Agent(n) => AgentNodeExecutor::execute(n, &mut state, &mut ctx)
                         .await
                         .map(|_| ()),

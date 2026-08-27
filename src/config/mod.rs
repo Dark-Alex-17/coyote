@@ -42,6 +42,9 @@ pub use self::install_remote::{
 pub use self::macro_policy::{
     MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, ResolvedMacro,
 };
+pub(crate) use self::mcp_tool_policy::expand_mcp_server_alias;
+#[cfg(test)]
+pub(crate) use self::mcp_tool_policy::{LayerSource, ToolFilter};
 #[allow(unused_imports)]
 pub use self::request_context::{
     RenderMode, RequestContext, effective_max_concurrent_jobs, jobs_enabled,

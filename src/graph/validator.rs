@@ -215,11 +215,7 @@ impl GraphValidator {
         };
 
         let expand_alias = |name: &str| {
-            ctx.app_config
-                .mapping_mcp_servers
-                .get(name)
-                .into_iter()
-                .flat_map(|mapped| mapped.split(',').map(|s| s.trim().to_string()))
+            crate::config::expand_mcp_server_alias(&ctx.app_config.mapping_mcp_servers, name)
         };
         let mut enabled_servers: HashSet<String> = ctx.mcp_servers.clone();
         for server in &ctx.mcp_servers {
@@ -255,7 +251,9 @@ impl GraphValidator {
             {
                 for key in mcp_tools.keys() {
                     let enabled = enabled_servers.contains(key)
-                        || expand_alias(key).any(|id| enabled_servers.contains(&id));
+                        || expand_alias(key)
+                            .iter()
+                            .any(|id| enabled_servers.contains(id));
                     if !enabled {
                         result.error(ValidationError::with_node(
                             node_id,

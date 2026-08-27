@@ -34,6 +34,10 @@ impl SkillRegistry {
         self.loaded.keys().cloned().collect()
     }
 
+    pub fn loaded_skills(&self) -> impl Iterator<Item = &Skill> {
+        self.loaded.values()
+    }
+
     pub fn loaded_mcp_servers(&self) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for skill in self.loaded.values() {

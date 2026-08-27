@@ -1,3 +1,4 @@
+use super::mcp_tool_policy::ToolFilter;
 use crate::function::{Functions, ToolCallTracker};
 use crate::mcp::{CatalogItem, CatalogItemKind, ConnectedServer, McpRegistry, McpServerFeatures};
 
@@ -44,6 +45,8 @@ pub enum McpPromptCompletion {
 #[derive(Default, Clone)]
 pub struct McpRuntime {
     pub servers: HashMap<String, Arc<ConnectedServer>>,
+    /// Per-server effective tool allowlists; a server absent here is unfiltered.
+    pub tool_filters: HashMap<String, ToolFilter>,
 }
 
 impl McpRuntime {
@@ -100,12 +103,24 @@ impl McpRuntime {
 
         if features.tools {
             match server_handle.list_all_tools().await {
-                Ok(tools) => merge_catalog_items(
-                    &mut items,
-                    tools
-                        .into_iter()
-                        .map(|tool| tool_catalog_item(server, tool)),
-                ),
+                Ok(mut tools) => {
+                    if let Some(filter) = self.tool_filters.get(server) {
+                        let advertised: Vec<String> =
+                            tools.iter().map(|tool| tool.name.to_string()).collect();
+                        for (source, pattern) in filter.dead_context_patterns(&advertised) {
+                            warn!(
+                                "MCP tool pattern '{pattern}' from {source} matches no allowed tools on server '{server}'"
+                            );
+                        }
+                        tools.retain(|tool| filter.allows(&tool.name));
+                    }
+                    merge_catalog_items(
+                        &mut items,
+                        tools
+                            .into_iter()
+                            .map(|tool| tool_catalog_item(server, tool)),
+                    )
+                }
                 Err(e) => warn!("Failed to list tools on MCP server {server}: {e}"),
             }
         }
@@ -195,6 +210,11 @@ impl McpRuntime {
 
         match kind {
             "tool" => {
+                if let Some(filter) = self.tool_filters.get(server)
+                    && !filter.allows(tool)
+                {
+                    return Err(anyhow!("{tool} not found in {server} MCP server catalog"));
+                }
                 let tool_schema = server_handle
                     .list_all_tools()
                     .await?
@@ -296,6 +316,12 @@ impl McpRuntime {
             .get(server)
             .cloned()
             .with_context(|| format!("Invoked MCP server does not exist: {server}"))?;
+
+        if let Some(filter) = self.tool_filters.get(server)
+            && !filter.allows(tool)
+        {
+            return Err(anyhow!("{tool} not found in {server} MCP server catalog"));
+        }
 
         let mut request = CallToolRequestParams::new(tool.to_owned());
         request.arguments = arguments.as_object().cloned();
@@ -869,6 +895,7 @@ mod tests {
         FIXTURE_ANNOTATED_URI, FixtureServer, add_fixture_server, fixture_runtime,
     };
     use super::*;
+    use crate::config::mcp_tool_policy::LayerSource;
     use crate::function::ToolCall;
     use log::{Level, LevelFilter, Log, Metadata, Record};
     use std::sync::atomic::Ordering;
@@ -1642,5 +1669,158 @@ mod tests {
         };
         assert_eq!(prompt, "summarize");
         assert_eq!(typed_keys, vec!["path".to_string()]);
+    }
+
+    fn single_layer_filter(source: LayerSource, patterns: &[&str]) -> ToolFilter {
+        let mut filter = ToolFilter::default();
+        filter.push_layer(
+            source,
+            &patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        );
+        filter
+    }
+
+    fn deny_all_filter() -> ToolFilter {
+        single_layer_filter(LayerSource::Global, &[])
+    }
+
+    #[tokio::test]
+    async fn catalog_items_drops_filtered_tools_but_keeps_other_kinds() {
+        let fixture = FixtureServer {
+            resources_capability: true,
+            prompts_capability: true,
+            ..Default::default()
+        };
+        let (mut runtime, _server) = fixture_runtime(fixture).await;
+        runtime
+            .tool_filters
+            .insert("fixture".to_string(), deny_all_filter());
+
+        let items = runtime.catalog_items("fixture").await.unwrap();
+
+        assert!(!items.contains_key("tool:dup"));
+        assert!(items.contains_key("resource:dup"));
+        assert!(items.contains_key("resource_template:file:///{path}/{name}"));
+        assert!(items.contains_key("prompt:summarize"));
+    }
+
+    #[tokio::test]
+    async fn catalog_items_keeps_tools_the_filter_allows() {
+        let (mut runtime, _server) = fixture_runtime(FixtureServer::default()).await;
+        runtime.tool_filters.insert(
+            "fixture".to_string(),
+            single_layer_filter(LayerSource::Global, &["d*"]),
+        );
+
+        let items = runtime.catalog_items("fixture").await.unwrap();
+
+        assert!(items.contains_key("tool:dup"));
+    }
+
+    #[tokio::test]
+    async fn search_never_surfaces_filtered_tools() {
+        let fixture = FixtureServer {
+            resources_capability: true,
+            ..Default::default()
+        };
+        let (mut runtime, _server) = fixture_runtime(fixture).await;
+        runtime
+            .tool_filters
+            .insert("fixture".to_string(), deny_all_filter());
+
+        let results = runtime.search("fixture", "dup", 10).await.unwrap();
+
+        assert!(
+            results
+                .iter()
+                .all(|item| item.kind != CatalogItemKind::Tool)
+        );
+        assert!(
+            results
+                .iter()
+                .any(|item| item.kind == CatalogItemKind::Resource)
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_blocked_tool_is_indistinguishable_from_missing() {
+        let (unfiltered, _server) = fixture_runtime(FixtureServer::default()).await;
+        let missing = unfiltered
+            .describe("fixture", "tool", "ghost")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        let (mut filtered, _other_server) = fixture_runtime(FixtureServer::default()).await;
+        filtered
+            .tool_filters
+            .insert("fixture".to_string(), deny_all_filter());
+        let blocked = filtered
+            .describe("fixture", "tool", "dup")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(blocked, "dup not found in fixture MCP server catalog");
+        assert_eq!(blocked, missing.replace("ghost", "dup"));
+    }
+
+    #[tokio::test]
+    async fn invoke_blocked_tool_errors_like_describe_and_never_reaches_server() {
+        let fixture = FixtureServer::default();
+        let call_tool_calls = Arc::clone(&fixture.call_tool_calls);
+        let (mut runtime, _server) = fixture_runtime(fixture).await;
+        runtime
+            .tool_filters
+            .insert("fixture".to_string(), deny_all_filter());
+
+        let invoke_err = runtime
+            .invoke("fixture", "dup", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        let describe_err = runtime
+            .describe("fixture", "tool", "dup")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(invoke_err, "dup not found in fixture MCP server catalog");
+        assert_eq!(invoke_err, describe_err);
+        assert_eq!(call_tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn invoke_allowed_tool_still_reaches_the_server() {
+        let fixture = FixtureServer::default();
+        let call_tool_calls = Arc::clone(&fixture.call_tool_calls);
+        let (mut runtime, _server) = fixture_runtime(fixture).await;
+        runtime.tool_filters.insert(
+            "fixture".to_string(),
+            single_layer_filter(LayerSource::Global, &["d*"]),
+        );
+
+        let _ = runtime.invoke("fixture", "dup", json!({})).await;
+
+        assert_eq!(call_tool_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn catalog_items_warns_on_dead_context_patterns() {
+        install_warn_collector();
+        let (mut runtime, _server) = fixture_runtime(FixtureServer::default()).await;
+        let mut filter = single_layer_filter(LayerSource::Global, &["*"]);
+        filter.push_layer(LayerSource::Session, &["zzz_*".to_string()]);
+        runtime.tool_filters.insert("fixture".to_string(), filter);
+
+        runtime.catalog_items("fixture").await.unwrap();
+
+        let messages = warn_messages().lock().unwrap();
+        assert!(
+            messages.iter().any(|msg| msg.contains("'zzz_*'")
+                && msg.contains("session (.set)")
+                && msg.contains("'fixture'")),
+            "missing dead-pattern warning in: {messages:?}"
+        );
     }
 }
