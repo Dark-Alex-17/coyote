@@ -1191,12 +1191,7 @@ pub async fn run_repl_command(
                 ask(ctx, abort_signal.clone(), input, true).await?;
             }
             ".recover" => {
-                let has_recoverable = ctx
-                    .last_message
-                    .as_ref()
-                    .map(|v| v.continuous && v.input.with_session())
-                    .unwrap_or(false);
-                if !has_recoverable {
+                if !ctx.has_recoverable_interruption() {
                     bail!("Unable to recover: no interrupted session response to recover from");
                 }
                 let recovery_text = args

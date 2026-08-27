@@ -16,6 +16,8 @@ use std::sync::LazyLock;
 
 static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}T\d{6}-").unwrap());
 
+pub const INTERRUPTED_RESPONSE_TEXT: &str = "[Response interrupted due to error]";
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Session {
     #[serde(rename(serialize = "model", deserialize = "model"))]
@@ -173,6 +175,13 @@ impl Session {
 
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty() && self.compressed_messages.is_empty()
+    }
+
+    pub fn has_interrupted_error_checkpoint(&self) -> bool {
+        self.messages.last().is_some_and(|message| {
+            message.role.is_assistant()
+                && matches!(&message.content, MessageContent::Text(text) if text == INTERRUPTED_RESPONSE_TEXT)
+        })
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -934,9 +943,9 @@ impl AutoName {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{Message, MessageContent, MessageRole, Model};
+    use crate::client::{Message, MessageContent, MessageContentToolCalls, MessageRole, Model};
     use crate::config::{AppConfig, AppState, RequestContext, WorkingMode};
-    use crate::function::Functions;
+    use crate::function::{Functions, ToolCall, ToolResult};
     use std::sync::Arc;
 
     #[test]
@@ -947,6 +956,67 @@ mod tests {
         assert_eq!(session.name(), "");
         assert_eq!(session.role_name(), None);
         assert!(!session.dirty());
+    }
+
+    fn push_interrupted_turn(session: &mut Session) {
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("do things".to_string()),
+        ));
+        session.messages.push(Message::new(
+            MessageRole::Tool,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![ToolResult::new(ToolCall::default(), json!("ok"))],
+                String::new(),
+            )),
+        ));
+        session.messages.push(Message::new(
+            MessageRole::Assistant,
+            MessageContent::Text(INTERRUPTED_RESPONSE_TEXT.to_string()),
+        ));
+    }
+
+    #[test]
+    fn session_has_interrupted_error_checkpoint_detects_sentinel() {
+        let mut session = Session::default();
+        assert!(!session.has_interrupted_error_checkpoint());
+
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("hi".to_string()),
+        ));
+        session.messages.push(Message::new(
+            MessageRole::Assistant,
+            MessageContent::Text("hello".to_string()),
+        ));
+        assert!(
+            !session.has_interrupted_error_checkpoint(),
+            "a normal completed exchange is not an interruption"
+        );
+
+        push_interrupted_turn(&mut session);
+        assert!(session.has_interrupted_error_checkpoint());
+    }
+
+    #[test]
+    fn session_interrupted_checkpoint_with_tool_calls_survives_yaml_round_trip() {
+        let mut session = Session::default();
+        push_interrupted_turn(&mut session);
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+
+        assert!(
+            reloaded.has_interrupted_error_checkpoint(),
+            "interruption checkpoint must survive save/reload"
+        );
+        assert!(
+            reloaded.messages.iter().any(|m| matches!(
+                &m.content,
+                MessageContent::ToolCalls(tc) if tc.tool_results.len() == 1
+            )),
+            "tool calls made before the crash must survive save/reload"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use super::bundles::BundleStore;
 use super::rag_cache::{RagCache, RagKey};
-use super::session::Session;
+use super::session::{INTERRUPTED_RESPONSE_TEXT, Session};
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
 use super::skill_registry::SkillRegistry;
@@ -958,11 +958,23 @@ impl RequestContext {
         let mut i = input.clone();
         i.clear_patch();
         if let Some(session) = i.session_mut(&mut self.session) {
-            let _ = session.add_message(&i, "[Response interrupted due to error]");
+            let _ = session.add_message(&i, INTERRUPTED_RESPONSE_TEXT);
             if !app.dry_run && session.save_session() == Some(true) {
                 let _ = session.flush();
             }
         }
+    }
+
+    pub fn has_recoverable_interruption(&self) -> bool {
+        let live = self
+            .last_message
+            .as_ref()
+            .map(|v| v.continuous && v.input.with_session())
+            .unwrap_or(false);
+        live || self
+            .session
+            .as_ref()
+            .is_some_and(Session::has_interrupted_error_checkpoint)
     }
 
     pub fn discontinuous_last_message(&mut self) {
@@ -6736,6 +6748,63 @@ mod tests {
         assert!(
             !ctx.session.as_ref().unwrap().is_empty(),
             "session should have the interrupted turn checkpointed"
+        );
+    }
+
+    #[test]
+    fn has_recoverable_interruption_false_by_default() {
+        let ctx = create_test_ctx();
+        assert!(!ctx.has_recoverable_interruption());
+    }
+
+    #[test]
+    fn has_recoverable_interruption_true_for_live_interrupted_turn() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        ctx.on_chat_completion_error(app.as_ref(), &input);
+
+        assert!(ctx.has_recoverable_interruption());
+    }
+
+    #[test]
+    fn has_recoverable_interruption_false_after_normal_exchange() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "all done")
+            .unwrap();
+
+        assert!(!ctx.has_recoverable_interruption());
+    }
+
+    #[test]
+    fn has_recoverable_interruption_survives_session_save_and_reload() {
+        // Simulates the full user flow: a turn crashes mid-tool-loop (the
+        // checkpoint lands in the session), the user runs `.save session`,
+        // exits, and a fresh process resumes the session. The in-memory
+        // last_message is gone; only the persisted checkpoint can mark the
+        // session recoverable for `.recover`.
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+        ctx.on_chat_completion_error(app.as_ref(), &input);
+
+        let yaml = serde_yaml::to_string(ctx.session.as_ref().unwrap()).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+
+        let mut resumed_ctx = create_test_ctx();
+        resumed_ctx.session = Some(reloaded);
+        assert!(resumed_ctx.last_message.is_none());
+        assert!(
+            resumed_ctx.has_recoverable_interruption(),
+            ".recover must work on a session resumed after an interrupted turn"
         );
     }
 
