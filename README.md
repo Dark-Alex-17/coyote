@@ -6,7 +6,7 @@
 ![Crate.io downloads](https://img.shields.io/crates/d/coyote-ai?label=Crate%20downloads)
 [![GitHub Downloads](https://img.shields.io/github/downloads/Dark-Alex-17/coyote/total.svg?label=GitHub%20downloads)](https://github.com/Dark-Alex-17/coyote/releases)
 ![Docker pulls](https://img.shields.io/docker/pulls/darkalex17/coyote?label=Docker%20downloads)
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](./LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://github.com/Dark-Alex-17/coyote/blob/main/LICENSE)
 
 Coyote is an all-in-one, batteries-included, LLM runtime featuring Shell Assistant, CLI & REPL Mode, RAG, AI Tools & 
 Agents, and more.
@@ -263,7 +263,7 @@ coyote | Out-String | Invoke-Expression
 
 ### Shell Integration
 You can integrate Coyote's Shell Assistant into your shell for enhanced command-line assistance. Add the code in the
-corresponding [shell integration script](./scripts/shell-integration) to your shell. Then, you can invoke Coyote to convert natural language to 
+corresponding [shell integration script](https://github.com/Dark-Alex-17/coyote/tree/main/scripts/shell-integration) to your shell. Then, you can invoke Coyote to convert natural language to 
 shell commands by pressing `Alt-e`. For example:
 
 ```shell
@@ -281,7 +281,7 @@ coyote --info | grep 'config_file' | awk '{print $2}'
 ```
 
 The configuration file consists of a number of settings. To see a full example configuration file with every setting
-defined, refer to the [example configuration file](./config.example.yaml).
+defined, refer to the [example configuration file](https://github.com/Dark-Alex-17/coyote/blob/main/config.example.yaml).
 
 ### Default LLM
 The following settings are available to configure the default LLM that is used when you start Coyote, and its
@@ -335,7 +335,7 @@ The appearance of Coyote can be modified using the following settings:
 
 Coyote began as a fork of [AIChat CLI](https://github.com/sigoden/aichat) and has since evolved into an independent project.
 
-See [CREDITS.md](./CREDITS.md) for full attribution and background.
+See [CREDITS.md](https://github.com/Dark-Alex-17/coyote/blob/main/CREDITS.md) for full attribution and background.
 
 ---
 
@@ -346,11 +346,11 @@ See [CREDITS.md](./CREDITS.md) for full attribution and background.
 
 ## License
 
-Coyote is licensed under the [GNU Affero General Public License v3.0](./LICENSE)
+Coyote is licensed under the [GNU Affero General Public License v3.0](https://github.com/Dark-Alex-17/coyote/blob/main/LICENSE)
 (AGPL-3.0-only).
 
 Coyote began as a fork of [AIChat](https://github.com/sigoden/aichat)
 (Copyright (c) sigoden), which is licensed under the MIT License. Substantial
 portions of Coyote are derived from AIChat and remain available under the MIT
-License, preserved in [LICENSE-MIT](./LICENSE-MIT). See [NOTICE](./NOTICE) and
-[CREDITS.md](./CREDITS.md) for details.
+License, preserved in [LICENSE-MIT](https://github.com/Dark-Alex-17/coyote/blob/main/LICENSE-MIT). See [NOTICE](https://github.com/Dark-Alex-17/coyote/blob/main/NOTICE) and
+[CREDITS.md](https://github.com/Dark-Alex-17/coyote/blob/main/CREDITS.md) for details.
