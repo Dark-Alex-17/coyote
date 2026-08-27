@@ -99,7 +99,7 @@ LABEL com.docker.sandboxes="templates" \
       com.docker.sandboxes.flavor="shell-docker" \
       com.docker.sandboxes.start-docker="true" \
       org.opencontainers.image.title="coyote" \
-      org.opencontainers.image.description="An all-in-one, batteries-included LLM CLI tool: Shell Assistant, CLI & REPL mode, RAG, AI tools & agents, MCP servers, skills, and macros." \
+      org.opencontainers.image.description="An all-in-one, batteries-included LLM runtime: Shell Assistant, CLI & REPL mode, RAG, AI tools & agents, MCP servers, skills, and macros." \
       org.opencontainers.image.source="https://github.com/Dark-Alex-17/coyote" \
       org.opencontainers.image.version="${COYOTE_VERSION}"
 
