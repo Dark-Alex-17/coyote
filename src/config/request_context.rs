@@ -5599,6 +5599,7 @@ mod tests {
                         url: None,
                         headers: None,
                         oauth: None,
+                        allowed_tools: None,
                     },
                 );
             }

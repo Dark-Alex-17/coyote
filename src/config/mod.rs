@@ -8,6 +8,7 @@ pub(crate) mod instructions;
 mod macro_policy;
 mod macros;
 mod mcp_factory;
+mod mcp_tool_policy;
 pub(crate) mod memory;
 pub(crate) mod paths;
 pub(crate) mod prompts;

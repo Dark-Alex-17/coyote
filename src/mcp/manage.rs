@@ -242,6 +242,7 @@ fn build_stdio(cli: &Cli, has_url: bool) -> Result<McpServer> {
         url: None,
         headers: None,
         oauth: None,
+        allowed_tools: None,
     })
 }
 
@@ -300,6 +301,7 @@ fn build_remote(cli: &Cli, transport: McpTransportType, has_command: bool) -> Re
         url: Some(url),
         headers: (!headers.is_empty()).then_some(headers),
         oauth,
+        allowed_tools: None,
     })
 }
 
