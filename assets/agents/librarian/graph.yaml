@@ -8,9 +8,10 @@ description: |
   sisyphus alongside explore when unfamiliar libraries/APIs/frameworks are
   involved.
 
-version: "1.0"
+version: '1.0'
 
 global_tools:
+  - web_search_coyote.sh
   - fetch_url_via_curl.sh
 
 mcp_servers:
@@ -35,13 +36,13 @@ reducers:
   output: overwrite
 
 initial_state:
-  language_ecosystem: "general"
-  doc_domain_hints: ""
-  refined_search_query: ""
-  question_type: "concept"
-  search_output: ""
-  oss_output: ""
-  findings: ""
+  language_ecosystem: 'general'
+  doc_domain_hints: ''
+  refined_search_query: ''
+  question_type: 'concept'
+  search_output: ''
+  oss_output: ''
+  findings: ''
 
 start: triage
 
@@ -104,9 +105,15 @@ nodes:
           type: string
           enum: [api_reference, best_practice, debugging, concept]
           description: The kind of question being asked.
-      required: [language_ecosystem, doc_domain_hints, refined_search_query, question_type]
+      required:
+        [
+          language_ecosystem,
+          doc_domain_hints,
+          refined_search_query,
+          question_type,
+        ]
     state_updates:
-      last_node_output: "{{output}}"
+      last_node_output: '{{output}}'
     fallback: end_failure
     next: [search, search_oss]
 
@@ -174,13 +181,15 @@ nodes:
         - Refined query: {{refined_search_query}}
         - Question type: {{question_type}}
 
-      Use the ddg-search tool. Prioritize the hinted doc domains when present
-      (e.g., search with `site:docs.python.org pathlib` style queries).
+      Use the ddg-search tool or the web_search_coyote tool. Prioritize the
+      hinted doc domains when present (e.g., search with `site:docs.python.org
+      pathlib` style queries).
     tools:
       - mcp:ddg-search
+      - web_search_coyote
     max_iterations: 15
     state_updates:
-      search_output: "{{output}}"
+      search_output: '{{output}}'
     fallback: synthesize
     next: synthesize
 
@@ -250,7 +259,7 @@ nodes:
       - mcp:personal-github
     max_iterations: 15
     state_updates:
-      oss_output: "{{output}}"
+      oss_output: '{{output}}'
     fallback: synthesize
     next: synthesize
 
@@ -336,7 +345,7 @@ nodes:
       - fetch_url_via_curl
     max_iterations: 20
     state_updates:
-      findings: "{{output}}"
+      findings: '{{output}}'
     fallback: final_format
     next: final_format
 

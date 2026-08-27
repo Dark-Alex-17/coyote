@@ -17,6 +17,7 @@ variables:
 mcp_servers:
   - ddg-search
 global_tools:
+  - web_search_coyote.sh
   - ast_grep.sh
   - fs_read.sh
   - fs_cat.sh
