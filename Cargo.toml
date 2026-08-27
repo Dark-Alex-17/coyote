@@ -143,6 +143,7 @@ arboard = { version = "3.3.0", default-features = false }
 libc = "0.2"
 
 [dev-dependencies]
+ctor = "1.0.13"
 pretty_assertions = "1.4.0"
 rmcp = { version = "3.1.2", features = ["server"] }
 serial_test = "3"

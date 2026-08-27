@@ -4901,6 +4901,39 @@ mod tests {
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use std::{env, mem};
 
+    // `list_client_names` / `list_all_models` cache the first AppConfig they
+    // see in process-wide OnceLocks. Several tests reach them through configs
+    // with an empty client list, which would permanently pin every later
+    // model lookup in this process to "unknown model" and make any test that
+    // needs a resolvable model dependent on test ordering. Seed the caches
+    // before any test runs with one client, "test-seeded", exposing a single
+    // embedding model. Deliberately NO chat model: some tests assert that no
+    // chat model is available, and chat lookups don't need one — a
+    // "test-seeded:<anything>" chat id resolves through the create-from-name
+    // fallback because the client name is registered.
+    //
+    // `unsafe` is ctor's required acknowledgment that this runs before main;
+    // the body only allocates and initializes OnceLocks, both of which are
+    // sound pre-main.
+    #[ctor::ctor(unsafe)]
+    fn seed_model_registries() {
+        use crate::client::{ClientConfig, ModelData, list_all_models, list_client_names};
+
+        let mut client = ClientConfig::default();
+        if let ClientConfig::OpenAIConfig(config) = &mut client {
+            config.name = Some("test-seeded".to_string());
+            let mut embedder = ModelData::new("test-embedder");
+            embedder.model_type = "embedding".to_string();
+            config.models = vec![embedder];
+        }
+        let config = AppConfig {
+            clients: vec![client],
+            ..AppConfig::default()
+        };
+        let _ = list_client_names(&config);
+        let _ = list_all_models(&config);
+    }
+
     struct TestConfigDirGuard {
         key: String,
         previous: Option<std::ffi::OsString>,
@@ -8199,25 +8232,23 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_applies_persisted_mcp_tools_immediately() {
-        // Mirrors use_session's ordering hazard: the tool-scope rebuild runs
-        // before `self.session` is assigned, so a re-attached session's
-        // persisted map is only enforced by the post-assignment refresh.
-        // (Session::load_from_ctx needs live model resolution, so the
-        // persisted session is round-tripped through serde directly.)
+        // use_session rebuilds the tool scope BEFORE `self.session` is
+        // assigned, so a re-attached session's persisted allowlist is
+        // enforced only by the filter refresh that runs after the
+        // assignment. Drive the real use_session against a session file on
+        // disk to prove that refresh happens.
         let _guard = TestConfigDirGuard::new();
         let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
-        let mut persisted = Session::default();
-        persisted.set_mcp_tools(Some(gh_get_only_map()));
-        let yaml = serde_yaml::to_string(&persisted).unwrap();
-        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+        let session_path = ctx.session_file("persisted");
+        ensure_parent_exists(&session_path).unwrap();
+        write(
+            &session_path,
+            "model: test-seeded:test-chat\nmessages: []\nmcp_tools:\n  gh:\n    - get_*\n",
+        )
+        .unwrap();
+        let app = ctx.app.config.clone();
 
-        run_async(ctx.refresh_tool_scope(utils::create_abort_signal())).unwrap();
-        assert!(
-            !ctx.tool_scope.mcp_runtime.tool_filters.contains_key("gh"),
-            "the pre-assignment rebuild cannot see the session layer"
-        );
-        ctx.session = Some(reloaded);
-        ctx.refresh_mcp_tool_filters();
+        run_async(ctx.use_session(&app, Some("persisted"), utils::create_abort_signal())).unwrap();
 
         let filter = ctx
             .tool_scope
@@ -8225,6 +8256,45 @@ mod tests {
             .tool_filters
             .get("gh")
             .expect("a re-attached session's persisted map must apply immediately");
+        assert!(filter.allows("get_issue"));
+        assert!(!filter.allows("delete_repo"));
+    }
+
+    #[test]
+    #[serial]
+    fn use_rag_does_not_drop_role_filters() {
+        // Attaching a RAG rebuilds the tool scope from scratch, and the
+        // rebuilt McpRuntime starts with no filters — so the rebuild must
+        // recompute the declarative filter layers or the active role's
+        // allowlist silently disappears. Uses the yaml driver so the load
+        // stays on the local filesystem; the externally-backed attach path
+        // needs a live vector store and cannot run here, but it funnels
+        // through the same tool-scope refresh.
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let mut role = Role::new("dev", "prompt");
+        role.set_mcp_tools(Some(gh_get_only_map()));
+        ctx.role = Some(role);
+        ctx.refresh_mcp_tool_filters();
+        assert!(ctx.tool_scope.mcp_runtime.tool_filters.contains_key("gh"));
+
+        let rag_path = ctx.rag_file("kb");
+        ensure_parent_exists(&rag_path).unwrap();
+        write(
+            &rag_path,
+            "driver: yaml\nembedding_model: test-seeded:test-embedder\nchunk_size: 512\nchunk_overlap: 64\ntop_k: 5\n",
+        )
+        .unwrap();
+
+        run_async(ctx.use_rag(Some("kb"), utils::create_abort_signal())).unwrap();
+
+        assert!(ctx.rag.is_some(), "the RAG must actually load");
+        let filter = ctx
+            .tool_scope
+            .mcp_runtime
+            .tool_filters
+            .get("gh")
+            .expect("attaching a RAG must not drop the role's filter layer");
         assert!(filter.allows("get_issue"));
         assert!(!filter.allows("delete_repo"));
     }
