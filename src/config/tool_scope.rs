@@ -640,6 +640,7 @@ pub(crate) mod test_fixtures {
     #[derive(Clone)]
     pub(crate) struct FixtureServer {
         pub(crate) tools_capability: bool,
+        pub(crate) tool_names: Vec<&'static str>,
         pub(crate) resources_capability: bool,
         pub(crate) prompts_capability: bool,
         pub(crate) hostile_prompt: bool,
@@ -658,6 +659,7 @@ pub(crate) mod test_fixtures {
         fn default() -> Self {
             Self {
                 tools_capability: true,
+                tool_names: vec!["dup"],
                 resources_capability: false,
                 prompts_capability: false,
                 hostile_prompt: false,
@@ -698,11 +700,12 @@ pub(crate) mod test_fixtures {
             .as_object()
             .cloned()
             .unwrap();
-            Ok(ListToolsResult::with_all_items(vec![Tool::new(
-                "dup",
-                "Duplicate-named tool",
-                schema,
-            )]))
+            Ok(ListToolsResult::with_all_items(
+                self.tool_names
+                    .iter()
+                    .map(|name| Tool::new(*name, "Fixture tool", schema.clone()))
+                    .collect(),
+            ))
         }
 
         async fn call_tool(

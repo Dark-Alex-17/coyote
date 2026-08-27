@@ -33,6 +33,21 @@ impl fmt::Display for LayerSource {
     }
 }
 
+impl LayerSource {
+    /// The bare level keyword, for compact diagnostics.
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            LayerSource::Global => "global",
+            LayerSource::AppConfig => "config",
+            LayerSource::Role(_) => "role",
+            LayerSource::Agent(_) => "agent",
+            LayerSource::Session => "session",
+            LayerSource::Skill(_) => "skill",
+            LayerSource::Node(_) => "node",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledPatterns {
     source: LayerSource,
@@ -54,6 +69,13 @@ impl ToolFilter {
         });
     }
 
+    /// Each layer's source and raw patterns, in application order.
+    pub fn layers(&self) -> impl Iterator<Item = (&LayerSource, &[String])> {
+        self.layers
+            .iter()
+            .map(|layer| (&layer.source, layer.raw.as_slice()))
+    }
+
     /// A tool is allowed iff it matches at least one pattern in every layer.
     pub fn allows(&self, tool: &str) -> bool {
         self.layers.iter().all(|layer| {
@@ -66,7 +88,6 @@ impl ToolFilter {
 
     /// The first matching raw pattern per layer, in layer order, or the
     /// source of the first layer with no match.
-    #[allow(dead_code)]
     pub fn allows_explain(&self, tool: &str) -> Result<Vec<(&LayerSource, &str)>, &LayerSource> {
         let mut matched = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
