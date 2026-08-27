@@ -23,7 +23,8 @@ use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,6 +42,8 @@ const JOB_RESULT_TAIL_CAP_CHARS: usize = 50_000;
 const JOB_KILL_GRACE: Duration = Duration::from_secs(5);
 
 const JOB_PUMP_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+const JOB_FILE_TAIL_POLL: Duration = Duration::from_millis(300);
 
 pub fn is_agent_task(supervisor: Option<&Arc<RwLock<Supervisor>>>, id: &str) -> bool {
     id.starts_with("agent_")
@@ -966,6 +969,34 @@ async fn pump_into_ring(mut reader: impl AsyncReadExt + Unpin, output_buf: Arc<M
     }
 }
 
+fn drain_output_file(path: &Path, offset: &Mutex<u64>, output_buf: &Mutex<RingBuf>) {
+    let mut offset = offset.lock();
+    let Ok(mut file) = fs::File::open(path) else {
+        return;
+    };
+    if file.seek(SeekFrom::Start(*offset)).is_err() {
+        return;
+    }
+
+    let mut appended = Vec::new();
+    let Ok(n) = file.read_to_end(&mut appended) else {
+        return;
+    };
+
+    if n > 0 {
+        *offset += n as u64;
+        output_buf.lock().push(&appended);
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Deletes the env snapshot's temp files however the job task exits,
 /// including a cancel/abort dropping the future mid-await.
 struct TempFileGuard(Vec<PathBuf>);
@@ -1030,6 +1061,18 @@ async fn run_process_job(
         .ok_or_else(|| anyhow!("Failed to capture stderr"))?;
     let stdout_pump = tokio::spawn(pump_into_ring(stdout, Arc::clone(&output_buf)));
     let stderr_pump = tokio::spawn(pump_into_ring(stderr, Arc::clone(&output_buf)));
+    let file_offset = Arc::new(Mutex::new(0u64));
+    let file_tailer = AbortOnDrop(tokio::spawn({
+        let path = snapshot.output_file.clone();
+        let offset = Arc::clone(&file_offset);
+        let output_buf = Arc::clone(&output_buf);
+        async move {
+            loop {
+                time::sleep(JOB_FILE_TAIL_POLL).await;
+                drain_output_file(&path, &offset, &output_buf);
+            }
+        }
+    }));
 
     let wait_result = if snapshot.timeout_secs > 0 {
         match time::timeout(Duration::from_secs(snapshot.timeout_secs), child.wait()).await {
@@ -1039,6 +1082,8 @@ async fn run_process_job(
                 state.lock().pgid = None;
                 drain_pump(stdout_pump).await;
                 drain_pump(stderr_pump).await;
+                drop(file_tailer);
+                drain_output_file(&snapshot.output_file, &file_offset, &output_buf);
                 let output_bytes_captured = output_buf.lock().total_written();
                 let message = format!(
                     "Tool call '{}' timed out after {}s and was killed (set COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited)",
@@ -1068,6 +1113,8 @@ async fn run_process_job(
     state.lock().pgid = None;
     drain_pump(stdout_pump).await;
     drain_pump(stderr_pump).await;
+    drop(file_tailer);
+    drain_output_file(&snapshot.output_file, &file_offset, &output_buf);
     let output_bytes_captured = output_buf.lock().total_written();
 
     let exit_code = status.code();
@@ -2370,7 +2417,11 @@ mod tests {
             assert_eq!(result.output, json!({"output": "hi"}));
             let tail = String::from_utf8_lossy(&output_buf.lock().tail()).to_string();
             assert!(tail.contains("captured"));
-            assert_eq!(result.output_bytes_captured, 9);
+            assert!(
+                tail.contains("hi"),
+                "file bytes must reach the ring: {tail}"
+            );
+            assert_eq!(result.output_bytes_captured, 11);
         });
     }
 
@@ -2439,6 +2490,62 @@ mod tests {
             assert_eq!(result.exit_code, Some(0));
             assert_eq!(result.output, json!({"output": "hi"}));
             assert!(!output_file.exists(), "temp file must be removed");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_process_job_counts_output_file_bytes() {
+        run_async(async {
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+            let snapshot = test_snapshot("sh", &["-c", "printf hello >> \"$LLM_OUTPUT\""], 0);
+
+            let result = run_process_job(snapshot, state, Arc::clone(&output_buf))
+                .await
+                .unwrap();
+
+            assert_eq!(result.exit_code, Some(0));
+            assert_eq!(result.output_bytes_captured, 5);
+            let tail = output_buf.lock().tail();
+            assert_eq!(String::from_utf8_lossy(&tail), "hello");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_process_job_streams_output_file_bytes_mid_run() {
+        run_async(async {
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+            let snapshot =
+                test_snapshot("sh", &["-c", "printf early >> \"$LLM_OUTPUT\"; sleep 5"], 0);
+            let task_state = Arc::clone(&state);
+            let task_buf = Arc::clone(&output_buf);
+            let task =
+                tokio::spawn(async move { run_process_job(snapshot, task_state, task_buf).await });
+
+            let mut saw_bytes_mid_run = false;
+            for _ in 0..45 {
+                time::sleep(Duration::from_millis(100)).await;
+                if !task.is_finished() && output_buf.lock().total_written() >= 5 {
+                    saw_bytes_mid_run = true;
+                    break;
+                }
+            }
+            let result = task.await.unwrap().unwrap();
+
+            assert!(
+                saw_bytes_mid_run,
+                "ring buffer never saw $LLM_OUTPUT bytes while the job was still running"
+            );
+            assert_eq!(result.exit_code, Some(0));
         });
     }
 
