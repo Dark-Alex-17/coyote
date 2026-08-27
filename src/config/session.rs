@@ -180,7 +180,7 @@ impl Session {
     pub fn has_interrupted_error_checkpoint(&self) -> bool {
         self.messages.last().is_some_and(|message| {
             message.role.is_assistant()
-                && matches!(&message.content, MessageContent::Text(text) if text == INTERRUPTED_RESPONSE_TEXT)
+                && matches!(&message.content, MessageContent::Text(text) if text.ends_with(INTERRUPTED_RESPONSE_TEXT))
         })
     }
 
@@ -995,6 +995,24 @@ mod tests {
         );
 
         push_interrupted_turn(&mut session);
+        assert!(session.has_interrupted_error_checkpoint());
+    }
+
+    #[test]
+    fn session_detects_checkpoint_appended_by_crashed_continue_turn() {
+        // A crash during a `.continue` turn appends the sentinel to the
+        // previous assistant text (add_message's continue_output branch)
+        // instead of pushing a standalone checkpoint message.
+        let mut session = Session::default();
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("hi".to_string()),
+        ));
+        session.messages.push(Message::new(
+            MessageRole::Assistant,
+            MessageContent::Text(format!("partial answer{INTERRUPTED_RESPONSE_TEXT}")),
+        ));
+
         assert!(session.has_interrupted_error_checkpoint());
     }
 
