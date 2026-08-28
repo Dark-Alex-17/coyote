@@ -28,6 +28,7 @@ points: 1.0            # engineer-days; ~1.0 per the sizing rule
 plan: PLAN-<slug>.md
 blocked_by: []         # TASK ids that must be complete first
 created: YYYY-MM-DD
+surfaces: []           # this task's surfaces; omitted = inherit the plan's list
 ---
 
 ## What
@@ -46,6 +47,8 @@ One paragraph: what this task produces, named concretely (files, symbols, behavi
 ```
 
 Status lives in frontmatter — there are no lifecycle directories. `status: complete` plus all boxes checked IS done.
+
+`surfaces` come from the plan's `## Quality bar`; rigor is run-level only — there is no per-task rigor.
 
 ## log.md conventions
 
