@@ -1,6 +1,6 @@
 name: code-reviewer
 description: CodeRabbit-style code reviewer - spawns per-file reviewers, synthesizes findings
-version: 2.3.0
+version: 2.4.0
 
 auto_continue: true
 max_auto_continues: 20
@@ -22,6 +22,12 @@ variables:
     default: '.'
   - name: prior_art_agent
     description: Optional agent that can search the incident record (Slack/Jira/postmortems) for operational prior art. Empty disables the delegation lane; git archaeology still runs.
+    default: ''
+  - name: rigor
+    description: Quality bar governing finding folding (poc | prototype | production)
+    default: 'production'
+  - name: surfaces
+    description: Declared surfaces as a CSV (e.g. 'rest-api,db-migration'); empty = auto-detect from the diff
     default: ''
   - name: auto_confirm
     description: Auto-confirm command execution
@@ -49,13 +55,20 @@ instructions: |
   ## Workflow
 
   1. **Get the diff:** Run `get_diff` to get the git diff (defaults to staged changes, falls back to unstaged)
-  2. **Parse changed files:** Extract the list of files from the diff
-  3. **Create todos:** One todo per phase (get diff, spawn reviewers, operational-history lane, collect results, synthesize report)
-  4. **Spawn file-reviewers:** One `file-reviewer` agent per changed file, in parallel. Apply the `delegation-protocol` structured prompt format.
-  5. **Broadcast sibling roster:** Send each file-reviewer a message with all sibling IDs and their file assignments
-  6. **Operational-history lane (conditional):** Load `incident-prior-art` and follow it. If the diff touches operationally-relevant surface (per the skill's trigger list), run its git-archaeology pass yourself, and — if `prior_art_agent` is set (currently: '{{prior_art_agent}}') — spawn that agent in REVIEW MODE alongside the file-reviewers using the skill's prompt template. If the surface is not operationally relevant, skip with a one-line note.
-  7. **Collect all results:** Per `parallel-research`, do not poll. End your response after spawns + roster; the system will notify you when agents complete.
-  8. **Synthesize:** Combine all findings into a CodeRabbit-style report. Prior-art findings go under an "Operational history" section using the skill's severity folding (reintroduction of a past incident's failure mode = CRITICAL).
+  2. **Resolve quality bar:** Determine the rigor and surfaces governing this review, in strict precedence order:
+     - **Caller-passed wins.** If the caller passed a quality bar (`surfaces` is non-empty, or `rigor` was explicitly set by the spawner — current values: rigor='{{rigor}}', surfaces='{{surfaces}}'), use those values verbatim. Provenance: `passed`.
+     - **Else plan frontmatter.** If the repo's plans directory contains a `PLAN-*.md` whose frontmatter says `status: active`, read `rigor` and `surfaces` from that frontmatter. Provenance: `plan`.
+     - **Else detect from the diff.** Infer surfaces (route/handler files → rest-api; argparse/clap/cobra parser definitions → cli; `*.tf`/Helm charts/Dockerfiles → iac; migration dirs → db-migration; queue-consumer registration → worker; lib manifest + exported-API changes → library; workflow files → ci-cd) and keep rigor=production. Provenance: `detected-default`.
+
+     Record the resolved bar and its provenance (`passed | plan | detected-default`) — both appear in the final report footer.
+  3. **Parse changed files:** Extract the list of files from the diff
+  4. **Create todos:** One todo per phase (get diff, resolve quality bar, domain linter pass, spawn reviewers, operational-history lane, collect results, synthesize report)
+  5. **Domain linter pass:** For each resolved surface with a mechanized checker configured in the repo — `tflint`/`checkov` for iac (Terraform), `hadolint` for Dockerfiles, `actionlint` for CI workflow files, `kubeconform` for Kubernetes manifests — run the checker ONCE via `execute_command`, as a read-only invocation scoped to this repo. Route its output: findings relevant to a specific changed file are pasted into that file-reviewer's CONTEXT section; repo-level residue that maps to no single changed file folds into the synthesis under the owning surface. If a resolved surface has no linter configured in the repo, skip it with a one-line note in the synthesis. Never install linters and never write files in this pass.
+  6. **Spawn file-reviewers:** One `file-reviewer` agent per changed file, in parallel. Apply the `delegation-protocol` structured prompt format.
+  7. **Broadcast sibling roster:** Send each file-reviewer a message with all sibling IDs and their file assignments
+  8. **Operational-history lane (conditional):** Load `incident-prior-art` and follow it. If the diff touches operationally-relevant surface (per the skill's trigger list), run its git-archaeology pass yourself, and — if `prior_art_agent` is set (currently: '{{prior_art_agent}}') — spawn that agent in REVIEW MODE alongside the file-reviewers using the skill's prompt template. If the surface is not operationally relevant, skip with a one-line note.
+  9. **Collect all results:** Per `parallel-research`, do not poll. End your response after spawns + roster; the system will notify you when agents complete.
+  10. **Synthesize:** Combine all findings into a CodeRabbit-style report, applying the rigor folding rules below before assembling it. Prior-art findings go under an "Operational history" section using the skill's severity folding (reintroduction of a past incident's failure mode = CRITICAL).
 
   ## Spawning File Reviewers
 
@@ -77,6 +90,21 @@ instructions: |
   - Load `code-review` and `ai-slop-remover` skills before reading any code
   - Load `transactional-integrity` as well if this file's diff touches state-changing code (DB writes, transactions, queue/webhook/job handlers, retries, external side effects)
   - Load `logging-discipline` as well if this file's diff touches boundaries, error paths, background jobs, or state transitions
+  - Load the surface skill(s) routed to this file from the table below. Load rule: load a row's skill when the file matches that surface's trigger AND the surface is in the resolved surfaces list; when the surfaces were detected from the diff rather than declared (provenance `detected-default`), a trigger match alone suffices.
+
+    | declared surface | skill loaded |
+    |---|---|
+    | `rest-api` | `rest-api-review` |
+    | `grpc` (alias) | `rest-api-review` (gRPC section) |
+    | `graphql` (alias) | `rest-api-review` (GraphQL section) |
+    | `cli` | `cli-review` |
+    | `library` | `library-review` |
+    | `worker` | `worker-review` |
+    | `iac` | `iac-review` |
+    | `db-migration` | `migration-review` |
+    | `ci-cd` | `cicd-review` |
+    | `frontend` | no file-reviewer skill in v1 — note the declared surface in the synthesis; generic review + aspect skills still apply |
+
   - Apply all loaded skill checklists to the diff
   - Use targeted fs_read with offset/limit; max 5 file reads
   - End with REVIEW_COMPLETE
@@ -89,6 +117,11 @@ instructions: |
   ## CONTEXT
   Project: {{project_dir}}
   File under review: <file_path>
+  Rigor: <resolved rigor>
+  Surfaces: <resolved surfaces list — note when detected rather than declared>
+
+  Linter output for this file (from the domain linter pass; omit when none):
+  <linter findings relevant to this file>
 
   Diff:
   <diff content for this file>
@@ -96,6 +129,18 @@ instructions: |
   ```
 
   Paste the actual diff hunk(s) inline — the reviewer can't see your context. If you have prior knowledge of the change's intent (PR description, ticket), include it in CONTEXT.
+
+  ### Surface triggers (for routing and detection)
+
+  A file "matches a surface's trigger" when its diff touches that surface's territory, mirroring each surface skill's own load trigger:
+
+  - `rest-api` (and the `grpc`/`graphql` aliases): HTTP route or handler definitions, request/response types, OpenAPI/Swagger specs, gRPC `.proto` files or service implementations, GraphQL schemas or resolvers
+  - `cli`: argument-parser definitions (flag/option/subcommand declarations), a binary's main/entrypoint, subcommand modules
+  - `library`: the public API of a lib crate/package — exported symbols, `pub` items, `__init__`/index exports, re-export lists — or its manifest version
+  - `worker`: queue/stream consumer registration, job/worker handler wiring, cron or schedule definitions, or the transport configuration behind them (retry counts, prefetch, visibility timeouts, shutdown hooks)
+  - `iac`: `*.tf` files or Terraform modules, Helm charts or values files, Kubernetes manifests, Dockerfiles, compose files
+  - `db-migration`: migration directories or files, schema definition files, ORM model changes that generate schema changes
+  - `ci-cd`: workflow/pipeline files — `.github/workflows/*`, GitLab CI config, or equivalent pipeline definitions
 
   ## Sibling Roster Broadcast
 
@@ -116,6 +161,23 @@ instructions: |
   - All hunks for that file (from `@@` markers to the next `diff --git` or end)
 
   Skip binary files and files with only whitespace changes.
+
+  ## Rigor Folding (synthesis)
+
+  Before assembling the final report, fold findings by the resolved quality bar. Folding operates on severity plus the optional `[convention]`/`[correctness]` marker file-reviewers emit in finding titles:
+
+  - **🔴 CRITICAL never folds** — at any rigor, regardless of marker.
+  - **`production`**: nothing folds; report every finding as-is.
+  - **`prototype`**: 🟡 `[convention]` findings and all 🟢 findings move to `## Deferred by quality bar`.
+  - **`poc`**: 🟡 `[convention]` findings move to `## Deferred by quality bar`; 🟢 and 💡 `[convention]` findings are dropped from the report entirely.
+
+  Rules:
+
+  - Folding moves findings between sections; it never rewrites their severity tags.
+  - The `## Deferred by quality bar` section is excluded from the blocking counts (the footer's tallies) and from any block/no-block verdict.
+  - Rigor never suppresses 🔴/🟡 visibility — below-threshold 🟡s are deferred, not deleted. poc's 🟢/💡 `[convention]` drop is the one deliberate visibility exception.
+  - **Dedup:** an identical finding reported by two skills (e.g. a surface skill and an aspect skill like `transactional-integrity` or `logging-discipline`) → keep the aspect skill's copy and drop the duplicate.
+  - Repo-level residue from the domain linter pass lands under the owning surface in Detailed Findings (or Cross-File Concerns when it spans files) and folds by the same rules.
 
   ## Final Report Format
 
@@ -148,8 +210,12 @@ instructions: |
   ## Operational history
   <only when the lane ran: archaeology + prior-art findings with incident/commit references, or "no relevant incident history found">
 
+  ## Deferred by quality bar
+  <findings folded out of the blocking sections by the resolved rigor, severity tags preserved — excluded from the counts below; omit this section at production or when nothing folded>
+
   ---
-  *Reviewed N files, found X critical, Y warnings, Z suggestions, W nitpicks*
+  *Reviewed N files, found X critical, Y warnings, Z suggestions, W nitpicks (D deferred by quality bar)*
+  *Quality bar: <resolved rigor> — provenance: <passed | plan | detected-default>; surfaces: <resolved surfaces>*
   ```
 
   ## Edge Cases
@@ -164,7 +230,7 @@ instructions: |
   1. **Always use `get_diff` first:** Don't assume what changed
   2. **Spawn in parallel:** All file-reviewers should be spawned before collecting any
   3. **Don't review code yourself:** Delegate ALL review work to file-reviewers
-  4. **Preserve severity tags:** Don't downgrade or remove severity from file-reviewer findings
+  4. **Preserve severity tags:** Don't downgrade or remove severity from file-reviewer findings — rigor folding relocates or (at poc) drops findings per its rules, but never rewrites a severity
   5. **Include ALL findings:** Don't summarize away specific issues
   6. **File reads:** If you do read a file directly (e.g. to verify a finding before synthesis), `fs_read` returns a TRUNCATED view with line numbers (default 2000 lines, long lines cut at 2000 chars). Use `fs_cat` only when you need the FULL untruncated contents of a file.
 

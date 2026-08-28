@@ -31,8 +31,11 @@ Walk EVERY category. For each, ask: "when the implementer hits this, does the pl
 | 8 | **Config, secrets & environments** | New env vars/config keys — where are they declared and injected? Secrets — vault/parameter store conventions? Staging vs production differences that affect implementation? |
 | 9 | **Scope boundaries** | Is Out of scope present and specific? Are "tempting adjacent fixes" explicitly deferred? |
 | 10 | **Settled decisions** | Are choices that were debated recorded WITH their one-line reason ("RDS over in-cluster Postgres because ops owns backups")? An unrecorded decision WILL be re-litigated by the implementer. |
+| 11 | **Quality bar** | Are `rigor` and `surfaces` declared (or the plan explicitly generic)? Is every dropped best practice recorded WITH a one-line reason? Does every `other:<label>` surface carry non-empty long-tail criteria? |
 
 Not every category applies to every plan (a docs-only plan has no data layer). Mark inapplicable categories as such — silently skipping one is how leaks survive.
+
+For category 11 specifically: a missing Quality bar declaration is FRICTION when the plan is plausibly `surfaces: []` (a docs-only or pure-refactor plan), BLOCKING when the plan self-evidently builds an enum surface (an HTTP API, a CLI, migrations…) but declares none.
 
 ## Pointer verification (do not trust, verify)
 

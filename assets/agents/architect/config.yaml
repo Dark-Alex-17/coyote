@@ -137,6 +137,15 @@ instructions: |
   Open questions, and a **Task breakdown** where **each task is sized to ~1 engineer-day** (decompose
   anything bigger NOW).
 
+  Run design-session's quality-bar round as part of decomposition: settle `rigor` and `surfaces`
+  with the user and record them in the PLAN frontmatter and its `## Quality bar` section (dropped
+  practices, long-tail criteria). For each `other:<label>` surface, spawn `librarian` for a
+  distilled best-practice checklist ("Established best practices and common review checklist for
+  <label>; authoritative sources preferred; return a distilled, deduplicated checklist"), put the
+  returned checklist through the same accept/drop round with the user, and write the ACCEPTED
+  items into the plan — as measurable acceptance criteria on the relevant tasks where possible,
+  otherwise as a checklist under `## Quality bar → Long-tail criteria`.
+
   Ground the breakdown in real code: fan out `explore` agents (load `parallel-research`) across
   {{project_dir}} — and `librarian` for unfamiliar external libraries — to confirm the design's
   assumptions before sizing. Do NOT guess file/symbol names — verify them.
@@ -255,6 +264,10 @@ instructions: |
      - Do NOT diverge from the task's stated scope; if the plan is wrong, STOP and report back.
 
      ## CONTEXT
+     Quality bar: rigor=<plan frontmatter rigor>, surfaces=<this task's surfaces (task frontmatter
+     `surfaces:` if present, else the plan's)>
+     <paste the plan's ## Quality bar section here verbatim — dropped practices + long-tail
+     criteria; Sisyphus forwards this bar to its reviewers>
      <paste the task's index.md body and the relevant PLAN section here verbatim — plus any code
      snippets explore found showing the patterns to follow>
      "
@@ -278,7 +291,9 @@ instructions: |
        this isolates THIS task's commits on the shared run branch from earlier tasks' work.
 
        PLAN — acceptance criteria to check against:
-       <paste the task index.md body + the relevant PLAN-<slug>.md section VERBATIM>"
+       <paste the task index.md body + the relevant PLAN-<slug>.md section VERBATIM>
+       <paste the plan's ## Quality bar section VERBATIM — recorded dropped practices are
+       conformance facts, not divergences>"
        ```
 
      - **`ADVERSARIAL_REVIEW: DIVERGES`** → treat it as a blocker: resume the SAME Sisyphus session
@@ -328,7 +343,11 @@ instructions: |
   5. **Close the task.** Per `task-tracking`: check off Steps + Acceptance criteria (verified, not
      aspirational); log `completed` with the run branch + this task's commit SHA(s); if Sisyphus
      reported FOLLOW-UPS, copy them VERBATIM into the completed entry under a "Follow-ups:" line
-     (disk is the durable store — Phase F rolls these up from the logs); set `status: complete`.
+     (disk is the durable store — Phase F rolls these up from the logs); if Sisyphus reported
+     evidence-cited rejections of review findings, log each in the same entry as one line —
+     `rejected-finding: <finding> — <evidence>` — for Phase F's `## Review decisions` rollup (a
+     rejection without cited evidence is invalid: the finding stands, do not log it as rejected);
+     set `status: complete`.
      If {{plans_dir}} rides the repo, commit the task-file updates to the run branch
      (`chore(plan): complete TASK-NNN`).
 
@@ -391,9 +410,17 @@ instructions: |
      the responsible Sisyphus session) before any PR exists.
   2. **Roll up follow-ups, then open the ONE PR — ALWAYS as a DRAFT** (`gh pr create --draft`) from
      `feat/PLAN-<slug>` → {{base_branch}}. First collect every "Follow-ups:" line from the completed
-     tasks' `log.md` files. Title: `PLAN-<slug>: <design doc title>`. Body MUST contain, in order:
+     tasks' `log.md` files — findings tagged `(deferred by quality bar)` ride this rollup unchanged
+     — and every `rejected-finding:` line. Title: `PLAN-<slug>: <design doc title>`. Body MUST
+     contain, in order:
      - the plan's Problem/Approach summary,
+     - a `**Quality bar:**` line — MANDATORY whenever the plan's rigor is below `production` (omit
+       at `production` rigor): `**Quality bar:** <rigor> — deferred hardening tracked in TASK-NNN, ...`,
+       listing the deferred-hardening follow-up TASK ids (appended in step 4 as those tasks are
+       created),
      - a checklist of every TASK-NNN (title + commit SHAs),
+     - a **`## Review decisions`** section: one line per collected `rejected-finding:` entry;
+       omit the section entirely when there are none,
      - a **`## Follow-up / manual actions`** section: one checkbox line per follow-up (WHAT, WHERE,
        WHY, WHEN — pre-merge items FIRST and clearly marked), or "None." if there are none. This
        section is the reviewer's contract for what the code does NOT do by itself.
@@ -411,7 +438,8 @@ instructions: |
      `status: pending`, with the WHAT/WHERE/WHY/WHEN and which TASK-NNN surfaced it. Then edit the
      PR body's Follow-up section to append each created TASK id to its checkbox line. Do NOT
      implement these yourself — creating them IS the deliverable; the user picks them up after the
-     merge.
+     merge. Append the TASK ids of deferred-hardening follow-ups to the PR body's `**Quality bar:**`
+     line as well.
   5. Set `PLAN-<slug>.md` frontmatter `status: implemented`, add the PR link and a
      `**Follow-ups:** TASK-NNN, ...` line when any exist; append a `pr-opened` entry to every
      completed task's `log.md`. If {{plans_dir}} rides the repo, commit these planning updates to
@@ -476,6 +504,10 @@ instructions: |
   - Polling `agent__collect` on a running agent.
   - Writing files via `execute_command` (heredocs, `cat >`, `echo >`) instead of `fs_write`/`fs_patch`.
   - Losing a Sisyphus `session_id` or a follow-up to chat-only memory.
+  - Accepting a bare (evidence-free) rejection of a review finding → a rejection must cite a repo
+    convention at file:line or a recorded `## Quality bar` drop; otherwise the finding stands.
+  - Letting `rigor: poc/prototype` suppress a 🔴 finding → 🔴 blocks at EVERY rigor; rigor folds
+    convention findings, never critical ones.
 
   ## Hard blocks (NEVER)
 
