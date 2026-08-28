@@ -1,40 +1,39 @@
 # ---- LLM ----
-model: openai:gpt-4o             # Specify the LLM to use
-temperature: null                # Set default temperature parameter (0, 1)
-top_p: null                      # Set default top-p parameter, with a range of (0, 1) or (0, 2) depending on the model
-reasoning_effort: null           # Reasoning effort level for models that support it (e.g. low, medium, high).
-                                 # Only valid when the active model declares reasoning_levels. See the Clients docs.
+model: openai:gpt-4o # Specify the LLM to use
+temperature: null # Set default temperature parameter (0, 1)
+top_p: null # Set default top-p parameter, with a range of (0, 1) or (0, 2) depending on the model
+reasoning_effort:
+  null # Reasoning effort level for models that support it (e.g. low, medium, high).
+  # Only valid when the active model declares reasoning_levels. See the Clients docs.
 
 # ---- Behavior ----
-stream: true                     # Controls whether to use the stream-style APIs when querying for completions from LLM clients.
-save: true                       # Indicates whether to persist the conversation to messages.md for posterity
-keybindings: emacs               # Choose keybinding style (emacs, vi)
-editor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $EDITOR
-wrap: no                         # Controls text wrapping (no, auto, <max-width>)
-wrap_code: false                 # Enables or disables the wrapping of code blocks
+stream: true # Controls whether to use the stream-style APIs when querying for completions from LLM clients.
+save: true # Indicates whether to persist the conversation to messages.md for posterity
+keybindings: emacs # Choose keybinding style (emacs, vi)
+editor: null # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $EDITOR
+wrap: no # Controls text wrapping (no, auto, <max-width>)
+wrap_code: false # Enables or disables the wrapping of code blocks
 
 # ---- Prelude ----
-repl_prelude: null               # Set a default session or role for REPL mode to use (e.g. role:<name>, session:<name>, <session>:<role>)
-cmd_prelude: null                # Set a default session or role for CMD mode to use (e.g. role:<name>, session:<name>, <session>:<role>)
-agent_session: null              # Set a session to use when starting an agent (e.g. temp, default)
+repl_prelude: null # Set a default session or role for REPL mode to use (e.g. role:<name>, session:<name>, <session>:<role>)
+cmd_prelude: null # Set a default session or role for CMD mode to use (e.g. role:<name>, session:<name>, <session>:<role>)
+agent_session: null # Set a session to use when starting an agent (e.g. temp, default)
 
 # ---- Appearance ----
-highlight: true                  # Controls syntax highlighting
-raw_markdown: false              # When true, render markdown as raw text with syntax highlighting only. When false (default), transforms markdown syntax (headings, bold, lists, etc.) into styled terminal output
-light_theme: false               # Activates a light color theme when true. env: COYOTE_LIGHT_THEME
+highlight: true # Controls syntax highlighting
+raw_markdown: false # When true, render markdown as raw text with syntax highlighting only. When false (default), transforms markdown syntax (headings, bold, lists, etc.) into styled terminal output
+light_theme: false # Activates a light color theme when true. env: COYOTE_LIGHT_THEME
 
 # ---- Miscellaneous ----
-user_agent: null                 # Set User-Agent HTTP header, use `auto` for coyote/<current-version>
-save_shell_history: true         # Whether to save shell execution command to the history file
-sync_models_url: >               # URL to sync model changes from
+user_agent: null # Set User-Agent HTTP header, use `auto` for coyote/<current-version>
+save_shell_history: true # Whether to save shell execution command to the history file
+sync_models_url: > # URL to sync model changes from
   https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/models.yaml
 
 # ---- REPL Prompt ----
 # Custom REPL left/right prompts; see the [REPL Prompt Documentation](https://github.com/Dark-Alex-17/coyote/wiki/REPL-Prompt) for more information
-left_prompt:
-  '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
-right_prompt:
-  '{color.cyan}{?reasoning_effort [{reasoning_effort}] }{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
+left_prompt: '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
+right_prompt: '{color.cyan}{?reasoning_effort [{reasoning_effort}] }{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
 
 # ---- Vault ----
 # See the [Vault documentation](https://github.com/Dark-Alex-17/coyote/wiki/Vault) for more information on the Coyote vault.
@@ -42,7 +41,7 @@ right_prompt:
 # The secrets_provider tells Coyote where to read and write secrets referenced via {{SECRET_NAME}} syntax.
 #
 # Shorthand: set vault_password_file to enable the local provider with that password file.
-vault_password_file: null        # Path to a file containing the password for the Coyote vault (cannot be a secret template)
+vault_password_file: null # Path to a file containing the password for the Coyote vault (cannot be a secret template)
 #
 # Explicit: set secrets_provider to one of the supported types below. When secrets_provider is set,
 # vault_password_file is ignored. Note: secrets_provider itself cannot use {{SECRET}} template syntax.
@@ -82,38 +81,39 @@ vault_password_file: null        # Path to a file containing the password for th
 
 # ---- Function Calling ----
 # See the [Tools documentation](https://github.com/Dark-Alex-17/coyote/wiki/Tools) for more details
-function_calling_support: true           # Enables or disables function calling (Globally).
-mapping_tools:                   # Alias for a tool or toolset
+function_calling_support: true # Enables or disables function calling (Globally).
+mapping_tools: # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write,fs_read,fs_glob,fs_grep'
-enabled_tools: null              # Which tools to enable by default.
-                                 # Accepts either a YAML list or a comma-separated string. Use 'all' to enable everything.
-                                 # Example (list form):
-                                 #   enabled_tools:
-                                 #     - fs
-                                 #     - web_search_coyote
-                                 # Example (comma-separated form):
-                                 #   enabled_tools: fs,web_search_coyote
-visible_tools:                   # Which tools are visible to be compiled (and are thus able to be defined in 'enabled_tools')
-#  - ast_grep.sh
-#  - demo_py.py
-#  - demo_sh.sh
-#  - demo_ts.ts
+enabled_tools:
+  null # Which tools to enable by default.
+  # Accepts either a YAML list or a comma-separated string. Use 'all' to enable everything.
+  # Example (list form):
+  #   enabled_tools:
+  #     - fs
+  #     - web_search_coyote
+  # Example (comma-separated form):
+  #   enabled_tools: fs,web_search_coyote
+visible_tools: # Which tools are visible to be compiled (and are thus able to be defined in 'enabled_tools')
+  #  - ast_grep.sh
+  #  - demo_py.py
+  #  - demo_sh.sh
+  #  - demo_ts.ts
   - execute_command.sh
-#  - execute_py_code.py
-#  - execute_sql_code.sh
-#  - fetch_url_via_curl.sh
-#  - fetch_url_via_jina.sh
+  #  - execute_py_code.py
+  #  - execute_sql_code.sh
+  #  - fetch_url_via_curl.sh
+  #  - fetch_url_via_jina.sh
   - fs_cat.sh
   - fs_ls.sh
-#  - fs_read.sh
-#  - fs_glob.sh
-#  - fs_grep.sh
-#  - fs_mkdir.sh
-#  - fs_patch.sh
-#  - fs_write.sh
+  #  - fs_read.sh
+  #  - fs_glob.sh
+  #  - fs_grep.sh
+  #  - fs_mkdir.sh
+  #  - fs_patch.sh
+  #  - fs_write.sh
   - get_current_time.sh
-#  - get_current_weather.py
-#  - get_current_weather.ts
+  #  - get_current_weather.py
+  #  - get_current_weather.ts
   - get_current_weather.sh
 #  - search_arxiv.sh
 #  - search_wikipedia.sh
@@ -126,85 +126,106 @@ visible_tools:                   # Which tools are visible to be compiled (and a
 
 # ---- MCP Servers ----
 # See the [MCP Servers documentation](https://github.com/Dark-Alex-17/coyote/wiki/MCP-Servers) for more details
-mcp_server_support: true         # Enables or disables MCP servers (globally).
-mapping_mcp_servers:             # Alias for an MCP server or set of servers
+mcp_server_support: true # Enables or disables MCP servers (globally).
+mapping_mcp_servers: # Alias for an MCP server or set of servers
   git: github,gitmcp
-enabled_mcp_servers: null        # Which MCP servers to enable by default.
-                                 # Accepts either a YAML list or a comma-separated string. Use 'all' to enable everything.
-                                 # Example (list form):
-                                 #   enabled_mcp_servers:
-                                 #     - github
-                                 #     - slack
-                                 # Example (comma-separated form):
-                                 #   enabled_mcp_servers: github,slack,ddg-search
-no_workspace_mcp: false          # Disable loading workspace-local MCP servers (default: false).
-                                 # When false (the default), Coyote merges the first workspace MCP config it finds
-                                 # into the global MCP registry at startup, checking in order:
-                                 #   1. .coyote/mcp.json
-                                 #   2. .coyote/.mcp.json  (Claude-style file name)
-                                 #   3. .mcp.json          (project root; Claude Code convention)
-                                 # Workspace entries shadow global ones on name collision.
-                                 # Set to true (or pass --no-workspace-mcp) to skip this entirely.
+enabled_mcp_servers:
+  null # Which MCP servers to enable by default.
+  # Accepts either a YAML list or a comma-separated string. Use 'all' to enable everything.
+  # Example (list form):
+  #   enabled_mcp_servers:
+  #     - github
+  #     - slack
+  # Example (comma-separated form):
+  #   enabled_mcp_servers: github,slack,ddg-search
+mcp_tools:
+  null # Per-server MCP tool allowlists (glob patterns: * and ? supported).
+  # Tools that match no pattern are hidden from the model as if they
+  # don't exist. Stacks with the other allowlist layers (mcp.json
+  # `allowedTools`, role, agent, session, skill, graph node). Every
+  # configured layer must allow a tool, so layers only ever narrow.
+  # An empty list blocks all of a server's tools.
+  # Example:
+  #   mcp_tools:
+  #     github:
+  #       - get_*
+  #       - list_*
+  #     slack: []
+no_workspace_mcp:
+  false # Disable loading workspace-local MCP servers (default: false).
+  # When false (the default), Coyote merges the first workspace MCP config it finds
+  # into the global MCP registry at startup, checking in order:
+  #   1. .coyote/mcp.json
+  #   2. .coyote/.mcp.json  (Claude-style file name)
+  #   3. .mcp.json          (project root; Claude Code convention)
+  # Workspace entries shadow global ones on name collision.
+  # Set to true (or pass --no-workspace-mcp) to skip this entirely.
 
 # ---- Skills ----
 # Skills are modular knowledge or capability packs the LLM can load and unload mid-conversation.
 # See the [Skills documentation](https://github.com/Dark-Alex-17/coyote/wiki/Skills) for more details.
-skills_enabled: true              # Master switch. Set to false to hide all skill management tools from the model.
-                                  # Skills also require `function_calling_support: true` above to work at all.
-visible_skills:                   # The universe of skills allowed to be enabled in any context. Omit (null) for "all installed".
+skills_enabled:
+  true # Master switch. Set to false to hide all skill management tools from the model.
+  # Skills also require `function_calling_support: true` above to work at all.
+visible_skills: # The universe of skills allowed to be enabled in any context. Omit (null) for "all installed".
   - ai-slop-remover
   - code-review
   - frontend-ui-ux
   - git-master
-enabled_skills: null              # Which skills are available by default (no role/agent/session active). null = all visible.
-                                  # Accepts either a YAML list or a comma-separated string.
-                                  # Example (list form):
-                                  #   enabled_skills:
-                                  #     - git-master
-                                  #     - ai-slop-remover
-                                  # Example (comma-separated form):
-                                  #   enabled_skills: git-master,ai-slop-remover
-inject_skill_instructions: true   # Inject a short hint pointing the model at `skill__list` when skills are enabled in
-                                  # this context. Only injected if `function_calling_support`, `skills_enabled`, and the
-                                  # effective enabled skill set is non-empty (default: true).
-skill_instructions: null          # Custom text used for the skill hint when injected. If null, uses built-in default.
+enabled_skills:
+  null # Which skills are available by default (no role/agent/session active). null = all visible.
+  # Accepts either a YAML list or a comma-separated string.
+  # Example (list form):
+  #   enabled_skills:
+  #     - git-master
+  #     - ai-slop-remover
+  # Example (comma-separated form):
+  #   enabled_skills: git-master,ai-slop-remover
+inject_skill_instructions:
+  true # Inject a short hint pointing the model at `skill__list` when skills are enabled in
+  # this context. Only injected if `function_calling_support`, `skills_enabled`, and the
+  # effective enabled skill set is non-empty (default: true).
+skill_instructions: null # Custom text used for the skill hint when injected. If null, uses built-in default.
 
 # ---- Macros ----
 # Macros are Coyote's custom commands: named sequences of REPL commands and prompts, invoked directly by name
 # (a macro file named `review.yaml` runs as `.review [args]`; built-in commands always win a name collision).
 # Workspace-local macros in `.coyote/macros/` shadow same-named global macros (skip them with --no-workspace-macros).
 # See the [Macros documentation](https://github.com/Dark-Alex-17/coyote/wiki/Macros) for more details.
-enabled_macros: null              # Which macros are invocable by default (no role/agent/session active). null = all visible.
-                                  # An empty list means NO macros are invocable. Accepts either a YAML list or a
-                                  # comma-separated string. Roles, agents, and sessions may define their own
-                                  # `enabled_macros`; the most specific active one wins (session > agent > role > global).
-                                  # Example (list form):
-                                  #   enabled_macros:
-                                  #     - generate-commit-message
-                                  # Example (comma-separated form):
-                                  #   enabled_macros: generate-commit-message,review
+enabled_macros:
+  null # Which macros are invocable by default (no role/agent/session active). null = all visible.
+  # An empty list means NO macros are invocable. Accepts either a YAML list or a
+  # comma-separated string. Roles, agents, and sessions may define their own
+  # `enabled_macros`; the most specific active one wins (session > agent > role > global).
+  # Example (list form):
+  #   enabled_macros:
+  #     - generate-commit-message
+  # Example (comma-separated form):
+  #   enabled_macros: generate-commit-message,review
 
 # ---- Auto-Continue (Todo System) ----
 # The auto-continue system provides built-in task tracking for improved reliability.
 # When enabled, the model can create todo lists and the system will automatically
 # prompt it to continue when incomplete tasks remain.
 # See the [Todo System documentation](https://github.com/Dark-Alex-17/coyote/wiki/TODO-System) for more information
-auto_continue: false              # Enable automatic continuation when incomplete todos remain (default: false)
-max_auto_continues: 10            # Maximum number of automatic continuations before stopping (default: 10)
-inject_todo_instructions: true    # Inject default todo usage instructions into the system prompt (default: true)
-continuation_prompt: null         # Custom prompt used when auto-continuing. If null, uses built-in default
+auto_continue: false # Enable automatic continuation when incomplete todos remain (default: false)
+max_auto_continues: 10 # Maximum number of automatic continuations before stopping (default: 10)
+inject_todo_instructions: true # Inject default todo usage instructions into the system prompt (default: true)
+continuation_prompt: null # Custom prompt used when auto-continuing. If null, uses built-in default
 
 # ---- Session ----
 # See the [Session documentation](https://github.com/Dark-Alex-17/coyote/wiki/Sessions) for more information
-save_session: null               # Controls the persistence of the session. If true, auto save; if false, don't auto-save save; if null, ask the user what to do
-compression_threshold: 4000      # Compress the session when the token count reaches or exceeds this threshold
-summarization_prompt: >          # The text prompt used for creating a concise summary of session message
+save_session: null # Controls the persistence of the session. If true, auto save; if false, don't auto-save save; if null, ask the user what to do
+compression_threshold: 4000 # Compress the session when the token count reaches or exceeds this threshold
+summarization_prompt:
+  > # The text prompt used for creating a concise summary of session message
   'Summarize the discussion briefly in 200 words or less to use as a prompt for future context.'
-summary_context_prompt: >        # The text prompt used for including the summary of the entire session as context to the model
+summary_context_prompt:
+  > # The text prompt used for including the summary of the entire session as context to the model
   'This is a summary of the chat history as a recap: '
-compression_keep_last: 0         # Number of most-recent messages to keep visible after compression (0 = compress all messages)
-max_tool_result_chars: null      # Cap on tool result characters forwarded to the model per call (null = no cap)
-max_concurrent_jobs: 5           # Max background jobs (`job__*` tools) running at once per context (default: 5; 0 disables background jobs entirely)
+compression_keep_last: 0 # Number of most-recent messages to keep visible after compression (0 = compress all messages)
+max_tool_result_chars: null # Cap on tool result characters forwarded to the model per call (null = no cap)
+max_concurrent_jobs: 5 # Max background jobs (`job__*` tools) running at once per context (default: 5; 0 disables background jobs entirely)
 
 # ---- Memory ----
 # See the [Memory documentation](https://github.com/Dark-Alex-17/coyote/wiki/Memory) for more information.
@@ -213,11 +234,13 @@ max_concurrent_jobs: 5           # Max background jobs (`job__*` tools) running 
 # even when memory files exist. The cascade is: agent > session > role > app.
 # Bootstrap with `coyote --init-memory [global|workspace]` to create the marker file
 # the LLM needs before it will write any memory.
-memory: null                     # null = enabled when memory exists on disk; true = force on; false = force off
-memory_cap_with_tools: null      # Char cap for injected memory when function calling is available (default: 6000).
-                                 # Only MEMORY.md indexes are injected; the LLM uses memory__read to fetch drill files.
-memory_cap_without_tools: null   # Char cap when function calling is unavailable (default: 12000).
-                                 # Indexes plus drill file bodies are injected up to this cap.
+memory: null # null = enabled when memory exists on disk; true = force on; false = force off
+memory_cap_with_tools:
+  null # Char cap for injected memory when function calling is available (default: 6000).
+  # Only MEMORY.md indexes are injected; the LLM uses memory__read to fetch drill files.
+memory_cap_without_tools:
+  null # Char cap when function calling is unavailable (default: 12000).
+  # Indexes plus drill file bodies are injected up to this cap.
 
 # ---- Workspace Instructions ----
 # Human-curated project instructions injected read-only into the system prompt, in full.
@@ -225,22 +248,23 @@ memory_cap_without_tools: null   # Char cap when function calling is unavailable
 # chain below (per directory, in order). Scaffold with `coyote --init-instructions`.
 # Disable per-invocation with --no-workspace-instructions, or override the chain with
 # repeatable --workspace-instructions-file flags.
-workspace_instructions: null     # null/true = inject when an instructions file exists; false = never inject
-workspace_instructions_files: null # File name chain to search, in priority order.
-                                   # Default: [COYOTE.md, AGENTS.md, CLAUDE.md, GEMINI.md]
-                                   # Set to a custom list to reorder or drop fallbacks, e.g.:
-                                   #   workspace_instructions_files: [COYOTE.md]
+workspace_instructions: null # null/true = inject when an instructions file exists; false = never inject
+workspace_instructions_files:
+  null # File name chain to search, in priority order.
+  # Default: [COYOTE.md, AGENTS.md, CLAUDE.md, GEMINI.md]
+  # Set to a custom list to reorder or drop fallbacks, e.g.:
+  #   workspace_instructions_files: [COYOTE.md]
 
 # ---- RAG ----
 # See the [RAG Docs](https://github.com/Dark-Alex-17/coyote/wiki/RAG) for more details.
-rag_embedding_model: null        # Specifies the embedding model used for context retrieval
-rag_reranker_model: null         # Specifies the reranker model used for sorting retrieved documents; Coyote uses Reciprocal Rank Fusion by default
-rag_top_k: 5                     # Specifies the number of documents to retrieve for answering queries
-rag_chunk_size: null             # Defines the size of chunks for document processing in characters
-rag_chunk_overlap: null          # Defines the overlap between chunks
-rag_extractor_model: null        # LLM model for graph-based entity/relationship extraction; when set, enables a graph RAG signal alongside vector and BM25
-rag_extractor_prompt: null       # Custom extraction prompt template; must contain __CHUNK__ placeholder; defaults to built-in prompt when null
-rag_graph_hops: 1                # Number of hops to expand from matched entities at query time (0 = seed nodes only; 1 = direct neighbors; increase for denser graphs)
+rag_embedding_model: null # Specifies the embedding model used for context retrieval
+rag_reranker_model: null # Specifies the reranker model used for sorting retrieved documents; Coyote uses Reciprocal Rank Fusion by default
+rag_top_k: 5 # Specifies the number of documents to retrieve for answering queries
+rag_chunk_size: null # Defines the size of chunks for document processing in characters
+rag_chunk_overlap: null # Defines the overlap between chunks
+rag_extractor_model: null # LLM model for graph-based entity/relationship extraction; when set, enables a graph RAG signal alongside vector and BM25
+rag_extractor_prompt: null # Custom extraction prompt template; must contain __CHUNK__ placeholder; defaults to built-in prompt when null
+rag_graph_hops: 1 # Number of hops to expand from matched entities at query time (0 = seed nodes only; 1 = direct neighbors; increase for denser graphs)
 # Defines the query structure using variables like __CONTEXT__, __SOURCES__, and __INPUT__ to tailor searches to specific needs
 rag_template: |
   Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
@@ -271,13 +295,14 @@ document_loaders:
   # You can add custom loaders using the following syntax:
   #   <file-extension>: <command-to-load-the-file>
   # Note: Use `$1` for input file and `$2` for output file. If `$2` is omitted, use stdout as output.
-  pdf: 'pdftotext $1 -'                                                                 # Use pdftotext to convert a PDF file to text
+  pdf: 'pdftotext $1 -' # Use pdftotext to convert a PDF file to text
   # (see https://poppler.freedesktop.org for details on how to install pdftotext)
-  docx: 'pandoc --to plain $1'                                                          # Use pandoc to convert a .docx file to text
+  docx: 'pandoc --to plain $1' # Use pandoc to convert a .docx file to text
   # (see https://pandoc.org for details on how to install pandoc)
-  jina: 'curl -fsSL https://r.jina.ai/$1 -H "Authorization: Bearer {{JINA_API_KEY}}'    # Use Jina to translate a website into text;
+  jina: 'curl -fsSL https://r.jina.ai/$1 -H "Authorization: Bearer {{JINA_API_KEY}}' # Use Jina to translate a website into text;
   # Requires a Jina API key to be added to the Coyote vault
-  git: >                                                                                # Use yek to load a git repository into the knowledgebase (https://github.com/bodo-run/yek)
+  git:
+    > # Use yek to load a git repository into the knowledgebase (https://github.com/bodo-run/yek)
     sh -c "yek $1 --json | jq 'map({ path: .filename, contents: .content })'"
 
 # ---- Clients ----
@@ -293,10 +318,10 @@ clients:
   #       supports_function_calling: true
   #     - name: xxxx                                  # Embedding model
   #       type: embedding
-  #       default_chunk_size: 1500                        
+  #       default_chunk_size: 1500
   #       max_batch_size: 100
   #     - name: xxxx                                  # Reranker model
-  #       type: reranker 
+  #       type: reranker
   #   patch:                                          # Patch API calls
   #     chat_completions:                             # API type; Possible values: chat_completions, embeddings, and rerank
   #       <regex>:                                    # The regex to match model names, e.g. '.*' 'gpt-4o' 'gpt-4o|gpt-4-.*'
@@ -312,15 +337,15 @@ clients:
 
   # See https://platform.openai.com/docs/quickstart
   - type: openai
-    api_base: https://api.openai.com/v1               # Optional
-    api_key: '{{OPENAI_API_KEY}}'                     # You can either hard-code or inject secrets from the Coyote vault
-    organization_id: org-xxx                          # Optional
+    api_base: https://api.openai.com/v1 # Optional
+    api_key: '{{OPENAI_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
+    organization_id: org-xxx # Optional
 
   # For any platform compatible with OpenAI's API
   - type: openai-compatible
     name: ollama
     api_base: http://localhost:11434/v1
-    api_key: '{{OLLAMA_API_KEY}}'                     # Optional; You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{OLLAMA_API_KEY}}' # Optional; You can either hard-code or inject secrets from the Coyote vault
     models:
       - name: deepseek-r1
         max_input_tokens: 131072
@@ -338,9 +363,10 @@ clients:
   # See https://ai.google.dev/docs
   - type: gemini
     api_base: https://generativelanguage.googleapis.com/v1beta
-    api_key: '{{GEMINI_API_KEY}}'                       # You can either hard-code or inject secrets from the Coyote vault
-    auth: null                                          # When set to 'oauth', Coyote will use OAuth instead of an API key
-                                                        # Authenticate with `coyote --authenticate` or `.authenticate` in the REPL
+    api_key: '{{GEMINI_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
+    auth:
+      null # When set to 'oauth', Coyote will use OAuth instead of an API key
+      # Authenticate with `coyote --authenticate` or `.authenticate` in the REPL
     patch:
       chat_completions:
         '.*':
@@ -357,25 +383,27 @@ clients:
 
   # See https://docs.anthropic.com/claude/reference/getting-started-with-the-api
   - type: claude
-    api_base: https://api.anthropic.com/v1              # Optional
-    api_key: '{{ANTHROPIC_API_KEY}}'                    # You can either hard-code or inject secrets from the Coyote vault
-    auth: null                                          # When set to 'oauth', Coyote will use OAuth instead of an API key
-                                                        # Authenticate with `coyote --authenticate` or `.authenticate` in the REPL
+    api_base: https://api.anthropic.com/v1 # Optional
+    api_key: '{{ANTHROPIC_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
+    auth:
+      null # When set to 'oauth', Coyote will use OAuth instead of an API key
+      # Authenticate with `coyote --authenticate` or `.authenticate` in the REPL
 
   # See https://docs.mistral.ai/
   - type: openai-compatible
     name: mistral
     api_base: https://api.mistral.ai/v1
-    api_key: '{{MISTRAL_API_KEY}}'                      # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{MISTRAL_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://docs.x.ai/docs - OAuth via SuperGrok / X Premium+ subscription
   - type: openai-compatible
     name: xai
     api_base: https://api.x.ai/v1
-    api_key: '{{XAI_API_KEY}}'                          # You can either hard-code or inject secrets from the Coyote vault
-    auth: null                                          # When set to 'oauth', Coyote will use OAuth instead of an API key
-                                                        # Authenticate with `coyote --authenticate` or `.authenticate` in the REPL
-                                                        # Note: Oauth requires SuperGrok/X Premium+ subscription
+    api_key: '{{XAI_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
+    auth:
+      null # When set to 'oauth', Coyote will use OAuth instead of an API key
+      # Authenticate with `coyote --authenticate` or `.authenticate` in the REPL
+      # Note: Oauth requires SuperGrok/X Premium+ subscription
 
   # Example: private OpenAI-compatible gateway with client_credentials OAuth
   # - type: openai-compatible
@@ -405,31 +433,31 @@ clients:
   - type: openai-compatible
     name: ai12
     api_base: https://api.ai21.com/studio/v1
-    api_key: '{{AI21_API_KEY}}'                         # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{AI21_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://docs.cohere.com/docs/the-cohere-platform
   - type: cohere
-    api_base: https://api.cohere.ai/v2                  # Optional
-    api_key: '{{COHERE_API_KEY}}'                       # You can either hard-code or inject secrets from the Coyote vault
+    api_base: https://api.cohere.ai/v2 # Optional
+    api_key: '{{COHERE_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://docs.perplexity.ai/getting-started/overview
   - type: openai-compatible
     name: perplexity
     api_base: https://api.perplexity.ai
-    api_key: '{{PERPLEXITY_API_KEY}}'                   # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{PERPLEXITY_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://console.groq.com/docs/quickstart
   - type: openai-compatible
     name: groq
     api_base: https://api.groq.com/openai/v1
-    api_key: '{{GROQ_API_KEY}}'                         # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{GROQ_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://learn.microsoft.com/en-us/azure/ai-services/openai/chatgpt-quickstart
   - type: azure-openai
     api_base: https://{RESOURCE}.openai.azure.com
-    api_key: '{{AZURE_OPENAI_API_KEY}}'                 # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{AZURE_OPENAI_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
     models:
-      - name: gpt-4o                                    # Model deployment name
+      - name: gpt-4o # Model deployment name
         max_input_tokens: 128000
         supports_vision: true
         supports_function_calling: true
@@ -441,7 +469,7 @@ clients:
     # Specifies an application default credentials (adc) file
     # Run `gcloud auth application-default login` to initialize the ADC file
     # see https://cloud.google.com/docs/authentication/external/set-up-adc for more information
-    adc_file: <gcloud-config-dir>/application_default_credentials.json  # Optional
+    adc_file: <gcloud-config-dir>/application_default_credentials.json # Optional
     patch:
       chat_completions:
         'gemini-.*':
@@ -458,77 +486,76 @@ clients:
 
   # See https://docs.aws.amazon.com/bedrock/latest/userguide/
   - type: bedrock
-    access_key_id: '{{AWS_ACCESS_KEY_ID}}'              # You can either hard-code or inject secrets from the Coyote vault
-    secret_access_key: '{{AWS_SECRET_ACCESS_KEY}}'      # You can either hard-code or inject secrets from the Coyote vault
+    access_key_id: '{{AWS_ACCESS_KEY_ID}}' # You can either hard-code or inject secrets from the Coyote vault
+    secret_access_key: '{{AWS_SECRET_ACCESS_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
     region: xxx
-    session_token: xxx                                  # Optional, only needed for temporary credentials
+    session_token: xxx # Optional, only needed for temporary credentials
 
   # See https://developers.cloudflare.com/workers-ai/
   - type: openai-compatible
     name: cloudflare
     api_base: https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1
-    api_key: '{{CLOUDFLARE_API_KEY}}'                    # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{CLOUDFLARE_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://cloud.baidu.com/doc/WENXINWORKSHOP/index.html
   - type: openai-compatible
     name: ernie
     api_base: https://qianfan.baidubce.com/v2
-    api_key: '{{BAIDU_API_KEY}}'                        # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{BAIDU_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://dashscope.aliyun.com/
   - type: openai-compatible
     name: qianwen
     api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
-    api_key: '{{ALIYUN_API_KEY}}'                       # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{ALIYUN_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://cloud.tencent.com/product/hunyuan
   - type: openai-compatible
     name: hunyuan
     api_base: https://api.hunyuan.cloud.tencent.com/v1
-    api_key: '{{TENCENT_API_KEY}}'                      # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{TENCENT_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://platform.moonshot.cn/docs/intro
   - type: openai-compatible
     name: moonshot
     api_base: https://api.moonshot.cn/v1
-    api_key: '{{MOONSHOT_API_KEY}}'                     # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{MOONSHOT_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://platform.deepseek.com/api-docs/
   - type: openai-compatible
     name: deepseek
     api_base: https://api.deepseek.com
-    api_key: '{{DEEPSEEK_API_KEY}}'                     # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{DEEPSEEK_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://open.bigmodel.cn/dev/howuse/introduction
   - type: openai-compatible
     name: zhipuai
     api_base: https://open.bigmodel.cn/api/paas/v4
-    api_key: '{{ZHIPUAI_API_KEY}}'                      # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{ZHIPUAI_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://platform.minimaxi.com/document/Fast%20access
   - type: openai-compatible
     name: minimax
     api_base: https://api.minimax.chat/v1
-    api_key: '{{MINIMAX_API_KEY}}'                      # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{MINIMAX_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://openrouter.ai/docs#quick-start
   - type: openai-compatible
     name: openrouter
     api_base: https://openrouter.ai/api/v1
-    api_key: '{{OPENROUTER_API_KEY}}'                   # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{OPENROUTER_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://github.com/marketplace/models
   - type: openai-compatible
     name: github
     api_base: https://models.inference.ai.azure.com
-    api_key: '{{GITHUB_API_KEY}}'                       # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{GITHUB_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://deepinfra.com/docs
   - type: openai-compatible
     name: deepinfra
     api_base: https://api.deepinfra.com/v1/openai
-    api_key: '{{DEEPINFRA_API_KEY}}'                    # You can either hard-code or inject secrets from the Coyote vault
-
+    api_key: '{{DEEPINFRA_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # ----- RAG dedicated -----
 
@@ -536,10 +563,10 @@ clients:
   - type: openai-compatible
     name: jina
     api_base: https://api.jina.ai/v1
-    api_key: '{{JINA_API_KEY}}'                         # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{JINA_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault
 
   # See https://docs.voyageai.com/docs/introduction
   - type: openai-compatible
     name: voyageai
     api_base: https://api.voyageai.com/v1
-    api_key: '{{VOYAGEAI_API_KEY}}'                     # You can either hard-code or inject secrets from the Coyote vault
+    api_key: '{{VOYAGEAI_API_KEY}}' # You can either hard-code or inject secrets from the Coyote vault

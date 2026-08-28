@@ -51,6 +51,10 @@ global_tools:                      # Tool universe an `llm` node's `tools:` whit
 mcp_servers:                       # MCP servers an `llm` node may reference via `mcp:<server>`
   - ddg-search
 
+mcp_tools:                         # Optional per-server tool allowlists (globs: * and ?) applied to
+  ddg-search:                      # every node that uses `mcp:<server>`; intersects with the other
+    - search                       # allowlist layers (global config, agent, mcp.json `allowedTools`).
+
 # ---------------------------------------------------------------------------
 # Skills policy (optional)
 # Skills only attach to `llm` nodes inside a graph. Both fields are optional.
@@ -402,6 +406,9 @@ nodes:
     tools:                     # Narrow whitelist: exactly these entries, nothing else
       - web_search_coyote        #   an exact global-tool / custom-tool name
       - mcp:ddg-search         #   `mcp:<server>` includes that server's functions
+    mcp_tools:                 # Optional per-node narrowing of MCP tools (globs: * and ?)
+      ddg-search:              #   keys must be servers this graph enables; intersects with
+        - search               #   the graph-level mcp_tools above and every other layer
     model: claude:claude-haiku-4-5  # Optional per-node model override
     temperature: 0.3           # Optional per-node sampling override
     reasoning_effort: null     # Optional per-node reasoning effort override (e.g. low, medium, high)
