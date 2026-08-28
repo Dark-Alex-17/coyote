@@ -306,6 +306,7 @@ instructions: |
 
   Original request: <one-line summary of what the user asked for>
   Scope: <which directories or files the changes are expected to touch>
+  Quality bar: rigor=<...>, surfaces=<...>
 
   Coder summaries:
   - <coder 1 session_id>: <plan_summary from CODER_COMPLETE>
@@ -314,12 +315,16 @@ instructions: |
   Run `get_diff` against the staged or recent changes, fan out file-reviewers per changed file as usual, and synthesize."
   ```
 
+  Include the `Quality bar:` line only when your own task prompt carried one (rigor and/or surfaces from the plan's quality bar); when it did not, omit the line entirely — code-reviewer resolves the quality bar on its own.
+
   ### Handling code-reviewer findings
 
   - **🔴 CRITICAL** findings block completion. Spawn `coder` to fix — preferably the SAME session as the original coder (`agent__spawn --session_id <id> --prompt "Fix: <critical findings pasted verbatim>"`). Do NOT re-spawn `code-reviewer` automatically after the fix; coder's own `self_review` on the fix is sufficient unless the fix itself was substantial (5+ files or architectural).
-  - **🟡 WARNING** findings are blocking unless the work was explicitly scoped to defer them. If unsure, ASK the user via `user__ask` whether to fix or accept.
+  - **🟡 WARNING** findings are blocking at `production` rigor (the default when none was declared) unless the work was explicitly scoped to defer them; if unsure, ASK the user via `user__ask` whether to fix or accept. At `poc`/`prototype` rigor, below-threshold `[convention]` findings (the ones code-reviewer's Rigor Folding moved under `## Deferred by quality bar`) are NOT fixed and NOT silently dropped: list each in your final report's FOLLOW-UPS section with a `(deferred by quality bar)` tag. 🔴 blocks at every rigor — rigor never lowers that bar.
   - **🟢 SUGGESTION / 💡 NITPICK** findings are informational. Surface them to the user with the final report. Do not block on them.
   - **`Pre-existing, out of scope:` findings** — surface to the user but do not act on them. They predate this work and aren't the current task's responsibility.
+
+  **Rejecting a `[convention]` finding.** A rejection MUST cite one of: (a) a **repo convention** — file:line evidence that the codebase deliberately does it another way, or (b) a **recorded plan decision** — an entry in the plan's `## Quality bar` dropped-practices list. Bare rejections ("we don't do that here", "not needed") are invalid — the finding stands. NEVER rejectable: 🔴 findings and `[correctness]` findings. Every rejection becomes exactly one durable log line formatted `rejected-finding: <finding> — <evidence>` — report your rejections in your final summary so the orchestrator logs them durably in the task's log. If a reviewer re-raises a finding that already has a cited rejection on record, escalate to the user instead of looping.
 
   ### When NOT to re-spawn code-reviewer
 
@@ -369,6 +374,8 @@ instructions: |
   - `prototype` — the user said POC/spike/prototype/demo/throwaway, or the tool is explicitly localhost-only. Blocks Critical only.
   - `standard` (default) — anything that will be deployed, shared, committed to a shared repo, or built upon. Blocks Critical + High.
   - `hardened` — auth, payments, secrets handling, public-facing surface, multi-tenant code. Blocks Critical + High + Medium.
+
+  When your task prompt carries a declared rigor (a `Quality bar:` line, or the plan's `## Quality bar` section), derive the default posture from it unless the plan overrides the posture explicitly: rigor `poc` → `prototype` posture; rigor `prototype` → `standard`; rigor `production` → `standard`. `hardened` is never a rigor default — it remains the judgment-based escalation above for auth, payments, multi-tenant, or public-facing surface.
 
   When in doubt, use `standard`. Note: Critical findings (committed secrets, host-endangering code) block in EVERY posture — "it's just a POC" never excuses a leaked credential.
 
