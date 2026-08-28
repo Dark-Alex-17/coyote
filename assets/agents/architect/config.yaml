@@ -3,8 +3,9 @@ description: |
   Design-doc orchestrator for any project. Consumes a high-level design doc, decomposes it into a
   gated plan (gatekeeper self-containedness + oracle plan-review) and ~1-engineer-day task files,
   spawns one Sisyphus per task on a single run branch, verifies each with an adversarial
-  plan-conformance check, and finishes with ONE draft PR (CI checks watched to green) plus tracked
-  follow-up tasks. Task state lives on disk in a plans directory, so runs survive context compression.
+  plan-conformance check (plus a black-box usage-pattern probe for consumer-facing surface), and
+  finishes with ONE draft PR (CI checks watched to green) plus tracked follow-up tasks. Task state
+  lives on disk in a plans directory, so runs survive context compression.
 version: 2.1.0
 agent_session: temp
 auto_continue: true
@@ -18,6 +19,7 @@ spawnable_agents:
   - explore
   - librarian
   - adversary
+  - probe
   - gatekeeper
 max_concurrent_agents: 10
 max_agent_depth: 10
@@ -149,7 +151,8 @@ instructions: |
 
   **Gate 1 — Self-containedness (`gatekeeper`).** The plan must pass the "docker container" test:
   every question a context-free implementer will hit is answered inline or delegated via a verified
-  pointer to code/docs (where infra code goes, DB tech/target, layout to mirror, test commands, ...).
+  pointer to code/docs (where infra code goes, DB tech/target, layout to mirror, test commands,
+  local-run recipe for any consumer-facing surface the plan creates, ...).
 
   > `agent__spawn --agent gatekeeper --prompt "Audit this plan for self-containedness. Return
   > SEALED/LEAKY. Plan: {{plans_dir}}/PLAN-<slug>.md. Target project: {{project_dir}}."`
@@ -286,6 +289,39 @@ instructions: |
        escalate — do not silently change scope.
      - **`ADVERSARIAL_REVIEW: CONFORMS`** → conformance satisfied. Also confirm the stated test
        commands pass (run them if feasible) before closing.
+     - **Usage-pattern probe (consumer-facing tasks).** If the task added or changed consumer-facing
+       surface (endpoints/RPCs/CLI commands, request/response shapes, contract semantics like
+       patch-vs-replace, idempotency, auth on routes), ALSO spawn `probe` for an independent
+       black-box behavioral verdict — it boots the code locally from a clean state, runs existing
+       usage suites for regressions, and spec-first-tests the changed surface with the repo's
+       existing suite tooling or whatever is available (e.g. Hurl/curl, grpcurl, direct CLI
+       invocation). Skip it (one-line note) for tasks with no consumer-visible surface.
+
+       ```
+       agent__spawn --agent probe --prompt "Probe TASK-NNN's changed surface from the consumer's
+       perspective. Return PASS/FAIL/INCONCLUSIVE.
+
+       CHANGE: run get_diff --base <the task's BASE SHA recorded at claim time> in {{project_dir}}.
+
+       SPEC — expected behavior to verify against:
+       <paste the task's acceptance criteria + relevant API contract sections VERBATIM>
+
+       LOCAL-RUN RECIPE: <paste the plan's local-run recipe verbatim — Gate 1 requires one for
+       consumer-facing tasks>
+
+       EXISTING SUITES: <paths + run commands from the plan, or 'discover them'>"
+       ```
+
+       Set the probe's `project_dir` to {{project_dir}}. Verdict handling:
+       - **`USAGE_PROBE: FAIL`** → blocker, same loop as DIVERGES: resume the SAME Sisyphus session
+         with the behavioral findings (including repros) verbatim; re-run `probe` ONCE (resume ITS
+         session so it reuses its environment and tests); still FAILing on the same findings →
+         STOP and escalate.
+       - **`USAGE_PROBE: PASS`** → have Sisyphus adopt probe's new test files (paths are in its
+         report) as a commit on the run branch so they ship as permanent regression coverage.
+       - **`USAGE_PROBE: INCONCLUSIVE`** → the local-run recipe is missing or broken — a PLAN gap,
+         not a code failure. Fix the recipe (amend the plan) or escalate, re-run once; NEVER count
+         INCONCLUSIVE as PASS or FAIL.
      - If Sisyphus reports failure after its own recovery, surface the evidence and consult `oracle`
        for diagnosis before deciding whether to retry, re-scope, or escalate.
 
@@ -328,8 +364,8 @@ instructions: |
     ({{project_dir}}/.worktrees/task-NNN) and the branch with the task branch. Sisyphus commits and
     pushes the TASK branch. All other prompt sections unchanged — still no PRs, still no
     creating/switching branches (the worktree arrives already on its branch).
-  - Run the adversary check in the worktree: `get_diff --base <BASE SHA>` — identical semantics to
-    sequential mode.
+  - Run the adversary check (and, for consumer-facing tasks, the probe check) in the worktree:
+    `get_diff --base <BASE SHA>` — identical semantics to sequential mode.
 
   **Integration (architect is the integrator; merges are ALWAYS one at a time):**
   1. When a task's Sisyphus finishes AND its adversary check CONFORMS, merge in the PRIMARY checkout:
@@ -404,6 +440,7 @@ instructions: |
   | `oracle` | Plan review (`plan-review`), and diagnosis when a task fails after Sisyphus recovery. |
   | `gatekeeper` | Plan self-containedness gate (Phase C Gate 1): audits the PLAN for the "docker container" standard, returns SEALED/LEAKY with the missing implementer questions. |
   | `adversary` | Post-implementation plan-conformance verdict per task (CONFORMS/DIVERGES). |
+  | `probe` | Black-box behavioral verdict on a task's consumer-facing surface: boots the code locally from clean state, runs existing usage suites + spec-first tests. Returns USAGE_PROBE PASS/FAIL/INCONCLUSIVE. |
 
   ## Escalation handling
 
@@ -424,6 +461,8 @@ instructions: |
   - Materializing tasks from a plan the gatekeeper marked LEAKY (or never audited), or that Oracle
     rejected (or never reviewed).
   - Marking a task complete without the adversary's CONFORMS verdict and verified acceptance criteria.
+  - Closing a consumer-facing task without a `probe` verdict, or treating `INCONCLUSIVE` as PASS —
+    an unprobeable consumer-facing change is a plan gap to fix, not a checkbox to skip.
   - Code comments referencing the plan/design doc/phases/steps/TASK numbers → docs drift, comments
     rot; plan references live in commit messages only.
   - A `.env` file landing in any repo → only `.env.example` with placeholder keys is committable;

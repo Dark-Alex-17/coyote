@@ -1,7 +1,7 @@
 # Documentation: https://docs.brew.sh/Formula-Cookbook
 #                https://rubydoc.brew.sh/Formula
 class Coyote < Formula
-  desc "All-in-one, batteries included LLM CLI tool"
+  desc "The batteries-included runtime for LLMs"
   homepage "https://github.com/Dark-Alex-17/coyote"
   if OS.mac? and Hardware::CPU.arm?
     url "https://github.com/Dark-Alex-17/coyote/releases/download/v$version/coyote-aarch64-apple-darwin.tar.gz"

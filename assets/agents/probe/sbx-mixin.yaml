@@ -1,0 +1,76 @@
+schemaVersion: '1'
+kind: mixin
+name: agent-probe
+description: >
+  Optional convenience for the probe agent: preinstalls Hurl (HTTP
+  usage-pattern tests) and grpcurl (gRPC probing) — the example tools its
+  skill reaches for — and allows the GitHub release endpoints the fallback
+  installers download from. Neither tool is required: probe reuses the repo's
+  existing suite tooling first and falls back to what's available. Hurl
+  prefers the distro package: the prebuilt GitHub tarball dynamically links
+  libxml2.so.2, which newer distros no longer ship (e.g. Ubuntu 26.04 moved
+  to libxml2.so.16). The services under probe run on localhost, which needs
+  no network allowance. POSIX-only: sbx runs these commands with /bin/sh (dash).
+
+network:
+  allowedDomains:
+    # Latest-release lookup + tarball downloads (GitHub redirects release
+    # assets to *.githubusercontent.com object hosts)
+    - 'api.github.com:443'
+    - 'github.com:443'
+    - 'objects.githubusercontent.com:443'
+    - 'release-assets.githubusercontent.com:443'
+
+commands:
+  install:
+    - command: |
+        set -eu
+        if command -v hurl >/dev/null 2>&1; then
+          hurl --version
+          exit 0
+        fi
+        if command -v apt-get >/dev/null 2>&1; then
+          sudo apt-get update
+          if apt-cache policy hurl 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+            sudo apt-get install -y --no-install-recommends hurl
+            hurl --version
+            exit 0
+          fi
+        fi
+        arch="$(uname -m)"
+        case "$arch" in
+          aarch64|arm64) arch="aarch64" ;;
+          *) arch="x86_64" ;;
+        esac
+        curl -fsSL https://api.github.com/repos/Orange-OpenSource/hurl/releases/latest -o /tmp/hurl-release.json
+        ver="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' /tmp/hurl-release.json | head -1)"
+        curl -fsSL "https://github.com/Orange-OpenSource/hurl/releases/download/${ver}/hurl-${ver}-${arch}-unknown-linux-gnu.tar.gz" -o /tmp/hurl.tgz
+        mkdir -p /tmp/hurl-extract
+        tar -xzf /tmp/hurl.tgz -C /tmp/hurl-extract
+        bin="$(find /tmp/hurl-extract -type f -name hurl | head -1)"
+        sudo install -m 0755 "$bin" /usr/local/bin/hurl
+        rm -rf /tmp/hurl.tgz /tmp/hurl-extract /tmp/hurl-release.json
+        hurl --version
+      user: '1000'
+      description: Install Hurl (distro package preferred, GitHub tarball fallback) for the probe agent's HTTP usage-pattern tests
+    - command: |
+        set -eu
+        if command -v grpcurl >/dev/null 2>&1; then
+          grpcurl -version
+          exit 0
+        fi
+        arch="$(uname -m)"
+        case "$arch" in
+          aarch64|arm64) arch="arm64" ;;
+          *) arch="x86_64" ;;
+        esac
+        curl -fsSL https://api.github.com/repos/fullstorydev/grpcurl/releases/latest -o /tmp/grpcurl-release.json
+        ver="$(sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' /tmp/grpcurl-release.json | head -1)"
+        curl -fsSL "https://github.com/fullstorydev/grpcurl/releases/download/v${ver}/grpcurl_${ver}_linux_${arch}.tar.gz" -o /tmp/grpcurl.tgz
+        mkdir -p /tmp/grpcurl-extract
+        tar -xzf /tmp/grpcurl.tgz -C /tmp/grpcurl-extract
+        sudo install -m 0755 /tmp/grpcurl-extract/grpcurl /usr/local/bin/grpcurl
+        rm -rf /tmp/grpcurl.tgz /tmp/grpcurl-extract /tmp/grpcurl-release.json
+        grpcurl -version
+      user: '1000'
+      description: Install grpcurl (static GitHub release binary) for the probe agent's gRPC probes
