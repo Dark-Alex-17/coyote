@@ -7872,6 +7872,10 @@ mod tests {
             Some(AssetCategory::Functions)
         );
         assert_eq!(
+            AssetCategory::parse("mcp-config"),
+            Some(AssetCategory::McpConfig)
+        );
+        assert_eq!(
             AssetCategory::parse("mcp_config"),
             Some(AssetCategory::McpConfig)
         );

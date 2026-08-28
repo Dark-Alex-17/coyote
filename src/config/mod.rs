@@ -407,12 +407,12 @@ pub enum AssetCategory {
     Macros,
     Functions,
     Skills,
-    #[value(name = "mcp_config")]
+    #[value(name = "mcp-config", alias = "mcp_config")]
     McpConfig,
 }
 
 impl AssetCategory {
-    pub const NAMES: [&'static str; 5] = ["agents", "macros", "functions", "skills", "mcp_config"];
+    pub const NAMES: [&'static str; 5] = ["agents", "macros", "functions", "skills", "mcp-config"];
 
     pub fn parse(name: &str) -> Option<Self> {
         match name {
@@ -420,7 +420,7 @@ impl AssetCategory {
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
             "skills" => Some(Self::Skills),
-            "mcp_config" => Some(Self::McpConfig),
+            "mcp-config" | "mcp_config" => Some(Self::McpConfig),
             _ => None,
         }
     }
@@ -439,7 +439,7 @@ pub enum InstallFilter {
     Skills,
     Macros,
     Functions,
-    #[value(name = "mcp_config")]
+    #[value(name = "mcp-config", alias = "mcp_config")]
     McpConfig,
 }
 
@@ -450,7 +450,7 @@ impl InstallFilter {
         "skills",
         "macros",
         "functions",
-        "mcp_config",
+        "mcp-config",
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -460,7 +460,7 @@ impl InstallFilter {
             "skills" => Some(Self::Skills),
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
-            "mcp_config" => Some(Self::McpConfig),
+            "mcp-config" | "mcp_config" => Some(Self::McpConfig),
             _ => None,
         }
     }

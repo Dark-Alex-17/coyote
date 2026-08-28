@@ -591,9 +591,30 @@ mod tests {
             Some(AssetCategory::Agents)
         );
         assert_eq!(
+            parse(&["--install-builtins", "mcp-config"]).install_builtins,
+            Some(AssetCategory::McpConfig)
+        );
+        assert_eq!(
             parse(&["--install-builtins", "mcp_config"]).install_builtins,
             Some(AssetCategory::McpConfig)
         );
+    }
+
+    #[test]
+    fn mcp_config_canonical_value_is_kebab_case() {
+        use clap::ValueEnum;
+
+        let category = AssetCategory::McpConfig.to_possible_value().unwrap();
+        assert_eq!(category.get_name(), "mcp-config");
+        assert!(category.get_name_and_aliases().any(|n| n == "mcp_config"));
+        assert!(AssetCategory::NAMES.contains(&"mcp-config"));
+        assert!(!AssetCategory::NAMES.contains(&"mcp_config"));
+
+        let filter = InstallFilter::McpConfig.to_possible_value().unwrap();
+        assert_eq!(filter.get_name(), "mcp-config");
+        assert!(filter.get_name_and_aliases().any(|n| n == "mcp_config"));
+        assert!(InstallFilter::NAMES.contains(&"mcp-config"));
+        assert!(!InstallFilter::NAMES.contains(&"mcp_config"));
     }
 
     #[test]
@@ -632,6 +653,26 @@ mod tests {
         assert_eq!(
             parse(&["--install", "https://github.com/x/y", "--filter", "agents"]).filter,
             Some(InstallFilter::Agents)
+        );
+        assert_eq!(
+            parse(&[
+                "--install",
+                "https://github.com/x/y",
+                "--filter",
+                "mcp-config"
+            ])
+            .filter,
+            Some(InstallFilter::McpConfig)
+        );
+        assert_eq!(
+            parse(&[
+                "--install",
+                "https://github.com/x/y",
+                "--filter",
+                "mcp_config"
+            ])
+            .filter,
+            Some(InstallFilter::McpConfig)
         );
     }
 

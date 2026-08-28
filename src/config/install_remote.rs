@@ -4159,6 +4159,10 @@ mod tests {
             InstallTarget::Category(AssetCategory::Agents)
         );
         assert_eq!(
+            classify_install_target("mcp-config", &[]),
+            InstallTarget::Category(AssetCategory::McpConfig)
+        );
+        assert_eq!(
             classify_install_target("mcp_config", &[]),
             InstallTarget::Category(AssetCategory::McpConfig)
         );
