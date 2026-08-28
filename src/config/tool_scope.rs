@@ -107,13 +107,16 @@ impl McpRuntime {
                     if let Some(filter) = self.tool_filters.get(server) {
                         let advertised: Vec<String> =
                             tools.iter().map(|tool| tool.name.to_string()).collect();
+
                         for (source, pattern) in filter.dead_context_patterns(&advertised) {
                             warn!(
                                 "MCP tool pattern '{pattern}' from {source} matches no allowed tools on server '{server}'"
                             );
                         }
+
                         tools.retain(|tool| filter.allows(&tool.name));
                     }
+
                     merge_catalog_items(
                         &mut items,
                         tools

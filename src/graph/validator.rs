@@ -1,6 +1,7 @@
 use super::state::template_root_keys;
 use super::types::{Graph, Node, NodeType};
 use crate::client::{Model, ModelType};
+use crate::config;
 use crate::config::{Agent, AppConfig, paths};
 use crate::rag::{GraphRagConfig, RagData};
 use anyhow::{Result, bail};
@@ -214,9 +215,8 @@ impl GraphValidator {
             return;
         };
 
-        let expand_alias = |name: &str| {
-            crate::config::expand_mcp_server_alias(&ctx.app_config.mapping_mcp_servers, name)
-        };
+        let expand_alias =
+            |name: &str| config::expand_mcp_server_alias(&ctx.app_config.mapping_mcp_servers, name);
         let mut enabled_servers: HashSet<String> = ctx.mcp_servers.clone();
         for server in &ctx.mcp_servers {
             enabled_servers.extend(expand_alias(server));

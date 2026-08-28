@@ -152,7 +152,6 @@ impl Skill {
         self.enabled_mcp_servers.as_deref()
     }
 
-    #[allow(dead_code)]
     pub fn mcp_tools(&self) -> Option<&IndexMap<String, Vec<String>>> {
         self.mcp_tools.as_ref()
     }
@@ -198,6 +197,7 @@ fn parse_skill_string_or_array(value: &Value) -> Option<Vec<String>> {
 fn parse_skill_mcp_tools_map(value: &Value) -> Option<IndexMap<String, Vec<String>>> {
     let map = value.as_object()?;
     let mut mcp_tools = IndexMap::new();
+
     for (server, tools) in map {
         if tools.is_null() {
             mcp_tools.insert(server.clone(), Vec::new());
@@ -205,6 +205,7 @@ fn parse_skill_mcp_tools_map(value: &Value) -> Option<IndexMap<String, Vec<Strin
             mcp_tools.insert(server.clone(), tools);
         }
     }
+
     Some(mcp_tools)
 }
 

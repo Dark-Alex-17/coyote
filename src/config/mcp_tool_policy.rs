@@ -34,7 +34,6 @@ impl fmt::Display for LayerSource {
 }
 
 impl LayerSource {
-    /// The bare level keyword, for compact diagnostics.
     pub fn short_label(&self) -> &'static str {
         match self {
             LayerSource::Global => "global",
@@ -69,14 +68,12 @@ impl ToolFilter {
         });
     }
 
-    /// Each layer's source and raw patterns, in application order.
     pub fn layers(&self) -> impl Iterator<Item = (&LayerSource, &[String])> {
         self.layers
             .iter()
             .map(|layer| (&layer.source, layer.raw.as_slice()))
     }
 
-    /// A tool is allowed iff it matches at least one pattern in every layer.
     pub fn allows(&self, tool: &str) -> bool {
         self.layers.iter().all(|layer| {
             layer
@@ -105,12 +102,7 @@ impl ToolFilter {
         Ok(matched)
     }
 
-    /// Context-layer patterns that match none of the advertised tools
-    /// surviving the global layer — dead weight, usually a typo.
-    pub fn dead_context_patterns<'a>(
-        &'a self,
-        advertised: &[String],
-    ) -> Vec<(&'a LayerSource, &'a str)> {
+    pub fn dead_context_patterns(&self, advertised: &[String]) -> Vec<(&LayerSource, &str)> {
         let surviving: Vec<&String> = advertised
             .iter()
             .filter(|name| {
@@ -140,6 +132,7 @@ impl ToolFilter {
                 }
             }
         }
+
         dead
     }
 }
@@ -280,10 +273,6 @@ fn push_level(
     }
 }
 
-/// Expands map keys to server ids: a key that is a server id maps to itself;
-/// a key that is an alias expands to every configured id in its
-/// comma-separated value; anything else is dropped. Keys expanding to the
-/// same server merge their pattern lists.
 fn expand_server_keys(
     mcp_config: &McpServersConfig,
     aliases: &IndexMap<String, String>,
@@ -308,11 +297,10 @@ fn expand_server_keys(
             }
         }
     }
+
     expanded
 }
 
-/// Expands a `mapping_mcp_servers` alias key into its comma-separated server
-/// ids. A key with no alias entry expands to nothing.
 pub(crate) fn expand_mcp_server_alias(
     aliases: &IndexMap<String, String>,
     key: &str,

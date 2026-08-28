@@ -363,9 +363,6 @@ fn whitelist_rejection(tool: &str) -> Option<Value> {
     })
 }
 
-/// Whether a declared tool could be run as a background job. This is the
-/// declare-side twin of `whitelist_rejection`: a tool is backgroundable
-/// exactly when `job__start` would not reject it by name.
 pub fn is_backgroundable_tool(tool: &str) -> bool {
     whitelist_rejection(tool).is_none()
 }

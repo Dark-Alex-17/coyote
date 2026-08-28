@@ -1229,6 +1229,7 @@ impl RequestContext {
                 app.enabled_tools.clone(),
                 app.enabled_mcp_servers.clone(),
             );
+
             role
         };
 
@@ -3063,7 +3064,6 @@ impl RequestContext {
                 .any(|id| has_layers(id))
     }
 
-    /// The `.list mcp-servers` output, or `None` when nothing is configured.
     pub fn mcp_servers_listing(&self) -> Option<String> {
         let mut names: Vec<String> = vec![];
         if let Some(mcp_config) = &self.app.mcp_config {
@@ -3108,6 +3108,7 @@ impl RequestContext {
             };
             out.push_str(&format!("  {marker} {name}{tag}\n"));
         }
+
         Some(out)
     }
 
