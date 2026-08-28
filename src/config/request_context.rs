@@ -798,15 +798,31 @@ impl RequestContext {
         let info = handle.peer_info();
         let features =
             McpServerFeatures::from_capabilities(name, info.as_ref().map(|i| &i.capabilities));
-        let capabilities: Vec<&str> = [
-            ("tools", features.tools),
-            ("resources", features.resources),
-            ("prompts", features.prompts),
-        ]
-        .iter()
-        .filter(|(_, supported)| *supported)
-        .map(|(label, _)| *label)
-        .collect();
+        let mut capabilities: Vec<String> = vec![];
+        if features.tools {
+            capabilities.push("tools".to_string());
+        }
+        if features.resources {
+            let resources = handle.list_all_resources().await;
+            let templates = handle.list_all_resource_templates().await;
+            capabilities.push(if resources.is_err() && templates.is_err() {
+                "resources (declared, list failed)".to_string()
+            } else {
+                let count = resources.map(|r| r.len()).unwrap_or_default()
+                    + templates.map(|t| t.len()).unwrap_or_default();
+                match count {
+                    0 => "resources (declared, none served)".to_string(),
+                    n => format!("resources ({n})"),
+                }
+            });
+        }
+        if features.prompts {
+            capabilities.push(match handle.list_all_prompts().await {
+                Ok(prompts) if prompts.is_empty() => "prompts (declared, none served)".to_string(),
+                Ok(prompts) => format!("prompts ({})", prompts.len()),
+                Err(_) => "prompts (declared, list failed)".to_string(),
+            });
+        }
 
         const INFO_LABEL_WIDTH: usize = 15;
         let mut out = String::new();
@@ -8676,7 +8692,11 @@ mod tests {
             info.contains("server         fixture (stdio, connected)"),
             "got:\n{info}"
         );
-        assert!(info.contains("capabilities   tools"), "got:\n{info}");
+        let cap_line = info
+            .lines()
+            .find(|line| line.starts_with("capabilities"))
+            .unwrap();
+        assert_eq!(cap_line, "capabilities   tools", "got:\n{info}");
         assert!(info.contains("global (mcp.json):"), "got:\n{info}");
         assert!(info.contains("get_* | list_*"), "got:\n{info}");
         assert!(info.contains("role (reviewer):"), "got:\n{info}");
@@ -8700,6 +8720,77 @@ mod tests {
         );
         assert!(
             info.contains("⚠ role pattern 'bogus_zzz*' matches no allowed tools"),
+            "got:\n{info}"
+        );
+    }
+
+    #[test]
+    fn info_mcp_server_counts_served_prompts_and_resources() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["fixture"]), WorkingMode::Cmd);
+
+        let info = run_async(async {
+            let (runtime, _server) = fixture_runtime(FixtureServer {
+                resources_capability: true,
+                prompts_capability: true,
+                ..Default::default()
+            })
+            .await;
+            ctx.tool_scope.mcp_runtime = runtime;
+            ctx.mcp_server_info("fixture").await.unwrap()
+        });
+
+        assert!(
+            info.contains("capabilities   tools, resources (3), prompts (1)"),
+            "got:\n{info}"
+        );
+    }
+
+    #[test]
+    fn info_mcp_server_annotates_declared_but_empty_capabilities() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["fixture"]), WorkingMode::Cmd);
+
+        let info = run_async(async {
+            let (runtime, _server) = fixture_runtime(FixtureServer {
+                resources_capability: true,
+                prompts_capability: true,
+                empty_resource_listings: true,
+                empty_prompt_listings: true,
+                ..Default::default()
+            })
+            .await;
+            ctx.tool_scope.mcp_runtime = runtime;
+            ctx.mcp_server_info("fixture").await.unwrap()
+        });
+
+        assert!(
+            info.contains(
+                "capabilities   tools, resources (declared, none served), prompts (declared, none served)"
+            ),
+            "got:\n{info}"
+        );
+    }
+
+    #[test]
+    fn info_mcp_server_annotates_failed_capability_listings() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["fixture"]), WorkingMode::Cmd);
+
+        let info = run_async(async {
+            let (runtime, _server) = fixture_runtime(FixtureServer {
+                resources_capability: true,
+                prompts_capability: true,
+                fail_resource_listings: true,
+                fail_prompt_listings: true,
+                ..Default::default()
+            })
+            .await;
+            ctx.tool_scope.mcp_runtime = runtime;
+            ctx.mcp_server_info("fixture").await.unwrap()
+        });
+
+        assert!(
+            info.contains(
+                "capabilities   tools, resources (declared, list failed), prompts (declared, list failed)"
+            ),
             "got:\n{info}"
         );
     }

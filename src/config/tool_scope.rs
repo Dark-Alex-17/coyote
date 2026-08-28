@@ -646,6 +646,8 @@ pub(crate) mod test_fixtures {
         pub(crate) hostile_prompt: bool,
         pub(crate) fail_resource_listings: bool,
         pub(crate) fail_prompt_listings: bool,
+        pub(crate) empty_resource_listings: bool,
+        pub(crate) empty_prompt_listings: bool,
         pub(crate) fail_get_prompt: bool,
         pub(crate) prompt_delay: Option<Duration>,
         pub(crate) tool_result: Option<CallToolResult>,
@@ -665,6 +667,8 @@ pub(crate) mod test_fixtures {
                 hostile_prompt: false,
                 fail_resource_listings: false,
                 fail_prompt_listings: false,
+                empty_resource_listings: false,
+                empty_prompt_listings: false,
                 fail_get_prompt: false,
                 prompt_delay: None,
                 tool_result: None,
@@ -732,6 +736,9 @@ pub(crate) mod test_fixtures {
             if self.fail_resource_listings {
                 return Err(ErrorData::internal_error("resource listing exploded", None));
             }
+            if self.empty_resource_listings {
+                return Ok(ListResourcesResult::with_all_items(vec![]));
+            }
             Ok(ListResourcesResult::with_all_items(vec![
                 Resource::new("dup", "dup-resource")
                     .with_description("Duplicate-named resource")
@@ -751,6 +758,9 @@ pub(crate) mod test_fixtures {
         ) -> Result<ListResourceTemplatesResult, ErrorData> {
             if self.fail_resource_listings {
                 return Err(ErrorData::internal_error("template listing exploded", None));
+            }
+            if self.empty_resource_listings {
+                return Ok(ListResourceTemplatesResult::with_all_items(vec![]));
             }
             Ok(ListResourceTemplatesResult::with_all_items(vec![
                 ResourceTemplate::new("file:///{path}/{name}", "file-template")
@@ -806,6 +816,9 @@ pub(crate) mod test_fixtures {
             }
             if self.fail_prompt_listings {
                 return Err(ErrorData::internal_error("prompt listing exploded", None));
+            }
+            if self.empty_prompt_listings {
+                return Ok(ListPromptsResult::with_all_items(vec![]));
             }
             let mut prompts = vec![Prompt::new(
                 "summarize",
