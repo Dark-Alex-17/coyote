@@ -885,23 +885,28 @@ impl RequestContext {
             .map(|tool| tool.chars().count())
             .max()
             .unwrap_or_default();
+        let allowed_marker = "✓".green().bold().to_string();
+        let hidden_marker = "✗".red().bold().to_string();
         for tool in &names {
             let explained = filter.map(|f| f.allows_explain(tool));
             match explained {
-                None => out.push_str(&format!("  ✓ {tool}\n")),
+                None => out.push_str(&format!("  {allowed_marker} {tool}\n")),
                 Some(Ok(matches)) => {
                     let chain: Vec<String> = matches
                         .iter()
                         .map(|(source, pattern)| format!("{pattern} ({})", source.short_label()))
                         .collect();
                     if chain.is_empty() {
-                        out.push_str(&format!("  ✓ {tool}\n"));
+                        out.push_str(&format!("  {allowed_marker} {tool}\n"));
                     } else {
-                        out.push_str(&format!("  ✓ {tool:<name_width$}  {}\n", chain.join(" ∧ ")));
+                        out.push_str(&format!(
+                            "  {allowed_marker} {tool:<name_width$}  {}\n",
+                            chain.join(" ∧ ")
+                        ));
                     }
                 }
                 Some(Err(source)) => out.push_str(&format!(
-                    "  ✗ {tool:<name_width$}  hidden by {} layer\n",
+                    "  {hidden_marker} {tool:<name_width$}  hidden by {} layer\n",
                     source.short_label()
                 )),
             }
@@ -3831,10 +3836,15 @@ impl RequestContext {
                 );
             }
         } else if cmd == ".info" && args.first() == Some(&"mcp-server") && args.len() == 2 {
-            if let Some(mcp_config) = &self.app.mcp_config {
-                values =
-                    super::map_completion_values(mcp_config.mcp_servers.keys().cloned().collect());
-            }
+            let mut names: Vec<String> = self
+                .tool_scope
+                .mcp_runtime
+                .servers
+                .keys()
+                .cloned()
+                .collect();
+            names.sort_unstable();
+            values = super::map_completion_values(names);
         } else if cmd == ".mcp"
             && (args.first() == Some(&"enable") || args.first() == Some(&"disable"))
             && args.len() == 2
@@ -8708,19 +8718,21 @@ mod tests {
         assert!(info.contains("get_* | bogus_zzz*"), "got:\n{info}");
         assert!(info.contains("tools (1 allowed / 3 total)"), "got:\n{info}");
         assert!(
-            info.lines().any(|line| line.contains("✓ get_issue")
+            info.lines().any(|line| line.contains('✓')
+                && line.contains("get_issue")
                 && line.contains("get_* (global) ∧ get_* (role)")),
             "got:\n{info}"
         );
         assert!(
-            info.lines()
-                .any(|line| line.contains("✗ list_prs") && line.contains("hidden by role layer")),
+            info.lines().any(|line| line.contains('✗')
+                && line.contains("list_prs")
+                && line.contains("hidden by role layer")),
             "got:\n{info}"
         );
         assert!(
-            info.lines()
-                .any(|line| line.contains("✗ delete_repo")
-                    && line.contains("hidden by global layer")),
+            info.lines().any(|line| line.contains('✗')
+                && line.contains("delete_repo")
+                && line.contains("hidden by global layer")),
             "got:\n{info}"
         );
         assert!(
@@ -8848,8 +8860,30 @@ mod tests {
 
         assert!(info.contains("(none — all tools allowed)"), "got:\n{info}");
         assert!(info.contains("tools (1 allowed / 1 total)"), "got:\n{info}");
-        assert!(info.contains("✓ dup"), "got:\n{info}");
+        assert!(
+            info.lines()
+                .any(|line| line.contains('✓') && line.contains("dup")),
+            "got:\n{info}"
+        );
         assert!(!info.contains('∧'), "got:\n{info}");
+    }
+
+    #[test]
+    fn repl_complete_info_mcp_server_offers_only_running_servers() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let (runtime, _server) = run_async(fixture_runtime(FixtureServer::default()));
+        ctx.tool_scope.mcp_runtime = runtime;
+
+        let values = ctx.repl_complete(".info", &["mcp-server", ""], "");
+
+        assert!(
+            values.iter().any(|(name, _)| name == "fixture"),
+            "running server must be offered, got: {values:?}"
+        );
+        assert!(
+            !values.iter().any(|(name, _)| name == "gh"),
+            "configured-but-not-running server must not be offered, got: {values:?}"
+        );
     }
 
     #[test]
