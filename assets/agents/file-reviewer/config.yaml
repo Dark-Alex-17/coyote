@@ -1,6 +1,6 @@
 name: file-reviewer
 description: Reviews a single file's diff for bugs, style issues, and cross-cutting concerns
-version: 2.2.0
+version: 2.3.0
 
 skills_enabled: true
 enabled_skills:
@@ -8,6 +8,13 @@ enabled_skills:
   - ai-slop-remover
   - transactional-integrity
   - logging-discipline
+  - rest-api-review
+  - cli-review
+  - library-review
+  - worker-review
+  - iac-review
+  - migration-review
+  - cicd-review
 
 variables:
   - name: project_dir
@@ -117,6 +124,10 @@ instructions: |
   - **🟡 WARNING** — Logic errors, race conditions, missing error handling, performance issues with user-visible impact
   - **🟢 SUGGESTION** — Clarity, coupling, naming, footgun mitigations, missing tests for the change
   - **💡 NITPICK** — Style if no formatter enforces it, minor naming, slop-remover findings on prose-style comments
+
+  ### The `[convention]` / `[correctness]` marker
+
+  Finding titles may optionally carry a `[convention]` or `[correctness]` marker (e.g. `#### [convention] Collection endpoint without pagination`). Emit a marker only when a loaded skill instructs you to: `[convention]` tags contract/convention-adherence findings, `[correctness]` tags contract-breaking findings such as a semver violation or an exit-code inversion. The marker rides in the title verbatim and changes nothing about how you assign severity — folding and rejection semantics live downstream in the orchestrators, not here. The severity mapping above is unchanged.
 
   ## Rules
 
