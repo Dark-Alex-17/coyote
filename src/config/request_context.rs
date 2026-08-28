@@ -4266,7 +4266,7 @@ impl RequestContext {
             }
         }
 
-        let mut functions = Functions::init(app.visible_tools.as_ref().unwrap_or(&Vec::new()))?;
+        let mut functions = Functions::init(app.visible_tools.as_deref())?;
         if self.working_mode.is_repl() {
             functions.append_user_interaction_functions();
         }
@@ -4687,7 +4687,7 @@ impl RequestContext {
 
     pub fn exit_agent(&mut self, app: &AppConfig) -> Result<()> {
         self.exit_session()?;
-        let mut functions = Functions::init(app.visible_tools.as_ref().unwrap_or(&Vec::new()))?;
+        let mut functions = Functions::init(app.visible_tools.as_deref())?;
         if self.working_mode.is_repl() {
             functions.append_user_interaction_functions();
         }

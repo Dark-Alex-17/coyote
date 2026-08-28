@@ -214,6 +214,57 @@ fn tool_source_stems() -> Result<HashSet<String>> {
     Ok(stems)
 }
 
+fn all_tool_source_files() -> Result<Vec<String>> {
+    let tools_dir = paths::global_tools_dir();
+    if !tools_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut file_names = Vec::new();
+    for entry in fs::read_dir(&tools_dir)? {
+        let path = entry?.path();
+        if path.is_file()
+            && let Some(name) = path.file_name().and_then(OsStr::to_str)
+        {
+            file_names.push(name.to_string());
+        }
+    }
+
+    Ok(dedupe_tool_files_by_stem(file_names))
+}
+
+fn dedupe_tool_files_by_stem(file_names: Vec<String>) -> Vec<String> {
+    fn extension_rank(name: &str) -> Option<usize> {
+        let ext = Path::new(name).extension().and_then(OsStr::to_str)?;
+        match Language::from_extension(ext) {
+            Language::Bash => Some(0),
+            Language::Python => Some(1),
+            Language::TypeScript => Some(2),
+            Language::Unsupported => None,
+        }
+    }
+
+    let mut best: HashMap<String, (usize, String)> = HashMap::new();
+    for name in file_names {
+        let Some(rank) = extension_rank(&name) else {
+            continue;
+        };
+        let Some(stem) = Path::new(&name).file_stem().and_then(OsStr::to_str) else {
+            continue;
+        };
+        match best.get(stem) {
+            Some((best_rank, _)) if *best_rank <= rank => {}
+            _ => {
+                best.insert(stem.to_string(), (rank, name));
+            }
+        }
+    }
+
+    let mut files: Vec<String> = best.into_values().map(|(_, name)| name).collect();
+    files.sort();
+    files
+}
+
 fn bin_entry_stem(file_name: &str) -> &str {
     let name = file_name.strip_prefix("run-").unwrap_or(file_name);
     Path::new(name)
@@ -587,18 +638,23 @@ impl Functions {
         Ok(())
     }
 
-    pub fn init(visible_tools: &[String]) -> Result<Self> {
+    pub fn init(visible_tools: Option<&[String]>) -> Result<Self> {
         Self::remove_stale_global_function_binaries()?;
 
+        let (visible_tools, lenient) = match visible_tools {
+            Some(tools) => (tools.to_vec(), false),
+            None => (all_tool_source_files()?, true),
+        };
+
         let declarations = Self {
-            declarations: Self::build_global_tool_declarations(visible_tools)?,
+            declarations: Self::build_global_tool_declarations(&visible_tools, lenient)?,
         };
 
         info!(
             "Building global function binaries in {}",
             paths::functions_bin_dir().display()
         );
-        Self::build_global_function_binaries(visible_tools, None)?;
+        Self::build_global_function_binaries(&visible_tools, None, lenient)?;
 
         Ok(declarations)
     }
@@ -608,13 +664,13 @@ impl Functions {
 
         let global_tools_declarations = if !global_tools.is_empty() {
             info!("Loading global tools for agent: {name}: {global_tools:?}");
-            let tools_declarations = Self::build_global_tool_declarations(global_tools)?;
+            let tools_declarations = Self::build_global_tool_declarations(global_tools, false)?;
 
             info!(
                 "Building global function binaries required by agent: {name} in {}",
                 paths::functions_bin_dir().display()
             );
-            Self::build_global_function_binaries(global_tools, Some(name))?;
+            Self::build_global_function_binaries(global_tools, Some(name), false)?;
             tools_declarations
         } else {
             debug!("No global tools found for agent: {}", name);
@@ -964,13 +1020,17 @@ impl Functions {
 
     fn build_global_tool_declarations(
         enabled_tools: &[String],
+        lenient: bool,
     ) -> Result<Vec<FunctionDeclaration>> {
         let global_tools_directory = paths::global_tools_dir();
         let mut function_declarations = Vec::new();
 
         for tool in enabled_tools {
-            let declaration = Self::generate_declarations(&global_tools_directory.join(tool))?;
-            function_declarations.extend(declaration);
+            match Self::generate_declarations(&global_tools_directory.join(tool)) {
+                Ok(declaration) => function_declarations.extend(declaration),
+                Err(err) if lenient => warn!("Skipping tool {tool}: {err}"),
+                Err(err) => return Err(err),
+            }
         }
 
         Ok(function_declarations)
@@ -1032,39 +1092,48 @@ impl Functions {
     fn build_global_function_binaries(
         enabled_tools: &[String],
         agent_name: Option<&str>,
+        lenient: bool,
     ) -> Result<()> {
         for tool in enabled_tools {
-            let language = Language::from(
-                &Path::new(&tool)
-                    .extension()
-                    .and_then(OsStr::to_str)
-                    .map(|s| s.to_lowercase())
-                    .ok_or_else(|| {
-                        anyhow::format_err!("Unable to extract file extension from path: {tool:?}")
-                    })?,
-            );
-            let binary_name = Path::new(&tool)
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .ok_or_else(|| {
-                    anyhow::format_err!("Unable to extract file name from path: {tool:?}")
-                })?;
-
-            if language == Language::Unsupported {
-                bail!("Unsupported tool file extension: {}", language.as_ref());
+            match Self::build_global_function_binary(tool, agent_name) {
+                Ok(()) => {}
+                Err(err) if lenient => warn!("Skipping binary for tool {tool}: {err}"),
+                Err(err) => return Err(err),
             }
-
-            let tool_path = paths::global_tools_dir().join(tool);
-            let custom_runtime = extract_shebang_runtime(&tool_path);
-            Self::build_binaries(
-                binary_name,
-                language,
-                BinaryType::Tool(agent_name),
-                custom_runtime.as_deref(),
-            )?;
         }
 
         Ok(())
+    }
+
+    fn build_global_function_binary(tool: &str, agent_name: Option<&str>) -> Result<()> {
+        let language = Language::from(
+            &Path::new(tool)
+                .extension()
+                .and_then(OsStr::to_str)
+                .map(|s| s.to_lowercase())
+                .ok_or_else(|| {
+                    anyhow::format_err!("Unable to extract file extension from path: {tool:?}")
+                })?,
+        );
+        let binary_name = Path::new(tool)
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| {
+                anyhow::format_err!("Unable to extract file name from path: {tool:?}")
+            })?;
+
+        if language == Language::Unsupported {
+            bail!("Unsupported tool file extension: {}", language.as_ref());
+        }
+
+        let tool_path = paths::global_tools_dir().join(tool);
+        let custom_runtime = extract_shebang_runtime(&tool_path);
+        Self::build_binaries(
+            binary_name,
+            language,
+            BinaryType::Tool(agent_name),
+            custom_runtime.as_deref(),
+        )
     }
 
     fn remove_stale_agent_bin_entries(name: &str) -> Result<()> {
@@ -2602,6 +2671,35 @@ mod tests {
     use serial_test::serial;
     use std::sync::Arc;
     use std::{mem, process};
+
+    #[test]
+    fn dedupe_tool_files_prefers_sh_over_py_over_ts() {
+        let files = vec![
+            "get_current_weather.ts".to_string(),
+            "get_current_weather.py".to_string(),
+            "get_current_weather.sh".to_string(),
+            "fetch.ts".to_string(),
+            "fetch.py".to_string(),
+            "demo_ts.ts".to_string(),
+        ];
+
+        assert_eq!(
+            dedupe_tool_files_by_stem(files),
+            vec!["demo_ts.ts", "fetch.py", "get_current_weather.sh"]
+        );
+    }
+
+    #[test]
+    fn dedupe_tool_files_skips_unsupported_extensions() {
+        let files = vec![
+            "notes.md".to_string(),
+            "tool.sh".to_string(),
+            "README".to_string(),
+            "archive.tar.gz".to_string(),
+        ];
+
+        assert_eq!(dedupe_tool_files_by_stem(files), vec!["tool.sh"]);
+    }
 
     fn call(name: &str, id: Option<&str>) -> ToolCall {
         ToolCall::new(name.to_string(), json!({}), id.map(|s| s.to_string()))

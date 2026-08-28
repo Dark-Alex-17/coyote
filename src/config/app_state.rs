@@ -69,7 +69,7 @@ impl AppState {
             }
         }
 
-        let mut functions = Functions::init(config.visible_tools.as_ref().unwrap_or(&Vec::new()))?;
+        let mut functions = Functions::init(config.visible_tools.as_deref())?;
         if !mcp_registry.is_empty() && config.mcp_server_support {
             functions.append_mcp_meta_functions(mcp_registry.server_features());
         }

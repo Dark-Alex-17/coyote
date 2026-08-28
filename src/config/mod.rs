@@ -150,6 +150,9 @@ fn validate_no_template_in_secrets_provider(content: &str) -> Result<()> {
 const DARK_THEME: &[u8] = include_bytes!("../../assets/monokai-extended.theme.bin");
 const LIGHT_THEME: &[u8] = include_bytes!("../../assets/monokai-extended-light.theme.bin");
 
+/// Fully documented config skeleton the first-run wizard splices dynamic values into.
+const CONFIG_TEMPLATE: &str = include_str!("../../assets/config-template.yaml");
+
 const CONFIG_FILE_NAME: &str = "config.yaml";
 const AGENT_GRAPH_FILE_NAME: &str = "graph.yaml";
 const ROLES_DIR_NAME: &str = "roles";
@@ -180,27 +183,6 @@ const BUNDLE_MANIFEST_FILE: &str = "coyote-bundle.yaml";
 const SBX_MIXIN_KITS_DIR_NAME: &str = "sbx-mixin-kits";
 const GIT_DIR_NAME: &str = ".git";
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
-const DEFAULT_VISIBLE_TOOLS: [&str; 19] = [
-    "execute_command.sh",
-    "execute_py_code.py",
-    "execute_sql_code.sh",
-    "fetch_url_via_curl.sh",
-    "fs_cat.sh",
-    "fs_glob.sh",
-    "fs_grep.sh",
-    "fs_ls.sh",
-    "fs_mkdir.sh",
-    "fs_patch.sh",
-    "fs_read.sh",
-    "fs_rm.sh",
-    "fs_write.sh",
-    "ast_grep.sh",
-    "get_current_time.sh",
-    "get_current_weather.sh",
-    "search_wikipedia.sh",
-    "search_arxiv.sh",
-    "web_search_coyote.sh",
-];
 
 const CLIENTS_FIELD: &str = "clients";
 
@@ -811,51 +793,20 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
 
     let client = Select::new("API Provider (required):", list_client_types()).prompt()?;
 
-    let mut config = json!({});
     let (model, clients_config) = create_client_config(client, &vault).await?;
-    config["model"] = model.into();
-    match &provider_choice {
-        None => {
-            config["vault_password_file"] =
-                vault.local_password_file()?.display().to_string().into();
-        }
+    let secrets = match &provider_choice {
+        None => json!({
+            "vault_password_file": vault.local_password_file()?.display().to_string()
+        }),
         Some(provider) => {
-            config["secrets_provider"] = serde_json::to_value(provider)
+            let provider = serde_json::to_value(provider)
                 .with_context(|| "failed to serialize secrets_provider config")?;
+            json!({ "secrets_provider": provider })
         }
-    }
-    config["stream"] = json!(true);
-    config["save"] = json!(true);
-    config["keybindings"] = json!("vi");
-    config["wrap"] = json!("auto");
-    config["wrap_code"] = json!(false);
-    config["function_calling_support"] = json!(true);
-    config["enabled_tools"] = json!(null);
-    config["visible_tools"] = json!(DEFAULT_VISIBLE_TOOLS);
-    config["mcp_server_support"] = json!(true);
-    config["enabled_mcp_servers"] = json!(null);
-    config["highlight"] = json!(true);
-    config["light_theme"] = json!(false);
-    config[CLIENTS_FIELD] = clients_config;
+    };
 
-    let config_data = serde_yaml::to_string(&config).with_context(|| "Failed to create config")?;
-    let config_data = format!(
-        "# see https://github.com/Dark-Alex-17/coyote/blob/main/config.example.yaml\n\n{config_data}"
-    );
-
-    ensure_parent_exists(config_path)?;
-    std::fs::write(config_path, config_data)
-        .with_context(|| format!("Failed to write to '{}'", config_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::prelude::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(config_path, perms)?;
-    }
-
-    println!("✓ Saved the config file to '{}'.\n", config_path.display());
-
-    Ok(())
+    let config_data = render_config_template(&model, Some(&secrets), &clients_config)?;
+    write_config_file(config_path, &config_data)
 }
 
 async fn create_config_file_sandbox(config_path: &Path) -> Result<()> {
@@ -865,7 +816,7 @@ async fn create_config_file_sandbox(config_path: &Path) -> Result<()> {
         "Running in sandbox mode — your API provider credentials are managed by your host Coyote configuration if configured."
     );
 
-    let oai_api_base = client::OPENAI_COMPATIBLE_PROVIDERS
+    let oai_api_base = OPENAI_COMPATIBLE_PROVIDERS
         .iter()
         .find(|(name, _)| *name == client)
         .map(|(_, url)| *url);
@@ -878,13 +829,13 @@ async fn create_config_file_sandbox(config_path: &Path) -> Result<()> {
         } else {
             api_base.to_string()
         };
-        serde_json::json!({
+        json!({
             "type": "openai-compatible",
             "name": client,
             "api_base": api_base_str,
         })
     } else {
-        serde_json::json!({ "type": client })
+        json!({ "type": client })
     };
 
     if client::client_type_supports_oauth(client) {
@@ -898,27 +849,35 @@ async fn create_config_file_sandbox(config_path: &Path) -> Result<()> {
 
     let model = set_client_models_config(&mut client_config, client).await?;
 
-    let mut config = serde_json::json!({});
-    config["model"] = model.into();
-    config["stream"] = serde_json::json!(true);
-    config["save"] = serde_json::json!(true);
-    config["keybindings"] = serde_json::json!("vi");
-    config["wrap"] = serde_json::json!("auto");
-    config["wrap_code"] = serde_json::json!(false);
-    config["function_calling_support"] = serde_json::json!(true);
-    config["enabled_tools"] = serde_json::json!(null);
-    config["visible_tools"] = serde_json::json!(DEFAULT_VISIBLE_TOOLS);
-    config["mcp_server_support"] = serde_json::json!(true);
-    config["enabled_mcp_servers"] = serde_json::json!(null);
-    config["highlight"] = serde_json::json!(true);
-    config["light_theme"] = serde_json::json!(false);
-    config[CLIENTS_FIELD] = serde_json::json!(vec![client_config]);
+    let config_data = render_config_template(&model, None, &json!([client_config]))?;
+    write_config_file(config_path, &config_data)
+}
 
-    let config_data = serde_yaml::to_string(&config).with_context(|| "Failed to create config")?;
-    let config_data = format!(
-        "# see https://github.com/Dark-Alex-17/coyote/blob/main/config.example.yaml\n\n{config_data}"
-    );
+fn render_config_template(
+    model: &str,
+    secrets: Option<&serde_json::Value>,
+    clients: &serde_json::Value,
+) -> Result<String> {
+    let to_yaml = |value: &serde_json::Value| {
+        serde_yaml::to_string(value).with_context(|| "Failed to create config")
+    };
 
+    let model_block = to_yaml(&json!({ "model": model }))?;
+    let secrets_block = match secrets {
+        Some(value) => to_yaml(value)?,
+        None => "# Sandbox mode: no vault provider is configured; secrets are provisioned\n\
+                 # from the host when the sandbox is created.\n"
+            .to_string(),
+    };
+    let clients_block = to_yaml(&json!({ CLIENTS_FIELD: clients }))?;
+
+    Ok(CONFIG_TEMPLATE
+        .replacen("__MODEL_BLOCK__\n", &model_block, 1)
+        .replacen("__SECRETS_BLOCK__\n", &secrets_block, 1)
+        .replacen("__CLIENTS_BLOCK__\n", &clients_block, 1))
+}
+
+fn write_config_file(config_path: &Path, config_data: &str) -> Result<()> {
     ensure_parent_exists(config_path)?;
     std::fs::write(config_path, config_data)
         .with_context(|| format!("Failed to write to '{}'", config_path.display()))?;
@@ -1172,6 +1131,55 @@ clients:
     fn config_enabled_macros_absent_is_none() {
         let cfg: Config = serde_yaml::from_str("model: provider:test").unwrap();
         assert_eq!(cfg.enabled_macros, None);
+    }
+
+    #[test]
+    fn config_template_renders_parseable_config() {
+        let secrets = json!({ "vault_password_file": "/home/user/.coyote_password" });
+        let clients = json!([{ "type": "openai", "api_key": "sk-test" }]);
+
+        let rendered = render_config_template("openai:gpt-4o", Some(&secrets), &clients).unwrap();
+
+        assert!(!rendered.contains("__MODEL_BLOCK__"));
+        assert!(!rendered.contains("__SECRETS_BLOCK__"));
+        assert!(!rendered.contains("__CLIENTS_BLOCK__"));
+
+        let cfg = Config::load_from_str(&rendered).unwrap();
+        assert_eq!(cfg.model_id, "openai:gpt-4o");
+        assert_eq!(
+            cfg.vault_password_file,
+            Some(PathBuf::from("/home/user/.coyote_password"))
+        );
+        assert!(cfg.secrets_provider.is_none());
+        assert_eq!(cfg.keybindings, "emacs");
+        assert!(cfg.save);
+        assert_eq!(cfg.wrap.as_deref(), Some("auto"));
+        assert!(cfg.visible_tools.is_none());
+        assert!(cfg.mapping_tools.is_empty());
+        assert!(cfg.document_loaders.is_empty());
+        assert_eq!(cfg.compression_threshold, 4000);
+        assert!(cfg.theme.is_none());
+        assert_eq!(cfg.clients.len(), 1);
+    }
+
+    #[test]
+    fn config_template_renders_parseable_sandbox_config() {
+        let clients = json!([{ "type": "claude" }]);
+
+        let rendered =
+            render_config_template("claude:claude-sonnet-4-20250514", None, &clients).unwrap();
+
+        assert!(!rendered.contains("__SECRETS_BLOCK__"));
+
+        let cfg = Config::load_from_str(&rendered).unwrap();
+        assert_eq!(cfg.model_id, "claude:claude-sonnet-4-20250514");
+        assert!(cfg.vault_password_file.is_none());
+        assert!(cfg.secrets_provider.is_none());
+        assert_eq!(cfg.keybindings, "emacs");
+        assert!(cfg.save);
+        assert!(cfg.visible_tools.is_none());
+        assert_eq!(cfg.compression_threshold, 4000);
+        assert_eq!(cfg.clients.len(), 1);
     }
 
     #[test]
