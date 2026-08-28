@@ -645,6 +645,7 @@ pub(crate) mod test_fixtures {
         pub(crate) prompts_capability: bool,
         pub(crate) hostile_prompt: bool,
         pub(crate) fail_resource_listings: bool,
+        pub(crate) fail_template_listings: bool,
         pub(crate) fail_prompt_listings: bool,
         pub(crate) empty_resource_listings: bool,
         pub(crate) empty_prompt_listings: bool,
@@ -666,6 +667,7 @@ pub(crate) mod test_fixtures {
                 prompts_capability: false,
                 hostile_prompt: false,
                 fail_resource_listings: false,
+                fail_template_listings: false,
                 fail_prompt_listings: false,
                 empty_resource_listings: false,
                 empty_prompt_listings: false,
@@ -756,7 +758,7 @@ pub(crate) mod test_fixtures {
             _request: Option<PaginatedRequestParams>,
             _context: RequestContext<RoleServer>,
         ) -> Result<ListResourceTemplatesResult, ErrorData> {
-            if self.fail_resource_listings {
+            if self.fail_resource_listings || self.fail_template_listings {
                 return Err(ErrorData::internal_error("template listing exploded", None));
             }
             if self.empty_resource_listings {

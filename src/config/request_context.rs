@@ -805,23 +805,23 @@ impl RequestContext {
         if features.resources {
             let resources = handle.list_all_resources().await;
             let templates = handle.list_all_resource_templates().await;
-            capabilities.push(if resources.is_err() && templates.is_err() {
-                "resources (declared, list failed)".to_string()
-            } else {
-                let count = resources.map(|r| r.len()).unwrap_or_default()
-                    + templates.map(|t| t.len()).unwrap_or_default();
-                match count {
-                    0 => "resources (declared, none served)".to_string(),
-                    n => format!("resources ({n})"),
-                }
-            });
+            let any_failed = resources.is_err() || templates.is_err();
+            let count = resources.map(|r| r.len()).unwrap_or_default()
+                + templates.map(|t| t.len()).unwrap_or_default();
+            if count > 0 {
+                capabilities.push(format!("resources ({count})"));
+            } else if any_failed {
+                capabilities.push("resources (declared, list failed)".to_string());
+            }
         }
         if features.prompts {
-            capabilities.push(match handle.list_all_prompts().await {
-                Ok(prompts) if prompts.is_empty() => "prompts (declared, none served)".to_string(),
-                Ok(prompts) => format!("prompts ({})", prompts.len()),
-                Err(_) => "prompts (declared, list failed)".to_string(),
-            });
+            match handle.list_all_prompts().await {
+                Ok(prompts) if prompts.is_empty() => {}
+                Ok(prompts) => capabilities.push(format!("prompts ({})", prompts.len())),
+                Err(_) => {
+                    capabilities.push("prompts (declared, list failed)".to_string());
+                }
+            }
         }
 
         const INFO_LABEL_WIDTH: usize = 15;
@@ -8746,7 +8746,7 @@ mod tests {
     }
 
     #[test]
-    fn info_mcp_server_annotates_declared_but_empty_capabilities() {
+    fn info_mcp_server_omits_declared_but_empty_capabilities() {
         let mut ctx = RequestContext::new(mcp_app_state(&["fixture"]), WorkingMode::Cmd);
 
         let info = run_async(async {
@@ -8762,12 +8762,11 @@ mod tests {
             ctx.mcp_server_info("fixture").await.unwrap()
         });
 
-        assert!(
-            info.contains(
-                "capabilities   tools, resources (declared, none served), prompts (declared, none served)"
-            ),
-            "got:\n{info}"
-        );
+        let cap_line = info
+            .lines()
+            .find(|line| line.starts_with("capabilities"))
+            .unwrap();
+        assert_eq!(cap_line, "capabilities   tools", "got:\n{info}");
     }
 
     #[test]
@@ -8791,6 +8790,32 @@ mod tests {
             info.contains(
                 "capabilities   tools, resources (declared, list failed), prompts (declared, list failed)"
             ),
+            "got:\n{info}"
+        );
+    }
+
+    #[test]
+    fn info_mcp_server_annotates_partial_resource_listing_failure() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["fixture"]), WorkingMode::Cmd);
+
+        let info = run_async(async {
+            let (runtime, _server) = fixture_runtime(FixtureServer {
+                resources_capability: true,
+                empty_resource_listings: true,
+                fail_template_listings: true,
+                ..Default::default()
+            })
+            .await;
+            ctx.tool_scope.mcp_runtime = runtime;
+            ctx.mcp_server_info("fixture").await.unwrap()
+        });
+
+        let cap_line = info
+            .lines()
+            .find(|line| line.starts_with("capabilities"))
+            .unwrap();
+        assert_eq!(
+            cap_line, "capabilities   tools, resources (declared, list failed)",
             "got:\n{info}"
         );
     }
