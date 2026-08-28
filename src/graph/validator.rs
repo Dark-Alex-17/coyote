@@ -1,6 +1,7 @@
 use super::state::template_root_keys;
 use super::types::{Graph, Node, NodeType};
 use crate::client::{Model, ModelType};
+use crate::config;
 use crate::config::{Agent, AppConfig, paths};
 use crate::rag::{GraphRagConfig, RagData};
 use anyhow::{Result, bail};
@@ -214,6 +215,14 @@ impl GraphValidator {
             return;
         };
 
+        let expand_alias =
+            |name: &str| config::expand_mcp_server_alias(&ctx.app_config.mapping_mcp_servers, name);
+        let mut enabled_servers: HashSet<String> = ctx.mcp_servers.clone();
+        for server in &ctx.mcp_servers {
+            enabled_servers.extend(expand_alias(server));
+        }
+        let all_servers_enabled = ctx.mcp_servers.iter().any(|s| s.trim() == "all");
+
         for (node_id, node) in &graph.nodes {
             let NodeType::Llm(llm) = &node.node_type else {
                 continue;
@@ -232,6 +241,25 @@ impl GraphValidator {
                         result.error(ValidationError::with_node(
                             node_id,
                             format!("llm node references unknown tool '{entry}'"),
+                        ));
+                    }
+                }
+            }
+
+            if let Some(mcp_tools) = &llm.mcp_tools
+                && !all_servers_enabled
+            {
+                for key in mcp_tools.keys() {
+                    let enabled = enabled_servers.contains(key)
+                        || expand_alias(key)
+                            .iter()
+                            .any(|id| enabled_servers.contains(id));
+                    if !enabled {
+                        result.error(ValidationError::with_node(
+                            node_id,
+                            format!(
+                                "llm node 'mcp_tools' references MCP server '{key}' not enabled by this graph"
+                            ),
                         ));
                     }
                 }
@@ -1001,6 +1029,7 @@ mod tests {
             max_concurrent_jobs: None,
             global_tools: Vec::new(),
             mcp_servers: Vec::new(),
+            mcp_tools: None,
             skills_enabled: None,
             enabled_skills: None,
             inject_skill_instructions: None,
@@ -1099,6 +1128,7 @@ mod tests {
                 instructions: None,
                 prompt: "p".into(),
                 tools: None,
+                mcp_tools: None,
                 model: None,
                 temperature: None,
                 top_p: None,
@@ -1257,6 +1287,19 @@ mod tests {
         node
     }
 
+    fn llm_node_with_mcp_tools(id: &str, servers: &[&str]) -> Node {
+        let mut node = llm_node(id, None, Some("end"));
+        if let NodeType::Llm(ref mut n) = node.node_type {
+            let mut mcp_tools = IndexMap::new();
+            for server in servers {
+                mcp_tools.insert(server.to_string(), vec!["get_*".to_string()]);
+            }
+            n.mcp_tools = Some(mcp_tools);
+        }
+
+        node
+    }
+
     #[test]
     fn llm_node_unknown_tool_is_an_error() {
         let graph = graph_with(
@@ -1338,6 +1381,103 @@ mod tests {
             .validate(&graph);
 
         assert!(result.is_valid());
+    }
+
+    #[test]
+    fn llm_node_mcp_tools_enabled_server_passes() {
+        let graph = graph_with(
+            vec![
+                ("l", llm_node_with_mcp_tools("l", &["github"])),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+
+        let result = validator()
+            .with_agent_context(agent_ctx(&[], &["github"]))
+            .validate(&graph);
+
+        assert!(result.is_valid());
+    }
+
+    #[test]
+    fn llm_node_mcp_tools_unknown_server_is_an_error() {
+        let graph = graph_with(
+            vec![
+                ("l", llm_node_with_mcp_tools("l", &["slack"])),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+
+        let result = validator()
+            .with_agent_context(agent_ctx(&[], &["github"]))
+            .validate(&graph);
+
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("'slack' not enabled"))
+        );
+    }
+
+    #[test]
+    fn llm_node_mcp_tools_alias_key_passes() {
+        let graph = graph_with(
+            vec![
+                ("l", llm_node_with_mcp_tools("l", &["gh"])),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+        let mut ctx = agent_ctx(&[], &["github-mcp"]);
+        let mut app = AppConfig::default();
+        app.mapping_mcp_servers
+            .insert("gh".to_string(), "github-mcp".to_string());
+        ctx.app_config = Arc::new(app);
+
+        let result = validator().with_agent_context(ctx).validate(&graph);
+
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn llm_node_mcp_tools_key_matching_alias_expansion_passes() {
+        let graph = graph_with(
+            vec![
+                ("l", llm_node_with_mcp_tools("l", &["github-mcp"])),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+        let mut ctx = agent_ctx(&[], &["gh"]);
+        let mut app = AppConfig::default();
+        app.mapping_mcp_servers
+            .insert("gh".to_string(), "github-mcp".to_string());
+        ctx.app_config = Arc::new(app);
+
+        let result = validator().with_agent_context(ctx).validate(&graph);
+
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn llm_node_mcp_tools_with_all_sentinel_passes() {
+        let graph = graph_with(
+            vec![
+                ("l", llm_node_with_mcp_tools("l", &["github"])),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+
+        let result = validator()
+            .with_agent_context(agent_ctx(&[], &["all"]))
+            .validate(&graph);
+
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
     }
 
     #[test]

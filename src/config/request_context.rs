@@ -1,4 +1,5 @@
 use super::bundles::BundleStore;
+use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{INTERRUPTED_RESPONSE_TEXT, Session};
 use super::skill::{SKILL_SCAFFOLD, Skill};
@@ -28,7 +29,8 @@ use crate::function::{
 };
 use crate::mcp::{
     CatalogItem, MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired,
-    McpServersConfig, is_auth_required_error, is_mcp_meta_function, mcp_meta_function_names,
+    McpServerFeatures, McpServersConfig, McpTransportType, is_auth_required_error,
+    is_mcp_meta_function, mcp_meta_function_names,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -51,7 +53,6 @@ use crate::graph;
 use anyhow::{Context, Error, Result, bail};
 use colored::Colorize;
 use gman::providers::SupportedProvider;
-#[cfg(test)]
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
@@ -95,10 +96,10 @@ pub(crate) fn expand_enabled_mcp_server_ids(
     for item in enabled_mcp_servers.iter().map(|s| s.trim()) {
         if mcp_config.mcp_servers.contains_key(item) {
             ids.push(item.to_string());
-        } else if let Some(mapped) = app.mapping_mcp_servers.get(item) {
-            for mapped_id in mapped.split(',').map(|s| s.trim()) {
-                if mcp_config.mcp_servers.contains_key(mapped_id) {
-                    ids.push(mapped_id.to_string());
+        } else {
+            for mapped_id in expand_mcp_server_alias(&app.mapping_mcp_servers, item) {
+                if mcp_config.mcp_servers.contains_key(&mapped_id) {
+                    ids.push(mapped_id);
                 }
             }
         }
@@ -207,7 +208,7 @@ fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<
         .collect()
 }
 
-const SET_COMPLETION_KEYS: [&str; 26] = [
+const SET_COMPLETION_KEYS: [&str; 27] = [
     "auto_continue",
     "continuation_prompt",
     "temperature",
@@ -220,6 +221,7 @@ const SET_COMPLETION_KEYS: [&str; 26] = [
     "inject_skill_instructions",
     "skill_instructions",
     "max_auto_continues",
+    "mcp_tools",
     "memory",
     "save_session",
     "compression_threshold",
@@ -333,6 +335,10 @@ pub struct RequestContext {
     /// context owns every job in its supervisor.
     pub node_job_scope: Option<Vec<String>>,
 
+    /// Set while a graph LLM node with `mcp_tools` is executing; re-applied as
+    /// the last filter layer by every `refresh_mcp_tool_filters` recompute.
+    pub active_node_mcp_tools: Option<(String, IndexMap<String, Vec<String>>)>,
+
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub self_agent_id: Option<String>,
@@ -369,6 +375,7 @@ impl RequestContext {
             tool_scope: ToolScope::default(),
             declared_function_names: Default::default(),
             node_job_scope: None,
+            active_node_mcp_tools: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -410,7 +417,7 @@ impl RequestContext {
             mcp_runtime.sync_from_registry(registry);
         }
 
-        Ok(Self {
+        let mut ctx = Self {
             app,
             macro_flag: false,
             macro_non_isolated: false,
@@ -431,6 +438,7 @@ impl RequestContext {
             },
             declared_function_names: Default::default(),
             node_job_scope: None,
+            active_node_mcp_tools: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -445,7 +453,9 @@ impl RequestContext {
             last_continuation_response: None,
             pending_prefill: None,
             render_mode: RenderMode::default(),
-        })
+        };
+        ctx.refresh_mcp_tool_filters();
+        Ok(ctx)
     }
 
     /// Forks the context for one parallel branch of a graph super-step.
@@ -480,6 +490,7 @@ impl RequestContext {
             tool_scope: self.tool_scope.clone(),
             declared_function_names: self.declared_function_names.clone(),
             node_job_scope: None,
+            active_node_mcp_tools: self.active_node_mcp_tools.clone(),
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -527,6 +538,7 @@ impl RequestContext {
             },
             declared_function_names: Default::default(),
             node_job_scope: None,
+            active_node_mcp_tools: None,
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -761,6 +773,154 @@ impl RequestContext {
                 Ok(out)
             }
         }
+    }
+
+    pub async fn mcp_server_info(&self, name: &str) -> Result<String> {
+        let Some(spec) = self
+            .app
+            .mcp_config
+            .as_ref()
+            .and_then(|config| config.mcp_servers.get(name))
+        else {
+            bail!(
+                "MCP server '{name}' is not configured. Run `.list mcp-servers` to see what's available"
+            );
+        };
+        let Some(handle) = self.tool_scope.mcp_runtime.servers.get(name).cloned() else {
+            bail!("MCP server '{name}' is not running. Enable it with `.mcp enable {name}`.");
+        };
+
+        let transport = match spec.transport_type {
+            McpTransportType::Stdio => "stdio",
+            McpTransportType::Http => "http",
+            McpTransportType::Sse => "sse",
+        };
+        let info = handle.peer_info();
+        let features =
+            McpServerFeatures::from_capabilities(name, info.as_ref().map(|i| &i.capabilities));
+        let mut capabilities: Vec<String> = vec![];
+        if features.tools {
+            capabilities.push("tools".to_string());
+        }
+        if features.resources {
+            let resources = handle.list_all_resources().await;
+            let templates = handle.list_all_resource_templates().await;
+            let any_failed = resources.is_err() || templates.is_err();
+            let count = resources.map(|r| r.len()).unwrap_or_default()
+                + templates.map(|t| t.len()).unwrap_or_default();
+            if count > 0 {
+                capabilities.push(format!("resources ({count})"));
+            } else if any_failed {
+                capabilities.push("resources (declared, list failed)".to_string());
+            }
+        }
+        if features.prompts {
+            match handle.list_all_prompts().await {
+                Ok(prompts) if prompts.is_empty() => {}
+                Ok(prompts) => capabilities.push(format!("prompts ({})", prompts.len())),
+                Err(_) => {
+                    capabilities.push("prompts (declared, list failed)".to_string());
+                }
+            }
+        }
+
+        const INFO_LABEL_WIDTH: usize = 15;
+        let mut out = String::new();
+        out.push_str(&format!(
+            "{:<INFO_LABEL_WIDTH$}{name} ({transport}, connected)\n",
+            "server"
+        ));
+        out.push_str(&format!(
+            "{:<INFO_LABEL_WIDTH$}{}\n",
+            "capabilities",
+            capabilities.join(", ")
+        ));
+
+        let filter = self.tool_scope.mcp_runtime.tool_filters.get(name);
+        let layers: Vec<(String, String)> = filter
+            .map(|f| {
+                f.layers()
+                    .map(|(source, patterns)| (format!("{source}:"), patterns.join(" | ")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if layers.is_empty() {
+            out.push_str(&format!(
+                "{:<INFO_LABEL_WIDTH$}(none — all tools allowed)\n",
+                "filter layers"
+            ));
+        } else {
+            let label_width = layers
+                .iter()
+                .map(|(label, _)| label.chars().count())
+                .max()
+                .unwrap_or_default()
+                + 2;
+            for (i, (label, patterns)) in layers.iter().enumerate() {
+                if i == 0 {
+                    out.push_str(&format!("{:<INFO_LABEL_WIDTH$}", "filter layers"));
+                } else {
+                    out.push_str(&" ".repeat(INFO_LABEL_WIDTH));
+                }
+                out.push_str(&format!("{label:<label_width$}{patterns}\n"));
+            }
+        }
+
+        let tools = handle
+            .list_all_tools()
+            .await
+            .with_context(|| format!("Failed to list tools on MCP server '{name}'"))?;
+        let mut names: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
+        names.sort_unstable();
+        let allowed = names
+            .iter()
+            .filter(|tool| filter.is_none_or(|f| f.allows(tool)))
+            .count();
+        out.push_str(&format!(
+            "\ntools ({allowed} allowed / {} total)\n",
+            names.len()
+        ));
+        let name_width = names
+            .iter()
+            .map(|tool| tool.chars().count())
+            .max()
+            .unwrap_or_default();
+        let allowed_marker = "✓".green().bold().to_string();
+        let hidden_marker = "✗".red().bold().to_string();
+        for tool in &names {
+            let explained = filter.map(|f| f.allows_explain(tool));
+            match explained {
+                None => out.push_str(&format!("  {allowed_marker} {tool}\n")),
+                Some(Ok(matches)) => {
+                    let chain: Vec<String> = matches
+                        .iter()
+                        .map(|(source, pattern)| format!("{pattern} ({})", source.short_label()))
+                        .collect();
+                    if chain.is_empty() {
+                        out.push_str(&format!("  {allowed_marker} {tool}\n"));
+                    } else {
+                        out.push_str(&format!(
+                            "  {allowed_marker} {tool:<name_width$}  {}\n",
+                            chain.join(" ∧ ")
+                        ));
+                    }
+                }
+                Some(Err(source)) => out.push_str(&format!(
+                    "  {hidden_marker} {tool:<name_width$}  hidden by {} layer\n",
+                    source.short_label()
+                )),
+            }
+        }
+        if let Some(f) = filter {
+            for (source, pattern) in f.dead_context_patterns(&names) {
+                out.push_str(&format!(
+                    "⚠ {} pattern '{pattern}' matches no allowed tools\n",
+                    source.short_label()
+                ));
+            }
+        }
+
+        Ok(out)
     }
 
     pub fn list_sessions(&self) -> Vec<String> {
@@ -1074,6 +1234,7 @@ impl RequestContext {
                 app.enabled_tools.clone(),
                 app.enabled_mcp_servers.clone(),
             );
+
             role
         };
 
@@ -1333,6 +1494,19 @@ impl RequestContext {
         match self.role_like_mut() {
             Some(role_like) => {
                 role_like.set_enabled_mcp_servers(value);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn set_mcp_tools_on_role_like(
+        &mut self,
+        value: Option<IndexMap<String, Vec<String>>>,
+    ) -> bool {
+        match self.role_like_mut() {
+            Some(role_like) => {
+                role_like.set_mcp_tools(value);
                 true
             }
             None => false,
@@ -2440,7 +2614,9 @@ impl RequestContext {
     pub fn use_temp_role(&mut self, _app: &AppConfig, prompt: &str) -> Result<()> {
         let mut role = Role::new(TEMP_ROLE_NAME, prompt);
         role.set_model(self.current_model().clone());
-        self.use_role_obj(role)
+        self.use_role_obj(role)?;
+        self.refresh_mcp_tool_filters();
+        Ok(())
     }
 
     pub fn edit_config(&self) -> Result<()> {
@@ -2871,44 +3047,9 @@ impl RequestContext {
                 Ok(())
             }
             "mcp-servers" => {
-                let mut names: Vec<String> = vec![];
-                if let Some(mcp_config) = &self.app.mcp_config {
-                    names.extend(mcp_config.mcp_servers.keys().map(|v| v.to_string()));
-                }
-                names.extend(
-                    self.app
-                        .config
-                        .mapping_mcp_servers
-                        .keys()
-                        .map(|v| v.to_string()),
-                );
-                names.sort_unstable();
-                names.dedup();
-
-                if names.is_empty() {
-                    println!("No MCP servers found.");
-                    return Ok(());
-                }
-
-                let enabled: Option<Vec<String>> = if let Some(session) = &self.session {
-                    session.enabled_mcp_servers()
-                } else if let Some(role) = &self.role {
-                    role.enabled_mcp_servers()
-                } else {
-                    self.app.config.enabled_mcp_servers.clone()
-                };
-                let skill_mcps = self.skill_registry.loaded_mcp_servers();
-
-                println!("MCP servers:");
-                for name in &names {
-                    let active = skill_mcps.contains(name.as_str())
-                        || matches!(&enabled, Some(list) if list.iter().any(|s| s.trim() == "all") || self.mcp_list_covers(list, name));
-                    let marker = if active {
-                        "✓".green().bold().to_string()
-                    } else {
-                        "✗".red().bold().to_string()
-                    };
-                    println!("  {marker} {name}");
+                match self.mcp_servers_listing() {
+                    Some(listing) => print!("{listing}"),
+                    None => println!("No MCP servers found."),
                 }
                 Ok(())
             }
@@ -2917,6 +3058,63 @@ impl RequestContext {
                 "Unknown kind '{kind}'. Valid kinds: roles, sessions, agents, rags, macros, skills, prompts, tools, mcp-servers, bundles"
             ),
         }
+    }
+
+    fn mcp_server_is_filtered(&self, name: &str) -> bool {
+        let filters = &self.tool_scope.mcp_runtime.tool_filters;
+        let has_layers = |id: &str| filters.get(id).is_some_and(|f| f.layers().next().is_some());
+        has_layers(name)
+            || expand_mcp_server_alias(&self.app.config.mapping_mcp_servers, name)
+                .iter()
+                .any(|id| has_layers(id))
+    }
+
+    pub fn mcp_servers_listing(&self) -> Option<String> {
+        let mut names: Vec<String> = vec![];
+        if let Some(mcp_config) = &self.app.mcp_config {
+            names.extend(mcp_config.mcp_servers.keys().map(|v| v.to_string()));
+        }
+        names.extend(
+            self.app
+                .config
+                .mapping_mcp_servers
+                .keys()
+                .map(|v| v.to_string()),
+        );
+        names.sort_unstable();
+        names.dedup();
+
+        if names.is_empty() {
+            return None;
+        }
+
+        let enabled: Option<Vec<String>> = if let Some(session) = &self.session {
+            session.enabled_mcp_servers()
+        } else if let Some(role) = &self.role {
+            role.enabled_mcp_servers()
+        } else {
+            self.app.config.enabled_mcp_servers.clone()
+        };
+        let skill_mcps = self.skill_registry.loaded_mcp_servers();
+
+        let mut out = String::from("MCP servers:\n");
+        for name in &names {
+            let active = skill_mcps.contains(name.as_str())
+                || matches!(&enabled, Some(list) if list.iter().any(|s| s.trim() == "all") || self.mcp_list_covers(list, name));
+            let marker = if active {
+                "✓".green().bold().to_string()
+            } else {
+                "✗".red().bold().to_string()
+            };
+            let tag = if self.mcp_server_is_filtered(name) {
+                " [filtered]"
+            } else {
+                ""
+            };
+            out.push_str(&format!("  {marker} {name}{tag}\n"));
+        }
+
+        Some(out)
     }
 
     pub fn delete(&self, kind: &str) -> Result<()> {
@@ -3159,6 +3357,118 @@ impl RequestContext {
                     self.bootstrap_tools(app.as_ref(), true, abort_signal.clone())
                         .await?;
                 }
+            }
+            k if k.starts_with("mcp_tools.") => {
+                if self.agent.as_ref().is_some_and(|a| a.is_graph()) {
+                    bail!(
+                        "Graph agents define MCP tool filters per-node via 'mcp_tools:' in graph.yaml"
+                    );
+                }
+                let server = k.strip_prefix("mcp_tools.").expect("guarded by match arm");
+                if server.is_empty() {
+                    bail!(
+                        "Usage: .set mcp_tools.<server> <patterns> to set patterns, .set mcp_tools.<server> null to remove an entry, or .set mcp_tools null to clear this layer's map"
+                    );
+                }
+                let is_configured = self
+                    .app
+                    .mcp_config
+                    .as_ref()
+                    .is_some_and(|c| c.mcp_servers.contains_key(server));
+                let is_alias = self.app.config.mapping_mcp_servers.contains_key(server);
+                if !is_configured && !is_alias {
+                    bail!(
+                        "MCP server '{server}' is not configured. Run `.list mcp-servers` to see what's available"
+                    );
+                }
+                let enabled: Option<Vec<String>> = if let Some(session) = &self.session {
+                    session.enabled_mcp_servers()
+                } else if let Some(role) = &self.role {
+                    role.enabled_mcp_servers()
+                } else {
+                    self.app.config.enabled_mcp_servers.clone()
+                };
+                let is_enabled = self.skill_registry.loaded_mcp_servers().contains(server)
+                    || matches!(&enabled, Some(list) if list.iter().any(|s| s.trim() == "all") || self.mcp_list_covers(list, server));
+                if !is_enabled {
+                    bail!(
+                        "MCP server '{server}' is not enabled in this context. Run `.list mcp-servers` to see what's available"
+                    );
+                }
+
+                let raw: Option<String> = super::parse_value(value)?;
+                let patterns: Option<Vec<String>> = raw.map(|s| super::csv_to_vec(&s));
+
+                let current: Option<IndexMap<String, Vec<String>>> =
+                    if let Some(session) = &self.session {
+                        session.mcp_tools()
+                    } else if let Some(agent) = &self.agent {
+                        agent.mcp_tools()
+                    } else if let Some(role) = &self.role {
+                        role.mcp_tools()
+                    } else {
+                        self.app.config.mcp_tools.clone()
+                    };
+                let mut map = current.unwrap_or_default();
+                match &patterns {
+                    Some(list) => {
+                        map.insert(server.to_string(), list.clone());
+                    }
+                    None => {
+                        map.shift_remove(server);
+                    }
+                }
+                let new = (!map.is_empty()).then_some(map);
+                if !self.set_mcp_tools_on_role_like(new.clone()) {
+                    self.update_app_config(|app| app.mcp_tools = new.clone());
+                }
+                self.refresh_mcp_tool_filters();
+
+                if let Some(set_patterns) = &patterns {
+                    let ids: Vec<String> = if is_configured {
+                        vec![server.to_string()]
+                    } else {
+                        expand_mcp_server_alias(&self.app.config.mapping_mcp_servers, server)
+                    };
+                    for id in ids {
+                        let Some(handle) = self.tool_scope.mcp_runtime.servers.get(&id).cloned()
+                        else {
+                            continue;
+                        };
+                        let Ok(tools) = handle.list_all_tools().await else {
+                            continue;
+                        };
+                        let Some(filter) = self.tool_scope.mcp_runtime.tool_filters.get(&id) else {
+                            continue;
+                        };
+                        let advertised: Vec<String> =
+                            tools.iter().map(|tool| tool.name.to_string()).collect();
+                        for (_, pattern) in filter.dead_context_patterns(&advertised) {
+                            if set_patterns.iter().any(|p| p == pattern) {
+                                println!(
+                                    "Note: pattern '{pattern}' matches no allowed tools on '{server}'."
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            "mcp_tools" => {
+                let raw: Option<String> = super::parse_value(value)?;
+                if raw.is_some() {
+                    bail!(
+                        "Usage: .set mcp_tools.<server> <patterns> to set patterns, .set mcp_tools.<server> null to remove an entry, or .set mcp_tools null to clear this layer's map"
+                    );
+                }
+                if self.agent.as_ref().is_some_and(|a| a.is_graph()) {
+                    bail!(
+                        "Graph agents define MCP tool filters per-node via 'mcp_tools:' in graph.yaml"
+                    );
+                }
+                if !self.set_mcp_tools_on_role_like(None) {
+                    self.update_app_config(|app| app.mcp_tools = None);
+                }
+                self.refresh_mcp_tool_filters();
             }
             "max_output_tokens" => {
                 let value = super::parse_value(value)?;
@@ -3457,11 +3767,28 @@ impl RequestContext {
                     None => vec![],
                 },
                 ".set" => {
-                    let mut values = SET_COMPLETION_KEYS.to_vec();
+                    let mut values: Vec<String> =
+                        SET_COMPLETION_KEYS.iter().map(|v| v.to_string()).collect();
                     if !self.current_model().reasoning_levels().is_empty() {
-                        values.push("reasoning_effort");
+                        values.push("reasoning_effort".to_string());
                     }
+                    if let Some(mcp_config) = &self.app.mcp_config {
+                        values.extend(
+                            mcp_config
+                                .mcp_servers
+                                .keys()
+                                .map(|name| format!("mcp_tools.{name}")),
+                        );
+                    }
+                    values.extend(
+                        self.app
+                            .config
+                            .mapping_mcp_servers
+                            .keys()
+                            .map(|name| format!("mcp_tools.{name}")),
+                    );
                     values.sort_unstable();
+                    values.dedup();
                     values
                         .into_iter()
                         .map(|v| (format!("{v} "), None))
@@ -3508,6 +3835,16 @@ impl RequestContext {
                         .collect(),
                 );
             }
+        } else if cmd == ".info" && args.first() == Some(&"mcp-server") && args.len() == 2 {
+            let mut names: Vec<String> = self
+                .tool_scope
+                .mcp_runtime
+                .servers
+                .keys()
+                .cloned()
+                .collect();
+            names.sort_unstable();
+            values = super::map_completion_values(names);
         } else if cmd == ".mcp"
             && (args.first() == Some(&"enable") || args.first() == Some(&"disable"))
             && args.len() == 2
@@ -3964,7 +4301,68 @@ impl RequestContext {
             mcp_runtime,
             tool_tracker,
         };
+        self.refresh_mcp_tool_filters();
         Ok(())
+    }
+
+    /// In-place full recompute of `tool_scope.mcp_runtime.tool_filters` from
+    /// the current declarative state: mcp.json `allowedTools`, app config,
+    /// active role, agent, session, one layer per loaded skill, and the
+    /// active graph-node layer (always applied last). Never incremental, so
+    /// detach and unload paths need no layer-removal logic.
+    pub fn refresh_mcp_tool_filters(&mut self) {
+        self.tool_scope.mcp_runtime.tool_filters = self.compute_mcp_tool_filters();
+    }
+
+    fn compute_mcp_tool_filters(&self) -> HashMap<String, ToolFilter> {
+        let Some(mcp_config) = self.app.mcp_config.as_ref() else {
+            return HashMap::new();
+        };
+        let app = &self.app.config;
+        let session_map = self.session.as_ref().and_then(|s| s.mcp_tools());
+        let agent_map = self.agent.as_ref().and_then(|a| a.mcp_tools());
+        let agent = self
+            .agent
+            .as_ref()
+            .zip(agent_map.as_ref())
+            .map(|(a, map)| (a.name(), map));
+        let role_map = self.role.as_ref().and_then(|r| r.mcp_tools());
+        let role = self
+            .role
+            .as_ref()
+            .zip(role_map.as_ref())
+            .map(|(r, map)| (r.name(), map));
+        let skills: Vec<SkillMcpLayer> = self
+            .skill_registry
+            .loaded_skills()
+            .filter_map(|skill| {
+                let mcp_tools = skill.mcp_tools()?.clone();
+                Some(SkillMcpLayer {
+                    name: skill.name().to_string(),
+                    enabled_servers: expand_enabled_mcp_server_ids(
+                        app,
+                        mcp_config,
+                        skill.enabled_mcp_servers().unwrap_or_default(),
+                    ),
+                    mcp_tools,
+                })
+            })
+            .collect();
+        let node = self
+            .active_node_mcp_tools
+            .as_ref()
+            .map(|(id, map)| (id.as_str(), map));
+
+        McpToolPolicy::effective(
+            mcp_config,
+            session_map.as_ref(),
+            agent,
+            role,
+            app.mcp_tools.as_ref(),
+            &skills,
+            node,
+            &app.mapping_mcp_servers,
+        )
     }
 
     pub async fn refresh_tool_scope(&mut self, abort_signal: AbortSignal) -> Result<()> {
@@ -4141,6 +4539,7 @@ impl RequestContext {
             }
         }
         self.session = session;
+        self.refresh_mcp_tool_filters();
         self.init_agent_session_variables(new_session)?;
         Ok(())
     }
@@ -4261,6 +4660,7 @@ impl RequestContext {
             .is_some()
             .then(|| RagKey::Agent(agent.name().to_string()));
         self.agent = Some(agent);
+        self.refresh_mcp_tool_filters();
         if let Some(old) = self.supervisor.as_ref() {
             old.read().cancel_recursive();
         }
@@ -4809,6 +5209,8 @@ mod tests {
     use super::*;
     use crate::config::AppState;
     use crate::config::agent::AgentConfig;
+    use crate::config::mcp_tool_policy::LayerSource;
+    use crate::config::tool_scope::test_fixtures::{FixtureServer, fixture_runtime};
     use crate::function::jobs::RingBuf;
     use crate::function::{ToolCall, skill};
     use crate::mcp::{McpServer, McpServerFeatures, McpServersConfig, McpTransportType};
@@ -4825,6 +5227,39 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use std::{env, mem};
+
+    // `list_client_names` / `list_all_models` cache the first AppConfig they
+    // see in process-wide OnceLocks. Several tests reach them through configs
+    // with an empty client list, which would permanently pin every later
+    // model lookup in this process to "unknown model" and make any test that
+    // needs a resolvable model dependent on test ordering. Seed the caches
+    // before any test runs with one client, "test-seeded", exposing a single
+    // embedding model. Deliberately NO chat model: some tests assert that no
+    // chat model is available, and chat lookups don't need one — a
+    // "test-seeded:<anything>" chat id resolves through the create-from-name
+    // fallback because the client name is registered.
+    //
+    // `unsafe` is ctor's required acknowledgment that this runs before main;
+    // the body only allocates and initializes OnceLocks, both of which are
+    // sound pre-main.
+    #[ctor::ctor(unsafe)]
+    fn seed_model_registries() {
+        use crate::client::{ClientConfig, ModelData, list_all_models, list_client_names};
+
+        let mut client = ClientConfig::default();
+        if let ClientConfig::OpenAIConfig(config) = &mut client {
+            config.name = Some("test-seeded".to_string());
+            let mut embedder = ModelData::new("test-embedder");
+            embedder.model_type = "embedding".to_string();
+            config.models = vec![embedder];
+        }
+        let config = AppConfig {
+            clients: vec![client],
+            ..AppConfig::default()
+        };
+        let _ = list_client_names(&config);
+        let _ = list_all_models(&config);
+    }
 
     struct TestConfigDirGuard {
         key: String,
@@ -5599,6 +6034,7 @@ mod tests {
                         url: None,
                         headers: None,
                         oauth: None,
+                        allowed_tools: None,
                     },
                 );
             }
@@ -7446,6 +7882,10 @@ mod tests {
             Some(AssetCategory::Functions)
         );
         assert_eq!(
+            AssetCategory::parse("mcp-config"),
+            Some(AssetCategory::McpConfig)
+        );
+        assert_eq!(
             AssetCategory::parse("mcp_config"),
             Some(AssetCategory::McpConfig)
         );
@@ -8010,5 +8450,634 @@ mod tests {
                 "expected job__start to be rejected on {action}, got: {err}"
             );
         }
+    }
+
+    fn mcp_app_state(servers: &[&str]) -> Arc<AppState> {
+        let mcp_servers = servers
+            .iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    McpServer {
+                        transport_type: McpTransportType::Stdio,
+                        command: Some("echo".to_string()),
+                        args: None,
+                        env: None,
+                        cwd: None,
+                        url: None,
+                        headers: None,
+                        oauth: None,
+                        allowed_tools: None,
+                    },
+                )
+            })
+            .collect();
+        Arc::new(AppState {
+            config: Arc::new(AppConfig::default()),
+            vault: Arc::new(Vault::default()),
+            mcp_factory: Arc::new(McpFactory::default()),
+            rag_cache: Arc::new(RagCache::default()),
+            mcp_config: Some(McpServersConfig { mcp_servers }),
+            mcp_log_path: None,
+            mcp_registry: None,
+            functions: Functions::default(),
+        })
+    }
+
+    fn gh_get_only_map() -> IndexMap<String, Vec<String>> {
+        IndexMap::from([("gh".to_string(), vec!["get_*".to_string()])])
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tool_scope_populates_filters_from_a_filtered_role() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let mut role = Role::new("dev", "prompt");
+        role.set_mcp_tools(Some(gh_get_only_map()));
+        ctx.role = Some(role);
+
+        run_async(ctx.refresh_tool_scope(utils::create_abort_signal())).unwrap();
+
+        let filter = ctx
+            .tool_scope
+            .mcp_runtime
+            .tool_filters
+            .get("gh")
+            .expect("a rebuild must never leave a filtered role unfiltered");
+        assert!(filter.allows("get_issue"));
+        assert!(!filter.allows("delete_repo"));
+    }
+
+    #[test]
+    #[serial]
+    fn mid_node_skill_load_keeps_node_filter_layer() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        ctx.update_app_config(|app| app.mcp_server_support = false);
+        ctx.active_node_mcp_tools = Some(("n1".to_string(), gh_get_only_map()));
+        ctx.refresh_mcp_tool_filters();
+        assert!(!ctx.tool_scope.mcp_runtime.tool_filters["gh"].allows("list_prs"));
+
+        ctx.skill_registry
+            .insert(Skill::new(
+                "sec",
+                "---\nenabled_mcp_servers: gh\nmcp_tools:\n  gh: [get_*, list_*]\n---\nBody",
+            ))
+            .unwrap();
+        run_async(ctx.refresh_tool_scope(utils::create_abort_signal())).unwrap();
+
+        let filter = &ctx.tool_scope.mcp_runtime.tool_filters["gh"];
+        assert!(filter.allows("get_issue"));
+        assert!(
+            !filter.allows("list_prs"),
+            "the node layer must survive a mid-node skill load"
+        );
+
+        ctx.active_node_mcp_tools = None;
+        ctx.refresh_mcp_tool_filters();
+        let filter = &ctx.tool_scope.mcp_runtime.tool_filters["gh"];
+        assert!(
+            filter.allows("list_prs"),
+            "the node layer must not outlive the node"
+        );
+        assert!(!filter.allows("delete_repo"));
+    }
+
+    #[test]
+    #[serial]
+    fn set_skills_enabled_does_not_drop_filters() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let mut role = Role::new("dev", "prompt");
+        role.set_mcp_tools(Some(gh_get_only_map()));
+        ctx.role = Some(role);
+        ctx.refresh_mcp_tool_filters();
+        assert!(ctx.tool_scope.mcp_runtime.tool_filters.contains_key("gh"));
+
+        run_async(ctx.update("skills_enabled false", utils::create_abort_signal())).unwrap();
+
+        assert!(ctx.tool_scope.mcp_runtime.tool_filters.contains_key("gh"));
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_applies_persisted_mcp_tools_immediately() {
+        // use_session rebuilds the tool scope BEFORE `self.session` is
+        // assigned, so a re-attached session's persisted allowlist is
+        // enforced only by the filter refresh that runs after the
+        // assignment. Drive the real use_session against a session file on
+        // disk to prove that refresh happens.
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let session_path = ctx.session_file("persisted");
+        ensure_parent_exists(&session_path).unwrap();
+        write(
+            &session_path,
+            "model: test-seeded:test-chat\nmessages: []\nmcp_tools:\n  gh:\n    - get_*\n",
+        )
+        .unwrap();
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, Some("persisted"), utils::create_abort_signal())).unwrap();
+
+        let filter = ctx
+            .tool_scope
+            .mcp_runtime
+            .tool_filters
+            .get("gh")
+            .expect("a re-attached session's persisted map must apply immediately");
+        assert!(filter.allows("get_issue"));
+        assert!(!filter.allows("delete_repo"));
+    }
+
+    #[test]
+    #[serial]
+    fn use_rag_does_not_drop_role_filters() {
+        // Attaching a RAG rebuilds the tool scope from scratch, and the
+        // rebuilt McpRuntime starts with no filters — so the rebuild must
+        // recompute the declarative filter layers or the active role's
+        // allowlist silently disappears. Uses the yaml driver so the load
+        // stays on the local filesystem; the externally-backed attach path
+        // needs a live vector store and cannot run here, but it funnels
+        // through the same tool-scope refresh.
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let mut role = Role::new("dev", "prompt");
+        role.set_mcp_tools(Some(gh_get_only_map()));
+        ctx.role = Some(role);
+        ctx.refresh_mcp_tool_filters();
+        assert!(ctx.tool_scope.mcp_runtime.tool_filters.contains_key("gh"));
+
+        let rag_path = ctx.rag_file("kb");
+        ensure_parent_exists(&rag_path).unwrap();
+        write(
+            &rag_path,
+            "driver: yaml\nembedding_model: test-seeded:test-embedder\nchunk_size: 512\nchunk_overlap: 64\ntop_k: 5\n",
+        )
+        .unwrap();
+
+        run_async(ctx.use_rag(Some("kb"), utils::create_abort_signal())).unwrap();
+
+        assert!(ctx.rag.is_some(), "the RAG must actually load");
+        let filter = ctx
+            .tool_scope
+            .mcp_runtime
+            .tool_filters
+            .get("gh")
+            .expect("attaching a RAG must not drop the role's filter layer");
+        assert!(filter.allows("get_issue"));
+        assert!(!filter.allows("delete_repo"));
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_applies_agent_filters_without_a_session() {
+        let _guard = TestConfigDirGuard::new();
+        let config_path = paths::agent_config_file("filterer");
+        ensure_parent_exists(&config_path).unwrap();
+        write(
+            &config_path,
+            "name: filterer\ninstructions: hi\nmcp_tools:\n  gh:\n    - get_*\n",
+        )
+        .unwrap();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_agent(&app, "filterer", None, utils::create_abort_signal())).unwrap();
+
+        let filter = ctx
+            .tool_scope
+            .mcp_runtime
+            .tool_filters
+            .get("gh")
+            .expect("the agent layer must apply on the no-session use_agent path");
+        assert!(filter.allows("get_issue"));
+        assert!(!filter.allows("delete_repo"));
+    }
+
+    #[test]
+    #[serial]
+    fn use_temp_role_recomputes_filters() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let mut role = Role::new("dev", "prompt");
+        role.set_mcp_tools(Some(gh_get_only_map()));
+        ctx.role = Some(role);
+        ctx.refresh_mcp_tool_filters();
+        assert!(ctx.tool_scope.mcp_runtime.tool_filters.contains_key("gh"));
+
+        let app = ctx.app.config.clone();
+        ctx.use_temp_role(&app, "temp prompt").unwrap();
+
+        assert!(
+            ctx.tool_scope.mcp_runtime.tool_filters.is_empty(),
+            "a temp role must clear the replaced role's filter layer"
+        );
+    }
+
+    #[test]
+    fn info_mcp_server_renders_layers_chains_and_dead_patterns() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["fixture"]), WorkingMode::Cmd);
+
+        let info = run_async(async {
+            let (runtime, _server) = fixture_runtime(FixtureServer {
+                tool_names: vec!["get_issue", "list_prs", "delete_repo"],
+                ..Default::default()
+            })
+            .await;
+            ctx.tool_scope.mcp_runtime = runtime;
+            let mut filter = ToolFilter::default();
+            filter.push_layer(
+                LayerSource::Global,
+                &["get_*".to_string(), "list_*".to_string()],
+            );
+            filter.push_layer(
+                LayerSource::Role("reviewer".to_string()),
+                &["get_*".to_string(), "bogus_zzz*".to_string()],
+            );
+            ctx.tool_scope
+                .mcp_runtime
+                .tool_filters
+                .insert("fixture".to_string(), filter);
+            ctx.mcp_server_info("fixture").await.unwrap()
+        });
+
+        assert!(
+            info.contains("server         fixture (stdio, connected)"),
+            "got:\n{info}"
+        );
+        let cap_line = info
+            .lines()
+            .find(|line| line.starts_with("capabilities"))
+            .unwrap();
+        assert_eq!(cap_line, "capabilities   tools", "got:\n{info}");
+        assert!(info.contains("global (mcp.json):"), "got:\n{info}");
+        assert!(info.contains("get_* | list_*"), "got:\n{info}");
+        assert!(info.contains("role (reviewer):"), "got:\n{info}");
+        assert!(info.contains("get_* | bogus_zzz*"), "got:\n{info}");
+        assert!(info.contains("tools (1 allowed / 3 total)"), "got:\n{info}");
+        assert!(
+            info.lines().any(|line| line.contains('✓')
+                && line.contains("get_issue")
+                && line.contains("get_* (global) ∧ get_* (role)")),
+            "got:\n{info}"
+        );
+        assert!(
+            info.lines().any(|line| line.contains('✗')
+                && line.contains("list_prs")
+                && line.contains("hidden by role layer")),
+            "got:\n{info}"
+        );
+        assert!(
+            info.lines().any(|line| line.contains('✗')
+                && line.contains("delete_repo")
+                && line.contains("hidden by global layer")),
+            "got:\n{info}"
+        );
+        assert!(
+            info.contains("⚠ role pattern 'bogus_zzz*' matches no allowed tools"),
+            "got:\n{info}"
+        );
+    }
+
+    #[test]
+    fn info_mcp_server_counts_served_prompts_and_resources() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["fixture"]), WorkingMode::Cmd);
+
+        let info = run_async(async {
+            let (runtime, _server) = fixture_runtime(FixtureServer {
+                resources_capability: true,
+                prompts_capability: true,
+                ..Default::default()
+            })
+            .await;
+            ctx.tool_scope.mcp_runtime = runtime;
+            ctx.mcp_server_info("fixture").await.unwrap()
+        });
+
+        assert!(
+            info.contains("capabilities   tools, resources (3), prompts (1)"),
+            "got:\n{info}"
+        );
+    }
+
+    #[test]
+    fn info_mcp_server_omits_declared_but_empty_capabilities() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["fixture"]), WorkingMode::Cmd);
+
+        let info = run_async(async {
+            let (runtime, _server) = fixture_runtime(FixtureServer {
+                resources_capability: true,
+                prompts_capability: true,
+                empty_resource_listings: true,
+                empty_prompt_listings: true,
+                ..Default::default()
+            })
+            .await;
+            ctx.tool_scope.mcp_runtime = runtime;
+            ctx.mcp_server_info("fixture").await.unwrap()
+        });
+
+        let cap_line = info
+            .lines()
+            .find(|line| line.starts_with("capabilities"))
+            .unwrap();
+        assert_eq!(cap_line, "capabilities   tools", "got:\n{info}");
+    }
+
+    #[test]
+    fn info_mcp_server_annotates_failed_capability_listings() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["fixture"]), WorkingMode::Cmd);
+
+        let info = run_async(async {
+            let (runtime, _server) = fixture_runtime(FixtureServer {
+                resources_capability: true,
+                prompts_capability: true,
+                fail_resource_listings: true,
+                fail_prompt_listings: true,
+                ..Default::default()
+            })
+            .await;
+            ctx.tool_scope.mcp_runtime = runtime;
+            ctx.mcp_server_info("fixture").await.unwrap()
+        });
+
+        assert!(
+            info.contains(
+                "capabilities   tools, resources (declared, list failed), prompts (declared, list failed)"
+            ),
+            "got:\n{info}"
+        );
+    }
+
+    #[test]
+    fn info_mcp_server_annotates_partial_resource_listing_failure() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["fixture"]), WorkingMode::Cmd);
+
+        let info = run_async(async {
+            let (runtime, _server) = fixture_runtime(FixtureServer {
+                resources_capability: true,
+                empty_resource_listings: true,
+                fail_template_listings: true,
+                ..Default::default()
+            })
+            .await;
+            ctx.tool_scope.mcp_runtime = runtime;
+            ctx.mcp_server_info("fixture").await.unwrap()
+        });
+
+        let cap_line = info
+            .lines()
+            .find(|line| line.starts_with("capabilities"))
+            .unwrap();
+        assert_eq!(
+            cap_line, "capabilities   tools, resources (declared, list failed)",
+            "got:\n{info}"
+        );
+    }
+
+    #[test]
+    fn info_mcp_server_errors_when_unconfigured_or_not_running() {
+        let ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+
+        let err = run_async(ctx.mcp_server_info("nope")).unwrap_err();
+        assert!(err.to_string().contains("not configured"), "got: {err}");
+
+        let err = run_async(ctx.mcp_server_info("gh")).unwrap_err();
+        assert!(err.to_string().contains("not running"), "got: {err}");
+    }
+
+    #[test]
+    fn info_mcp_server_unfiltered_renders_all_allowed() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["fixture"]), WorkingMode::Cmd);
+
+        let info = run_async(async {
+            let (runtime, _server) = fixture_runtime(FixtureServer::default()).await;
+            ctx.tool_scope.mcp_runtime = runtime;
+            ctx.mcp_server_info("fixture").await.unwrap()
+        });
+
+        assert!(info.contains("(none — all tools allowed)"), "got:\n{info}");
+        assert!(info.contains("tools (1 allowed / 1 total)"), "got:\n{info}");
+        assert!(
+            info.lines()
+                .any(|line| line.contains('✓') && line.contains("dup")),
+            "got:\n{info}"
+        );
+        assert!(!info.contains('∧'), "got:\n{info}");
+    }
+
+    #[test]
+    fn repl_complete_info_mcp_server_offers_only_running_servers() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let (runtime, _server) = run_async(fixture_runtime(FixtureServer::default()));
+        ctx.tool_scope.mcp_runtime = runtime;
+
+        let values = ctx.repl_complete(".info", &["mcp-server", ""], "");
+
+        assert!(
+            values.iter().any(|(name, _)| name == "fixture"),
+            "running server must be offered, got: {values:?}"
+        );
+        assert!(
+            !values.iter().any(|(name, _)| name == "gh"),
+            "configured-but-not-running server must not be offered, got: {values:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_servers_listing_tags_filtered_servers() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh", "jira"]), WorkingMode::Cmd);
+        let mut filter = ToolFilter::default();
+        filter.push_layer(LayerSource::Global, &["get_*".to_string()]);
+        ctx.tool_scope
+            .mcp_runtime
+            .tool_filters
+            .insert("gh".to_string(), filter);
+        ctx.tool_scope
+            .mcp_runtime
+            .tool_filters
+            .insert("jira".to_string(), ToolFilter::default());
+
+        let listing = ctx.mcp_servers_listing().unwrap();
+
+        let gh_line = listing.lines().find(|line| line.contains(" gh")).unwrap();
+        assert!(gh_line.contains("[filtered]"), "got:\n{listing}");
+        let jira_line = listing.lines().find(|line| line.contains("jira")).unwrap();
+        assert!(
+            !jira_line.contains("[filtered]"),
+            "a zero-layer filter entry must not count as filtered, got:\n{listing}"
+        );
+    }
+
+    #[test]
+    fn mcp_servers_listing_tags_aliases_of_filtered_servers() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        ctx.update_app_config(|app| {
+            app.mapping_mcp_servers
+                .insert("hub".to_string(), "gh".to_string());
+        });
+        let mut filter = ToolFilter::default();
+        filter.push_layer(LayerSource::Global, &["get_*".to_string()]);
+        ctx.tool_scope
+            .mcp_runtime
+            .tool_filters
+            .insert("gh".to_string(), filter);
+
+        let listing = ctx.mcp_servers_listing().unwrap();
+
+        let hub_line = listing.lines().find(|line| line.contains("hub")).unwrap();
+        assert!(hub_line.contains("[filtered]"), "got:\n{listing}");
+    }
+
+    #[test]
+    fn set_mcp_tools_writes_app_layer_and_refreshes_filters() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        ctx.update_app_config(|app| app.enabled_mcp_servers = Some(vec!["all".to_string()]));
+
+        run_async(ctx.update(
+            "mcp_tools.gh get_*,list_issues",
+            utils::create_abort_signal(),
+        ))
+        .unwrap();
+
+        let map = ctx.app.config.mcp_tools.as_ref().unwrap();
+        assert_eq!(
+            map.get("gh").unwrap(),
+            &vec!["get_*".to_string(), "list_issues".to_string()]
+        );
+        let filter = ctx.tool_scope.mcp_runtime.tool_filters.get("gh").unwrap();
+        assert!(filter.allows("get_issue"));
+        assert!(!filter.allows("delete_repo"));
+    }
+
+    #[test]
+    fn set_mcp_tools_writes_session_layer_when_attached() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let mut session = Session::default();
+        session.set_enabled_mcp_servers(Some(vec!["all".to_string()]));
+        ctx.session = Some(session);
+
+        run_async(ctx.update("mcp_tools.gh get_*", utils::create_abort_signal())).unwrap();
+
+        let map = ctx.session.as_ref().unwrap().mcp_tools().unwrap();
+        assert_eq!(map.get("gh").unwrap(), &vec!["get_*".to_string()]);
+        assert!(ctx.app.config.mcp_tools.is_none());
+    }
+
+    #[test]
+    fn set_mcp_tools_keeps_dotted_server_names_verbatim() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["my.server"]), WorkingMode::Cmd);
+        ctx.update_app_config(|app| app.enabled_mcp_servers = Some(vec!["all".to_string()]));
+
+        run_async(ctx.update("mcp_tools.my.server get_*", utils::create_abort_signal())).unwrap();
+
+        let map = ctx.app.config.mcp_tools.as_ref().unwrap();
+        assert!(map.contains_key("my.server"));
+        assert!(ctx.tool_scope.mcp_runtime.tool_filters["my.server"].allows("get_issue"));
+    }
+
+    #[test]
+    #[serial]
+    fn set_mcp_tools_rejects_graph_agents_on_both_arms() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_graph_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\nversion: \"1.0\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: ok\n"
+            ),
+        )
+        .unwrap();
+        run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
+
+        for data in ["mcp_tools.gh get_*", "mcp_tools null"] {
+            let err = run_async(ctx.update(data, utils::create_abort_signal())).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Graph agents define MCP tool filters per-node"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_mcp_tools_rejects_unknown_and_disabled_servers() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        ctx.update_app_config(|app| app.enabled_mcp_servers = Some(vec!["all".to_string()]));
+
+        let err =
+            run_async(ctx.update("mcp_tools.nope x", utils::create_abort_signal())).unwrap_err();
+        assert!(err.to_string().contains("not configured"), "got: {err}");
+
+        ctx.update_app_config(|app| app.enabled_mcp_servers = None);
+        let err =
+            run_async(ctx.update("mcp_tools.gh get_*", utils::create_abort_signal())).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("not enabled"), "got: {message}");
+        assert!(message.contains(".list mcp-servers"), "got: {message}");
+    }
+
+    #[test]
+    fn set_mcp_tools_null_removes_entries_and_clears_layer() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh", "jira"]), WorkingMode::Cmd);
+        ctx.update_app_config(|app| app.enabled_mcp_servers = Some(vec!["all".to_string()]));
+        let abort = utils::create_abort_signal;
+
+        run_async(ctx.update("mcp_tools.gh get_*", abort())).unwrap();
+        run_async(ctx.update("mcp_tools.gh null", abort())).unwrap();
+        assert!(
+            ctx.app.config.mcp_tools.is_none(),
+            "removing the only entry must store None, not an empty map"
+        );
+        assert!(!ctx.tool_scope.mcp_runtime.tool_filters.contains_key("gh"));
+
+        run_async(ctx.update("mcp_tools.gh get_*", abort())).unwrap();
+        run_async(ctx.update("mcp_tools.jira list_*", abort())).unwrap();
+        run_async(ctx.update("mcp_tools.gh null", abort())).unwrap();
+        let map = ctx.app.config.mcp_tools.as_ref().unwrap();
+        assert!(!map.contains_key("gh"));
+        assert!(map.contains_key("jira"));
+
+        run_async(ctx.update("mcp_tools null", abort())).unwrap();
+        assert!(ctx.app.config.mcp_tools.is_none());
+        assert!(ctx.tool_scope.mcp_runtime.tool_filters.is_empty());
+
+        let err = run_async(ctx.update("mcp_tools get_*", abort())).unwrap_err();
+        assert!(
+            err.to_string().contains("Usage: .set mcp_tools.<server>"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn set_mcp_tools_session_layer_cannot_widen_role_layer() {
+        let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
+        let mut role = Role::new("dev", "prompt");
+        role.set_mcp_tools(Some(gh_get_only_map()));
+        ctx.role = Some(role);
+        let mut session = Session::default();
+        session.set_enabled_mcp_servers(Some(vec!["all".to_string()]));
+        ctx.session = Some(session);
+
+        run_async(ctx.update("mcp_tools.gh *", utils::create_abort_signal())).unwrap();
+
+        let filter = &ctx.tool_scope.mcp_runtime.tool_filters["gh"];
+        assert!(filter.allows("get_issue"));
+        assert!(
+            !filter.allows("delete_repo"),
+            "a session layer can only narrow, never widen"
+        );
     }
 }

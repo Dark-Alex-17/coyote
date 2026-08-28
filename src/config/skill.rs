@@ -37,6 +37,8 @@ pub struct Skill {
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled_mcp_servers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_tools: Option<IndexMap<String, Vec<String>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     auto_unload: Option<bool>,
 }
 
@@ -73,6 +75,9 @@ impl Skill {
                     }
                     "enabled_mcp_servers" => {
                         skill.enabled_mcp_servers = parse_skill_string_or_array(value);
+                    }
+                    "mcp_tools" => {
+                        skill.mcp_tools = parse_skill_mcp_tools_map(value);
                     }
                     "auto_unload" => {
                         skill.auto_unload = value.as_bool();
@@ -147,6 +152,10 @@ impl Skill {
         self.enabled_mcp_servers.as_deref()
     }
 
+    pub fn mcp_tools(&self) -> Option<&IndexMap<String, Vec<String>>> {
+        self.mcp_tools.as_ref()
+    }
+
     pub fn auto_unload(&self) -> bool {
         self.auto_unload.unwrap_or(false)
     }
@@ -185,6 +194,21 @@ fn parse_skill_string_or_array(value: &Value) -> Option<Vec<String>> {
     None
 }
 
+fn parse_skill_mcp_tools_map(value: &Value) -> Option<IndexMap<String, Vec<String>>> {
+    let map = value.as_object()?;
+    let mut mcp_tools = IndexMap::new();
+
+    for (server, tools) in map {
+        if tools.is_null() {
+            mcp_tools.insert(server.clone(), Vec::new());
+        } else if let Some(tools) = parse_skill_string_or_array(tools) {
+            mcp_tools.insert(server.clone(), tools);
+        }
+    }
+
+    Some(mcp_tools)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +220,44 @@ mod tests {
         assert_eq!(skill.name(), "test");
         assert_eq!(skill.body(), "You are a git expert");
         assert_eq!(skill.description(), "");
+    }
+
+    #[test]
+    fn skill_new_parses_mcp_tools_list_and_csv_values() {
+        let content = "---\nmcp_tools:\n  github: [get_*, list_*]\n  slack: a,b\n---\nBody";
+
+        let skill = Skill::new("test", content);
+
+        let mcp_tools = skill.mcp_tools().unwrap();
+        assert_eq!(
+            mcp_tools.get("github"),
+            Some(&vec!["get_*".to_string(), "list_*".to_string()])
+        );
+        assert_eq!(
+            mcp_tools.get("slack"),
+            Some(&vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn skill_new_mcp_tools_absent_is_none() {
+        let skill = Skill::new("test", "---\ndescription: d\n---\nBody");
+
+        assert_eq!(skill.mcp_tools(), None);
+    }
+
+    #[test]
+    fn skill_new_mcp_tools_empty_list_server_is_some_empty() {
+        let skill = Skill::new("test", "---\nmcp_tools:\n  github: []\n---\nBody");
+
+        assert_eq!(skill.mcp_tools().unwrap().get("github"), Some(&vec![]));
+    }
+
+    #[test]
+    fn skill_new_mcp_tools_per_server_null_is_some_empty() {
+        let skill = Skill::new("test", "---\nmcp_tools:\n  github:\n---\nBody");
+
+        assert_eq!(skill.mcp_tools().unwrap().get("github"), Some(&vec![]));
     }
 
     #[test]

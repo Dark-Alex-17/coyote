@@ -40,6 +40,8 @@ pub struct Session {
         deserialize_with = "super::deserialize_csv_or_vec"
     )]
     enabled_mcp_servers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mcp_tools: Option<IndexMap<String, Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skills_enabled: Option<bool>,
     #[serde(
@@ -249,6 +251,9 @@ impl Session {
         if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
             data["enabled_mcp_servers"] = json!(enabled_mcp_servers);
         }
+        if let Some(mcp_tools) = self.mcp_tools() {
+            data["mcp_tools"] = json!(mcp_tools);
+        }
         if let Some(skills_enabled) = self.skills_enabled() {
             data["skills_enabled"] = skills_enabled.into();
         }
@@ -327,6 +332,13 @@ impl Session {
 
         if let Some(enabled_mcp_servers) = self.enabled_mcp_servers() {
             items.push(("enabled_mcp_servers", enabled_mcp_servers.join(",")));
+        }
+
+        if let Some(mcp_tools) = self.mcp_tools() {
+            items.push((
+                "mcp_tools",
+                serde_json::to_string(&mcp_tools).unwrap_or_default(),
+            ));
         }
 
         if let Some(skills_enabled) = self.skills_enabled() {
@@ -870,6 +882,10 @@ impl RoleLike for Session {
         self.enabled_mcp_servers.clone()
     }
 
+    fn mcp_tools(&self) -> Option<IndexMap<String, Vec<String>>> {
+        self.mcp_tools.clone()
+    }
+
     fn set_model(&mut self, model: Model) {
         if self.model().id() != model.id() {
             self.model_id = model.id();
@@ -910,6 +926,13 @@ impl RoleLike for Session {
     fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>) {
         if self.enabled_mcp_servers != value {
             self.enabled_mcp_servers = value;
+            self.dirty = true;
+        }
+    }
+
+    fn set_mcp_tools(&mut self, value: Option<IndexMap<String, Vec<String>>>) {
+        if self.mcp_tools != value {
+            self.mcp_tools = value;
             self.dirty = true;
         }
     }
@@ -1042,6 +1065,45 @@ mod tests {
         let session: Session = serde_yaml::from_str("model: provider:test\nmessages: []").unwrap();
 
         assert_eq!(session.enabled_macros, None);
+    }
+
+    #[test]
+    fn session_mcp_tools_survives_yaml_round_trip() {
+        let mut session = Session::default();
+        let mut mcp_tools = IndexMap::new();
+        mcp_tools.insert("github".to_string(), vec!["get_*".to_string()]);
+        mcp_tools.insert("slack".to_string(), vec![]);
+        session.set_mcp_tools(Some(mcp_tools.clone()));
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(reloaded.mcp_tools(), Some(mcp_tools));
+    }
+
+    #[test]
+    fn session_set_role_does_not_copy_mcp_tools() {
+        let role = Role::new(
+            "test",
+            "---\nmcp_tools:\n  github: [get_issue]\n---\nPrompt",
+        );
+        assert!(role.mcp_tools().is_some());
+        let mut session = Session::default();
+
+        session.set_role(role);
+
+        assert_eq!(session.mcp_tools(), None);
+    }
+
+    #[test]
+    fn session_set_mcp_tools_marks_dirty() {
+        let mut session = Session::default();
+        assert!(!session.dirty());
+
+        session.set_mcp_tools(Some(IndexMap::new()));
+
+        assert!(session.dirty());
+        assert_eq!(session.mcp_tools(), Some(IndexMap::new()));
     }
 
     #[test]

@@ -682,6 +682,10 @@ impl RoleLike for Agent {
         Some(self.config.mcp_servers.clone())
     }
 
+    fn mcp_tools(&self) -> Option<IndexMap<String, Vec<String>>> {
+        self.config.mcp_tools.clone()
+    }
+
     fn set_model(&mut self, model: Model) {
         self.config.model_id = Some(model.id());
         self.model = model;
@@ -722,6 +726,10 @@ impl RoleLike for Agent {
                 self.config.mcp_servers.clear();
             }
         }
+    }
+
+    fn set_mcp_tools(&mut self, value: Option<IndexMap<String, Vec<String>>>) {
+        self.config.mcp_tools = value;
     }
 }
 
@@ -774,6 +782,8 @@ pub struct AgentConfig {
     pub version: String,
     #[serde(default)]
     pub mcp_servers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tools: Option<IndexMap<String, Vec<String>>>,
     #[serde(default)]
     pub global_tools: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -846,6 +856,7 @@ impl AgentConfig {
             description: graph.description.clone(),
             global_tools: graph.global_tools.clone(),
             mcp_servers: graph.mcp_servers.clone(),
+            mcp_tools: graph.mcp_tools.clone(),
             skills_enabled: graph.skills_enabled,
             enabled_skills: graph.enabled_skills.clone(),
             inject_skill_instructions: graph.inject_skill_instructions.unwrap_or(true),
@@ -1283,6 +1294,33 @@ variables:
         let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
 
         assert_eq!(config.enabled_macros, None);
+    }
+
+    #[test]
+    fn agent_config_parses_mcp_tools() {
+        let yaml =
+            "name: minimal\ninstructions: hi\nmcp_tools:\n  github:\n    - get_*\n    - list_*\n";
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+
+        let mcp_tools = config.mcp_tools.unwrap();
+        assert_eq!(
+            mcp_tools.get("github"),
+            Some(&vec!["get_*".to_string(), "list_*".to_string()])
+        );
+    }
+
+    #[test]
+    fn agent_mcp_tools_role_like_round_trip() {
+        let config: AgentConfig =
+            serde_yaml::from_str("name: minimal\ninstructions: hi\n").unwrap();
+        let mut agent = Agent::test_new(config);
+        assert_eq!(agent.mcp_tools(), None);
+
+        let mut mcp_tools = IndexMap::new();
+        mcp_tools.insert("github".to_string(), vec!["get_*".to_string()]);
+        agent.set_mcp_tools(Some(mcp_tools.clone()));
+
+        assert_eq!(agent.mcp_tools(), Some(mcp_tools));
     }
 
     #[test]

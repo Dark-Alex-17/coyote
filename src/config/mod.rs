@@ -8,6 +8,7 @@ pub(crate) mod instructions;
 mod macro_policy;
 mod macros;
 mod mcp_factory;
+mod mcp_tool_policy;
 pub(crate) mod memory;
 pub(crate) mod paths;
 pub(crate) mod prompts;
@@ -41,6 +42,9 @@ pub use self::install_remote::{
 pub use self::macro_policy::{
     MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, ResolvedMacro,
 };
+pub(crate) use self::mcp_tool_policy::expand_mcp_server_alias;
+#[cfg(test)]
+pub(crate) use self::mcp_tool_policy::{LayerSource, ToolFilter};
 #[allow(unused_imports)]
 pub use self::request_context::{
     RenderMode, RequestContext, effective_max_concurrent_jobs, jobs_enabled,
@@ -250,6 +254,7 @@ pub struct Config {
     pub mapping_mcp_servers: IndexMap<String, String>,
     #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
     pub enabled_mcp_servers: Option<Vec<String>>,
+    pub mcp_tools: Option<IndexMap<String, Vec<String>>>,
 
     pub auto_continue: bool,
     pub max_auto_continues: usize,
@@ -333,6 +338,7 @@ impl Default for Config {
             mcp_server_support: true,
             mapping_mcp_servers: Default::default(),
             enabled_mcp_servers: None,
+            mcp_tools: None,
 
             auto_continue: false,
             max_auto_continues: 10,
@@ -401,12 +407,12 @@ pub enum AssetCategory {
     Macros,
     Functions,
     Skills,
-    #[value(name = "mcp_config")]
+    #[value(name = "mcp-config", alias = "mcp_config")]
     McpConfig,
 }
 
 impl AssetCategory {
-    pub const NAMES: [&'static str; 5] = ["agents", "macros", "functions", "skills", "mcp_config"];
+    pub const NAMES: [&'static str; 5] = ["agents", "macros", "functions", "skills", "mcp-config"];
 
     pub fn parse(name: &str) -> Option<Self> {
         match name {
@@ -414,7 +420,7 @@ impl AssetCategory {
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
             "skills" => Some(Self::Skills),
-            "mcp_config" => Some(Self::McpConfig),
+            "mcp-config" | "mcp_config" => Some(Self::McpConfig),
             _ => None,
         }
     }
@@ -433,7 +439,7 @@ pub enum InstallFilter {
     Skills,
     Macros,
     Functions,
-    #[value(name = "mcp_config")]
+    #[value(name = "mcp-config", alias = "mcp_config")]
     McpConfig,
 }
 
@@ -444,7 +450,7 @@ impl InstallFilter {
         "skills",
         "macros",
         "functions",
-        "mcp_config",
+        "mcp-config",
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -454,7 +460,7 @@ impl InstallFilter {
             "skills" => Some(Self::Skills),
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
-            "mcp_config" => Some(Self::McpConfig),
+            "mcp-config" | "mcp_config" => Some(Self::McpConfig),
             _ => None,
         }
     }
@@ -1126,6 +1132,17 @@ clients:
     api_key: '{{OPENAI_KEY}}'
 ";
         assert!(validate_no_template_in_secrets_provider(yaml).is_ok());
+    }
+
+    #[test]
+    fn config_yaml_parses_mcp_tools() {
+        let cfg: Config = serde_yaml::from_str("mcp_tools:\n  github:\n    - get_*\n").unwrap();
+
+        assert_eq!(
+            cfg.mcp_tools.as_ref().unwrap().get("github"),
+            Some(&vec!["get_*".to_string()])
+        );
+        assert_eq!(Config::default().mcp_tools, None);
     }
 
     #[test]

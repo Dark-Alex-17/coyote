@@ -4159,6 +4159,10 @@ mod tests {
             InstallTarget::Category(AssetCategory::Agents)
         );
         assert_eq!(
+            classify_install_target("mcp-config", &[]),
+            InstallTarget::Category(AssetCategory::McpConfig)
+        );
+        assert_eq!(
             classify_install_target("mcp_config", &[]),
             InstallTarget::Category(AssetCategory::McpConfig)
         );
@@ -4787,6 +4791,49 @@ mod tests {
         assert!(!written.mcp_servers.contains_key("srv"));
         assert!(written.mcp_servers.contains_key("user-srv"));
         assert!(store.get("omc").unwrap().mcp_servers.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uninstall_mcp_preserves_allowed_tools_on_surviving_entries() {
+        let dir = fresh_temp_dir("uninst-mcp-allowed-tools-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let mcp = dir.join("mcp.json");
+        write_mcp(
+            &mcp,
+            r#"{"mcpServers": {
+                "srv": {"type": "stdio", "command": "echo"},
+                "user-srv": {"type": "stdio", "command": "mine", "allowedTools": ["get_*", "list_issues"]}
+            }}"#,
+        );
+        let parsed: McpServersConfig =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        let hash = hash_bytes(
+            serde_json::to_string(parsed.mcp_servers.get("srv").unwrap())
+                .unwrap()
+                .as_bytes(),
+        );
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![mcp_server_record("srv", McpAction::Added, Some(hash))],
+            )
+            .unwrap();
+        let servers = store.get("omc").unwrap().mcp_servers.clone();
+
+        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+
+        assert_eq!(summary.removed, vec!["srv"]);
+        let raw = fs::read_to_string(&mcp).unwrap();
+        assert!(raw.contains("allowedTools"));
+        let written: McpServersConfig = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            written.mcp_servers.get("user-srv").unwrap().allowed_tools,
+            Some(vec!["get_*".to_string(), "list_issues".to_string()])
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

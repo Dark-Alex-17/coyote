@@ -11,64 +11,74 @@
 #   - <agent-name>_AGENT_SESSION
 #   - <agent-name>_VARIABLES (as JSON array of key-value pairs; e.g. '[{"name": "username", "value": "alex"}]')
 
-model: openai:gpt-4o             # Specify the LLM to use
-temperature: null                # Set default temperature parameter, range (0, 1)
-top_p: null                      # Set default top-p parameter, with a range of (0, 1) or (0, 2) depending on the model
-reasoning_effort: null           # Reasoning effort level for models that support it (e.g. low, medium, high).
-                                 # Only valid when the agent's model declares reasoning_levels.
-agent_session: null              # Set a session to use when starting the agent. (e.g. temp, default); defaults to globally set agent_session
-name: <agent-name>               # Name of the agent, used in the UI and logs
-description: <description>       # Description of the agent, used in the UI
-version: 1                       # Version of the agent
+model: openai:gpt-4o # Specify the LLM to use
+temperature: null # Set default temperature parameter, range (0, 1)
+top_p: null # Set default top-p parameter, with a range of (0, 1) or (0, 2) depending on the model
+reasoning_effort:
+  null # Reasoning effort level for models that support it (e.g. low, medium, high).
+  # Only valid when the agent's model declares reasoning_levels.
+agent_session: null # Set a session to use when starting the agent. (e.g. temp, default); defaults to globally set agent_session
+name: <agent-name> # Name of the agent, used in the UI and logs
+description: <description> # Description of the agent, used in the UI
+version: 1 # Version of the agent
 # Auto-Continue (Todo System)
 # The auto-continue system provides built-in task tracking for improved reliability.
 # When enabled, the model can create todo lists and the system will automatically
 # prompt it to continue when incomplete tasks remain.
 # See the [Todo System documentation](https://github.com/Dark-Alex-17/coyote/wiki/TODO-System) for more information
-auto_continue: false             # Enable automatic continuation when incomplete todos remain
-max_auto_continues: 10           # Maximum number of automatic continuations before stopping
-inject_todo_instructions: true   # Inject the default todo tool usage instructions into the agent's system prompt
-continuation_prompt: null        # Custom prompt used when auto-continuing (optional; uses default if null)
+auto_continue: false # Enable automatic continuation when incomplete todos remain
+max_auto_continues: 10 # Maximum number of automatic continuations before stopping
+inject_todo_instructions: true # Inject the default todo tool usage instructions into the agent's system prompt
+continuation_prompt: null # Custom prompt used when auto-continuing (optional; uses default if null)
 # Sub-Agent Spawning System
 # Enable this agent to spawn and manage child agents in parallel.
 # See https://github.com/Dark-Alex-17/coyote/wiki/Agents for detailed documentation.
-can_spawn_agents: false          # Enable the agent to spawn child agents
+can_spawn_agents: false # Enable the agent to spawn child agents
 # spawnable_agents:              # Optional whitelist restricting which agents can be spawned via `agent__spawn`.
 #   - explore                    # If omitted (the default), ALL installed agents are spawnable. This is the unrestricted default.
 #   - coder                      # Provide a list to restrict. Match is exact and case-sensitive (use directory names).
 #   - oracle                     # An empty list ([]) means literally nothing spawnable.
-                                 # Also filters `agent__list_available` output so the LLM only sees what it can spawn.
-                                 # Graph agents (graph.yaml) ignore this; they declare spawn targets in agent nodes.
-max_concurrent_agents: 4         # Maximum number of agents that can run simultaneously
-max_agent_depth: 3               # Maximum nesting depth for sub-agents (prevents runaway spawning)
-max_concurrent_jobs: 5           # Max background jobs (`job__*` tools) running at once for this agent
-                                 # (overrides the global setting; 0 disables background jobs for this agent)
-inject_spawn_instructions: true  # Inject the default agent spawning instructions into the agent's system prompt
-summarization_model: null        # Model to use for summarizing sub-agent output (e.g. 'openai:gpt-4o-mini'); defaults to current model
-summarization_threshold: 4000    # Character threshold above which sub-agent output is summarized before returning to parent
-escalation_timeout: 300          # Seconds a sub-agent waits for a user interaction response before timing out (default: 5 minutes)
-mcp_servers:                     # Optional list of MCP servers that the agent utilizes
-  - github                       # Corresponds to the name of an MCP server in the `<coyote-config-dir>/mcp.json` file
-global_tools:                    # Optional list of additional global tools to enable for the agent; i.e. not tools specific to the agent
+# Also filters `agent__list_available` output so the LLM only sees what it can spawn.
+# Graph agents (graph.yaml) ignore this; they declare spawn targets in agent nodes.
+max_concurrent_agents: 4 # Maximum number of agents that can run simultaneously
+max_agent_depth: 3 # Maximum nesting depth for sub-agents (prevents runaway spawning)
+max_concurrent_jobs:
+  5 # Max background jobs (`job__*` tools) running at once for this agent
+  # (overrides the global setting; 0 disables background jobs for this agent)
+inject_spawn_instructions: true # Inject the default agent spawning instructions into the agent's system prompt
+summarization_model: null # Model to use for summarizing sub-agent output (e.g. 'openai:gpt-4o-mini'); defaults to current model
+summarization_threshold: 4000 # Character threshold above which sub-agent output is summarized before returning to parent
+escalation_timeout: 300 # Seconds a sub-agent waits for a user interaction response before timing out (default: 5 minutes)
+mcp_servers: # Optional list of MCP servers that the agent utilizes
+  - github # Corresponds to the name of an MCP server in the `<coyote-config-dir>/mcp.json` file
+mcp_tools: # Optional per-server tool allowlist for the agent's MCP servers
+  github: # (glob patterns: * and ?). Intersects with the global config,
+    - get_* # mcp.json `allowedTools`, and every other configured layer. It
+    - search_* # can only narrow access, never widen it.
+global_tools: # Optional list of additional global tools to enable for the agent; i.e. not tools specific to the agent
   - web_search
   - fs
   - python
-skills_enabled: true             # Master switch for skills in this agent (default: inherit from global).
-                                 # Skills also require `function_calling_support: true` in the global config.
-enabled_skills:                  # Optional list of skills available when this agent runs.
-                                 # Must be a subset of global `visible_skills`. Omit to inherit the global default.
+skills_enabled:
+  true # Master switch for skills in this agent (default: inherit from global).
+  # Skills also require `function_calling_support: true` in the global config.
+enabled_skills: # Optional list of skills available when this agent runs.
+  # Must be a subset of global `visible_skills`. Omit to inherit the global default.
   - git-master
   - ai-slop-remover
-inject_skill_instructions: true  # Inject a short hint pointing the model at `skill__list` when skills are enabled
-                                 # (default: true). Suppressed automatically when no skills are available.
-skill_instructions: null         # Custom text for the skill hint (optional; uses built-in default if null)
-enabled_macros:                  # Optional list of macros invocable when this agent is active in the REPL.
-  - generate-commit-message      # An empty list disables all macros. Omit to inherit the role/global default.
-memory: null                     # Per-agent memory override (default: inherit). Set to `false` to disable memory
-                                 # for this agent regardless of workspace/global presence. See the Memory wiki page.
+inject_skill_instructions:
+  true # Inject a short hint pointing the model at `skill__list` when skills are enabled
+  # (default: true). Suppressed automatically when no skills are available.
+skill_instructions: null # Custom text for the skill hint (optional; uses built-in default if null)
+enabled_macros: # Optional list of macros invocable when this agent is active in the REPL.
+  - generate-commit-message # An empty list disables all macros. Omit to inherit the role/global default.
+memory:
+  null # Per-agent memory override (default: inherit). Set to `false` to disable memory
+  # for this agent regardless of workspace/global presence. See the Memory wiki page.
 
-dynamic_instructions: false      # Whether to use dynamic instructions for the agent; if false, static instructions are used
-instructions: |                  # Static instructions for the agent; ignored if dynamic instructions are used
+dynamic_instructions: false # Whether to use dynamic instructions for the agent; if false, static instructions are used
+instructions:
+  | # Static instructions for the agent; ignored if dynamic instructions are used
   You are a AI agent designed to demonstrate agent capabilities.
 
   <tools>
@@ -88,12 +98,12 @@ instructions: |                  # Static instructions for the agent; ignored if
   <user>
   username: {{username}}
   </user>
-variables:                      # Optional variables for the agent
-                                # The variables defined above like {{__variable_name__}} are automatically available
+variables: # Optional variables for the agent
+  # The variables defined above like {{__variable_name__}} are automatically available
   - name: username
     description: Your user name
-    default: null               # A default value for this variable; if null, the variable must be provided when starting the agent
-conversation_starters:          # Optional conversation starters for the agent
+    default: null # A default value for this variable; if null, the variable must be provided when starting the agent
+conversation_starters: # Optional conversation starters for the agent
   - What is the meaning of life?
   - Tell me a joke.
   - What is the capital of France?
@@ -104,15 +114,15 @@ conversation_starters:          # Optional conversation starters for the agent
   - How do I stay motivated?
   - What is the best way to exercise?
   - How do I manage my time effectively?
-documents:                     # Optional documents to load for the agent
-                               # To enable graph-based RAG (entity/relationship extraction + knowledge graph retrieval),
-                               # set `rag_extractor_model` in your global config.yaml.
-                               # See https://github.com/Dark-Alex-17/coyote/wiki/RAG#graph-based-rag
-  - git:/some/repo             # Explicitly tell Coyote to use the 'git' document loader using an absolute path
-  - pdf:some-pdf-file.pdf      # Explicitly tell Coyote to use the 'pdf' document loader using a relative path
+documents: # Optional documents to load for the agent
+  # To enable graph-based RAG (entity/relationship extraction + knowledge graph retrieval),
+  # set `rag_extractor_model` in your global config.yaml.
+  # See https://github.com/Dark-Alex-17/coyote/wiki/RAG#graph-based-rag
+  - git:/some/repo # Explicitly tell Coyote to use the 'git' document loader using an absolute path
+  - pdf:some-pdf-file.pdf # Explicitly tell Coyote to use the 'pdf' document loader using a relative path
   - https://some-website.com/some-page
-  - some-file.pdf              # File with relative path to the <coyote-config-dir>/agents/<agent-name> directory; i.e. file in the same directory as this config file
-  - ~/some-file.txt            # File in the user's home directory
-  - /absolute/path/to/some-file.md  # File with absolute path
-  - /absolute/path/**/NAME.txt    # Find all NAME.txt files in the specified directory and all its subdirectories
+  - some-file.pdf # File with relative path to the <coyote-config-dir>/agents/<agent-name> directory; i.e. file in the same directory as this config file
+  - ~/some-file.txt # File in the user's home directory
+  - /absolute/path/to/some-file.md # File with absolute path
+  - /absolute/path/**/NAME.txt # Find all NAME.txt files in the specified directory and all its subdirectories
   - /absolute/path/to/*/README.md # Find all README.md files in all immediate subdirectories of the specified directory (depth=1)

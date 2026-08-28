@@ -38,6 +38,9 @@ pub struct Graph {
     pub mcp_servers: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tools: Option<IndexMap<String, Vec<String>>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills_enabled: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -286,6 +289,9 @@ pub struct LlmNode {
     pub tools: Option<Vec<String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tools: Option<IndexMap<String, Vec<String>>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -527,6 +533,47 @@ nodes:
         match &node2.node_type {
             NodeType::End(end) => assert_eq!(end.output, "{{result}}"),
             _ => panic!("expected End variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_mcp_tools_at_graph_and_node_level() {
+        let yaml = r#"
+name: g
+mcp_servers: [github]
+mcp_tools:
+  github:
+    - get_*
+    - list_*
+start: l
+nodes:
+  l:
+    id: l
+    type: llm
+    prompt: hi
+    mcp_tools:
+      github:
+        - search_code
+    next: e
+  e:
+    id: e
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(
+            graph.mcp_tools.as_ref().unwrap().get("github"),
+            Some(&vec!["get_*".to_string(), "list_*".to_string()])
+        );
+        match &graph.get_node("l").unwrap().node_type {
+            NodeType::Llm(llm) => {
+                assert_eq!(
+                    llm.mcp_tools.as_ref().unwrap().get("github"),
+                    Some(&vec!["search_code".to_string()])
+                );
+            }
+            _ => panic!("expected Llm variant"),
         }
     }
 

@@ -6,7 +6,7 @@ mod sse_transport;
 
 use crate::config::AppConfig;
 use crate::config::paths;
-use crate::utils::{AbortSignal, abortable_run_with_spinner};
+use crate::utils::{AbortSignal, abortable_run_with_spinner, dimmed_text};
 use crate::vault::Vault;
 use crate::vault::interpolate_secrets;
 use anyhow::Error;
@@ -166,6 +166,8 @@ pub(crate) struct McpServer {
     pub headers: Option<IndexMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth: Option<McpOAuthConfig>,
+    #[serde(rename = "allowedTools", skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 impl McpServer {
@@ -177,6 +179,15 @@ impl McpServer {
     }
 
     pub fn validate(&self, name: &str) -> Result<()> {
+        if let Some(tools) = &self.allowed_tools
+            && tools.is_empty()
+        {
+            let message = format!(
+                "MCP server '{name}' has an empty \"allowedTools\" list, so none of its tools will be callable"
+            );
+            warn!("{message}");
+            eprintln!("{}", dimmed_text(&message));
+        }
         if self.is_remote() {
             let type_label = match self.transport_type {
                 McpTransportType::Http => "http",
@@ -802,6 +813,7 @@ mod tests {
             url: None,
             headers: None,
             oauth: None,
+            allowed_tools: None,
         }
     }
 
@@ -815,6 +827,7 @@ mod tests {
             url: Some(url.to_string()),
             headers: None,
             oauth: None,
+            allowed_tools: None,
         }
     }
 
@@ -828,6 +841,7 @@ mod tests {
             url: Some(url.to_string()),
             headers: None,
             oauth: None,
+            allowed_tools: None,
         }
     }
 
@@ -860,6 +874,7 @@ mod tests {
             url: None,
             headers: None,
             oauth: None,
+            allowed_tools: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -878,6 +893,7 @@ mod tests {
             url: Some("http://localhost".into()),
             headers: None,
             oauth: None,
+            allowed_tools: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -898,6 +914,7 @@ mod tests {
             url: None,
             headers: Some(headers),
             oauth: None,
+            allowed_tools: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -923,6 +940,7 @@ mod tests {
             url: None,
             headers: None,
             oauth: None,
+            allowed_tools: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -941,6 +959,7 @@ mod tests {
             url: Some("http://localhost".into()),
             headers: None,
             oauth: None,
+            allowed_tools: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -959,6 +978,7 @@ mod tests {
             url: Some("http://localhost".into()),
             headers: None,
             oauth: None,
+            allowed_tools: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -977,6 +997,7 @@ mod tests {
             url: Some("http://localhost".into()),
             headers: None,
             oauth: None,
+            allowed_tools: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -1002,6 +1023,7 @@ mod tests {
             url: None,
             headers: None,
             oauth: None,
+            allowed_tools: None,
         };
 
         let err = spec.validate("test").unwrap_err();

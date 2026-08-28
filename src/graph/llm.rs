@@ -30,11 +30,12 @@ pub struct LlmNodeExecutor;
 
 impl LlmNodeExecutor {
     pub(super) async fn execute(
+        node_id: &str,
         node: &LlmNode,
         state_manager: &mut StateManager,
         parent_ctx: &mut RequestContext,
     ) -> Result<LlmExecutionOutcome> {
-        let result = run(node, state_manager, parent_ctx).await;
+        let result = run(node_id, node, state_manager, parent_ctx).await;
         let (output, failure_reason) = match result {
             Ok(raw) => match &node.output_schema {
                 Some(schema) => match structured::extract(&raw, schema, parent_ctx).await {
@@ -79,6 +80,7 @@ fn outcome_from(
 }
 
 async fn run(
+    node_id: &str,
     node: &LlmNode,
     state_manager: &mut StateManager,
     parent_ctx: &mut RequestContext,
@@ -177,6 +179,13 @@ async fn run(
     // Jobs are node-local: everything job__start registers while this node
     // runs is recorded here and reaped on every exit path below.
     let saved_job_scope = parent_ctx.node_job_scope.replace(Vec::new());
+    // The node's tool filter layer lives in tracked context state so any
+    // mid-node filter recompute (e.g. a skill load) re-applies it last.
+    let saved_node_mcp_tools = std::mem::replace(
+        &mut parent_ctx.active_node_mcp_tools,
+        node.mcp_tools.clone().map(|map| (node_id.to_string(), map)),
+    );
+    parent_ctx.refresh_mcp_tool_filters();
     let result = match node.timeout {
         Some(secs) => match timeout(
             Duration::from_secs(secs),
@@ -193,6 +202,8 @@ async fn run(
     let node_jobs =
         std::mem::replace(&mut parent_ctx.node_job_scope, saved_job_scope).unwrap_or_default();
     reap_jobs(parent_ctx.supervisor.as_ref(), &node_jobs).await;
+    parent_ctx.active_node_mcp_tools = saved_node_mcp_tools;
+    parent_ctx.refresh_mcp_tool_filters();
     restore_agent_skill_policy(parent_ctx, saved_agent_skill_state);
     result
 }
@@ -506,6 +517,7 @@ mod tests {
             instructions: Some("sys".into()),
             prompt: "user".into(),
             tools: None,
+            mcp_tools: None,
             model: None,
             temperature: None,
             top_p: None,

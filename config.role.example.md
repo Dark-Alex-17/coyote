@@ -16,6 +16,10 @@ enabled_tools:                        # Tools to enable for this role. Accepts a
 enabled_mcp_servers:                  # MCP servers to enable for this role. Accepts a YAML list (preferred)
   - github                            # or a comma-separated string (e.g. `enabled_mcp_servers: github,gitmcp`).
   - gitmcp                            # Use `all` to enable every configured MCP server.
+mcp_tools:                            # Per-server MCP tool allowlists for this role (globs: * and ?).
+  github:                             # Intersects with the global config / mcp.json `allowedTools`.
+    - get_*                           # Layers only narrow. Tools matching no pattern are hidden from
+    - search_*                        # the model as if they don't exist.
 skills_enabled: true                  # Master switch for skills in this role (default: inherit from global).
                                       # Skills also require `function_calling_support: true` in the global config.
 enabled_skills:                       # Skills available when this role is active. Accepts a YAML list (preferred)

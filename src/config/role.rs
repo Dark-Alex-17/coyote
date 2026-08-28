@@ -30,6 +30,7 @@ pub trait RoleLike {
     fn top_p(&self) -> Option<f64>;
     fn enabled_tools(&self) -> Option<Vec<String>>;
     fn enabled_mcp_servers(&self) -> Option<Vec<String>>;
+    fn mcp_tools(&self) -> Option<IndexMap<String, Vec<String>>>;
     fn set_model(&mut self, model: Model);
     fn set_temperature(&mut self, value: Option<f64>);
     fn reasoning_effort(&self) -> Option<String>;
@@ -37,6 +38,7 @@ pub trait RoleLike {
     fn set_reasoning_effort(&mut self, value: Option<String>);
     fn set_enabled_tools(&mut self, value: Option<Vec<String>>);
     fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>);
+    fn set_mcp_tools(&mut self, value: Option<IndexMap<String, Vec<String>>>);
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -67,6 +69,8 @@ pub struct Role {
         deserialize_with = "super::deserialize_csv_or_vec"
     )]
     enabled_mcp_servers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mcp_tools: Option<IndexMap<String, Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skills_enabled: Option<bool>,
     #[serde(
@@ -133,6 +137,7 @@ impl Role {
                     "enabled_mcp_servers" => {
                         role.enabled_mcp_servers = parse_string_or_array(value)
                     }
+                    "mcp_tools" => role.mcp_tools = parse_mcp_tools_map(value),
                     "skills_enabled" => role.skills_enabled = value.as_bool(),
                     "enabled_skills" => role.enabled_skills = parse_string_or_array(value),
                     "enabled_macros" => role.enabled_macros = parse_string_or_array(value),
@@ -195,6 +200,10 @@ impl Role {
             let inline =
                 serde_json::to_string(enabled_mcp_servers).unwrap_or_else(|_| "[]".to_string());
             metadata.push(format!("enabled_mcp_servers: {inline}"));
+        }
+        if let Some(mcp_tools) = &self.mcp_tools {
+            let inline = serde_json::to_string(mcp_tools).unwrap_or_else(|_| "{}".to_string());
+            metadata.push(format!("mcp_tools: {inline}"));
         }
         if let Some(skills_enabled) = self.skills_enabled {
             metadata.push(format!("skills_enabled: {skills_enabled}"));
@@ -279,6 +288,10 @@ impl Role {
             enabled_tools,
             enabled_mcp_servers,
         );
+        let mcp_tools = role_like.mcp_tools();
+        if mcp_tools.is_some() {
+            self.set_mcp_tools(mcp_tools);
+        }
     }
 
     pub fn batch_set(
@@ -453,6 +466,10 @@ impl RoleLike for Role {
         self.enabled_mcp_servers.clone()
     }
 
+    fn mcp_tools(&self) -> Option<IndexMap<String, Vec<String>>> {
+        self.mcp_tools.clone()
+    }
+
     fn set_model(&mut self, model: Model) {
         if !self.model().id().is_empty() {
             self.model_id = Some(model.id().to_string());
@@ -479,6 +496,10 @@ impl RoleLike for Role {
     fn set_enabled_mcp_servers(&mut self, value: Option<Vec<String>>) {
         self.enabled_mcp_servers = value;
     }
+
+    fn set_mcp_tools(&mut self, value: Option<IndexMap<String, Vec<String>>>) {
+        self.mcp_tools = value;
+    }
 }
 
 fn parse_string_or_array(value: &Value) -> Option<Vec<String>> {
@@ -501,6 +522,19 @@ fn parse_string_or_array(value: &Value) -> Option<Vec<String>> {
     }
 
     None
+}
+
+fn parse_mcp_tools_map(value: &Value) -> Option<IndexMap<String, Vec<String>>> {
+    let map = value.as_object()?;
+    let mut mcp_tools = IndexMap::new();
+    for (server, tools) in map {
+        if tools.is_null() {
+            mcp_tools.insert(server.clone(), Vec::new());
+        } else if let Some(tools) = parse_string_or_array(tools) {
+            mcp_tools.insert(server.clone(), tools);
+        }
+    }
+    Some(mcp_tools)
 }
 
 fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
@@ -650,6 +684,69 @@ mod tests {
         let role = Role::new("test", "---\nenabled_macros: null\n---\nPrompt");
 
         assert_eq!(role.enabled_macros, None);
+    }
+
+    #[test]
+    fn role_new_parses_mcp_tools_list_and_csv_values() {
+        let content = "---\nmcp_tools:\n  github: [get_*, list_*, search_code]\n  slack: conversations_history,conversations_replies\n---\nPrompt";
+
+        let role = Role::new("test", content);
+
+        let mcp_tools = role.mcp_tools().unwrap();
+        assert_eq!(
+            mcp_tools.get("github"),
+            Some(&vec![
+                "get_*".to_string(),
+                "list_*".to_string(),
+                "search_code".to_string()
+            ])
+        );
+        assert_eq!(
+            mcp_tools.get("slack"),
+            Some(&vec![
+                "conversations_history".to_string(),
+                "conversations_replies".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn role_new_mcp_tools_empty_list_server_is_some_empty() {
+        let role = Role::new("test", "---\nmcp_tools:\n  github: []\n---\nPrompt");
+
+        assert_eq!(role.mcp_tools().unwrap().get("github"), Some(&vec![]));
+    }
+
+    #[test]
+    fn role_new_mcp_tools_per_server_null_is_some_empty() {
+        let role = Role::new("test", "---\nmcp_tools:\n  github:\n---\nPrompt");
+
+        assert_eq!(role.mcp_tools().unwrap().get("github"), Some(&vec![]));
+    }
+
+    #[test]
+    fn role_new_mcp_tools_absent_is_none() {
+        let role = Role::new("test", "---\ntemperature: 0.5\n---\nPrompt");
+
+        assert_eq!(role.mcp_tools(), None);
+    }
+
+    #[test]
+    fn role_new_mcp_tools_null_is_none() {
+        let role = Role::new("test", "---\nmcp_tools: null\n---\nPrompt");
+
+        assert_eq!(role.mcp_tools(), None);
+    }
+
+    #[test]
+    fn role_export_mcp_tools_round_trips() {
+        let content = "---\nmcp_tools:\n  github: [get_issue]\n  slack: a,b\n---\nPrompt";
+        let role = Role::new("test", content);
+
+        let reparsed = Role::new("test", &role.export());
+
+        assert_eq!(reparsed.mcp_tools(), role.mcp_tools());
+        assert!(role.mcp_tools().is_some());
     }
 
     #[test]

@@ -55,7 +55,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     4. Continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 62]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 63]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -63,6 +63,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 62]> = LazyLock::new(|| {
             ".info tools",
             "Show the list of enabled tools to be passed to the LLM",
             AssertState::True(StateFlags::FUNCTION_CALLING),
+        ),
+        ReplCommand::new(
+            ".info mcp-server",
+            "Show an MCP server's tool filters and effective catalog",
+            AssertState::pass(),
         ),
         ReplCommand::new(
             ".authenticate",
@@ -637,6 +642,16 @@ pub async fn run_repl_command(
                 }
                 Some("todo") => {
                     let info = ctx.todo_info()?;
+                    print!("{info}");
+                }
+                Some(arg) if arg.starts_with("mcp-server") => {
+                    let mut parts = arg.splitn(2, char::is_whitespace);
+                    parts.next();
+                    let name = parts.next().map(str::trim).unwrap_or("");
+                    if name.is_empty() {
+                        bail!("Usage: .info mcp-server <server>");
+                    }
+                    let info = ctx.mcp_server_info(name).await?;
                     print!("{info}");
                 }
                 Some(_) => unknown_command()?,
@@ -1959,8 +1974,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_62_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 62);
+    fn repl_commands_has_63_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 63);
     }
 
     #[test]

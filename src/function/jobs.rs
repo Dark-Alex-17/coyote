@@ -363,9 +363,6 @@ fn whitelist_rejection(tool: &str) -> Option<Value> {
     })
 }
 
-/// Whether a declared tool could be run as a background job. This is the
-/// declare-side twin of `whitelist_rejection`: a tool is backgroundable
-/// exactly when `job__start` would not reject it by name.
 pub fn is_backgroundable_tool(tool: &str) -> bool {
     whitelist_rejection(tool).is_none()
 }
@@ -457,6 +454,11 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             .unwrap_or_else(|| json!({}));
         let mut mcp_runtime = McpRuntime::new();
         mcp_runtime.insert(server.clone(), Arc::clone(server_handle));
+        if let Some(filter) = ctx.tool_scope.mcp_runtime.tool_filters.get(&server) {
+            mcp_runtime
+                .tool_filters
+                .insert(server.clone(), filter.clone());
+        }
         let job_ctx = JobCtx {
             mcp_runtime,
             current_depth: ctx.current_depth,
@@ -1263,7 +1265,9 @@ fn tail_chars(text: &str, max_chars: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_fixtures::{FixtureServer, fixture_runtime};
     use crate::config::{AppConfig, AppState, WorkingMode};
+    use crate::config::{LayerSource, ToolFilter};
     use crate::function::agents::{
         GuardrailAction, check_pending_tasks_guardrail, handle_agent_tool,
     };
@@ -1694,6 +1698,43 @@ mod tests {
 
             assert_eq!(reaped, vec!["j1".to_string()]);
             assert!(!ctx.supervisor.as_ref().unwrap().read().has_job("j1"));
+        });
+    }
+
+    #[test]
+    fn job_runtime_carries_the_servers_tool_filter() {
+        run_async(async {
+            let mut ctx = plain_ctx();
+            ctx.declared_function_names
+                .insert("mcp_invoke_fixture".into());
+            let fixture = FixtureServer::default();
+            let call_tool_calls = Arc::clone(&fixture.call_tool_calls);
+            let (mut runtime, _server) = fixture_runtime(fixture).await;
+            let mut filter = ToolFilter::default();
+            filter.push_layer(LayerSource::Global, &[]);
+            runtime.tool_filters.insert("fixture".to_string(), filter);
+            ctx.tool_scope.mcp_runtime = runtime;
+
+            let started = handle_start(
+                &mut ctx,
+                &json!({"tool": "mcp_invoke_fixture", "arguments": {"tool": "dup"}}),
+            )
+            .await
+            .unwrap();
+            let job_id = started["job_id"].as_str().unwrap().to_string();
+
+            let collected = handle_collect(&ctx, &json!({"id": job_id})).await.unwrap();
+
+            assert_eq!(collected["status"], "failed");
+            assert!(
+                collected["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("dup not found in fixture MCP server catalog"),
+                "unexpected error: {}",
+                collected["error"]
+            );
+            assert_eq!(call_tool_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         });
     }
 
