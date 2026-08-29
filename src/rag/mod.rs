@@ -1869,6 +1869,12 @@ fn select_embedding_model(models: &[&Model]) -> Result<String> {
 }
 
 pub(crate) fn select_rag_driver() -> Result<String> {
+    // Statically linked musl builds cannot dlopen DuckDB extensions, so duckdb is not offered there.
+    #[cfg(target_env = "musl")]
+    let options = vec![
+        "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
+    ];
+    #[cfg(not(target_env = "musl"))]
     let options = vec![
         "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
         "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search.",

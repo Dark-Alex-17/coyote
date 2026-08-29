@@ -85,6 +85,21 @@ pub struct DuckDbProvider {
 }
 
 impl DuckDbProvider {
+    /// Fail fast on musl builds, before any filesystem or DuckDB work. Coyote's musl
+    /// builds are statically linked, and a statically linked binary cannot dlopen the
+    /// `vss`/`fts` extension shared objects, so this driver can never work there.
+    fn reject_musl() -> Result<()> {
+        #[cfg(target_env = "musl")]
+        bail!(
+            "The duckdb RAG driver is unavailable in this build of coyote: musl builds \
+             are statically linked, and a statically linked binary cannot load DuckDB \
+             extensions like `vss`/`fts` (dlopen is unsupported). Use the `qdrant` RAG \
+             driver instead, or a gnu-libc build of coyote."
+        );
+        #[cfg(not(target_env = "musl"))]
+        Ok(())
+    }
+
     /// Open (or create) the DuckDB file. `dim` is the embedding vector dimension,
     /// supplied by the caller who knows the model.
     ///
@@ -95,6 +110,7 @@ impl DuckDbProvider {
     /// created or initialized here, or lazily through `ensure_writable` on the rebuild
     /// path.
     pub fn open(db_path: &Path, dim: usize) -> Result<Self> {
+        Self::reject_musl()?;
         let (conn, writable) = Self::open_for_workload(db_path, dim)?;
         // A reopened file may already carry a live FTS index from a previous session,
         // in which case keyword search works immediately.
@@ -173,6 +189,7 @@ impl DuckDbProvider {
     }
 
     pub fn introspect_dim(db_path: &Path) -> Result<Option<usize>> {
+        Self::reject_musl()?;
         if !db_path.exists() {
             return Ok(None);
         }
@@ -819,7 +836,9 @@ impl RagProvider for DuckDbProvider {
     }
 }
 
-#[cfg(test)]
+// Not compiled for musl: `open` bails there (statically linked binaries cannot dlopen
+// the extension shared objects), so every test in this module would fail at setup.
+#[cfg(all(test, not(target_env = "musl")))]
 mod tests {
     use super::*;
     use crate::rag::provider::RagProvider;
