@@ -1,3 +1,190 @@
+## v0.9.0 (2026-08-29)
+
+### BREAKING CHANGE
+
+- invocations using --prompt <text> must switch to
+--temp-role <text>; clap rejects the old flag loudly.
+
+### Feat
+
+- upgraded to v2 mixin schema
+- improved first-time run experience and included a templated configuration file that now has comments like the config.example.yaml so users don't have to go to the repo to see all the knobs
+- **TASK-005**: carry the quality bar through sisyphus and architect
+- **TASK-004**: reviewer routing — code-reviewer quality-bar resolution, domain linter pass, surface-skill routing, rigor folding; file-reviewer surface-skill whitelist + convention/correctness marker
+- **TASK-003**: add surface skills batch B — worker-review, iac-review, migration-review, cicd-review
+- **TASK-002**: add surface skills batch A — rest-api-review, cli-review, library-review
+- **TASK-001**: add rigor/surfaces declaration layer to planning skills
+- **repl**: color .info mcp-server verdicts and complete only running servers
+- **cli**: rename mcp_config asset category to mcp-config with snake_case alias
+- create a new probe agent to probe code verifications using usage-pattern testing
+- Add in the web_search_coyote tool where helpful
+- **mcp**: add .info mcp-server, .set mcp_tools, and filtered-server listing to the REPL
+- **mcp**: enforce per-server tool allowlists across runtime, jobs, agents, and graph nodes
+- **mcp**: add mcp_tools allowlist config surfaces across roles, sessions, agents, graphs, and skills
+- **mcp**: add per-server tool allowlist policy module and allowedTools config field
+- support mcp.json in the root of bundle repos as well as in the legacy functions directory
+- prefer ~/.config/coyote/mcp.json for the user-scope MCP config
+- claude and openai native web search via web_search_coyote
+- **jobs**: node-local job ownership and capability-gated job__* visibility
+- **graph**: support max_concurrent_jobs at the graph level
+- **jobs**: allow uncapped collect via full_result
+- **jobs**: exempt polling tools from loop tracker and hint on unchanged checks
+- **supervisor**: push agent completion notifications to the spawning context
+- **jobs**: push background-job completion notifications via per-context queue
+- inject background-jobs prompt guidance when jobs are enabled
+- add background job runner, job__* handlers, and start gates
+- generalize supervisor registry to TaskHandle enum with job scaffolding, kill discipline, and max_concurrent_jobs config
+- run an advisory observability pass after implementation in sisyphus
+- add an observability-review skill for post-implementation monitoring analysis
+- check under- and over-logging in the code review gate
+- calibrate logging registers in the code-writing agents
+- add a logging-discipline skill for calibrating log output to repo conventions
+- **cli**: rename --prompt to --temp-role
+- complete --filter and --force on the first .install argument
+- **mcp**: bound tool-result passthrough and surface resource audience annotations
+- **mcp**: add mcp_prompt meta-tool and harden prompt display rendering
+- **repl**: add .prompt command with live staged tab-completion
+- **mcp**: add mcp_read meta-tool for resource reads
+- **mcp**: gate meta-function emission on advertised server capabilities
+- **mcp**: add render.rs content policy (text paging, pattern filter, blob spill)
+- **mcp**: extend the server catalog to resources, templates, and prompts
+- complete --filter and --force on the first .install argument
+- run design interviews as grilling frontier rounds across the planning agents
+- add a grilling skill for frontier-round design interviews
+- add an on-demand architecture-reviewer agent for deepening scans
+- add a codebase-design skill with the deep-module design vocabulary
+- add a feedback-loop-first diagnosing-bugs skill to the coding suite
+- add a Fowler code-smell baseline to the code-review skill
+- flag duplicate helpers in code reviews with a repo-wide DRY check
+- add a transactional-integrity review skill to the code review gate
+- add an operational-history prior-art lane to the code-reviewer agent
+- support name=value macro arguments with variable tab completion
+- add --help guides to the .install and .uninstall REPL commands
+- expand owner/repo shorthand for --install with a --git-host flag
+- remove the deprecated --install-from flag and .install remote form
+- rename install flags and unify .install dispatch
+- add --uninstall and .uninstall for installed bundles
+- add --update-bundle with provenance-aware conflict handling
+- add --list-bundles and .list bundles with drift detection
+- record bundle provenance when installing from remote repos
+- add bundle provenance store
+- parse bundle manifests and capture resolved SHAs for remote installs
+- created a new comment-discipline skill for the built in sisyphus suite
+- created a dedicated git_command tool to tighten tool calling permissions in the git-master skill
+- Added a new security review step to the code writing quality gates
+- addressed review comments
+- add --no-workspace-macros opt-out for workspace macro loading
+- execute non-isolated macros on the live REPL context
+- surface macros as first-class custom commands in the REPL
+- add lazy macro resolver with two-dir discovery and per-macro states
+- add enabled_macros config field at global, role, agent, and session levels
+- add description and isolated fields to Macro struct
+- Dynamically detect RAG embedding model dimension for any given model
+- Support auto confirmation for gatekeeper agents
+- retry LLM API calls once after 401 by force-refreshing the OAuth token
+- identity-aware rejected-token marker for LLM OAuth cache
+- typed ApiStatusError carrying HTTP status through LLM client errors
+- per-request OAuth token injection with mid-session refresh for HTTP MCP servers
+- reason-specific warnings for MCP servers that fail OAuth at startup
+- Installed duckdb into the coyote image
+- Support managing MCP servers from the CLI directly
+- append new built-in rag__query function to RAG contexts to allow further querying by LLMs
+- support static file bundling with sbx-mixins
+- **rag**: offer the storage driver when an agent initializes its RAG
+- simplified the duckdb selection prompt
+- **rag**: let several Coyote processes query one duckdb RAG at once
+- **rag**: support string and UUID Qdrant point IDs
+- **rag**: create the API key secret inline in the attach wizard
+- let workflow rag nodes select a RAG driver
+- improved wording and heuristic detection for sisyphus suite of agents
+- upgraded to sbx kit v2 spec for improved integration
+- **rag**: add attach-only Qdrant provider, attach wizard and sandbox wiring
+- **rag**: add DuckDB provider behind the RAG driver abstraction
+- **rag**: add driver/attached fields, validation floors and force-reingest
+- **mcp**: send RFC 8707 resource indicator in OAuth flows
+- Added loaded indicators to .list tools/mcp-servers/skills
+- hide .recover from tab completions when no session is active
+- add a new .recover command for sessions to recover from errors
+- integrated the git-ssh-sign kit into the coyote sandbox kit
+
+### Fix
+
+- **mcp**: omit declared-but-empty prompt/resource capabilities from .info mcp-server
+- **mcp**: annotate declared-but-empty prompt/resource capabilities in .info mcp-server
+- also support the .continue edge case for session crashing checkpointing
+- checkpoint sessions that crash for easy resuming
+- job__check ring buffer also collects file output for LLM_OUTPUT as well as stdout
+- **tools**: interactive-shell semantics and stderr capture in execute_command
+- **function**: gate test-only declaration appender behind cfg(test)
+- **graph**: gate unix-only test imports behind cfg(unix)
+- harden job runner lifecycle and whitelist conformance
+- **function**: floor tool-output truncation cut to a UTF-8 char boundary
+- **supervisor**: make agent__check a pure status probe that never consumes the handle
+- **supervisor**: surface finished-but-uncollected tasks in turn-end guardrail
+- fix grep "binary" errors when searching UTF-8 files with unicode characters like some of the Coyote source
+- **bundles**: harden the install pipeline for cross-platform correctness
+- **mcp**: harden the spill path for cross-platform correctness
+- **repl**: offer prompts in .list tab completion and rename its listing helpers
+- **mcp**: gate unix-only spill permission APIs for windows builds
+- harden the bundle lifecycle per code review
+- address code review findings on the bundle lifecycle
+- reserve category names, confirm fork-name collisions, report secrets on uninstall
+- make bundle provenance portable to Windows
+- user__ask should have been renamed to user__select in graph agent user interaction invocations
+- support tab completions for graph-based agents with variables as well as standard agents
+- surface macro parse errors on top-level invocation
+- render .list macros as a comfy-table instead of fixed-width columns
+- drain crossterm characters in zellij in kitty contexts to prevent DA1 responses from entering prompt
+- drain tty input when displaying inquire prompts to prevent unintentional escapes
+- breaking iwe MCP server changes with newest version
+- improved handling of non service-specific secrets using sbx custom-secrets
+- include tool output to LLM_OUTPUT in errors as well as stderr
+- prevent tmp-overwriting
+- Corrected a rare edge case on how tool files are generated during parallel executions
+- cosmetic fix after improved bash tool handling
+- Improved subagent escalation handling
+- latent parsing bugs in fs_patch and argc
+- Prevent infinite hangs in coder agent and implement timeouts for LLM API calls and interactive tools
+- allow nested italics inside bold spans in markdown renderer
+- properly handle OAuth refreshes
+- correct newline removal from fs_write and fs_patch
+- detect duplicate tool call IDs client-side before sending to Claude
+- **rag**: warn when a duckdb store is empty but files are indexed
+- **rag**: keep a local Qdrant off an ambient proxy
+- keep loopback and LAN traffic off an ambient proxy
+- **rag**: stop routing Qdrant requests through an ambient proxy
+- **rag**: treat a zero min_score as no floor on Qdrant searches
+- **rag**: address Copilot review findings on the driver abstraction
+- **rag**: delete the DuckDB write-ahead log alongside the store
+- **sandbox**: discover agent-scoped RAG mixin sidecars
+- **rag**: stop the attach wizard from silently accepting an empty collection
+- **rag**: fail loudly when a RAG's vault secret is missing
+- **rag**: serialize DuckDB extension installs to stop a Windows race
+- **rag**: emit an sbx kit v2 mixin and declare RAG credentials to the proxy
+- **rag**: install DuckDB vss and fts extensions when they are missing
+- don't output thinking blocks for claude-based models
+- additional edge case fix for duplicate tool call IDs in anthropic API calls
+- removed temperature modifier in librarian agent to mitigate invisible errors
+- strip reasoning blocks for structured LLM output in graph agents
+- prevent rare duplicate tool call IDs in long running claude prompts
+- agents inherit global reasoning effort if unset
+
+### Refactor
+
+- **function**: finish supervisor-to-agent vocabulary migration
+- **function**: rename agent-tool symbols out of supervisor vocabulary
+- Modified the naming of several generalized supervisor values
+- pulled out some imports to clean up the MCP render module a bit
+- **mcp**: centralize meta-function prefix predicates and fix list_tools pagination
+- Refactored some bundle const locations
+- drop the .install remote migration hint
+- drop the --install-from tombstone entirely
+- render .list agents and .list skills as comfy-tables
+- **rag**: discover driver_config secrets by grammar, not field name
+- **rag**: drop the hardcoded embedding model hint from attach
+- **rag**: interpolate every driver_config value, not just api_key
+- **rag**: extract RagProvider trait and add YamlProvider
+
 ## v0.8.3 (2026-08-03)
 
 ### Fix
