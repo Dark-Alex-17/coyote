@@ -1,4 +1,4 @@
-schemaVersion: '1'
+schemaVersion: '2'
 kind: mixin
 name: agent-probe
 description: >
@@ -12,16 +12,17 @@ description: >
   to libxml2.so.16). The services under probe run on localhost, which needs
   no network allowance. POSIX-only: sbx runs these commands with /bin/sh (dash).
 
-network:
-  allowedDomains:
-    # Latest-release lookup + tarball downloads (GitHub redirects release
-    # assets to *.githubusercontent.com object hosts)
-    - 'api.github.com:443'
-    - 'github.com:443'
-    - 'objects.githubusercontent.com:443'
-    - 'release-assets.githubusercontent.com:443'
+permissions:
+  network:
+    allow:
+      # Latest-release lookup + tarball downloads (GitHub redirects release
+      # assets to *.githubusercontent.com object hosts)
+      - 'api.github.com:443'
+      - 'github.com:443'
+      - 'objects.githubusercontent.com:443'
+      - 'release-assets.githubusercontent.com:443'
 
-commands:
+setup:
   install:
     - command: |
         set -eu
