@@ -1869,29 +1869,35 @@ fn select_embedding_model(models: &[&Model]) -> Result<String> {
 }
 
 pub(crate) fn select_rag_driver() -> Result<String> {
-    // Statically linked musl builds cannot dlopen DuckDB extensions, so duckdb is not offered there.
     #[cfg(target_env = "musl")]
-    let options = vec![
-        "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
-    ];
-    #[cfg(not(target_env = "musl"))]
-    let options = vec![
-        "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
-        "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search.",
-    ];
-    let sel = Select::new("RAG storage driver:", options)
-        .with_starting_cursor(0)
-        .prompt()?;
-    if sel.starts_with("duckdb") {
+    {
         println!(
-            "Note: several Coyote processes can query a duckdb RAG at the same time, \
-             but while one process is ingesting or rebuilding it the others cannot \
-             read it until that finishes. Changing its driver later means deleting \
-             and recreating the RAG."
+            "Note: the duckdb RAG driver is only available in GNU builds of coyote \
+             (musl builds are statically linked and cannot load DuckDB extensions). \
+             Using the yaml driver."
         );
-        Ok("duckdb".to_string())
-    } else {
         Ok("yaml".to_string())
+    }
+    #[cfg(not(target_env = "musl"))]
+    {
+        let options = vec![
+            "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
+            "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search.",
+        ];
+        let sel = Select::new("RAG storage driver:", options)
+            .with_starting_cursor(0)
+            .prompt()?;
+        if sel.starts_with("duckdb") {
+            println!(
+                "Note: several Coyote processes can query a duckdb RAG at the same time, \
+                 but while one process is ingesting or rebuilding it the others cannot \
+                 read it until that finishes. Changing its driver later means deleting \
+                 and recreating the RAG."
+            );
+            Ok("duckdb".to_string())
+        } else {
+            Ok("yaml".to_string())
+        }
     }
 }
 
