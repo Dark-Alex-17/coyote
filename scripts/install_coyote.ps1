@@ -16,6 +16,8 @@ param(
   [string]$BinDir = $env:BIN_DIR
 )
 
+if ($Version -and $Version -match '^[0-9]') { $Version = "v$Version" }
+
 $Repo = 'Dark-Alex-17/coyote'
 
 function Write-Info($msg) { Write-Host "[coyote-install] $msg" }
@@ -89,105 +91,127 @@ if ($os -eq 'windows') {
 
 $tmp = New-Item -ItemType Directory -Force -Path ([IO.Path]::Combine([IO.Path]::GetTempPath(), "coyote-$(Get-Random)"))
 
-$exec = if ($isWin) { 'coyote.exe' } else { 'coyote' }
-$dest = Join-Path $BinDir $exec
+try {
+  $exec = if ($isWin) { 'coyote.exe' } else { 'coyote' }
+  $dest = Join-Path $BinDir $exec
 
-$installed = $false
-$tried = @()
-$attempt = 0
-foreach ($c in $candidates) {
-  $asset = $release.assets | Where-Object { $_.name -eq $c } | Select-Object -First 1
-  if (-not $asset) {
-    $tried += "${c}: no matching release asset"
-    continue
-  }
+  $installed = $false
+  $tried = @()
+  $attempt = 0
+  foreach ($c in $candidates) {
+    $asset = $release.assets | Where-Object { $_.name -eq $c } | Select-Object -First 1
+    if (-not $asset) {
+      $tried += "${c}: no matching release asset"
+      continue
+    }
 
-  $attempt++
-  $work = New-Item -ItemType Directory -Force -Path (Join-Path $tmp.FullName "attempt-$attempt")
+    $attempt++
+    $work = New-Item -ItemType Directory -Force -Path (Join-Path $tmp.FullName "attempt-$attempt")
 
-  Write-Info "Selected asset: $($asset.name)"
-  Write-Info "Download URL:  $($asset.browser_download_url)"
+    Write-Info "Selected asset: $($asset.name)"
+    Write-Info "Download URL:  $($asset.browser_download_url)"
 
-  $archive = Join-Path $work.FullName 'asset'
-  try {
-    Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'coyote-installer' } -Uri $asset.browser_download_url -OutFile $archive
-  } catch {
-    Write-Info "Failed to download ${c}; trying next candidate. $_"
-    $tried += "${c}: download failed"
-    continue
-  }
+    $archive = Join-Path $work.FullName 'asset'
+    try {
+      Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'coyote-installer' } -Uri $asset.browser_download_url -OutFile $archive
+    } catch {
+      Write-Info "Failed to download ${c}; trying next candidate. $_"
+      $tried += "${c}: download failed"
+      continue
+    }
 
-  $extractDir = Join-Path $work.FullName 'extract'; New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+    $extractDir = Join-Path $work.FullName 'extract'; New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
 
-  try {
-    if ($asset.name -match '\.zip$') {
-      Add-Type -AssemblyName System.IO.Compression.FileSystem
-      [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $extractDir)
-    } elseif ($asset.name -match '\.tar\.gz$' -or $asset.name -match '\.tgz$') {
-      $tar = Get-Command tar -ErrorAction SilentlyContinue
-      if ($tar) { & $tar.Source -xzf $archive -C $extractDir }
-      else { throw "Asset is tar archive but 'tar' is not available." }
-    } else {
-      try { Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $extractDir) }
-      catch {
+    try {
+      if ($asset.name -match '\.zip$') {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $extractDir)
+      } elseif ($asset.name -match '\.tar\.gz$' -or $asset.name -match '\.tgz$') {
         $tar = Get-Command tar -ErrorAction SilentlyContinue
-        if ($tar) { & $tar.Source -xf $archive -C $extractDir } else { throw "Unknown archive format; neither zip nor tar workable." }
+        if ($tar) { & $tar.Source -xzf $archive -C $extractDir }
+        else { throw "Asset is tar archive but 'tar' is not available." }
+      } else {
+        try { Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $extractDir) }
+        catch {
+          $tar = Get-Command tar -ErrorAction SilentlyContinue
+          if ($tar) { & $tar.Source -xf $archive -C $extractDir } else { throw "Unknown archive format; neither zip nor tar workable." }
+        }
+      }
+    } catch {
+      Write-Info "Failed to extract ${c}; trying next candidate. $_"
+      $tried += "${c}: extract failed"
+      continue
+    }
+
+    $bin = $null
+    Get-ChildItem -Recurse -File $extractDir | ForEach-Object {
+      if ($isWin) { if ($_.Name -ieq 'coyote.exe') { $bin = $_.FullName } }
+      else { if ($_.Name -ieq 'coyote') { $bin = $_.FullName } }
+    }
+    if (-not $bin) {
+      Write-Info "Could not find coyote binary inside ${c}; trying next candidate"
+      $tried += "${c}: no coyote binary in archive"
+      continue
+    }
+
+    if (-not $isWin) { try { & chmod +x -- $bin } catch {} }
+
+    $works = $false
+    try { & $bin --version *> $null; if ($LASTEXITCODE -eq 0) { $works = $true } } catch { }
+    if (-not $works -and -not $isWin) {
+      # The temp dir may live on a noexec mount; retry from a probe file in
+      # the install directory before rejecting.
+      $probe = Join-Path $BinDir ".coyote-install-probe-$PID"
+      try {
+        Copy-Item -Force $bin $probe
+        & chmod +x -- $probe
+        & $probe --version *> $null
+        if ($LASTEXITCODE -eq 0) { $works = $true }
+      } catch { } finally {
+        Remove-Item -Force -ErrorAction SilentlyContinue $probe
       }
     }
-  } catch {
-    Write-Info "Failed to extract ${c}; trying next candidate. $_"
-    $tried += "${c}: extract failed"
-    continue
+    if (-not $works) {
+      Write-Info "Downloaded $c but it failed to run on this system; trying next candidate"
+      $tried += "${c}: binary failed to run on this system"
+      continue
+    }
+
+    Copy-Item -Force $bin $dest
+    Write-Info "Installed: $dest"
+    $installed = $true
+    break
   }
 
-  $bin = $null
-  Get-ChildItem -Recurse -File $extractDir | ForEach-Object {
-    if ($isWin) { if ($_.Name -ieq 'coyote.exe') { $bin = $_.FullName } }
-    else { if ($_.Name -ieq 'coyote') { $bin = $_.FullName } }
-  }
-  if (-not $bin) {
-    Write-Info "Could not find coyote binary inside ${c}; trying next candidate"
-    $tried += "${c}: no coyote binary in archive"
-    continue
+  if (-not $installed) {
+    Write-Error "No usable asset found for $os-$arch. Tried:"
+    $tried | ForEach-Object { Write-Error "  - $_" }
+    exit 1
   }
 
-  if (-not $isWin) { try { & chmod +x -- $bin } catch {} }
-
-  $works = $false
-  try { & $bin --version *> $null; if ($LASTEXITCODE -eq 0) { $works = $true } } catch { }
-  if (-not $works) {
-    Write-Info "Downloaded $c but it failed to run on this system; trying next candidate"
-    $tried += "${c}: binary failed to run on this system"
-    continue
-  }
-
-  Copy-Item -Force $bin $dest
-  Write-Info "Installed: $dest"
-  $installed = $true
-  break
-}
-
-if (-not $installed) {
-  Write-Error "No usable asset found for $os-$arch. Tried:"
-  $tried | ForEach-Object { Write-Error "  - $_" }
-  exit 1
-}
-
-if ($isWin) {
-  $pathParts = ($env:Path -split ';') | Where-Object { $_ -ne '' }
-  if ($pathParts -notcontains $BinDir) {
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User'); if (-not $userPath) { $userPath = '' }
-    if (-not ($userPath -split ';' | Where-Object { $_ -eq $BinDir })) {
-      $newUserPath = if ($userPath.Trim().Length -gt 0) { "$userPath;$BinDir" } else { $BinDir }
-      [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
-      Write-Info "Added to User PATH: $BinDir (restart shell to take effect)"
+  if ($isWin) {
+    $pathParts = ($env:Path -split ';') | Where-Object { $_ -ne '' }
+    if ($pathParts -notcontains $BinDir) {
+      # Read/write the User PATH via the registry directly: the [Environment]
+      # round-trip expands %VAR% entries and bakes them in on write.
+      $regKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+      if ($regKey) {
+        $userPath = [string]$regKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if (-not (($userPath -split ';') -contains $BinDir)) {
+          $newUserPath = if ($userPath.Trim().Length -gt 0) { "$userPath;$BinDir" } else { $BinDir }
+          $regKey.SetValue('Path', $newUserPath, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+          Write-Info "Added to User PATH: $BinDir (restart shell to take effect)"
+        }
+        $regKey.Close()
+      }
+    }
+  } else {
+    if (-not ($env:PATH -split ':' | Where-Object { $_ -eq $BinDir })) {
+      Write-Info "Note: $BinDir is not in PATH. Add it to your shell profile."
     }
   }
-} else {
-  if (-not ($env:PATH -split ':' | Where-Object { $_ -eq $BinDir })) {
-    Write-Info "Note: $BinDir is not in PATH. Add it to your shell profile."
-  }
+
+  Write-Info "Done. Try: coyote --help"
+} finally {
+  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp
 }
-
-Write-Info "Done. Try: coyote --help"
-
