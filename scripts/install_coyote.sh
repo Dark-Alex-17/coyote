@@ -121,7 +121,22 @@ elif [[ "$OS" == "linux" ]]; then
   if ldd --version 2>&1 | grep -qi glibc; then LIBC="gnu"; fi
 
   if [[ "$LIBC" == "gnu" ]]; then
-    if ldconfig -p 2>/dev/null | grep -q 'libssl\.so\.3'; then
+    # The gnu binary dynamically links OpenSSL 3. On Debian/Ubuntu, ldconfig lives
+    # in /usr/sbin, which is often missing from non-root PATHs, so try its known
+    # locations and fall back to probing the usual library directories directly.
+    LIBSSL3=""
+    for LDCONFIG in ldconfig /sbin/ldconfig /usr/sbin/ldconfig; do
+      if command -v "$LDCONFIG" >/dev/null 2>&1; then
+        if "$LDCONFIG" -p 2>/dev/null | grep -q 'libssl\.so\.3'; then LIBSSL3="yes"; fi
+        break
+      fi
+    done
+    if [[ -z "$LIBSSL3" ]]; then
+      for LIBSSL_CANDIDATE in /usr/lib/*/libssl.so.3 /lib/*/libssl.so.3 /usr/lib64/libssl.so.3 /usr/lib/libssl.so.3 /usr/local/lib/libssl.so.3 /usr/local/lib/*/libssl.so.3; do
+        if [[ -e "$LIBSSL_CANDIDATE" ]]; then LIBSSL3="yes"; break; fi
+      done
+    fi
+    if [[ -n "$LIBSSL3" ]]; then
       ASSET_CANDIDATES+=("coyote-${ARCH}-unknown-linux-gnu.tar.gz")
     else
       log "glibc detected but OpenSSL 3 (libssl.so.3) not found; using musl build"

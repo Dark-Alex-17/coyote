@@ -65,8 +65,17 @@ if ($os -eq 'windows') {
   try { getconf GNU_LIBC_VERSION *> $null; if ($LASTEXITCODE -eq 0) { $libc = 'gnu' } } catch { }
   try { if ((ldd --version 2>&1 | Out-String) -imatch 'glibc') { $libc = 'gnu' } } catch { }
   if ($libc -eq 'gnu') {
+    # ldconfig lives in /usr/sbin on Debian/Ubuntu, often missing from non-root
+    # PATHs, so try its known locations and fall back to probing library dirs.
     $libssl3 = $false
-    try { if ((ldconfig -p 2>&1 | Out-String) -match 'libssl\.so\.3') { $libssl3 = $true } } catch { }
+    foreach ($ldc in @('ldconfig', '/sbin/ldconfig', '/usr/sbin/ldconfig')) {
+      try { if ((& $ldc -p 2>&1 | Out-String) -match 'libssl\.so\.3') { $libssl3 = $true; break } } catch { }
+    }
+    if (-not $libssl3) {
+      foreach ($libDir in @('/usr/lib/*/libssl.so.3', '/lib/*/libssl.so.3', '/usr/lib64/libssl.so.3', '/usr/lib/libssl.so.3', '/usr/local/lib/libssl.so.3', '/usr/local/lib/*/libssl.so.3')) {
+        if (Get-Item -Path $libDir -ErrorAction SilentlyContinue) { $libssl3 = $true; break }
+      }
+    }
     if ($libssl3) {
       $candidates += "coyote-$arch-unknown-linux-gnu.tar.gz"
     } else {
