@@ -67,7 +67,13 @@ if ($os -eq 'windows') {
     try { getconf GNU_LIBC_VERSION *> $null; if ($LASTEXITCODE -eq 0) { $libc = 'gnu' } } catch { }
     try { if ((ldd --version 2>&1 | Out-String) -imatch 'glibc') { $libc = 'gnu' } } catch { }
     if ($libc -eq 'gnu') {
-      $candidates += 'coyote-x86_64-unknown-linux-gnu.tar.gz'
+      $libssl3 = $false
+      try { if ((ldconfig -p 2>&1 | Out-String) -match 'libssl\.so\.3') { $libssl3 = $true } } catch { }
+      if ($libssl3) {
+        $candidates += 'coyote-x86_64-unknown-linux-gnu.tar.gz'
+      } else {
+        Write-Info "glibc detected but OpenSSL 3 (libssl.so.3) not found; using musl build"
+      }
     }
     $candidates += 'coyote-x86_64-unknown-linux-musl.tar.gz'
   } else {
@@ -77,53 +83,91 @@ if ($os -eq 'windows') {
   Fail "Unsupported OS for this installer: $os"
 }
 
-$asset = $null
+$tmp = New-Item -ItemType Directory -Force -Path ([IO.Path]::Combine([IO.Path]::GetTempPath(), "coyote-$(Get-Random)"))
+
+$exec = if ($isWin) { 'coyote.exe' } else { 'coyote' }
+$dest = Join-Path $BinDir $exec
+
+$installed = $false
+$tried = @()
+$attempt = 0
 foreach ($c in $candidates) {
   $asset = $release.assets | Where-Object { $_.name -eq $c } | Select-Object -First 1
-  if ($asset) { break }
+  if (-not $asset) {
+    $tried += "${c}: no matching release asset"
+    continue
+  }
+
+  $attempt++
+  $work = New-Item -ItemType Directory -Force -Path (Join-Path $tmp.FullName "attempt-$attempt")
+
+  Write-Info "Selected asset: $($asset.name)"
+  Write-Info "Download URL:  $($asset.browser_download_url)"
+
+  $archive = Join-Path $work.FullName 'asset'
+  try {
+    Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'coyote-installer' } -Uri $asset.browser_download_url -OutFile $archive
+  } catch {
+    Write-Info "Failed to download ${c}; trying next candidate. $_"
+    $tried += "${c}: download failed"
+    continue
+  }
+
+  $extractDir = Join-Path $work.FullName 'extract'; New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+
+  try {
+    if ($asset.name -match '\.zip$') {
+      Add-Type -AssemblyName System.IO.Compression.FileSystem
+      [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $extractDir)
+    } elseif ($asset.name -match '\.tar\.gz$' -or $asset.name -match '\.tgz$') {
+      $tar = Get-Command tar -ErrorAction SilentlyContinue
+      if ($tar) { & $tar.Source -xzf $archive -C $extractDir }
+      else { throw "Asset is tar archive but 'tar' is not available." }
+    } else {
+      try { Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $extractDir) }
+      catch {
+        $tar = Get-Command tar -ErrorAction SilentlyContinue
+        if ($tar) { & $tar.Source -xf $archive -C $extractDir } else { throw "Unknown archive format; neither zip nor tar workable." }
+      }
+    }
+  } catch {
+    Write-Info "Failed to extract ${c}; trying next candidate. $_"
+    $tried += "${c}: extract failed"
+    continue
+  }
+
+  $bin = $null
+  Get-ChildItem -Recurse -File $extractDir | ForEach-Object {
+    if ($isWin) { if ($_.Name -ieq 'coyote.exe') { $bin = $_.FullName } }
+    else { if ($_.Name -ieq 'coyote') { $bin = $_.FullName } }
+  }
+  if (-not $bin) {
+    Write-Info "Could not find coyote binary inside ${c}; trying next candidate"
+    $tried += "${c}: no coyote binary in archive"
+    continue
+  }
+
+  if (-not $isWin) { try { & chmod +x -- $bin } catch {} }
+
+  $works = $false
+  try { & $bin --version *> $null; if ($LASTEXITCODE -eq 0) { $works = $true } } catch { }
+  if (-not $works) {
+    Write-Info "Downloaded $c but it failed to run on this system; trying next candidate"
+    $tried += "${c}: binary failed to run on this system"
+    continue
+  }
+
+  Copy-Item -Force $bin $dest
+  Write-Info "Installed: $dest"
+  $installed = $true
+  break
 }
-if (-not $asset) {
-  Write-Error "No matching asset found for $os-$arch. Tried:"; $candidates | ForEach-Object { Write-Error "  - $_" }
+
+if (-not $installed) {
+  Write-Error "No usable asset found for $os-$arch. Tried:"
+  $tried | ForEach-Object { Write-Error "  - $_" }
   exit 1
 }
-
-Write-Info "Selected asset: $($asset.name)"
-Write-Info "Download URL:  $($asset.browser_download_url)"
-
-$tmp = New-Item -ItemType Directory -Force -Path ([IO.Path]::Combine([IO.Path]::GetTempPath(), "coyote-$(Get-Random)"))
-$archive = Join-Path $tmp.FullName 'asset'
-try { Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'coyote-installer' } -Uri $asset.browser_download_url -OutFile $archive } catch { Fail "Failed to download asset. $_" }
-
-$extractDir = Join-Path $tmp.FullName 'extract'; New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-
-if ($asset.name -match '\.zip$') {
-  Add-Type -AssemblyName System.IO.Compression.FileSystem
-  [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $extractDir)
-} elseif ($asset.name -match '\.tar\.gz$' -or $asset.name -match '\.tgz$') {
-  $tar = Get-Command tar -ErrorAction SilentlyContinue
-  if ($tar) { & $tar.Source -xzf $archive -C $extractDir }
-  else { Fail "Asset is tar archive but 'tar' is not available." }
-} else {
-  try { Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $extractDir) }
-  catch {
-    $tar = Get-Command tar -ErrorAction SilentlyContinue
-    if ($tar) { & $tar.Source -xf $archive -C $extractDir } else { Fail "Unknown archive format; neither zip nor tar workable." }
-  }
-}
-
-$bin = $null
-Get-ChildItem -Recurse -File $extractDir | ForEach-Object {
-  if ($isWin) { if ($_.Name -ieq 'coyote.exe') { $bin = $_.FullName } }
-  else { if ($_.Name -ieq 'coyote') { $bin = $_.FullName } }
-}
-if (-not $bin) { Fail "Could not find coyote binary inside the archive." }
-
-if (-not $isWin) { try { & chmod +x -- $bin } catch {} }
-
-$exec = if ($isWin) { 'coyote.exe'} else { 'coyote' }
-$dest = Join-Path $BinDir $exec
-Copy-Item -Force $bin $dest
-Write-Info "Installed: $dest"
 
 if ($isWin) {
   $pathParts = ($env:Path -split ';') | Where-Object { $_ -ne '' }

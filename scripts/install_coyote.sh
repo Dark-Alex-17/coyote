@@ -122,7 +122,11 @@ elif [[ "$OS" == "linux" ]]; then
     if ldd --version 2>&1 | grep -qi glibc; then LIBC="gnu"; fi
 
     if [[ "$LIBC" == "gnu" ]]; then
-      ASSET_CANDIDATES+=("coyote-x86_64-unknown-linux-gnu.tar.gz")
+      if ldconfig -p 2>/dev/null | grep -q 'libssl\.so\.3'; then
+        ASSET_CANDIDATES+=("coyote-x86_64-unknown-linux-gnu.tar.gz")
+      else
+        log "glibc detected but OpenSSL 3 (libssl.so.3) not found; using musl build"
+      fi
     fi
 
     ASSET_CANDIDATES+=("coyote-x86_64-unknown-linux-musl.tar.gz")
@@ -137,65 +141,100 @@ DL_URLS=$(grep -oE '"browser_download_url":[[:space:]]*"[^"]+"' "$JSON" \
   | sed -E 's/.*"browser_download_url":[[:space:]]*"//; s/"$//' \
   || true)
 
-ASSET_NAME=""; ASSET_URL=""
+INSTALLED=""
+TRIED=()
+ATTEMPT=0
 for candidate in "${ASSET_CANDIDATES[@]}"; do
+  ASSET_URL=""
   while IFS= read -r url; do
     [[ -z "$url" ]] && continue
     if [[ "$url" == */"$candidate" ]]; then
-      ASSET_NAME="$candidate"
       ASSET_URL="$url"
       break
     fi
   done <<< "$DL_URLS"
-  [[ -n "$ASSET_URL" ]] && break
+
+  if [[ -z "$ASSET_URL" ]]; then
+    TRIED+=("$candidate: no matching release asset")
+    continue
+  fi
+
+  ATTEMPT=$((ATTEMPT + 1))
+  WORK="$TMPDIR/attempt-$ATTEMPT"
+  mkdir -p "$WORK"
+
+  log "Selected asset: $candidate"
+  log "Download URL: $ASSET_URL"
+
+  ARCHIVE="$WORK/asset"
+  if [[ "$DL" == "curl" ]]; then
+    if ! curl -fL -H 'User-Agent: coyote-installer' "$ASSET_URL" -o "$ARCHIVE"; then
+      log "Failed to download $candidate; trying next candidate"
+      TRIED+=("$candidate: download failed")
+      continue
+    fi
+  else
+    if ! wget -q --header='User-Agent: coyote-installer' "$ASSET_URL" -O "$ARCHIVE"; then
+      log "Failed to download $candidate; trying next candidate"
+      TRIED+=("$candidate: download failed")
+      continue
+    fi
+  fi
+
+  EXTRACTED_DIR="$WORK/extracted"; mkdir -p "$EXTRACTED_DIR"
+
+  if tar -tf "$ARCHIVE" >/dev/null 2>&1; then
+    if ! tar -xzf "$ARCHIVE" -C "$EXTRACTED_DIR"; then
+      log "Failed to extract $candidate; trying next candidate"
+      TRIED+=("$candidate: extract failed")
+      continue
+    fi
+  else
+    if command -v unzip >/dev/null 2>&1; then
+      if ! unzip -q "$ARCHIVE" -d "$EXTRACTED_DIR"; then
+        log "Failed to extract $candidate; trying next candidate"
+        TRIED+=("$candidate: extract failed")
+        continue
+      fi
+    else
+      log "Unknown archive format for $candidate and 'unzip' is not available; trying next candidate"
+      TRIED+=("$candidate: unknown archive format and 'unzip' unavailable")
+      continue
+    fi
+  fi
+
+  BIN_PATH=""
+  while IFS= read -r -d '' f; do
+    base=$(basename "$f")
+    if [[ "$base" == "coyote" ]]; then
+    	BIN_PATH="$f"
+    	break
+    fi
+  done < <(find "$EXTRACTED_DIR" -type f -print0)
+
+  if [[ -z "$BIN_PATH" ]]; then
+    log "Could not find 'coyote' binary in $candidate; trying next candidate"
+    TRIED+=("$candidate: no 'coyote' binary in archive")
+    continue
+  fi
+
+  chmod +x "$BIN_PATH"
+  if ! "$BIN_PATH" --version >/dev/null 2>&1; then
+    log "Downloaded $candidate but it failed to run on this system; trying next candidate"
+    TRIED+=("$candidate: binary failed to run on this system")
+    continue
+  fi
+
+  install -m 0755 "$BIN_PATH" "${BIN_DIR}/coyote"
+  INSTALLED="$candidate"
+  break
 done
 
-if [[ -z "$ASSET_URL" ]]; then
-  echo "Error: no matching asset found for ${OS}-${ARCH}. Tried:" >&2
-  for c in "${ASSET_CANDIDATES[@]}"; do echo "  - $c" >&2; done
+if [[ -z "$INSTALLED" ]]; then
+  echo "Error: no usable asset found for ${OS}-${ARCH}. Tried:" >&2
+  for t in "${TRIED[@]}"; do echo "  - $t" >&2; done
   exit 1
 fi
-
-log "Selected asset: $ASSET_NAME"
-log "Download URL: $ASSET_URL"
-
-ARCHIVE="$TMPDIR/asset"
-if [[ "$DL" == "curl" ]]; then
-  curl -fL -H 'User-Agent: coyote-installer' "$ASSET_URL" -o "$ARCHIVE"
-else
-  wget -q --header='User-Agent: coyote-installer' "$ASSET_URL" -O "$ARCHIVE"
-fi
-
-WORK="$TMPDIR/work"; mkdir -p "$WORK"
-EXTRACTED_DIR="$WORK/extracted"; mkdir -p "$EXTRACTED_DIR"
-
-if tar -tf "$ARCHIVE" >/dev/null 2>&1; then
-  tar -xzf "$ARCHIVE" -C "$EXTRACTED_DIR"
-else
-  if command -v unzip >/dev/null 2>&1; then
-  	unzip -q "$ARCHIVE" -d "$EXTRACTED_DIR"
-  else
-  	echo "Error: unknown archive format; install 'unzip'" >&2
-  	exit 1
-  fi
-fi
-
-BIN_PATH=""
-while IFS= read -r -d '' f; do
-  base=$(basename "$f")
-  if [[ "$base" == "coyote" ]]; then
-  	BIN_PATH="$f"
-  	break
-  fi
-done < <(find "$EXTRACTED_DIR" -type f -print0)
-
-if [[ -z "$BIN_PATH" ]]; then
-	echo "Error: could not find 'coyote' binary in the archive" >&2
-	exit 1
-fi
-
-chmod +x "$BIN_PATH"
-install -m 0755 "$BIN_PATH" "${BIN_DIR}/coyote"
 
 log "Installed: ${BIN_DIR}/coyote"
 
