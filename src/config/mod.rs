@@ -858,6 +858,15 @@ fn render_config_template(
     secrets: Option<&serde_json::Value>,
     clients: &serde_json::Value,
 ) -> Result<String> {
+    render_config_template_from(CONFIG_TEMPLATE, model, secrets, clients)
+}
+
+fn render_config_template_from(
+    template: &str,
+    model: &str,
+    secrets: Option<&serde_json::Value>,
+    clients: &serde_json::Value,
+) -> Result<String> {
     let to_yaml = |value: &serde_json::Value| {
         serde_yaml::to_string(value).with_context(|| "Failed to create config")
     };
@@ -871,7 +880,8 @@ fn render_config_template(
     };
     let clients_block = to_yaml(&json!({ CLIENTS_FIELD: clients }))?;
 
-    Ok(CONFIG_TEMPLATE
+    Ok(template
+        .replace("\r\n", "\n")
         .replacen("__MODEL_BLOCK__\n", &model_block, 1)
         .replacen("__SECRETS_BLOCK__\n", &secrets_block, 1)
         .replacen("__CLIENTS_BLOCK__\n", &clients_block, 1))
@@ -1179,6 +1189,26 @@ clients:
         assert!(cfg.save);
         assert!(cfg.visible_tools.is_none());
         assert_eq!(cfg.compression_threshold, 4000);
+        assert_eq!(cfg.clients.len(), 1);
+    }
+
+    #[test]
+    fn config_template_renders_with_crlf_line_endings() {
+        let crlf_template = CONFIG_TEMPLATE.replace('\n', "\r\n");
+        let secrets = json!({ "vault_password_file": "/home/user/.coyote_password" });
+        let clients = json!([{ "type": "openai", "api_key": "sk-test" }]);
+
+        let rendered =
+            render_config_template_from(&crlf_template, "openai:gpt-4o", Some(&secrets), &clients)
+                .unwrap();
+
+        assert!(!rendered.contains("__MODEL_BLOCK__"));
+        assert!(!rendered.contains("__SECRETS_BLOCK__"));
+        assert!(!rendered.contains("__CLIENTS_BLOCK__"));
+        assert!(!rendered.contains('\r'));
+
+        let cfg = Config::load_from_str(&rendered).unwrap();
+        assert_eq!(cfg.model_id, "openai:gpt-4o");
         assert_eq!(cfg.clients.len(), 1);
     }
 
