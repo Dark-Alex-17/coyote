@@ -61,24 +61,19 @@ if ($os -eq 'windows') {
   if ($arch -eq 'x86_64') { $candidates += 'coyote-x86_64-apple-darwin.tar.gz' }
   else { $candidates += 'coyote-aarch64-apple-darwin.tar.gz' }
 } elseif ($os -eq 'linux') {
-  if ($arch -eq 'x86_64') {
-    # Mirror install_coyote.sh: only offer the gnu build when glibc is detected.
-    $libc = 'musl'
-    try { getconf GNU_LIBC_VERSION *> $null; if ($LASTEXITCODE -eq 0) { $libc = 'gnu' } } catch { }
-    try { if ((ldd --version 2>&1 | Out-String) -imatch 'glibc') { $libc = 'gnu' } } catch { }
-    if ($libc -eq 'gnu') {
-      $libssl3 = $false
-      try { if ((ldconfig -p 2>&1 | Out-String) -match 'libssl\.so\.3') { $libssl3 = $true } } catch { }
-      if ($libssl3) {
-        $candidates += 'coyote-x86_64-unknown-linux-gnu.tar.gz'
-      } else {
-        Write-Info "glibc detected but OpenSSL 3 (libssl.so.3) not found; using musl build"
-      }
+  $libc = 'musl'
+  try { getconf GNU_LIBC_VERSION *> $null; if ($LASTEXITCODE -eq 0) { $libc = 'gnu' } } catch { }
+  try { if ((ldd --version 2>&1 | Out-String) -imatch 'glibc') { $libc = 'gnu' } } catch { }
+  if ($libc -eq 'gnu') {
+    $libssl3 = $false
+    try { if ((ldconfig -p 2>&1 | Out-String) -match 'libssl\.so\.3') { $libssl3 = $true } } catch { }
+    if ($libssl3) {
+      $candidates += "coyote-$arch-unknown-linux-gnu.tar.gz"
+    } else {
+      Write-Info "glibc detected but OpenSSL 3 (libssl.so.3) not found; using musl build"
     }
-    $candidates += 'coyote-x86_64-unknown-linux-musl.tar.gz'
-  } else {
-    $candidates += 'coyote-aarch64-unknown-linux-musl.tar.gz'
   }
+  $candidates += "coyote-$arch-unknown-linux-musl.tar.gz"
 } else {
   Fail "Unsupported OS for this installer: $os"
 }

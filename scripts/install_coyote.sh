@@ -116,23 +116,19 @@ if [[ "$OS" == "darwin" ]]; then
     ASSET_CANDIDATES+=("coyote-aarch64-apple-darwin.tar.gz")
   fi
 elif [[ "$OS" == "linux" ]]; then
-  if [[ "$ARCH" == "x86_64" ]]; then
-    LIBC="musl"
-    if command -v getconf >/dev/null 2>&1 && getconf GNU_LIBC_VERSION >/dev/null 2>&1; then LIBC="gnu"; fi
-    if ldd --version 2>&1 | grep -qi glibc; then LIBC="gnu"; fi
+  LIBC="musl"
+  if command -v getconf >/dev/null 2>&1 && getconf GNU_LIBC_VERSION >/dev/null 2>&1; then LIBC="gnu"; fi
+  if ldd --version 2>&1 | grep -qi glibc; then LIBC="gnu"; fi
 
-    if [[ "$LIBC" == "gnu" ]]; then
-      if ldconfig -p 2>/dev/null | grep -q 'libssl\.so\.3'; then
-        ASSET_CANDIDATES+=("coyote-x86_64-unknown-linux-gnu.tar.gz")
-      else
-        log "glibc detected but OpenSSL 3 (libssl.so.3) not found; using musl build"
-      fi
+  if [[ "$LIBC" == "gnu" ]]; then
+    if ldconfig -p 2>/dev/null | grep -q 'libssl\.so\.3'; then
+      ASSET_CANDIDATES+=("coyote-${ARCH}-unknown-linux-gnu.tar.gz")
+    else
+      log "glibc detected but OpenSSL 3 (libssl.so.3) not found; using musl build"
     fi
-
-    ASSET_CANDIDATES+=("coyote-x86_64-unknown-linux-musl.tar.gz")
-  else
-    ASSET_CANDIDATES+=("coyote-aarch64-unknown-linux-musl.tar.gz")
   fi
+
+  ASSET_CANDIDATES+=("coyote-${ARCH}-unknown-linux-musl.tar.gz")
 else
   echo "Error: unsupported OS for this installer: $OS" >&2; exit 1
 fi
