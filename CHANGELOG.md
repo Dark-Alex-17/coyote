@@ -1,3 +1,9 @@
+## v0.10.1 (2026-08-31)
+
+### Fix
+
+- make binary shims for custom tools cross-device compatible so users can't accidentally break sandboxes via `sbx cp ~/.config/coyote <sbx-name>:/home/agent/.config`
+
 ## v0.10.0 (2026-08-29)
 
 ### BREAKING CHANGE
