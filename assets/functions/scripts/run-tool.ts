@@ -3,17 +3,41 @@
 // Usage: ./{function_name}.ts <tool-data>
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
-import { join } from "path";
-import { pathToFileURL } from "url";
+import { dirname, join, resolve } from "path";
+import { fileURLToPath, pathToFileURL } from "url";
+
+function selfDir(): string {
+  if (typeof __dirname !== "undefined") {
+    return __dirname;
+  }
+  return dirname(fileURLToPath(import.meta.url));
+}
+
+// Resolve a directory at run time: prefer the override env var when set,
+// otherwise fall back to the default path derived from this script's own
+// location, so the shim keeps working when the config dir moves or is shared
+// across environments with different home directories.
+function resolveDir(envName: string, defaultPath: string): string {
+  const value = process.env[envName];
+  if (value) {
+    return value;
+  }
+  return resolve(defaultPath);
+}
 
 async function main(): Promise<void> {
   const rawData = parseArgv();
   const toolData = parseRawData(rawData);
 
-  const rootDir = "{root_dir}";
+  const binDir = selfDir();
+  const rootDir = resolveDir("{root_dir_env}", join(binDir, "{root_dir_rel}"));
+  const functionsDir = resolveDir(
+    "{functions_dir_env}",
+    join(binDir, "{functions_dir_rel}"),
+  );
   setupEnv(rootDir, rawData);
 
-  const toolPath = "{tool_path}.ts";
+  const toolPath = join(functionsDir, "tools", "{function_name}.ts");
   await run(toolPath, "run", toolData);
 }
 

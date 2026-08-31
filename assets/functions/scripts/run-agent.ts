@@ -3,17 +3,38 @@
 // Usage: ./{agent_name}.ts <agent-func> <agent-data>
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
-import { join } from "path";
-import { pathToFileURL } from "url";
+import { dirname, join, resolve } from "path";
+import { fileURLToPath, pathToFileURL } from "url";
+
+function selfDir(): string {
+  if (typeof __dirname !== "undefined") {
+    return __dirname;
+  }
+  return dirname(fileURLToPath(import.meta.url));
+}
+
+// Resolve a directory at run time: prefer the override env var when set,
+// otherwise fall back to the default path derived from this script's own
+// location, so the shim keeps working when the config dir moves or is shared
+// across environments with different home directories.
+function resolveDir(envName: string, defaultPath: string): string {
+  const value = process.env[envName];
+  if (value) {
+    return value;
+  }
+  return resolve(defaultPath);
+}
 
 async function main(): Promise<void> {
   const { agentFunc, rawData } = parseArgv();
   const agentData = parseRawData(rawData);
 
-  const configDir = "{config_dir}";
-  setupEnv(configDir, agentFunc, rawData);
+  const binDir = selfDir();
+  const agentDir = resolve(binDir, "..");
+  const configDir = resolveDir("{root_dir_env}", join(binDir, "{root_dir_rel}"));
+  setupEnv(configDir, agentDir, agentFunc, rawData);
 
-  const agentToolsPath = join(configDir, "agents", "{agent_name}", "tools.ts");
+  const agentToolsPath = join(agentDir, "tools.ts");
   await run(agentToolsPath, agentFunc, agentData);
 }
 
@@ -48,12 +69,17 @@ function parseArgv(): { agentFunc: string; rawData: string } {
   return { agentFunc, rawData: agentData };
 }
 
-function setupEnv(configDir: string, agentFunc: string, rawData: string): void {
+function setupEnv(
+  configDir: string,
+  agentDir: string,
+  agentFunc: string,
+  rawData: string,
+): void {
   loadEnv(join(configDir, ".env"));
   process.env["LLM_ROOT_DIR"] = configDir;
   process.env["LLM_AGENT_NAME"] = "{agent_name}";
   process.env["LLM_AGENT_FUNC"] = agentFunc;
-  process.env["LLM_AGENT_ROOT_DIR"] = join(configDir, "agents", "{agent_name}");
+  process.env["LLM_AGENT_ROOT_DIR"] = agentDir;
   process.env["LLM_AGENT_CACHE_DIR"] = join(configDir, "cache", "{agent_name}");
   process.env["LLM_AGENT_RAW_JSON"] = rawData;
 }

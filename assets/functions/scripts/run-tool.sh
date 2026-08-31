@@ -5,11 +5,27 @@
 set -e
 
 main() {
-    root_dir="{root_dir}"
+    self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    root_dir="$(resolve_dir "{root_dir_env}" "$self_dir/{root_dir_rel}")"
+    functions_dir="$(resolve_dir "{functions_dir_env}" "$self_dir/{functions_dir_rel}")"
     parse_argv "$@"
     setup_env
-    tool_path="{tool_path}.sh"
+    tool_path="$functions_dir/tools/{function_name}.sh"
     run
+}
+
+# Resolve a directory at run time: prefer the override env var ($1) when set,
+# otherwise fall back to the default path ($2) derived from this script's own
+# location, so the shim keeps working when the config dir moves or is shared
+# across environments with different home directories.
+resolve_dir() {
+    local override
+    override="$(printenv "$1" 2>/dev/null || true)"
+    if [[ -n "$override" ]]; then
+        echo "$override"
+    else
+        (cd "$2" 2>/dev/null && pwd) || echo "$2"
+    fi
 }
 
 parse_argv() {
@@ -28,7 +44,7 @@ setup_env() {
     export LLM_ROOT_DIR="$root_dir"
     export LLM_TOOL_NAME="{function_name}"
     export LLM_TOOL_CACHE_DIR="$LLM_ROOT_DIR/cache/{function_name}"
-    export LLM_PROMPT_UTILS_FILE="{prompt_utils_file}"
+    export LLM_PROMPT_UTILS_FILE="$functions_dir/utils/prompt-utils.sh"
     export LLM_TOOL_RAW_JSON="$tool_data"
 }
 
@@ -54,6 +70,10 @@ load_env() {
 run() {
     if [[ -z "$tool_data" ]]; then
         die "error: no JSON data"
+    fi
+
+    if [[ ! -f "$tool_path" ]]; then
+        die "error: tool script not found: $tool_path"
     fi
 
     if [[ "$OS" == "Windows_NT" ]]; then

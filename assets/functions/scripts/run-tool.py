@@ -27,14 +27,30 @@ def _ensure_cwd_venv():
 _ensure_cwd_venv()
 
 
+def resolve_dir(env_name, default_path):
+    """Resolve a directory at run time.
+
+    Prefer the override env var when set, otherwise fall back to the default
+    path derived from this script's own location, so the shim keeps working
+    when the config dir moves or is shared across environments with different
+    home directories.
+    """
+    value = os.environ.get(env_name)
+    if value:
+        return value
+    return os.path.normpath(default_path)
+
+
 def main():
     raw_data = parse_argv()
     tool_data = parse_raw_data(raw_data)
 
-    root_dir = "{root_dir}"
+    self_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = resolve_dir("{root_dir_env}", os.path.join(self_dir, "{root_dir_rel}"))
+    functions_dir = resolve_dir("{functions_dir_env}", os.path.join(self_dir, "{functions_dir_rel}"))
     setup_env(root_dir, raw_data)
 
-    tool_path = "{tool_path}.py"
+    tool_path = os.path.join(functions_dir, "tools", "{function_name}.py")
     run(tool_path, "run", tool_data)
 
 

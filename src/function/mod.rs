@@ -1175,6 +1175,35 @@ impl Functions {
         Self::build_binaries(name, language, BinaryType::Agent, custom_runtime.as_deref())
     }
 
+    fn render_shim_template(
+        content_template: &str,
+        binary_name: &str,
+        binary_type: &BinaryType,
+    ) -> String {
+        let functions_dir_env = get_env_name("functions_dir");
+        match binary_type {
+            BinaryType::Tool(None) => content_template
+                .replace("{function_name}", binary_name)
+                .replace("{root_dir_env}", &functions_dir_env)
+                .replace("{root_dir_rel}", "..")
+                .replace("{functions_dir_rel}", ".."),
+            BinaryType::Tool(Some(agent_name)) => content_template
+                .replace("{function_name}", binary_name)
+                .replace(
+                    "{root_dir_env}",
+                    &format!("{}_DATA_DIR", normalize_env_name(agent_name)),
+                )
+                .replace("{root_dir_rel}", "..")
+                .replace("{functions_dir_rel}", "../../../functions"),
+            BinaryType::Agent => content_template
+                .replace("{agent_name}", binary_name)
+                .replace("{root_dir_env}", &get_env_name("config_dir"))
+                .replace("{root_dir_rel}", "../../..")
+                .replace("{functions_dir_rel}", "../../../functions"),
+        }
+        .replace("{functions_dir_env}", &functions_dir_env)
+    }
+
     #[cfg(windows)]
     fn build_binaries(
         binary_name: &str,
@@ -1218,41 +1247,7 @@ impl Functions {
             )
         })?;
         let content_template = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
-        let to_script_path = |p: &str| -> String { p.replace('\\', "/") };
-        let content = match binary_type {
-            BinaryType::Tool(None) => {
-                let root_dir = paths::functions_dir();
-                let tool_path = format!(
-                    "{}/{binary_name}",
-                    paths::global_tools_dir().to_string_lossy()
-                );
-                content_template
-                    .replace("{function_name}", binary_name)
-                    .replace("{root_dir}", &to_script_path(&root_dir.to_string_lossy()))
-                    .replace("{tool_path}", &to_script_path(&tool_path))
-            }
-            BinaryType::Tool(Some(agent_name)) => {
-                let root_dir = paths::agent_data_dir(agent_name);
-                let tool_path = format!(
-                    "{}/{binary_name}",
-                    paths::global_tools_dir().to_string_lossy()
-                );
-                content_template
-                    .replace("{function_name}", binary_name)
-                    .replace("{root_dir}", &to_script_path(&root_dir.to_string_lossy()))
-                    .replace("{tool_path}", &to_script_path(&tool_path))
-            }
-            BinaryType::Agent => content_template
-                .replace("{agent_name}", binary_name)
-                .replace(
-                    "{config_dir}",
-                    &to_script_path(&paths::config_dir().to_string_lossy()),
-                ),
-        }
-        .replace(
-            "{prompt_utils_file}",
-            &to_script_path(&paths::bash_prompt_utils_file().to_string_lossy()),
-        );
+        let content = Self::render_shim_template(content_template, binary_name, &binary_type);
         write_file_atomic(&binary_script_file, &content, None)?;
 
         info!(
@@ -1298,21 +1293,17 @@ impl Functions {
                 _ => bail!("Unsupported language: {}", language.as_ref()),
             }
         };
-        let bin_dir = binary_file
-            .parent()
-            .expect("Failed to get parent directory of binary file");
-        let canonical_bin_dir = dunce::canonicalize(bin_dir)?.to_string_lossy().into_owned();
-        let wrapper_binary = dunce::canonicalize(&binary_script_file)?
-            .to_string_lossy()
-            .into_owned();
+        // %~dp0 (the .cmd's own directory) keeps the launcher relocatable: no
+        // absolute paths may be baked into it (see render_shim_template).
+        let script_name = format!("run-{binary_name}.{}", language.to_extension());
         let content = formatdoc!(
             r#"
 						@echo off
 						setlocal
 
-						set "bin_dir={canonical_bin_dir}"
+						set "bin_dir=%~dp0"
 
-						{run} "{wrapper_binary}" %*"#,
+						{run} "%~dp0{script_name}" %*"#,
         );
 
         write_file_atomic(&binary_file, &content, None)?;
@@ -1352,37 +1343,7 @@ impl Functions {
             )
         })?;
         let content_template = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
-        let mut content = match binary_type {
-            BinaryType::Tool(None) => {
-                let root_dir = paths::functions_dir();
-                let tool_path = format!(
-                    "{}/{binary_name}",
-                    paths::global_tools_dir().to_string_lossy()
-                );
-                content_template
-                    .replace("{function_name}", binary_name)
-                    .replace("{root_dir}", &root_dir.to_string_lossy())
-                    .replace("{tool_path}", &tool_path)
-            }
-            BinaryType::Tool(Some(agent_name)) => {
-                let root_dir = paths::agent_data_dir(agent_name);
-                let tool_path = format!(
-                    "{}/{binary_name}",
-                    paths::global_tools_dir().to_string_lossy()
-                );
-                content_template
-                    .replace("{function_name}", binary_name)
-                    .replace("{root_dir}", &root_dir.to_string_lossy())
-                    .replace("{tool_path}", &tool_path)
-            }
-            BinaryType::Agent => content_template
-                .replace("{agent_name}", binary_name)
-                .replace("{config_dir}", &paths::config_dir().to_string_lossy()),
-        }
-        .replace(
-            "{prompt_utils_file}",
-            &paths::bash_prompt_utils_file().to_string_lossy(),
-        );
+        let mut content = Self::render_shim_template(content_template, binary_name, &binary_type);
 
         if let Some(rt) = custom_runtime
             && let Some(newline_pos) = content.find('\n')
@@ -1398,9 +1359,10 @@ impl Functions {
             write_file_atomic(&script_file, &content, Some(0o755))?;
 
             let ts_runtime = custom_runtime.unwrap_or("tsx");
+            // Locate the script next to the wrapper at run time instead of
+            // baking an absolute path (see render_shim_template).
             let wrapper = format!(
-                "#!/bin/sh\nexec {ts_runtime} \"{}\" \"$@\"\n",
-                script_file.display()
+                "#!/bin/sh\nexec {ts_runtime} \"$(dirname \"$0\")/run-{binary_name}.ts\" \"$@\"\n",
             );
             write_file_atomic(&binary_file, &wrapper, Some(0o755))?;
         } else {
@@ -4611,6 +4573,97 @@ mod tests {
         prune_stale_bin_entries(&dir, &HashSet::new(), None).unwrap();
         assert!(dir.is_dir());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn built_shims_resolve_paths_at_runtime_after_relocation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_file("-shim-relocate-", "");
+        let home_a = root.join("home-a");
+        let config_a = home_a.join("coyote");
+        let tools_dir = config_a.join("functions").join("tools");
+        fs::create_dir_all(&tools_dir).unwrap();
+        fs::create_dir_all(config_a.join("functions").join("bin")).unwrap();
+        let tool_src = tools_dir.join("relocheck.sh");
+        fs::write(
+            &tool_src,
+            "#!/usr/bin/env bash\necho \"relocated-ok\" >> \"$LLM_OUTPUT\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&tool_src, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config_env = get_env_name("config_dir");
+        let functions_env = get_env_name("functions_dir");
+        let saved_config = env::var(&config_env).ok();
+        let saved_functions = env::var(&functions_env).ok();
+        unsafe {
+            env::set_var(&config_env, &config_a);
+            env::remove_var(&functions_env);
+        }
+
+        let build_result = Functions::build_global_function_binary("relocheck.sh", None);
+
+        unsafe {
+            match saved_config {
+                Some(v) => env::set_var(&config_env, v),
+                None => env::remove_var(&config_env),
+            }
+            match saved_functions {
+                Some(v) => env::set_var(&functions_env, v),
+                None => env::remove_var(&functions_env),
+            }
+        }
+        build_result.unwrap();
+
+        let shim = config_a.join("functions").join("bin").join("relocheck");
+        let content = fs::read_to_string(&shim).unwrap();
+        assert!(
+            !content.contains(config_a.to_str().unwrap()),
+            "shim must not bake the generation-time config path:\n{content}"
+        );
+        assert!(
+            content.contains(&functions_env),
+            "shim must consult the functions dir env override at run time:\n{content}"
+        );
+
+        // Simulate the config dir landing under a different home directory
+        // (shared/synced config dir, or a sandbox with another $HOME).
+        let home_b = root.join("home-b");
+        fs::rename(&home_a, &home_b).unwrap();
+        let moved_shim = home_b
+            .join("coyote")
+            .join("functions")
+            .join("bin")
+            .join("relocheck");
+
+        if which::which("bash").is_err() || which::which("jq").is_err() {
+            fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+
+        let output = process::Command::new(&moved_shim)
+            .arg("{}")
+            .env_remove(&config_env)
+            .env_remove(&functions_env)
+            .env_remove("LLM_OUTPUT")
+            .env_remove("LLM_TOOL_DATA_FILE")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "relocated shim failed: stderr={} stdout={stdout}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("relocated-ok"),
+            "unexpected output: {stdout}"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

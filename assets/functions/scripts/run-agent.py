@@ -27,14 +27,30 @@ def _ensure_cwd_venv():
 _ensure_cwd_venv()
 
 
+def resolve_dir(env_name, default_path):
+    """Resolve a directory at run time.
+
+    Prefer the override env var when set, otherwise fall back to the default
+    path derived from this script's own location, so the shim keeps working
+    when the config dir moves or is shared across environments with different
+    home directories.
+    """
+    value = os.environ.get(env_name)
+    if value:
+        return value
+    return os.path.normpath(default_path)
+
+
 def main():
     (agent_func, raw_data) = parse_argv()
     agent_data = parse_raw_data(raw_data)
 
-    root_dir = "{config_dir}"
-    setup_env(root_dir, agent_func, raw_data)
+    self_dir = os.path.dirname(os.path.abspath(__file__))
+    agent_dir = os.path.normpath(os.path.join(self_dir, ".."))
+    root_dir = resolve_dir("{root_dir_env}", os.path.join(self_dir, "{root_dir_rel}"))
+    setup_env(root_dir, agent_dir, agent_func, raw_data)
 
-    agent_tools_path = os.path.join(root_dir, "agents/{agent_name}/tools.py")
+    agent_tools_path = os.path.join(agent_dir, "tools.py")
     run(agent_tools_path, agent_func, agent_data)
 
 
@@ -65,12 +81,12 @@ def parse_argv():
     return agent_func, agent_data
 
 
-def setup_env(root_dir, agent_func, raw_data):
+def setup_env(root_dir, agent_dir, agent_func, raw_data):
     load_env(os.path.join(root_dir, ".env"))
     os.environ["LLM_ROOT_DIR"] = root_dir
     os.environ["LLM_AGENT_NAME"] = "{agent_name}"
     os.environ["LLM_AGENT_FUNC"] = agent_func
-    os.environ["LLM_AGENT_ROOT_DIR"] = os.path.join(root_dir, "agents", "{agent_name}")
+    os.environ["LLM_AGENT_ROOT_DIR"] = agent_dir
     os.environ["LLM_AGENT_CACHE_DIR"] = os.path.join(root_dir, "cache", "{agent_name}")
     os.environ["LLM_AGENT_RAW_JSON"] = raw_data
 
