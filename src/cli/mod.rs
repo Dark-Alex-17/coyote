@@ -1,8 +1,8 @@
 mod completer;
 
 use crate::cli::completer::{
-    ShellCompletion, agent_completer, macro_completer, mcp_server_completer, model_completer,
-    rag_completer, role_completer, secrets_completer, session_completer,
+    ShellCompletion, agent_completer, bundle_completer, macro_completer, mcp_server_completer,
+    model_completer, rag_completer, role_completer, secrets_completer, session_completer,
 };
 use crate::config::{AssetCategory, InstallFilter, MemoryScope};
 use anyhow::{Context, Result};
@@ -230,6 +230,7 @@ pub struct Cli {
         value_name = "NAME",
         group = "yes_scope",
         conflicts_with_all = ["uninstall"],
+        add = ArgValueCompleter::new(bundle_completer),
         help_heading = "Installation & Updates"
     )]
     pub update_bundle: Option<String>,

@@ -33,6 +33,7 @@ pub use self::agent::{
 pub use self::app_config::AppConfig;
 #[allow(unused_imports)]
 pub use self::app_state::AppState;
+pub(crate) use self::bundles::installed_bundle_names;
 pub use self::bundles::list_installed_bundles;
 pub use self::input::Input;
 pub use self::install_remote::{

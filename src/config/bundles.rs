@@ -9,6 +9,7 @@ use crate::utils::IS_STDOUT_TERMINAL;
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use inquire::Confirm;
+use log::warn;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -635,6 +636,20 @@ pub(crate) fn bundle_list_rows(store: &BundleStore, config_dir: &Path) -> Vec<Bu
             }
         })
         .collect()
+}
+
+pub(crate) fn installed_bundle_names() -> Vec<String> {
+    match BundleStore::load() {
+        Ok(store) => store
+            .bundle_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        Err(e) => {
+            warn!("skipping bundle-name completion: {e:#}");
+            Vec::new()
+        }
+    }
 }
 
 pub fn list_installed_bundles() -> Result<()> {

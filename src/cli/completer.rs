@@ -105,6 +105,15 @@ pub(super) fn macro_completer(current: &OsStr) -> Vec<CompletionCandidate> {
         .collect()
 }
 
+pub(super) fn bundle_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    let cur = current.to_string_lossy();
+    crate::config::installed_bundle_names()
+        .into_iter()
+        .filter(|b| b.starts_with(&*cur))
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
 fn extract_agent_from_args() -> Option<String> {
     let args: Vec<String> = env::args().collect();
     let mut i = 0;

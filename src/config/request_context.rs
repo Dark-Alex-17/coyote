@@ -1,4 +1,4 @@
-use super::bundles::BundleStore;
+use super::bundles::installed_bundle_names;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{INTERRUPTED_RESPONSE_TEXT, Session};
@@ -66,22 +66,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs};
-
-/// Completion must degrade rather than break the prompt, but a corrupt store
-/// should not vanish silently: the failure is logged before returning empty.
-fn installed_bundle_names() -> Vec<String> {
-    match BundleStore::load() {
-        Ok(store) => store
-            .bundle_names()
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-        Err(e) => {
-            warn!("skipping bundle-name completion: {e:#}");
-            Vec::new()
-        }
-    }
-}
 
 pub(crate) fn expand_enabled_mcp_server_ids(
     app: &AppConfig,
@@ -5210,6 +5194,7 @@ mod tests {
     use super::*;
     use crate::config::AppState;
     use crate::config::agent::AgentConfig;
+    use crate::config::bundles::BundleStore;
     use crate::config::mcp_tool_policy::LayerSource;
     use crate::config::tool_scope::test_fixtures::{FixtureServer, fixture_runtime};
     use crate::function::jobs::RingBuf;
