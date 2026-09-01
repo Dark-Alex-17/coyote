@@ -2041,6 +2041,7 @@ impl RequestContext {
             ("highlight", app.highlight.to_string()),
             ("raw_markdown", app.raw_markdown.to_string()),
             ("theme", super::format_option_value(&app.theme)),
+            ("config_dir", display_path(&paths::config_dir())),
             ("config_file", display_path(&paths::config_file())),
             ("env_file", display_path(&paths::env_file())),
             ("agents_dir", display_path(&paths::agents_data_dir())),
