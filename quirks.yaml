@@ -9,6 +9,11 @@
 # entries are grouped under a `# legacy — pruning candidates` comment.
 
 - provider: openai
+  exclude:
+    - "text-embedding-*"
+    - "gpt-image-*"
+    - "chatgpt-image-*"
+    - "gpt-realtime*"
   rules:
     - match: "gpt-5.6-*"
       default_reasoning_effort: medium
@@ -118,8 +123,39 @@
           max_tokens: null
           temperature: null
           top_p: null
+    - name: chat-latest
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 30
+      supports_vision: true
+      supports_function_calling: true
+    - name: gpt-5.1-chat-latest
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      input_price: 1.25
+      output_price: 10
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [none, low, medium, high]
+      default_reasoning_effort: none
+    - name: gpt-5-chat-latest
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      input_price: 1.25
+      output_price: 10
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [minimal, low, medium, high]
+      default_reasoning_effort: medium
 
 - provider: gemini
+  exclude:
+    - "gemini-embedding-*"
+    - "veo-*"
+    - "*-tts"
+    - "*-tts-preview"
+    - "*-image-preview"
   rules:
     - match: "gemini-3.6-flash"
       default_reasoning_effort: medium
@@ -135,6 +171,7 @@
       default_reasoning_effort: high
     - match: "gemini-2.5-pro"
       default_reasoning_effort: high
+      reasoning_levels: [low, medium, high]
   models:
     - name: text-embedding-004
       type: embedding
@@ -142,6 +179,18 @@
       max_tokens_per_chunk: 2048
       default_chunk_size: 1500
       max_batch_size: 100
+    # legacy — pruning candidates
+    - name: gemini-3-pro-preview
+      max_input_tokens: 1048576
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [low, high]
+      default_reasoning_effort: high
+    - name: gemma-3-27b-it
+      max_input_tokens: 131072
+      max_output_tokens: 8192
+      input_price: 0
+      output_price: 0
 
 - provider: claude
   rules:
@@ -246,8 +295,28 @@
           thinking:
             type: enabled
             budget_tokens: 16000
+  models:
+    # legacy — pruning candidates
+    - name: claude-opus-4-1-20250805
+      max_input_tokens: 200000
+      max_output_tokens: 8192
+      require_max_tokens: true
+      input_price: 15
+      output_price: 75
+      supports_vision: true
+      supports_function_calling: true
+    - name: claude-opus-4-20250514
+      max_input_tokens: 200000
+      max_output_tokens: 8192
+      require_max_tokens: true
+      input_price: 15
+      output_price: 75
+      supports_vision: true
+      supports_function_calling: true
 
 - provider: mistral
+  exclude:
+    - "voxtral-*"
   models:
     - name: mistral-embed
       type: embedding
@@ -255,6 +324,21 @@
       input_price: 0.1
       max_tokens_per_chunk: 8092
       default_chunk_size: 2000
+    # legacy — pruning candidates
+    - name: magistral-small-latest
+      max_input_tokens: 131072
+      input_price: 0.5
+      output_price: 1.5
+    - name: devstral-small-latest
+      max_input_tokens: 262144
+      input_price: 0.1
+      output_price: 0.3
+      supports_function_calling: true
+    - name: ministral-14b-latest
+      max_input_tokens: 262144
+      input_price: 0.2
+      output_price: 0.2
+      supports_function_calling: true
 
 - provider: ai21
   models:
@@ -300,6 +384,8 @@
       max_input_tokens: 4096
 
 - provider: xai
+  exclude:
+    - "grok-imagine-*"
   oauth:
     client_id: b1a00492-073a-47ea-816f-4c329264a828
     authorize_url: https://auth.x.ai/oauth2/authorize
@@ -337,8 +423,71 @@
       output_price: 2.5
       max_input_tokens: 1000000
       supports_function_calling: true
+    - name: grok-4-1-fast-non-reasoning
+      max_input_tokens: 1000000
+      input_price: 0.2
+      output_price: 0.5
+      supports_function_calling: true
+    - name: grok-4-1-fast-reasoning
+      max_input_tokens: 1000000
+      input_price: 0.2
+      output_price: 0.5
+      supports_function_calling: true
+    - name: grok-code-fast-1
+      max_input_tokens: 256000
+      input_price: 0.2
+      output_price: 1.5
+      supports_function_calling: true
+    - name: grok-3
+      max_input_tokens: 131072
+      input_price: 3
+      output_price: 15
+      supports_function_calling: true
+    - name: grok-3-mini
+      max_input_tokens: 131072
+      input_price: 0.3
+      output_price: 0.5
+      supports_function_calling: true
+
+- provider: perplexity
+  models:
+    # legacy — pruning candidates
+    - name: sonar-reasoning
+      max_input_tokens: 128000
+      input_price: 1
+      output_price: 5
+
+- provider: groq
+  exclude:
+    - "whisper-*"
+  models:
+    # legacy — pruning candidates
+    - name: meta-llama/llama-4-maverick-17b-128e-instruct
+      max_input_tokens: 131072
+      input_price: 0
+      output_price: 0
+      supports_vision: true
+      supports_function_calling: true
+    - name: meta-llama/llama-4-scout-17b-16e-instruct
+      max_input_tokens: 131072
+      input_price: 0
+      output_price: 0
+      supports_vision: true
+      supports_function_calling: true
+    - name: moonshotai/kimi-k2-instruct-0905
+      max_input_tokens: 262144
+      input_price: 0
+      output_price: 0
+      supports_function_calling: true
+    - name: qwen/qwen3-32b
+      max_input_tokens: 131072
+      input_price: 0
+      output_price: 0
 
 - provider: vertexai
+  exclude:
+    - "gemini-embedding-*"
+    - "*-tts"
   rules:
     - match: "claude-*"
       require_max_tokens: true
@@ -354,8 +503,10 @@
       default_reasoning_effort: high
     - match: "gemini-2.5-flash"
       default_reasoning_effort: medium
+      reasoning_levels: [low, medium, high]
     - match: "gemini-2.5-pro"
       default_reasoning_effort: high
+      reasoning_levels: [low, medium, high]
     - match: "claude-opus-5"
       default_reasoning_effort: high
     - match: "claude-fable-*"
@@ -449,6 +600,109 @@
       max_tokens_per_chunk: 2048
       default_chunk_size: 1500
       max_batch_size: 5
+    # legacy — pruning candidates
+    - name: gemini-3-pro-preview
+      max_input_tokens: 1048576
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [low, high]
+      default_reasoning_effort: high
+    - name: claude-opus-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_function_calling: true
+      supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
+    - name: claude-fable-5-1
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      supports_function_calling: true
+      supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
+    - name: claude-fable-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      supports_function_calling: true
+      supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
+    - name: claude-opus-4-8
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
+    - name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
+    - name: claude-opus-4-6
+      max_input_tokens: 200000
+      max_output_tokens: 8192
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+    - name: claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 3
+      output_price: 15
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
+    - name: claude-sonnet-4-6
+      max_input_tokens: 200000
+      max_output_tokens: 8192
+      require_max_tokens: true
+      input_price: 3
+      output_price: 15
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [low, medium, high, max]
+      default_reasoning_effort: high
+    - name: claude-3-5-haiku@20241022
+      max_input_tokens: 200000
+      max_output_tokens: 8192
+      require_max_tokens: true
+      input_price: 0.8
+      output_price: 4
+      supports_vision: true
+      supports_function_calling: true
+    - name: mistral-small-2503
+      max_input_tokens: 32000
+      input_price: 0.1
+      output_price: 0.3
+      supports_function_calling: true
+    - name: codestral-2501
+      max_input_tokens: 256000
+      input_price: 0.3
+      output_price: 0.9
+      supports_function_calling: true
 
 - provider: bedrock
   rules:
@@ -559,6 +813,36 @@
       max_tokens_per_chunk: 512
       default_chunk_size: 1000
       max_batch_size: 96
+    # legacy — pruning candidates
+    - name: us.meta.llama3-3-70b-instruct-v1:0
+      max_input_tokens: 131072
+      max_output_tokens: 8192
+      require_max_tokens: true
+      input_price: 0.72
+      output_price: 0.72
+      supports_function_calling: true
+    - name: us.amazon.nova-premier-v1:0
+      max_input_tokens: 300000
+      max_output_tokens: 5120
+      input_price: 2.5
+      output_price: 12.5
+    - name: us.amazon.nova-pro-v1:0
+      max_input_tokens: 300000
+      max_output_tokens: 5120
+      input_price: 0.8
+      output_price: 3.2
+      supports_vision: true
+    - name: us.amazon.nova-lite-v1:0
+      max_input_tokens: 300000
+      max_output_tokens: 5120
+      input_price: 0.06
+      output_price: 0.24
+      supports_vision: true
+    - name: us.amazon.nova-micro-v1:0
+      max_input_tokens: 128000
+      max_output_tokens: 5120
+      input_price: 0.035
+      output_price: 0.14
 
 - provider: cloudflare
   rules:
@@ -571,6 +855,13 @@
       max_tokens_per_chunk: 512
       default_chunk_size: 1000
       max_batch_size: 100
+    # legacy — pruning candidates
+    - name: '@cf/google/gemma-3-12b-it'
+      max_input_tokens: 131072
+      max_output_tokens: 2048
+      require_max_tokens: true
+      input_price: 0
+      output_price: 0
 
 - provider: ernie
   models:
@@ -609,6 +900,8 @@
       input_price: 0.07
 
 - provider: qianwen
+  exclude:
+    - "*-realtime"
   rules:
     - match: "qwen3.5-plus"
       patch:
@@ -646,6 +939,40 @@
       max_tokens_per_chunk: 8192
       default_chunk_size: 2000
       max_batch_size: 10
+    # legacy — pruning candidates
+    - name: qwen3-vl-flash
+      max_input_tokens: 262144
+      supports_vision: true
+    - name: qwen3-235b-a22b-instruct-2507
+      max_input_tokens: 131072
+      input_price: 0.28
+      output_price: 1.12
+      supports_function_calling: true
+    - name: qwen3-235b-a22b-thinking-2507
+      max_input_tokens: 131072
+      input_price: 0.28
+      output_price: 2.8
+    - name: qwen3-30b-a3b-instruct-2507
+      max_input_tokens: 131072
+      input_price: 0.105
+      output_price: 0.42
+      supports_function_calling: true
+    - name: qwen3-30b-a3b-thinking-2507
+      max_input_tokens: 131072
+      input_price: 0.105
+      output_price: 1.05
+    - name: qwen3-vl-32b-instruct
+      max_input_tokens: 131072
+      input_price: 0.28
+      output_price: 1.12
+      supports_vision: true
+    - name: qwen3-vl-8b-instruct
+      max_input_tokens: 131072
+      input_price: 0.07
+      output_price: 0.28
+      supports_vision: true
+    - name: qwen3-coder-next
+      max_input_tokens: 262144
 
 - provider: hunyuan
   models:
@@ -670,6 +997,21 @@
       max_tokens_per_chunk: 1024
       default_chunk_size: 1000
       max_batch_size: 100
+
+- provider: deepseek
+  models:
+    # legacy — pruning candidates
+    - name: deepseek-chat
+      max_input_tokens: 64000
+      max_output_tokens: 8192
+      input_price: 0.56
+      output_price: 1.68
+      supports_function_calling: true
+    - name: deepseek-reasoner
+      max_input_tokens: 64000
+      max_output_tokens: 32768
+      input_price: 0.56
+      output_price: 1.68
 
 - provider: zhipuai
   variants:
@@ -698,6 +1040,46 @@
       type: reranker
       max_input_tokens: 4096
       input_price: 0.112
+    # legacy — pruning candidates
+    - name: glm-4.6v-flash
+      max_input_tokens: 65536
+      input_price: 0
+      output_price: 0
+      supports_vision: true
+
+- provider: minimax
+  models:
+    # legacy — pruning candidates
+    - name: minimax-m3
+      max_input_tokens: 1000000
+      input_price: 4.2
+      output_price: 16.8
+      supports_function_calling: true
+    - name: minimax-m2.7
+      max_input_tokens: 204800
+      input_price: 0.294
+      output_price: 1.176
+      supports_function_calling: true
+    - name: minimax-m2.5
+      max_input_tokens: 204800
+      input_price: 0.294
+      output_price: 1.176
+      supports_function_calling: true
+    - name: minimax-m2.5-highspeed
+      max_input_tokens: 204800
+      input_price: 0.588
+      output_price: 2.352
+      supports_function_calling: true
+    - name: minimax-m2.1
+      max_input_tokens: 204800
+      input_price: 0.294
+      output_price: 1.176
+      supports_function_calling: true
+    - name: minimax-m2.1-highspeed
+      max_input_tokens: 204800
+      input_price: 0.588
+      output_price: 2.352
+      supports_function_calling: true
 
 - provider: openrouter
   rules:
@@ -705,54 +1087,76 @@
       require_max_tokens: true
     - match: "openai/gpt-5.6-*"
       default_reasoning_effort: medium
+      reasoning_levels: [none, low, medium, high, xhigh, max]
     - match: "openai/gpt-5.5"
       default_reasoning_effort: medium
+      reasoning_levels: [none, low, medium, high, xhigh]
     - match: "openai/gpt-5.5-pro"
       default_reasoning_effort: high
+      reasoning_levels: [medium, high, xhigh]
     - match: "openai/gpt-5.4"
       default_reasoning_effort: none
+      reasoning_levels: [none, low, medium, high, xhigh]
     - match: "openai/gpt-5.4-pro"
       default_reasoning_effort: medium
+      reasoning_levels: [medium, high, xhigh]
     - match: "openai/gpt-5.4-mini"
       default_reasoning_effort: none
+      reasoning_levels: [none, low, medium, high, xhigh]
     - match: "openai/gpt-5.4-nano"
       default_reasoning_effort: none
+      reasoning_levels: [none, low, medium, high, xhigh]
     - match: "openai/gpt-5.3-codex"
       default_reasoning_effort: medium
+      reasoning_levels: [low, medium, high, xhigh]
     - match: "openai/gpt-5.2"
       default_reasoning_effort: none
+      reasoning_levels: [none, low, medium, high, xhigh]
     - match: "openai/gpt-5.2-pro"
       default_reasoning_effort: medium
+      reasoning_levels: [medium, high, xhigh]
     - match: "openai/gpt-5"
       default_reasoning_effort: medium
+      reasoning_levels: [minimal, low, medium, high]
     - match: "google/gemini-3.5-flash"
       default_reasoning_effort: medium
+      reasoning_levels: [minimal, low, medium, high]
     - match: "google/gemini-3-flash-preview"
       default_reasoning_effort: high
+      reasoning_levels: [minimal, low, medium, high]
     - match: "google/gemini-3.1-flash-lite"
       default_reasoning_effort: minimal
+      reasoning_levels: [minimal, low, medium, high]
     - match: "google/gemini-3.1-pro-preview"
       default_reasoning_effort: high
+      reasoning_levels: [low, medium, high]
     - match: "google/gemini-3-pro-preview"
       default_reasoning_effort: high
     - match: "google/gemini-2.5-flash"
       default_reasoning_effort: low
+      reasoning_levels: [low, medium, high]
     - match: "google/gemini-2.5-pro"
       default_reasoning_effort: high
+      reasoning_levels: [low, medium, high]
     - match: "anthropic/claude-opus-5"
       default_reasoning_effort: high
+      reasoning_levels: [low, medium, high, xhigh, max]
     - match: "anthropic/claude-fable-*"
       default_reasoning_effort: high
+      reasoning_levels: [low, medium, high, xhigh, max]
     - match: "anthropic/claude-opus-4-8"
       default_reasoning_effort: high
     - match: "anthropic/claude-opus-4-7"
       default_reasoning_effort: high
     - match: "anthropic/claude-opus-4.6"
       default_reasoning_effort: high
+      reasoning_levels: [low, medium, high, max]
     - match: "anthropic/claude-sonnet-5"
       default_reasoning_effort: high
+      reasoning_levels: [low, medium, high, xhigh, max]
     - match: "anthropic/claude-sonnet-4.6"
       default_reasoning_effort: high
+      reasoning_levels: [low, medium, high, max]
     - match: "perplexity/sonar-reasoning-pro"
       patch:
         body:
@@ -761,9 +1165,105 @@
       patch:
         body:
           include_reasoning: true
+  models:
+    # legacy — pruning candidates
+    - name: google/gemini-3-pro-preview
+      max_input_tokens: 1048576
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [low, high]
+      default_reasoning_effort: high
+    - name: google/gemini-2.0-flash-001
+      max_input_tokens: 1000000
+      input_price: 0.15
+      output_price: 0.6
+      supports_vision: true
+      supports_function_calling: true
+    - name: google/gemini-2.0-flash-lite-001
+      max_input_tokens: 1048576
+      input_price: 0.075
+      output_price: 0.3
+      supports_vision: true
+      supports_function_calling: true
+    - name: anthropic/claude-fable-5-1
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      supports_function_calling: true
+      supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
+    - name: anthropic/claude-opus-4-8
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
+    - name: anthropic/claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_function_calling: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
+    - name: mistralai/devstral-small
+      max_input_tokens: 131072
+      input_price: 0.07
+      output_price: 0.28
+      supports_function_calling: true
+    - name: ai21/jamba-large-1.7
+      max_input_tokens: 256000
+      input_price: 2
+      output_price: 8
+      supports_function_calling: true
+    - name: x-ai/grok-4.1-fast
+      max_input_tokens: 2000000
+      input_price: 0.2
+      output_price: 0.5
+      supports_function_calling: true
+    - name: x-ai/grok-code-fast-1
+      max_input_tokens: 256000
+      input_price: 0.2
+      output_price: 1.5
+      supports_function_calling: true
 
+# Fully hand-owned: upstream catalogs track GitHub Copilot ids, which do not
+# match the GitHub Models API ids coyote uses.
 - provider: github
   models:
+    - name: gpt-5
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      supports_vision: true
+      supports_function_calling: true
+    - name: gpt-5-mini
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      supports_vision: true
+      supports_function_calling: true
+    - name: gpt-5-nano
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      supports_vision: true
+      supports_function_calling: true
+    - name: gpt-4.1
+      max_input_tokens: 1047576
+      max_output_tokens: 32768
+      supports_vision: true
+      supports_function_calling: true
+    - name: gpt-4o
+      max_input_tokens: 128000
+      max_output_tokens: 16384
+      supports_function_calling: true
     - name: text-embedding-3-large
       type: embedding
       max_tokens_per_chunk: 8191
@@ -774,6 +1274,23 @@
       max_tokens_per_chunk: 8191
       default_chunk_size: 2000
       max_batch_size: 100
+    - name: llama-4-maverick-17b-128e-instruct-fp8
+      max_input_tokens: 1048576
+      supports_vision: true
+    - name: llama-4-scout-17b-16e-instruct
+      max_input_tokens: 327680
+      supports_vision: true
+    - name: llama-3.3-70b-instruct
+      max_input_tokens: 131072
+    - name: mistral-medium-2505
+      max_input_tokens: 131072
+      supports_function_calling: true
+    - name: mistral-small-2503
+      max_input_tokens: 131072
+      supports_function_calling: true
+    - name: codestral-2501
+      max_input_tokens: 256000
+      supports_function_calling: true
     - name: cohere-embed-v3-english
       type: embedding
       max_tokens_per_chunk: 512
@@ -784,6 +1301,24 @@
       max_tokens_per_chunk: 512
       default_chunk_size: 1000
       max_batch_size: 96
+    - name: deepseek-r1-0528
+      max_input_tokens: 163840
+    - name: deepseek-v3-0324
+      max_input_tokens: 163840
+    - name: mai-ds-r1
+      max_input_tokens: 163840
+    - name: phi-4
+      max_input_tokens: 16384
+    - name: phi-4-mini-instruct
+      max_input_tokens: 131072
+    - name: phi-4-reasoning
+      max_input_tokens: 33792
+    - name: phi-4-mini-reasoning
+      max_input_tokens: 131072
+    - name: grok-3
+      max_input_tokens: 131072
+    - name: grok-3-mini
+      max_input_tokens: 131072
 
 - provider: deepinfra
   models:
@@ -817,6 +1352,63 @@
       max_tokens_per_chunk: 512
       default_chunk_size: 1000
       max_batch_size: 100
+    # legacy — pruning candidates
+    - name: Qwen/Qwen3-Max-Thinking
+      max_input_tokens: 262144
+      input_price: 1.2
+      output_price: 6
+      supports_function_calling: true
+    - name: Qwen/Qwen3-Next-80B-A3B-Thinking
+      max_input_tokens: 262144
+      input_price: 0.14
+      output_price: 1.4
+    - name: Qwen/Qwen3-235B-A22B-Thinking-2507
+      max_input_tokens: 131072
+      input_price: 0.13
+      output_price: 0.6
+    - name: Qwen/Qwen3-Coder-480B-A35B-Instruct
+      max_input_tokens: 131072
+      input_price: 0.4
+      output_price: 1.6
+      supports_function_calling: true
+    - name: Qwen/Qwen3-Coder-30B-A3B-Instruct
+      max_input_tokens: 262144
+      input_price: 0.07
+      output_price: 0.27
+      supports_function_calling: true
+    - name: Qwen/Qwen3-VL-8B-Instruct
+      max_input_tokens: 262144
+      input_price: 0.18
+      output_price: 0.69
+      supports_vision: true
+    - name: google/gemma-3-27b-it
+      max_input_tokens: 131072
+      input_price: 0.1
+      output_price: 0.2
+    - name: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+      max_input_tokens: 32768
+      input_price: 0.06
+      output_price: 0.12
+    - name: moonshotai/Kimi-K2-Instruct-0905
+      max_input_tokens: 262144
+      input_price: 0.5
+      output_price: 2.0
+      supports_function_calling: true
+    - name: moonshotai/Kimi-K2-Thinking
+      max_input_tokens: 262144
+      input_price: 0.55
+      output_price: 2.5
+      supports_function_calling: true
+    - name: MiniMaxAI/MiniMax-M2.1
+      max_input_tokens: 196608
+      input_price: 0.27
+      output_price: 0.95
+      supports_function_calling: true
+    - name: zai-org/GLM-4.6V
+      max_input_tokens: 131072
+      input_price: 0.3
+      output_price: 0.9
+      supports_vision: true
 
 - provider: jina
   models:

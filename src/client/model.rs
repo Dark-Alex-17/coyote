@@ -358,7 +358,7 @@ impl ModelData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderModels {
     pub provider: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthConfig>,
     pub models: Vec<ModelData>,
 }
