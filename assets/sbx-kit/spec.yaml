@@ -67,6 +67,7 @@ permissions:
       - 'api.cohere.ai'
       - 'api.groq.com'
       - 'openrouter.ai'
+      - 'models.dev'
       - 'api.ai21.com'
       - 'api.cloudflare.com'
       - 'api.deepinfra.com'
