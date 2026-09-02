@@ -5219,7 +5219,7 @@ mod tests {
     // with an empty client list, which would permanently pin every later
     // model lookup in this process to "unknown model" and make any test that
     // needs a resolvable model dependent on test ordering. Seed the caches
-    // before any test runs with one client, "test-seeded", exposing a single
+    // before any test runs with a client, "test-seeded", exposing a single
     // embedding model. Deliberately NO chat model: some tests assert that no
     // chat model is available, and chat lookups don't need one — a
     // "test-seeded:<anything>" chat id resolves through the create-from-name
@@ -5239,8 +5239,17 @@ mod tests {
             embedder.model_type = "embedding".to_string();
             config.models = vec![embedder];
         }
+        // A claude client is seeded alongside it so tests can exercise
+        // provider-quirk inheritance through the create-from-name fallback.
+        // It deliberately carries one embedding model: an empty `models` list
+        // would fall back to the full embedded claude catalog and register
+        // real chat models, breaking the no-chat-model invariant above.
+        let claude: ClientConfig = serde_yaml::from_str(
+            "type: claude\nmodels:\n  - name: test-claude-embedder\n    type: embedding\n",
+        )
+        .unwrap();
         let config = AppConfig {
-            clients: vec![client],
+            clients: vec![client, claude],
             ..AppConfig::default()
         };
         let _ = list_client_names(&config);
