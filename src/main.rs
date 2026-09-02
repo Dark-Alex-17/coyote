@@ -26,7 +26,8 @@ use crate::config::instructions::WORKSPACE_INSTRUCTIONS_FILE_NAME;
 use crate::config::{
     Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, MemoryScope,
     RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
-    install_builtins, list_agents, load_env_file, macro_execute, sync_models,
+    install_builtins, list_agents, load_env_file, macro_execute, maybe_spawn_models_refresh,
+    sync_models,
 };
 use crate::config::{memory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
@@ -293,7 +294,7 @@ async fn run(
 ) -> Result<()> {
     if cli.sync_models {
         let url = ctx.app.config.sync_models_url();
-        return sync_models(&url, abort_signal.clone()).await;
+        return sync_models(url.as_deref(), abort_signal.clone()).await;
     }
 
     if let Some(path) = &cli.generate_models {
@@ -549,6 +550,7 @@ async fn run(
             if !*IS_STDOUT_TERMINAL {
                 bail!("No TTY for REPL")
             }
+            maybe_spawn_models_refresh(&ctx.app.config);
             start_interactive(ctx).await
         }
     }
