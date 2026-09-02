@@ -102,6 +102,8 @@ pub struct AppConfig {
     pub no_workspace_mcp: bool,
     pub no_workspace_macros: bool,
     pub sync_models_url: Option<String>,
+    pub sync_models_auto: bool,
+    pub sync_models_ttl_hours: u64,
 
     pub clients: Vec<ClientConfig>,
 }
@@ -188,6 +190,8 @@ impl Default for AppConfig {
             no_workspace_mcp: false,
             no_workspace_macros: false,
             sync_models_url: None,
+            sync_models_auto: true,
+            sync_models_ttl_hours: 24,
 
             clients: vec![],
         }
@@ -276,6 +280,8 @@ impl AppConfig {
             no_workspace_mcp: false,
             no_workspace_macros: false,
             sync_models_url: config.sync_models_url,
+            sync_models_auto: config.sync_models_auto,
+            sync_models_ttl_hours: config.sync_models_ttl_hours,
 
             clients: config.clients,
         };
@@ -388,10 +394,8 @@ impl AppConfig {
             .ok_or_else(|| anyhow!("Editor not found. Please add the `editor` configuration or set the $EDITOR or $VISUAL environment variable."))
     }
 
-    pub fn sync_models_url(&self) -> String {
-        self.sync_models_url
-            .clone()
-            .unwrap_or_else(|| super::SYNC_MODELS_URL.into())
+    pub fn sync_models_url(&self) -> Option<String> {
+        self.sync_models_url.clone()
     }
 
     pub fn light_theme(&self) -> bool {
@@ -664,6 +668,13 @@ impl AppConfig {
         }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("sync_models_url")) {
             self.sync_models_url = v;
+        }
+        if let Some(Some(v)) = super::read_env_bool(&get_env_name("sync_models_auto")) {
+            self.sync_models_auto = v;
+        }
+        if let Some(Some(v)) = super::read_env_value::<u64>(&get_env_name("sync_models_ttl_hours"))
+        {
+            self.sync_models_ttl_hours = v;
         }
     }
 }
@@ -951,10 +962,70 @@ mod tests {
     }
 
     #[test]
-    fn sync_models_url_has_default() {
+    fn sync_models_url_defaults_to_none() {
         let app = AppConfig::default();
-        let url = app.sync_models_url();
-        assert!(!url.is_empty());
+        assert!(app.sync_models_url().is_none());
+    }
+
+    #[test]
+    fn sync_models_auto_and_ttl_have_defaults() {
+        let app = AppConfig::default();
+        assert!(app.sync_models_auto);
+        assert_eq!(app.sync_models_ttl_hours, 24);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_envs_overrides_sync_models_auto() {
+        let env_name = get_env_name("sync_models_auto");
+        let prev = env::var_os(&env_name);
+
+        let mut app = AppConfig::default();
+
+        unsafe { env::set_var(&env_name, "false") };
+        app.load_envs();
+        assert!(!app.sync_models_auto);
+
+        unsafe { env::set_var(&env_name, "true") };
+        app.load_envs();
+        assert!(app.sync_models_auto);
+
+        unsafe { env::remove_var(&env_name) };
+        app.sync_models_auto = false;
+        app.load_envs();
+        assert!(!app.sync_models_auto);
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_envs_overrides_sync_models_ttl_hours() {
+        let env_name = get_env_name("sync_models_ttl_hours");
+        let prev = env::var_os(&env_name);
+
+        let mut app = AppConfig::default();
+
+        unsafe { env::set_var(&env_name, "6") };
+        app.load_envs();
+        assert_eq!(app.sync_models_ttl_hours, 6);
+
+        unsafe { env::remove_var(&env_name) };
+        app.sync_models_ttl_hours = 48;
+        app.load_envs();
+        assert_eq!(app.sync_models_ttl_hours, 48);
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
+            }
+        }
     }
 
     #[test]
