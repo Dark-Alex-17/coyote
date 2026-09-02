@@ -27,6 +27,8 @@ pub const AGENT_FUNCTION_PREFIX: &str = "agent__";
 
 pub const PENDING_TASKS_GUARDRAIL_MAX: u32 = 3;
 
+pub const PARENT_ALIAS: &str = "parent";
+
 fn agent_permitted(whitelist: Option<&[String]>, target: &str) -> bool {
     match whitelist {
         None => true,
@@ -462,7 +464,7 @@ pub fn teammate_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
         FunctionDeclaration {
             name: format!("{AGENT_FUNCTION_PREFIX}send_message"),
-            description: "Send a text message to a sibling or child agent's inbox. Use to share cross-cutting findings or coordinate with teammates.".to_string(),
+            description: "Send a text message to another agent's inbox: a child or sibling by its agent id, or your parent via the reserved id 'parent'. Use to share cross-cutting findings or coordinate with teammates.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([
@@ -470,7 +472,7 @@ pub fn teammate_function_declarations() -> Vec<FunctionDeclaration> {
                         "id".to_string(),
                         JsonSchema {
                             type_value: Some("string".to_string()),
-                            description: Some("The target agent ID".into()),
+                            description: Some("The target agent ID, or the reserved id 'parent' to message the agent that spawned you".into()),
                             ..Default::default()
                         },
                     ),
@@ -625,6 +627,7 @@ pub async fn run_agent_for_graph(
 
     let child_inbox = Arc::new(Inbox::new());
     parent_ctx.ensure_root_escalation_queue();
+    parent_ctx.ensure_inbox();
     let child_abort = create_abort_signal();
 
     let app_config = Arc::clone(&parent_ctx.app.config);
@@ -807,6 +810,7 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let child_inbox = Arc::new(Inbox::new());
 
     ctx.ensure_root_escalation_queue();
+    ctx.ensure_inbox();
 
     let child_abort = create_abort_signal();
 
@@ -1224,52 +1228,74 @@ fn handle_send_message(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'message' is required"))?;
 
-    let sender = ctx
+    // The routable identity of this sender from the recipient's point of view.
+    // Only spawned agents have a `self_agent_id`; the name fallback covers
+    // contexts that cannot be replied to anyway (e.g. macro contexts).
+    let self_label = ctx
         .self_agent_id
         .clone()
         .or_else(|| ctx.agent.as_ref().map(|a| a.name().to_string()))
-        .unwrap_or_else(|| "parent".to_string());
+        .unwrap_or_else(|| PARENT_ALIAS.to_string());
 
-    let inbox = ctx
+    let deliver = |inbox: &Arc<Inbox>, from: String| {
+        inbox.deliver(Envelope {
+            from,
+            to: id.to_string(),
+            payload: EnvelopePayload::Text {
+                content: message.to_string(),
+            },
+            timestamp: Utc::now(),
+        });
+    };
+
+    if id == PARENT_ALIAS {
+        return match ctx.parent_inbox.as_ref() {
+            Some(inbox) => {
+                deliver(inbox, self_label);
+                Ok(json!({
+                    "status": "ok",
+                    "message": "Message delivered to your parent agent's inbox; it will be read on the parent's next check_inbox call.",
+                }))
+            }
+            None => Ok(json!({
+                "status": "error",
+                "message": "You have no parent agent — the reserved id 'parent' is only routable from a spawned subagent.",
+            })),
+        };
+    }
+
+    let own_child_inbox = ctx
         .supervisor
         .as_ref()
         .and_then(|sup| sup.read().inbox(id).cloned());
-
-    let inbox = inbox.or_else(|| {
-        ctx.parent_supervisor
-            .as_ref()
-            .and_then(|sup| sup.read().inbox(id).cloned())
-    });
-
-    match inbox {
-        Some(inbox) => {
-            inbox.deliver(Envelope {
-                from: sender,
-                to: id.to_string(),
-                payload: EnvelopePayload::Text {
-                    content: message.to_string(),
-                },
-                timestamp: Utc::now(),
-            });
-
-            Ok(json!({
-                "status": "ok",
-                "message": format!("Message delivered to agent '{id}'"),
-            }))
-        }
-        None => {
-            if is_job_task(ctx.supervisor.as_ref(), id)
-                || is_job_task(ctx.parent_supervisor.as_ref(), id)
-            {
-                return Ok(job_id_teaching_error(id));
-            }
-
-            Ok(json!({
-                "status": "error",
-                "message": format!("No agent found with id '{id}'. Agent may not exist or may have already completed."),
-            }))
-        }
+    if let Some(inbox) = own_child_inbox {
+        deliver(&inbox, PARENT_ALIAS.to_string());
+        return Ok(json!({
+            "status": "ok",
+            "message": format!("Message delivered to agent '{id}'"),
+        }));
     }
+
+    let sibling_inbox = ctx
+        .parent_supervisor
+        .as_ref()
+        .and_then(|sup| sup.read().inbox(id).cloned());
+    if let Some(inbox) = sibling_inbox {
+        deliver(&inbox, self_label);
+        return Ok(json!({
+            "status": "ok",
+            "message": format!("Message delivered to agent '{id}'"),
+        }));
+    }
+
+    if is_job_task(ctx.supervisor.as_ref(), id) || is_job_task(ctx.parent_supervisor.as_ref(), id) {
+        return Ok(job_id_teaching_error(id));
+    }
+
+    Ok(json!({
+        "status": "error",
+        "message": format!("No agent found with id '{id}'. Agent may not exist or may have already completed."),
+    }))
 }
 
 fn handle_check_inbox(ctx: &mut RequestContext) -> Result<Value> {
@@ -2019,6 +2045,9 @@ mod tests {
             EnvelopePayload::Text { content } => assert_eq!(content, "hello from parent"),
             _ => panic!("expected text payload"),
         }
+        // A child can only route replies through the reserved alias, so
+        // messages from the spawning agent must be labeled with it.
+        assert_eq!(msgs[0].from, PARENT_ALIAS);
     }
 
     #[test]
@@ -2027,6 +2056,74 @@ mod tests {
         let result =
             handle_send_message(&mut ctx, &json!({"id": "missing", "message": "hi"})).unwrap();
         assert_eq!(result["status"], "error");
+    }
+
+    #[test]
+    fn handle_send_message_parent_alias_delivers_to_parent_inbox() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let parent_inbox = Arc::new(Inbox::new());
+        ctx.parent_inbox = Some(Arc::clone(&parent_inbox));
+        ctx.self_agent_id = Some("agent_explore_abc123".to_string());
+
+        let result = handle_send_message(
+            &mut ctx,
+            &json!({"id": "parent", "message": "hello from child"}),
+        )
+        .unwrap();
+        assert_eq!(result["status"], "ok");
+
+        let msgs = parent_inbox.drain();
+        assert_eq!(msgs.len(), 1);
+        // The parent can reply through its own supervisor, so the sender must
+        // be the child's routable agent id.
+        assert_eq!(msgs[0].from, "agent_explore_abc123");
+        match &msgs[0].payload {
+            EnvelopePayload::Text { content } => assert_eq!(content, "hello from child"),
+            _ => panic!("expected text payload"),
+        }
+    }
+
+    #[test]
+    fn handle_send_message_parent_alias_without_parent_errors() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let result =
+            handle_send_message(&mut ctx, &json!({"id": "parent", "message": "hi"})).unwrap();
+        assert_eq!(result["status"], "error");
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("no parent agent")
+        );
+    }
+
+    #[test]
+    fn handle_send_message_to_sibling_labels_sender_with_own_id() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.self_agent_id = Some("agent_explore_sender".to_string());
+
+        let mut sibling_ctx = ctx_with_supervisor(4, 3);
+        register_fake_agent(&mut sibling_ctx, "agent_explore_receiver", "explore");
+        ctx.parent_supervisor = sibling_ctx.supervisor.clone();
+
+        let result = handle_send_message(
+            &mut ctx,
+            &json!({"id": "agent_explore_receiver", "message": "hi sibling"}),
+        )
+        .unwrap();
+        assert_eq!(result["status"], "ok");
+
+        let inbox = ctx
+            .parent_supervisor
+            .as_ref()
+            .unwrap()
+            .read()
+            .inbox("agent_explore_receiver")
+            .unwrap()
+            .clone();
+        let msgs = inbox.drain();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].from, "agent_explore_sender");
     }
 
     #[test]

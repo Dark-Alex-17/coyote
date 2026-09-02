@@ -71,7 +71,7 @@ instructions: |
 
   To alert a sibling:
   ```
-  agent__send_message --to <sibling_agent_id> --message "ALERT: <description of cross-file concern>"
+  agent__send_message --id <sibling_agent_id> --message "ALERT: <description of cross-file concern>"
   ```
 
   Check your inbox periodically for alerts from siblings:
