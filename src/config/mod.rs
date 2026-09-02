@@ -621,15 +621,20 @@ fn write_models_override(list: Vec<ProviderModels>) -> Result<PathBuf> {
 
     let model_override_path = paths::models_override_file();
     ensure_parent_exists(&model_override_path)?;
-    // Write through a sibling .tmp file and rename it over the target so an
-    // interrupted write can never leave a truncated override behind.
+    // Write through a sibling temp file and rename it over the target so an
+    // interrupted write can never leave a truncated override behind. The temp
+    // name embeds the pid so concurrent coyote processes (auto-refresh racing
+    // a manual --sync-models) never interleave writes into the same file.
     let mut tmp_name = model_override_path.as_os_str().to_os_string();
-    tmp_name.push(".tmp");
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
     let tmp_path = PathBuf::from(tmp_name);
     std::fs::write(&tmp_path, models_override_data)
         .with_context(|| format!("Failed to write to '{}'", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &model_override_path)
-        .with_context(|| format!("Failed to write to '{}'", model_override_path.display()))?;
+    if let Err(error) = std::fs::rename(&tmp_path, &model_override_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error)
+            .with_context(|| format!("Failed to write to '{}'", model_override_path.display()));
+    }
     Ok(model_override_path)
 }
 
@@ -1589,12 +1594,12 @@ clients:
             fs::write(&path, serde_yaml::to_string(&mismatched).unwrap()).unwrap();
             assert!(paths::local_models_override().is_err());
 
-            // write_models_override goes through the sibling .tmp file and
+            // write_models_override goes through the sibling temp file and
             // leaves a loadable override behind.
             let written = write_models_override(vec![entry()]).unwrap();
             assert_eq!(written, path);
             let mut tmp_name = path.as_os_str().to_os_string();
-            tmp_name.push(".tmp");
+            tmp_name.push(format!(".{}.tmp", std::process::id()));
             assert!(!PathBuf::from(tmp_name).exists());
             let loaded = paths::local_models_override().unwrap();
             assert_eq!(loaded.len(), 1);
