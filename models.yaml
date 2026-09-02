@@ -423,6 +423,16 @@
       supports_vision: true
       reasoning_levels: [low, medium, high, xhigh, max]
       default_reasoning_effort: high
+    - name: claude-fable-5-1
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      supports_function_calling: true
+      supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1071,6 +1081,16 @@
       supports_vision: true
       reasoning_levels: [low, medium, high, xhigh, max]
       default_reasoning_effort: high
+    - name: claude-fable-5-1
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
+      supports_function_calling: true
+      supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
     - name: claude-fable-5
       max_input_tokens: 1000000
       max_output_tokens: 128000
@@ -1274,6 +1294,16 @@
       require_max_tokens: true
       input_price: 5
       output_price: 25
+      supports_function_calling: true
+      supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
+    - name: us.anthropic.claude-fable-5-1
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
       supports_function_calling: true
       supports_vision: true
       reasoning_levels: [low, medium, high, xhigh, max]
@@ -2152,6 +2182,16 @@
       require_max_tokens: true
       input_price: 5
       output_price: 25
+      supports_function_calling: true
+      supports_vision: true
+      reasoning_levels: [low, medium, high, xhigh, max]
+      default_reasoning_effort: high
+    - name: anthropic/claude-fable-5-1
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 10
+      output_price: 50
       supports_function_calling: true
       supports_vision: true
       reasoning_levels: [low, medium, high, xhigh, max]
