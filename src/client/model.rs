@@ -1,5 +1,7 @@
 use super::{
-    ApiPatch, MessageContentToolCalls, RequestPatch, list_all_models, list_client_names,
+    ApiPatch, MessageContentToolCalls, RequestPatch,
+    catalog::{ALL_QUIRKS, apply_rules, quirks_for},
+    list_all_models, list_client_names,
     message::{Message, MessageContent, MessageContentPart},
 };
 
@@ -77,6 +79,9 @@ impl Model {
                 {
                     let mut new_model = Self::new(client_name, model_name);
                     new_model.data.model_type = model_type.to_string();
+                    if let Some(quirks) = quirks_for(&ALL_QUIRKS, client_name) {
+                        apply_rules(quirks, &mut new_model.data);
+                    }
                     return Ok(new_model);
                 }
             }
@@ -132,6 +137,7 @@ impl Model {
                     output_price,
                     supports_vision,
                     supports_function_calling,
+                    reasoning_levels,
                     ..
                 } = &self.data;
                 let max_input_tokens = stringify_option_value(max_input_tokens);
@@ -144,6 +150,9 @@ impl Model {
                 };
                 if *supports_function_calling {
                     capabilities.push('⚒');
+                };
+                if !reasoning_levels.is_empty() {
+                    capabilities.push('🧠');
                 };
                 let capabilities: String = capabilities
                     .into_iter()
@@ -417,5 +426,45 @@ where
     match value {
         Some(value) => value.to_string(),
         None => "-".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::ClientConfig;
+
+    #[test]
+    fn created_from_name_inherits_family_rules() {
+        // The model registries are process-wide caches seeded by a ctor (see
+        // the request_context tests) that registers a "claude" client; the
+        // config below documents the shape a real lookup would use.
+        let claude: ClientConfig = serde_yaml::from_str(
+            "type: claude\nmodels:\n  - name: test-claude-embedder\n    type: embedding\n",
+        )
+        .unwrap();
+        let config = AppConfig {
+            clients: vec![claude],
+            ..AppConfig::default()
+        };
+        let model = Model::retrieve_model(
+            &config,
+            "claude:claude-definitely-not-a-real-model",
+            ModelType::Chat,
+        )
+        .unwrap();
+        assert_eq!(model.name(), "claude-definitely-not-a-real-model");
+        assert_eq!(model.model_type(), ModelType::Chat);
+        assert!(model.data.require_max_tokens);
+    }
+
+    #[test]
+    fn description_shows_brain_glyph() {
+        let mut model = Model::new("claude", "some-model");
+        model.data.reasoning_levels = vec!["low".to_string(), "high".to_string()];
+        assert!(model.description().contains('🧠'));
+
+        model.data.reasoning_levels.clear();
+        assert!(!model.description().contains('🧠'));
     }
 }
