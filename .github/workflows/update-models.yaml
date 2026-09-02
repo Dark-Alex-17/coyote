@@ -1,0 +1,95 @@
+name: Update models
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-models
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  update:
+    name: Update models
+
+    runs-on: ubuntu-latest
+
+    env:
+      RUSTFLAGS: --deny warnings
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: true
+
+    - name: Install Rust Toolchain Components
+      uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Cache DuckDB Extensions
+      id: duckdb-extensions
+      uses: actions/cache@v4
+      with:
+        path: ~/.duckdb/extensions
+        key: duckdb-ext-ubuntu-latest-${{ hashFiles('Cargo.lock') }}
+
+    - name: Install DuckDB Extensions
+      if: steps.duckdb-extensions.outputs.cache-hit != 'true'
+      run: cargo test --all duckdb
+
+    # Coyote loads its config before handling --generate-models/--list-models, and a
+    # bare non-TTY runner has no config file (and no way to answer the first-run
+    # prompt), so point COYOTE_CONFIG_DIR at a throwaway dir with a minimal stub.
+    - name: Write stub config
+      run: |
+        COYOTE_CONFIG_DIR="$(mktemp -d)"
+        printf 'clients:\n  - type: openai\n  - type: claude\n' > "$COYOTE_CONFIG_DIR/config.yaml"
+        echo "COYOTE_CONFIG_DIR=$COYOTE_CONFIG_DIR" >> "$GITHUB_ENV"
+
+    - name: Regenerate model catalog
+      run: cargo run --release -- --generate-models
+
+    - name: Detect catalog changes
+      id: diff
+      run: echo "changed=$(git diff --quiet models.yaml && echo false || echo true)" >> "$GITHUB_OUTPUT"
+
+    # The binary built by the regeneration step embedded the OLD models.yaml (the file
+    # was rewritten after that build), so rebuild before smoke-testing: cargo tracks
+    # include_str! inputs, making this a cheap incremental rebuild of the final crate.
+    - name: Rebuild with the refreshed catalog
+      if: steps.diff.outputs.changed == 'true'
+      run: cargo build --release
+
+    - name: Test
+      if: steps.diff.outputs.changed == 'true'
+      run: cargo test --all
+
+    - name: Smoke test the refreshed catalog
+      if: steps.diff.outputs.changed == 'true'
+      run: |
+        COUNT=$(./target/release/coyote --list-models | wc -l)
+        echo "Listed $COUNT chat models"
+        test "$COUNT" -ge 40
+
+    # Pushes made with the default GITHUB_TOKEN do not trigger other workflows,
+    # so this push cannot start a workflow loop. The pull --rebase covers a human
+    # push landing mid-run; if the race is lost anyway, the next cron run retries.
+    - name: Commit and push
+      if: steps.diff.outputs.changed == 'true'
+      run: |
+        git add models.yaml
+        git checkout -- .
+        git config user.name 'github-actions[bot]'
+        git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+        git commit -m 'chore: refresh generated model catalog'
+        git pull --rebase origin main
+        git push origin main
