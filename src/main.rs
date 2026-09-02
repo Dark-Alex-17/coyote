@@ -20,7 +20,7 @@ extern crate log;
 
 use crate::cli::Cli;
 use crate::client::{
-    ModelType, call_chat_completions, call_chat_completions_streaming, list_models, oauth,
+    ModelType, call_chat_completions, call_chat_completions_streaming, catalog, list_models, oauth,
 };
 use crate::config::instructions::WORKSPACE_INSTRUCTIONS_FILE_NAME;
 use crate::config::{
@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
 
     let info_flag = cli.info
         || cli.sync_models
+        || cli.generate_models.is_some()
         || cli.list_models
         || cli.list_roles
         || cli.list_agents
@@ -293,6 +294,10 @@ async fn run(
     if cli.sync_models {
         let url = ctx.app.config.sync_models_url();
         return sync_models(&url, abort_signal.clone()).await;
+    }
+
+    if let Some(path) = &cli.generate_models {
+        return catalog::generate_models_file(path).await;
     }
 
     if cli.list_models {
