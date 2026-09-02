@@ -39,6 +39,51 @@ Allowed:
 
 Duplicate searches waste tokens, may contradict the delegate, and defeat the point of parallelism.
 
+## Team mode (optional): let lanes message each other
+
+Every spawned LLM-loop agent has a built-in mailbox (`agent__send_message` /
+`agent__check_inbox`) — no configuration needed. By default parallel lanes are isolated, and for
+most bursts that is correct. Turn on team mode when one lane's discovery is likely to CHANGE what
+another lane should look for:
+
+- **Adjacent slices of one system** — the routes lane finds the middleware file the token lane
+  is hunting for.
+- **Mixed-angle bursts** — one lane discovers the project already vendors library X, which
+  should redirect another lane's search immediately, not after synthesis.
+- **Long-running lanes** where routing a fact through you costs a full collect/re-spawn round
+  trip.
+
+Skip team mode when lanes are genuinely independent (survey-style sweeps, one-agent-per-module
+audits). And NEVER wire reviewer lanes together (`adversary`, `code-reviewer`,
+`security-reviewer`, `probe`): their verdicts derive value from independence — shared chatter
+biases them.
+
+### Orchestrator protocol
+
+Agent IDs exist only after spawning, so the roster travels as a message:
+
+1. Spawn the whole burst as usual.
+2. Immediately send EVERY lane the roster:
+
+   `agent__send_message --id <routes-lane-id> --message "Teammate roster: middleware=<id>,
+   tokens=<id>. If you find a specific fact that belongs to a teammate's lane, message them
+   directly; check your inbox after each search round and before finalizing."`
+
+3. Synthesis is unchanged: every lane still reports its findings back to YOU. Teammate messages
+   move facts sideways mid-flight; they never replace the final report.
+
+Graph agents (`librarian`) cannot participate — their nodes have no inbox tools. A fact that
+affects a graph lane routes through you: collect, then re-spawn or refine that lane's prompt.
+
+### Worker rules (for agents that receive a roster)
+
+- A message is one or two sentences of specific fact: file:line, exact symbol/term, verbatim
+  quote — never chat, status updates, or opinions.
+- A teammate's message never broadens YOUR slice: use it to sharpen your own search, or carry
+  the pointer into your report. Entirely outside your slice → ignore it.
+- Check your inbox after each search round and ALWAYS before finalizing — a teammate's fact may
+  be the search term you were missing.
+
 ## Stop conditions
 
 Stop searching when:
