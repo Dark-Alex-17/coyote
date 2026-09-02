@@ -330,11 +330,11 @@ pub struct ModelData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    no_stream: bool,
+    pub(crate) no_stream: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    no_system_message: bool,
+    pub(crate) no_system_message: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system_prompt_prefix: Option<String>,
+    pub(crate) system_prompt_prefix: Option<String>,
 
     // embedding-only properties
     #[serde(skip_serializing_if = "Option::is_none")]

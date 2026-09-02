@@ -1,4 +1,5 @@
 mod access_token;
+pub mod catalog;
 mod claude_oauth;
 mod common;
 mod gemini_oauth;
