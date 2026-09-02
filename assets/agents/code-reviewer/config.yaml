@@ -147,7 +147,7 @@ instructions: |
   After spawning ALL file-reviewers (collecting their IDs), send each one a message with the roster:
 
   ```
-  agent__send_message --to <agent_id> --message "SIBLING_ROSTER:
+  agent__send_message --id <agent_id> --message "SIBLING_ROSTER:
   - <agent_id_1>: reviewing <file_1>
   - <agent_id_2>: reviewing <file_2>
   ...

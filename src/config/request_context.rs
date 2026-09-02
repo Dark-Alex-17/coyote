@@ -327,6 +327,7 @@ pub struct RequestContext {
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub self_agent_id: Option<String>,
     pub inbox: Option<Arc<Inbox>>,
+    pub parent_inbox: Option<Arc<Inbox>>,
     pub escalation_queue: Option<Arc<EscalationQueue>>,
     pub notification_queue: Arc<NotificationQueue>,
     pub current_depth: usize,
@@ -364,6 +365,7 @@ impl RequestContext {
             parent_supervisor: None,
             self_agent_id: None,
             inbox: None,
+            parent_inbox: None,
             escalation_queue: None,
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
@@ -427,6 +429,7 @@ impl RequestContext {
             parent_supervisor: None,
             self_agent_id: None,
             inbox: None,
+            parent_inbox: None,
             escalation_queue: None,
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
@@ -479,6 +482,7 @@ impl RequestContext {
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
             inbox: self.inbox.clone(),
+            parent_inbox: self.parent_inbox.clone(),
             escalation_queue: self.escalation_queue.clone(),
             notification_queue: self.notification_queue.clone(),
             current_depth: self.current_depth,
@@ -527,6 +531,7 @@ impl RequestContext {
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
             inbox: Some(inbox),
+            parent_inbox: parent.inbox.clone(),
             escalation_queue: parent.escalation_queue.clone(),
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth,
@@ -556,6 +561,12 @@ impl RequestContext {
     pub fn ensure_root_escalation_queue(&mut self) -> Arc<EscalationQueue> {
         self.escalation_queue
             .get_or_insert_with(|| Arc::new(EscalationQueue::new()))
+            .clone()
+    }
+
+    pub fn ensure_inbox(&mut self) -> Arc<Inbox> {
+        self.inbox
+            .get_or_insert_with(|| Arc::new(Inbox::new()))
             .clone()
     }
 
@@ -4651,6 +4662,7 @@ impl RequestContext {
         }
         self.supervisor = supervisor;
         self.inbox = None;
+        self.parent_inbox = None;
         self.escalation_queue = None;
         self.notification_queue = Arc::new(NotificationQueue::new());
         self.self_agent_id = None;
@@ -4694,6 +4706,7 @@ impl RequestContext {
             self.parent_supervisor = None;
             self.self_agent_id = None;
             self.inbox = None;
+            self.parent_inbox = None;
             self.escalation_queue = None;
             self.notification_queue = Arc::new(NotificationQueue::new());
             self.current_depth = 0;
@@ -5956,6 +5969,40 @@ mod tests {
     fn inbox_defaults_to_none() {
         let ctx = create_test_ctx();
         assert!(ctx.inbox.is_none());
+    }
+
+    #[test]
+    fn parent_inbox_defaults_to_none() {
+        let ctx = create_test_ctx();
+
+        assert!(ctx.parent_inbox.is_none());
+    }
+
+    #[test]
+    fn ensure_inbox_allocates_once_and_is_stable() {
+        let mut ctx = create_test_ctx();
+        let first = ctx.ensure_inbox();
+        let second = ctx.ensure_inbox();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(ctx.inbox.is_some());
+    }
+
+    #[test]
+    fn new_for_child_inherits_parent_inbox() {
+        let mut parent = create_test_ctx();
+        let parent_inbox = parent.ensure_inbox();
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+
+        let child_parent_inbox = child.parent_inbox.expect("child should see parent's inbox");
+
+        assert!(Arc::ptr_eq(&parent_inbox, &child_parent_inbox));
     }
 
     #[test]

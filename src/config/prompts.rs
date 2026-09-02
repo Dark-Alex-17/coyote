@@ -212,7 +212,7 @@ pub(in crate::config) const DEFAULT_TEAMMATE_INSTRUCTIONS: &str = indoc! {"
     ## Teammate Messaging
 
     You have tools to communicate with other agents running alongside you:
-        - `agent__send_message --id <agent_id> --message \"...\"`: Send a message to a sibling or parent agent.
+        - `agent__send_message --id <agent_id> --message \"...\"`: Send a message to a child or sibling agent by its id, or to your parent with the reserved id `parent`.
         - `agent__check_inbox`: Check for messages sent to you by other agents.
 
     If you are working alongside other agents (e.g. reviewing different files, exploring different areas):
