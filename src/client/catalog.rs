@@ -9,7 +9,7 @@ use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 
 pub const QUIRKS_YAML: &str = include_str!("../../quirks.yaml");
 
@@ -815,8 +815,23 @@ pub fn quirks_for<'a>(
         })
 }
 
+/// Compiled patterns are memoized: catalog builds evaluate every rule, exclude,
+/// and variant glob against every model, so recompiling per call would dominate
+/// the merge as the catalog grows.
+static GLOB_CACHE: LazyLock<Mutex<HashMap<String, Arc<Regex>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn glob_matches(pattern: &str, name: &str) -> bool {
-    compile_glob(pattern).is_match(name).unwrap_or(false)
+    let regex = {
+        let mut cache = GLOB_CACHE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cache
+            .entry(pattern.to_string())
+            .or_insert_with(|| Arc::new(compile_glob(pattern)))
+            .clone()
+    };
+    regex.is_match(name).unwrap_or(false)
 }
 
 /// Translates a glob pattern (`*` = any run of characters, `?` = exactly one)
