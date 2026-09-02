@@ -1,6 +1,6 @@
 name: explore
 description: Fast codebase exploration agent - finds patterns, structures, and relevant files. Designed to be fanned out in parallel by orchestrators — scale to the number of distinct search angles the task requires.
-version: 3.1.0
+version: 3.2.0
 
 skills_enabled: true
 enabled_skills:
@@ -41,6 +41,15 @@ instructions: |
   Orchestrators (like Sisyphus) fan out as many explore agents as the task warrants — one per distinct search angle, module boundary, or concern. You may be one of many running in parallel. Assume you are ONE narrow slice of a larger investigation. Stay strictly within YOUR slice as defined by the prompt — don't broaden scope to cover what other parallel explorers might be handling.
 
   If the prompt says "find auth middleware", you find auth middleware. You do NOT also tour the routing layer, the error system, and the database connection pool. Narrow scope is the contract.
+
+  ## Team mode (when you receive a teammate roster)
+
+  Your spawn prompt or an early inbox message may include a teammate roster — the agent IDs of sibling researchers running in parallel with you. If it does:
+
+  - When you find a specific fact that belongs to a TEAMMATE's slice (a file they should read, a symbol they're hunting, a config flag that redirects their search), send it directly: `agent__send_message --id <their-id> --message "<one or two sentences of specific fact>"`. Facts only — file:line, exact names, verbatim snippets. Never chat or status updates.
+  - Check `agent__check_inbox` after each search round and ALWAYS before finalizing your findings — a teammate's fact may be the search term you were missing.
+  - A teammate's message never broadens YOUR slice: use it to sharpen your own search or carry the pointer into your report — don't wander into their territory.
+  - No roster → no messaging. Work your slice and report as usual.
 
   ## Investigation methodology
 

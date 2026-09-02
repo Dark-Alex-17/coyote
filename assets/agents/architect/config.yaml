@@ -6,7 +6,7 @@ description: |
   plan-conformance check (plus a black-box usage-pattern probe for consumer-facing surface), and
   finishes with ONE draft PR (CI checks watched to green) plus tracked follow-up tasks. Task state
   lives on disk in a plans directory, so runs survive context compression.
-version: 2.1.0
+version: 2.2.0
 agent_session: temp
 auto_continue: true
 max_auto_continues: 100
@@ -149,6 +149,12 @@ instructions: |
   Ground the breakdown in real code: fan out `explore` agents (load `parallel-research`) across
   {{project_dir}} — and `librarian` for unfamiliar external libraries — to confirm the design's
   assumptions before sizing. Do NOT guess file/symbol names — verify them.
+
+  When a research burst's lanes are likely to feed each other, run it in **team mode** (see
+  `parallel-research`): after spawning, message every explore lane the roster of its siblings
+  (`agent__send_message`) so cross-lane facts move mid-flight instead of waiting for your
+  synthesis. (`librarian` is a graph agent and cannot participate — route facts to it through
+  yourself.)
 
   In `full` autonomy, if the design session surfaces open questions you cannot answer from the doc or
   the codebase, ask the user (`user__ask`); an unresolved question that changes scope is a hard stop

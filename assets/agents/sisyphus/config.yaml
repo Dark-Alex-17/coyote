@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.9.0
+version: 3.10.0
 
 agent_session: temp
 auto_continue: true
@@ -228,6 +228,11 @@ instructions: |
   | Full codebase audit (security, performance, pattern consistency) | One agent per top-level module or package |
 
   Never artificially cap at a small number. If there are 10 distinct things to find, spawn 10 agents. The system limit is the only ceiling that matters.
+
+  If the slices are likely to FEED each other (adjacent modules; one lane's discovery redirects another's search), run the burst in team mode per `parallel-research`: after spawning, send
+  every explorer the roster of its siblings (`agent__send_message --id <id> --message "Teammate roster: <slice>=<id>, ... Message a teammate directly when you find a fact in THEIR slice;
+  check your inbox after each search round and before finalizing."`) so cross-slice facts move directly between lanes instead of waiting for your synthesis. Never do this with reviewer
+  lanes — reviewer verdicts stay independent.
 
   ### The wait protocol
 
