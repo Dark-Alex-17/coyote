@@ -94,7 +94,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::{
-    env,
+    env, fs,
     fs::{File, create_dir_all, read_dir, read_to_string},
     io::Write,
     path::{Path, PathBuf},
@@ -548,8 +548,6 @@ pub async fn sync_models(url: Option<&str>, abort_signal: AbortSignal) -> Result
     Ok(())
 }
 
-/// [`sync_models`] without a spinner or terminal output, for background use;
-/// failures are returned for the caller to log.
 pub async fn sync_models_quiet(url: Option<&str>) -> Result<()> {
     let list = match url {
         Some(url) => {
@@ -589,6 +587,7 @@ fn build_refreshed_catalog(
     if sources.openrouter.is_none() {
         warnings.push("Failed to fetch OpenRouter; continuing with models.dev data only".into());
     }
+
     let mut build = catalog::build_catalog(sources, &catalog::ALL_QUIRKS);
     if !build.degraded.is_empty() {
         warnings.push(format!(
@@ -602,12 +601,15 @@ fn build_refreshed_catalog(
             build.failed.join(", ")
         ));
     }
+
     let embedded = serde_yaml::from_str::<Vec<ProviderModels>>(MODELS_YAML)
         .with_context(|| "Failed to parse the embedded models.yaml")?;
     catalog::backfill_embedded_floor(&mut build, &embedded);
+
     if build.providers.is_empty() {
         bail!("Model sync produced no providers");
     }
+
     Ok((build.providers, warnings))
 }
 
@@ -626,20 +628,18 @@ fn write_models_override(list: Vec<ProviderModels>) -> Result<PathBuf> {
     // name embeds the pid so concurrent coyote processes (auto-refresh racing
     // a manual --sync-models) never interleave writes into the same file.
     let mut tmp_name = model_override_path.as_os_str().to_os_string();
-    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    tmp_name.push(format!(".{}.tmp", process::id()));
     let tmp_path = PathBuf::from(tmp_name);
-    std::fs::write(&tmp_path, models_override_data)
+    fs::write(&tmp_path, models_override_data)
         .with_context(|| format!("Failed to write to '{}'", tmp_path.display()))?;
-    if let Err(error) = std::fs::rename(&tmp_path, &model_override_path) {
-        let _ = std::fs::remove_file(&tmp_path);
+    if let Err(error) = fs::rename(&tmp_path, &model_override_path) {
+        let _ = fs::remove_file(&tmp_path);
         return Err(error)
             .with_context(|| format!("Failed to write to '{}'", model_override_path.display()));
     }
     Ok(model_override_path)
 }
 
-/// A missing, unreadable, corrupt, or version-mismatched override is always
-/// stale; a loadable one is stale once its mtime is older than the TTL.
 fn models_override_is_stale(loadable: bool, mtime: Option<SystemTime>, ttl_hours: u64) -> bool {
     if !loadable {
         return true;
@@ -653,15 +653,12 @@ fn models_override_is_stale(loadable: bool, mtime: Option<SystemTime>, ttl_hours
     }
 }
 
-/// Fire-and-forget refresh of the models override on REPL startup. The
-/// running session keeps its already-loaded catalog; the next start picks up
-/// the refreshed file.
 pub fn maybe_spawn_models_refresh(app: &AppConfig) {
     if !app.sync_models_auto || app.dry_run {
         return;
     }
     let loadable = paths::local_models_override().is_ok();
-    let mtime = std::fs::metadata(paths::models_override_file())
+    let mtime = fs::metadata(paths::models_override_file())
         .and_then(|metadata| metadata.modified())
         .ok();
     if !models_override_is_stale(loadable, mtime, app.sync_models_ttl_hours) {
@@ -1030,13 +1027,13 @@ fn render_config_template_from(
 
 fn write_config_file(config_path: &Path, config_data: &str) -> Result<()> {
     ensure_parent_exists(config_path)?;
-    std::fs::write(config_path, config_data)
+    fs::write(config_path, config_data)
         .with_context(|| format!("Failed to write to '{}'", config_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::prelude::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(config_path, perms)?;
+        let perms = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(config_path, perms)?;
     }
 
     println!("✓ Saved the config file to '{}'.\n", config_path.display());
@@ -1545,6 +1542,7 @@ clients:
         let margin = std::time::Duration::from_secs(300);
         let just_fresh = SystemTime::now() - (ttl - margin);
         let just_stale = SystemTime::now() - (ttl + margin);
+
         assert!(!models_override_is_stale(true, Some(just_fresh), ttl_hours));
         assert!(models_override_is_stale(true, Some(just_stale), ttl_hours));
     }
@@ -1552,6 +1550,7 @@ clients:
     #[test]
     fn future_mtime_is_not_stale() {
         let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+
         assert!(!models_override_is_stale(true, Some(future), 24));
     }
 
@@ -1564,8 +1563,8 @@ clients:
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let tmp_dir = std::env::temp_dir().join(format!("coyote-models-override-{unique}"));
-        fs::create_dir_all(&tmp_dir).unwrap();
+        let tmp_dir = env::temp_dir().join(format!("coyote-models-override-{unique}"));
+        create_dir_all(&tmp_dir).unwrap();
 
         let env_name = get_env_name("config_dir");
         let prev = env::var_os(&env_name);
