@@ -338,9 +338,6 @@ pub struct RequestContext {
     pub last_continuation_response: Option<String>,
     pub pending_prefill: Option<String>,
 
-    /// The turn's abort signal, set by the REPL/cmd entry points. Lets blocking
-    /// tools (job__collect, agent__collect) notice a user interrupt -- SIGINT is
-    /// otherwise swallowed in cooked mode during tool execution.
     pub session_abort: Option<AbortSignal>,
 
     pub render_mode: RenderMode,
