@@ -556,7 +556,6 @@ async fn run(
     }
 }
 
-#[async_recursion::async_recursion]
 async fn start_directive(
     ctx: &mut RequestContext,
     input: Input,
@@ -576,37 +575,36 @@ async fn start_directive(
         return Ok(());
     }
 
-    let client = input.create_client()?;
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
-    ctx.before_chat_completion(&input)?;
-    let (output, tool_results) = if !input.stream() || extract_code {
-        call_chat_completions(
-            &input,
-            true,
-            extract_code,
-            client.as_ref(),
-            ctx,
-            abort_signal.clone(),
-        )
-        .await?
-    } else {
-        call_chat_completions_streaming(&input, client.as_ref(), ctx, abort_signal.clone()).await?
-    };
-    ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
+    let mut input = input;
+    loop {
+        let client = input.create_client()?;
+        ctx.before_chat_completion(&input)?;
+        let (output, tool_results) = if !input.stream() || extract_code {
+            call_chat_completions(
+                &input,
+                true,
+                extract_code,
+                client.as_ref(),
+                ctx,
+                abort_signal.clone(),
+            )
+            .await?
+        } else {
+            call_chat_completions_streaming(&input, client.as_ref(), ctx, abort_signal.clone())
+                .await?
+        };
+        ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
 
-    if !tool_results.is_empty() {
-        start_directive(
-            ctx,
-            input.merge_tool_results(output, tool_results),
-            code_mode,
-            abort_signal,
-        )
-        .await?;
-    } else {
+        if !tool_results.is_empty() {
+            input = input.merge_tool_results(output, tool_results);
+            continue;
+        }
+
         match check_pending_tasks_guardrail(ctx) {
             GuardrailAction::Inject(prompt) => {
-                let guardrail_input = Input::from_str(ctx, &prompt, None)?;
-                return start_directive(ctx, guardrail_input, code_mode, abort_signal).await;
+                input = Input::from_str(ctx, &prompt, None)?;
+                continue;
             }
             GuardrailAction::ForceTerminate(ids) => {
                 warn!(
@@ -617,6 +615,8 @@ async fn start_directive(
             }
             GuardrailAction::NoAction => {}
         }
+
+        break;
     }
 
     ctx.exit_session()?;
