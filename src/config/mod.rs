@@ -657,15 +657,18 @@ pub fn maybe_spawn_models_refresh(app: &AppConfig) {
     if !app.sync_models_auto || app.dry_run {
         return;
     }
-    let loadable = paths::local_models_override().is_ok();
-    let mtime = fs::metadata(paths::models_override_file())
-        .and_then(|metadata| metadata.modified())
-        .ok();
-    if !models_override_is_stale(loadable, mtime, app.sync_models_ttl_hours) {
-        return;
-    }
+    let ttl_hours = app.sync_models_ttl_hours;
     let url = app.sync_models_url.clone();
     tokio::spawn(async move {
+        // The loadable probe deserializes the whole override catalog; keep it
+        // off the startup path.
+        let loadable = paths::local_models_override().is_ok();
+        let mtime = fs::metadata(paths::models_override_file())
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        if !models_override_is_stale(loadable, mtime, ttl_hours) {
+            return;
+        }
         if let Err(err) = sync_models_quiet(url.as_deref()).await {
             debug!("Background models refresh failed: {err}");
         }
