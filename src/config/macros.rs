@@ -74,6 +74,7 @@ pub async fn macro_execute(
     macro_ctx.current_depth = ctx.current_depth;
     macro_ctx.auto_continue_count = ctx.auto_continue_count;
     macro_ctx.todo_list = ctx.todo_list.clone();
+    macro_ctx.auto_continue_paused = ctx.auto_continue_paused.clone();
     macro_ctx.tool_scope.tool_tracker = ctx.tool_scope.tool_tracker.clone();
     macro_ctx.discontinuous_last_message();
 

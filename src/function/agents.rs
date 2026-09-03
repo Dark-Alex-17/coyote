@@ -1,3 +1,4 @@
+use super::todo::TODO_FUNCTION_PREFIX;
 use super::{FunctionDeclaration, JsonSchema};
 use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::{
@@ -10,6 +11,7 @@ use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor, T
 use crate::utils::{AbortSignal, create_abort_signal, wait_abort_signal, wait_user_interrupt};
 
 use crate::graph;
+use crate::repl::DEFAULT_CONTINUATION_PROMPT;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use indexmap::IndexMap;
@@ -574,7 +576,13 @@ pub fn run_child_agent(
 
             if tool_results.is_empty() {
                 match check_pending_tasks_guardrail(&mut child_ctx) {
-                    GuardrailAction::NoAction => break,
+                    GuardrailAction::NoAction => {
+                        if let Some(prompt) = todo_continuation_prompt(&mut child_ctx) {
+                            input = Input::from_str(&child_ctx, &prompt, None)?;
+                            continue;
+                        }
+                        break;
+                    }
                     GuardrailAction::ForceTerminate(ids) => {
                         warn!(
                             "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
@@ -599,6 +607,33 @@ pub fn run_child_agent(
 
         Ok(accumulated_output)
     })
+}
+
+fn todo_continuation_prompt(ctx: &mut RequestContext) -> Option<String> {
+    let config = ctx.auto_continue_config();
+    if !ctx.app.config.function_calling_support
+        || !config.enabled
+        || ctx.auto_continue_count >= config.max_continues
+        || !ctx.todo_list.has_incomplete()
+        || ctx.auto_continue_paused.is_some()
+    {
+        return None;
+    }
+
+    ctx.increment_auto_continue_count();
+    debug!(
+        "Auto-continuing child agent ({}/{}): {} incomplete todo(s) remain",
+        ctx.auto_continue_count,
+        config.max_continues,
+        ctx.todo_list.incomplete_count()
+    );
+
+    let prompt = config
+        .continuation_prompt
+        .as_deref()
+        .unwrap_or(DEFAULT_CONTINUATION_PROMPT);
+
+    Some(format!("{prompt}\n\n{}", ctx.todo_list.render_for_model()))
 }
 
 /// Spawn an agent synchronously from a graph node and return its accumulated
@@ -749,6 +784,14 @@ fn sync_agent_functions_to_ctx(ctx: &mut RequestContext) -> Result<()> {
     };
 
     ctx.tool_scope.functions = functions;
+    // Agent::init builds one function set regardless of how the agent runs;
+    // this sync is only ever called for spawned children.
+    if ctx.self_agent_id.is_some() {
+        ctx.tool_scope
+            .functions
+            .remove_function(&format!("{TODO_FUNCTION_PREFIX}pause"));
+    }
+
     Ok(())
 }
 
@@ -1650,7 +1693,7 @@ async fn summarize_output(ctx: &RequestContext, agent_name: &str, output: &str) 
 mod tests {
     use super::*;
     use crate::config::test_fixtures::{FixtureServer, fixture_runtime};
-    use crate::config::{AgentConfig, AppState, WorkingMode};
+    use crate::config::{AgentConfig, AppConfig, AppState, WorkingMode};
     use crate::function::jobs::RingBuf;
     use crate::mcp::{McpServer, McpServersConfig, McpTransportType};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
@@ -1671,6 +1714,58 @@ mod tests {
             max_depth,
         ))));
         ctx
+    }
+
+    fn auto_continue_ctx() -> RequestContext {
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                auto_continue: true,
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        RequestContext::new(Arc::new(app), WorkingMode::Cmd)
+    }
+
+    #[test]
+    fn todo_continuation_fires_for_child_with_incomplete_todos() {
+        let mut ctx = auto_continue_ctx();
+        ctx.init_todo_list("ship feature");
+        ctx.add_todo("build the thing");
+
+        let prompt = todo_continuation_prompt(&mut ctx).expect("child should auto-continue");
+
+        assert!(prompt.contains("TODO CONTINUATION"), "{prompt}");
+        assert!(prompt.contains("build the thing"), "{prompt}");
+        assert_eq!(ctx.auto_continue_count, 1);
+    }
+
+    #[test]
+    fn todo_continuation_stops_when_done_paused_capped_or_disabled() {
+        // All todos complete → run may end.
+        let mut ctx = auto_continue_ctx();
+        ctx.init_todo_list("ship feature");
+        let id = ctx.add_todo("build the thing");
+        ctx.mark_todo_done(id);
+        assert!(todo_continuation_prompt(&mut ctx).is_none());
+
+        // Defense-in-depth: children cannot call todo__pause, but a set flag
+        // must still stop the continuation loop.
+        ctx.add_todo("deploy the thing");
+        ctx.pause_auto_continue("blocked on credentials");
+        assert!(todo_continuation_prompt(&mut ctx).is_none());
+        ctx.resume_auto_continue();
+        assert!(todo_continuation_prompt(&mut ctx).is_some());
+
+        // Continuation cap reached → run may end.
+        ctx.auto_continue_count = ctx.auto_continue_config().max_continues;
+        assert!(todo_continuation_prompt(&mut ctx).is_none());
+
+        // Auto-continue disabled → run may end even with incomplete todos.
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.init_todo_list("ship feature");
+        ctx.add_todo("build the thing");
+        assert!(todo_continuation_prompt(&mut ctx).is_none());
     }
 
     fn ctx_with_job_capable_supervisor() -> RequestContext {
@@ -1838,6 +1933,31 @@ mod tests {
         assert!(functions.contains("mcp_describe_fixture"));
         assert!(functions.contains("mcp_read_fixture"));
         assert!(!functions.contains("mcp_invoke_fixture"));
+    }
+
+    /// `Agent::init` registers the full todo tool set (incl. `todo__pause`)
+    /// whenever the agent config enables auto_continue, because the same
+    /// function set serves top-level `--agent` sessions. Spawned children
+    /// must never advertise `todo__pause` (they are driven to completion
+    /// autonomously), so the child-only sync strips that one declaration
+    /// while leaving the rest of the todo tools intact.
+    #[tokio::test]
+    async fn sync_strips_todo_pause_declaration_for_child_contexts() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let mut agent = Agent::test_new(AgentConfig::default());
+        agent.functions_mut().append_todo_functions();
+        ctx.agent = Some(agent);
+        ctx.self_agent_id = Some("agent_sisyphus_abc123".to_string());
+
+        sync_agent_functions_to_ctx(&mut ctx).unwrap();
+
+        let functions = &ctx.tool_scope.functions;
+        assert!(!functions.contains("todo__pause"));
+        assert!(functions.contains("todo__init"));
+        assert!(functions.contains("todo__add"));
+        assert!(functions.contains("todo__done"));
+        assert!(functions.contains("todo__list"));
+        assert!(functions.contains("todo__clear"));
     }
 
     fn app_state_with_fixture_mcp_config() -> Arc<AppState> {

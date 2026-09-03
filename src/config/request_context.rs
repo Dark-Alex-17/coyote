@@ -336,6 +336,7 @@ pub struct RequestContext {
     pub todo_list: TodoList,
     pub skill_registry: SkillRegistry,
     pub last_continuation_response: Option<String>,
+    pub auto_continue_paused: Option<String>,
     pub pending_prefill: Option<String>,
 
     pub session_abort: Option<AbortSignal>,
@@ -376,6 +377,7 @@ impl RequestContext {
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
+            auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
             render_mode: RenderMode::default(),
@@ -441,6 +443,7 @@ impl RequestContext {
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
+            auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
             render_mode: RenderMode::default(),
@@ -495,6 +498,7 @@ impl RequestContext {
             todo_list: self.todo_list.clone(),
             skill_registry: self.skill_registry.clone(),
             last_continuation_response: None,
+            auto_continue_paused: self.auto_continue_paused.clone(),
             pending_prefill: None,
             session_abort: self.session_abort.clone(),
             render_mode: self.render_mode,
@@ -545,6 +549,7 @@ impl RequestContext {
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
+            auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
             render_mode: parent.render_mode,
@@ -582,6 +587,7 @@ impl RequestContext {
 
     pub fn init_todo_list(&mut self, goal: &str) {
         self.todo_list = TodoList::new(goal);
+        self.auto_continue_paused = None;
     }
 
     pub fn add_todo(&mut self, task: &str) -> usize {
@@ -595,10 +601,19 @@ impl RequestContext {
     pub fn clear_todo_list(&mut self) {
         self.todo_list.clear();
         self.auto_continue_count = 0;
+        self.auto_continue_paused = None;
     }
 
     pub fn increment_auto_continue_count(&mut self) {
         self.auto_continue_count += 1;
+    }
+
+    pub fn pause_auto_continue(&mut self, reason: &str) {
+        self.auto_continue_paused = Some(reason.to_string());
+    }
+
+    pub fn resume_auto_continue(&mut self) {
+        self.auto_continue_paused = None;
     }
 
     pub fn reset_continuation_count(&mut self) {
@@ -4676,6 +4691,7 @@ impl RequestContext {
         self.current_depth = 0;
         self.auto_continue_count = 0;
         self.todo_list = TodoList::default();
+        self.auto_continue_paused = None;
 
         if let Some(session_name) = session_name.as_deref() {
             self.use_session(app, Some(session_name), abort_signal)
@@ -4719,6 +4735,7 @@ impl RequestContext {
             self.auto_continue_count = 0;
             self.pending_tasks_guardrail_count = 0;
             self.todo_list = TodoList::default();
+            self.auto_continue_paused = None;
             self.rag.take();
             // Cleared alongside `rag` so the pair never disagrees: an agent RAG is
             // cached under `RagKey::Agent(<agent name>)`, and leaving that key behind

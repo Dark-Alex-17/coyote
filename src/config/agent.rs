@@ -648,6 +648,11 @@ impl Agent {
             enabled_tools: None,
         }
     }
+
+    #[cfg(test)]
+    pub fn functions_mut(&mut self) -> &mut Functions {
+        &mut self.functions
+    }
 }
 
 impl RoleLike for Agent {

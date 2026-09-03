@@ -52,7 +52,8 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     1. BEFORE marking a todo done: verify the work compiles/works. No premature completion.
     2. If a todo is broad (e.g. \"implement X and implement Y\"): break it into specific subtasks FIRST using todo__add, then work on those.\n\
     3. Each todo should be atomic and be \"single responsibility\" - completable in one focused action.
-    4. Continue with the next pending item now. Call tools immediately."
+    4. If you are blocked on user input or a user-side action: call todo__pause with the reason, ask the user, and end your turn. NEVER mark unfinished todos done just to stop this reminder.
+    5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
 static REPL_COMMANDS: LazyLock<[ReplCommand; 63]> = LazyLock::new(|| {
@@ -1409,6 +1410,7 @@ pub async fn run_repl_command(
                 handle_shell_passthrough(cmd)?;
             } else {
                 reset_continuation(ctx);
+                ctx.resume_auto_continue();
                 let input = Input::from_str(ctx, line, None)?;
                 ask(ctx, abort_signal.clone(), input, true).await?;
             }
@@ -1535,6 +1537,22 @@ async fn ask(
             ask(ctx, abort_signal, continuation_input, false).await
         } else {
             reset_continuation(ctx);
+            if let Some(reason) = ctx.auto_continue_paused.clone()
+                && ctx.todo_list.has_incomplete()
+            {
+                let remaining = ctx.todo_list.incomplete_count();
+                let color = if app.light_theme() {
+                    nu_ansi_term::Color::LightGray
+                } else {
+                    nu_ansi_term::Color::DarkGray
+                };
+                eprintln!(
+                    "\n⏸ {}",
+                    color.italic().paint(format!(
+                        "Auto-continue paused, awaiting user ({remaining} incomplete todo(s) preserved): {reason}"
+                    ))
+                );
+            }
             if ctx.maybe_autoname_session() {
                 let color = if app.light_theme() {
                     nu_ansi_term::Color::LightGray
@@ -1621,6 +1639,7 @@ fn should_continue(ctx: &RequestContext) -> bool {
         && config.enabled
         && ctx.auto_continue_count < config.max_continues
         && ctx.todo_list.has_incomplete()
+        && ctx.auto_continue_paused.is_none()
 }
 
 fn reset_continuation(ctx: &mut RequestContext) {
