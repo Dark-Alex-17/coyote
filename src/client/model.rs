@@ -65,12 +65,16 @@ impl Model {
         };
         match model_name {
             Some(model_name) => {
-                if let Some(model) = models.iter().find(|v| v.id() == model_id) {
-                    if model.model_type() == model_type {
-                        return Ok((*model).clone());
-                    } else {
-                        bail!("Model '{model_id}' is not a {model_type} model")
-                    }
+                // Ids are not unique across types (e.g. a model that is both
+                // an embedder and a reranker), so match on id AND type.
+                if let Some(model) = models
+                    .iter()
+                    .find(|v| v.id() == model_id && v.model_type() == model_type)
+                {
+                    return Ok((*model).clone());
+                }
+                if models.iter().any(|v| v.id() == model_id) {
+                    bail!("Model '{model_id}' is not a {model_type} model")
                 }
                 if list_client_names(config)
                     .into_iter()
@@ -456,6 +460,35 @@ mod tests {
         assert_eq!(model.name(), "claude-definitely-not-a-real-model");
         assert_eq!(model.model_type(), ModelType::Chat);
         assert!(model.data.require_max_tokens);
+    }
+
+    #[test]
+    fn duplicate_id_across_types_resolves_by_requested_type() {
+        // Mirrors jina:jina-colbert-v2, which is both an embedder and a
+        // reranker under the same id.
+        let claude: ClientConfig = serde_yaml::from_str(
+            "type: claude\nmodels:\n  - name: test-dual-model\n    type: embedding\n  - name: test-dual-model\n    type: reranker\n",
+        )
+        .unwrap();
+        let config = AppConfig {
+            clients: vec![claude],
+            ..AppConfig::default()
+        };
+
+        let embedder =
+            Model::retrieve_model(&config, "claude:test-dual-model", ModelType::Embedding).unwrap();
+        assert_eq!(embedder.model_type(), ModelType::Embedding);
+
+        let reranker =
+            Model::retrieve_model(&config, "claude:test-dual-model", ModelType::Reranker).unwrap();
+        assert_eq!(reranker.model_type(), ModelType::Reranker);
+
+        // An id that exists only under other types still teaches instead of
+        // silently creating a chat model from the name.
+        let err = Model::retrieve_model(&config, "claude:test-dual-model", ModelType::Chat)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a chat model"), "got: {err}");
     }
 
     #[test]

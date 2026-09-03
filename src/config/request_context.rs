@@ -5263,8 +5263,10 @@ mod tests {
         // It deliberately carries one embedding model: an empty `models` list
         // would fall back to the full embedded claude catalog and register
         // real chat models, breaking the no-chat-model invariant above.
+        // The test-dual-model pair shares one id across two types, mirroring
+        // jina:jina-colbert-v2, for the type-aware lookup tests.
         let claude: ClientConfig = serde_yaml::from_str(
-            "type: claude\nmodels:\n  - name: test-claude-embedder\n    type: embedding\n",
+            "type: claude\nmodels:\n  - name: test-claude-embedder\n    type: embedding\n  - name: test-dual-model\n    type: embedding\n  - name: test-dual-model\n    type: reranker\n",
         )
         .unwrap();
         let config = AppConfig {
