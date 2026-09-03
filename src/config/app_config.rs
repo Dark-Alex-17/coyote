@@ -640,7 +640,10 @@ impl AppConfig {
         if self.highlight && self.theme.is_none() {
             if let Some(v) = super::read_env_value::<String>(&get_env_name("theme")) {
                 self.theme = v;
-            } else if *IS_STDOUT_TERMINAL {
+            } else if !cfg!(test) && *IS_STDOUT_TERMINAL {
+                // Never query the terminal from test builds: the test harness
+                // shares the process TTY, so parallel raw-mode color queries
+                // garble the runner's output and stall on stolen replies.
                 if let Ok(color_scheme) = color_scheme(QueryOptions::default()) {
                     let theme = match color_scheme {
                         ColorScheme::Dark => "dark",
