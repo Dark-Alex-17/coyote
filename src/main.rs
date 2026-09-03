@@ -564,6 +564,7 @@ async fn start_directive(
     abort_signal: AbortSignal,
 ) -> Result<()> {
     let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
+    ctx.session_abort = Some(abort_signal.clone());
 
     if graph::active_agent_graph_name(ctx).is_some() {
         ctx.before_chat_completion(&input)?;
