@@ -52,7 +52,8 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     1. BEFORE marking a todo done: verify the work compiles/works. No premature completion.
     2. If a todo is broad (e.g. \"implement X and implement Y\"): break it into specific subtasks FIRST using todo__add, then work on those.\n\
     3. Each todo should be atomic and be \"single responsibility\" - completable in one focused action.
-    4. Continue with the next pending item now. Call tools immediately."
+    4. If you are blocked on user input or a user-side action: call todo__pause with the reason, ask the user, and end your turn. NEVER mark unfinished todos done just to stop this reminder.
+    5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
 static REPL_COMMANDS: LazyLock<[ReplCommand; 63]> = LazyLock::new(|| {
@@ -1409,6 +1410,7 @@ pub async fn run_repl_command(
                 handle_shell_passthrough(cmd)?;
             } else {
                 reset_continuation(ctx);
+                ctx.resume_auto_continue();
                 let input = Input::from_str(ctx, line, None)?;
                 ask(ctx, abort_signal.clone(), input, true).await?;
             }
@@ -1422,73 +1424,73 @@ pub async fn run_repl_command(
     Ok(false)
 }
 
-#[async_recursion::async_recursion]
 async fn ask(
     ctx: &mut RequestContext,
     abort_signal: AbortSignal,
-    mut input: Input,
+    input: Input,
     with_embeddings: bool,
 ) -> Result<()> {
-    if input.is_empty() {
-        return Ok(());
-    }
-    if with_embeddings {
-        input.use_embeddings(abort_signal.clone()).await?;
-    }
-    while ctx.is_compressing_session() {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    let app = Arc::clone(&ctx.app.config);
-
-    if graph::active_agent_graph_name(ctx).is_some() {
-        ctx.before_chat_completion(&input)?;
-        let output =
-            graph::run_active_agent_graph(ctx, &input.text(), abort_signal.clone()).await?;
-        app.print_markdown(&output)?;
-        ctx.after_chat_completion(app.as_ref(), &input, &output, &[])?;
-        return Ok(());
-    }
-
-    let client = input.create_client()?;
-    ctx.before_chat_completion(&input)?;
-    let (output, tool_results) = {
-        let result = if input.stream() {
-            call_chat_completions_streaming(&input, client.as_ref(), ctx, abort_signal.clone())
-                .await
-        } else {
-            call_chat_completions(
-                &input,
-                true,
-                false,
-                client.as_ref(),
-                ctx,
-                abort_signal.clone(),
-            )
-            .await
-        };
-        match result {
-            Ok(v) => v,
-            Err(err) => {
-                ctx.on_chat_completion_error(app.as_ref(), &input);
-                return Err(err);
-            }
+    let mut input = input;
+    let mut with_embeddings = with_embeddings;
+    loop {
+        if input.is_empty() {
+            return Ok(());
         }
-    };
-    ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
-    if !tool_results.is_empty() {
-        ask(
-            ctx,
-            abort_signal,
-            input.merge_tool_results(output, tool_results),
-            false,
-        )
-        .await
-    } else {
+        ctx.session_abort = Some(abort_signal.clone());
+        if with_embeddings {
+            input.use_embeddings(abort_signal.clone()).await?;
+            with_embeddings = false;
+        }
+        while ctx.is_compressing_session() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let app = Arc::clone(&ctx.app.config);
+
+        if graph::active_agent_graph_name(ctx).is_some() {
+            ctx.before_chat_completion(&input)?;
+            let output =
+                graph::run_active_agent_graph(ctx, &input.text(), abort_signal.clone()).await?;
+            app.print_markdown(&output)?;
+            ctx.after_chat_completion(app.as_ref(), &input, &output, &[])?;
+            return Ok(());
+        }
+
+        let client = input.create_client()?;
+        ctx.before_chat_completion(&input)?;
+        let (output, tool_results) = {
+            let result = if input.stream() {
+                call_chat_completions_streaming(&input, client.as_ref(), ctx, abort_signal.clone())
+                    .await
+            } else {
+                call_chat_completions(
+                    &input,
+                    true,
+                    false,
+                    client.as_ref(),
+                    ctx,
+                    abort_signal.clone(),
+                )
+                .await
+            };
+            match result {
+                Ok(v) => v,
+                Err(err) => {
+                    ctx.on_chat_completion_error(app.as_ref(), &input);
+                    return Err(err);
+                }
+            }
+        };
+        ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
+        if !tool_results.is_empty() {
+            input = input.merge_tool_results(output, tool_results);
+            continue;
+        }
+
         match check_pending_tasks_guardrail(ctx) {
             GuardrailAction::Inject(prompt) => {
-                let guardrail_input = Input::from_str(ctx, &prompt, None)?;
-                return ask(ctx, abort_signal, guardrail_input, false).await;
+                input = Input::from_str(ctx, &prompt, None)?;
+                continue;
             }
             GuardrailAction::ForceTerminate(ids) => {
                 warn!(
@@ -1530,87 +1532,103 @@ async fn ask(
 
                 format!("{prompt}\n\n{todo_state}")
             };
-            let continuation_input = Input::from_str(ctx, &full_prompt, None)?;
-            ask(ctx, abort_signal, continuation_input, false).await
-        } else {
-            reset_continuation(ctx);
-            if ctx.maybe_autoname_session() {
-                let color = if app.light_theme() {
-                    nu_ansi_term::Color::LightGray
-                } else {
-                    nu_ansi_term::Color::DarkGray
-                };
-                eprintln!("\n📢 {}", color.italic().paint("Autonaming the session."),);
-                if let Err(err) = ctx.autoname_session(app.as_ref()).await {
-                    warn!("Failed to autonaming the session: {err}");
-                }
-                if let Some(session) = ctx.session.as_mut() {
-                    session.set_autonaming(false);
-                }
-            }
-
-            let needs_compression = ctx
-                .session
-                .as_ref()
-                .is_some_and(|s| s.needs_compression(app.compression_threshold));
-
-            if needs_compression {
-                let agent_can_continue_after_compress =
-                    should_continue(ctx) && !abort_signal.aborted_ctrlc();
-
-                if let Some(session) = ctx.session.as_mut() {
-                    session.set_compressing(true);
-                }
-
-                let color = if app.light_theme() {
-                    nu_ansi_term::Color::LightGray
-                } else {
-                    nu_ansi_term::Color::DarkGray
-                };
-                eprintln!("\n📢 {}", color.italic().paint("Compressing the session."),);
-
-                if let Err(err) = ctx.compress_session().await {
-                    warn!("Failed to compress the session: {err}");
-                }
-                if let Some(session) = ctx.session.as_mut() {
-                    session.set_compressing(false);
-                }
-
-                if agent_can_continue_after_compress {
-                    let full_prompt = {
-                        let config = ctx.auto_continue_config();
-                        let todo_state = ctx.todo_list.render_for_model();
-                        let remaining = ctx.todo_list.incomplete_count();
-                        ctx.increment_auto_continue_count();
-                        let count = ctx.auto_continue_count;
-                        let max = config.max_continues;
-
-                        let prompt = config
-                            .continuation_prompt
-                            .as_deref()
-                            .unwrap_or(DEFAULT_CONTINUATION_PROMPT);
-
-                        let color = if app.light_theme() {
-                            nu_ansi_term::Color::LightGray
-                        } else {
-                            nu_ansi_term::Color::DarkGray
-                        };
-                        eprintln!(
-                            "\n📋 {}",
-                            color.italic().paint(format!(
-                                "Auto-continuing after compression ({count}/{max}): {remaining} incomplete todo(s) remain"
-                            ))
-                        );
-
-                        format!("{prompt}\n\n{todo_state}")
-                    };
-                    let continuation_input = Input::from_str(ctx, &full_prompt, None)?;
-                    return ask(ctx, abort_signal, continuation_input, false).await;
-                }
-            }
-
-            Ok(())
+            input = Input::from_str(ctx, &full_prompt, None)?;
+            continue;
         }
+
+        reset_continuation(ctx);
+        if let Some(reason) = ctx.auto_continue_paused.clone()
+            && ctx.todo_list.has_incomplete()
+        {
+            let remaining = ctx.todo_list.incomplete_count();
+            let color = if app.light_theme() {
+                nu_ansi_term::Color::LightGray
+            } else {
+                nu_ansi_term::Color::DarkGray
+            };
+            eprintln!(
+                "\n⏸ {}",
+                color.italic().paint(format!(
+                    "Auto-continue paused, awaiting user ({remaining} incomplete todo(s) preserved): {reason}"
+                ))
+            );
+        }
+        if ctx.maybe_autoname_session() {
+            let color = if app.light_theme() {
+                nu_ansi_term::Color::LightGray
+            } else {
+                nu_ansi_term::Color::DarkGray
+            };
+            eprintln!("\n📢 {}", color.italic().paint("Autonaming the session."),);
+            if let Err(err) = ctx.autoname_session(app.as_ref()).await {
+                warn!("Failed to autonaming the session: {err}");
+            }
+            if let Some(session) = ctx.session.as_mut() {
+                session.set_autonaming(false);
+            }
+        }
+
+        let needs_compression = ctx
+            .session
+            .as_ref()
+            .is_some_and(|s| s.needs_compression(app.compression_threshold));
+
+        if needs_compression {
+            let agent_can_continue_after_compress =
+                should_continue(ctx) && !abort_signal.aborted_ctrlc();
+
+            if let Some(session) = ctx.session.as_mut() {
+                session.set_compressing(true);
+            }
+
+            let color = if app.light_theme() {
+                nu_ansi_term::Color::LightGray
+            } else {
+                nu_ansi_term::Color::DarkGray
+            };
+            eprintln!("\n📢 {}", color.italic().paint("Compressing the session."),);
+
+            if let Err(err) = ctx.compress_session().await {
+                warn!("Failed to compress the session: {err}");
+            }
+            if let Some(session) = ctx.session.as_mut() {
+                session.set_compressing(false);
+            }
+
+            if agent_can_continue_after_compress {
+                let full_prompt = {
+                    let config = ctx.auto_continue_config();
+                    let todo_state = ctx.todo_list.render_for_model();
+                    let remaining = ctx.todo_list.incomplete_count();
+                    ctx.increment_auto_continue_count();
+                    let count = ctx.auto_continue_count;
+                    let max = config.max_continues;
+
+                    let prompt = config
+                        .continuation_prompt
+                        .as_deref()
+                        .unwrap_or(DEFAULT_CONTINUATION_PROMPT);
+
+                    let color = if app.light_theme() {
+                        nu_ansi_term::Color::LightGray
+                    } else {
+                        nu_ansi_term::Color::DarkGray
+                    };
+                    eprintln!(
+                        "\n📋 {}",
+                        color.italic().paint(format!(
+                            "Auto-continuing after compression ({count}/{max}): {remaining} incomplete todo(s) remain"
+                        ))
+                    );
+
+                    format!("{prompt}\n\n{todo_state}")
+                };
+                input = Input::from_str(ctx, &full_prompt, None)?;
+                continue;
+            }
+        }
+
+        return Ok(());
     }
 }
 
@@ -1620,6 +1638,7 @@ fn should_continue(ctx: &RequestContext) -> bool {
         && config.enabled
         && ctx.auto_continue_count < config.max_continues
         && ctx.todo_list.has_incomplete()
+        && ctx.auto_continue_paused.is_none()
 }
 
 fn reset_continuation(ctx: &mut RequestContext) {

@@ -336,7 +336,10 @@ pub struct RequestContext {
     pub todo_list: TodoList,
     pub skill_registry: SkillRegistry,
     pub last_continuation_response: Option<String>,
+    pub auto_continue_paused: Option<String>,
     pub pending_prefill: Option<String>,
+
+    pub session_abort: Option<AbortSignal>,
 
     pub render_mode: RenderMode,
 }
@@ -374,7 +377,9 @@ impl RequestContext {
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
+            auto_continue_paused: None,
             pending_prefill: None,
+            session_abort: None,
             render_mode: RenderMode::default(),
         }
     }
@@ -438,7 +443,9 @@ impl RequestContext {
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
+            auto_continue_paused: None,
             pending_prefill: None,
+            session_abort: None,
             render_mode: RenderMode::default(),
         };
         ctx.refresh_mcp_tool_filters();
@@ -491,7 +498,9 @@ impl RequestContext {
             todo_list: self.todo_list.clone(),
             skill_registry: self.skill_registry.clone(),
             last_continuation_response: None,
+            auto_continue_paused: self.auto_continue_paused.clone(),
             pending_prefill: None,
+            session_abort: self.session_abort.clone(),
             render_mode: self.render_mode,
         }
     }
@@ -540,7 +549,9 @@ impl RequestContext {
             todo_list: TodoList::default(),
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
+            auto_continue_paused: None,
             pending_prefill: None,
+            session_abort: None,
             render_mode: parent.render_mode,
         }
     }
@@ -576,6 +587,7 @@ impl RequestContext {
 
     pub fn init_todo_list(&mut self, goal: &str) {
         self.todo_list = TodoList::new(goal);
+        self.auto_continue_paused = None;
     }
 
     pub fn add_todo(&mut self, task: &str) -> usize {
@@ -589,10 +601,19 @@ impl RequestContext {
     pub fn clear_todo_list(&mut self) {
         self.todo_list.clear();
         self.auto_continue_count = 0;
+        self.auto_continue_paused = None;
     }
 
     pub fn increment_auto_continue_count(&mut self) {
         self.auto_continue_count += 1;
+    }
+
+    pub fn pause_auto_continue(&mut self, reason: &str) {
+        self.auto_continue_paused = Some(reason.to_string());
+    }
+
+    pub fn resume_auto_continue(&mut self) {
+        self.auto_continue_paused = None;
     }
 
     pub fn reset_continuation_count(&mut self) {
@@ -4670,6 +4691,7 @@ impl RequestContext {
         self.current_depth = 0;
         self.auto_continue_count = 0;
         self.todo_list = TodoList::default();
+        self.auto_continue_paused = None;
 
         if let Some(session_name) = session_name.as_deref() {
             self.use_session(app, Some(session_name), abort_signal)
@@ -4713,6 +4735,7 @@ impl RequestContext {
             self.auto_continue_count = 0;
             self.pending_tasks_guardrail_count = 0;
             self.todo_list = TodoList::default();
+            self.auto_continue_paused = None;
             self.rag.take();
             // Cleared alongside `rag` so the pair never disagrees: an agent RAG is
             // cached under `RagKey::Agent(<agent name>)`, and leaving that key behind
@@ -5232,7 +5255,7 @@ mod tests {
     // with an empty client list, which would permanently pin every later
     // model lookup in this process to "unknown model" and make any test that
     // needs a resolvable model dependent on test ordering. Seed the caches
-    // before any test runs with one client, "test-seeded", exposing a single
+    // before any test runs with a client, "test-seeded", exposing a single
     // embedding model. Deliberately NO chat model: some tests assert that no
     // chat model is available, and chat lookups don't need one — a
     // "test-seeded:<anything>" chat id resolves through the create-from-name
@@ -5252,8 +5275,19 @@ mod tests {
             embedder.model_type = "embedding".to_string();
             config.models = vec![embedder];
         }
+        // A claude client is seeded alongside it so tests can exercise
+        // provider-quirk inheritance through the create-from-name fallback.
+        // It deliberately carries one embedding model: an empty `models` list
+        // would fall back to the full embedded claude catalog and register
+        // real chat models, breaking the no-chat-model invariant above.
+        // The test-dual-model pair shares one id across two types, mirroring
+        // jina:jina-colbert-v2, for the type-aware lookup tests.
+        let claude: ClientConfig = serde_yaml::from_str(
+            "type: claude\nmodels:\n  - name: test-claude-embedder\n    type: embedding\n  - name: test-dual-model\n    type: embedding\n  - name: test-dual-model\n    type: reranker\n",
+        )
+        .unwrap();
         let config = AppConfig {
-            clients: vec![client],
+            clients: vec![client, claude],
             ..AppConfig::default()
         };
         let _ = list_client_names(&config);

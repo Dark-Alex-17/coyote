@@ -63,11 +63,14 @@ pub(in crate::config) const DEFAULT_TODO_INSTRUCTIONS: &str = indoc! {"
         - `todo__done`: Mark a task done by id. Call this immediately after completing each step.
         - `todo__list`: Show the current todo list.
         - `todo__clear`: Clear the entire todo list and reset the goal. Use when the user cancels or changes direction.
+        - `todo__pause`: Pause auto-continue and yield the turn to the user, keeping incomplete todos intact. Use when you are blocked on user input or a user-side action. Auto-continue resumes on the user's next message.
 
     RULES:
         - Always create a todo list before starting work.
         - Mark each task done as soon as you finish it; do not batch.
         - If the user cancels the current task or changes direction, call `todo__clear` immediately.
+        - If you need user input (or the user must do something on their end) before you can continue, call `todo__pause` with the reason, ask the user, and end your turn. NEVER mark unfinished todos done just to stop the auto-continue prompts.
+        - `todo__pause` is for top-level sessions only. Subagents are driven to completion autonomously and cannot pause. If you are a subagent and need input, use a `user__*` tool (it escalates to the root agent mid-turn and blocks until answered, so you keep working without ending your turn).
         - If you stop with incomplete tasks, the system will automatically prompt you to continue."
 };
 

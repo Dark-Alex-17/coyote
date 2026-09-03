@@ -16,7 +16,9 @@ use crate::mcp::{
 };
 use crate::supervisor::notification::job_notification;
 use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor};
-use crate::utils::{create_abort_signal, muted_warning_text, temp_file, wait_abort_signal};
+use crate::utils::{
+    create_abort_signal, muted_warning_text, temp_file, wait_abort_signal, wait_user_interrupt,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
@@ -623,6 +625,14 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
         job.abort_signal.clone()
     };
 
+    let interrupted = || {
+        json!({
+            "status": "interrupted",
+            "id": id,
+            "message": format!("job__collect was interrupted by the user; job '{id}' is still running in the background. Collect it again later, cancel it with job__cancel, or continue with other work."),
+        })
+    };
+
     loop {
         let is_finished = {
             let sup = supervisor.read();
@@ -631,6 +641,10 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
 
         if is_finished {
             break;
+        }
+
+        if ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
+            return Ok(interrupted());
         }
 
         if let Some(queue) = ctx.root_escalation_queue()
@@ -666,6 +680,9 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
         tokio::select! {
             _ = time::sleep(Duration::from_millis(200)) => {}
             _ = wait_abort_signal(&target_abort) => {}
+            _ = wait_user_interrupt(ctx.session_abort.as_ref()) => {
+                return Ok(interrupted());
+            }
         }
     }
 
@@ -2137,6 +2154,74 @@ mod tests {
             assert_eq!(result["status"], "completed");
             assert_eq!(result["result"], "l2\nl3");
             assert_eq!(result["result_truncated"], true);
+        });
+    }
+
+    #[test]
+    fn handle_collect_session_interrupt_returns_and_keeps_job() {
+        run_async(async {
+            let mut ctx = ctx_with_job_supervisor(4);
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let task_state = Arc::clone(&state);
+            let join_handle = tokio::spawn(async move {
+                let _ = rx.await;
+                task_state.lock().status = JobStatus::Completed;
+                Ok(JobResult {
+                    output: json!("late result"),
+                    exit_code: Some(0),
+                    output_bytes_captured: 0,
+                })
+            });
+            let handle = JobHandle {
+                id: "j1".to_string(),
+                tool: "execute_command".to_string(),
+                started_at: Instant::now(),
+                join_handle,
+                abort_signal: create_abort_signal(),
+                state,
+                output_buf: Arc::new(Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+                last_check_state: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            let session = create_abort_signal();
+            session.set_ctrlc();
+            ctx.session_abort = Some(session.clone());
+
+            let result = time::timeout(
+                Duration::from_secs(2),
+                handle_collect(&ctx, &json!({"id": "j1"})),
+            )
+            .await
+            .expect("interrupted collect must return promptly")
+            .unwrap();
+
+            assert_eq!(result["status"], "interrupted");
+            assert_eq!(result["id"], "j1");
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("still running")
+            );
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_job("j1"));
+
+            session.reset();
+            tx.send(()).unwrap();
+
+            let collected = handle_collect(&ctx, &json!({"id": "j1"})).await.unwrap();
+            assert_eq!(collected["status"], "completed");
+            assert_eq!(collected["result"], "late result");
         });
     }
 

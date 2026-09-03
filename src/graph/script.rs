@@ -262,13 +262,16 @@ echo '{"quality": 0.85, "issues": 3, "_next": "approve"}'
 
     #[tokio::test]
     async fn bash_script_can_read_state_from_env() {
-        if !cmd_available("bash") || !cmd_available("python3") {
-            eprintln!("skipping: bash or python3 not available");
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
             return;
         }
+        // Pure-bash JSON extraction: spawning python3 here blew tight
+        // timeouts on Windows CI (first-start AV scans of the interpreter).
         let (dir, path) = write_script(
             r#"#!/bin/bash
-NAME=$(python3 -c 'import json,os; print(json.loads(os.environ["GRAPH_STATE"])["name"])')
+t=${GRAPH_STATE#*'"name":"'}
+NAME=${t%%'"'*}
 printf '{"greeting": "hello %s"}' "$NAME"
 "#,
             "sh",
@@ -280,7 +283,7 @@ printf '{"greeting": "hello %s"}' "$NAME"
 
         let _ = executor
             .execute(
-                &node_for(path.file_name().unwrap().to_str().unwrap(), 5),
+                &node_for(path.file_name().unwrap().to_str().unwrap(), 30),
                 &mut state,
             )
             .await
@@ -466,7 +469,7 @@ echo '{"ok":true}'
 
     #[tokio::test]
     async fn large_state_is_delivered_via_file_env_var() {
-        if !cmd_available("bash") || !cmd_available("python3") {
+        if !cmd_available("bash") {
             return;
         }
         let big = "x".repeat(MAX_STATE_SIZE_BYTES + 1024);
@@ -476,7 +479,10 @@ echo '{"ok":true}'
         let (dir, path) = write_script(
             r#"#!/bin/bash
 if [ -n "$GRAPH_STATE_FILE" ]; then
-    LEN=$(python3 -c 'import json,os; print(len(json.load(open(os.environ["GRAPH_STATE_FILE"]))["blob"]))')
+    CONTENT=$(cat "$GRAPH_STATE_FILE")
+    t=${CONTENT#*'"blob":"'}
+    BLOB=${t%%'"'*}
+    LEN=${#BLOB}
     printf '{"blob_len": %s, "via_file": true}' "$LEN"
 elif [ -n "$GRAPH_STATE" ]; then
     echo '{"via_file": false}'
@@ -489,7 +495,7 @@ fi
         let executor = ScriptExecutor::new(&dir);
         executor
             .execute(
-                &node_for(path.file_name().unwrap().to_str().unwrap(), 10),
+                &node_for(path.file_name().unwrap().to_str().unwrap(), 30),
                 &mut state,
             )
             .await
@@ -524,7 +530,7 @@ print(json.dumps({
         let executor = ScriptExecutor::new(&dir);
         let next = executor
             .execute(
-                &node_for(path.file_name().unwrap().to_str().unwrap(), 5),
+                &node_for(path.file_name().unwrap().to_str().unwrap(), 60),
                 &mut state,
             )
             .await

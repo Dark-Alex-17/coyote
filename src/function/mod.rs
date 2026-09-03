@@ -727,6 +727,10 @@ impl Functions {
             .retain(|f| !f.name.starts_with(TODO_FUNCTION_PREFIX));
     }
 
+    pub fn remove_function(&mut self, name: &str) {
+        self.declarations.retain(|f| f.name != name);
+    }
+
     pub fn append_memory_functions(&mut self) {
         self.declarations
             .extend(memory::memory_function_declarations());
@@ -3371,6 +3375,7 @@ mod tests {
         assert!(f.contains("todo__done"));
         assert!(f.contains("todo__list"));
         assert!(f.contains("todo__clear"));
+        assert!(f.contains("todo__pause"));
     }
 
     #[test]
@@ -4912,6 +4917,79 @@ mod tests {
         let err = out["tool_call_error"].as_str().unwrap();
         assert!(err.starts_with("Todo tool failed"), "{err}");
         assert!(err.contains("Auto-continue is not enabled"), "{err}");
+    }
+
+    #[test]
+    fn todo_pause_sets_and_clears_pause_flag() {
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                auto_continue: true,
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.tool_scope.functions.append_todo_functions();
+
+        // A blank reason is rejected and does not pause.
+        let out = run_async(call_with_args("todo__pause", json!({"reason": "   "})).eval(&mut ctx))
+            .unwrap();
+        assert_eq!(out["error"], "reason is required");
+        assert!(ctx.auto_continue_paused.is_none());
+
+        // A real reason pauses auto-continue, preserving the todo list.
+        run_async(call_with_args("todo__init", json!({"goal": "ship"})).eval(&mut ctx)).unwrap();
+        run_async(call_with_args("todo__add", json!({"task": "deploy"})).eval(&mut ctx)).unwrap();
+        let out = run_async(
+            call_with_args("todo__pause", json!({"reason": "need prod API key"})).eval(&mut ctx),
+        )
+        .unwrap();
+        assert_eq!(out["status"], "ok");
+        assert_eq!(
+            ctx.auto_continue_paused.as_deref(),
+            Some("need prod API key")
+        );
+        assert!(ctx.todo_list.has_incomplete());
+
+        // The next real user message lifts the pause.
+        ctx.resume_auto_continue();
+        assert!(ctx.auto_continue_paused.is_none());
+
+        // Re-initializing or clearing the list also lifts a stale pause.
+        ctx.pause_auto_continue("stale");
+        run_async(call_with_args("todo__init", json!({"goal": "new"})).eval(&mut ctx)).unwrap();
+        assert!(ctx.auto_continue_paused.is_none());
+        ctx.pause_auto_continue("stale again");
+        run_async(call_with_args("todo__clear", json!({})).eval(&mut ctx)).unwrap();
+        assert!(ctx.auto_continue_paused.is_none());
+    }
+
+    /// Subagents are driven to completion autonomously: their turn boundary
+    /// has no interactive user, and user__* escalations work mid-turn, so
+    /// pausing is never the right move for a child. The handler must reject
+    /// the call, leave the pause flag unset, and redirect to escalation.
+    #[test]
+    fn todo_pause_is_rejected_for_subagents() {
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                auto_continue: true,
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.tool_scope.functions.append_todo_functions();
+        ctx.self_agent_id = Some("agent_sisyphus_abc123".to_string());
+
+        let out = run_async(
+            call_with_args("todo__pause", json!({"reason": "need user input"})).eval(&mut ctx),
+        )
+        .unwrap();
+
+        let err = out["error"].as_str().unwrap();
+        assert!(err.contains("unavailable to subagents"), "{err}");
+        assert!(err.contains("user__"), "{err}");
+        assert!(ctx.auto_continue_paused.is_none());
     }
 
     #[test]

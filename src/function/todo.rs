@@ -86,6 +86,33 @@ pub fn todo_function_declarations() -> Vec<FunctionDeclaration> {
             },
             agent: false,
         },
+        FunctionDeclaration {
+            name: format!("{TODO_FUNCTION_PREFIX}pause"),
+            description: "Pause auto-continue and yield the turn back to the user while keeping \
+                          incomplete todos intact. Use when you cannot proceed without user input \
+                          or a user-side action. NEVER mark unfinished todos as done just to stop \
+                          auto-continuation. Auto-continue resumes automatically on the user's \
+                          next message. Unavailable to subagents: they are driven to completion \
+                          autonomously — a subagent needing input must use a user__* tool, which \
+                          escalates to the root agent mid-turn and blocks until answered."
+                .to_string(),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
+                properties: Some(IndexMap::from([(
+                    "reason".to_string(),
+                    JsonSchema {
+                        type_value: Some("string".to_string()),
+                        description: Some(
+                            "What you are waiting on from the user (shown to the user)".into(),
+                        ),
+                        ..Default::default()
+                    },
+                )])),
+                required: Some(vec!["reason".to_string()]),
+                ..Default::default()
+            },
+            agent: false,
+        },
     ]
 }
 
@@ -148,6 +175,38 @@ pub fn handle_todo_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) 
         "clear" => {
             ctx.clear_todo_list();
             Ok(json!({"status": "ok", "message": "Todo list cleared"}))
+        }
+        "pause" => {
+            if ctx.self_agent_id.is_some() {
+                return Ok(json!({
+                    "error": "todo__pause is unavailable to subagents: you are driven to \
+                              completion autonomously and there is no interactive user at your \
+                              turn boundary. If you need input, ask via a user__* tool — it \
+                              escalates to the root agent mid-turn and blocks until answered, so \
+                              you can keep working. If you are blocked on an action outside your \
+                              scope, finish what you can and report the blocker in your final \
+                              output."
+                }));
+            }
+
+            let reason = args
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if reason.is_empty() {
+                return Ok(json!({"error": "reason is required"}));
+            }
+
+            ctx.pause_auto_continue(&reason);
+
+            Ok(json!({
+                "status": "ok",
+                "message": "Auto-continue paused; incomplete todos are preserved. Tell the user \
+                            what you need from them, then end your turn. Auto-continue resumes \
+                            on their next message."
+            }))
         }
         _ => bail!("Unknown todo action: {action}"),
     }
