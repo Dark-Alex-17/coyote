@@ -69,8 +69,9 @@ pub use self::tool_scope::{
 };
 pub use self::update::run_self_update;
 use crate::client::{
-    self, ClientConfig, MessageContentToolCalls, Model, ModelType, OPENAI_COMPATIBLE_PROVIDERS,
-    ProviderModels, create_client_config, list_client_types, oauth, set_client_models_config,
+    self, ClientConfig, MODELS_YAML, MessageContentToolCalls, Model, ModelType,
+    OPENAI_COMPATIBLE_PROVIDERS, ProviderModels, catalog, create_client_config, list_client_types,
+    oauth, set_client_models_config,
 };
 use crate::function::{FunctionDeclaration, Functions};
 use crate::rag::Rag;
@@ -93,12 +94,13 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::{
-    env,
+    env, fs,
     fs::{File, create_dir_all, read_dir, read_to_string},
     io::Write,
     path::{Path, PathBuf},
     process,
     sync::{Arc, OnceLock},
+    time::SystemTime,
 };
 
 pub const TEMP_ROLE_NAME: &str = "temp";
@@ -186,9 +188,6 @@ const GIT_DIR_NAME: &str = ".git";
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
 
 const CLIENTS_FIELD: &str = "clients";
-
-const SYNC_MODELS_URL: &str =
-    "https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/models.yaml";
 
 const SUMMARIZATION_PROMPT: &str =
     "Summarize the discussion briefly in 200 words or less to use as a prompt for future context.";
@@ -287,6 +286,8 @@ pub struct Config {
     pub user_agent: Option<String>,
     pub save_shell_history: bool,
     pub sync_models_url: Option<String>,
+    pub sync_models_auto: bool,
+    pub sync_models_ttl_hours: u64,
 
     pub clients: Vec<ClientConfig>,
 }
@@ -370,6 +371,8 @@ impl Default for Config {
             user_agent: None,
             save_shell_history: true,
             sync_models_url: None,
+            sync_models_auto: true,
+            sync_models_ttl_hours: 24,
 
             clients: vec![],
         }
@@ -513,26 +516,163 @@ pub fn list_sessions() -> Vec<String> {
     list_file_names(default_sessions_dir(), ".yaml")
 }
 
-pub async fn sync_models(url: &str, abort_signal: AbortSignal) -> Result<()> {
-    let content = abortable_run_with_spinner(fetch(url), "Fetching models.yaml", abort_signal)
-        .await
-        .with_context(|| format!("Failed to fetch '{url}'"))?;
-    println!("✓ Fetched '{url}'");
-    let list = serde_yaml::from_str::<Vec<ProviderModels>>(&content)
-        .with_context(|| "Failed to parse models.yaml")?;
+/// Refreshes the models override. With a URL, mirrors a full models.yaml from
+/// it; without one, rebuilds the catalog from the live models.dev + OpenRouter
+/// APIs merged with the embedded quirks.
+pub async fn sync_models(url: Option<&str>, abort_signal: AbortSignal) -> Result<()> {
+    let list = match url {
+        Some(url) => {
+            let content =
+                abortable_run_with_spinner(fetch(url), "Fetching models.yaml", abort_signal)
+                    .await
+                    .with_context(|| format!("Failed to fetch '{url}'"))?;
+            println!("✓ Fetched '{url}'");
+            parse_mirrored_models(&content)?
+        }
+        None => {
+            let sources = abortable_run_with_spinner(
+                async { Ok(catalog::fetch_sources().await) },
+                "Fetching model data",
+                abort_signal,
+            )
+            .await?;
+            let (list, warnings) = build_refreshed_catalog(&sources)?;
+            for warning in &warnings {
+                println!("{} {warning}", warning_text("WARNING:"));
+            }
+            list
+        }
+    };
+    let model_override_path = write_models_override(list)?;
+    println!("✓ Updated '{}'", model_override_path.display());
+    Ok(())
+}
+
+pub async fn sync_models_quiet(url: Option<&str>) -> Result<()> {
+    let list = match url {
+        Some(url) => {
+            let content = fetch(url)
+                .await
+                .with_context(|| format!("Failed to fetch '{url}'"))?;
+            parse_mirrored_models(&content)?
+        }
+        None => {
+            let sources = catalog::fetch_sources().await;
+            let (list, warnings) = build_refreshed_catalog(&sources)?;
+            for warning in warnings {
+                debug!("{warning}");
+            }
+            list
+        }
+    };
+    write_models_override(list)?;
+    Ok(())
+}
+
+fn parse_mirrored_models(content: &str) -> Result<Vec<ProviderModels>> {
+    serde_yaml::from_str::<Vec<ProviderModels>>(content)
+        .with_context(|| "Failed to parse models.yaml")
+}
+
+fn build_refreshed_catalog(
+    sources: &catalog::FetchedSources,
+) -> Result<(Vec<ProviderModels>, Vec<String>)> {
+    if sources.modelsdev.is_none() && sources.openrouter.is_none() {
+        bail!("Failed to fetch model data from both models.dev and OpenRouter");
+    }
+    let mut warnings = Vec::new();
+    if sources.modelsdev.is_none() {
+        warnings.push("Failed to fetch models.dev; continuing with OpenRouter data only".into());
+    }
+    if sources.openrouter.is_none() {
+        warnings.push("Failed to fetch OpenRouter; continuing with models.dev data only".into());
+    }
+
+    let mut build = catalog::build_catalog(sources, &catalog::ALL_QUIRKS);
+    if !build.degraded.is_empty() {
+        warnings.push(format!(
+            "No live API data for: {}; keeping their embedded models",
+            build.degraded.join(", ")
+        ));
+    }
+    if !build.failed.is_empty() {
+        warnings.push(format!(
+            "No models resolved for: {}; keeping their embedded models",
+            build.failed.join(", ")
+        ));
+    }
+
+    let embedded = serde_yaml::from_str::<Vec<ProviderModels>>(MODELS_YAML)
+        .with_context(|| "Failed to parse the embedded models.yaml")?;
+    catalog::backfill_embedded_floor(&mut build, &embedded);
+
+    if build.providers.is_empty() {
+        bail!("Model sync produced no providers");
+    }
+
+    Ok((build.providers, warnings))
+}
+
+fn write_models_override(list: Vec<ProviderModels>) -> Result<PathBuf> {
     let models_override = ModelsOverride {
         version: env!("CARGO_PKG_VERSION").to_string(),
         list,
     };
-    let models_override_data =
-        serde_yaml::to_string(&models_override).with_context(|| "Failed to serde {}")?;
+    let models_override_data = serde_yaml::to_string(&models_override)
+        .with_context(|| "Failed to serialize the models override")?;
 
     let model_override_path = paths::models_override_file();
     ensure_parent_exists(&model_override_path)?;
-    std::fs::write(&model_override_path, models_override_data)
-        .with_context(|| format!("Failed to write to '{}'", model_override_path.display()))?;
-    println!("✓ Updated '{}'", model_override_path.display());
-    Ok(())
+    // Write through a sibling temp file and rename it over the target so an
+    // interrupted write can never leave a truncated override behind. The temp
+    // name embeds the pid so concurrent coyote processes (auto-refresh racing
+    // a manual --sync-models) never interleave writes into the same file.
+    let mut tmp_name = model_override_path.as_os_str().to_os_string();
+    tmp_name.push(format!(".{}.tmp", process::id()));
+    let tmp_path = PathBuf::from(tmp_name);
+    fs::write(&tmp_path, models_override_data)
+        .with_context(|| format!("Failed to write to '{}'", tmp_path.display()))?;
+    if let Err(error) = fs::rename(&tmp_path, &model_override_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error)
+            .with_context(|| format!("Failed to write to '{}'", model_override_path.display()));
+    }
+    Ok(model_override_path)
+}
+
+fn models_override_is_stale(loadable: bool, mtime: Option<SystemTime>, ttl_hours: u64) -> bool {
+    if !loadable {
+        return true;
+    }
+    let Some(mtime) = mtime else {
+        return true;
+    };
+    match SystemTime::now().duration_since(mtime) {
+        Ok(age) => age.as_secs() > ttl_hours.saturating_mul(3600),
+        Err(_) => false,
+    }
+}
+
+pub fn maybe_spawn_models_refresh(app: &AppConfig) {
+    if !app.sync_models_auto || app.dry_run {
+        return;
+    }
+    let ttl_hours = app.sync_models_ttl_hours;
+    let url = app.sync_models_url.clone();
+    tokio::spawn(async move {
+        // The loadable probe deserializes the whole override catalog; keep it
+        // off the startup path.
+        let loadable = paths::local_models_override().is_ok();
+        let mtime = fs::metadata(paths::models_override_file())
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        if !models_override_is_stale(loadable, mtime, ttl_hours) {
+            return;
+        }
+        if let Err(err) = sync_models_quiet(url.as_deref()).await {
+            debug!("Background models refresh failed: {err}");
+        }
+    });
 }
 
 impl Config {
@@ -890,13 +1030,13 @@ fn render_config_template_from(
 
 fn write_config_file(config_path: &Path, config_data: &str) -> Result<()> {
     ensure_parent_exists(config_path)?;
-    std::fs::write(config_path, config_data)
+    fs::write(config_path, config_data)
         .with_context(|| format!("Failed to write to '{}'", config_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::prelude::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(config_path, perms)?;
+        let perms = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(config_path, perms)?;
     }
 
     println!("✓ Saved the config file to '{}'.\n", config_path.display());
@@ -1380,5 +1520,103 @@ clients:
             raw.contains("{{ANTHROPIC_API_KEY}}"),
             "placeholder should be preserved as a literal string in sandbox mode"
         );
+    }
+
+    #[test]
+    fn unloadable_override_is_stale() {
+        assert!(models_override_is_stale(false, Some(SystemTime::now()), 24));
+        assert!(models_override_is_stale(false, None, 24));
+    }
+
+    #[test]
+    fn unreadable_mtime_is_stale() {
+        assert!(models_override_is_stale(true, None, 24));
+    }
+
+    #[test]
+    fn fresh_loadable_override_is_not_stale() {
+        assert!(!models_override_is_stale(true, Some(SystemTime::now()), 24));
+    }
+
+    #[test]
+    fn ttl_boundary_controls_staleness() {
+        let ttl_hours = 24;
+        let ttl = std::time::Duration::from_secs(ttl_hours * 3600);
+        let margin = std::time::Duration::from_secs(300);
+        let just_fresh = SystemTime::now() - (ttl - margin);
+        let just_stale = SystemTime::now() - (ttl + margin);
+
+        assert!(!models_override_is_stale(true, Some(just_fresh), ttl_hours));
+        assert!(models_override_is_stale(true, Some(just_stale), ttl_hours));
+    }
+
+    #[test]
+    fn future_mtime_is_not_stale() {
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+
+        assert!(!models_override_is_stale(true, Some(future), 24));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn models_override_loading_and_atomic_write() {
+        use std::fs;
+
+        let unique = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_dir = env::temp_dir().join(format!("coyote-models-override-{unique}"));
+        create_dir_all(&tmp_dir).unwrap();
+
+        let env_name = get_env_name("config_dir");
+        let prev = env::var_os(&env_name);
+        unsafe { env::set_var(&env_name, &tmp_dir) };
+
+        let result = std::panic::catch_unwind(|| {
+            let path = paths::models_override_file();
+            let entry = || ProviderModels {
+                provider: "openai".into(),
+                oauth: None,
+                models: vec![client::ModelData::new("gpt-test")],
+            };
+
+            // Missing override is unloadable.
+            assert!(paths::local_models_override().is_err());
+
+            // Corrupt override is unloadable.
+            fs::write(&path, "not: [valid").unwrap();
+            assert!(paths::local_models_override().is_err());
+
+            // Version-mismatched override is unloadable.
+            let mismatched = ModelsOverride {
+                version: "0.0.0".into(),
+                list: vec![entry()],
+            };
+            fs::write(&path, serde_yaml::to_string(&mismatched).unwrap()).unwrap();
+            assert!(paths::local_models_override().is_err());
+
+            // write_models_override goes through the sibling temp file and
+            // leaves a loadable override behind.
+            let written = write_models_override(vec![entry()]).unwrap();
+            assert_eq!(written, path);
+            let mut tmp_name = path.as_os_str().to_os_string();
+            tmp_name.push(format!(".{}.tmp", std::process::id()));
+            assert!(!PathBuf::from(tmp_name).exists());
+            let loaded = paths::local_models_override().unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].provider, "openai");
+        });
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

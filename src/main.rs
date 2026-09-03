@@ -20,13 +20,14 @@ extern crate log;
 
 use crate::cli::Cli;
 use crate::client::{
-    ModelType, call_chat_completions, call_chat_completions_streaming, list_models, oauth,
+    ModelType, call_chat_completions, call_chat_completions_streaming, catalog, list_models, oauth,
 };
 use crate::config::instructions::WORKSPACE_INSTRUCTIONS_FILE_NAME;
 use crate::config::{
     Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, MemoryScope,
     RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
-    install_builtins, list_agents, load_env_file, macro_execute, sync_models,
+    install_builtins, list_agents, load_env_file, macro_execute, maybe_spawn_models_refresh,
+    sync_models,
 };
 use crate::config::{memory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
@@ -101,6 +102,7 @@ async fn main() -> Result<()> {
 
     let info_flag = cli.info
         || cli.sync_models
+        || cli.generate_models.is_some()
         || cli.list_models
         || cli.list_roles
         || cli.list_agents
@@ -292,7 +294,11 @@ async fn run(
 ) -> Result<()> {
     if cli.sync_models {
         let url = ctx.app.config.sync_models_url();
-        return sync_models(&url, abort_signal.clone()).await;
+        return sync_models(url.as_deref(), abort_signal.clone()).await;
+    }
+
+    if let Some(path) = &cli.generate_models {
+        return catalog::generate_models_file(path).await;
     }
 
     if cli.list_models {
@@ -544,6 +550,7 @@ async fn run(
             if !*IS_STDOUT_TERMINAL {
                 bail!("No TTY for REPL")
             }
+            maybe_spawn_models_refresh(&ctx.app.config);
             start_interactive(ctx).await
         }
     }
@@ -557,6 +564,7 @@ async fn start_directive(
     abort_signal: AbortSignal,
 ) -> Result<()> {
     let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
+    ctx.session_abort = Some(abort_signal.clone());
 
     if graph::active_agent_graph_name(ctx).is_some() {
         ctx.before_chat_completion(&input)?;

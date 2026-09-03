@@ -26,8 +26,13 @@ light_theme: false               # Activates a light color theme when true. env:
 # ---- Miscellaneous ----
 user_agent: null                 # Set User-Agent HTTP header, use `auto` for coyote/<current-version>
 save_shell_history: true         # Whether to save shell execution command to the history file
-sync_models_url: >               # URL to sync model changes from
-  https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/models.yaml
+sync_models_url: null            # Where `--sync-models` and the automatic refresh get model data from.
+                                 # If null, fetches fresh model data from models.dev + OpenRouter.
+                                 # Set a URL to mirror a full models.yaml instead, e.g.:
+                                 #   https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/models.yaml
+sync_models_auto: true           # Whether to refresh the model catalog in the background on REPL startup
+                                 # once it goes stale
+sync_models_ttl_hours: 24        # Hours before the synced model catalog is considered stale
 
 # ---- REPL Prompt ----
 # Custom REPL left/right prompts; see the [REPL Prompt Documentation](https://github.com/Dark-Alex-17/coyote/wiki/REPL-Prompt) for more information

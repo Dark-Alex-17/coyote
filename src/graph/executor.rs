@@ -695,6 +695,7 @@ nodes:
     type: script
     script: doubler.py
     state_updates: {}
+    timeout: 60
   done:
     type: end
     output: "{{doubled}}"

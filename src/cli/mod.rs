@@ -12,6 +12,7 @@ use clap_complete::ArgValueCompleter;
 use is_terminal::IsTerminal;
 use std::collections::HashSet;
 use std::io::{Read, stdin};
+use std::path::PathBuf;
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpTransportArg {
@@ -53,7 +54,7 @@ pub enum McpScopeArg {
 				"install_builtins", "sync_models", "list_models", "list_roles",
 				"list_sessions", "list_agents", "list_rags", "list_macros",
 				"list_skills", "list_bundles", "skill", "tail_logs", "completions",
-				"update", "update_bundle", "uninstall",
+				"update", "update_bundle", "uninstall", "generate_models",
 			])
 	),
 	group(
@@ -253,6 +254,15 @@ pub struct Cli {
     /// Sync models updates
     #[arg(long, help_heading = "Installation & Updates")]
     pub sync_models: bool,
+    /// Regenerate the models catalog file from live API data
+    #[arg(
+        long,
+        hide = true,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = "models.yaml"
+    )]
+    pub generate_models: Option<PathBuf>,
     /// Update Coyote to the latest release, or to a specific version
     #[arg(long, value_name = "VERSION", help_heading = "Installation & Updates")]
     pub update: Option<Option<String>>,
@@ -808,6 +818,19 @@ mod tests {
     fn parse_sync_models_flag() {
         let cli = parse(&["--sync-models"]);
         assert!(cli.sync_models);
+    }
+
+    #[test]
+    fn parse_generate_models_flag() {
+        assert_eq!(parse(&[]).generate_models, None);
+        assert_eq!(
+            parse(&["--generate-models"]).generate_models,
+            Some(PathBuf::from("models.yaml"))
+        );
+        assert_eq!(
+            parse(&["--generate-models", "out.yaml"]).generate_models,
+            Some(PathBuf::from("out.yaml"))
+        );
     }
 
     #[test]

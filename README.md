@@ -61,6 +61,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [Client Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Clients): Configuration instructions for various LLM providers.
     * [Authentication (API Key & OAuth)](https://github.com/Dark-Alex-17/coyote/wiki/Clients#authentication): Authenticate with API keys or OAuth for subscription-based access.
     * [Patching API Requests](https://github.com/Dark-Alex-17/coyote/wiki/Patches): Learn how to patch API requests for advanced customization.
+* [Dynamic Model Catalog](https://github.com/Dark-Alex-17/coyote/wiki/Model-Catalog): Coyote's model catalog (context windows, pricing, capabilities) is generated from live API data, refreshed automatically in the background, and mirrorable for air-gapped setups. New models show up without waiting for a release.
 * [Custom Themes](https://github.com/Dark-Alex-17/coyote/wiki/Themes): Change the look and feel of Coyote to your preferences with custom themes.
 * [History](#history): A history of how Coyote came to be.
 
