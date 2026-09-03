@@ -1,5 +1,6 @@
 use super::model::{ModelData, ProviderModels};
 use super::oauth::OAuthConfig;
+use std::cmp::Ordering;
 
 use crate::utils::fetch;
 
@@ -9,6 +10,8 @@ use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub const QUIRKS_YAML: &str = include_str!("../../quirks.yaml");
@@ -19,10 +22,6 @@ pub static ALL_QUIRKS: LazyLock<Vec<ProviderQuirks>> =
 const MODELSDEV_API_URL: &str = "https://models.dev/api.json";
 const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1/models";
 
-/// Upstream ids for one coyote provider. The table order is the fixed output
-/// order of the built catalog. Providers with neither upstream id are fully
-/// quirks-owned; `openrouter` is special-cased in the merge: its models come
-/// from the OpenRouter list natively instead of via a prefix join.
 struct SourceIds {
     provider: &'static str,
     modelsdev: Option<&'static str>,
@@ -152,15 +151,11 @@ const PROVIDER_SOURCES: [SourceIds; 24] = [
     },
 ];
 
-/// Raw payloads from the two upstream catalogs. Each source is independently
-/// fallible; `None` means that fetch failed and the merge degrades gracefully.
 pub struct FetchedSources {
     pub modelsdev: Option<String>,
     pub openrouter: Option<String>,
 }
 
-/// Fetches both upstream catalogs concurrently. A failed fetch is logged and
-/// surfaces as `None` rather than an error.
 pub async fn fetch_sources() -> FetchedSources {
     let (modelsdev, openrouter) = tokio::join!(fetch(MODELSDEV_API_URL), fetch(OPENROUTER_API_URL));
     FetchedSources {
@@ -173,8 +168,6 @@ pub async fn fetch_sources() -> FetchedSources {
     }
 }
 
-/// An API-sourced model plus the release date used for ordering. The date is
-/// deliberately kept out of [`ModelData`] and never serialized.
 struct SourcedModel {
     data: ModelData,
     release_date: Option<String>,
@@ -192,9 +185,6 @@ fn clamp_price(value: f64) -> Option<f64> {
     (0.0..=10_000.0).contains(&value).then_some(value)
 }
 
-/// Extracts the models of one models.dev provider. Tolerant by design:
-/// missing or malformed fields are skipped while the model is kept, and
-/// out-of-range numbers are dropped field-wise.
 fn modelsdev_provider_models(api: &Value, provider_id: &str) -> Vec<SourcedModel> {
     let Some(models) = api[provider_id]["models"].as_object() else {
         return Vec::new();
@@ -236,15 +226,11 @@ fn modelsdev_provider_models(api: &Value, provider_id: &str) -> Vec<SourcedModel
         .collect()
 }
 
-/// OpenRouter prices are USD per token; the catalog stores USD per million
-/// tokens, rounded to 4 decimals.
 fn openrouter_price(value: &Value) -> Option<f64> {
     let per_token: f64 = value.as_str()?.parse().ok()?;
     clamp_price((per_token * 1_000_000.0 * 10_000.0).round() / 10_000.0)
 }
 
-/// Maps one OpenRouter list entry onto [`ModelData`], with the same field-wise
-/// tolerance and clamping as the models.dev adapter.
 fn openrouter_model_data(name: &str, entry: &Value) -> ModelData {
     let mut data = ModelData::new(name);
     data.max_input_tokens = entry["context_length"]
@@ -276,9 +262,6 @@ fn openrouter_index(payload: &Value) -> HashMap<&str, &Value> {
         .unwrap_or_default()
 }
 
-/// Every OpenRouter list entry as a model of the `openrouter` provider, named
-/// by its full id. OpenRouter publishes no release date, so ordering falls
-/// back to name-ascending.
 fn openrouter_native_models(payload: &Value) -> Vec<SourcedModel> {
     payload["data"]
         .as_array()
@@ -297,8 +280,6 @@ fn openrouter_native_models(payload: &Value) -> Vec<SourcedModel> {
         .unwrap_or_default()
 }
 
-/// Fills fields that models.dev left unset on the same model: OpenRouter data
-/// never overrides a present models.dev value.
 fn fill_from_openrouter(data: &mut ModelData, entry: &Value) {
     let filler = openrouter_model_data(&data.name, entry);
     if data.max_input_tokens.is_none() {
@@ -427,8 +408,8 @@ pub fn build_catalog(sources: &FetchedSources, quirks: &[ProviderQuirks]) -> Cat
             (Some(a_date), Some(b_date)) => b_date
                 .cmp(a_date)
                 .then_with(|| a.data.name.cmp(&b.data.name)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
             (None, None) => a.data.name.cmp(&b.data.name),
         });
 
@@ -474,8 +455,6 @@ pub fn build_catalog(sources: &FetchedSources, quirks: &[ProviderQuirks]) -> Cat
     }
 }
 
-/// Like [`build_catalog`], but errors unless every provider was assembled
-/// from live API data (or is quirks-owned by design).
 pub fn build_catalog_strict(
     sources: &FetchedSources,
     quirks: &[ProviderQuirks],
@@ -488,6 +467,7 @@ pub fn build_catalog_strict(
             build.failed.join(", ")
         );
     }
+
     Ok(build.providers)
 }
 
@@ -528,13 +508,10 @@ pub fn backfill_embedded_floor(build: &mut CatalogBuild, embedded: &[ProviderMod
     build.providers = providers;
 }
 
-const GENERATED_HEADER: &str = "# GENERATED by 'coyote --generate-models' — DO NOT hand-edit model data.\n\
+const GENERATED_HEADER: &str = "# GENERATED by 'coyote --generate-models' \n#DO NOT hand-edit model data.\n\
 # Hand-owned behavior lives in quirks.yaml; this file is the embedded offline fallback.\n";
 
-/// Builds the catalog from live API data and writes it to `path`. Both
-/// upstream sources must respond and every provider must fully resolve;
-/// identical source data always produces identical bytes.
-pub async fn generate_models_file(path: &std::path::Path) -> Result<()> {
+pub async fn generate_models_file(path: &Path) -> Result<()> {
     let sources = fetch_sources().await;
     if sources.modelsdev.is_none() || sources.openrouter.is_none() {
         bail!(
@@ -544,25 +521,24 @@ pub async fn generate_models_file(path: &std::path::Path) -> Result<()> {
     let providers = build_catalog_strict(&sources, &ALL_QUIRKS)?;
     let model_count: usize = providers.iter().map(|provider| provider.models.len()).sum();
     let yaml = serde_yaml::to_string(&providers)?;
-    std::fs::write(path, format!("{GENERATED_HEADER}{yaml}"))?;
+
+    fs::write(path, format!("{GENERATED_HEADER}{yaml}"))?;
     println!(
         "Wrote {} models across {} providers to {}",
         model_count,
         providers.len(),
         path.display()
     );
+
     Ok(())
 }
 
-/// Fraction of `old` names that also appear in `new`; empty `old` yields 1.0.
-/// Used to guard against upstream id-shape drift: a low overlap means the
-/// upstream catalog renamed its models out from under us.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn name_overlap(old: &[String], new: &[String]) -> f64 {
     if old.is_empty() {
         return 1.0;
     }
-    let new_names: std::collections::HashSet<&str> = new.iter().map(String::as_str).collect();
+    let new_names: HashSet<&str> = new.iter().map(String::as_str).collect();
     let kept = old
         .iter()
         .filter(|name| new_names.contains(name.as_str()))
@@ -570,10 +546,6 @@ pub(crate) fn name_overlap(old: &[String], new: &[String]) -> f64 {
     kept as f64 / old.len() as f64
 }
 
-/// Overlays a hand-owned quirks entry onto the API-sourced model of the same
-/// name. Every field the hand-owned entry carries (Some, true, or non-empty)
-/// wins; absent fields keep the API value. `model_type` is authoritative on
-/// the hand-owned entry.
 fn overlay_hand_owned(hand: ModelData, api: ModelData) -> ModelData {
     ModelData {
         name: hand.name,
@@ -604,9 +576,6 @@ fn overlay_hand_owned(hand: ModelData, api: ModelData) -> ModelData {
     }
 }
 
-/// Hand-owned catalog overrides for a single provider: oauth configuration,
-/// curation excludes, field overlays for API-sourced models, suffixed model
-/// variants, and fully hand-owned model entries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderQuirks {
@@ -623,10 +592,6 @@ pub struct ProviderQuirks {
     pub models: Vec<ModelData>,
 }
 
-/// A field overlay applied to every API-sourced model whose name matches the
-/// glob in `match` (`*` = any run of characters, `?` = exactly one). Only
-/// explicitly present fields are written; absent fields leave the model
-/// untouched.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuirkRule {
@@ -661,9 +626,6 @@ pub struct QuirkRule {
     pub system_prompt_prefix: Option<String>,
 }
 
-/// Clones every model whose name matches the glob in `match`, appends `suffix`
-/// to the clone's name, and overlays any explicitly present fields onto the
-/// clone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuirkVariant {
@@ -699,8 +661,6 @@ pub struct QuirkVariant {
     pub system_prompt_prefix: Option<String>,
 }
 
-/// Applies every rule whose glob matches `data.name`, in file order; later
-/// rules overwrite earlier ones on the same field.
 pub fn apply_rules(provider_quirks: &ProviderQuirks, data: &mut ModelData) {
     for rule in &provider_quirks.rules {
         if !glob_matches(&rule.r#match, &data.name) {
@@ -751,8 +711,6 @@ pub fn apply_rules(provider_quirks: &ProviderQuirks, data: &mut ModelData) {
     }
 }
 
-/// Overlays a variant's explicitly present fields onto a cloned model; same
-/// field semantics as [`apply_rules`].
 fn apply_variant(variant: &QuirkVariant, data: &mut ModelData) {
     if let Some(real_name) = &variant.real_name {
         data.real_name = Some(real_name.clone());
@@ -798,9 +756,6 @@ fn apply_variant(variant: &QuirkVariant, data: &mut ModelData) {
     }
 }
 
-/// Finds the quirks for a client: an exact provider match wins, otherwise a
-/// client whose name starts with the provider name (openai-compatible clients
-/// are conventionally named after the provider they wrap).
 pub fn quirks_for<'a>(
     quirks: &'a [ProviderQuirks],
     client_name: &str,
@@ -815,9 +770,6 @@ pub fn quirks_for<'a>(
         })
 }
 
-/// Compiled patterns are memoized: catalog builds evaluate every rule, exclude,
-/// and variant glob against every model, so recompiling per call would dominate
-/// the merge as the catalog grows.
 static GLOB_CACHE: LazyLock<Mutex<HashMap<String, Arc<Regex>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -834,8 +786,6 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
     regex.is_match(name).unwrap_or(false)
 }
 
-/// Translates a glob pattern (`*` = any run of characters, `?` = exactly one)
-/// into an anchored regex. Patterns that fail to compile match nothing.
 fn compile_glob(pattern: &str) -> Regex {
     let translated = format!(
         "^{}$",
@@ -853,6 +803,7 @@ fn compile_glob(pattern: &str) -> Regex {
 mod tests {
     use super::*;
 
+    use crate::client::MODELS_YAML;
     use serde_json::json;
 
     const KNOWN_PROVIDERS: [&str; 24] = [
@@ -934,6 +885,7 @@ mod tests {
             .iter()
             .map(|source| source.provider)
             .collect();
+
         assert_eq!(order, KNOWN_PROVIDERS);
     }
 
@@ -1122,7 +1074,9 @@ rules:
             .iter()
             .flat_map(|id| modelsdev_provider_models(&api, id))
             .collect();
+
         all.extend(openrouter_native_models(&payload));
+
         assert!(!all.is_empty());
         for model in &all {
             let data = &model.data;
@@ -1154,7 +1108,9 @@ rules:
     token_url: https://example.com/token
 "#,
         );
+
         let build = build_catalog(&fixture_sources(), &quirks);
+
         assert!(find_provider(&build, "xai").oauth.is_some());
         assert!(find_provider(&build, "openai").oauth.is_none());
     }
@@ -1352,7 +1308,9 @@ rules:
   models: [{name: jamba}]
 "#,
         );
+
         let build = build_catalog(&make_sources(None, None), &quirks);
+
         assert_eq!(build.degraded, ["gemini"]);
         assert!(build.failed.contains(&"openai".to_string()));
         assert!(build.failed.contains(&"openrouter".to_string()));
@@ -1383,9 +1341,11 @@ rules:
   models: [{name: g-1}]
 "#,
         );
+
         let err = build_catalog_strict(&make_sources(None, None), &quirks)
             .unwrap_err()
             .to_string();
+
         assert!(err.contains("gemini"), "{err}");
         assert!(err.contains("openai"), "{err}");
     }
@@ -1416,6 +1376,7 @@ rules:
   models: [{name: v}]
 "#,
         );
+
         let providers =
             build_catalog_strict(&make_sources(Some(&modelsdev), Some(&openrouter)), &quirks)
                 .unwrap();
@@ -1423,6 +1384,7 @@ rules:
             .iter()
             .map(|provider| provider.provider.as_str())
             .collect();
+
         assert_eq!(order, KNOWN_PROVIDERS);
     }
 
@@ -1430,13 +1392,14 @@ rules:
     fn name_overlap_fraction_of_old_names_still_present() {
         let old: Vec<String> = ["a", "b", "c", "d"].map(str::to_string).into();
         let new: Vec<String> = ["a", "c", "x"].map(str::to_string).into();
+
         assert_eq!(name_overlap(&old, &new), 0.5);
         assert_eq!(name_overlap(&[], &new), 1.0);
         assert_eq!(name_overlap(&old, &[]), 0.0);
     }
 
     fn embedded_catalog() -> Vec<ProviderModels> {
-        serde_yaml::from_str(crate::client::MODELS_YAML).unwrap()
+        serde_yaml::from_str(MODELS_YAML).unwrap()
     }
 
     fn embedded_provider<'a>(providers: &'a [ProviderModels], name: &str) -> &'a ProviderModels {
@@ -1598,8 +1561,7 @@ rules:
 
     #[test]
     fn backfill_restores_embedded_floor_for_unresolved_providers() {
-        let embedded: Vec<ProviderModels> =
-            serde_yaml::from_str(crate::client::MODELS_YAML).unwrap();
+        let embedded: Vec<ProviderModels> = serde_yaml::from_str(MODELS_YAML).unwrap();
         let mut build = build_catalog(&make_sources(Some(MODELSDEV_FIXTURE), None), &ALL_QUIRKS);
         let unresolved: Vec<String> = build
             .degraded
@@ -1645,8 +1607,7 @@ rules:
                 .expect("openrouter fetch failed"),
         )
         .unwrap();
-        let embedded: Vec<ProviderModels> =
-            serde_yaml::from_str(crate::client::MODELS_YAML).unwrap();
+        let embedded: Vec<ProviderModels> = serde_yaml::from_str(MODELS_YAML).unwrap();
 
         println!(
             "{:<12} {:>7} {:>5} {:>5}",
