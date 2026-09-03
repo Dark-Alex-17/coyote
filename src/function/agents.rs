@@ -7,7 +7,7 @@ use crate::config::{
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
 use crate::supervisor::notification::agent_notification;
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor, TaskKind};
-use crate::utils::{AbortSignal, create_abort_signal, wait_abort_signal};
+use crate::utils::{AbortSignal, create_abort_signal, wait_abort_signal, wait_user_interrupt};
 
 use crate::graph;
 use anyhow::{Context, Result, anyhow, bail};
@@ -1031,6 +1031,14 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
         sup.abort_signal_for(id)
     };
 
+    let interrupted = || {
+        json!({
+            "status": "interrupted",
+            "id": id,
+            "message": format!("agent__collect was interrupted by the user; agent '{id}' is still running in the background. Collect it again later, cancel it with agent__cancel, or continue with other work."),
+        })
+    };
+
     loop {
         let is_finished = {
             let sup = supervisor.read();
@@ -1039,6 +1047,10 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
 
         if is_finished {
             break;
+        }
+
+        if ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
+            return Ok(interrupted());
         }
 
         if let Some(queue) = ctx.root_escalation_queue()
@@ -1068,10 +1080,18 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
                 tokio::select! {
                     _ = time::sleep(Duration::from_millis(200)) => {}
                     _ = wait_abort_signal(abort) => {}
+                    _ = wait_user_interrupt(ctx.session_abort.as_ref()) => {
+                        return Ok(interrupted());
+                    }
                 }
             }
             None => {
-                time::sleep(Duration::from_millis(200)).await;
+                tokio::select! {
+                    _ = time::sleep(Duration::from_millis(200)) => {}
+                    _ = wait_user_interrupt(ctx.session_abort.as_ref()) => {
+                        return Ok(interrupted());
+                    }
+                }
             }
         }
     }
@@ -2555,6 +2575,72 @@ mod tests {
             ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
             None
         );
+    }
+
+    #[test]
+    fn handle_collect_session_interrupt_returns_and_keeps_agent() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let join_handle = tokio::spawn(async move {
+                let _ = rx.await;
+                Ok(AgentResult {
+                    id: "a1".to_string(),
+                    agent_name: "explore".to_string(),
+                    output: "late output".to_string(),
+                    exit_status: AgentExitStatus::Completed,
+                })
+            });
+            let handle = AgentHandle {
+                id: "a1".to_string(),
+                agent_name: "explore".to_string(),
+                depth: 1,
+                inbox: Arc::new(Inbox::new()),
+                abort_signal: create_abort_signal(),
+                join_handle,
+                child_supervisor: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            let session = create_abort_signal();
+            session.set_ctrlc();
+            ctx.session_abort = Some(session.clone());
+
+            let result = time::timeout(
+                Duration::from_secs(2),
+                handle_collect(&mut ctx, &json!({"id": "a1"})),
+            )
+            .await
+            .expect("interrupted collect must return promptly")
+            .unwrap();
+
+            assert_eq!(result["status"], "interrupted");
+            assert_eq!(result["id"], "a1");
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("still running")
+            );
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
+                Some(false)
+            );
+
+            session.reset();
+            tx.send(()).unwrap();
+
+            let collected = handle_collect(&mut ctx, &json!({"id": "a1"}))
+                .await
+                .unwrap();
+            assert_eq!(collected["status"], "completed");
+            assert_eq!(collected["output"], "late output");
+        });
     }
 
     #[test]

@@ -338,6 +338,11 @@ pub struct RequestContext {
     pub last_continuation_response: Option<String>,
     pub pending_prefill: Option<String>,
 
+    /// The turn's abort signal, set by the REPL/cmd entry points. Lets blocking
+    /// tools (job__collect, agent__collect) notice a user interrupt -- SIGINT is
+    /// otherwise swallowed in cooked mode during tool execution.
+    pub session_abort: Option<AbortSignal>,
+
     pub render_mode: RenderMode,
 }
 
@@ -375,6 +380,7 @@ impl RequestContext {
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
             pending_prefill: None,
+            session_abort: None,
             render_mode: RenderMode::default(),
         }
     }
@@ -439,6 +445,7 @@ impl RequestContext {
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
             pending_prefill: None,
+            session_abort: None,
             render_mode: RenderMode::default(),
         };
         ctx.refresh_mcp_tool_filters();
@@ -492,6 +499,7 @@ impl RequestContext {
             skill_registry: self.skill_registry.clone(),
             last_continuation_response: None,
             pending_prefill: None,
+            session_abort: self.session_abort.clone(),
             render_mode: self.render_mode,
         }
     }
@@ -541,6 +549,7 @@ impl RequestContext {
             skill_registry: SkillRegistry::default(),
             last_continuation_response: None,
             pending_prefill: None,
+            session_abort: None,
             render_mode: parent.render_mode,
         }
     }

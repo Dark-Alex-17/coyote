@@ -1432,6 +1432,7 @@ async fn ask(
     if input.is_empty() {
         return Ok(());
     }
+    ctx.session_abort = Some(abort_signal.clone());
     if with_embeddings {
         input.use_embeddings(abort_signal.clone()).await?;
     }
