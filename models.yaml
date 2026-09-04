@@ -5968,8 +5968,8 @@
   - name: deepseek/deepseek-v4-flash-vision-exp
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.44
-    output_price: 1.32
+    input_price: 0.22
+    output_price: 0.66
     max_output_tokens: 384000
     supports_vision: true
     supports_function_calling: true
