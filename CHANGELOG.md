@@ -1,3 +1,42 @@
+## v0.10.2 (2026-09-04)
+
+### Feat
+
+- added a clear line separator for the end of LLM turns to make it more clear where they are
+- sort models by release date
+- Improved the architect, explore, and sisyphus agents to have a team mode so they can all work in parallel as a team and updated the parallel-research skill to make explicit mention of this functionality
+- support auto continuation in subagents and prevent them from calling todo__pause
+- apply provider quirks to models created from a name
+- refresh the model catalog from live API data at runtime
+- generate the model catalog from live API data
+- add model catalog source adapters and merge engine
+- add hand-owned model quirks overlay
+- apply provider quirks to models created from a name
+- refresh the model catalog from live API data at runtime
+- generate the model catalog from live API data
+- add model catalog source adapters and merge engine
+- add hand-owned model quirks overlay
+- Improved the architect, explore, and sisyphus agents to have a team mode so they can all work in parallel as a team and updated the parallel-research skill to make explicit mention of this functionality
+- added tab completions to --update-bundle flag
+- added a dedicated config_dir output to coyote --info/.info
+
+### Fix
+
+- children subagents couldn't properly send messages to parent inboxes
+- --generate-models parsed before vault initialization
+- drive tool rounds iteratively instead of recursively to prevent stack overflow on long agentic turns to fix latent stack overflow recursion bug
+- session replays now include mid-turn messages so the full session gets replayed
+- resolve duplicate model ids by requested type
+- let ctrl-c interrupt blocking job and agent collects
+- skip terminal color-scheme queries in test builds
+- memoize quirk glob patterns and isolate concurrent override writes
+- memoize quirk glob patterns and isolate concurrent override writes
+- children subagents couldn't properly send messages to parent inboxes
+
+### Perf
+
+- probe models-override staleness in the background refresh task
+
 ## v0.10.1 (2026-08-31)
 
 ### Fix
