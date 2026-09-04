@@ -705,6 +705,10 @@ impl Config {
             Self::load_from_file(&config_path)?
         };
 
+        if info_flag {
+            return Ok(config);
+        }
+
         let bootstrap_app = AppConfig {
             vault_password_file: config.vault_password_file.clone(),
             secrets_provider: config.secrets_provider.clone(),
@@ -712,7 +716,7 @@ impl Config {
         };
         let vault = Vault::init(&bootstrap_app)?;
         let (parsed_config, missing_secrets) = interpolate_secrets(&content, &vault)?;
-        if !missing_secrets.is_empty() && !info_flag {
+        if !missing_secrets.is_empty() {
             debug!(
                 "Global config references secrets that are missing from the vault: {missing_secrets:?}"
             );
@@ -723,7 +727,7 @@ impl Config {
                 missing_secrets
             )));
         }
-        if !parsed_config.is_empty() && !info_flag {
+        if !parsed_config.is_empty() {
             debug!("Global config is invalid once secrets are injected: {parsed_config}");
             let new_config = Self::load_from_str(&parsed_config).with_context(|| {
                 formatdoc!(
@@ -735,6 +739,7 @@ impl Config {
             })?;
             config = new_config;
         }
+
         Ok(config)
     }
 

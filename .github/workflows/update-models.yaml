@@ -46,9 +46,6 @@ jobs:
       if: steps.duckdb-extensions.outputs.cache-hit != 'true'
       run: cargo test --all duckdb
 
-    # Coyote loads its config before handling --generate-models/--list-models, and a
-    # bare non-TTY runner has no config file (and no way to answer the first-run
-    # prompt), so point COYOTE_CONFIG_DIR at a throwaway dir with a minimal stub.
     - name: Write stub config
       run: |
         COYOTE_CONFIG_DIR="$(mktemp -d)"

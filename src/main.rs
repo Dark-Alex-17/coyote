@@ -102,7 +102,6 @@ async fn main() -> Result<()> {
 
     let info_flag = cli.info
         || cli.sync_models
-        || cli.generate_models.is_some()
         || cli.list_models
         || cli.list_roles
         || cli.list_agents
@@ -117,6 +116,10 @@ async fn main() -> Result<()> {
         || cli.list_secrets;
 
     let log_path = setup_logger(cli.acp_server)?;
+
+    if let Some(path) = &cli.generate_models {
+        return catalog::generate_models_file(path).await;
+    }
 
     if let Some(version) = &cli.update {
         let version = version.clone();
@@ -250,6 +253,7 @@ async fn main() -> Result<()> {
             app_config,
             log_path,
             start_mcp_servers,
+            info_flag,
             abort_signal.clone(),
         )
         .await?,
@@ -295,10 +299,6 @@ async fn run(
     if cli.sync_models {
         let url = ctx.app.config.sync_models_url();
         return sync_models(url.as_deref(), abort_signal.clone()).await;
-    }
-
-    if let Some(path) = &cli.generate_models {
-        return catalog::generate_models_file(path).await;
     }
 
     if cli.list_models {

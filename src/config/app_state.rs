@@ -42,9 +42,14 @@ impl AppState {
         config: Arc<AppConfig>,
         log_path: Option<PathBuf>,
         start_mcp_servers: bool,
+        lenient_vault: bool,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        let vault = Arc::new(Vault::init(&config)?);
+        let vault = if lenient_vault {
+            Arc::new(Vault::init_lenient(&config))
+        } else {
+            Arc::new(Vault::init(&config)?)
+        };
 
         let mcp_registry = McpRegistry::init(
             log_path,

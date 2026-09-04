@@ -96,14 +96,25 @@ impl Vault {
     }
 
     pub fn init(config: &AppConfig) -> Result<Self> {
-        if env::var_os(SANDBOX_ENV_FLAG).is_some() {
-            return Ok(Self {
-                sandbox_mode: true,
-                ..Self::default()
-            });
+        let mut vault = Self::init_lenient(config);
+        if !vault.sandbox_mode
+            && let SupportedProvider::Local { provider_def } = &mut vault.provider
+        {
+            ensure_password_file_initialized(provider_def)?;
         }
 
-        let mut provider = match &config.secrets_provider {
+        Ok(vault)
+    }
+
+    pub fn init_lenient(config: &AppConfig) -> Self {
+        if env::var_os(SANDBOX_ENV_FLAG).is_some() {
+            return Self {
+                sandbox_mode: true,
+                ..Self::default()
+            };
+        }
+
+        let provider = match &config.secrets_provider {
             Some(p) => p.clone(),
             None => SupportedProvider::Local {
                 provider_def: LocalProvider {
@@ -113,14 +124,10 @@ impl Vault {
             },
         };
 
-        if let SupportedProvider::Local { provider_def } = &mut provider {
-            ensure_password_file_initialized(provider_def)?;
-        }
-
-        Ok(Self {
+        Self {
             provider,
             sandbox_mode: false,
-        })
+        }
     }
 
     pub fn local_password_file(&self) -> Result<PathBuf> {
