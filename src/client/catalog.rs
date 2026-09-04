@@ -316,11 +316,13 @@ pub struct CatalogBuild {
 ///
 /// Per provider: API models (models.dev primary, OpenRouter gap-fill) are
 /// curated by `exclude` globs and `rules`, hand-owned `models:` entries are
-/// merged in field-wise (hand-owned wins) and placed first, API models are
-/// sorted newest-first by release date (name-ascending tiebreak, undated
-/// last), and `variants` clones are inserted immediately after their base
-/// model. Providers without usable data are routed to `degraded` or `failed`
-/// instead of erroring; a provider never emits zero models.
+/// merged in field-wise (hand-owned wins, inheriting the API model's release
+/// date), and all models are sorted newest-first by release date
+/// (name-ascending tiebreak). Undated models sort last: hand-owned ones in
+/// quirks.yaml order (preserving curation for quirks-owned providers), then
+/// API ones name-ascending. `variants` clones are inserted immediately after
+/// their base model. Providers without usable data are routed to `degraded`
+/// or `failed` instead of erroring; a provider never emits zero models.
 pub fn build_catalog(sources: &FetchedSources, quirks: &[ProviderQuirks]) -> CatalogBuild {
     let modelsdev: Option<Value> = sources
         .modelsdev
@@ -398,9 +400,15 @@ pub fn build_catalog(sources: &FetchedSources, quirks: &[ProviderQuirks]) -> Cat
             {
                 Some(position) => {
                     let api = api_models.remove(position);
-                    merged_hand.push(overlay_hand_owned(hand, api.data));
+                    merged_hand.push(SourcedModel {
+                        data: overlay_hand_owned(hand, api.data),
+                        release_date: api.release_date,
+                    });
                 }
-                None => merged_hand.push(hand),
+                None => merged_hand.push(SourcedModel {
+                    data: hand,
+                    release_date: None,
+                }),
             }
         }
 
@@ -413,9 +421,17 @@ pub fn build_catalog(sources: &FetchedSources, quirks: &[ProviderQuirks]) -> Cat
             (None, None) => a.data.name.cmp(&b.data.name),
         });
 
-        let bases = merged_hand
-            .into_iter()
-            .chain(api_models.into_iter().map(|model| model.data));
+        let mut all_models = merged_hand;
+        all_models.extend(api_models);
+        all_models.sort_by(|a, b| match (&a.release_date, &b.release_date) {
+            (Some(a_date), Some(b_date)) => b_date
+                .cmp(a_date)
+                .then_with(|| a.data.name.cmp(&b.data.name)),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        });
+        let bases = all_models.into_iter().map(|model| model.data);
 
         let variants = provider_quirks
             .map(|provider_quirks| provider_quirks.variants.as_slice())
@@ -1222,7 +1238,7 @@ rules:
     }
 
     #[test]
-    fn ordering_hand_owned_first_then_release_date_desc_name_asc() {
+    fn ordering_release_date_desc_hand_owned_interleaved_undated_last() {
         let shuffled_payloads = [
             r#"{"openai":{"models":{
                 "b":{"release_date":"2026-05-01"},
@@ -1245,16 +1261,25 @@ rules:
   models:
     - name: n2
     - name: n1
+    - name: b
+      input_price: 9
 "#,
         );
         for payload in shuffled_payloads {
             let build = build_catalog(&make_sources(Some(payload), None), &quirks);
-            let names: Vec<&str> = find_provider(&build, "openai")
+            let openai = find_provider(&build, "openai");
+            let names: Vec<&str> = openai
                 .models
                 .iter()
                 .map(|model| model.name.as_str())
                 .collect();
-            assert_eq!(names, ["n2", "n1", "c", "a", "b", "y", "z"]);
+            // Dated models sort newest-first with a name-ascending tiebreak;
+            // hand-owned "b" inherits its API release date and interleaves
+            // instead of pinning to the top. Undated models sort last:
+            // hand-owned in quirks order (n2, n1), then API name-ascending.
+            assert_eq!(names, ["c", "a", "b", "n2", "n1", "y", "z"]);
+            // "b" is still the hand-owned overlay, not the bare API entry.
+            assert_eq!(find_model(openai, "b").input_price, Some(9.0));
         }
     }
 
