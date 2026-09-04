@@ -1453,6 +1453,7 @@ async fn ask(
                 graph::run_active_agent_graph(ctx, &input.text(), abort_signal.clone()).await?;
             app.print_markdown(&output)?;
             ctx.after_chat_completion(app.as_ref(), &input, &output, &[])?;
+            print_turn_divider();
             return Ok(());
         }
 
@@ -1628,8 +1629,17 @@ async fn ask(
             }
         }
 
+        print_turn_divider();
         return Ok(());
     }
+}
+
+fn print_turn_divider() {
+    let width = crossterm::terminal::size()
+        .map(|(columns, _)| columns as usize)
+        .unwrap_or(33);
+    println!("{}", dimmed_text(&"─".repeat(width)));
+    println!();
 }
 
 fn should_continue(ctx: &RequestContext) -> bool {
