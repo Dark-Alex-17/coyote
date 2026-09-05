@@ -3,6 +3,20 @@
 # Hand-owned behavior lives in quirks.yaml; this file is the embedded offline fallback.
 - provider: openai
   models:
+  - name: gpt-6-astra
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 10.0
+    output_price: 50.0
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
   - name: gpt-5.6
     type: chat
     max_input_tokens: 1050000
@@ -5947,8 +5961,8 @@
   - name: deepseek/deepseek-v4-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0886
-    output_price: 0.1772
+    input_price: 0.0872
+    output_price: 0.1744
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731
@@ -5976,15 +5990,15 @@
   - name: deepseek/deepseek-v4-pro
     type: chat
     max_input_tokens: 1048576
-    input_price: 1.0423
-    output_price: 2.0845
+    input_price: 0.9817
+    output_price: 1.9634
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813
     type: chat
     max_input_tokens: 1048576
-    input_price: 1.1154
-    output_price: 3.3462
+    input_price: 1.1207
+    output_price: 3.362
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813:batch
@@ -6381,13 +6395,6 @@
     input_price: 0.017
     output_price: 0.112
     max_output_tokens: 117900
-  - name: ibm-granite/granite-4.1-8b
-    type: chat
-    max_input_tokens: 131072
-    input_price: 0.05
-    output_price: 0.1
-    max_output_tokens: 117964
-    supports_function_calling: true
   - name: ibm-granite/granite-4.2-8b
     type: chat
     max_input_tokens: 131072
@@ -6424,6 +6431,13 @@
     max_output_tokens: 235929
     supports_function_calling: true
   - name: inclusionai/ling-3.0-flash-fin:free
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.0
+    output_price: 0.0
+    max_output_tokens: 32768
+    supports_function_calling: true
+  - name: inclusionai/ling-3.0-flash-sante:free
     type: chat
     max_input_tokens: 262144
     input_price: 0.0
@@ -7707,6 +7721,38 @@
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
+  - name: openai/gpt-6-astra
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 10.0
+    output_price: 50.0
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+  - name: openai/gpt-6-astra-pro
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 10.0
+    output_price: 50.0
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+  - name: openai/gpt-6-astra-pro:batch
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 5.0
+    output_price: 25.0
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+  - name: openai/gpt-6-astra:batch
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 5.0
+    output_price: 25.0
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
   - name: openai/gpt-audio
     type: chat
     max_input_tokens: 128000
@@ -8006,9 +8052,9 @@
   - name: qwen/qwen3-235b-a22b-2507
     type: chat
     max_input_tokens: 262144
-    input_price: 0.0875
-    output_price: 0.35
-    max_output_tokens: 235929
+    input_price: 0.09
+    output_price: 0.55
+    max_output_tokens: 16384
     supports_function_calling: true
   - name: qwen/qwen3-235b-a22b-thinking-2507
     type: chat
@@ -8190,9 +8236,9 @@
   - name: qwen/qwen3.5-35b-a3b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.25
-    output_price: 1.25
-    max_output_tokens: 235929
+    input_price: 0.08
+    output_price: 0.75
+    max_output_tokens: 16384
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.5-397b-a17b
@@ -8246,9 +8292,9 @@
   - name: qwen/qwen3.6-27b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.6
-    output_price: 3.6
-    max_output_tokens: 235929
+    input_price: 0.3
+    output_price: 2.0
+    max_output_tokens: 65536
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.6-35b-a3b
@@ -8781,8 +8827,8 @@
     type: chat
     max_input_tokens: 1310720
     input_price: 0.05
-    output_price: 0.16
-    max_output_tokens: 393216
+    output_price: 0.1
+    max_output_tokens: 131072
     supports_function_calling: true
   - name: ~google/gemini-flash-latest
     type: chat
