@@ -5961,8 +5961,8 @@
   - name: deepseek/deepseek-v4-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.085
-    output_price: 0.17
+    input_price: 0.0827
+    output_price: 0.1655
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731
@@ -5990,8 +5990,8 @@
   - name: deepseek/deepseek-v4-pro
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.8803
-    output_price: 1.7605
+    input_price: 0.7889
+    output_price: 1.5778
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813
@@ -8236,8 +8236,8 @@
   - name: qwen/qwen3.5-35b-a3b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.08
-    output_price: 0.75
+    input_price: 0.3125
+    output_price: 1.25
     max_output_tokens: 16384
     supports_vision: true
     supports_function_calling: true
@@ -8528,7 +8528,7 @@
     max_input_tokens: 1024000
     input_price: 0.4
     output_price: 0.4
-    max_output_tokens: 26214
+    max_output_tokens: 819200
     supports_function_calling: true
   - name: thinkingmachines/inkling
     type: chat
@@ -8699,8 +8699,8 @@
   - name: z-ai/glm-4.6
     type: chat
     max_input_tokens: 204800
-    input_price: 0.55
-    output_price: 2.2
+    input_price: 0.5
+    output_price: 2.0
     max_output_tokens: 131072
     supports_function_calling: true
   - name: z-ai/glm-4.6v
@@ -8889,9 +8889,9 @@
   - name: ~z-ai/glm-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 1.15
-    output_price: 3.5
-    max_output_tokens: 235929
+    input_price: 1.17
+    output_price: 3.96
+    max_output_tokens: 943718
     supports_function_calling: true
 - provider: github
   models:
