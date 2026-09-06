@@ -5961,16 +5961,16 @@
   - name: deepseek/deepseek-v4-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0827
-    output_price: 0.1655
+    input_price: 0.0805
+    output_price: 0.161
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.065
-    output_price: 0.18
-    max_output_tokens: 943718
+    input_price: 0.05
+    output_price: 0.1
+    max_output_tokens: 131072
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731:batch
     type: chat
@@ -5990,8 +5990,8 @@
   - name: deepseek/deepseek-v4-pro
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.7889
-    output_price: 1.5778
+    input_price: 0.6774
+    output_price: 1.3548
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813
@@ -8699,8 +8699,8 @@
   - name: z-ai/glm-4.6
     type: chat
     max_input_tokens: 204800
-    input_price: 0.5
-    output_price: 2.0
+    input_price: 0.55
+    output_price: 2.2
     max_output_tokens: 131072
     supports_function_calling: true
   - name: z-ai/glm-4.6v
@@ -8826,9 +8826,9 @@
   - name: ~deepseek/deepseek-v4-flash-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.05
-    output_price: 0.1
-    max_output_tokens: 131072
+    input_price: 0.045
+    output_price: 0.09
+    max_output_tokens: 943718
     supports_function_calling: true
   - name: ~google/gemini-flash-latest
     type: chat
@@ -8891,7 +8891,7 @@
     max_input_tokens: 1310720
     input_price: 1.17
     output_price: 3.96
-    max_output_tokens: 943718
+    max_output_tokens: 235929
     supports_function_calling: true
 - provider: github
   models:
@@ -9076,7 +9076,7 @@
   - name: deepseek-ai/DeepSeek-V4-Flash-0731
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.08
+    input_price: 0.06
     output_price: 0.18
     max_output_tokens: 384000
     supports_function_calling: true
