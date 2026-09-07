@@ -4981,49 +4981,6 @@
     max_output_tokens: 262144
     supports_vision: true
     supports_function_calling: true
-  - name: kimi-k2.5
-    type: chat
-    max_input_tokens: 262144
-    input_price: 0.6
-    output_price: 3.0
-    max_output_tokens: 262144
-    supports_vision: true
-    supports_function_calling: true
-  - name: kimi-k2-thinking
-    type: chat
-    max_input_tokens: 262144
-    input_price: 0.6
-    output_price: 2.5
-    max_output_tokens: 262144
-    supports_function_calling: true
-  - name: kimi-k2-thinking-turbo
-    type: chat
-    max_input_tokens: 262144
-    input_price: 1.15
-    output_price: 8.0
-    max_output_tokens: 262144
-    supports_function_calling: true
-  - name: kimi-k2-0905-preview
-    type: chat
-    max_input_tokens: 262144
-    input_price: 0.6
-    output_price: 2.5
-    max_output_tokens: 262144
-    supports_function_calling: true
-  - name: kimi-k2-turbo-preview
-    type: chat
-    max_input_tokens: 262144
-    input_price: 2.4
-    output_price: 10.0
-    max_output_tokens: 262144
-    supports_function_calling: true
-  - name: kimi-k2-0711-preview
-    type: chat
-    max_input_tokens: 131072
-    input_price: 0.6
-    output_price: 2.5
-    max_output_tokens: 16384
-    supports_function_calling: true
 - provider: deepseek
   models:
   - name: deepseek-v4-flash-vision-exp
@@ -5961,15 +5918,15 @@
   - name: deepseek/deepseek-v4-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0805
-    output_price: 0.161
+    input_price: 0.0899
+    output_price: 0.1797
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.05
-    output_price: 0.1
+    input_price: 0.14
+    output_price: 0.28
     max_output_tokens: 131072
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731:batch
@@ -5990,8 +5947,8 @@
   - name: deepseek/deepseek-v4-pro
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.6774
-    output_price: 1.3548
+    input_price: 1.0353
+    output_price: 2.0706
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813
@@ -8159,7 +8116,7 @@
     max_input_tokens: 262144
     input_price: 0.15
     output_price: 1.2
-    max_output_tokens: 32768
+    max_output_tokens: 235929
     supports_function_calling: true
   - name: qwen/qwen3-vl-235b-a22b-instruct
     type: chat
@@ -8244,9 +8201,9 @@
   - name: qwen/qwen3.5-397b-a17b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.55
-    output_price: 3.5
-    max_output_tokens: 235929
+    input_price: 0.39
+    output_price: 2.34
+    max_output_tokens: 65536
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.5-9b
@@ -8699,9 +8656,9 @@
   - name: z-ai/glm-4.6
     type: chat
     max_input_tokens: 204800
-    input_price: 0.55
-    output_price: 2.2
-    max_output_tokens: 131072
+    input_price: 0.43
+    output_price: 1.75
+    max_output_tokens: 16384
     supports_function_calling: true
   - name: z-ai/glm-4.6v
     type: chat
@@ -8753,19 +8710,12 @@
     output_price: 3.036
     max_output_tokens: 131072
     supports_function_calling: true
-  - name: z-ai/glm-5.2:free
-    type: chat
-    max_input_tokens: 256000
-    input_price: 0.0
-    output_price: 0.0
-    max_output_tokens: 230400
-    supports_function_calling: true
   - name: z-ai/glm-5.3
     type: chat
     max_input_tokens: 1310720
     input_price: 1.4
     output_price: 4.4
-    max_output_tokens: 262144
+    max_output_tokens: 943718
     supports_function_calling: true
   - name: z-ai/glm-5.3-flash
     type: chat
