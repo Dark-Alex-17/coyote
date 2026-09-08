@@ -47,6 +47,12 @@ pub static CODE_BLOCK_RE: LazyLock<Regex> =
 pub static THINK_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^\s*<think>.*?</think>(\s*|$)").unwrap());
 pub static IS_STDOUT_TERMINAL: LazyLock<bool> = LazyLock::new(|| io::stdout().is_terminal());
+pub static SHOW_TOOL_CALLS: LazyLock<bool> = LazyLock::new(|| {
+    env::var(get_env_name("show_tool_calls"))
+        .ok()
+        .and_then(|v| parse_bool(&v))
+        .unwrap_or_default()
+});
 pub static HEADLESS: AtomicBool = AtomicBool::new(false);
 pub static ACP_SERVER: AtomicBool = AtomicBool::new(false);
 

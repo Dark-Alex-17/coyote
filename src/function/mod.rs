@@ -1485,7 +1485,10 @@ impl ToolCall {
         let json_data = self.parse_arguments()?;
         let cmd_name = self.name.as_str();
         let quiet = ctx.current_depth > 0;
-        if *IS_STDOUT_TERMINAL && ctx.current_depth == 0 && !HEADLESS.load(Ordering::SeqCst) {
+        if (*IS_STDOUT_TERMINAL || *SHOW_TOOL_CALLS)
+            && ctx.current_depth == 0
+            && !HEADLESS.load(Ordering::SeqCst)
+        {
             println!(
                 "{}",
                 format_call_log(cmd_name, &[json_data.to_string()], &json_data)
@@ -1562,7 +1565,10 @@ impl ToolCall {
 
         cmd_args.push(json_data.to_string());
 
-        if *IS_STDOUT_TERMINAL && current_depth == 0 && !HEADLESS.load(Ordering::SeqCst) {
+        if (*IS_STDOUT_TERMINAL || *SHOW_TOOL_CALLS)
+            && current_depth == 0
+            && !HEADLESS.load(Ordering::SeqCst)
+        {
             println!("{}", format_call_log(&cmd_name, &cmd_args, &json_data));
         }
 
