@@ -1173,7 +1173,7 @@ impl RequestContext {
             agent.set_shared_variables(new_variables);
         }
         if !self.info_flag {
-            agent.update_shared_dynamic_instructions(false)?;
+            agent.update_shared_dynamic_instructions(false, self.app.config.tool_timeout)?;
         }
         Ok(())
     }
@@ -1199,15 +1199,16 @@ impl RequestContext {
                 };
             agent.set_session_variables(session_variables);
             if !self.info_flag {
-                agent.update_session_dynamic_instructions(None)?;
+                agent.update_session_dynamic_instructions(None, self.app.config.tool_timeout)?;
             }
             session.sync_agent(agent);
         } else {
             let variables = session.agent_variables();
             agent.set_session_variables(variables.clone());
-            agent.update_session_dynamic_instructions(Some(
-                session.agent_instructions().to_string(),
-            ))?;
+            agent.update_session_dynamic_instructions(
+                Some(session.agent_instructions().to_string()),
+                self.app.config.tool_timeout,
+            )?;
         }
         Ok(())
     }

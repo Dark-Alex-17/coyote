@@ -1677,7 +1677,14 @@ impl ToolCall {
                         json!({"tool_call_error": error_msg})
                     })
             }
-            _ => match run_llm_function(cmd_name, cmd_args, envs, agent_name, quiet) {
+            _ => match run_llm_function(
+                cmd_name,
+                cmd_args,
+                envs,
+                agent_name,
+                ctx.app.config.tool_timeout,
+                quiet,
+            ) {
                 Ok(Some(contents)) => serde_json::from_str(&contents)
                     .ok()
                     .unwrap_or_else(|| json!({"output": contents})),
@@ -2271,11 +2278,20 @@ fn clamp_metadata_field(object: &mut Value, key: &str) {
     object[key] = json!(clamped);
 }
 
+pub(crate) fn tool_timeout_secs(config_value: Option<u64>) -> u64 {
+    env::var(get_env_name("tool_timeout"))
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .or(config_value)
+        .unwrap_or(1800)
+}
+
 pub fn run_llm_function(
     cmd_name: String,
     cmd_args: Vec<String>,
     mut envs: HashMap<String, String>,
     agent_name: Option<String>,
+    tool_timeout: Option<u64>,
     quiet: bool,
 ) -> Result<Option<String>> {
     let mut bin_dirs: Vec<PathBuf> = vec![];
@@ -2395,10 +2411,7 @@ pub fn run_llm_function(
         buf
     });
 
-    let timeout_secs = env::var("COYOTE_TOOL_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(1800);
+    let timeout_secs = tool_timeout_secs(tool_timeout);
     let deadline = (timeout_secs > 0).then(|| Instant::now() + Duration::from_secs(timeout_secs));
     let status = loop {
         match child.try_wait() {
@@ -2414,7 +2427,7 @@ pub fn run_llm_function(
             drop(stdout_thread);
             drop(stderr_thread);
             let tool_error_message = format!(
-                "Tool call '{command_name}' timed out after {timeout_secs}s and was killed (set COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited)"
+                "Tool call '{command_name}' timed out after {timeout_secs}s and was killed (set tool_timeout in config or COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited)"
             );
             emit_tool_warning(
                 quiet,
@@ -4546,6 +4559,7 @@ mod tests {
             ],
             HashMap::new(),
             None,
+            None,
             false,
         )
         .unwrap()
@@ -4573,6 +4587,7 @@ mod tests {
             ],
             HashMap::new(),
             None,
+            None,
             true,
         )
         .unwrap()
@@ -4587,6 +4602,32 @@ mod tests {
         );
         assert_eq!(json["stderr"], "err-text");
         assert_eq!(json["output"], "partial-output\n");
+    }
+
+    #[test]
+    #[serial]
+    fn tool_timeout_secs_prefers_env_then_config_then_default() {
+        let prev = env::var_os("COYOTE_TOOL_TIMEOUT");
+
+        unsafe { env::set_var("COYOTE_TOOL_TIMEOUT", "42") };
+        assert_eq!(tool_timeout_secs(Some(900)), 42);
+
+        unsafe { env::set_var("COYOTE_TOOL_TIMEOUT", "abc") };
+        assert_eq!(tool_timeout_secs(Some(900)), 900);
+
+        unsafe { env::set_var("COYOTE_TOOL_TIMEOUT", "0") };
+        assert_eq!(tool_timeout_secs(Some(900)), 0);
+
+        unsafe { env::remove_var("COYOTE_TOOL_TIMEOUT") };
+        assert_eq!(tool_timeout_secs(Some(900)), 900);
+        assert_eq!(tool_timeout_secs(None), 1800);
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("COYOTE_TOOL_TIMEOUT", v),
+                None => env::remove_var("COYOTE_TOOL_TIMEOUT"),
+            }
+        }
     }
 
     #[test]

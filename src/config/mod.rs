@@ -256,6 +256,7 @@ pub struct Config {
     pub summary_context_prompt: Option<String>,
     pub max_tool_result_chars: Option<usize>,
     pub max_concurrent_jobs: Option<usize>,
+    pub tool_timeout: Option<u64>,
 
     pub memory: Option<bool>,
     pub memory_cap_with_tools: Option<usize>,
@@ -342,6 +343,7 @@ impl Default for Config {
             summary_context_prompt: None,
             max_tool_result_chars: None,
             max_concurrent_jobs: None,
+            tool_timeout: None,
 
             memory: None,
             memory_cap_with_tools: None,

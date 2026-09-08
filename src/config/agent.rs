@@ -599,30 +599,39 @@ impl Agent {
         self.config.dynamic_instructions
     }
 
-    pub fn update_shared_dynamic_instructions(&mut self, force: bool) -> Result<()> {
+    pub fn update_shared_dynamic_instructions(
+        &mut self,
+        force: bool,
+        tool_timeout: Option<u64>,
+    ) -> Result<()> {
         if self.is_dynamic_instructions() && (force || self.shared_dynamic_instructions.is_none()) {
-            self.shared_dynamic_instructions = Some(self.run_instructions_fn()?);
+            self.shared_dynamic_instructions = Some(self.run_instructions_fn(tool_timeout)?);
         }
         Ok(())
     }
 
-    pub fn update_session_dynamic_instructions(&mut self, value: Option<String>) -> Result<()> {
+    pub fn update_session_dynamic_instructions(
+        &mut self,
+        value: Option<String>,
+        tool_timeout: Option<u64>,
+    ) -> Result<()> {
         if self.is_dynamic_instructions() {
             let value = match value {
                 Some(v) => v,
-                None => self.run_instructions_fn()?,
+                None => self.run_instructions_fn(tool_timeout)?,
             };
             self.session_dynamic_instructions = Some(value);
         }
         Ok(())
     }
 
-    fn run_instructions_fn(&self) -> Result<String> {
+    fn run_instructions_fn(&self, tool_timeout: Option<u64>) -> Result<String> {
         let value = run_llm_function(
             self.name().to_string(),
             vec!["_instructions".into(), "{}".into()],
             self.variable_envs(),
             Some(self.name().to_string()),
+            tool_timeout,
             false,
         )?;
         match value {

@@ -143,8 +143,9 @@ pub fn job_function_declarations() -> Vec<FunctionDeclaration> {
                           directly. Backgroundable tools: external command tools (e.g. execute_command) and \
                           `mcp_invoke_*` calls; built-in `agent__`/`job__`/`user__`/`todo__`/`memory__`/`skill__` \
                           tools cannot be backgrounded. The job runs against a snapshot of the current config and \
-                          environment; later changes do not affect it. Process jobs honor COYOTE_TOOL_TIMEOUT; MCP \
-                          jobs have NO timeout — cancel a hung one with `job__cancel`. Jobs do not survive coyote \
+                          environment; later changes do not affect it. Process jobs honor the tool timeout \
+                          (`tool_timeout` config / COYOTE_TOOL_TIMEOUT env var); MCP jobs have NO timeout — cancel \
+                          a hung one with `job__cancel`. Jobs do not survive coyote \
                           exiting. In graph LLM nodes, jobs are node-local: collect or cancel every job you start \
                           before the node ends — leftovers are cancelled at node exit.".to_string(),
             parameters: JsonSchema {
@@ -963,10 +964,7 @@ fn build_env_snapshot(
         args
     };
 
-    let timeout_secs = env::var("COYOTE_TOOL_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(1800);
+    let timeout_secs = super::tool_timeout_secs(ctx.app.config.tool_timeout);
 
     Ok(JobEnvSnapshot {
         cmd_name,
@@ -1105,7 +1103,7 @@ async fn run_process_job(
                 drain_output_file(&snapshot.output_file, &file_offset, &output_buf);
                 let output_bytes_captured = output_buf.lock().total_written();
                 let message = format!(
-                    "Tool call '{}' timed out after {}s and was killed (set COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited)",
+                    "Tool call '{}' timed out after {}s and was killed (set tool_timeout in config or COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited)",
                     snapshot.display_name, snapshot.timeout_secs
                 );
 

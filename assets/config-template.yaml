@@ -177,6 +177,7 @@ summarization_prompt: null       # The text prompt used for creating a concise s
 summary_context_prompt: null     # The text prompt used for including the summary of the entire session as context to the model. If null, uses built-in default
 max_tool_result_chars: null      # Cap on tool result characters forwarded to the model per call (null = no cap)
 max_concurrent_jobs: null        # Max background jobs (`job__*` tools) running at once per context (null = 5; 0 disables background jobs entirely)
+tool_timeout: null               # Max seconds a tool call may run before being killed (null = 1800; 0 = unlimited). COYOTE_TOOL_TIMEOUT env var overrides
 
 # ---- Memory ----
 # See the [Memory documentation](https://github.com/Dark-Alex-17/coyote/wiki/Memory) for more information.
