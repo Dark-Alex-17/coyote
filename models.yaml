@@ -5951,9 +5951,9 @@
   - name: deepseek/deepseek-v4-flash-0731
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.14
-    output_price: 0.28
-    max_output_tokens: 131072
+    input_price: 0.065
+    output_price: 0.18
+    max_output_tokens: 943718
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731:batch
     type: chat
@@ -6595,7 +6595,7 @@
   - name: minimax/minimax-m1
     type: chat
     max_input_tokens: 1000000
-    input_price: 0.55
+    input_price: 0.4
     output_price: 2.2
     max_output_tokens: 40000
     supports_function_calling: true
@@ -8006,9 +8006,9 @@
   - name: qwen/qwen3-14b
     type: chat
     max_input_tokens: 131072
-    input_price: 0.12
-    output_price: 0.24
-    max_output_tokens: 16384
+    input_price: 0.2275
+    output_price: 0.91
+    max_output_tokens: 8192
     supports_function_calling: true
   - name: qwen/qwen3-235b-a22b
     type: chat
@@ -8212,9 +8212,9 @@
   - name: qwen/qwen3.5-397b-a17b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.39
-    output_price: 2.34
-    max_output_tokens: 65536
+    input_price: 0.55
+    output_price: 3.5
+    max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.5-9b
