@@ -59,7 +59,11 @@ main() {
     # (they only matter when recursing into a directory tree).
 
     local results
-    results=$(grep "${grep_args[@]}" -E "$search_pattern" "$search_path" 2>/dev/null | head -n "$MAX_RESULTS") || true
+    # tr strips NUL bytes from matches in real binary files (text mode searches
+    # them), which would otherwise trigger bash's "ignored null byte in input"
+    # warning in the command substitution. -I can't be used instead: it overrides
+    # --binary-files=text and re-skips the misdetected UTF-8 files noted above.
+    results=$(grep "${grep_args[@]}" -E "$search_pattern" "$search_path" 2>/dev/null | tr -d '\0' | head -n "$MAX_RESULTS") || true
 
     if [[ -z "$results" ]]; then
         echo "No matches found for: $search_pattern" >> "$LLM_OUTPUT"
