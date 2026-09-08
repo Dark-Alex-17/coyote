@@ -1484,6 +1484,7 @@ impl ToolCall {
     async fn eval_mcp(&self, ctx: &RequestContext) -> Result<Value> {
         let json_data = self.parse_arguments()?;
         let cmd_name = self.name.as_str();
+        let quiet = ctx.current_depth > 0;
         if *IS_STDOUT_TERMINAL && ctx.current_depth == 0 && !HEADLESS.load(Ordering::SeqCst) {
             println!(
                 "{}",
@@ -1495,7 +1496,7 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP search failed: {e}");
-                    eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
+                    emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
                     json!({"tool_call_error": error_msg})
                 })
         } else if cmd_name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX) {
@@ -1503,7 +1504,7 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP describe failed: {e}");
-                    eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
+                    emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
                     json!({"tool_call_error": error_msg})
                 })
         } else if cmd_name.starts_with(MCP_READ_META_FUNCTION_NAME_PREFIX) {
@@ -1511,7 +1512,7 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP read failed: {e}");
-                    eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
+                    emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
                     json!({"tool_call_error": error_msg})
                 })
         } else if cmd_name.starts_with(MCP_PROMPT_META_FUNCTION_NAME_PREFIX) {
@@ -1519,7 +1520,7 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP prompt failed: {e}");
-                    eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
+                    emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
                     json!({"tool_call_error": error_msg})
                 })
         } else {
@@ -1527,7 +1528,7 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP tool invocation failed: {e}");
-                    eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
+                    emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
                     json!({"tool_call_error": error_msg})
                 })
         };
@@ -1538,6 +1539,7 @@ impl ToolCall {
         let agent = ctx.agent.clone();
         let functions = ctx.tool_scope.functions.clone();
         let current_depth = ctx.current_depth;
+        let quiet = current_depth > 0;
         let agent_name = agent.as_ref().map(|agent| agent.name().to_owned());
         let (call_name, cmd_name, mut cmd_args, envs) = match agent.as_ref() {
             Some(agent) => self.extract_call_config_from_agent(&functions, agent)?,
@@ -1570,7 +1572,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP search failed: {e}");
-                        eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
+                        emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1579,7 +1581,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP describe failed: {e}");
-                        eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
+                        emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1588,7 +1590,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP read failed: {e}");
-                        eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
+                        emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1597,7 +1599,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP prompt failed: {e}");
-                        eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
+                        emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1606,21 +1608,21 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP tool invocation failed: {e}");
-                        eprintln!("{}", muted_warning_text(&mcp_error_display(&error_msg)));
+                        emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
                         json!({"tool_call_error": error_msg})
                     })
             }
             _ if cmd_name.starts_with(TODO_FUNCTION_PREFIX) => {
                 todo::handle_todo_tool(ctx, &cmd_name, &json_data).unwrap_or_else(|e| {
                     let error_msg = format!("Todo tool failed: {e}");
-                    eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
                     json!({"tool_call_error": error_msg})
                 })
             }
             _ if cmd_name.starts_with(MEMORY_FUNCTION_PREFIX) => {
                 memory::handle_memory_tool(ctx, &cmd_name, &json_data).unwrap_or_else(|e| {
                     let error_msg = format!("Memory tool failed: {e}");
-                    eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                    emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
                     json!({"tool_call_error": error_msg})
                 })
             }
@@ -1629,7 +1631,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("Skill tool failed: {e}");
-                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1638,7 +1640,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("Agent tool failed: {e}");
-                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1647,7 +1649,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("User interaction failed: {e}");
-                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1656,7 +1658,7 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("RAG query failed: {e}");
-                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1665,11 +1667,11 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("Job tool failed: {e}");
-                        eprintln!("{}", muted_warning_text(&format!("⚠️ {error_msg} ⚠️")));
+                        emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
                         json!({"tool_call_error": error_msg})
                     })
             }
-            _ => match run_llm_function(cmd_name, cmd_args, envs, agent_name) {
+            _ => match run_llm_function(cmd_name, cmd_args, envs, agent_name, quiet) {
                 Ok(Some(contents)) => serde_json::from_str(&contents)
                     .ok()
                     .unwrap_or_else(|| json!({"output": contents})),
@@ -2108,6 +2110,16 @@ fn mcp_error_display(error_msg: &str) -> String {
     sanitize_display_text(&format!("⚠️ {error_msg} ⚠️"))
 }
 
+// Subagent (depth > 0) tool calls run while the parent session owns the
+// terminal; route their warnings to the debug log instead of stderr.
+fn emit_tool_warning(quiet: bool, display: &str, plain: &str) {
+    if quiet {
+        debug!("{plain}");
+    } else {
+        eprintln!("{}", muted_warning_text(display));
+    }
+}
+
 /// Bounds a raw `CallToolResult` JSON value: oversized text is sliced,
 /// base64 blob content is routed through the blob renderer instead of
 /// reaching model context, and oversized structured content is replaced with
@@ -2258,6 +2270,7 @@ pub fn run_llm_function(
     cmd_args: Vec<String>,
     mut envs: HashMap<String, String>,
     agent_name: Option<String>,
+    quiet: bool,
 ) -> Result<Option<String>> {
     let mut bin_dirs: Vec<PathBuf> = vec![];
     let mut command_name = cmd_name.clone();
@@ -2327,6 +2340,9 @@ pub fn run_llm_function(
             }
             let chunk = &buffer[0..n];
             buf.extend_from_slice(chunk);
+            if quiet {
+                continue;
+            }
             let mut last_pos = 0;
             for (i, &byte) in chunk.iter().enumerate() {
                 if byte == b'\n' {
@@ -2354,6 +2370,9 @@ pub fn run_llm_function(
             }
             let chunk = &buffer[0..n];
             buf.extend_from_slice(chunk);
+            if quiet {
+                continue;
+            }
             let mut last_pos = 0;
             for (i, &byte) in chunk.iter().enumerate() {
                 if byte == b'\n' {
@@ -2391,9 +2410,10 @@ pub fn run_llm_function(
             let tool_error_message = format!(
                 "Tool call '{command_name}' timed out after {timeout_secs}s and was killed (set COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited)"
             );
-            eprintln!(
-                "{}",
-                muted_warning_text(&format!("⚠️ {tool_error_message} ⚠️"))
+            emit_tool_warning(
+                quiet,
+                &format!("⚠️ {tool_error_message} ⚠️"),
+                &tool_error_message,
             );
             let error_json = json!({"tool_call_error": tool_error_message});
 
@@ -2411,9 +2431,10 @@ pub fn run_llm_function(
         let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
         let stdout = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
         let tool_error_message = format!("Tool call '{command_name}' exited with code {exit_code}");
-        eprintln!(
-            "{}",
-            muted_warning_text(&format!("⚠️ {tool_error_message} ⚠️"))
+        emit_tool_warning(
+            quiet,
+            &format!("⚠️ {tool_error_message} ⚠️"),
+            &tool_error_message,
         );
         let mut error_json = json!({"tool_call_error": tool_error_message});
         if !stderr.is_empty() {
@@ -4519,6 +4540,34 @@ mod tests {
             ],
             HashMap::new(),
             None,
+            false,
+        )
+        .unwrap()
+        .expect("nonzero exit must return an error payload");
+
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            json["tool_call_error"]
+                .as_str()
+                .unwrap()
+                .contains("exited with code 3")
+        );
+        assert_eq!(json["stderr"], "err-text");
+        assert_eq!(json["output"], "partial-output\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_llm_function_quiet_still_collects_output_buffers() {
+        let result = run_llm_function(
+            "bash".into(),
+            vec![
+                "-c".into(),
+                "echo partial-output >> \"$LLM_OUTPUT\"; echo err-text >&2; exit 3".into(),
+            ],
+            HashMap::new(),
+            None,
+            true,
         )
         .unwrap()
         .expect("nonzero exit must return an error payload");
