@@ -172,6 +172,7 @@ By default (`parallel_tasks: 0`) tasks run **sequentially** on the single run br
 | [`oracle`](../oracle/README.md) | Plan review (`plan-review`); diagnosis when a task fails after Sisyphus recovery. |
 | [`explore`](../explore/README.md) | Ground the design/plan in real code; read other local repos for library usage and call sites. |
 | [`librarian`](../librarian/README.md) | External docs / OSS examples for unfamiliar libraries. |
+| [`whetstone`](../whetstone/README.md) | Continuous improvement — spawned once before the final report when the run addressed PR review feedback from outside its own lanes; converts review misses into user-approved suite edits / ledger entries. Never blocks the run. |
 
 ## Related skills
 

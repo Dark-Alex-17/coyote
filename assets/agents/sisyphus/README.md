@@ -48,6 +48,7 @@ Spawnable sub-agents (from `config.yaml`):
 - **[adversary](../adversary/README.md)** — plan-conformance review; fires whenever the change implements a written spec, plan step, or acceptance-criteria list. Orthogonal to `code-reviewer` — both can run.
 - **[security-reviewer](../security-reviewer/README.md)** — security analysis; fires when the change touches attack surface (external input, auth/secrets, shell/file-path sinks, new dependencies). Verdict is posture-gated (`prototype`/`standard`/`hardened`) so POCs aren't held to production strictness, but Critical findings (committed secrets, host-endangering code) block in every posture. Orthogonal to both other reviewers — all three can run.
 - **[step-runner](../step-runner/README.md)** — graph agent that executes one step of a phased plan repo. Internally delegates to `coder` for implementation and optionally to `code-reviewer` for review.
+- **[whetstone](../whetstone/README.md)** — continuous improvement; spawned ONCE at the end of a run that addressed review feedback from outside Sisyphus's own lanes (humans, or a teammate's independent review agent — never its own reviewers' output). Classifies each piece of feedback CATCH/PARTIAL/MISS against what the run's own reviewers flagged and converts the misses into user-approved suite improvements (skill edits, ledger entries). Never blocks run completion.
 
 ## Features
 
