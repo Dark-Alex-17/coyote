@@ -1,0 +1,17 @@
+# Record a review miss (a defect that ESCAPED review and was caught later) in the
+# review-miss ledger at ~/.config/coyote/share/review-misses.md. The first step appends
+# a numbered skeleton entry deterministically (zero tokens; it also migrates a ledger
+# from the legacy config-root location); the second has the agent interview you to fill
+# in the <fill> fields — the detection pattern is the payload.
+# Run as:
+#   coyote --macro record-miss "<one line: what escaped and how it was caught>"
+# (avoid double quotes inside the description; it is spliced into a shell string)
+variables:
+  - name: description
+    description: One line describing what escaped review and how it was caught
+isolated: false
+steps:
+  - |-
+    !f="$HOME/.config/coyote/share/review-misses.md"; legacy="$HOME/.config/coyote/review-misses.md"; mkdir -p "$(dirname "$f")"; [ -f "$legacy" ] && [ ! -f "$f" ] && mv "$legacy" "$f"; [ -f "$f" ] || printf '# Review-miss ledger\n\nFormat and usage: the review-misses skill.\n' > "$f"; n=$(grep -c '^## MISS-' "$f" 2>/dev/null || true); n=$((${n:-0}+1)); id=$(printf 'MISS-%03d' "$n"); printf '\n## %s — {{description}}\n- date: %s\n- repo: <fill owner/repo>\n- surface: <fill rest-api|worker|db-migration|cli|iac|library|ci-cd|any>\n- what escaped: {{description}}\n- why review missed it: <fill>\n- detection pattern: <fill the concrete check/grep a reviewer runs to catch this CLASS>\n' "$id" "$(date +%F)" >> "$f"; echo "Appended $id to $f"
+  - |-
+    Load the `review-misses` skill, then open `$HOME/.config/coyote/share/review-misses.md` and find the newest `## MISS-` entry (just appended: "{{description}}"). Interview me briefly — one focused question at a time — to fill in the `<fill …>` fields, then write the completed entry back. Push hardest on the **detection pattern**: it must be a concrete check or grep a reviewer can run, not advice. If my miss matches an existing entry's defect class, propose sharpening that entry instead of keeping a duplicate.

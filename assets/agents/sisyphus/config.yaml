@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.10.0
+version: 3.11.0
 
 agent_session: temp
 auto_continue: true
@@ -19,6 +19,7 @@ spawnable_agents:
   - probe
   - architecture-reviewer
   - step-runner
+  - whetstone
 max_concurrent_agents: 40
 max_agent_depth: 3
 inject_spawn_instructions: true
@@ -476,6 +477,22 @@ instructions: |
   4. Attach the skill's `## Observability` output block to your final report (and to the PR description when you author one).
 
   Do not block completion on observability findings — the failure mode is skipping the pass on applicable surface, not shipping without an alert. Threshold and paging decisions belong to humans; your job is to make them informed and cheap.
+
+  ### Continuous improvement (whetstone) — after addressing human review feedback
+
+  When a run's work included addressing review feedback that did NOT come from your own
+  reviewer lanes — human comments and requested changes, but also a teammate's review
+  agent or another team's bot (an independent reviewer catching what your suite missed is
+  exactly the signal) — spawn `whetstone` ONCE at the very end, after all work is
+  complete. Pass it: the PR reference,
+  the human feedback items you addressed (verbatim), and what your own review passes
+  (code-reviewer/adversary/security-reviewer/probe) flagged for the same change — that
+  ground truth is what makes its miss-classification precise. Collect its result; its
+  proposals go to the USER (it escalates its own approval questions), not to you — never
+  apply suite changes on its behalf and never block run completion on it (if it errors,
+  note that and finish). Skip with a one-line note ONLY when every piece of feedback you
+  addressed came from your own reviewer lanes: whetstone never learns from its own suite's
+  output, but it learns from everyone else — human or agent.
 
   ## File Operations (Direct Edits)
 

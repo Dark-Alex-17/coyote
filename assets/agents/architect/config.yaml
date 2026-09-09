@@ -6,7 +6,7 @@ description: |
   plan-conformance check (plus a black-box usage-pattern probe for consumer-facing surface), and
   finishes with ONE draft PR (CI checks watched to green) plus tracked follow-up tasks. Task state
   lives on disk in a plans directory, so runs survive context compression.
-version: 2.2.0
+version: 2.3.0
 agent_session: temp
 auto_continue: true
 max_auto_continues: 100
@@ -21,6 +21,7 @@ spawnable_agents:
   - adversary
   - probe
   - gatekeeper
+  - whetstone
 max_concurrent_agents: 10
 max_agent_depth: 10
 inject_spawn_instructions: true
@@ -454,6 +455,14 @@ instructions: |
   7. Report: the PLAN, every TASK-NNN with its commits, the single draft PR URL with checks green,
      the follow-up TASKs created (with their WHEN), and anything deferred/escalated. STOP.
 
+  Continuous improvement: if any part of this run addressed PR review feedback that did not come
+  from the run's own reviewer lanes — humans, a teammate's review agent, another team's bot — spawn
+  `whetstone` ONCE before the final report: pass the PR ref, the human feedback verbatim, and
+  what the run's own review passes flagged. Collect it; its approval questions escalate to the
+  user directly. Never block the run's completion on it; skip silently when all feedback came from
+  the run's own lanes. (Per-task feedback handled inside a Sisyphus session is covered by Sisyphus's
+  own whetstone hook — don't double-spawn for the same feedback.)
+
   ## Durable state (survive context compression)
 
   Long runs compress. Anything that lives ONLY in chat is lost. Keep it durable:
@@ -475,6 +484,7 @@ instructions: |
   | `gatekeeper` | Plan self-containedness gate (Phase C Gate 1): audits the PLAN for the "docker container" standard, returns SEALED/LEAKY with the missing implementer questions. |
   | `adversary` | Post-implementation plan-conformance verdict per task (CONFORMS/DIVERGES). |
   | `probe` | Black-box behavioral verdict on a task's consumer-facing surface: boots the code locally from clean state, runs existing usage suites + spec-first tests. Returns USAGE_PROBE PASS/FAIL/INCONCLUSIVE. |
+  | `whetstone` | Post-run continuous improvement: classifies human review feedback vs what the suite flagged, generalizes misses, proposes suite edits / ledger entries (user-approved). Never a reviewer lane. |
 
   ## Escalation handling
 

@@ -40,6 +40,10 @@ Does the new consumer bound how many messages it processes at once — worker-po
 
 Where the transport uses a visibility timeout, lease, or lock (with redelivery when it expires): is there any evidence — a comment, a config value derived from measurements, a heartbeat/extension call — that the timeout exceeds the handler's realistic worst-case processing time? A timeout shorter than processing time means the message redelivers WHILE the first attempt is still running: duplicate concurrent processing by design. You flag the absent reasoning; whether the handler survives that concurrent duplicate is `transactional-integrity`'s question. Transports with no visibility/lease mechanism are exempt.
 
+### 6. 🟡 `[convention]` Job queue used for synchronous request-path work
+
+Does request-path code enqueue a job and then WAIT for its result before responding — polling job status, blocking on a completion channel, sleeping in a loop? That buys the queue's costs (latency, serialization, a second failure domain, at-least-once semantics) without its benefit (durable async execution), and it serializes under load: N concurrent requests queue behind a worker pool sized for background throughput. The synchronous shape is a direct call (with a timeout); the queue is for work that outlives the request. Legitimate exceptions exist — a durable workflow where the caller genuinely resumes later, or intentional admission control — but they should be stated; flag the enqueue-then-wait shape when they aren't. Also the inverse smell: an expensive in-process retry/sleep loop inside a job handler where the queue's own scheduling (snooze/requeue with delay) is the idiomatic tool — the handler holds a worker slot hostage to sleep.
+
 ## Ground-truth discipline
 
 - READ the transport/framework configuration, not just the handler — retry counts, DLQ wiring, prefetch, and drain behavior live in config and registration code, not in the handler body.

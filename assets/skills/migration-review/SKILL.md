@@ -40,6 +40,14 @@ Does the migration mix a data backfill (UPDATE/INSERT over existing rows) into t
 
 Does the migration tool in this repo support down/rollback scripts, and do sibling migrations provide them? Then a new migration without one is the finding — the first schema rollback should not be authored during the incident that needs it. Where the down-path is genuinely impossible (see item 2), the down script should say so explicitly rather than be omitted. Repos whose tooling or stated convention is forward-only are exempt; cite the convention.
 
+### 6. 🟡 `[correctness]` Seed/backfill literals not cross-checked against canonical values
+
+Does the migration INSERT or UPDATE literal data values — enum strings, type/kind/status names, display copy, identifiers? Every literal has a canonical source somewhere: the application's enum/constant definitions, the schema's CHECK constraints, existing seed data, or a migration landing in the SAME stack. `fs_grep` for each literal's canonical definition and verify it matches — a seed row whose value drifts from the enum (or that omits a column a same-stack migration is about to make meaningful, or that conflicts on a constraint a sibling migration changes) fails at deploy time or, worse, seeds wrong data silently. Check the same-stack interaction explicitly: seed scripts and schema migrations that land together must be reviewed together.
+
+### 7. 🟢 `[convention]` New table without audit columns
+
+Does a new table carry the repo's standard audit columns — typically `created_at`/`updated_at`, and `version`/row-tracking where the house convention uses them? READ two or three sibling tables' migrations for the actual house convention first (Ground-truth discipline below) and cite one; a new table silently skipping it is the finding. A table that genuinely needs no audit trail (pure join table, ephemeral scratch) can be exempt — the author should say so, not leave it to inference.
+
 ## Ground-truth discipline
 
 - `fs_grep` the application code for every column, table, and constraint this migration touches — the expand/contract question is answered by the code, not by the migration file.

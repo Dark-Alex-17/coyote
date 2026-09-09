@@ -29,15 +29,39 @@ fs_read --path "src/auth.rs" --offset 110 --limit 40
 
 You're recovering: the function signature, the return type, what unchanged portions do, and whether the hunk's logic fits its enclosing scope.
 
-### Read the callers of anything changed
+### Blast radius: verify every caller (MANDATORY)
 
-If a hunk changes a function's body or its signature, grep for the name to find callers and check whether the change ripples:
+A locally-correct change that alters a symbol's CONTRACT breaks callers you can't see in the diff. For every changed exported/public symbol, grep for its callers and verify each one still holds:
 
 ```
 fs_grep --pattern "changed_function" --include "*.rs"
 ```
 
+Contract changes that ripple (check the callers against each one that applies):
+
+- **Return type / error type changed** — do callers match on variants that no longer exist, or miss new ones?
+- **Nullability / optionality** — a value that could never be null/None now can be (or vice versa).
+- **Defaults changed** — callers relying on the old default silently change behavior.
+- **Units / encoding / format** — seconds→millis, bytes→string, naive→UTC datetimes.
+- **Ordering / uniqueness guarantees** — output was sorted/deduped, now isn't (or vice versa).
+- **Error semantics** — a function that returned an error now panics/throws, or swallows what it used to propagate.
+- **Sync→async / blocking behavior** — callers on hot paths or in handlers now block or need awaiting.
+
+This check is MANDATORY and produces output even when clean: state `Blast radius: N call sites checked, all compatible` in your findings, or one finding per incompatible/unverifiable caller (`caller at path:line still assumes <old contract>`). Greps are cheap — the file-read budget does not apply to `fs_grep`/`fs_glob`; spend greps freely here and targeted reads only on suspicious callers.
+
 Skip the test files in this search; do the test sweep next.
+
+### Guard symmetry across sibling paths (MANDATORY when a guard changes)
+
+When the diff ADDS, STRENGTHENS, or FIXES a guard/check/validation in one code path, the same
+flaw usually lives in that path's parallel twins — sibling strategies implementing the same
+interface, other enqueue/call sites of the same job, the script's sibling scripts, the other
+branch of the same switch. Enumerate the twins (`fs_grep` for the shared interface, the job
+kind, the naming pattern) and verify each one either has the equivalent guard or provably
+doesn't need it. A twin missing the guard is a finding at the twin's `path:line` — same
+severity as the bug the guard fixes. Report even when clean: `Guard symmetry: N sibling
+paths checked`. (Guards REMOVED are the removed-guards check below — this is about the ones
+added: a fix applied to one of N twins is N-1 latent bugs.)
 
 ### Read the tests for the change
 
@@ -58,7 +82,26 @@ These are review findings that only surface in a diff context, not in a whole-fi
 - **Signature changes** — verify all callers compile against the new signature. Compiler-checked languages catch some of this; dynamic languages don't.
 - **New code path without new tests** — usually a missing test. Flag it.
 - **Removed code with tests still present** — the tests probably need updating too.
+- **Removed guards, checks, and validations** — for EVERY removed guard/branch/validation/limit, name where that responsibility now lives ("moved to X at path:line") or flag it as a regression risk. Deleted code had a reason; "nothing now does what the deleted code did" is a 🟡 finding by default, and 🔴 when the guard protected money, auth, or data integrity. Reviews fixate on added lines — the removed lines are where incidents come from.
 - **The "dog that didn't bark"** — what's obvious by its ABSENCE? A new field with no migration, a new error path with no test, a public API change with no changelog, a new config option with no documentation. Flag these as missing pieces, not as things to add later.
+- **Minted but unused / partial adoption** — every artifact the diff INTRODUCES (variable, flag,
+  helper, image, config key) must be consumed somewhere; `fs_grep` for each one. Zero uses = a
+  finding (dead weight or a forgotten wiring step). Used in SOME applicable in-diff sites but
+  not others = a finding naming the sites that didn't adopt it — half-adopted artifacts are how
+  two mechanisms for the same job end up coexisting forever.
+- **Version-literal consistency and freshness** — when the diff bumps a version (image tag,
+  tool version, dependency pin), `fs_grep` the repo for other occurrences of the OLD version
+  string (compose files, workflows, docs, sibling Dockerfiles) — stragglers are findings. For
+  NEWLY-pinned versions, check the upstream latest when network tools allow it and flag pins
+  that start life stale; skip silently offline.
+- **Silent-failure fix without remediation** — a diff that fixes a silently-failing write path
+  (bad address, swallowed error, wrong topic) leaves behind whatever state was damaged or
+  omitted while it was broken. The fix must state how that backlog gets reconciled (backfill,
+  reconciliation run, "provably no traffic since X") — absent statement is a finding.
+- **Normative doc changes** — a diff adding/changing a rules doc, convention, or runbook: grep
+  the governed tree for PRE-EXISTING violations of the new rule (the doc is wrong or the tree
+  is — say which). Runbooks/docs hardcoding mutable environment identifiers (personal accounts,
+  org names, pool IDs) are a maintenance hazard — flag unless marked with an ownership note.
 
 ### Scope discipline
 
@@ -83,6 +126,23 @@ A diff review is a review of THE CHANGE, not the whole file:
 - Will they fail when the code regresses? Or are they tautological (e.g., `assert!(x.is_empty() || !x.is_empty())`)?
 - Do they cover the unhappy paths, not just the happy ones?
 - Is there a missing test for the specific bug or feature being added? `fs_grep` for the function name in test files to check.
+
+### Test adequacy: the mutation question (MANDATORY)
+
+Presence of tests proves nothing. For EACH behavior change in the diff, ask: **"if this
+specific logic were wrong, which test would fail?"** and name it. No nameable test = a
+finding (`behavior <X> has no test that would catch its regression`). State the mapping
+even when clean: `Tests: <behavior> covered by <test name>`.
+
+Named adequacy anti-patterns — each is a finding even when coverage looks green:
+
+- **Mock-assertion tests** — the test asserts the mock was called, never the real outcome; it verifies wiring, not behavior, and passes when the logic is wrong.
+- **Unexercised branch** — the diff adds a branch/condition no test drives down; coverage of the function ≠ coverage of the new path.
+- **Implementation-mirroring tests** — the test recomputes the expected value using the same logic as the code under test; both are wrong together, so it can never fail meaningfully. Expected values must be independently derived literals.
+- **Missing negative case** — a new validation/guard with tests only proving it ACCEPTS good input, never that it REJECTS bad input. The reject path is the whole point of a guard.
+- **Leaky fixture** — an integration test against a shared/persistent database inserts fixture
+  rows directly with no paired cleanup (deferred delete/teardown/transaction rollback). The
+  test passes today and leaves a primary-key landmine for the next run.
 
 ## 3. Clarity
 

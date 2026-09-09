@@ -1,0 +1,170 @@
+name: finding-verifier
+description: |
+  Graph-based independent verifier for code-review findings. Given a list of
+  🔴/🟡 findings (path, lines, claim), it mechanically fans out ONE verification
+  branch per finding — the graph structure makes skipping a finding impossible —
+  and returns a per-finding verdict: VERIFIED (with quoted evidence), FALSE
+  (provably wrong, with proof), or UNVERIFIABLE (kept, marked unverified).
+  Fresh-context by design: it re-derives each claim from the working tree, so a
+  synthesizing orchestrator can't confirmation-bias its own workers' findings.
+  It verifies EXISTENCE and BEHAVIOR of cited code only — it is not a second
+  opinion and never re-judges severity or importance.
+
+version: '1.0'
+
+global_tools:
+  - fs_read.sh
+  - fs_cat.sh
+  - fs_grep.sh
+
+variables:
+  - name: project_dir
+    description: Repository the findings cite; relative paths in findings resolve against it.
+    default: '.'
+
+settings:
+  max_loop_iterations: 8
+  log_state_snapshots: true
+  timeout: 900
+
+reducers:
+  output: overwrite
+
+initial_state:
+  findings_list: []
+  verdicts: []
+
+start: parse
+
+nodes:
+  parse:
+    id: parse
+    type: llm
+    description: Extract the 🔴/🟡 findings from the spawn prompt into a structured list. Extraction only — no judging.
+    instructions: |
+      You extract code-review findings from a report into a structured list.
+      EXTRACTION ONLY — do not judge, filter, merge, or rephrase-away any
+      finding. Rules:
+
+      - Include every 🔴 CRITICAL and 🟡 WARNING finding. Ignore 🟢/💡
+        findings (they post unverified by design).
+      - Preserve the reported severity marker verbatim (including any
+        `[convention]`/`[correctness]` title marker).
+      - `claim` must be SELF-CONTAINED: what the finding asserts the code
+        does, lacks, or gets wrong, understandable without the original
+        report. Include the suggested-fix context when it clarifies the claim.
+      - `path` and `lines` come from the finding verbatim; if a finding cites
+        multiple locations, emit one entry per location with the same id plus
+        a `-b`, `-c` suffix.
+    prompt: |
+      Extract the findings from this verification request:
+
+      {{initial_prompt}}
+    tools: []
+    output_schema:
+      type: object
+      properties:
+        findings_list:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                description: Short stable slug for mapping the verdict back (e.g. "f1", "f2-b").
+              severity:
+                type: string
+                description: The severity marker verbatim (e.g. "🔴 CRITICAL", "🟡 WARNING [correctness]").
+              path:
+                type: string
+                description: File path the finding cites, as reported.
+              lines:
+                type: string
+                description: Line or line-range the finding cites, as reported (may be empty).
+              claim:
+                type: string
+                description: Self-contained statement of what the finding asserts about the code.
+            required: [id, severity, path, lines, claim]
+      required: [findings_list]
+    next: verify_each
+
+  verify_each:
+    id: verify_each
+    type: map
+    over: '{{findings_list}}'
+    as: finding
+    branch: verify_one
+    collect_into: verdicts
+    max_concurrency: 4
+    next: done
+
+  verify_one:
+    id: verify_one
+    type: llm
+    description: Verify ONE finding against the working tree — existence and behavior of the cited code, nothing else.
+    instructions: |
+      You verify a single code-review finding against the actual repository.
+      Your question is narrow: does the cited code EXIST, and does it BEHAVE
+      as the claim says? You are not a reviewer and this is not a second
+      opinion — never re-judge severity, style, or whether the issue
+      "matters".
+
+      Method:
+      1. `fs_read` the cited path at the cited lines (with generous
+         surrounding context — the enclosing function at least). If the path
+         or lines don't match the claim's description, `fs_grep` for the
+         symbols in the claim before concluding anything (the finding may
+         cite drifted line numbers — code that MOVED still verifies).
+      2. Compare what the code actually does against the claim.
+
+      Verdict rules:
+      - `VERIFIED` — the cited code exists and the claim accurately describes
+        it. `evidence` MUST be the decisive line(s) quoted verbatim with
+        path:line.
+      - `FALSE` — the cited code does not exist anywhere (not just moved), or
+        it PROVABLY does not do what the claim says (e.g. the claim says a
+        nil-check is missing but it is right there). `evidence` MUST quote
+        the proof. When in doubt, this is NOT the verdict — FALSE requires
+        proof, not disagreement.
+      - `UNVERIFIABLE` — you could not establish it either way (claim depends
+        on runtime behavior, external systems, or code you cannot locate with
+        confidence). Explain why in `note`. Doubt lands here, never in FALSE.
+    prompt: |
+      Repository: {{project_dir}}
+
+      Verify this single finding:
+      {{finding}}
+    tools:
+      - fs_read
+      - fs_cat
+      - fs_grep
+    max_iterations: 8
+    max_attempts: 2
+    temperature: 0.1
+    output_schema:
+      type: object
+      properties:
+        id:
+          type: string
+          description: The finding's id, echoed back verbatim.
+        verdict:
+          type: string
+          enum: [VERIFIED, FALSE, UNVERIFIABLE]
+        evidence:
+          type: string
+          description: Verbatim quoted line(s) with path:line. Required for VERIFIED and FALSE; empty for UNVERIFIABLE.
+        note:
+          type: string
+          description: One line — for FALSE the disproof in words, for UNVERIFIABLE why it could not be established. Empty otherwise.
+      required: [id, verdict, evidence, note]
+
+  done:
+    id: done
+    type: end
+    output: |
+      FINDING_VERIFIER_RESULTS
+      (verdict semantics for the caller: VERIFIED = keep the finding and paste its evidence
+      quote into the Description; FALSE = drop the finding and tally it in the footer;
+      UNVERIFIABLE = keep the finding, marked unverified. Severities are never rewritten.)
+
+      {{verdicts}}

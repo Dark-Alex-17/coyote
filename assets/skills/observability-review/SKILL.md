@@ -68,5 +68,13 @@ For inapplicable changes the whole block collapses to: `## Observability` / `Not
 - **Invented thresholds.** A threshold with no baseline is a guess; either ground it in observed data (existing dashboards, load expectations stated in the change) or mark it explicitly as "start here, tune after N days".
 - **Duplicating existing coverage** because you only grepped for one spelling of the metric — inventory first, propose second.
 - **Metrics nobody will chart.** Each proposed metric names who would look at it and when. "Might be useful" is not a consumer.
+- **Per-verb metric families.** Sibling metrics differing only by an operation verb
+  (`thing_create_total`, `thing_update_total`, `thing_delete_total`) fragment dashboards and
+  alerts; the idiomatic shape is ONE family with an `operation` (and `outcome`) label. Flag the
+  family split — bounded label values, so cardinality stays sane (the unbounded-label check is
+  separate and still applies).
+- **Telemetry outside its feature flag.** A change that gates behavior behind a flag but
+  records the behavior's metrics/logs unconditionally reports activity that isn't happening
+  (or leaks rollout state); gate the telemetry with the behavior.
 - **Blocking on this pass.** It is advisory: produce the artifact, attach it, move on. The only failure mode is skipping the pass on a change that added operational surface.
 - **Touching external alerting systems.** Recommendations only; live systems belong to humans and their change control.
