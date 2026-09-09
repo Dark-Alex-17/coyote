@@ -415,11 +415,7 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                         user_parts.push(json!({
                             "toolResult": {
                                 "toolUseId": tool_result.call.id,
-                                "content": [
-                                    {
-                                        "json": tool_result.output,
-                                    }
-                                ]
+                                "content": [bedrock_tool_result_content(&tool_result.output)]
                             }
                         }));
                     }
@@ -489,6 +485,14 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
         })
     }
     Ok(body)
+}
+
+fn bedrock_tool_result_content(output: &Value) -> Value {
+    match output {
+        Value::Object(_) => json!({ "json": output }),
+        Value::String(text) => json!({ "text": text }),
+        _ => json!({ "text": output.to_string() }),
+    }
 }
 
 fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
@@ -652,4 +656,76 @@ fn gen_signing_key(key: &str, date_stamp: &str, region: &str, service: &str) -> 
     let k_region = hmac_sha256(&k_date, region);
     let k_service = hmac_sha256(&k_region, service);
     hmac_sha256(&k_service, "aws4_request")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::function::{ToolCall, ToolResult};
+
+    fn tool_result(output: Value) -> ToolResult {
+        ToolResult {
+            call: ToolCall::new(
+                "fs_read".into(),
+                json!({"path": "x"}),
+                Some("tool_A".into()),
+            ),
+            output,
+            text: None,
+            thinking: vec![],
+        }
+    }
+
+    fn tool_result_content_block(output: Value) -> Value {
+        let data = ChatCompletionsData {
+            messages: vec![
+                Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::ToolCalls(MessageContentToolCalls {
+                        tool_results: vec![tool_result(output)],
+                        text: String::new(),
+                        sequence: true,
+                    }),
+                ),
+            ],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream: false,
+        };
+        let body = build_chat_completions_body(data, &Model::new("bedrock", "test")).unwrap();
+        body["messages"][2]["content"][0]["toolResult"]["content"][0].clone()
+    }
+
+    #[test]
+    fn test_bedrock_tool_result_object_uses_json_block() {
+        assert_eq!(
+            tool_result_content_block(json!({"output": "ok"})),
+            json!({"json": {"output": "ok"}})
+        );
+        assert_eq!(tool_result_content_block(json!({})), json!({"json": {}}));
+    }
+
+    #[test]
+    fn test_bedrock_tool_result_array_uses_text_block() {
+        assert_eq!(
+            tool_result_content_block(json!([{"id": 1}, {"id": 2}])),
+            json!({"text": "[{\"id\":1},{\"id\":2}]"})
+        );
+    }
+
+    #[test]
+    fn test_bedrock_tool_result_scalars_use_text_block() {
+        assert_eq!(
+            tool_result_content_block(json!("plain text")),
+            json!({"text": "plain text"})
+        );
+        assert_eq!(tool_result_content_block(json!(42)), json!({"text": "42"}));
+        assert_eq!(
+            tool_result_content_block(json!(null)),
+            json!({"text": "null"})
+        );
+    }
 }
