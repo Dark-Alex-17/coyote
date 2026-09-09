@@ -835,7 +835,7 @@ fn default_max_concurrent_agents() -> usize {
     4
 }
 
-fn default_max_agent_depth() -> usize {
+pub(crate) fn default_max_agent_depth() -> usize {
     3
 }
 
@@ -878,10 +878,16 @@ impl AgentConfig {
             skill_instructions: graph.skill_instructions.clone(),
             conversation_starters: graph.conversation_starters.clone(),
             variables: graph.variables.clone(),
-            can_spawn_agents: graph.has_agent_node(),
-            max_concurrent_agents: default_max_concurrent_agents(),
+            can_spawn_agents: graph
+                .can_spawn_agents
+                .unwrap_or_else(|| graph.has_agent_node()),
+            max_concurrent_agents: graph
+                .max_concurrent_agents
+                .unwrap_or_else(default_max_concurrent_agents),
             max_concurrent_jobs: graph.max_concurrent_jobs,
-            max_agent_depth: default_max_agent_depth(),
+            max_agent_depth: graph
+                .max_agent_depth
+                .unwrap_or_else(default_max_agent_depth),
             escalation_timeout: default_escalation_timeout(),
             ..AgentConfig::default()
         }
@@ -1458,6 +1464,67 @@ variables:
         );
         assert_eq!(config.max_agent_depth, default_max_agent_depth());
         assert_eq!(config.escalation_timeout, default_escalation_timeout());
+    }
+
+    #[test]
+    fn from_graph_explicit_can_spawn_agents_enables_spawning_without_agent_nodes() {
+        let yaml = formatdoc! {r#"
+            name: g
+            can_spawn_agents: true
+            start: x
+            nodes:
+              x:
+                id: x
+                type: end
+                output: ok
+            "#};
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+
+        assert!(AgentConfig::from_graph("d", &graph).can_spawn_agents);
+    }
+
+    #[test]
+    fn from_graph_explicit_can_spawn_agents_false_wins_over_agent_nodes() {
+        let yaml = formatdoc! {r#"
+            name: g
+            can_spawn_agents: false
+            start: a
+            nodes:
+              a:
+                id: a
+                type: agent
+                agent: helper
+                prompt: hi
+                next: e
+              e:
+                id: e
+                type: end
+                output: done
+            "#};
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+
+        assert!(!AgentConfig::from_graph("d", &graph).can_spawn_agents);
+    }
+
+    #[test]
+    fn from_graph_propagates_explicit_agent_limits() {
+        let yaml = formatdoc! {r#"
+            name: g
+            max_concurrent_agents: 7
+            max_agent_depth: 3
+            start: x
+            nodes:
+              x:
+                id: x
+                type: end
+                output: ok
+            "#};
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+
+        let config = AgentConfig::from_graph("d", &graph);
+
+        assert_eq!(config.max_concurrent_agents, 7);
+        assert_eq!(config.max_agent_depth, 3);
     }
 
     #[test]

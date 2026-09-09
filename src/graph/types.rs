@@ -31,6 +31,15 @@ pub struct Graph {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_jobs: Option<usize>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_spawn_agents: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_agents: Option<usize>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_agent_depth: Option<usize>,
+
     #[serde(default)]
     pub global_tools: Vec<String>,
 
@@ -946,9 +955,32 @@ nodes:
         assert!(graph.temperature.is_none());
         assert!(graph.top_p.is_none());
         assert!(graph.max_concurrent_jobs.is_none());
+        assert!(graph.can_spawn_agents.is_none());
+        assert!(graph.max_concurrent_agents.is_none());
+        assert!(graph.max_agent_depth.is_none());
         assert!(graph.global_tools.is_empty());
         assert!(graph.mcp_servers.is_empty());
         assert!(graph.conversation_starters.is_empty());
+    }
+
+    #[test]
+    fn graph_parses_agent_orchestration_keys() {
+        let yaml = r#"
+name: g
+can_spawn_agents: true
+max_concurrent_agents: 6
+max_agent_depth: 2
+start: x
+nodes:
+  x:
+    id: x
+    type: end
+    output: ok
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(graph.can_spawn_agents, Some(true));
+        assert_eq!(graph.max_concurrent_agents, Some(6));
+        assert_eq!(graph.max_agent_depth, Some(2));
     }
 
     #[test]
