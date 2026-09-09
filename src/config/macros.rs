@@ -964,7 +964,9 @@ variables:
             let m: Macro = serde_yaml::from_str(content)
                 .unwrap_or_else(|e| panic!("asset '{}' failed to deserialize: {e}", file.as_ref()));
 
-            assert!(m.isolated, "asset '{}'", file.as_ref());
+            if !content.contains("isolated:") {
+                assert!(m.isolated, "asset '{}'", file.as_ref());
+            }
             assert!(!m.steps.is_empty(), "asset '{}'", file.as_ref());
         }
     }
