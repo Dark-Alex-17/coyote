@@ -21,7 +21,7 @@ pub const INPUT_PLACEHOLDER: &str = "__INPUT__";
 struct RolesAsset;
 
 static RE_METADATA: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)-{3,}\s*(.*?)\s*-{3,}\s*(.*)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?s)\A\s*-{3,}\s*(.*?)\s*-{3,}\s*(.*)").unwrap());
 
 pub trait RoleLike {
     fn to_role(&self) -> Role;
@@ -111,8 +111,15 @@ impl Role {
         if let Ok(Some(caps)) = RE_METADATA.captures(content)
             && let (Some(metadata_value), Some(prompt_value)) = (caps.get(1), caps.get(2))
         {
-            metadata = metadata_value.as_str().trim();
-            prompt = prompt_value.as_str().trim();
+            let candidate = metadata_value.as_str().trim();
+            if candidate.is_empty()
+                || serde_yaml::from_str::<Value>(candidate)
+                    .map(|v| v.is_object())
+                    .unwrap_or(false)
+            {
+                metadata = candidate;
+                prompt = prompt_value.as_str().trim();
+            }
         }
         let mut prompt = prompt.to_string();
         interpolate_variables(&mut prompt);
@@ -643,6 +650,40 @@ mod tests {
         assert_eq!(role.top_p(), None);
         assert_eq!(role.enabled_tools(), None);
         assert_eq!(role.enabled_mcp_servers(), None);
+    }
+
+    #[test]
+    fn role_new_keeps_prompt_containing_markdown_table_separator() {
+        let content = "You review PRs.\nThe PR: <url>\n\n| Lane | Verdict |\n|------|---------|\n| code-reviewer | PASS |";
+
+        let role = Role::new("test", content);
+
+        assert_eq!(role.prompt(), content);
+        assert_eq!(role.model_id(), None);
+    }
+
+    #[test]
+    fn role_new_parses_metadata_with_table_separator_in_prompt() {
+        let content =
+            "---\nmodel: openai:gpt-4\n---\nIntro kept\n\n| a | b |\n|---|---|\n| 1 | 2 |";
+
+        let role = Role::new("test", content);
+
+        assert_eq!(role.model_id(), Some("openai:gpt-4"));
+        assert_eq!(
+            role.prompt(),
+            "Intro kept\n\n| a | b |\n|---|---|\n| 1 | 2 |"
+        );
+    }
+
+    #[test]
+    fn role_new_leading_dash_decoration_is_not_metadata() {
+        let content = "--- IMPORTANT ---\nDo the thing";
+
+        let role = Role::new("test", content);
+
+        assert_eq!(role.prompt(), content);
+        assert_eq!(role.model_id(), None);
     }
 
     #[test]
