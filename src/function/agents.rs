@@ -2,10 +2,10 @@ use super::todo::TODO_FUNCTION_PREFIX;
 use super::{FunctionDeclaration, JsonSchema};
 use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::{
-    Agent, AppState, Input, RequestContext, Role, RoleLike, effective_max_concurrent_jobs,
-    jobs_enabled, list_agents_with_descriptions,
+    Agent, AppState, Input, RequestContext, Role, RoleLike, default_max_agent_depth,
+    effective_max_concurrent_jobs, jobs_enabled, list_agents_with_descriptions,
 };
-use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
+use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
 use crate::supervisor::notification::agent_notification;
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor, TaskKind};
 use crate::utils::{AbortSignal, create_abort_signal, wait_abort_signal, wait_user_interrupt};
@@ -314,8 +314,10 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
         FunctionDeclaration {
             name: format!("{AGENT_FUNCTION_PREFIX}list_running"),
             description: "List all subagents YOU have spawned that are still tracked by the supervisor, with their \
-                          status. Use this to see which of your background agents are still active. To discover which \
-                          agent types you can spawn in the first place, use `agent__list_available` instead.".to_string(),
+                          status. Use this to see which of your background agents are still active. When you run with \
+                          concurrent teammates, they appear in a separate `peers` section (message-only, not \
+                          collectible). To discover which agent types you can spawn in the first place, use \
+                          `agent__list_available` instead.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::new()),
@@ -466,7 +468,7 @@ pub fn teammate_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
         FunctionDeclaration {
             name: format!("{AGENT_FUNCTION_PREFIX}send_message"),
-            description: "Send a text message to another agent's inbox: a child or sibling by its agent id, or your parent via the reserved id 'parent'. Use to share cross-cutting findings or coordinate with teammates.".to_string(),
+            description: "Send a text message to another agent's inbox: a child, sibling, or concurrent teammate by its agent id, or your parent via the reserved id 'parent'. Use to share cross-cutting findings or coordinate with teammates.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([
@@ -474,7 +476,7 @@ pub fn teammate_function_declarations() -> Vec<FunctionDeclaration> {
                         "id".to_string(),
                         JsonSchema {
                             type_value: Some("string".to_string()),
-                            description: Some("The target agent ID, or the reserved id 'parent' to message the agent that spawned you".into()),
+                            description: Some("The target agent ID (including teammate peer ids), or the reserved id 'parent' to message the agent that spawned you".into()),
                             ..Default::default()
                         },
                     ),
@@ -494,7 +496,7 @@ pub fn teammate_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{AGENT_FUNCTION_PREFIX}check_inbox"),
-            description: "Check for and drain all pending messages in your inbox from sibling agents or your parent.".to_string(),
+            description: "Check for and drain all pending messages in your inbox from sibling agents, concurrent teammates, or your parent.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::new()),
@@ -636,6 +638,49 @@ fn todo_continuation_prompt(ctx: &mut RequestContext) -> Option<String> {
     Some(format!("{prompt}\n\n{}", ctx.todo_list.render_for_model()))
 }
 
+fn render_teammate_roster(self_id: &str, registry: &PeerRegistry) -> String {
+    let mut own_label = None;
+    let mut lines = Vec::new();
+
+    for (id, label) in registry.roster() {
+        if id == self_id {
+            own_label = Some(label);
+        } else {
+            lines.push(format!("- `{id}` — {label}"));
+        }
+    }
+
+    let own = own_label.map(|l| format!(" ({l})")).unwrap_or_default();
+
+    format!(
+        "## Teammate roster\nYou are `{self_id}`{own}. Concurrent teammates:\n{}\n\nMessage a teammate directly via `agent__send_message` when you find something relevant to their slice; check `agent__check_inbox` after completing work phases and before finalizing. You can rediscover peers anytime via `agent__list_running`.",
+        lines.join("\n")
+    )
+}
+
+fn augment_prompt_with_roster(
+    prompt: &str,
+    registry: Option<&PeerRegistry>,
+    self_id: &str,
+) -> String {
+    match registry {
+        Some(registry) => format!("{prompt}\n\n{}", render_teammate_roster(self_id, registry)),
+        None => prompt.to_string(),
+    }
+}
+
+fn effective_max_agent_depth(parent_ctx: &RequestContext) -> usize {
+    if let Some(supervisor) = parent_ctx.supervisor.as_ref() {
+        return supervisor.read().max_depth();
+    }
+
+    parent_ctx
+        .agent
+        .as_ref()
+        .map(|agent| agent.max_agent_depth())
+        .unwrap_or_else(default_max_agent_depth)
+}
+
 /// Spawn an agent synchronously from a graph node and return its accumulated
 /// output. This is similar to `handle_spawn` but runs the child agent in the
 /// current task (no tokio::spawn, no supervisor handle registration) so the
@@ -645,22 +690,26 @@ pub async fn run_agent_for_graph(
     agent_name: &str,
     prompt: &str,
 ) -> Result<String> {
-    let short_uuid = &Uuid::new_v4().to_string()[..8];
-    let agent_id = format!("graph_agent_{agent_name}_{short_uuid}");
+    let peer_assignment = parent_ctx.peer_assignment.take();
+    let assigned_peer = peer_assignment.is_some();
+    let peer_registry = if assigned_peer {
+        parent_ctx.peer_registry.take()
+    } else {
+        None
+    };
+    let (agent_id, child_inbox) =
+        peer_assignment.unwrap_or_else(|| (graph_agent_id(agent_name), Arc::new(Inbox::new())));
     let current_depth = parent_ctx.current_depth + 1;
 
-    if let Some(supervisor) = parent_ctx.supervisor.as_ref().cloned() {
-        let max_depth = supervisor.read().max_depth();
-        if current_depth > max_depth {
-            bail!("Max agent depth exceeded ({current_depth}/{max_depth})");
-        }
+    let max_depth = effective_max_agent_depth(parent_ctx);
+    if current_depth > max_depth {
+        bail!("Max agent depth exceeded ({current_depth}/{max_depth})");
     }
 
     if !parent_ctx.app.config.function_calling_support {
         bail!("Function calling support must be enabled to spawn agents.");
     }
 
-    let child_inbox = Arc::new(Inbox::new());
     parent_ctx.ensure_root_escalation_queue();
     parent_ctx.ensure_inbox();
     let child_abort = create_abort_signal();
@@ -710,6 +759,9 @@ pub async fn run_agent_for_graph(
     );
     child_ctx.rag = agent.rag();
     child_ctx.agent = Some(agent);
+    if assigned_peer {
+        child_ctx.peer_registry = peer_registry.clone();
+    }
     if should_init_supervisor {
         child_ctx.supervisor = Some(Arc::new(RwLock::new(
             Supervisor::new(agent_max_concurrent_subagents, agent_max_depth)
@@ -729,11 +781,18 @@ pub async fn run_agent_for_graph(
         child_ctx.init_agent_shared_variables()?;
     }
 
-    let input = Input::from_str(&child_ctx, prompt, None)?;
+    let prompt = augment_prompt_with_roster(prompt, child_ctx.peer_registry.as_deref(), &agent_id);
+    let input = Input::from_str(&child_ctx, &prompt, None)?;
 
     debug!("Spawning agent '{agent_name}' for graph node as '{agent_id}'");
 
-    run_child_agent(child_ctx, input, child_abort).await
+    let result = run_child_agent(child_ctx, input, child_abort).await;
+
+    if let Some(registry) = &peer_registry {
+        registry.mark_finished(&agent_id);
+    }
+
+    result
 }
 
 async fn populate_agent_mcp_runtime(ctx: &mut RequestContext, server_ids: &[String]) -> Result<()> {
@@ -1171,31 +1230,59 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
 }
 
 fn handle_list_running(ctx: &mut RequestContext) -> Result<Value> {
-    let supervisor = ctx
-        .supervisor
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| anyhow!("No supervisor active"))?;
-    let sup = supervisor.read();
-
-    let agents: Vec<Value> = sup
-        .list_agents()
-        .into_iter()
-        .map(|(id, name)| {
-            let finished = sup.is_finished(id).unwrap_or(false);
-            json!({
-                "id": id,
-                "agent": name,
-                "status": if finished { "finished" } else { "running" },
+    let peers: Option<Vec<Value>> = ctx.peer_registry.as_ref().map(|registry| {
+        registry
+            .roster()
+            .into_iter()
+            .filter(|(id, _)| Some(id.as_str()) != ctx.self_agent_id.as_deref())
+            .map(|(id, label)| {
+                let status = if registry.is_finished(&id) {
+                    "finished"
+                } else {
+                    "running"
+                };
+                json!({ "id": id, "label": label, "kind": "peer", "status": status })
             })
-        })
-        .collect();
+            .collect()
+    });
 
-    Ok(json!({
-        "active_count": sup.active_count(),
-        "max_concurrent": sup.max_concurrent(),
-        "agents": agents,
-    }))
+    let supervisor = ctx.supervisor.as_ref().cloned();
+    if supervisor.is_none() && peers.is_none() {
+        return Err(anyhow!("No supervisor active"));
+    }
+
+    let mut result = match supervisor {
+        Some(supervisor) => {
+            let sup = supervisor.read();
+            let agents: Vec<Value> = sup
+                .list_agents()
+                .into_iter()
+                .map(|(id, name)| {
+                    let finished = sup.is_finished(id).unwrap_or(false);
+                    json!({
+                        "id": id,
+                        "agent": name,
+                        "status": if finished { "finished" } else { "running" },
+                    })
+                })
+                .collect();
+            json!({
+                "active_count": sup.active_count(),
+                "max_concurrent": sup.max_concurrent(),
+                "agents": agents,
+            })
+        }
+        None => json!({}),
+    };
+
+    if let Some(peers) = peers {
+        result["peers"] = Value::Array(peers);
+        result["peers_note"] = json!(
+            "Peers are concurrent teammates reachable via agent__send_message; they cannot be checked, collected, or cancelled."
+        );
+    }
+
+    Ok(result)
 }
 
 fn handle_list_available(ctx: &RequestContext) -> Result<Value> {
@@ -1348,6 +1435,25 @@ fn handle_send_message(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
         return Ok(json!({
             "status": "ok",
             "message": format!("Message delivered to agent '{id}'"),
+        }));
+    }
+
+    if let Some(registry) = ctx.peer_registry.as_ref()
+        && let Some(inbox) = registry.get(id)
+    {
+        if registry.is_finished(id) {
+            return Ok(json!({
+                "status": "error",
+                "message": format!(
+                    "Teammate '{id}' has already finished; message not delivered. \
+                     Its results flow through the graph's collected outputs."
+                ),
+            }));
+        }
+        deliver(&inbox, self_label);
+        return Ok(json!({
+            "status": "ok",
+            "message": format!("Message delivered to teammate '{id}'"),
         }));
     }
 
@@ -1693,18 +1799,64 @@ async fn summarize_output(ctx: &RequestContext, agent_name: &str, output: &str) 
 mod tests {
     use super::*;
     use crate::config::test_fixtures::{FixtureServer, fixture_runtime};
-    use crate::config::{AgentConfig, AppConfig, AppState, WorkingMode};
+    use crate::config::{AgentConfig, AppConfig, AppState, WorkingMode, paths};
     use crate::function::jobs::RingBuf;
     use crate::mcp::{McpServer, McpServersConfig, McpTransportType};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus};
+    use crate::utils::get_env_name;
     use parking_lot::Mutex;
     use serde_json::json;
     use serial_test::serial;
-    use std::mem;
+    use std::fs::{create_dir_all, remove_dir_all, write};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{env, mem};
 
     fn default_app_state() -> Arc<AppState> {
         Arc::new(AppState::test_default())
+    }
+
+    struct TestConfigDirGuard {
+        key: String,
+        previous: Option<std::ffi::OsString>,
+        path: PathBuf,
+    }
+
+    impl TestConfigDirGuard {
+        fn new() -> Self {
+            let key = get_env_name("config_dir");
+            let previous = env::var_os(&key);
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!("coyote-agents-tests-{unique}"));
+            create_dir_all(&path).unwrap();
+            unsafe {
+                env::set_var(&key, &path);
+            }
+            Self {
+                key,
+                previous,
+                path,
+            }
+        }
+    }
+
+    impl Drop for TestConfigDirGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                unsafe {
+                    env::set_var(&self.key, previous);
+                }
+            } else {
+                unsafe {
+                    env::remove_var(&self.key);
+                }
+            }
+            let _ = remove_dir_all(&self.path);
+        }
     }
 
     fn ctx_with_supervisor(max_concurrent: usize, max_depth: usize) -> RequestContext {
@@ -1714,6 +1866,57 @@ mod tests {
             max_depth,
         ))));
         ctx
+    }
+
+    #[test]
+    fn effective_max_agent_depth_prefers_supervisor() {
+        let ctx = ctx_with_supervisor(4, 7);
+        assert_eq!(effective_max_agent_depth(&ctx), 7);
+    }
+
+    #[test]
+    fn effective_max_agent_depth_falls_back_without_supervisor() {
+        let ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        assert!(ctx.supervisor.is_none());
+        assert!(ctx.agent.is_none());
+        assert_eq!(effective_max_agent_depth(&ctx), default_max_agent_depth());
+    }
+
+    #[test]
+    #[serial]
+    fn effective_max_agent_depth_uses_agent_limit_without_supervisor() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = format!(
+            "test_depth_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\nmax_agent_depth: 5\n"),
+        )
+        .unwrap();
+
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let app_config = Arc::clone(&ctx.app.config);
+        let model = ctx.current_model().clone();
+        let agent = run_async(Agent::init(
+            app_config.as_ref(),
+            ctx.app.as_ref(),
+            &model,
+            false,
+            &agent_name,
+            create_abort_signal(),
+        ))
+        .unwrap();
+        ctx.agent = Some(agent);
+
+        assert!(ctx.supervisor.is_none());
+        assert_eq!(effective_max_agent_depth(&ctx), 5);
     }
 
     fn auto_continue_ctx() -> RequestContext {
@@ -2043,6 +2246,68 @@ mod tests {
     }
 
     #[test]
+    fn handle_list_running_includes_peers_and_excludes_self() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        ctx.self_agent_id = Some("p_self".to_string());
+        let registry = Arc::new(PeerRegistry::new());
+        registry.insert("p_self".into(), "shards[0]".into(), Arc::new(Inbox::new()));
+        registry.insert("p_other".into(), "shards[1]".into(), Arc::new(Inbox::new()));
+        ctx.peer_registry = Some(registry);
+
+        let result = handle_list_running(&mut ctx).unwrap();
+
+        assert_eq!(result["active_count"], 0);
+        let peers = result["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["id"], "p_other");
+        assert_eq!(peers[0]["label"], "shards[1]");
+        assert_eq!(peers[0]["kind"], "peer");
+    }
+
+    #[test]
+    fn handle_list_running_peer_status_reflects_finished() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.self_agent_id = Some("p1".to_string());
+        let registry = Arc::new(PeerRegistry::new());
+        registry.insert("p1".into(), "shards[0]".into(), Arc::new(Inbox::new()));
+        registry.insert("p2".into(), "shards[1]".into(), Arc::new(Inbox::new()));
+        registry.insert("p3".into(), "shards[2]".into(), Arc::new(Inbox::new()));
+        registry.mark_finished("p3");
+        ctx.peer_registry = Some(registry);
+
+        let result = handle_list_running(&mut ctx).unwrap();
+
+        let peers = result["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0]["id"], "p2");
+        assert_eq!(peers[0]["status"], "running");
+        assert_eq!(peers[1]["id"], "p3");
+        assert_eq!(peers[1]["status"], "finished");
+    }
+
+    #[test]
+    fn handle_list_running_peers_without_supervisor() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.self_agent_id = Some("p_self".to_string());
+        let registry = Arc::new(PeerRegistry::new());
+        registry.insert("p_self".into(), "a".into(), Arc::new(Inbox::new()));
+        registry.insert("p_other".into(), "b".into(), Arc::new(Inbox::new()));
+        ctx.peer_registry = Some(registry);
+
+        let result = handle_list_running(&mut ctx).unwrap();
+
+        assert_eq!(result["peers"].as_array().unwrap().len(), 1);
+        assert!(result.get("agents").is_none());
+    }
+
+    #[test]
+    fn handle_list_running_no_peers_key_without_registry() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let result = handle_list_running(&mut ctx).unwrap();
+        assert!(result.get("peers").is_none());
+    }
+
+    #[test]
     fn handle_list_available_returns_shape() {
         let ctx = ctx_with_supervisor(4, 3);
 
@@ -2264,6 +2529,114 @@ mod tests {
         let msgs = inbox.drain();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].from, "agent_explore_sender");
+    }
+
+    #[test]
+    fn handle_send_message_resolves_teammate_peer_id() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.self_agent_id = Some("graph_agent_worker_aaaa1111".to_string());
+        let peer_inbox = Arc::new(Inbox::new());
+        let registry = Arc::new(PeerRegistry::new());
+        registry.insert(
+            "graph_agent_worker_bbbb2222".into(),
+            "shards[1]".into(),
+            Arc::clone(&peer_inbox),
+        );
+        ctx.peer_registry = Some(registry);
+
+        let result = handle_send_message(
+            &mut ctx,
+            &json!({"id": "graph_agent_worker_bbbb2222", "message": "hi peer"}),
+        )
+        .unwrap();
+        assert_eq!(result["status"], "ok");
+
+        let msgs = peer_inbox.drain();
+        assert_eq!(msgs.len(), 1);
+        // The sender's self_agent_id IS its peer id, so the recipient can
+        // reply symmetrically through the same registry.
+        assert_eq!(msgs[0].from, "graph_agent_worker_aaaa1111");
+        match &msgs[0].payload {
+            EnvelopePayload::Text { content } => assert_eq!(content, "hi peer"),
+            _ => panic!("expected text payload"),
+        }
+    }
+
+    #[test]
+    fn handle_send_message_to_finished_teammate_errors() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.self_agent_id = Some("graph_agent_worker_aaaa1111".to_string());
+        let peer_inbox = Arc::new(Inbox::new());
+        let registry = Arc::new(PeerRegistry::new());
+        registry.insert(
+            "graph_agent_worker_bbbb2222".into(),
+            "shards[1]".into(),
+            Arc::clone(&peer_inbox),
+        );
+        registry.mark_finished("graph_agent_worker_bbbb2222");
+        ctx.peer_registry = Some(registry);
+
+        let result = handle_send_message(
+            &mut ctx,
+            &json!({"id": "graph_agent_worker_bbbb2222", "message": "hi peer"}),
+        )
+        .unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("has already finished; message not delivered"),
+            "{result}"
+        );
+        assert!(peer_inbox.drain().is_empty());
+    }
+
+    #[test]
+    fn handle_send_message_unknown_id_with_peer_registry_errors() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.peer_registry = Some(Arc::new(PeerRegistry::new()));
+        let result =
+            handle_send_message(&mut ctx, &json!({"id": "missing", "message": "hi"})).unwrap();
+        assert_eq!(result["status"], "error");
+    }
+
+    #[test]
+    fn teammate_roster_excludes_self_and_includes_labels() {
+        let registry = PeerRegistry::new();
+        registry.insert("p1".into(), "shards[0]".into(), Arc::new(Inbox::new()));
+        registry.insert("p2".into(), "shards[1]".into(), Arc::new(Inbox::new()));
+        registry.insert("p3".into(), "shards[2]".into(), Arc::new(Inbox::new()));
+
+        let roster = render_teammate_roster("p2", &registry);
+
+        assert!(roster.contains("You are `p2` (shards[1])"), "{roster}");
+        assert!(roster.contains("- `p1` — shards[0]"), "{roster}");
+        assert!(roster.contains("- `p3` — shards[2]"), "{roster}");
+        assert!(!roster.contains("- `p2`"), "{roster}");
+    }
+
+    #[test]
+    fn augment_prompt_with_roster_appends_non_self_peers() {
+        let registry = PeerRegistry::new();
+        registry.insert("p1".into(), "shards[0]".into(), Arc::new(Inbox::new()));
+        registry.insert("p2".into(), "shards[1]".into(), Arc::new(Inbox::new()));
+
+        let prompt = augment_prompt_with_roster("do the work", Some(&registry), "p1");
+
+        assert!(prompt.starts_with("do the work\n\n"), "{prompt}");
+        assert!(prompt.contains("You are `p1` (shards[0])"), "{prompt}");
+        assert!(prompt.contains("- `p2` — shards[1]"), "{prompt}");
+        assert!(!prompt.contains("- `p1`"), "{prompt}");
+    }
+
+    #[test]
+    fn augment_prompt_without_registry_is_unchanged() {
+        assert_eq!(
+            augment_prompt_with_roster("do the work", None, "p1"),
+            "do the work"
+        );
     }
 
     #[test]

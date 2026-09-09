@@ -25,6 +25,7 @@ mod update;
 
 #[cfg(test)]
 pub(crate) use self::agent::AgentConfig;
+pub(crate) use self::agent::default_max_agent_depth;
 pub use self::agent::{
     Agent, AgentVariable, AgentVariables, complete_agent_variables, list_agents,
     list_agents_with_descriptions,

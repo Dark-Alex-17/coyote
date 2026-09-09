@@ -1,4 +1,6 @@
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
@@ -57,6 +59,79 @@ impl Clone for Inbox {
             messages: parking_lot::Mutex::new(messages),
         }
     }
+}
+
+pub struct PeerEntry {
+    pub label: String,
+    pub inbox: Arc<Inbox>,
+    pub finished: bool,
+}
+
+/// A pre-provisioned teammate identity: the routable peer id and the inbox
+/// registered for it in a `PeerRegistry`.
+pub type PeerAssignment = (String, Arc<Inbox>);
+
+/// Messaging-only directory of concurrent sibling agents ("teammates").
+/// Entries carry no lifecycle semantics: peers are never supervised,
+/// checked, or collected. The registry only routes `agent__send_message`
+/// and answers roster queries, and it dies when the fan-out's Arcs drop.
+#[derive(Default)]
+pub struct PeerRegistry {
+    entries: parking_lot::RwLock<IndexMap<String, PeerEntry>>,
+}
+
+impl PeerRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&self, id: String, label: String, inbox: Arc<Inbox>) {
+        let replaced = self.entries.write().insert(
+            id.clone(),
+            PeerEntry {
+                label,
+                inbox,
+                finished: false,
+            },
+        );
+        debug_assert!(
+            replaced.is_none(),
+            "peer id '{id}' registered twice; short-uuid collision or duplicate insert"
+        );
+    }
+
+    pub fn get(&self, id: &str) -> Option<Arc<Inbox>> {
+        self.entries
+            .read()
+            .get(id)
+            .map(|entry| Arc::clone(&entry.inbox))
+    }
+
+    pub fn mark_finished(&self, id: &str) {
+        if let Some(entry) = self.entries.write().get_mut(id) {
+            entry.finished = true;
+        }
+    }
+
+    pub fn is_finished(&self, id: &str) -> bool {
+        self.entries
+            .read()
+            .get(id)
+            .is_some_and(|entry| entry.finished)
+    }
+
+    pub fn roster(&self) -> Vec<(String, String)> {
+        self.entries
+            .read()
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.label.clone()))
+            .collect()
+    }
+}
+
+pub fn graph_agent_id(agent_name: &str) -> String {
+    let short_uuid = &uuid::Uuid::new_v4().to_string()[..8];
+    format!("graph_agent_{agent_name}_{short_uuid}")
 }
 
 #[cfg(test)]
@@ -175,5 +250,55 @@ mod tests {
             inbox.deliver(text_envelope("a", "b", &format!("msg {i}")));
         }
         assert_eq!(inbox.drain().len(), 5);
+    }
+
+    #[test]
+    fn peer_registry_get_returns_inserted_inbox() {
+        let registry = PeerRegistry::new();
+        let inbox = Arc::new(Inbox::new());
+        registry.insert("p1".into(), "branch[0]".into(), Arc::clone(&inbox));
+
+        let found = registry.get("p1").expect("inserted peer should resolve");
+        assert!(Arc::ptr_eq(&found, &inbox));
+    }
+
+    #[test]
+    fn peer_registry_get_unknown_id_is_none() {
+        let registry = PeerRegistry::new();
+        registry.insert("p1".into(), "branch[0]".into(), Arc::new(Inbox::new()));
+
+        assert!(registry.get("missing").is_none());
+    }
+
+    #[test]
+    fn peer_registry_mark_finished_flips_state() {
+        let registry = PeerRegistry::new();
+        registry.insert("p1".into(), "branch[0]".into(), Arc::new(Inbox::new()));
+
+        assert!(!registry.is_finished("p1"));
+        registry.mark_finished("p1");
+        assert!(registry.is_finished("p1"));
+    }
+
+    #[test]
+    fn peer_registry_mark_finished_unknown_id_is_noop() {
+        let registry = PeerRegistry::new();
+        registry.mark_finished("missing");
+        assert!(!registry.is_finished("missing"));
+    }
+
+    #[test]
+    fn peer_registry_roster_preserves_insertion_order() {
+        let registry = PeerRegistry::new();
+        registry.insert("p1".into(), "branch[0]".into(), Arc::new(Inbox::new()));
+        registry.insert("p2".into(), "branch[1]".into(), Arc::new(Inbox::new()));
+
+        assert_eq!(
+            registry.roster(),
+            vec![
+                ("p1".to_string(), "branch[0]".to_string()),
+                ("p2".to_string(), "branch[1]".to_string()),
+            ]
+        );
     }
 }

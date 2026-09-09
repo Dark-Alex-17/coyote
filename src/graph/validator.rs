@@ -176,6 +176,7 @@ impl GraphValidator {
         self.validate_llm_nodes(graph, &mut result);
         self.validate_llm_skills(graph, &mut result);
         self.validate_max_concurrency(graph, &mut result);
+        self.validate_orchestration_limits(graph, &mut result);
         self.validate_map_branches(graph, &mut result);
         self.validate_parallel_user_interaction(graph, &mut result);
         self.validate_parallel_writes(graph, &mut result);
@@ -526,6 +527,23 @@ impl GraphValidator {
                      would deadlock the executor",
                 ));
             }
+        }
+    }
+
+    fn validate_orchestration_limits(&self, graph: &Graph, result: &mut ValidationResult) {
+        if graph.max_agent_depth == Some(0) {
+            result.warning(ValidationError::new(
+                "`max_agent_depth: 0` forbids spawning any sub-agent, so every \
+                 `agent` node and dynamic spawn will fail; remove the key or \
+                 set it >= 1",
+            ));
+        }
+        if graph.max_concurrent_agents == Some(0) {
+            result.warning(ValidationError::new(
+                "`max_concurrent_agents: 0` leaves no slot for any spawn to \
+                 acquire, so agent spawning deadlocks; remove the key or set \
+                 it >= 1",
+            ));
         }
     }
 
@@ -1027,6 +1045,9 @@ mod tests {
             top_p: None,
             reasoning_effort: None,
             max_concurrent_jobs: None,
+            can_spawn_agents: None,
+            max_concurrent_agents: None,
+            max_agent_depth: None,
             global_tools: Vec::new(),
             mcp_servers: Vec::new(),
             mcp_tools: None,
@@ -1637,6 +1658,7 @@ mod tests {
                 state_updates: None,
                 output_schema: None,
                 timeout: None,
+                teammates: false,
             }),
             next: next.map(NextTargets::from),
         }
@@ -2593,6 +2615,57 @@ mod tests {
                 .any(|e| e.message.contains("max_concurrency")),
             "default max_concurrency should not error: {:?}",
             result.errors
+        );
+    }
+
+    #[test]
+    fn zero_max_agent_depth_warns() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.max_agent_depth = Some(0);
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("`max_agent_depth: 0`")),
+            "expected max_agent_depth=0 warning: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn zero_max_concurrent_agents_warns() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.max_concurrent_agents = Some(0);
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("`max_concurrent_agents: 0`")),
+            "expected max_concurrent_agents=0 warning: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn unset_orchestration_limits_do_not_warn() {
+        let graph = graph_with(vec![("e", end_node("e"))], "e");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result.warnings.iter().any(|w| {
+                w.message.contains("max_agent_depth") || w.message.contains("max_concurrent_agents")
+            }),
+            "unset limits should not warn: {:?}",
+            result.warnings
         );
     }
 

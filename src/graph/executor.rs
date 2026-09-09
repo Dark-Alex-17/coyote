@@ -10,6 +10,7 @@ use super::types::{EndNode, Graph, Node, NodeType};
 use super::user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 use super::validator::{AgentValidationContext, GraphValidator};
 use crate::config::{RenderMode, RequestContext};
+use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::join_all;
@@ -160,6 +161,13 @@ impl GraphExecutor {
                 logger.super_step_start(&branches);
             }
 
+            // Pre-provision teammate identities for `teammates: true` agent
+            // nodes running concurrently in this super-step, before any branch
+            // starts, so an early finisher can message one still waiting on
+            // the semaphore. A lone flagged node has no peers.
+            let flagged = teammate_flagged_nodes(&graph, &frontier);
+            let (peer_registry, mut peer_assignments) = provision_frontier_peers(flagged);
+
             let mut branch_tasks = Vec::with_capacity(frontier_size);
             for node_id in &frontier {
                 let node = graph
@@ -171,6 +179,10 @@ impl GraphExecutor {
                 logger.node_start(&node, in_super_step);
                 let branch_state = state.fork_for_branch_state();
                 let mut branch_ctx = ctx.fork_for_branch();
+                if let Some(assignment) = peer_assignments.remove(node_id) {
+                    branch_ctx.peer_registry = peer_registry.clone();
+                    branch_ctx.peer_assignment = Some(assignment);
+                }
                 if in_super_step {
                     branch_ctx.render_mode = RenderMode::Silent;
                 }
@@ -355,6 +367,36 @@ fn sorted_frontier(frontier: &HashSet<String>) -> Vec<String> {
     v
 }
 
+fn teammate_flagged_nodes(graph: &Graph, frontier: &HashSet<String>) -> Vec<(String, String)> {
+    frontier
+        .iter()
+        .filter_map(
+            |node_id| match graph.get_node(node_id).map(|n| &n.node_type) {
+                Some(NodeType::Agent(n)) if n.teammates => Some((node_id.clone(), n.agent.clone())),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+fn provision_frontier_peers(
+    flagged: Vec<(String, String)>,
+) -> (Option<Arc<PeerRegistry>>, HashMap<String, PeerAssignment>) {
+    if flagged.len() < 2 {
+        return (None, HashMap::new());
+    }
+
+    let registry = Arc::new(PeerRegistry::new());
+    let mut assignments = HashMap::new();
+    for (node_id, agent_name) in flagged {
+        let id = graph_agent_id(&agent_name);
+        let inbox = Arc::new(Inbox::new());
+        registry.insert(id.clone(), node_id.clone(), Arc::clone(&inbox));
+        assignments.insert(node_id, (id, inbox));
+    }
+    (Some(registry), assignments)
+}
+
 pub(super) struct StepContext<'a> {
     pub graph: &'a Graph,
     pub script_executor: &'a ScriptExecutor,
@@ -475,7 +517,9 @@ fn apply_simple_state_updates(updates: Option<&HashMap<String, String>>, state: 
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::{AgentNode, GraphSettings};
     use super::*;
+    use indexmap::IndexMap;
     use serde_json::json;
 
     fn state_with(pairs: &[(&str, Value)]) -> StateManager {
@@ -556,6 +600,135 @@ mod tests {
         apply_simple_state_updates(Some(&updates), &mut state);
 
         assert_eq!(state.state().get("k"), Some(&json!("new-old")));
+    }
+
+    fn agent_node(id: &str, teammates: bool) -> Node {
+        Node {
+            id: id.into(),
+            description: String::new(),
+            node_type: NodeType::Agent(AgentNode {
+                agent: format!("{id}-agent"),
+                prompt: "p".into(),
+                state_updates: None,
+                output_schema: None,
+                timeout: None,
+                teammates,
+            }),
+            next: None,
+        }
+    }
+
+    fn terminal_node(id: &str) -> Node {
+        Node {
+            id: id.into(),
+            description: String::new(),
+            node_type: NodeType::End(EndNode {
+                output: String::new(),
+                state_updates: None,
+            }),
+            next: None,
+        }
+    }
+
+    fn graph_of(nodes: Vec<Node>) -> Graph {
+        let start = nodes[0].id.clone();
+        let mut map: IndexMap<String, Node> = IndexMap::new();
+        for node in nodes {
+            map.insert(node.id.clone(), node);
+        }
+
+        Graph {
+            name: "t".into(),
+            description: String::new(),
+            version: "1.0".into(),
+            model: None,
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            max_concurrent_jobs: None,
+            can_spawn_agents: None,
+            max_concurrent_agents: None,
+            max_agent_depth: None,
+            global_tools: Vec::new(),
+            mcp_servers: Vec::new(),
+            mcp_tools: None,
+            skills_enabled: None,
+            enabled_skills: None,
+            inject_skill_instructions: None,
+            skill_instructions: None,
+            conversation_starters: Vec::new(),
+            variables: Vec::new(),
+            settings: GraphSettings::default(),
+            initial_state: HashMap::new(),
+            reducers: HashMap::new(),
+            start,
+            nodes: map,
+        }
+    }
+
+    #[test]
+    fn teammate_flagged_nodes_selects_only_flagged_agent_nodes() {
+        let graph = graph_of(vec![
+            agent_node("a", true),
+            agent_node("b", true),
+            agent_node("c", false),
+            terminal_node("done"),
+        ]);
+        let frontier: HashSet<String> = ["a", "b", "c", "done"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut flagged = teammate_flagged_nodes(&graph, &frontier);
+        flagged.sort();
+
+        assert_eq!(
+            flagged,
+            vec![
+                ("a".to_string(), "a-agent".to_string()),
+                ("b".to_string(), "b-agent".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn provision_frontier_peers_two_flagged_share_one_registry() {
+        let flagged = vec![
+            ("a".to_string(), "worker".to_string()),
+            ("b".to_string(), "worker".to_string()),
+        ];
+
+        let (registry, assignments) = provision_frontier_peers(flagged);
+
+        let registry = registry.expect("two flagged nodes should get a registry");
+        assert_eq!(assignments.len(), 2);
+        let roster = registry.roster();
+        assert_eq!(roster.len(), 2);
+
+        let (id_a, inbox_a) = &assignments["a"];
+        let (id_b, _) = &assignments["b"];
+        assert_ne!(id_a, id_b);
+        let resolved = registry.get(id_a).expect("assigned id should resolve");
+        assert!(Arc::ptr_eq(&resolved, inbox_a));
+        assert!(roster.iter().any(|(id, label)| id == id_a && label == "a"));
+        assert!(roster.iter().any(|(id, label)| id == id_b && label == "b"));
+    }
+
+    #[test]
+    fn provision_frontier_peers_single_flagged_gets_no_registry() {
+        let (registry, assignments) =
+            provision_frontier_peers(vec![("a".to_string(), "worker".to_string())]);
+
+        assert!(registry.is_none());
+        assert!(assignments.is_empty());
+    }
+
+    #[test]
+    fn provision_frontier_peers_empty_frontier_gets_no_registry() {
+        let (registry, assignments) = provision_frontier_peers(Vec::new());
+
+        assert!(registry.is_none());
+        assert!(assignments.is_empty());
     }
 }
 

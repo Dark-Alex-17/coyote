@@ -113,6 +113,7 @@ mod tests {
             state_updates: updates,
             output_schema: None,
             timeout: None,
+            teammates: false,
         }
     }
 

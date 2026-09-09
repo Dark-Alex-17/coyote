@@ -239,6 +239,9 @@ pub struct AgentNode {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+
+    #[serde(default)]
+    pub teammates: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -542,6 +545,41 @@ nodes:
         match &node2.node_type {
             NodeType::End(end) => assert_eq!(end.output, "{{result}}"),
             _ => panic!("expected End variant"),
+        }
+    }
+
+    #[test]
+    fn agent_node_teammates_parses_and_defaults_false() {
+        let yaml = r#"
+name: g
+start: a
+nodes:
+  a:
+    id: a
+    type: agent
+    agent: helper
+    prompt: hi
+    teammates: true
+    next: b
+  b:
+    id: b
+    type: agent
+    agent: helper
+    prompt: hi
+    next: e
+  e:
+    id: e
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        match &graph.get_node("a").unwrap().node_type {
+            NodeType::Agent(n) => assert!(n.teammates),
+            _ => panic!("expected Agent variant"),
+        }
+        match &graph.get_node("b").unwrap().node_type {
+            NodeType::Agent(n) => assert!(!n.teammates),
+            _ => panic!("expected Agent variant"),
         }
     }
 

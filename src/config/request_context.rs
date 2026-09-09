@@ -35,7 +35,7 @@ use crate::mcp::{
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
-use crate::supervisor::mailbox::Inbox;
+use crate::supervisor::mailbox::{Inbox, PeerRegistry};
 use crate::supervisor::notification::NotificationQueue;
 use crate::utils::{
     AbortSignal, abortable_run_with_spinner, edit_file, fuzzy_filter, get_env_name,
@@ -328,6 +328,13 @@ pub struct RequestContext {
     pub self_agent_id: Option<String>,
     pub inbox: Option<Arc<Inbox>>,
     pub parent_inbox: Option<Arc<Inbox>>,
+    /// Directory of concurrent teammates for `teammates: true` graph fan-outs.
+    /// Never inherited: fork sites and `run_agent_for_graph` propagate it
+    /// explicitly so it cannot leak into nested fan-outs or spawned children.
+    pub peer_registry: Option<Arc<PeerRegistry>>,
+    /// Pre-provisioned (agent id, inbox) for the sub-agent this branch context
+    /// will run, consumed by `run_agent_for_graph`.
+    pub peer_assignment: Option<(String, Arc<Inbox>)>,
     pub escalation_queue: Option<Arc<EscalationQueue>>,
     pub notification_queue: Arc<NotificationQueue>,
     pub current_depth: usize,
@@ -369,6 +376,8 @@ impl RequestContext {
             self_agent_id: None,
             inbox: None,
             parent_inbox: None,
+            peer_registry: None,
+            peer_assignment: None,
             escalation_queue: None,
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
@@ -435,6 +444,8 @@ impl RequestContext {
             self_agent_id: None,
             inbox: None,
             parent_inbox: None,
+            peer_registry: None,
+            peer_assignment: None,
             escalation_queue: None,
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth: 0,
@@ -490,6 +501,8 @@ impl RequestContext {
             self_agent_id: self.self_agent_id.clone(),
             inbox: self.inbox.clone(),
             parent_inbox: self.parent_inbox.clone(),
+            peer_registry: None,
+            peer_assignment: None,
             escalation_queue: self.escalation_queue.clone(),
             notification_queue: self.notification_queue.clone(),
             current_depth: self.current_depth,
@@ -541,6 +554,8 @@ impl RequestContext {
             self_agent_id: Some(self_agent_id),
             inbox: Some(inbox),
             parent_inbox: parent.inbox.clone(),
+            peer_registry: None,
+            peer_assignment: None,
             escalation_queue: parent.escalation_queue.clone(),
             notification_queue: Arc::new(NotificationQueue::new()),
             current_depth,
@@ -6038,6 +6053,40 @@ mod tests {
         let child_parent_inbox = child.parent_inbox.expect("child should see parent's inbox");
 
         assert!(Arc::ptr_eq(&parent_inbox, &child_parent_inbox));
+    }
+
+    #[test]
+    fn fork_for_branch_resets_peer_fields() {
+        let mut ctx = create_test_ctx();
+        ctx.peer_registry = Some(Arc::new(PeerRegistry::new()));
+        ctx.peer_assignment = Some(("graph_agent_a_1".to_string(), Arc::new(Inbox::new())));
+
+        let branch = ctx.fork_for_branch();
+
+        assert!(
+            branch.peer_registry.is_none() && branch.peer_assignment.is_none(),
+            "branches must not inherit peer identity; the executor provisions per-branch assignments"
+        );
+    }
+
+    #[test]
+    fn new_for_child_resets_peer_fields() {
+        let mut parent = create_test_ctx();
+        parent.peer_registry = Some(Arc::new(PeerRegistry::new()));
+        parent.peer_assignment = Some(("graph_agent_a_1".to_string(), Arc::new(Inbox::new())));
+
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+
+        assert!(
+            child.peer_registry.is_none() && child.peer_assignment.is_none(),
+            "children must not inherit the parent frontier's peer roster"
+        );
     }
 
     #[test]

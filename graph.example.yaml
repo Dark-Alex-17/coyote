@@ -334,6 +334,16 @@ nodes:
       Research {{topic}} in depth. Existing context:
       {{context}}
     timeout: 600               # Optional wall-clock cap, seconds. Default 300.
+    teammates: false           # Optional. When true and this node runs concurrently
+                               # with other flagged agent nodes (map fan-out branches
+                               # or the same super-step), the siblings can message
+                               # each other via agent__send_message / agent__check_inbox.
+                               # Each fan-out gets its OWN registry: a `teammates` map
+                               # fan-out and a `teammates` agent node in the same
+                               # super-step frontier form two separate teams and cannot
+                               # message each other. Peers only span a single map
+                               # node's branches or a single super-step's flagged
+                               # agent nodes.
     output_schema:             # Optional. Same extraction as llm nodes
       type: object
       properties:
