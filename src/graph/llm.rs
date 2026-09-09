@@ -1,4 +1,7 @@
 use super::state::StateManager;
+use super::state_updates;
+#[cfg(test)]
+use super::state_updates::OUTPUT_KEY;
 use super::structured;
 use super::types::LlmNode;
 use crate::client::{Model, ModelType, call_chat_completions};
@@ -17,8 +20,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
-
-const OUTPUT_KEY: &str = "output";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum LlmExecutionOutcome {
@@ -456,37 +457,12 @@ fn apply_state_updates_with_output(
     state_manager: &mut StateManager,
     output: &Value,
 ) {
-    if node.output_schema.is_some()
-        && let Some(obj) = output.as_object()
-    {
-        for (k, v) in obj {
-            state_manager.state_mut().set(k.clone(), v.clone());
-        }
-    }
-
-    let Some(updates) = &node.state_updates else {
-        return;
-    };
-    let prev_output = state_manager.state().get(OUTPUT_KEY).cloned();
-    state_manager
-        .state_mut()
-        .set(OUTPUT_KEY.into(), output.clone());
-
-    for (key, template) in updates {
-        let value = state_manager.interpolate_lenient(template);
-        state_manager
-            .state_mut()
-            .set(key.clone(), Value::String(value));
-    }
-
-    match prev_output {
-        Some(v) => state_manager.state_mut().set(OUTPUT_KEY.into(), v),
-        None => {
-            state_manager
-                .state_mut()
-                .set(OUTPUT_KEY.into(), Value::Null);
-        }
-    }
+    state_updates::apply(
+        state_manager,
+        output,
+        node.output_schema.is_some(),
+        node.state_updates.as_ref(),
+    );
 }
 
 fn format_schema_hint(schema: &Value) -> String {

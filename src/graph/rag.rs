@@ -1,4 +1,5 @@
 use super::state::StateManager;
+use super::state_updates;
 use super::types::RagNode;
 use crate::config::RequestContext;
 use crate::utils::create_abort_signal;
@@ -7,7 +8,6 @@ use serde_json::{Map, Value};
 use std::time::Duration;
 use tokio::time::timeout;
 
-const OUTPUT_KEY: &str = "output";
 const DEFAULT_QUERY: &str = "{{initial_prompt}}";
 const DEFAULT_RAG_TIMEOUT_SECS: u64 = 120;
 
@@ -70,27 +70,7 @@ fn build_rag_output(context: String, sources_str: &str) -> Value {
 }
 
 fn apply_state_updates(node: &RagNode, state_manager: &mut StateManager, output: &Value) {
-    let Some(updates) = &node.state_updates else {
-        return;
-    };
-    let prev_output = state_manager.state().get(OUTPUT_KEY).cloned();
-    state_manager
-        .state_mut()
-        .set(OUTPUT_KEY.into(), output.clone());
-
-    for (key, template) in updates {
-        let value = state_manager.interpolate_lenient(template);
-        state_manager
-            .state_mut()
-            .set(key.clone(), Value::String(value));
-    }
-
-    match prev_output {
-        Some(v) => state_manager.state_mut().set(OUTPUT_KEY.into(), v),
-        None => state_manager
-            .state_mut()
-            .set(OUTPUT_KEY.into(), Value::Null),
-    }
+    state_updates::apply(state_manager, output, false, node.state_updates.as_ref());
 }
 
 #[cfg(test)]
