@@ -129,6 +129,15 @@ nodes:
       - `UNVERIFIABLE` — you could not establish it either way (claim depends
         on runtime behavior, external systems, or code you cannot locate with
         confidence). Explain why in `note`. Doubt lands here, never in FALSE.
+
+      Output format — respond with ONLY this JSON object, no prose before or
+      after it:
+      {"id": "<the finding's id, echoed back verbatim>",
+       "verdict": "VERIFIED" | "FALSE" | "UNVERIFIABLE",
+       "evidence": "<verbatim quoted line(s) with path:line — required for
+      VERIFIED and FALSE, empty string for UNVERIFIABLE>",
+       "note": "<one line — for FALSE the disproof in words, for UNVERIFIABLE
+      why it could not be established; empty string otherwise>"}
     prompt: |
       Repository: {{project_dir}}
 
@@ -141,22 +150,6 @@ nodes:
     max_iterations: 8
     max_attempts: 2
     temperature: 0.1
-    output_schema:
-      type: object
-      properties:
-        id:
-          type: string
-          description: The finding's id, echoed back verbatim.
-        verdict:
-          type: string
-          enum: [VERIFIED, FALSE, UNVERIFIABLE]
-        evidence:
-          type: string
-          description: Verbatim quoted line(s) with path:line. Required for VERIFIED and FALSE; empty for UNVERIFIABLE.
-        note:
-          type: string
-          description: One line — for FALSE the disproof in words, for UNVERIFIABLE why it could not be established. Empty otherwise.
-      required: [id, verdict, evidence, note]
 
   done:
     id: done
