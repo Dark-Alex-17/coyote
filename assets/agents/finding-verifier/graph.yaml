@@ -95,6 +95,7 @@ nodes:
     as: finding
     branch: verify_one
     collect_into: verdicts
+    output_key: verdict
     max_concurrency: 4
     next: done
 
@@ -150,6 +151,8 @@ nodes:
     max_iterations: 8
     max_attempts: 2
     temperature: 0.1
+    state_updates:
+      verdict: "{{output}}"
 
   done:
     id: done

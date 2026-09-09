@@ -115,6 +115,7 @@ nodes:
     as: question
     branch: research_one_question
     collect_into: question_findings
+    output_key: finding
     max_concurrency: 3
     next: combine_findings
 
@@ -152,6 +153,8 @@ nodes:
     max_iterations: 10
     max_attempts: 2
     temperature: 0.1
+    state_updates:
+      finding: "{{output}}"
 
   combine_findings:
     id: combine_findings

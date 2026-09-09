@@ -387,7 +387,7 @@ nodes:
                                     # (not spawn-finish order).
     max_concurrency: 3          # Optional per-map cap. Defaults to
                                 # settings.max_concurrency above.
-    output_key: output          # Optional. State key the branch's output
+    output_key: subject_summary # Optional. State key the branch's output
                                 # appears under. Default "output". Useful
                                 # only if the branch reads its own bound
                                 # name back (rare).
@@ -403,8 +403,11 @@ nodes:
     prompt: "Research {{subject}}: pull the key facts and one citation."
     tools:
       - web_search_coyote
-    # No `next:`, `state_updates:`, or `output_schema:` here. Map branches
-    # have a strict contract (see `subjects_map.branch` comment).
+    # Recommended pattern: write the completion to a named key via
+    # `state_updates` and point the map's `output_key` at that same key.
+    # `{{output}}` is bound only while these templates render.
+    state_updates:
+      subject_summary: "{{output}}"
 
   # Aggregator that runs after the map joins. Reads the collected list.
   aggregate_subjects:
