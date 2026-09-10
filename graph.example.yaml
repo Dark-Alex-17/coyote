@@ -345,7 +345,7 @@ nodes:
     #                          # seeded from `prompt:`) and is rejected as an input key.
     #                          # `inputs:` on a config-only agent is a load-time error,
     #                          # and `inputs` values count as reads for the cross-branch
-    #                          # read check. See the wiki: Graph Agents → "Passing state
+    #                          # read check. See the wiki: Graph Agents -> "Passing state
     #                          # into a child graph agent (inputs)".
     timeout: 600               # Optional wall-clock cap, seconds. Default 300; 0 = no bound.
     teammates: false           # Optional. When true and this node runs concurrently
