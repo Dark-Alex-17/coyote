@@ -11,7 +11,7 @@ use crate::config::{
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::function::jobs::reap_jobs;
 use crate::function::skill::skill_function_declarations;
-use crate::utils::create_abort_signal;
+use crate::utils::AbortSignal;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use log::warn;
 use serde_json::Value;
@@ -33,8 +33,9 @@ impl LlmNodeExecutor {
         node: &LlmNode,
         state_manager: &mut StateManager,
         parent_ctx: &mut RequestContext,
+        abort: &AbortSignal,
     ) -> Result<LlmExecutionOutcome> {
-        let result = run(node_id, node, state_manager, parent_ctx).await;
+        let result = run(node_id, node, state_manager, parent_ctx, abort).await;
         let (output, failure_reason) = match result {
             Ok(raw) => match &node.output_schema {
                 Some(schema) => match structured::extract(&raw, schema, parent_ctx).await {
@@ -83,6 +84,7 @@ async fn run(
     node: &LlmNode,
     state_manager: &mut StateManager,
     parent_ctx: &mut RequestContext,
+    abort: &AbortSignal,
 ) -> Result<String> {
     let mut instructions: Option<String> = match &node.instructions {
         Some(s) => Some(
@@ -186,11 +188,11 @@ async fn run(
     );
     parent_ctx.refresh_mcp_tool_filters();
     let result = match node.timeout.and_then(wall_clock) {
-        Some(d) => match timeout(d, run_with_retries(node, &prompt, parent_ctx)).await {
+        Some(d) => match timeout(d, run_with_retries(node, &prompt, parent_ctx, abort)).await {
             Ok(r) => r,
             Err(_) => Err(anyhow!("llm node timed out after {}s", d.as_secs())),
         },
-        None => run_with_retries(node, &prompt, parent_ctx).await,
+        None => run_with_retries(node, &prompt, parent_ctx, abort).await,
     };
     parent_ctx.role = saved_role;
     let node_jobs =
@@ -242,10 +244,11 @@ async fn run_with_retries(
     node: &LlmNode,
     prompt: &str,
     ctx: &mut RequestContext,
+    abort: &AbortSignal,
 ) -> Result<String> {
     let mut last_err: Option<Error> = None;
     for attempt in 1..=node.max_attempts {
-        match run_chat_loop(node, prompt, ctx).await {
+        match run_chat_loop(node, prompt, ctx, abort).await {
             Ok(out) => return Ok(out),
             Err(e) if is_transient(&e) && attempt < node.max_attempts => {
                 warn!("llm node attempt {attempt} failed (transient): {e}; retrying");
@@ -262,8 +265,13 @@ pub(crate) fn is_last_turn(turn: u32, max_iterations: u32) -> bool {
     max_iterations > 0 && turn + 1 == max_iterations
 }
 
-async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -> Result<String> {
-    let abort = create_abort_signal();
+async fn run_chat_loop(
+    node: &LlmNode,
+    prompt: &str,
+    ctx: &mut RequestContext,
+    abort: &AbortSignal,
+) -> Result<String> {
+    let abort = abort.clone();
     let app_cfg = Arc::clone(&ctx.app.config);
     let role_for_input = ctx.role.clone();
     let mut input = Input::from_str(ctx, prompt, role_for_input)?;
@@ -271,6 +279,9 @@ async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -
 
     let mut turn: u32 = 0;
     loop {
+        if abort.aborted() {
+            bail!("llm node aborted");
+        }
         let client = input.create_client()?;
         ctx.before_chat_completion(&input)?;
         let (output, tool_results) =
@@ -474,6 +485,8 @@ mod tests {
     use super::super::state_updates::OUTPUT_KEY;
     use super::super::types::*;
     use super::*;
+    use crate::config::{Agent, AgentConfig, AppState, WorkingMode};
+    use crate::utils::create_abort_signal;
     use serde_json::json;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -753,5 +766,35 @@ mod tests {
         assert!(!is_last_turn(0, 0));
         assert!(!is_last_turn(9, 0));
         assert!(!is_last_turn(u32::MAX, 0));
+    }
+
+    /// The turn-top abort check runs before any client is created, so an
+    /// already-aborted graph never issues a model call and the node fails
+    /// with the abort reason rather than a connection error.
+    #[tokio::test]
+    async fn run_chat_loop_bails_before_first_call_when_aborted() {
+        let node = node_with(None);
+        let mut state = manager_with(&[]);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let abort = create_abort_signal();
+        abort.set_ctrlc();
+
+        let err = LlmNodeExecutor::execute("think", &node, &mut state, &mut ctx, &abort)
+            .await
+            .expect_err("a pre-set abort must fail the node");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(
+                "LLM node failed and no fallback declared: LLM call failed: llm node aborted"
+            ),
+            "{chain}"
+        );
+        assert_eq!(
+            state.state().get(OUTPUT_KEY),
+            None,
+            "no output is recorded for an aborted node without state_updates"
+        );
     }
 }

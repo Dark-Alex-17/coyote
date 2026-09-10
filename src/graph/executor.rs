@@ -580,7 +580,9 @@ pub(super) async fn step(
             Ok(StepResult::Continue(vec![next]))
         }
         NodeType::Llm(llm_node) => {
-            let outcome = LlmNodeExecutor::execute(current, llm_node, state, ctx).await?;
+            let outcome =
+                LlmNodeExecutor::execute(current, llm_node, state, ctx, step_ctx.abort_signal)
+                    .await?;
             let targets = match outcome {
                 LlmExecutionOutcome::Continue => {
                     static_next_targets(node, current, "llm", step_ctx.branch_mode)?

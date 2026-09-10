@@ -1684,6 +1684,7 @@ impl ToolCall {
                 agent_name,
                 ctx.app.config.tool_timeout,
                 quiet,
+                ctx.session_abort.clone(),
             ) {
                 Ok(Some(contents)) => serde_json::from_str(&contents)
                     .ok()
@@ -2293,6 +2294,7 @@ pub fn run_llm_function(
     agent_name: Option<String>,
     tool_timeout: Option<u64>,
     quiet: bool,
+    abort: Option<AbortSignal>,
 ) -> Result<Option<String>> {
     let mut bin_dirs: Vec<PathBuf> = vec![];
     let mut command_name = cmd_name.clone();
@@ -2439,6 +2441,21 @@ pub fn run_llm_function(
             debug!("Tool call error: {error_json:?}");
 
             return Ok(Some(error_json.to_string()));
+        }
+        if abort.as_ref().is_some_and(|a| a.aborted()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(stdout_thread);
+            drop(stderr_thread);
+            let tool_error_message = format!("Tool call '{command_name}' aborted");
+            emit_tool_warning(
+                quiet,
+                &format!("⚠️ {tool_error_message} ⚠️"),
+                &tool_error_message,
+            );
+            return Ok(Some(
+                json!({"tool_call_error": tool_error_message}).to_string(),
+            ));
         }
         thread::sleep(Duration::from_millis(100));
     };
@@ -4562,6 +4579,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap()
         .expect("nonzero exit must return an error payload");
@@ -4590,6 +4608,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap()
         .expect("nonzero exit must return an error payload");
@@ -4603,6 +4622,38 @@ mod tests {
         );
         assert_eq!(json["stderr"], "err-text");
         assert_eq!(json["output"], "partial-output\n");
+    }
+
+    /// An already-aborted signal is noticed on the first wait-loop poll, so a
+    /// tool that would run for seconds is killed and reported within one poll
+    /// interval instead of running to completion or `tool_timeout`.
+    #[cfg(unix)]
+    #[test]
+    fn run_llm_function_aborts_running_tool() {
+        if which::which("bash").is_err() {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let abort = create_abort_signal();
+        abort.set_ctrlc();
+
+        let started = Instant::now();
+        let result = run_llm_function(
+            "bash".into(),
+            vec!["-c".into(), "sleep 5".into()],
+            HashMap::new(),
+            None,
+            None,
+            true,
+            Some(abort),
+        )
+        .unwrap()
+        .expect("an aborted tool must return an error payload");
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["tool_call_error"], "Tool call 'bash' aborted");
     }
 
     #[test]
