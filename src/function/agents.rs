@@ -786,13 +786,7 @@ pub async fn run_agent_for_graph(
 
     debug!("Spawning agent '{agent_name}' for graph node as '{agent_id}'");
 
-    let result = run_child_agent(child_ctx, input, child_abort).await;
-
-    if let Some(registry) = &peer_registry {
-        registry.mark_finished(&agent_id);
-    }
-
-    result
+    run_child_agent(child_ctx, input, child_abort).await
 }
 
 async fn populate_agent_mcp_runtime(ctx: &mut RequestContext, server_ids: &[String]) -> Result<()> {

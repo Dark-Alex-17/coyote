@@ -179,10 +179,13 @@ impl GraphExecutor {
                 logger.node_start(&node, in_super_step);
                 let branch_state = state.fork_for_branch_state();
                 let mut branch_ctx = ctx.fork_for_branch();
+                let mut peer_id: Option<String> = None;
                 if let Some(assignment) = peer_assignments.remove(node_id) {
+                    peer_id = Some(assignment.0.clone());
                     branch_ctx.peer_registry = peer_registry.clone();
                     branch_ctx.peer_assignment = Some(assignment);
                 }
+                let registry_for_task = peer_registry.clone();
                 if in_super_step {
                     branch_ctx.render_mode = RenderMode::Silent;
                 }
@@ -216,12 +219,16 @@ impl GraphExecutor {
                     let mut state = branch_state;
                     let mut ctx = branch_ctx;
                     let step_ctx = StepContext {
-                        graph: graph_clone.as_ref(),
+                        graph: Arc::clone(&graph_clone),
                         script_executor: &script_exec_clone,
                         max_concurrency,
                         abort_signal: &abort_clone,
+                        branch_mode: false,
                     };
                     let result = step(&node, &mut state, &mut ctx, &step_ctx, &current).await;
+                    if let (Some(registry), Some(id)) = (&registry_for_task, &peer_id) {
+                        registry.mark_finished(id);
+                    }
                     let elapsed = node_start.elapsed();
                     match &result {
                         Ok(StepResult::Continue(targets)) => {
@@ -398,10 +405,11 @@ fn provision_frontier_peers(
 }
 
 pub(super) struct StepContext<'a> {
-    pub graph: &'a Graph,
+    pub graph: Arc<Graph>,
     pub script_executor: &'a ScriptExecutor,
     pub max_concurrency: usize,
     pub abort_signal: &'a AbortSignal,
+    pub branch_mode: bool,
 }
 
 impl StepContext<'_> {
@@ -410,7 +418,7 @@ impl StepContext<'_> {
     }
 }
 
-enum StepResult {
+pub(super) enum StepResult {
     // The set of next-node ids the executor should add to the next super-step's
     // frontier. A `Vec` of length 1 for sequential routing (default) and the
     // full target list for fan-out (`next: [a, b, ...]`). Dynamic single-route
@@ -420,7 +428,7 @@ enum StepResult {
     End(String),
 }
 
-async fn step(
+pub(super) async fn step(
     node: &Node,
     state: &mut StateManager,
     ctx: &mut RequestContext,
@@ -430,7 +438,7 @@ async fn step(
     match &node.node_type {
         NodeType::Agent(agent_node) => {
             AgentNodeExecutor::execute(agent_node, state, ctx).await?;
-            let targets = static_next_targets(node, current, "agent")?;
+            let targets = static_next_targets(node, current, "agent", step_ctx.branch_mode)?;
             Ok(StepResult::Continue(targets))
         }
         NodeType::Script(script_node) => {
@@ -452,7 +460,7 @@ async fn step(
             };
             let targets = match dynamic {
                 Some(n) => vec![n],
-                None => static_next_targets(node, current, "script")?,
+                None => static_next_targets(node, current, "script", step_ctx.branch_mode)?,
             };
             Ok(StepResult::Continue(targets))
         }
@@ -468,26 +476,38 @@ async fn step(
         NodeType::Llm(llm_node) => {
             let outcome = LlmNodeExecutor::execute(current, llm_node, state, ctx).await?;
             let targets = match outcome {
-                LlmExecutionOutcome::Continue => static_next_targets(node, current, "llm")?,
+                LlmExecutionOutcome::Continue => {
+                    static_next_targets(node, current, "llm", step_ctx.branch_mode)?
+                }
                 LlmExecutionOutcome::FellBack(target) => vec![target],
             };
             Ok(StepResult::Continue(targets))
         }
         NodeType::Rag(rag_node) => {
             RagNodeExecutor::execute(rag_node, current, state, ctx).await?;
-            let targets = static_next_targets(node, current, "rag")?;
+            let targets = static_next_targets(node, current, "rag", step_ctx.branch_mode)?;
             Ok(StepResult::Continue(targets))
         }
         NodeType::End(end_node) => Ok(StepResult::End(resolve_end_output(end_node, state))),
         NodeType::Map(map_node) => {
-            let targets = static_next_targets(node, current, "map")?;
+            let targets = static_next_targets(node, current, "map", step_ctx.branch_mode)?;
             MapNodeExecutor::execute(map_node, state, ctx, step_ctx, current).await?;
             Ok(StepResult::Continue(targets))
         }
     }
 }
 
-fn static_next_targets(node: &Node, current: &str, kind: &str) -> Result<Vec<String>> {
+/// Inside a map branch a node without `next` simply ends the item's chain; on
+/// the main flow it is a routing error.
+fn static_next_targets(
+    node: &Node,
+    current: &str,
+    kind: &str,
+    branch_mode: bool,
+) -> Result<Vec<String>> {
+    if node.next.is_none() && branch_mode {
+        return Ok(Vec::new());
+    }
     node.next
         .as_ref()
         .map(|t| t.as_slice().to_vec())

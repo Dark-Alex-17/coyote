@@ -862,6 +862,44 @@ fn find_reachable_nodes(graph: &Graph) -> HashSet<String> {
     reachable
 }
 
+/// Nodes reachable from `entry` over the edges a chain can follow at run
+/// time: `next` targets and script/llm `fallback`s. Approval routes and a
+/// nested map's `branch` are not followed — neither may appear inside a
+/// branch, and the validator reports them separately.
+pub(super) fn branch_subgraph(graph: &Graph, entry: &str) -> HashSet<String> {
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+
+    if !graph.has_node(entry) {
+        return reachable;
+    }
+
+    reachable.insert(entry.to_string());
+    queue.push_back(entry.to_string());
+
+    while let Some(id) = queue.pop_front() {
+        let Some(node) = graph.get_node(&id) else {
+            continue;
+        };
+        let mut edges: Vec<&String> = node
+            .next
+            .as_ref()
+            .map(|t| t.as_slice().iter().collect())
+            .unwrap_or_default();
+        match &node.node_type {
+            NodeType::Script(s) => edges.extend(s.fallback.as_ref()),
+            NodeType::Llm(l) => edges.extend(l.fallback.as_ref()),
+            _ => {}
+        }
+        for next in edges {
+            if graph.has_node(next) && reachable.insert(next.clone()) {
+                queue.push_back(next.clone());
+            }
+        }
+    }
+    reachable
+}
+
 // v1 parallel-group detection: only the immediate `next` targets of a fan-out node count as a parallel group. Map
 // branches are handled separately by `validate_map_branches` (the branch's self-parallelism is checked via strict-mode
 // rules on the branch node itself, not via group membership).

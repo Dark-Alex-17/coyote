@@ -517,6 +517,10 @@ impl GraphState {
         self.data.insert(key, value);
     }
 
+    pub fn remove(&mut self, key: &str) -> Option<Value> {
+        self.data.remove(key)
+    }
+
     pub fn merge(&mut self, json_obj: &serde_json::Map<String, Value>) {
         for (key, value) in json_obj {
             self.data.insert(key.clone(), value.clone());
