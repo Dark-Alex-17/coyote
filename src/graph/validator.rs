@@ -586,9 +586,10 @@ impl GraphValidator {
     }
 
     /// Explicit `0` opt-outs on `settings` and node bounds: a `timeout: 0`
-    /// disables the wall-clock bound and `max_loop_iterations: 0` disables the
-    /// per-node visit cap. Both are legal; the warnings only make the choice
-    /// visible.
+    /// disables the wall-clock bound, `max_loop_iterations: 0` disables the
+    /// per-node visit cap, and an llm node's `max_iterations: 0` disables its
+    /// tool-call-loop turn cap. All are legal; the warnings only make the
+    /// choice visible.
     fn validate_timeouts(&self, graph: &Graph, result: &mut ValidationResult) {
         if graph.settings.max_loop_iterations == 0 {
             result.warning(ValidationError::new(
@@ -604,6 +605,17 @@ impl GraphValidator {
             ));
         }
         for (node_id, node) in &graph.nodes {
+            if let NodeType::Llm(l) = &node.node_type
+                && l.max_iterations == 0
+            {
+                result.warning(ValidationError::with_node(
+                    node_id,
+                    format!(
+                        "max_iterations: 0 disables the turn cap for llm node '{node_id}'; it runs \
+                         until the model concludes, the context window fills, an enclosing timeout, or abort"
+                    ),
+                ));
+            }
             let kind = match &node.node_type {
                 NodeType::Agent(a) if a.timeout == Some(0) => "agent",
                 NodeType::Script(s) if s.timeout == 0 => "script",
@@ -3369,6 +3381,75 @@ mod tests {
             "non-zero cap should not warn: {:?}",
             result.warnings
         );
+    }
+
+    #[test]
+    fn llm_max_iterations_zero_warns() {
+        let mut l = llm_node("l", None, Some("end"));
+        if let NodeType::Llm(ref mut ln) = l.node_type {
+            ln.max_iterations = 0;
+        }
+        let graph = graph_with(vec![("l", l), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id.as_deref(), Some("l"));
+        assert_eq!(
+            w[0].message,
+            "max_iterations: 0 disables the turn cap for llm node 'l'; it runs until the model \
+             concludes, the context window fills, an enclosing timeout, or abort"
+        );
+    }
+
+    #[test]
+    fn llm_max_iterations_nonzero_does_not_warn() {
+        let graph = graph_with(
+            vec![
+                ("l", llm_node("l", None, Some("end"))),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("max_iterations: 0")),
+            "non-zero cap should not warn: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn llm_zero_cap_and_zero_timeout_warn_in_order() {
+        let mut l = llm_node("l", None, Some("end"));
+        if let NodeType::Llm(ref mut ln) = l.node_type {
+            ln.max_iterations = 0;
+            ln.timeout = Some(0);
+        }
+        let graph = graph_with(vec![("l", l), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 2, "{:?}", result.warnings);
+        assert!(
+            w[0].message
+                .starts_with("max_iterations: 0 disables the turn cap")
+        );
+        assert!(
+            w[1].message
+                .starts_with("timeout: 0 disables the wall-clock bound")
+        );
+        assert_eq!(w[0].node_id.as_deref(), Some("l"));
+        assert_eq!(w[1].node_id.as_deref(), Some("l"));
     }
 
     #[test]
