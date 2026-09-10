@@ -12,11 +12,12 @@ use super::validator::{AgentValidationContext, GraphValidator};
 use super::wall_clock;
 use crate::config::{RenderMode, RequestContext};
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
-use crate::utils::AbortSignal;
+use crate::utils::{AbortSignal, wait_abort_signal, wait_user_interrupt};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::join_all;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -110,6 +111,24 @@ impl GraphExecutor {
         let max_concurrency = graph.settings.max_concurrency;
         let graph = Arc::new(graph);
         let start = Instant::now();
+
+        // Maps a user interrupt (SIGINT, or the enclosing turn aborting) onto
+        // this run's abort flag for as long as the run lives. Without a
+        // session signal (ACP, bare executor) SIGINT handling is unchanged.
+        let _bridge = match ctx.session_abort.clone() {
+            Some(session) if session.aborted() => {
+                abort_signal.set_ctrlc();
+                None
+            }
+            Some(session) => {
+                let graph_abort = abort_signal.clone();
+                Some(TaskCancelGuard::spawn_one(async move {
+                    wait_user_interrupt(Some(&session)).await;
+                    graph_abort.set_ctrlc();
+                }))
+            }
+            None => None,
+        };
 
         let mut frontier: HashSet<String> = HashSet::from([graph.start.clone()]);
         logger.graph_start(&graph.start, graph.nodes.len());
@@ -222,6 +241,19 @@ impl GraphExecutor {
                 let observer = frontier_observer.clone();
 
                 let task = tokio::spawn(async move {
+                    // Retires the teammate identity however this task ends:
+                    // dropped explicitly right after step() on the normal
+                    // path, by unwinding on the abort return, task abort, or
+                    // panic.
+                    let retire =
+                        registry_for_task
+                            .zip(peer_id)
+                            .map(|(registry, id)| PeerRetireGuard {
+                                registry,
+                                id,
+                                #[cfg(test)]
+                                observer,
+                            });
                     let _permit = sem_clone
                         .acquire()
                         .await
@@ -252,13 +284,7 @@ impl GraphExecutor {
                         branch_mode: false,
                     };
                     let result = step(&node, &mut state, &mut ctx, &step_ctx, &current).await;
-                    if let (Some(registry), Some(id)) = (&registry_for_task, &peer_id) {
-                        registry.mark_finished(id);
-                        #[cfg(test)]
-                        if let Some(observe) = &observer {
-                            observe(registry, id);
-                        }
-                    }
+                    drop(retire);
                     let elapsed = node_start.elapsed();
                     match &result {
                         Ok(StepResult::Continue(targets)) => {
@@ -299,29 +325,34 @@ impl GraphExecutor {
                 branch_tasks.push(task);
             }
 
-            let joined = match graph_timeout {
-                Some(t) => {
-                    let remaining = t.saturating_sub(start.elapsed());
-                    let abort_handles: Vec<_> = branch_tasks
-                        .iter()
-                        .map(|task| task.abort_handle())
-                        .collect();
-                    match tokio::time::timeout(remaining, join_all(branch_tasks)).await {
-                        Ok(joined) => joined,
-                        Err(_) => {
-                            for handle in abort_handles {
-                                handle.abort();
-                            }
-                            bail!(
-                                "Graph '{}' timed out after {}s during super-step with frontier {:?}",
-                                graph.name,
-                                t.as_secs(),
-                                sorted_frontier(&frontier)
-                            );
-                        }
+            // Owns the branch tasks until the join completes: a timeout or
+            // abort bail drops it and cancels whatever is still in flight.
+            let _cancel = TaskCancelGuard::new(&branch_tasks);
+            let bounded_join = async {
+                match graph_timeout {
+                    Some(t) => {
+                        let remaining = t.saturating_sub(start.elapsed());
+                        tokio::time::timeout(remaining, join_all(branch_tasks))
+                            .await
+                            .map_err(|_| {
+                                anyhow!(
+                                    "Graph '{}' timed out after {}s during super-step with frontier {:?}",
+                                    graph.name,
+                                    t.as_secs(),
+                                    sorted_frontier(&frontier)
+                                )
+                            })
                     }
+                    None => Ok(join_all(branch_tasks).await),
                 }
-                None => join_all(branch_tasks).await,
+            };
+            let joined = tokio::select! {
+                joined = bounded_join => joined?,
+                _ = wait_abort_signal(&abort_signal) => bail!(
+                    "Graph '{}' aborted during super-step with frontier {:?}",
+                    graph.name,
+                    sorted_frontier(&frontier)
+                ),
             };
 
             let mut branch_writes: Vec<BranchWrites> = Vec::new();
@@ -432,6 +463,51 @@ fn provision_frontier_peers(
         assignments.insert(node_id, (id, inbox));
     }
     (Some(registry), assignments)
+}
+
+/// Aborts every owned task when dropped. Aborting a task that has already
+/// finished is a no-op, so the success path is unaffected.
+pub(super) struct TaskCancelGuard(Vec<tokio::task::AbortHandle>);
+
+impl TaskCancelGuard {
+    pub(super) fn new<T>(tasks: &[tokio::task::JoinHandle<T>]) -> Self {
+        Self(tasks.iter().map(|task| task.abort_handle()).collect())
+    }
+
+    pub(super) fn spawn_one<F>(fut: F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        Self(vec![tokio::spawn(fut).abort_handle()])
+    }
+}
+
+impl Drop for TaskCancelGuard {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+/// Retires a teammate identity when dropped, so a branch or item task that
+/// is aborted, panics, or returns early still leaves its peers seeing it as
+/// finished. `mark_finished` is idempotent; an explicit earlier call is fine.
+pub(super) struct PeerRetireGuard {
+    pub(super) registry: Arc<PeerRegistry>,
+    pub(super) id: String,
+    #[cfg(test)]
+    pub(super) observer: Option<FrontierObserver>,
+}
+
+impl Drop for PeerRetireGuard {
+    fn drop(&mut self) {
+        self.registry.mark_finished(&self.id);
+        #[cfg(test)]
+        if let Some(observe) = &self.observer {
+            observe(&self.registry, &self.id);
+        }
+    }
 }
 
 pub(super) struct StepContext<'a> {
@@ -820,16 +896,20 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use crate::config::paths;
     use crate::config::{AppState, WorkingMode};
     #[cfg(unix)]
     use crate::function::jobs::RingBuf;
     #[cfg(unix)]
     use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor, notification};
-    use crate::utils::{create_abort_signal, temp_file};
+    use crate::utils::{create_abort_signal, get_env_name, temp_file};
     use parking_lot::Mutex;
+    use serial_test::serial;
+    use std::env;
     use std::fs;
     #[cfg(unix)]
     use std::mem;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn cmd_available(name: &str) -> bool {
         which::which(name).is_ok()
@@ -1423,5 +1503,360 @@ nodes:
         assert_eq!(events.len(), 1, "queued notification must survive the run");
         assert_eq!(events[0].id, "job_bg");
         assert_eq!(events[0].event, "job_completed");
+    }
+
+    struct TestConfigDirGuard {
+        key: String,
+        previous: Option<std::ffi::OsString>,
+        path: PathBuf,
+    }
+
+    impl TestConfigDirGuard {
+        fn new() -> Self {
+            let key = get_env_name("config_dir");
+            let previous = env::var_os(&key);
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!("coyote-graph-executor-tests-{unique}"));
+            fs::create_dir_all(&path).unwrap();
+            unsafe {
+                env::set_var(&key, &path);
+            }
+            Self {
+                key,
+                previous,
+                path,
+            }
+        }
+    }
+
+    impl Drop for TestConfigDirGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                unsafe {
+                    env::set_var(&self.key, previous);
+                }
+            } else {
+                unsafe {
+                    env::remove_var(&self.key);
+                }
+            }
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    const PROBE_AGENT: &str = "timeout-probe";
+
+    /// Materializes a graph agent under the guarded config dir that
+    /// `Agent::init` can load offline; its single script node sleeps for
+    /// `hold_secs` and then writes `output`, so an agent node can be held
+    /// in flight without any LLM.
+    fn materialize_probe_agent(hold_secs: f64) {
+        let graph_path = paths::agent_graph_file(PROBE_AGENT);
+        let agent_dir = graph_path.parent().unwrap();
+        fs::create_dir_all(agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("hold.py"),
+            format!(
+                "#!/usr/bin/env python3\nimport json, time\ntime.sleep({hold_secs})\n\
+                 print(json.dumps({{\"output\": \"held\"}}))\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &graph_path,
+            format!(
+                r#"
+name: {PROBE_AGENT}
+start: hold
+nodes:
+  hold:
+    type: script
+    script: hold.py
+    timeout: 30
+    next: done
+  done:
+    type: end
+    output: "{{{{output}}}}"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_cancel_guard_aborts_owned_tasks() {
+        let tasks: Vec<tokio::task::JoinHandle<()>> = (0..3)
+            .map(|_| tokio::spawn(std::future::pending::<()>()))
+            .collect();
+
+        drop(TaskCancelGuard::new(&tasks));
+
+        for task in tasks {
+            let err = task
+                .await
+                .expect_err("an owned task is aborted when the guard drops");
+            assert!(err.is_cancelled(), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_retire_guard_fires_on_task_abort() {
+        let (registry, assignments) = provision_frontier_peers(vec![
+            ("a".to_string(), "worker".to_string()),
+            ("b".to_string(), "worker".to_string()),
+        ]);
+        let registry = registry.expect("two flagged nodes should get a registry");
+        let id_a = assignments["a"].0.clone();
+        let id_b = assignments["b"].0.clone();
+        let guard = PeerRetireGuard {
+            registry: Arc::clone(&registry),
+            id: id_a.clone(),
+            observer: None,
+        };
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        task.abort();
+        let err = task.await.expect_err("the task was aborted");
+
+        assert!(err.is_cancelled(), "{err}");
+        assert!(
+            registry.is_finished(&id_a),
+            "the aborted task's identity is retired by the guard"
+        );
+        assert!(!registry.is_finished(&id_b), "the sibling is untouched");
+    }
+
+    /// A session already aborted when the run starts trips the synchronous
+    /// pre-check: no bridge task, no super-step, the start script never runs.
+    #[tokio::test]
+    async fn graph_run_aborts_when_session_is_preset() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        let sentinel = ws.dir.join("ran");
+        ws.write_script(
+            "mark.sh",
+            &format!("#!/bin/bash\ntouch '{}'\necho '{{}}'\n", sentinel.display()),
+        );
+
+        let yaml = r#"
+name: preset_session_abort_test
+start: mark
+nodes:
+  mark:
+    type: script
+    script: mark.sh
+    state_updates: {}
+    next: done
+  done:
+    type: end
+    output: "done"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let session = create_abort_signal();
+        session.set_ctrlc();
+        ctx.session_abort = Some(session);
+        let graph_abort = create_abort_signal();
+
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, graph_abort.clone())
+            .await;
+
+        let err = format!(
+            "{:#}",
+            result.expect_err("a pre-set session aborts the run")
+        );
+        assert!(err.contains("aborted before super-step"), "{err}");
+        assert!(
+            graph_abort.aborted(),
+            "the session flag is mapped onto the graph's own abort"
+        );
+        assert!(!sentinel.exists(), "the start script must never run");
+    }
+
+    /// The graph abort and the session abort are different signals and only
+    /// the session one is set, mid-run: the bridge is what must fire, and the
+    /// cancelled branch task must kill its script before the `&&` runs.
+    #[tokio::test]
+    async fn session_abort_mid_run_aborts_graph() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        let sentinel = ws.dir.join("finished");
+        ws.write_script(
+            "hold.sh",
+            &format!(
+                "#!/bin/bash\nsleep 1.5 && touch '{}'\necho '{{}}'\n",
+                sentinel.display()
+            ),
+        );
+
+        let yaml = r#"
+name: mid_run_session_abort_test
+start: hold
+nodes:
+  hold:
+    type: script
+    script: hold.sh
+    state_updates: {}
+    next: done
+  done:
+    type: end
+    output: "done"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let session = create_abort_signal();
+        ctx.session_abort = Some(Arc::clone(&session));
+        let graph_abort = create_abort_signal();
+        assert!(!Arc::ptr_eq(&session, &graph_abort));
+
+        let trigger = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            session.set_ctrlc();
+        });
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, graph_abort.clone())
+            .await;
+        trigger.await.unwrap();
+
+        let err = format!("{:#}", result.expect_err("a session abort ends the run"));
+        assert!(err.contains("aborted"), "{err}");
+        assert!(graph_abort.aborted(), "the bridge set the graph's abort");
+
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !sentinel.exists(),
+            "the cancelled branch's script was killed before its `&&` ran"
+        );
+    }
+
+    /// Two flagged agent nodes under one permit: the graph abort lands while
+    /// the first is holding its probe agent open and the second is still
+    /// waiting on the semaphore. Both tasks are cancelled by the abort, and
+    /// each guard retires its identity as the task unwinds.
+    #[tokio::test]
+    #[serial]
+    async fn aborted_frontier_agents_are_retired() {
+        if !cmd_available("bash") || !cmd_available("python3") {
+            eprintln!("skipping: bash or python3 not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new();
+        materialize_probe_agent(5.0);
+        let ws = TestWorkspace::new();
+        ws.write_script("dispatcher.sh", "#!/bin/bash\necho '{}'\n");
+
+        let yaml = format!(
+            r#"
+name: aborted_frontier_test
+start: dispatcher
+settings:
+  max_concurrency: 1
+  validate_before_run: false
+nodes:
+  dispatcher:
+    type: script
+    script: dispatcher.sh
+    state_updates: {{}}
+    next: [worker_a, worker_b]
+  worker_a:
+    type: agent
+    agent: {PROBE_AGENT}
+    prompt: "p"
+    teammates: true
+    next: join
+  worker_b:
+    type: agent
+    agent: {PROBE_AGENT}
+    prompt: "p"
+    teammates: true
+    next: join
+  join:
+    type: end
+    output: "done"
+"#
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+
+        // Each observation: (retired peer id, every roster (peer id, label, is_finished)).
+        type RosterSnapshot = Vec<(String, String, bool)>;
+        let observations: Arc<Mutex<Vec<(String, RosterSnapshot)>>> = Arc::default();
+        let sink = Arc::clone(&observations);
+        let observer: FrontierObserver = Arc::new(move |registry, id| {
+            let snapshot = registry
+                .roster()
+                .into_iter()
+                .map(|(peer_id, label)| {
+                    let finished = registry.is_finished(&peer_id);
+                    (peer_id, label, finished)
+                })
+                .collect();
+            sink.lock().push((id.to_string(), snapshot));
+        });
+
+        let trigger = {
+            let abort = abort.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                abort.set_ctrlc();
+            })
+        };
+        let started = Instant::now();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .with_frontier_observer(observer)
+            .execute(&mut ctx, abort)
+            .await;
+        trigger.await.unwrap();
+
+        let err = format!("{:#}", result.expect_err("the abort ends the run"));
+        assert!(err.contains("aborted"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the run must not wait for the 5s probe hold: {:?}",
+            started.elapsed()
+        );
+
+        // Aborted tasks unwind on the runtime's next pass, not inside execute().
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let observations = observations.lock();
+        assert_eq!(
+            observations.len(),
+            2,
+            "each cancelled branch retires its identity exactly once: {observations:?}"
+        );
+        for (retired, snapshot) in observations.iter() {
+            assert!(
+                snapshot
+                    .iter()
+                    .any(|(peer_id, _, finished)| peer_id == retired && *finished),
+                "the retired id reads as finished in its own observation: {observations:?}"
+            );
+            assert!(
+                snapshot
+                    .iter()
+                    .all(|(_, label, _)| label.starts_with("worker_")),
+                "{snapshot:?}"
+            );
+        }
+        assert_ne!(observations[0].0, observations[1].0);
+        let (_, last) = &observations[1];
+        assert!(
+            last.iter().all(|(_, _, finished)| *finished),
+            "both identities are retired once the last task unwinds: {last:?}"
+        );
     }
 }

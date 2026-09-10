@@ -1,4 +1,4 @@
-use super::executor::{StepContext, StepResult, step};
+use super::executor::{PeerRetireGuard, StepContext, StepResult, TaskCancelGuard, step};
 use super::state::StateManager;
 use super::types::{ConcurrencyCap, Graph, MapNode, Node, NodeType};
 use super::validator::branch_subgraph;
@@ -86,6 +86,17 @@ async fn run_map(
         let abort = step_ctx.abort_signal.clone();
 
         let task = tokio::spawn(async move {
+            // Cancellation net behind the chain runner's own retirement: a
+            // task aborted before or during its chain still leaves the item's
+            // identity finished.
+            let _retire = item_peers
+                .as_ref()
+                .map(|(registry, assignment)| PeerRetireGuard {
+                    registry: Arc::clone(registry),
+                    id: assignment.0.clone(),
+                    #[cfg(test)]
+                    observer: None,
+                });
             let _permit = sem
                 .acquire()
                 .await
@@ -112,6 +123,9 @@ async fn run_map(
         sub_tasks.push(task);
     }
 
+    // Owns the item tasks across the join: if this future is dropped (the
+    // map's own task aborted), every in-flight chain is cancelled with it.
+    let _cancel = TaskCancelGuard::new(&sub_tasks);
     let joined = join_all(sub_tasks).await;
 
     // Collect outputs keyed by input index so order is preserved regardless of finish order.
@@ -512,6 +526,30 @@ mod tests {
         assert!(provision(branch, 3).is_none());
     }
 
+    #[tokio::test]
+    async fn map_item_peer_guard_retires_on_cancel() {
+        let (registry, assignments) = provision(agent_branch(true), 2).expect("should provision");
+        let guard = PeerRetireGuard {
+            registry: Arc::clone(&registry),
+            id: assignments[0].0.clone(),
+            observer: None,
+        };
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        task.abort();
+        let err = task.await.expect_err("the item task was aborted");
+
+        assert!(err.is_cancelled(), "{err}");
+        assert!(
+            registry.is_finished(&assignments[0].0),
+            "the cancelled item's identity is retired by the guard"
+        );
+        assert!(!registry.is_finished(&assignments[1].0));
+    }
+
     fn map_with_cap(cap: Option<ConcurrencyCap>) -> MapNode {
         MapNode {
             over: "{{items}}".into(),
@@ -695,6 +733,80 @@ mod chain_tests {
         match result {
             Ok(out) => panic!("expected failure, got output: {out}"),
             Err(e) => format!("{e:#}"),
+        }
+    }
+
+    /// Three item chains hold their scripts open; the graph abort lands
+    /// mid-fan-out. The map's frontier task is cancelled, which must cancel
+    /// every item task with it so the shells are killed before `&&` runs.
+    #[tokio::test]
+    async fn map_abort_cancels_item_chains() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script(
+            "hold.sh",
+            &format!(
+                "#!/bin/bash\n\
+                 t=${{GRAPH_STATE#*'\"item\":'}}\n\
+                 n=${{t%%[!0-9]*}}\n\
+                 sleep 1.5 && touch '{}/sentinel-'\"$n\"\n\
+                 echo '{{\"output\": 1}}'\n",
+                ws.dir.display()
+            ),
+        );
+
+        let yaml = r#"
+name: map_abort_test
+start: fan_out
+settings:
+  validate_before_run: false
+initial_state:
+  items: [1, 2, 3]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: hold
+    collect_into: results
+    max_concurrency: 3
+    next: done
+  hold:
+    type: script
+    script: hold.sh
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let trigger = {
+            let abort = abort.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                abort.set_ctrlc();
+            })
+        };
+
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await;
+        trigger.await.unwrap();
+
+        let chain = error_chain(result);
+        assert!(chain.contains("aborted"), "{chain}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        for n in 1..=3 {
+            let sentinel = ws.dir.join(format!("sentinel-{n}"));
+            assert!(
+                !sentinel.exists(),
+                "item chain {n} kept running after the abort cancelled the map task"
+            );
         }
     }
 

@@ -2052,6 +2052,36 @@ mod tests {
         );
     }
 
+    /// The child ctx must carry the parent's session flag: a session already
+    /// aborted before the child starts trips the child graph's own pre-check,
+    /// so it never reaches its (otherwise trivially successful) end node.
+    /// Without the inheritance the child sees `None` and returns "done".
+    #[test]
+    #[serial]
+    fn run_agent_for_graph_child_inherits_session_abort() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_session_abort_graph_agent");
+        write_graph_agent(&agent_name);
+        let session = create_abort_signal();
+        session.set_ctrlc();
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.session_abort = Some(Arc::clone(&session));
+
+        let err = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None))
+            .expect_err("the inherited session abort must end the child graph");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(&format!("Graph execution failed for agent '{agent_name}'")),
+            "{chain}"
+        );
+        assert!(chain.contains("aborted before super-step"), "{chain}");
+        assert!(
+            Arc::ptr_eq(ctx.session_abort.as_ref().unwrap(), &session),
+            "the parent's own session signal is untouched"
+        );
+    }
+
     #[test]
     fn cancel_on_drop_guard_cancels_when_armed_and_not_when_disarmed() {
         run_async(async {
