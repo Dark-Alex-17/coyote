@@ -4424,6 +4424,18 @@
     - low
     - medium
     - xhigh
+  - name: '@cf/zai-org/glm-5.3'
+    type: chat
+    max_input_tokens: 1310720
+    input_price: 1.4
+    output_price: 4.4
+    max_output_tokens: 1310720
+    require_max_tokens: true
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
   - name: '@cf/deepseek-ai/deepseek-v4-pro-0813'
     type: chat
     max_input_tokens: 1048576
@@ -6239,6 +6251,14 @@
     output_price: 1.98
     max_output_tokens: 943718
     supports_function_calling: true
+  - name: deepseek/deepseek-v4.1-flash
+    type: chat
+    max_input_tokens: 1048576
+    input_price: 0.15
+    output_price: 0.6
+    max_output_tokens: 384000
+    supports_vision: true
+    supports_function_calling: true
   - name: dots-studio/dots-3-note-preview:free
     type: chat
     max_input_tokens: 512000
@@ -6904,6 +6924,13 @@
     output_price: 0.9
     max_output_tokens: 204800
     supports_function_calling: true
+  - name: mistralai/codestral-2508:batch
+    type: chat
+    max_input_tokens: 256000
+    input_price: 0.15
+    output_price: 0.45
+    max_output_tokens: 204800
+    supports_function_calling: true
   - name: mistralai/devstral-2512
     type: chat
     max_input_tokens: 262144
@@ -6935,6 +6962,14 @@
     max_output_tokens: 209715
     supports_vision: true
     supports_function_calling: true
+  - name: mistralai/ministral-8b-2512:batch
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.075
+    output_price: 0.075
+    max_output_tokens: 209715
+    supports_vision: true
+    supports_function_calling: true
   - name: mistralai/mistral-large
     type: chat
     max_input_tokens: 128000
@@ -6954,6 +6989,14 @@
     max_input_tokens: 262144
     input_price: 0.5
     output_price: 1.5
+    max_output_tokens: 209715
+    supports_vision: true
+    supports_function_calling: true
+  - name: mistralai/mistral-large-2512:batch
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.25
+    output_price: 0.75
     max_output_tokens: 209715
     supports_vision: true
     supports_function_calling: true
@@ -6989,6 +7032,14 @@
     max_output_tokens: 104857
     supports_vision: true
     supports_function_calling: true
+  - name: mistralai/mistral-medium-3.1:batch
+    type: chat
+    max_input_tokens: 131072
+    input_price: 0.2
+    output_price: 1.0
+    max_output_tokens: 104857
+    supports_vision: true
+    supports_function_calling: true
   - name: mistralai/mistral-nemo
     type: chat
     max_input_tokens: 131072
@@ -7014,6 +7065,14 @@
     max_input_tokens: 262144
     input_price: 0.15
     output_price: 0.6
+    max_output_tokens: 209715
+    supports_vision: true
+    supports_function_calling: true
+  - name: mistralai/mistral-small-2603:batch
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.075
+    output_price: 0.3
     max_output_tokens: 209715
     supports_vision: true
     supports_function_calling: true
@@ -8283,9 +8342,9 @@
   - name: qwen/qwen3-30b-a3b-instruct-2507
     type: chat
     max_input_tokens: 262144
-    input_price: 0.09
-    output_price: 0.3
-    max_output_tokens: 235929
+    input_price: 0.0482
+    output_price: 0.1931
+    max_output_tokens: 32000
     supports_function_calling: true
   - name: qwen/qwen3-30b-a3b-thinking-2507
     type: chat
@@ -8980,8 +9039,8 @@
   - name: z-ai/glm-5.3-flash
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.07
-    output_price: 0.2333
+    input_price: 0.15
+    output_price: 0.5
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
@@ -9098,17 +9157,17 @@
   - name: ~z-ai/glm-flash-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.07
-    output_price: 0.2333
+    input_price: 0.075
+    output_price: 0.25
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
   - name: ~z-ai/glm-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 1.113
-    output_price: 3.498
-    max_output_tokens: 128000
+    input_price: 1.0075
+    output_price: 3.41
+    max_output_tokens: 235929
     supports_function_calling: true
 - provider: github
   models:
