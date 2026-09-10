@@ -206,7 +206,8 @@ async fn run_chain_steps(
 }
 
 /// Runs a single node of the chain and returns the node to visit next, or
-/// `None` once the chain has ended.
+/// `None` once the chain has ended. Errors carry no map/item locator; the
+/// caller's context supplies it.
 async fn run_chain_step(
     chain: &ItemChain<'_>,
     state: &mut StateManager,
@@ -216,11 +217,12 @@ async fn run_chain_step(
 ) -> Result<Option<String>> {
     let ItemChain { map_id, idx, .. } = *chain;
     if step_ctx.abort_signal.aborted() {
-        bail!("map sub-branch [{idx}] aborted");
+        bail!("aborted");
     }
-    let node = step_ctx.graph.get_node(current).ok_or_else(|| {
-        anyhow!("map node '{map_id}': sub-branch [{idx}] routed to unknown node '{current}'")
-    })?;
+    let node = step_ctx
+        .graph
+        .get_node(current)
+        .ok_or_else(|| anyhow!("routed to unknown node '{current}'"))?;
     let disallowed = match &node.node_type {
         NodeType::Approval(_) => Some("an approval node"),
         NodeType::Input(_) => Some("an input node"),
@@ -239,10 +241,7 @@ async fn run_chain_step(
     let visits = state.state().loop_count(current);
     let max_loops = step_ctx.graph.settings.max_loop_iterations;
     if visits > max_loops {
-        bail!(
-            "node '{current}' visited {visits} times in map branch [{idx}] \
-             (max_loop_iterations={max_loops})"
-        );
+        bail!("node '{current}' visited {visits} times (max_loop_iterations={max_loops})");
     }
 
     if let Some((registry, assignment)) = chain.peers
@@ -267,9 +266,9 @@ async fn run_chain_step(
                         chain.subgraph.iter().map(String::as_str).collect();
                     branch_nodes.sort_unstable();
                     bail!(
-                        "map node '{map_id}': sub-branch [{idx}] routed to '{target}' which is \
-                         outside the branch subgraph rooted at '{}' (branch nodes: {}). Script \
-                         `_next` targets inside a map branch must stay within the branch.",
+                        "routed to '{target}' which is outside the branch subgraph rooted at \
+                         '{}' (branch nodes: {}). Script `_next` targets inside a map branch \
+                         must stay within the branch.",
                         chain.entry,
                         branch_nodes.join(", ")
                     );
@@ -281,12 +280,12 @@ async fn run_chain_step(
                 Ok(Some(target.clone()))
             }
             many => bail!(
-                "map node '{map_id}': sub-branch [{idx}] node '{current}' fanned out to {many:?}; \
-                 a map branch must route to a single node"
+                "node '{current}' fanned out to {many:?}; a map branch must route to a single node"
             ),
         },
+        // The node-type pre-check above rejects End before step() runs.
         StepResult::End(_) => bail!(
-            "map node '{map_id}': sub-branch [{idx}] reached end node '{current}' inside a map branch"
+            "internal error: step() returned End for '{current}' after the node-type pre-check"
         ),
     }
 }
@@ -896,11 +895,10 @@ nodes:
             "{chain}"
         );
         assert!(
-            chain.contains(
-                "node 'looper' visited 4 times in map branch [0] (max_loop_iterations=3)"
-            ),
+            chain.contains("node 'looper' visited 4 times (max_loop_iterations=3)"),
             "{chain}"
         );
+        assert_eq!(chain.matches("sub-branch [").count(), 1, "{chain}");
     }
 
     #[tokio::test]
@@ -949,7 +947,11 @@ nodes:
             ),
             "{chain}"
         );
-        assert!(chain.contains("failed at node 'gate' (step 1)"), "{chain}");
+        assert!(
+            chain.contains("map node 'fan_out': sub-branch [0] failed at node 'gate' (step 1)"),
+            "{chain}"
+        );
+        assert_eq!(chain.matches("sub-branch [").count(), 1, "{chain}");
     }
 
     #[tokio::test]
@@ -1512,11 +1514,11 @@ nodes:
 
         let chain = unwrap_err_chain(h.run("doubler", Some(&peers), &mut state, &mut ctx).await);
 
-        assert!(chain.contains("map sub-branch [0] aborted"), "{chain}");
         assert!(
-            chain.contains("failed at node 'doubler' (step 1)"),
+            chain.contains("failed at node 'doubler' (step 1): aborted"),
             "{chain}"
         );
+        assert_eq!(chain.matches("sub-branch [").count(), 1, "{chain}");
         assert_eq!(state.state().loop_count("doubler"), 0);
         assert!(state.state().get("output").is_none());
         assert!(peers.0.is_finished(&peers.1.0));
