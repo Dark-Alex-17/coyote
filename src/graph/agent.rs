@@ -5,7 +5,9 @@ use super::types::AgentNode;
 use crate::config::RequestContext;
 use crate::function::agents::run_agent_for_graph;
 use anyhow::{Context, Result};
+use log::debug;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -24,6 +26,13 @@ impl AgentNodeExecutor {
             .interpolate(&node.prompt)
             .with_context(|| format!("Failed to interpolate prompt for agent '{}'", node.agent))?;
 
+        let graph_inputs = resolve_inputs(node, state_manager)?;
+        if let Some(inputs) = &graph_inputs {
+            let mut keys: Vec<&String> = inputs.keys().collect();
+            keys.sort_unstable();
+            debug!("Agent '{}' graph inputs: {keys:?}", node.agent);
+        }
+
         let timeout_dur = Duration::from_secs(node.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
         // run_agent_for_graph takes the identity off the ctx; keep a handle so
@@ -39,7 +48,7 @@ impl AgentNodeExecutor {
 
         let raw_result = timeout(
             timeout_dur,
-            run_agent_for_graph(parent_ctx, &node.agent, &prompt),
+            run_agent_for_graph(parent_ctx, &node.agent, &prompt, graph_inputs),
         )
         .await;
         if retire_peer_on_return && let Some((registry, id)) = &peer {
@@ -71,6 +80,30 @@ impl AgentNodeExecutor {
 
         Ok(raw)
     }
+}
+
+/// Resolves each `inputs` template against the parent state. A lone
+/// `{{key}}` yields the state value as-is (numbers, arrays, objects and
+/// `null` all survive); anything else renders to a string. Every key is
+/// strict: a missing reference fails the node before the child starts.
+fn resolve_inputs(
+    node: &AgentNode,
+    state_manager: &StateManager,
+) -> Result<Option<HashMap<String, Value>>> {
+    let Some(inputs) = &node.inputs else {
+        return Ok(None);
+    };
+    let mut resolved = HashMap::with_capacity(inputs.len());
+    for (key, template) in inputs {
+        let value = state_manager.interpolate_raw(template).with_context(|| {
+            format!(
+                "Failed to interpolate inputs.{key} for agent '{}'",
+                node.agent
+            )
+        })?;
+        resolved.insert(key.clone(), value);
+    }
+    Ok(Some(resolved))
 }
 
 fn apply_state_updates(node: &AgentNode, state_manager: &mut StateManager, output: &Value) {
@@ -107,6 +140,7 @@ mod tests {
             state_updates: updates,
             output_schema: None,
             timeout: None,
+            inputs: None,
             teammates: false,
         }
     }
@@ -153,6 +187,68 @@ mod tests {
         execute_past_max_depth(&mut ctx, false).await;
 
         assert!(!registry.is_finished(&id));
+    }
+
+    fn node_with_inputs(pairs: &[(&str, &str)]) -> AgentNode {
+        let mut node = node_with("hi", None);
+        node.inputs = Some(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        );
+        node
+    }
+
+    #[test]
+    fn resolve_inputs_is_none_when_node_has_no_inputs() {
+        let node = node_with("hi", None);
+        let state = manager_with(&[("n", json!(3))]);
+
+        assert_eq!(resolve_inputs(&node, &state).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_inputs_lone_reference_keeps_the_array_value() {
+        let node = node_with_inputs(&[("items", "{{list}}")]);
+        let state = manager_with(&[("list", json!(["a", "b"]))]);
+
+        let inputs = resolve_inputs(&node, &state).unwrap().unwrap();
+
+        assert_eq!(inputs.get("items"), Some(&json!(["a", "b"])));
+    }
+
+    #[test]
+    fn resolve_inputs_mixed_text_renders_to_a_string() {
+        let node = node_with_inputs(&[("label", "n={{n}}")]);
+        let state = manager_with(&[("n", json!(3))]);
+
+        let inputs = resolve_inputs(&node, &state).unwrap().unwrap();
+
+        assert_eq!(inputs.get("label"), Some(&json!("n=3")));
+    }
+
+    #[test]
+    fn resolve_inputs_lone_reference_to_null_yields_null() {
+        let node = node_with_inputs(&[("x", "{{k}}")]);
+        let state = manager_with(&[("k", Value::Null)]);
+
+        let inputs = resolve_inputs(&node, &state).unwrap().unwrap();
+
+        assert_eq!(inputs.get("x"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn resolve_inputs_missing_key_errors_naming_the_input() {
+        let node = node_with_inputs(&[("width", "{{nope}}")]);
+        let state = manager_with(&[]);
+
+        let err = resolve_inputs(&node, &state).expect_err("missing key must fail");
+
+        let chain = format!("{err:#}");
+        assert!(chain.contains("inputs.width"), "{chain}");
+        assert!(chain.contains("for agent 'test_agent'"), "{chain}");
+        assert!(chain.contains("'nope' not found in state"), "{chain}");
     }
 
     #[test]

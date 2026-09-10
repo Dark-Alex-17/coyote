@@ -240,6 +240,9 @@ pub struct AgentNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<HashMap<String, String>>,
+
     #[serde(default)]
     pub teammates: bool,
 }
@@ -632,6 +635,48 @@ nodes:
             NodeType::Agent(n) => assert!(!n.teammates),
             _ => panic!("expected Agent variant"),
         }
+    }
+
+    #[test]
+    fn agent_node_inputs_parse_optionally_and_empty_map_is_some() {
+        let yaml = r#"
+name: g
+start: with_inputs
+nodes:
+  with_inputs:
+    id: with_inputs
+    type: agent
+    agent: helper
+    prompt: hi
+    inputs:
+      width: "{{n}}"
+      note: "Repo: {{repo}}"
+    next: without_inputs
+  without_inputs:
+    id: without_inputs
+    type: agent
+    agent: helper
+    prompt: hi
+    next: empty_inputs
+  empty_inputs:
+    id: empty_inputs
+    type: agent
+    agent: helper
+    prompt: hi
+    inputs: {}
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let inputs_of = |id: &str| match &graph.get_node(id).unwrap().node_type {
+            NodeType::Agent(n) => n.inputs.clone(),
+            _ => panic!("expected Agent variant"),
+        };
+
+        let with = inputs_of("with_inputs").expect("inputs should parse");
+        assert_eq!(with.len(), 2);
+        assert_eq!(with.get("width").map(String::as_str), Some("{{n}}"));
+        assert_eq!(with.get("note").map(String::as_str), Some("Repo: {{repo}}"));
+        assert_eq!(inputs_of("without_inputs"), None);
+        assert_eq!(inputs_of("empty_inputs"), Some(HashMap::new()));
     }
 
     #[test]

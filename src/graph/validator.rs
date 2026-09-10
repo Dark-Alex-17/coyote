@@ -1790,6 +1790,7 @@ mod tests {
                 state_updates: None,
                 output_schema: None,
                 timeout: None,
+                inputs: None,
                 teammates: false,
             }),
             next: next.map(NextTargets::from),

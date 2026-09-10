@@ -18,6 +18,7 @@ use indexmap::IndexMap;
 use log::{debug, warn};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -535,16 +536,29 @@ pub async fn handle_agent_tool(
 }
 
 pub fn run_child_agent(
-    mut child_ctx: RequestContext,
+    child_ctx: RequestContext,
     initial_input: Input,
     abort_signal: AbortSignal,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
+    run_child_agent_with_graph_inputs(child_ctx, initial_input, abort_signal, None)
+}
+
+/// Runs a child agent to completion. When the child is a graph agent,
+/// `graph_inputs` is overlaid on its `initial_state` before the graph
+/// starts; it is ignored for config-only agents.
+fn run_child_agent_with_graph_inputs(
+    mut child_ctx: RequestContext,
+    initial_input: Input,
+    abort_signal: AbortSignal,
+    graph_inputs: Option<HashMap<String, Value>>,
+) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
         if graph::active_agent_graph_name(&child_ctx).is_some() {
-            return graph::run_active_agent_graph(
+            return graph::run_active_agent_graph_with_inputs(
                 &mut child_ctx,
                 &initial_input.text(),
                 abort_signal,
+                graph_inputs,
             )
             .await;
         }
@@ -685,10 +699,13 @@ fn effective_max_agent_depth(parent_ctx: &RequestContext) -> usize {
 /// output. This is similar to `handle_spawn` but runs the child agent in the
 /// current task (no tokio::spawn, no supervisor handle registration) so the
 /// graph executor can sequence agent nodes directly.
+/// `graph_inputs` seeds the child's graph state and is only accepted when the
+/// target is a graph agent.
 pub async fn run_agent_for_graph(
     parent_ctx: &mut RequestContext,
     agent_name: &str,
     prompt: &str,
+    graph_inputs: Option<HashMap<String, Value>>,
 ) -> Result<String> {
     let peer_assignment = parent_ctx.peer_assignment.take();
     let assigned_peer = peer_assignment.is_some();
@@ -759,6 +776,19 @@ pub async fn run_agent_for_graph(
     );
     child_ctx.rag = agent.rag();
     child_ctx.agent = Some(agent);
+    if graph_inputs.is_some() && graph::active_agent_graph_name(&child_ctx).is_none() {
+        bail!(
+            "agent '{agent_name}' has no graph.yaml; `inputs:` is only valid on agent nodes that target a graph agent"
+        );
+    }
+    if graph_inputs
+        .as_ref()
+        .is_some_and(|inputs| inputs.contains_key("initial_prompt"))
+    {
+        bail!(
+            "agent '{agent_name}': `inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)"
+        );
+    }
     if assigned_peer {
         child_ctx.peer_registry = peer_registry.clone();
     }
@@ -786,7 +816,7 @@ pub async fn run_agent_for_graph(
 
     debug!("Spawning agent '{agent_name}' for graph node as '{agent_id}'");
 
-    run_child_agent(child_ctx, input, child_abort).await
+    run_child_agent_with_graph_inputs(child_ctx, input, child_abort, graph_inputs).await
 }
 
 async fn populate_agent_mcp_runtime(ctx: &mut RequestContext, server_ids: &[String]) -> Result<()> {
