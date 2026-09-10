@@ -488,7 +488,7 @@ nodes:
     temperature: 0.3           # Optional per-node sampling override
     reasoning_effort: null     # Optional per-node reasoning effort override (e.g. low, medium, high)
     max_attempts: 2            # Retry count on transient errors only. Default 1.
-    max_iterations: 10         # Tool-call-loop turn cap. Default 10.
+    max_iterations: 10         # Tool-call-loop turn cap. Default 10; 0 = no cap.
     fallback: review           # Route here if all attempts fail
     timeout: 300               # Optional node wall-clock cap, seconds (unset or 0 = no timeout)
     state_updates:
