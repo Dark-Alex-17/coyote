@@ -333,6 +333,20 @@ nodes:
     prompt: |                  # User message sent to the child (templated)
       Research {{topic}} in depth. Existing context:
       {{context}}
+    # inputs:                  # Optional. Only valid when `agent` is a GRAPH agent
+    #   max_parallel: "{{n}}"  # (has a graph.yaml; deep-research is one). Each value
+    #   context: "Repo: {{r}}" # is a template against THIS graph's state. The resolved
+    #                          # map is overlaid on the child's `initial_state` before
+    #                          # its graph starts, so the child can read {{max_parallel}}
+    #                          # and {{context}} from its first node on. A lone {{key}}
+    #                          # keeps the value's JSON type (numbers stay numbers, lists
+    #                          # stay lists, null overlays the child's default); mixed text
+    #                          # becomes a string. `initial_prompt` is reserved (always
+    #                          # seeded from `prompt:`) and is rejected as an input key.
+    #                          # `inputs:` on a config-only agent is a load-time error,
+    #                          # and `inputs` values count as reads for the cross-branch
+    #                          # read check. See the wiki: Graph Agents → "Passing state
+    #                          # into a child graph agent (inputs)".
     timeout: 600               # Optional wall-clock cap, seconds. Default 300.
     teammates: false           # Optional. When true and this node runs concurrently
                                # with other flagged agent nodes (map fan-out branches
