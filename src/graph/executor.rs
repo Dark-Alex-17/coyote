@@ -21,9 +21,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
+/// Test-only hook invoked inside a frontier branch task right after its
+/// teammate identity is retired, with the super-step's registry and the
+/// retired peer id. Runs before the task returns, so an observer sees the
+/// registry as siblings still in flight see it.
+#[cfg(test)]
+type FrontierObserver = Arc<dyn Fn(&PeerRegistry, &str) + Send + Sync>;
+
 pub struct GraphExecutor {
     graph: Graph,
     base_dir: PathBuf,
+    #[cfg(test)]
+    frontier_observer: Option<FrontierObserver>,
 }
 
 impl GraphExecutor {
@@ -31,7 +40,15 @@ impl GraphExecutor {
         Self {
             graph,
             base_dir: base_dir.into(),
+            #[cfg(test)]
+            frontier_observer: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_frontier_observer(mut self, observer: FrontierObserver) -> Self {
+        self.frontier_observer = Some(observer);
+        self
     }
 
     pub async fn execute(
@@ -58,7 +75,12 @@ impl GraphExecutor {
         ctx: &mut RequestContext,
         abort_signal: AbortSignal,
     ) -> Result<String> {
-        let GraphExecutor { graph, base_dir } = self;
+        let GraphExecutor {
+            graph,
+            base_dir,
+            #[cfg(test)]
+            frontier_observer,
+        } = self;
 
         if graph.settings.validate_before_run {
             let mut validator = GraphValidator::new(&base_dir);
@@ -194,6 +216,8 @@ impl GraphExecutor {
                 let current = node_id.clone();
                 let sem_clone = semaphore.clone();
                 let abort_clone = abort_signal.clone();
+                #[cfg(test)]
+                let observer = frontier_observer.clone();
 
                 let task = tokio::spawn(async move {
                     let _permit = sem_clone
@@ -228,6 +252,10 @@ impl GraphExecutor {
                     let result = step(&node, &mut state, &mut ctx, &step_ctx, &current).await;
                     if let (Some(registry), Some(id)) = (&registry_for_task, &peer_id) {
                         registry.mark_finished(id);
+                        #[cfg(test)]
+                        if let Some(observe) = &observer {
+                            observe(registry, id);
+                        }
                     }
                     let elapsed = node_start.elapsed();
                     match &result {
@@ -795,6 +823,7 @@ mod integration_tests {
     #[cfg(unix)]
     use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor, notification};
     use crate::utils::{create_abort_signal, temp_file};
+    use parking_lot::Mutex;
     use std::fs;
     #[cfg(unix)]
     use std::mem;
@@ -1004,6 +1033,106 @@ nodes:
         assert!(
             err.contains("worker_fail"),
             "error should mention failing node: {err}"
+        );
+    }
+
+    /// Two flagged agent nodes share one super-step under a single permit, so
+    /// the first branch retires its identity while its sibling has not even
+    /// started. The observer runs inside the branch task, before that task
+    /// returns, so the snapshot it takes is what a still-running sibling
+    /// would see if it messaged the finished node.
+    #[tokio::test]
+    async fn frontier_branch_is_finished_before_super_step_join() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("dispatcher.sh", "#!/bin/bash\necho '{}'\n");
+
+        let yaml = r#"
+name: frontier_finish_test
+start: dispatcher
+settings:
+  max_concurrency: 1
+  validate_before_run: false
+nodes:
+  dispatcher:
+    type: script
+    script: dispatcher.sh
+    state_updates: {}
+    next: [worker_a, worker_b]
+  worker_a:
+    type: agent
+    agent: no-such-agent
+    prompt: "p"
+    teammates: true
+    next: join
+  worker_b:
+    type: agent
+    agent: no-such-agent
+    prompt: "p"
+    teammates: true
+    next: join
+  join:
+    type: end
+    output: "done"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+
+        // Each observation: (retired peer id, every roster (label, is_finished)).
+        type RosterSnapshot = Vec<(String, bool)>;
+        let observations: Arc<Mutex<Vec<(String, RosterSnapshot)>>> = Arc::default();
+        let sink = Arc::clone(&observations);
+        let observer: FrontierObserver = Arc::new(move |registry, id| {
+            let snapshot = registry
+                .roster()
+                .into_iter()
+                .map(|(peer_id, label)| (label, registry.is_finished(&peer_id)))
+                .collect();
+            sink.lock().push((id.to_string(), snapshot));
+        });
+
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .with_frontier_observer(observer)
+            .execute(&mut ctx, abort)
+            .await;
+
+        assert!(result.is_err(), "both agent branches fail at Agent::init");
+        let observations = observations.lock();
+        assert_eq!(
+            observations.len(),
+            2,
+            "one observation per flagged branch: {observations:?}"
+        );
+
+        let (_, first) = &observations[0];
+        let finished_first: Vec<&str> = first
+            .iter()
+            .filter(|(_, finished)| *finished)
+            .map(|(label, _)| label.as_str())
+            .collect();
+        assert_eq!(
+            finished_first.len(),
+            1,
+            "the first branch to complete is retired while its sibling is still \
+             unfinished, so this read happened before the super-step join: {first:?}"
+        );
+        assert!(
+            first.iter().all(|(label, _)| label.starts_with("worker_")),
+            "{first:?}"
+        );
+
+        let (_, second) = &observations[1];
+        assert!(
+            second.iter().all(|(_, finished)| *finished),
+            "both identities are retired once the last branch completes: {second:?}"
+        );
+        assert_ne!(
+            observations[0].0, observations[1].0,
+            "each branch retires its own identity exactly once"
         );
     }
 

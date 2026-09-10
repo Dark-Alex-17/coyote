@@ -568,12 +568,16 @@ mod chain_tests {
     use super::super::executor::GraphExecutor;
     use super::super::script::ScriptExecutor;
     use super::*;
+    use crate::config::paths;
     use crate::config::{AppState, Role, WorkingMode};
-    use crate::utils::{AbortSignal, create_abort_signal, temp_file};
+    use crate::utils::{AbortSignal, create_abort_signal, get_env_name, temp_file};
     use indexmap::IndexMap;
     use serde_json::json;
+    use serial_test::serial;
+    use std::env;
     use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn cmd_available(name: &str) -> bool {
         which::which(name).is_ok()
@@ -1171,6 +1175,89 @@ nodes:
         }
     }
 
+    struct TestConfigDirGuard {
+        key: String,
+        previous: Option<std::ffi::OsString>,
+        path: PathBuf,
+    }
+
+    impl TestConfigDirGuard {
+        fn new() -> Self {
+            let key = get_env_name("config_dir");
+            let previous = env::var_os(&key);
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!("coyote-graph-map-tests-{unique}"));
+            fs::create_dir_all(&path).unwrap();
+            unsafe {
+                env::set_var(&key, &path);
+            }
+            Self {
+                key,
+                previous,
+                path,
+            }
+        }
+    }
+
+    impl Drop for TestConfigDirGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                unsafe {
+                    env::set_var(&self.key, previous);
+                }
+            } else {
+                unsafe {
+                    env::remove_var(&self.key);
+                }
+            }
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    const PROBE_AGENT: &str = "timeout-probe";
+
+    /// Materializes a graph agent under the guarded config dir that
+    /// `Agent::init` can load offline: no global tools, variables, MCP servers,
+    /// or rag nodes, so nothing in `run_agent_for_graph` bails before the
+    /// agent's own graph starts executing. Its single script node sleeps for
+    /// `hold_secs` and then writes `output`, so the whole run needs no LLM and
+    /// the agent future can be held open for as long as a test needs.
+    fn materialize_probe_agent(hold_secs: f64) {
+        let graph_path = paths::agent_graph_file(PROBE_AGENT);
+        let agent_dir = graph_path.parent().unwrap();
+        fs::create_dir_all(agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("hold.py"),
+            format!(
+                "#!/usr/bin/env python3\nimport json, time\ntime.sleep({hold_secs})\n\
+                 print(json.dumps({{\"output\": \"held\"}}))\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &graph_path,
+            format!(
+                r#"
+name: {PROBE_AGENT}
+start: hold
+nodes:
+  hold:
+    type: script
+    script: hold.py
+    timeout: 30
+    next: done
+  done:
+    type: end
+    output: "{{{{output}}}}"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
     const DOUBLER_GRAPH: &str = r#"
 name: t
 start: doubler
@@ -1305,6 +1392,94 @@ nodes:
         );
         assert!(chain.contains("Agent 'no-such-agent' failed"), "{chain}");
         assert!(registry.is_finished(&assignments[0].0));
+        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+    }
+
+    fn flagged_probe_graph(timeout: Option<u64>) -> String {
+        let timeout_line = timeout
+            .map(|t| format!("    timeout: {t}\n"))
+            .unwrap_or_default();
+        format!(
+            r#"
+name: t
+start: worker
+nodes:
+  worker:
+    type: agent
+    agent: {PROBE_AGENT}
+    prompt: "p"
+    teammates: true
+    state_updates:
+      output: "{{{{output}}}}"
+{timeout_line}"#
+        )
+    }
+
+    /// Control for the timeout test below: the same materialized agent, with
+    /// the default timeout and no hold, runs its own graph to completion
+    /// offline and hands its output back through the chain. That pins the
+    /// recipe, so a `timed out` error in the sibling test cannot be an init
+    /// failure in disguise.
+    #[tokio::test]
+    #[serial]
+    async fn run_item_chain_probe_agent_runs_its_graph_offline() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new();
+        materialize_probe_agent(0.0);
+        let h = Harness::new(&flagged_probe_graph(None));
+        let peers = manual_peer("worker");
+        let mut state = item_state(json!(0));
+        let mut ctx = silent_ctx();
+
+        h.run("worker", Some(&peers), &mut state, &mut ctx)
+            .await
+            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+
+        assert_eq!(state.state().get("output"), Some(&json!("held")));
+        assert!(peers.0.is_finished(&peers.1.0));
+        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+    }
+
+    /// `tokio::time::timeout` polls the agent future first and a zero-duration
+    /// sleep still goes through the time driver, so `Elapsed` only fires if the
+    /// agent future is still pending when the timer is next polled. The
+    /// materialized agent's graph holds its script step open for seconds, so
+    /// the future is dropped mid-flight and the chain runner alone retires
+    /// the identity.
+    #[tokio::test]
+    #[serial]
+    async fn run_item_chain_marks_identity_finished_when_agent_step_times_out() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new();
+        materialize_probe_agent(5.0);
+        let h = Harness::new(&flagged_probe_graph(Some(0)));
+        let (registry, assignments) = h.provision("worker", 2);
+        let peers = (Arc::clone(&registry), assignments[0].clone());
+        let mut state = item_state(json!(0));
+        let mut ctx = silent_ctx();
+
+        let chain = unwrap_err_chain(h.run("worker", Some(&peers), &mut state, &mut ctx).await);
+
+        assert!(
+            chain.contains("failed at node 'worker' (step 1)"),
+            "{chain}"
+        );
+        assert!(
+            chain.contains(&format!("Agent '{PROBE_AGENT}' timed out after 0s")),
+            "{chain}"
+        );
+        assert!(
+            !chain.contains(&format!("Agent '{PROBE_AGENT}' failed")),
+            "{chain}"
+        );
+        assert!(registry.is_finished(&assignments[0].0));
+        assert!(!registry.is_finished(&assignments[1].0));
         assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
     }
 
