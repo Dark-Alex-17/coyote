@@ -476,6 +476,25 @@ impl GraphValidator {
                         ),
                     ));
                 }
+                if let Some(inputs) = &a.inputs {
+                    if has_config && !has_graph {
+                        result.error(ValidationError::with_node(
+                            node_id,
+                            format!(
+                                "agent node '{node_id}': `inputs:` requires agent '{}' to be a graph agent (no graph.yaml found)",
+                                a.agent
+                            ),
+                        ));
+                    }
+                    if inputs.contains_key("initial_prompt") {
+                        result.error(ValidationError::with_node(
+                            node_id,
+                            format!(
+                                "agent node '{node_id}': `inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)"
+                            ),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1044,7 +1063,13 @@ fn primary_templated_fields(node: &Node) -> Vec<String> {
             }
             v
         }
-        NodeType::Agent(n) => vec![n.prompt.clone()],
+        NodeType::Agent(n) => {
+            let mut v = vec![n.prompt.clone()];
+            if let Some(inputs) = &n.inputs {
+                v.extend(inputs.values().cloned());
+            }
+            v
+        }
         NodeType::Rag(n) => {
             vec![
                 n.query
@@ -1158,9 +1183,14 @@ fn detect_cycle_dfs(
 mod tests {
     use super::super::types::*;
     use super::*;
+    use crate::utils::get_env_name;
     use indexmap::IndexMap;
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn graph_with(nodes: Vec<(&str, Node)>, start: &str) -> Graph {
         let mut map: IndexMap<String, Node> = IndexMap::new();
@@ -3420,6 +3450,216 @@ mod tests {
                 .any(|e| e.message.contains("reads state key(s) `items`")
                     && e.message.contains("'producer'")),
             "expected cross-branch read error for map `over` reading sibling write: {:?}",
+            result.errors
+        );
+    }
+
+    struct TestConfigDirGuard {
+        key: String,
+        previous: Option<std::ffi::OsString>,
+        path: PathBuf,
+    }
+
+    impl TestConfigDirGuard {
+        fn new() -> Self {
+            let key = get_env_name("config_dir");
+            let previous = env::var_os(&key);
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!("coyote-graph-validator-tests-{unique}"));
+            fs::create_dir_all(&path).unwrap();
+            unsafe {
+                env::set_var(&key, &path);
+            }
+            Self {
+                key,
+                previous,
+                path,
+            }
+        }
+    }
+
+    impl Drop for TestConfigDirGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                unsafe {
+                    env::set_var(&self.key, previous);
+                }
+            } else {
+                unsafe {
+                    env::remove_var(&self.key);
+                }
+            }
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn materialize_config_only_agent(name: &str) {
+        fs::create_dir_all(paths::agent_data_dir(name)).unwrap();
+        fs::write(paths::agent_config_file(name), "").unwrap();
+    }
+
+    fn materialize_graph_agent(name: &str) {
+        fs::create_dir_all(paths::agent_data_dir(name)).unwrap();
+        fs::write(paths::agent_graph_file(name), "").unwrap();
+    }
+
+    fn agent_node_with_inputs(id: &str, agent: &str, inputs: &[(&str, &str)]) -> Node {
+        let mut node = agent_node(id, agent, Some("end"));
+        if let NodeType::Agent(ref mut a) = node.node_type {
+            a.inputs = Some(
+                inputs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            );
+        }
+        node
+    }
+
+    fn inputs_requires_graph_agent_error(result: &ValidationResult, node_id: &str) -> bool {
+        result.errors.iter().any(|e| {
+            e.message.contains("`inputs:` requires agent")
+                && e.message
+                    .contains("to be a graph agent (no graph.yaml found)")
+                && e.node_id.as_deref() == Some(node_id)
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_on_config_only_agent_errors() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_config_only_agent("plain-agent");
+        let node = agent_node_with_inputs("a", "plain-agent", &[("x", "{{k}}")]);
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| {
+                e.message
+                    == "agent node 'a': `inputs:` requires agent 'plain-agent' to be a graph agent (no graph.yaml found)"
+                    && e.node_id.as_deref() == Some("a")
+            }),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn agent_empty_inputs_on_config_only_agent_still_errors() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_config_only_agent("plain-agent");
+        let node = agent_node_with_inputs("a", "plain-agent", &[]);
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            inputs_requires_graph_agent_error(&result, "a"),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_on_graph_agent_passes() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_graph_agent("graph-agent");
+        let node = agent_node_with_inputs("a", "graph-agent", &[("x", "{{k}}")]);
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_missing_agent_dir_gets_only_the_not_found_error() {
+        let _guard = TestConfigDirGuard::new();
+        let node = agent_node_with_inputs("a", "ghost-agent", &[("x", "{{k}}")]);
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("Agent 'ghost-agent' not found")),
+            "{:?}",
+            result.errors
+        );
+        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_initial_prompt_is_reserved() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_graph_agent("graph-agent");
+        let node = agent_node_with_inputs(
+            "a",
+            "graph-agent",
+            &[("initial_prompt", "{{k}}"), ("x", "{{k}}")],
+        );
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| {
+                e.message
+                    == "agent node 'a': `inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)"
+                    && e.node_id.as_deref() == Some("a")
+            }),
+            "{:?}",
+            result.errors
+        );
+        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+    }
+
+    #[test]
+    fn agent_inputs_reading_sibling_write_errors() {
+        let reader = agent_node_with_inputs("worker_a", "some-agent", &[("x", "{{k}}")]);
+        let writer = llm_with_state_updates("worker_b", &[("k", "static")], Some("end"));
+        let graph = fan_out_graph_with_two_workers(reader, writer);
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("reads state key(s) `k`")
+                    && e.message.contains("'worker_b'")
+                    && e.node_id.as_deref() == Some("worker_a")),
+            "expected cross-branch read error for agent inputs: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn agent_inputs_reading_upstream_key_passes() {
+        let reader = agent_node_with_inputs("worker_a", "some-agent", &[("x", "{{k}}")]);
+        let writer = llm_with_state_updates("worker_b", &[("other", "static")], Some("end"));
+        let graph = fan_out_graph_with_two_workers(reader, writer);
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("reads state key")),
+            "upstream `k` shouldn't trigger cross-branch read error: {:?}",
             result.errors
         );
     }
