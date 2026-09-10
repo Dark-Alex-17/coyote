@@ -118,7 +118,7 @@ settings:
   max_loop_iterations: 100   # Per-node visit cap. If one node id is entered more
                              # than this many times, execution aborts. Default 100.
   timeout: 600               # Optional wall-clock cap (seconds) on the whole run,
-                             # checked between node transitions.
+                             # checked between node transitions. 0 = no bound.
   log_state_snapshots: true  # Log state before each node (debug/trace). Default true.
   validate_before_run: true  # Run the graph validator at startup. Default true.
   max_concurrency: 4         # Cap on simultaneously running branches in any
@@ -242,7 +242,7 @@ nodes:
       - https://example.com/reference
     query: "{{topic}}"         # Retrieval query (templated). Default: {{initial_prompt}}.
     top_k: 5                   # Chunks to retrieve. Default = the KB's own top_k.
-    timeout: 120               # Retrieval timeout in seconds. Default 120.
+    timeout: 120               # Retrieval timeout in seconds. Default 120; 0 = no bound.
     # Knowledge-base build config (optional; used only when the KB is first
     # built). When embedding_model + chunk_size + chunk_overlap are all set,
     # the KB builds with no interactive prompts (works in non-interactive runs).
@@ -311,7 +311,7 @@ nodes:
     id: synthesize
     type: script
     script: scripts/synthesize.py  # Path relative to the agent directory
-    timeout: 30                # Seconds. Default 30.
+    timeout: 30                # Seconds. Default 30; 0 = no bound.
     state_updates:             # Applied after the stdout JSON is merged
       decided_for: "{{topic}}"
     next: summarize            # Default route if the script emits no `_next`
@@ -347,7 +347,7 @@ nodes:
     #                          # and `inputs` values count as reads for the cross-branch
     #                          # read check. See the wiki: Graph Agents → "Passing state
     #                          # into a child graph agent (inputs)".
-    timeout: 600               # Optional wall-clock cap, seconds. Default 300.
+    timeout: 600               # Optional wall-clock cap, seconds. Default 300; 0 = no bound.
     teammates: false           # Optional. When true and this node runs concurrently
                                # with other flagged agent nodes (map fan-out branches
                                # or the same super-step), the siblings can message
@@ -490,7 +490,7 @@ nodes:
     max_attempts: 2            # Retry count on transient errors only. Default 1.
     max_iterations: 10         # Tool-call-loop turn cap. Default 10.
     fallback: review           # Route here if all attempts fail
-    timeout: 300               # Optional node wall-clock cap, seconds (unset = no timeout)
+    timeout: 300               # Optional node wall-clock cap, seconds (unset or 0 = no timeout)
     state_updates:
       research: "{{output}}"
     next: review               # Required for llm nodes: the success route
