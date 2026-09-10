@@ -688,6 +688,55 @@ nodes:
     }
 
     #[tokio::test]
+    async fn map_chain_two_script_steps_pass_validation_before_run() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_py(
+            "step_one.py",
+            r#"print(json.dumps({"draft": state["item"] * 2}))"#,
+        );
+        ws.write_py(
+            "step_two.py",
+            r#"print(json.dumps({"output": state["draft"] + 1}))"#,
+        );
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  validate_before_run: true
+initial_state:
+  items: [1, 2, 3]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: step_one
+    collect_into: results
+    next: done
+  step_one:
+    type: script
+    script: step_one.py
+    next: step_two
+  step_two:
+    type: script
+    script: step_two.py
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let result = run_graph(yaml, &ws)
+            .await
+            .unwrap_or_else(|e| panic!("validation rejected a runnable chain: {e:#}"));
+
+        assert_eq!(collected(&result), vec![json!(3), json!(5), json!(7)]);
+    }
+
+    #[tokio::test]
     async fn map_chain_script_next_loop_is_bounded_by_max_loop_iterations() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
