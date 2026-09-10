@@ -257,6 +257,11 @@ async fn run_with_retries(
     Err(last_err.unwrap_or_else(|| anyhow!("llm node exhausted retries")))
 }
 
+/// Whether `turn` (0-based) is the final turn the node's cap allows. A cap of 0 means no cap.
+pub(crate) fn is_last_turn(turn: u32, max_iterations: u32) -> bool {
+    max_iterations > 0 && turn + 1 == max_iterations
+}
+
 async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -> Result<String> {
     let abort = create_abort_signal();
     let app_cfg = Arc::clone(&ctx.app.config);
@@ -264,7 +269,8 @@ async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -
     let mut input = Input::from_str(ctx, prompt, role_for_input)?;
     let mut accumulated = String::new();
 
-    for turn in 0..node.max_iterations {
+    let mut turn: u32 = 0;
+    loop {
         let client = input.create_client()?;
         ctx.before_chat_completion(&input)?;
         let (output, tool_results) =
@@ -291,7 +297,7 @@ async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -
                     return Ok(accumulated);
                 }
                 GuardrailAction::Inject(prompt) => {
-                    if turn + 1 == node.max_iterations {
+                    if is_last_turn(turn, node.max_iterations) {
                         bail!(
                             "llm node hit max_iterations ({}) before LLM concluded",
                             node.max_iterations
@@ -299,22 +305,19 @@ async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -
                     }
                     let role = ctx.role.clone();
                     input = Input::from_str(ctx, &prompt, role)?;
-                    continue;
                 }
             }
+        } else {
+            if is_last_turn(turn, node.max_iterations) {
+                bail!(
+                    "llm node hit max_iterations ({}) before LLM concluded",
+                    node.max_iterations
+                );
+            }
+            input = input.merge_tool_results(output, tool_results);
         }
-
-        if turn + 1 == node.max_iterations {
-            bail!(
-                "llm node hit max_iterations ({}) before LLM concluded",
-                node.max_iterations
-            );
-        }
-
-        input = input.merge_tool_results(output, tool_results);
+        turn = turn.saturating_add(1);
     }
-
-    bail!("llm node ended without producing output")
 }
 
 fn build_inline_role(
@@ -735,5 +738,20 @@ mod tests {
             Some(5u64).and_then(wall_clock),
             Some(Duration::from_secs(5))
         );
+    }
+
+    #[test]
+    fn is_last_turn_bounded() {
+        assert!(is_last_turn(0, 1));
+        assert!(!is_last_turn(0, 10));
+        assert!(is_last_turn(9, 10));
+        assert!(!is_last_turn(10, 10));
+    }
+
+    #[test]
+    fn is_last_turn_zero_cap_never_fires() {
+        assert!(!is_last_turn(0, 0));
+        assert!(!is_last_turn(9, 0));
+        assert!(!is_last_turn(u32::MAX, 0));
     }
 }
