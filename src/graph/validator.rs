@@ -178,6 +178,7 @@ impl GraphValidator {
         self.validate_max_concurrency(graph, &mut result);
         self.validate_max_concurrency_template(graph, &mut result);
         self.validate_orchestration_limits(graph, &mut result);
+        self.validate_timeouts(graph, &mut result);
         self.validate_map_subgraphs(graph, &mut result);
         self.validate_parallel_user_interaction(graph, &mut result);
         self.validate_parallel_writes(graph, &mut result);
@@ -580,6 +581,34 @@ impl GraphValidator {
                 "`max_concurrent_agents: 0` leaves no slot for any spawn to \
                  acquire, so agent spawning deadlocks; remove the key or set \
                  it >= 1",
+            ));
+        }
+    }
+
+    /// A `timeout: 0` is the author's explicit opt-out of the wall-clock
+    /// bound. It is legal; the warning only makes the choice visible.
+    fn validate_timeouts(&self, graph: &Graph, result: &mut ValidationResult) {
+        if graph.settings.timeout == Some(0) {
+            result.warning(ValidationError::new(
+                "settings.timeout: 0 disables the graph wall-clock bound; the run \
+                 ends only when the graph completes, is aborted, or hits \
+                 max_loop_iterations",
+            ));
+        }
+        for (node_id, node) in &graph.nodes {
+            let kind = match &node.node_type {
+                NodeType::Agent(a) if a.timeout == Some(0) => "agent",
+                NodeType::Script(s) if s.timeout == 0 => "script",
+                NodeType::Llm(l) if l.timeout == Some(0) => "llm",
+                NodeType::Rag(r) if r.timeout == Some(0) => "rag",
+                _ => continue,
+            };
+            result.warning(ValidationError::with_node(
+                node_id,
+                format!(
+                    "timeout: 0 disables the wall-clock bound for {kind} node \
+                     '{node_id}'; it runs until it returns"
+                ),
             ));
         }
     }
@@ -3166,6 +3195,135 @@ mod tests {
                 w.message.contains("max_agent_depth") || w.message.contains("max_concurrent_agents")
             }),
             "unset limits should not warn: {:?}",
+            result.warnings
+        );
+    }
+
+    fn timeout_warnings(result: &ValidationResult) -> Vec<&ValidationError> {
+        result
+            .warnings
+            .iter()
+            .filter(|w| w.message.contains("disables the"))
+            .collect()
+    }
+
+    #[test]
+    fn settings_timeout_zero_warns() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.settings.timeout = Some(0);
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid());
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id, None);
+        assert_eq!(
+            w[0].message,
+            "settings.timeout: 0 disables the graph wall-clock bound; the run ends only when \
+             the graph completes, is aborted, or hits max_loop_iterations"
+        );
+    }
+
+    #[test]
+    fn agent_timeout_zero_warns() {
+        let mut a = agent_node("a", "worker", Some("end"));
+        if let NodeType::Agent(ref mut an) = a.node_type {
+            an.timeout = Some(0);
+        }
+        let graph = graph_with(vec![("a", a), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id.as_deref(), Some("a"));
+        assert_eq!(
+            w[0].message,
+            "timeout: 0 disables the wall-clock bound for agent node 'a'; it runs until it returns"
+        );
+    }
+
+    #[test]
+    fn script_timeout_zero_warns() {
+        let mut s = script_node("s", "does-not-exist.py", None);
+        if let NodeType::Script(ref mut sn) = s.node_type {
+            sn.timeout = 0;
+        }
+        s.next = Some("end".into());
+        let graph = graph_with(vec![("s", s), ("end", end_node("end"))], "s");
+
+        let result = validator().validate(&graph);
+
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id.as_deref(), Some("s"));
+        assert_eq!(
+            w[0].message,
+            "timeout: 0 disables the wall-clock bound for script node 's'; it runs until it returns"
+        );
+    }
+
+    #[test]
+    fn llm_timeout_zero_warns() {
+        let mut l = llm_node("l", None, Some("end"));
+        if let NodeType::Llm(ref mut ln) = l.node_type {
+            ln.timeout = Some(0);
+        }
+        let graph = graph_with(vec![("l", l), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id.as_deref(), Some("l"));
+        assert_eq!(
+            w[0].message,
+            "timeout: 0 disables the wall-clock bound for llm node 'l'; it runs until it returns"
+        );
+    }
+
+    #[test]
+    fn rag_timeout_zero_warns() {
+        let mut r = rag_node("r", &["docs/"], true);
+        if let NodeType::Rag(ref mut rn) = r.node_type {
+            rn.timeout = Some(0);
+        }
+        let graph = graph_with(vec![("r", r), ("end", end_node("end"))], "r");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id.as_deref(), Some("r"));
+        assert_eq!(
+            w[0].message,
+            "timeout: 0 disables the wall-clock bound for rag node 'r'; it runs until it returns"
+        );
+    }
+
+    #[test]
+    fn nonzero_and_unset_timeouts_do_not_warn() {
+        let mut a = agent_node("a", "worker", Some("s"));
+        if let NodeType::Agent(ref mut an) = a.node_type {
+            an.timeout = Some(600);
+        }
+        let mut s = script_node("s", "does-not-exist.py", None);
+        s.next = Some("l".into());
+        let l = llm_node("l", None, Some("end"));
+        let mut graph = graph_with(
+            vec![("a", a), ("s", s), ("l", l), ("end", end_node("end"))],
+            "a",
+        );
+        graph.settings.timeout = Some(30);
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            timeout_warnings(&result).is_empty(),
+            "non-zero and unset timeouts should not warn: {:?}",
             result.warnings
         );
     }
