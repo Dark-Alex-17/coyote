@@ -300,8 +300,10 @@ fn wants_peer_identity(node: &Node) -> bool {
 
 /// A templated cap is resolved against the parent state right before the
 /// fan-out. Scripts often emit numbers as strings, so a numeric string is
-/// accepted; anything else, including 0, is the author's bug and surfaces
-/// as an error rather than being clamped.
+/// accepted; anything else is the author's bug and surfaces as an error
+/// rather than being clamped. A literal 0 is rejected the same way, so a
+/// graph loaded with validation off fails here instead of silently running
+/// one item at a time. Only the absent-cap default is clamped.
 fn resolve_max_concurrency(
     node: &MapNode,
     state: &StateManager,
@@ -310,7 +312,10 @@ fn resolve_max_concurrency(
 ) -> Result<usize> {
     let template = match &node.max_concurrency {
         None => return Ok(default.max(1)),
-        Some(ConcurrencyCap::Fixed(n)) => return Ok((*n).max(1)),
+        Some(ConcurrencyCap::Fixed(0)) => {
+            bail!("map node '{node_id}': max_concurrency 0; expected a positive integer")
+        }
+        Some(ConcurrencyCap::Fixed(n)) => return Ok(*n),
         Some(ConcurrencyCap::Template(t)) => t,
     };
 
@@ -529,6 +534,18 @@ mod tests {
     fn resolve_max_concurrency_fixed_uses_literal() {
         let state = StateManager::new(HashMap::new());
         assert_eq!(resolve(Some(ConcurrencyCap::Fixed(4)), &state).unwrap(), 4);
+    }
+
+    #[test]
+    fn resolve_max_concurrency_fixed_zero_errors() {
+        let state = StateManager::new(HashMap::new());
+        let msg = resolve(Some(ConcurrencyCap::Fixed(0)), &state)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            msg,
+            "map node 'm': max_concurrency 0; expected a positive integer"
+        );
     }
 
     #[test]
