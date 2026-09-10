@@ -221,13 +221,17 @@ async fn run_chain_step(
     let node = step_ctx.graph.get_node(current).ok_or_else(|| {
         anyhow!("map node '{map_id}': sub-branch [{idx}] routed to unknown node '{current}'")
     })?;
-    if !matches!(
-        node.node_type,
-        NodeType::Llm(_) | NodeType::Agent(_) | NodeType::Rag(_) | NodeType::Script(_)
-    ) {
+    let disallowed = match &node.node_type {
+        NodeType::Approval(_) => Some("an approval node"),
+        NodeType::Input(_) => Some("an input node"),
+        NodeType::End(_) => Some("an end node"),
+        NodeType::Map(_) => Some("a map node"),
+        NodeType::Agent(_) | NodeType::Llm(_) | NodeType::Rag(_) | NodeType::Script(_) => None,
+    };
+    if let Some(type_phrase) = disallowed {
         bail!(
-            "map branch '{current}' has type that cannot run inside a map \
-             (validator should have caught this; internal error)"
+            "'{current}' is {type_phrase}; approval/input/end/map nodes cannot run inside a \
+             map branch (enable settings.validate_before_run to catch this at load time)"
         );
     }
 
@@ -1115,10 +1119,64 @@ nodes:
         let chain = error_chain(run_graph(yaml, &ws).await);
 
         assert!(
-            chain.contains("map branch 'ask' has type that cannot run inside a map"),
+            chain.contains(
+                "'ask' is an approval node; approval/input/end/map nodes cannot run inside a \
+                 map branch (enable settings.validate_before_run to catch this at load time)"
+            ),
             "{chain}"
         );
         assert!(chain.contains("failed at node 'ask' (step 2)"), "{chain}");
+    }
+
+    #[tokio::test]
+    async fn map_chain_pre_check_rejects_end_node() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_py("gate.py", r#"print(json.dumps({}))"#);
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  validate_before_run: false
+initial_state:
+  items: [1]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: gate
+    collect_into: results
+    next: done
+  gate:
+    type: script
+    script: gate.py
+    next: finish
+  finish:
+    type: end
+    output: "done early"
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let chain = error_chain(run_graph(yaml, &ws).await);
+
+        assert!(
+            chain.contains(
+                "'finish' is an end node; approval/input/end/map nodes cannot run inside a \
+                 map branch (enable settings.validate_before_run to catch this at load time)"
+            ),
+            "{chain}"
+        );
+        assert!(
+            chain.contains("map node 'fan_out': sub-branch [0] failed at node 'finish' (step 2)"),
+            "{chain}"
+        );
+        assert_eq!(chain.matches("sub-branch [").count(), 1, "{chain}");
     }
 
     #[tokio::test]
