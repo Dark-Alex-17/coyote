@@ -1,4 +1,4 @@
-use super::state::template_root_keys;
+use super::state::{is_lone_template, template_root_keys};
 use super::types::{ConcurrencyCap, Graph, NextTargets, Node, NodeType};
 use crate::client::{Model, ModelType};
 use crate::config;
@@ -557,12 +557,12 @@ impl GraphValidator {
         for (node_id, node) in &graph.nodes {
             if let NodeType::Map(m) = &node.node_type
                 && let Some(ConcurrencyCap::Template(t)) = &m.max_concurrency
-                && !contains_template(t)
+                && !is_lone_template(t)
             {
                 result.error(ValidationError::with_node(
                     node_id,
                     "map node's `max_concurrency` is a string but not a template; write \
-                     an integer or a `{{key}}` template",
+                     an integer or exactly one `{{key}}` with nothing around it",
                 ));
             }
         }
@@ -654,12 +654,13 @@ impl GraphValidator {
                 ));
             }
             // A missing entry is reported by `validate_node_references`.
-            let mut members: Vec<String> = branch_subgraph(graph, &m.branch).into_iter().collect();
-            if members.is_empty() {
+            let mut member_ids: Vec<String> =
+                branch_subgraph(graph, &m.branch).into_iter().collect();
+            if member_ids.is_empty() {
                 continue;
             }
-            members.sort();
-            let members: Vec<(&str, &Node)> = members
+            member_ids.sort();
+            let members: Vec<(&str, &Node)> = member_ids
                 .iter()
                 .filter_map(|id| graph.get_node(id).map(|n| (id.as_str(), n)))
                 .collect();
@@ -1154,11 +1155,6 @@ fn primary_templated_fields(node: &Node) -> Vec<String> {
         }
         NodeType::Script(_) => Vec::new(),
     }
-}
-
-fn contains_template(s: &str) -> bool {
-    s.find("{{")
-        .is_some_and(|open| s[open + 2..].contains("}}"))
 }
 
 fn node_state_updates_map(node: &Node) -> Option<&std::collections::HashMap<String, String>> {
@@ -3626,6 +3622,52 @@ mod tests {
             "expected unclosed-template cap error: {:?}",
             result.errors
         );
+    }
+
+    #[test]
+    fn map_max_concurrency_malformed_templates_error() {
+        for cap in ["{{}}", "{{ key }}", "n={{k}}", "{{a}} {{b", "{{a-b}}"] {
+            let map = map_with_cap("m", "br", Some("end"), cap);
+            let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+            let graph = graph_with(
+                vec![("m", map), ("br", branch), ("end", end_node("end"))],
+                "m",
+            );
+
+            let result = validator().validate(&graph);
+
+            assert!(
+                result.errors.iter().any(|e| e.message
+                    == "map node's `max_concurrency` is a string but not a template; write \
+                        an integer or exactly one `{{key}}` with nothing around it"
+                    && e.node_id.as_deref() == Some("m")),
+                "cap {cap:?} should fail the whole-string template check: {:?}",
+                result.errors
+            );
+        }
+    }
+
+    #[test]
+    fn map_max_concurrency_lone_template_forms_pass() {
+        for cap in ["{{budget}}", "{{cfg.limits[0]}}", "  {{budget}}  "] {
+            let map = map_with_cap("m", "br", Some("end"), cap);
+            let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+            let graph = graph_with(
+                vec![("m", map), ("br", branch), ("end", end_node("end"))],
+                "m",
+            );
+
+            let result = validator().validate(&graph);
+
+            assert!(
+                !result
+                    .errors
+                    .iter()
+                    .any(|e| e.message.contains("is a string but not a template")),
+                "cap {cap:?} is a lone template and must pass: {:?}",
+                result.errors
+            );
+        }
     }
 
     #[test]

@@ -320,6 +320,16 @@ pub(super) fn template_root_keys(template: &str) -> Vec<String> {
         .collect()
 }
 
+// Whether `s` is exactly one `{{key}}` reference and nothing else, after the
+// same trim `interpolate_raw` applies, so this accepts exactly the strings the
+// runtime resolves as a pure reference.
+pub(super) fn is_lone_template(s: &str) -> bool {
+    let s = s.trim();
+    TEMPLATE_VAR_RE
+        .find(s)
+        .is_ok_and(|m| m.is_some_and(|m| m.start() == 0 && m.end() == s.len()))
+}
+
 fn value_to_string(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -929,6 +939,38 @@ mod tests {
         let result = manager.interpolate_raw("  {{k}}  ").unwrap();
 
         assert_eq!(result, json!("v"));
+    }
+
+    #[test]
+    fn is_lone_template_cases() {
+        for accepted in [
+            "{{budget}}",
+            "{{cfg.limits[0]}}",
+            "  {{budget}}  ",
+            "\n{{k}}\t",
+        ] {
+            assert!(
+                is_lone_template(accepted),
+                "{accepted:?} should be a lone template"
+            );
+        }
+        for rejected in [
+            "",
+            "4",
+            "{{}}",
+            "{{ key }}",
+            "n={{k}}",
+            "{{k}}x",
+            "{{a}} {{b",
+            "{{a}}{{b}}",
+            "{{a-b}}",
+            "{{k",
+        ] {
+            assert!(
+                !is_lone_template(rejected),
+                "{rejected:?} must not be a lone template"
+            );
+        }
     }
 
     #[test]

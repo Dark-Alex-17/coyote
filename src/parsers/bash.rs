@@ -19,7 +19,7 @@ pub fn generate_bash_declarations(
 
     debug!("Building script at '{tool_file:?}'");
     let (build_script, declarations) = build_bash_tool(&src, file_name)
-        .with_context(|| format!("Failed to build script at '{tools_file_path:?}'"))?;
+        .with_context(|| format!("Failed to build script '{file_name}'"))?;
     function::write_file_atomic(tools_file_path, &build_script, Some(0o755))
         .with_context(|| format!("Failed to write built script to '{tools_file_path:?}'"))?;
 
