@@ -499,6 +499,8 @@ pub enum Reducer {
 #[derive(Debug, Clone, Default)]
 pub struct GraphState {
     data: HashMap<String, Value>,
+    /// Ordered visit log, kept for test assertions only.
+    #[cfg(test)]
     history: Vec<String>,
     loop_counts: HashMap<String, usize>,
 }
@@ -507,6 +509,7 @@ impl GraphState {
     pub fn new(initial: HashMap<String, Value>) -> Self {
         Self {
             data: initial,
+            #[cfg(test)]
             history: Vec::new(),
             loop_counts: HashMap::new(),
         }
@@ -535,6 +538,7 @@ impl GraphState {
     }
 
     pub fn visit_node(&mut self, node_id: &str) {
+        #[cfg(test)]
         self.history.push(node_id.to_string());
         *self.loop_counts.entry(node_id.to_string()).or_insert(0) += 1;
     }
