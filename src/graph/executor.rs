@@ -465,7 +465,7 @@ pub(super) async fn step(
 ) -> Result<StepResult> {
     match &node.node_type {
         NodeType::Agent(agent_node) => {
-            AgentNodeExecutor::execute(agent_node, state, ctx).await?;
+            AgentNodeExecutor::execute(agent_node, state, ctx, !step_ctx.branch_mode).await?;
             let targets = static_next_targets(node, current, "agent", step_ctx.branch_mode)?;
             Ok(StepResult::Continue(targets))
         }

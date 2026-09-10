@@ -18,6 +18,7 @@ impl AgentNodeExecutor {
         node: &AgentNode,
         state_manager: &mut StateManager,
         parent_ctx: &mut RequestContext,
+        retire_peer_on_return: bool,
     ) -> Result<String> {
         let prompt = state_manager
             .interpolate(&node.prompt)
@@ -25,19 +26,34 @@ impl AgentNodeExecutor {
 
         let timeout_dur = Duration::from_secs(node.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
-        let raw = timeout(
+        // run_agent_for_graph takes the identity off the ctx; keep a handle so
+        // a frontier peer is retired the moment the agent stops, not after
+        // extraction. Chains re-arm the same identity for later steps and
+        // leave retirement to the chain runner.
+        let peer = parent_ctx.peer_registry.clone().zip(
+            parent_ctx
+                .peer_assignment
+                .as_ref()
+                .map(|(id, _)| id.clone()),
+        );
+
+        let raw_result = timeout(
             timeout_dur,
             run_agent_for_graph(parent_ctx, &node.agent, &prompt),
         )
-        .await
-        .with_context(|| {
-            format!(
-                "Agent '{}' timed out after {}s",
-                node.agent,
-                timeout_dur.as_secs()
-            )
-        })?
-        .with_context(|| format!("Agent '{}' failed", node.agent))?;
+        .await;
+        if retire_peer_on_return && let Some((registry, id)) = &peer {
+            registry.mark_finished(id);
+        }
+        let raw = raw_result
+            .with_context(|| {
+                format!(
+                    "Agent '{}' timed out after {}s",
+                    node.agent,
+                    timeout_dur.as_secs()
+                )
+            })?
+            .with_context(|| format!("Agent '{}' failed", node.agent))?;
 
         let output_value = match &node.output_schema {
             Some(schema) => structured::extract(&raw, schema, parent_ctx)
@@ -70,8 +86,11 @@ fn apply_state_updates(node: &AgentNode, state_manager: &mut StateManager, outpu
 mod tests {
     use super::super::types::AgentNode;
     use super::*;
+    use crate::config::{AppState, WorkingMode, default_max_agent_depth};
+    use crate::supervisor::mailbox::{Inbox, PeerRegistry, graph_agent_id};
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn manager_with(pairs: &[(&str, Value)]) -> StateManager {
         let mut map = HashMap::new();
@@ -90,6 +109,50 @@ mod tests {
             timeout: None,
             teammates: false,
         }
+    }
+
+    fn ctx_at_max_depth_with_peer() -> (RequestContext, Arc<PeerRegistry>, String) {
+        let registry = Arc::new(PeerRegistry::new());
+        let id = graph_agent_id("test_agent");
+        let inbox = Arc::new(Inbox::new());
+        registry.insert(id.clone(), "worker[0]".into(), Arc::clone(&inbox));
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.current_depth = default_max_agent_depth();
+        ctx.peer_registry = Some(Arc::clone(&registry));
+        ctx.peer_assignment = Some((id.clone(), inbox));
+        (ctx, registry, id)
+    }
+
+    async fn execute_past_max_depth(ctx: &mut RequestContext, retire_peer_on_return: bool) {
+        let mut node = node_with("hi", None);
+        node.teammates = true;
+        let mut state = manager_with(&[]);
+
+        let err = AgentNodeExecutor::execute(&node, &mut state, ctx, retire_peer_on_return)
+            .await
+            .expect_err("agent past max depth should fail before running");
+
+        let chain = format!("{err:#}");
+        assert!(chain.contains("Agent 'test_agent' failed"), "{chain}");
+        assert!(chain.contains("Max agent depth exceeded"), "{chain}");
+    }
+
+    #[tokio::test]
+    async fn execute_retires_peer_identity_on_frontier_when_agent_fails() {
+        let (mut ctx, registry, id) = ctx_at_max_depth_with_peer();
+
+        execute_past_max_depth(&mut ctx, true).await;
+
+        assert!(registry.is_finished(&id));
+    }
+
+    #[tokio::test]
+    async fn execute_leaves_peer_identity_live_in_branch_mode_when_agent_fails() {
+        let (mut ctx, registry, id) = ctx_at_max_depth_with_peer();
+
+        execute_past_max_depth(&mut ctx, false).await;
+
+        assert!(!registry.is_finished(&id));
     }
 
     #[test]
