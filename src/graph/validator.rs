@@ -585,9 +585,17 @@ impl GraphValidator {
         }
     }
 
-    /// A `timeout: 0` is the author's explicit opt-out of the wall-clock
-    /// bound. It is legal; the warning only makes the choice visible.
+    /// Explicit `0` opt-outs on `settings` and node bounds: a `timeout: 0`
+    /// disables the wall-clock bound and `max_loop_iterations: 0` disables the
+    /// per-node visit cap. Both are legal; the warnings only make the choice
+    /// visible.
     fn validate_timeouts(&self, graph: &Graph, result: &mut ValidationResult) {
+        if graph.settings.max_loop_iterations == 0 {
+            result.warning(ValidationError::new(
+                "settings.max_loop_iterations: 0 disables the per-node visit cap; a \
+                 non-converging loop runs until an enclosing timeout or abort",
+            ));
+        }
         if graph.settings.timeout == Some(0) {
             result.warning(ValidationError::new(
                 "settings.timeout: 0 disables the graph wall-clock bound; the run \
@@ -3324,6 +3332,41 @@ mod tests {
         assert!(
             timeout_warnings(&result).is_empty(),
             "non-zero and unset timeouts should not warn: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn max_loop_iterations_zero_warns() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.settings.max_loop_iterations = 0;
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid());
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert!(w[0].node_id.is_none());
+        assert_eq!(
+            w[0].message,
+            "settings.max_loop_iterations: 0 disables the per-node visit cap; a non-converging \
+             loop runs until an enclosing timeout or abort"
+        );
+    }
+
+    #[test]
+    fn max_loop_iterations_nonzero_does_not_warn() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.settings.max_loop_iterations = 5;
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("max_loop_iterations: 0")),
+            "non-zero cap should not warn: {:?}",
             result.warnings
         );
     }
