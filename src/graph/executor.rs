@@ -143,10 +143,11 @@ impl GraphExecutor {
             // Loop-count and visit tracking on live state, BEFORE forking.
             // This counts every entry to a node toward max_loop_iterations
             // regardless of how many parallel branches converged on it.
+            // A cap of 0 disables the check.
             for node_id in &frontier {
                 state.state_mut().visit_node(node_id);
                 let visits = state.state().loop_count(node_id);
-                if visits > max_iterations {
+                if max_iterations > 0 && visits > max_iterations {
                     bail!(
                         "Node '{}' visited {} times (max_loop_iterations={}). \
                          Possible infinite loop.",
@@ -1254,6 +1255,95 @@ nodes:
             .await;
 
         result.unwrap_or_else(|e| panic!("timeout: 0 should not bound the run: {e:#}"));
+    }
+
+    /// Bash script that bumps `n` in state and re-enters `looper` while
+    /// `n < stop`; once `n == stop` it omits `_next` so the static
+    /// `next: done` edge is taken.
+    fn looper_script(stop: usize) -> String {
+        format!(
+            "#!/bin/bash\n\
+             t=${{GRAPH_STATE#*'\"n\":'}}\n\
+             n=${{t%%[!0-9]*}}\n\
+             n=$((n + 1))\n\
+             if (( n < {stop} )); then\n\
+               printf '{{\"n\": %d, \"_next\": \"looper\"}}' \"$n\"\n\
+             else\n\
+               printf '{{\"n\": %d}}' \"$n\"\n\
+             fi\n"
+        )
+    }
+
+    fn loop_cap_graph(max_loop_iterations: usize) -> Graph {
+        let yaml = format!(
+            r#"
+name: loop_cap_test
+start: looper
+initial_state:
+  n: 0
+settings:
+  max_loop_iterations: {max_loop_iterations}
+nodes:
+  looper:
+    type: script
+    script: looper.sh
+    next: done
+  done:
+    type: end
+    output: "{{{{n}}}}"
+"#
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    #[tokio::test]
+    async fn max_loop_iterations_zero_is_unbounded() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        // Loop past the default cap so a fallback-to-default implementation
+        // would be caught, not just a lifted small cap.
+        let stop = crate::graph::DEFAULT_MAX_LOOP_ITERATIONS + 1;
+        let ws = TestWorkspace::new();
+        ws.write_script("looper.sh", &looper_script(stop));
+
+        let graph = loop_cap_graph(0);
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("max_loop_iterations: 0 should not cap visits: {e:#}"));
+
+        assert_eq!(result, stop.to_string());
+    }
+
+    #[tokio::test]
+    async fn max_loop_iterations_nonzero_still_bounds() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        // Always re-enter `looper`: only the cap can end this run.
+        ws.write_script("looper.sh", "#!/bin/bash\necho '{\"_next\": \"looper\"}'\n");
+
+        let graph = loop_cap_graph(2);
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await;
+
+        assert!(result.is_err(), "expected the visit cap to abort the run");
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains(
+                "Node 'looper' visited 3 times (max_loop_iterations=2). Possible infinite loop."
+            ),
+            "error should report the visit cap: {err}"
+        );
     }
 
     #[cfg(unix)]

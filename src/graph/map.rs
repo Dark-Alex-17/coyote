@@ -240,7 +240,7 @@ async fn run_chain_step(
     state.state_mut().visit_node(current);
     let visits = state.state().loop_count(current);
     let max_loops = step_ctx.graph.settings.max_loop_iterations;
-    if visits > max_loops {
+    if max_loops > 0 && visits > max_loops {
         bail!("node '{current}' visited {visits} times (max_loop_iterations={max_loops})");
     }
 
@@ -952,6 +952,51 @@ nodes:
             "{chain}"
         );
         assert_eq!(chain.matches("sub-branch [").count(), 1, "{chain}");
+    }
+
+    #[tokio::test]
+    async fn map_chain_script_next_loop_with_zero_cap_runs_to_completion() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        // Re-enter `looper` until n reaches 5; omitting `_next` ends the item.
+        ws.write_py(
+            "looper.py",
+            r#"n = state.get("n", 0) + 1
+out = {"n": n, "output": n}
+if n < 5:
+    out["_next"] = "looper"
+print(json.dumps(out))"#,
+        );
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  max_loop_iterations: 0
+  validate_before_run: false
+initial_state:
+  items: [1]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: looper
+    collect_into: results
+    next: done
+  looper:
+    type: script
+    script: looper.py
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let result = run_graph(yaml, &ws).await;
+
+        assert_eq!(collected(&result.unwrap()), vec![json!(5)]);
     }
 
     #[tokio::test]
