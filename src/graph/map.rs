@@ -1484,6 +1484,46 @@ nodes:
         .unwrap();
     }
 
+    const ECHO_INPUTS_AGENT: &str = "echo-inputs";
+
+    /// Materializes a graph agent whose only script echoes the `width` it
+    /// finds in `GRAPH_STATE` back as `output`. Its YAML default is
+    /// `width: 1`, so a parent that seeds `width` through `inputs:` is
+    /// observable against a parent that does not.
+    fn materialize_echo_inputs_agent() {
+        let graph_path = paths::agent_graph_file(ECHO_INPUTS_AGENT);
+        let agent_dir = graph_path.parent().unwrap();
+        fs::create_dir_all(agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("echo.py"),
+            "#!/usr/bin/env python3\nimport os, json\n\
+             state = json.loads(os.environ.get(\"GRAPH_STATE\", \"{}\"))\n\
+             print(json.dumps({\"output\": str(state[\"width\"])}))\n",
+        )
+        .unwrap();
+        fs::write(
+            &graph_path,
+            format!(
+                r#"
+name: {ECHO_INPUTS_AGENT}
+start: echo
+initial_state:
+  width: 1
+nodes:
+  echo:
+    type: script
+    script: echo.py
+    timeout: 30
+    next: done
+  done:
+    type: end
+    output: "{{{{output}}}}"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
     const DOUBLER_GRAPH: &str = r#"
 name: t
 start: doubler
@@ -1782,6 +1822,71 @@ nodes:
         assert!(chain.contains("'nope' not found in state"), "{chain}");
         assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
         assert!(peers.0.is_finished(&peers.1.0));
+    }
+
+    fn echo_inputs_parent_graph(inputs_block: &str) -> String {
+        format!(
+            r#"
+name: t
+start: worker
+nodes:
+  worker:
+    type: agent
+    agent: {ECHO_INPUTS_AGENT}
+    prompt: "p"
+{inputs_block}    state_updates:
+      output: "{{{{output}}}}"
+"#
+        )
+    }
+
+    async fn run_echo_inputs_chain(parent_yaml: &str) -> StateManager {
+        let h = Harness::new(parent_yaml);
+        let mut state = StateManager::new(HashMap::from([("n".to_string(), json!(3))]));
+        let mut ctx = silent_ctx();
+
+        h.run("worker", None, &mut state, &mut ctx)
+            .await
+            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+
+        state
+    }
+
+    /// The child's `width` default is overlaid by the parent's `inputs`
+    /// before the child graph starts, so its script sees the parent's value.
+    #[tokio::test]
+    #[serial]
+    async fn agent_node_inputs_seed_the_child_graph_state() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new();
+        materialize_echo_inputs_agent();
+        let parent = echo_inputs_parent_graph("    inputs:\n      width: \"{{n}}\"\n");
+
+        let state = run_echo_inputs_chain(&parent).await;
+
+        assert_eq!(state.state().get("output"), Some(&json!("3")));
+    }
+
+    /// Control for the test above: the same child with no `inputs` on the
+    /// parent node keeps its YAML default, so an override in the sibling
+    /// test cannot be the child ignoring its own `initial_state`.
+    #[tokio::test]
+    #[serial]
+    async fn agent_node_without_inputs_leaves_the_child_graph_defaults() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new();
+        materialize_echo_inputs_agent();
+        let parent = echo_inputs_parent_graph("");
+
+        let state = run_echo_inputs_chain(&parent).await;
+
+        assert_eq!(state.state().get("output"), Some(&json!("1")));
     }
 
     #[tokio::test]

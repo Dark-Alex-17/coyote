@@ -1943,6 +1943,88 @@ mod tests {
         assert_eq!(effective_max_agent_depth(&ctx), 5);
     }
 
+    fn unique_agent_name(prefix: &str) -> String {
+        format!(
+            "{prefix}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    fn write_config_only_agent(agent_name: &str) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_graph_agent(agent_name: &str) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\nstart: done\nnodes:\n  done:\n    type: end\n    output: done\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn run_agent_for_graph_error(
+        agent_name: &str,
+        graph_inputs: Option<HashMap<String, Value>>,
+    ) -> String {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let err = run_async(run_agent_for_graph(
+            &mut ctx,
+            agent_name,
+            "hi",
+            graph_inputs,
+        ))
+        .expect_err("run_agent_for_graph should reject the inputs");
+        format!("{err:#}")
+    }
+
+    #[test]
+    #[serial]
+    fn run_agent_for_graph_rejects_inputs_for_config_only_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_inputs_plain_agent");
+        write_config_only_agent(&agent_name);
+
+        let chain = run_agent_for_graph_error(&agent_name, Some(HashMap::new()));
+
+        assert_eq!(
+            chain,
+            format!(
+                "agent '{agent_name}' has no graph.yaml; `inputs:` is only valid on agent nodes that target a graph agent"
+            )
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_agent_for_graph_rejects_initial_prompt_input_on_graph_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_inputs_graph_agent");
+        write_graph_agent(&agent_name);
+        let inputs = HashMap::from([("initial_prompt".to_string(), json!("x"))]);
+
+        let chain = run_agent_for_graph_error(&agent_name, Some(inputs));
+
+        assert_eq!(
+            chain,
+            format!(
+                "agent '{agent_name}': `inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)"
+            )
+        );
+    }
+
     fn auto_continue_ctx() -> RequestContext {
         let app = AppState {
             config: Arc::new(AppConfig {
