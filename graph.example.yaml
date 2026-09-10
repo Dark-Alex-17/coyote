@@ -119,6 +119,9 @@ settings:
                              # than this many times, execution aborts. Default 100; 0 = no cap.
   timeout: 600               # Optional wall-clock cap (seconds) on the whole run,
                              # checked between node transitions. 0 = no bound.
+                             # Ctrl-C (or the enclosing turn aborting) ends the run
+                             # promptly from anywhere: in-flight branches, tools, and
+                             # child graph agents are cancelled with it.
   log_state_snapshots: true  # Log state before each node (debug/trace). Default true.
   validate_before_run: true  # Run the graph validator at startup. Default true.
   max_concurrency: 4         # Cap on simultaneously running branches in any
@@ -403,7 +406,8 @@ nodes:
                                 # and thus `collect_into` is written as [].
     as: subject                 # Required. Per-branch state key holding the
                                 # current item. Read with {{subject}} from any
-                                # node in the branch chain.
+                                # node in the branch chain. Must differ from
+                                # `output_key` (load-time error otherwise).
     branch: research_subject    # Required. ENTRY node of the per-item chain.
                                 # Every node reachable from it via `next:` /
                                 # `fallback:` is part of the chain and must be
@@ -422,13 +426,15 @@ nodes:
     max_concurrency: 3          # Optional cap on items in flight (one slot is
                                 # held for an item's WHOLE chain). Defaults to
                                 # settings.max_concurrency above. Accepts an
-                                # integer or a "{{key}}" template that must
-                                # resolve to a positive integer at run time,
+                                # integer or a template that is exactly one
+                                # "{{key}}" (surrounding whitespace allowed,
+                                # nothing else) and resolves to a positive integer,
                                 # e.g. `max_concurrency: "{{research_budget}}"`.
     output_key: subject_summary # Optional. State key whose value in the item's
                                 # FINAL fork state becomes the item's result.
-                                # Default "output". The key is removed from the
-                                # fork before the chain starts, so the chain
+                                # Default "output"; must differ from `as:`. The
+                                # key is removed from the fork before the chain
+                                # starts, so the chain
                                 # must write it (via state_updates, an
                                 # output_schema property, or a script's JSON);
                                 # an item that never writes it is an error, and
