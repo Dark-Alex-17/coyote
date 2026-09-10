@@ -18,23 +18,32 @@ pub fn generate_bash_declarations(
         .with_context(|| format!("Failed to load script at '{tool_file:?}'"))?;
 
     debug!("Building script at '{tool_file:?}'");
+    let (build_script, declarations) = build_bash_tool(&src, file_name)
+        .with_context(|| format!("Failed to build script at '{tools_file_path:?}'"))?;
+    function::write_file_atomic(tools_file_path, &build_script, Some(0o755))
+        .with_context(|| format!("Failed to write built script to '{tools_file_path:?}'"))?;
+
+    Ok(declarations)
+}
+
+/// Builds the argc script and derives its declarations without touching the
+/// filesystem, so callers can inspect a tool source without rewriting it.
+pub fn build_bash_tool(src: &str, file_name: &str) -> Result<(String, Vec<FunctionDeclaration>)> {
     let build_script = argc::build(
-        &src,
+        src,
         "",
         env::var("TERM_WIDTH").ok().and_then(|v| v.parse().ok()),
     )?;
     let build_script = allow_empty_required_values(&build_script);
-    function::write_file_atomic(tools_file_path, &build_script, Some(0o755))
-        .with_context(|| format!("Failed to write built script to '{tools_file_path:?}'"))?;
 
     let command_value = argc::export(&build_script, file_name)
-        .with_context(|| format!("Failed to parse script at '{tool_file:?}'"))?;
+        .with_context(|| format!("Failed to parse script '{file_name}'"))?;
     if command_value.subcommands.is_empty() {
         let function_declaration =
             command_to_function_declaration(&command_value).ok_or_else(|| {
                 anyhow::format_err!("Tool definition missing or empty description: {file_name}")
             })?;
-        Ok(vec![function_declaration])
+        Ok((build_script, vec![function_declaration]))
     } else {
         let mut declarations = vec![];
         for subcommand in &command_value.subcommands {
@@ -54,7 +63,7 @@ pub fn generate_bash_declarations(
             }
         }
 
-        Ok(declarations)
+        Ok((build_script, declarations))
     }
 }
 

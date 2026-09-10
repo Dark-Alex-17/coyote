@@ -3389,7 +3389,8 @@ mod tests {
                 continue;
             }
             let name = path.file_stem().unwrap().to_string_lossy().to_string();
-            let declarations = Functions::generate_declarations(&path)
+            let src = std::fs::read_to_string(&path).unwrap();
+            let (_, declarations) = bash::build_bash_tool(&src, &name)
                 .unwrap_or_else(|e| panic!("bundled tool '{name}' failed to parse: {e}"));
             assert!(
                 !declarations.is_empty(),
