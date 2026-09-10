@@ -9,6 +9,7 @@ use super::state::StateManager;
 use super::types::{EndNode, Graph, Node, NodeType};
 use super::user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 use super::validator::{AgentValidationContext, GraphValidator};
+use super::wall_clock;
 use crate::config::{RenderMode, RequestContext};
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
 use crate::utils::AbortSignal;
@@ -105,7 +106,7 @@ impl GraphExecutor {
             .unwrap_or_default();
         let script_executor = ScriptExecutor::new(&base_dir).with_envs(agent_envs);
         let max_iterations = graph.settings.max_loop_iterations;
-        let graph_timeout = graph.settings.timeout.map(Duration::from_secs);
+        let graph_timeout = graph.settings.timeout.and_then(wall_clock);
         let max_concurrency = graph.settings.max_concurrency;
         let graph = Arc::new(graph);
         let start = Instant::now();
@@ -1219,6 +1220,40 @@ nodes:
             "error should report during-super-step timeout: {err}"
         );
         assert!(err.contains("sleeper"), "error should name frontier: {err}");
+    }
+
+    #[tokio::test]
+    async fn graph_timeout_zero_is_unbounded() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("sleeper.sh", "#!/bin/bash\nsleep 1.5\necho '{}'\n");
+
+        let yaml = r#"
+name: zero_timeout_test
+start: sleeper
+settings:
+  timeout: 0
+nodes:
+  sleeper:
+    type: script
+    script: sleeper.sh
+    state_updates: {}
+    next: done
+  done:
+    type: end
+    output: "done"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await;
+
+        result.unwrap_or_else(|e| panic!("timeout: 0 should not bound the run: {e:#}"));
     }
 
     #[cfg(unix)]

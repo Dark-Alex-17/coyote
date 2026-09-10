@@ -1709,12 +1709,10 @@ nodes:
         assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
     }
 
-    /// `tokio::time::timeout` polls the agent future first and a zero-duration
-    /// sleep still goes through the time driver, so `Elapsed` only fires if the
-    /// agent future is still pending when the timer is next polled. The
-    /// materialized agent's graph holds its script step open for seconds, so
-    /// the future is dropped mid-flight and the chain runner alone retires
-    /// the identity.
+    /// The materialized agent's graph holds its script step open for seconds,
+    /// so the 1s timer fires while that step is still pending: the agent
+    /// future is dropped mid-flight and the chain runner alone retires the
+    /// identity.
     #[tokio::test]
     #[serial]
     async fn run_item_chain_marks_identity_finished_when_agent_step_times_out() {
@@ -1724,7 +1722,7 @@ nodes:
         }
         let _guard = TestConfigDirGuard::new();
         materialize_probe_agent(5.0);
-        let h = Harness::new(&flagged_probe_graph(Some(0)));
+        let h = Harness::new(&flagged_probe_graph(Some(1)));
         let (registry, assignments) = h.provision("worker", 2);
         let peers = (Arc::clone(&registry), assignments[0].clone());
         let mut state = item_state(json!(0));
@@ -1737,7 +1735,7 @@ nodes:
             "{chain}"
         );
         assert!(
-            chain.contains(&format!("Agent '{PROBE_AGENT}' timed out after 0s")),
+            chain.contains(&format!("Agent '{PROBE_AGENT}' timed out after 1s")),
             "{chain}"
         );
         assert!(
@@ -1746,6 +1744,32 @@ nodes:
         );
         assert!(registry.is_finished(&assignments[0].0));
         assert!(!registry.is_finished(&assignments[1].0));
+        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+    }
+
+    /// Positive twin of the timeout test above: with `timeout: 0` the agent
+    /// step has no wall-clock bound, so a hold longer than any accidental 0s
+    /// or 1s bound still runs to completion and hands its output back.
+    #[tokio::test]
+    #[serial]
+    async fn run_item_chain_probe_agent_with_zero_timeout_runs_to_completion() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new();
+        materialize_probe_agent(1.5);
+        let h = Harness::new(&flagged_probe_graph(Some(0)));
+        let peers = manual_peer("worker");
+        let mut state = item_state(json!(0));
+        let mut ctx = silent_ctx();
+
+        h.run("worker", Some(&peers), &mut state, &mut ctx)
+            .await
+            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+
+        assert_eq!(state.state().get("output"), Some(&json!("held")));
+        assert!(peers.0.is_finished(&peers.1.0));
         assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
     }
 

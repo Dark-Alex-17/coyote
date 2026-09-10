@@ -2,6 +2,7 @@ use super::state::StateManager;
 use super::state_updates;
 use super::structured;
 use super::types::LlmNode;
+use super::wall_clock;
 use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use crate::config::{
@@ -16,7 +17,6 @@ use log::warn;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::time::timeout;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -185,15 +185,10 @@ async fn run(
         node.mcp_tools.clone().map(|map| (node_id.to_string(), map)),
     );
     parent_ctx.refresh_mcp_tool_filters();
-    let result = match node.timeout {
-        Some(secs) => match timeout(
-            Duration::from_secs(secs),
-            run_with_retries(node, &prompt, parent_ctx),
-        )
-        .await
-        {
+    let result = match node.timeout.and_then(wall_clock) {
+        Some(d) => match timeout(d, run_with_retries(node, &prompt, parent_ctx)).await {
             Ok(r) => r,
-            Err(_) => Err(anyhow!("llm node timed out after {secs}s")),
+            Err(_) => Err(anyhow!("llm node timed out after {}s", d.as_secs())),
         },
         None => run_with_retries(node, &prompt, parent_ctx).await,
     };
@@ -478,6 +473,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn manager_with(pairs: &[(&str, Value)]) -> StateManager {
         let mut map = HashMap::new();
@@ -730,5 +726,14 @@ mod tests {
         )));
         assert!(!is_transient(&anyhow!("hit max_iterations")));
         assert!(!is_transient(&anyhow!("authentication failed")));
+    }
+
+    #[test]
+    fn zero_timeout_resolves_to_no_bound() {
+        assert!(Some(0u64).and_then(wall_clock).is_none());
+        assert_eq!(
+            Some(5u64).and_then(wall_clock),
+            Some(Duration::from_secs(5))
+        );
     }
 }

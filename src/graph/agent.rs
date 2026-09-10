@@ -2,13 +2,13 @@ use super::state::StateManager;
 use super::state_updates;
 use super::structured;
 use super::types::AgentNode;
+use super::wall_clock;
 use crate::config::RequestContext;
 use crate::function::agents::run_agent_for_graph;
 use anyhow::{Context, Result};
 use log::debug;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::Duration;
 use tokio::time::timeout;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
@@ -33,7 +33,8 @@ impl AgentNodeExecutor {
             debug!("Agent '{}' graph inputs: {keys:?}", node.agent);
         }
 
-        let timeout_dur = Duration::from_secs(node.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
+        let secs = node.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let bound = wall_clock(secs);
 
         // run_agent_for_graph takes the identity off the ctx; keep a handle so
         // a frontier peer is retired the moment the agent stops, not after
@@ -46,22 +47,16 @@ impl AgentNodeExecutor {
                 .map(|(id, _)| id.clone()),
         );
 
-        let raw_result = timeout(
-            timeout_dur,
-            run_agent_for_graph(parent_ctx, &node.agent, &prompt, graph_inputs),
-        )
-        .await;
+        let fut = run_agent_for_graph(parent_ctx, &node.agent, &prompt, graph_inputs);
+        let raw_result = match bound {
+            Some(d) => timeout(d, fut).await,
+            None => Ok(fut.await),
+        };
         if retire_peer_on_return && let Some((registry, id)) = &peer {
             registry.mark_finished(id);
         }
         let raw = raw_result
-            .with_context(|| {
-                format!(
-                    "Agent '{}' timed out after {}s",
-                    node.agent,
-                    timeout_dur.as_secs()
-                )
-            })?
+            .with_context(|| format!("Agent '{}' timed out after {}s", node.agent, secs))?
             .with_context(|| format!("Agent '{}' failed", node.agent))?;
 
         let output_value = match &node.output_schema {

@@ -22,11 +22,17 @@ pub use dispatch::{
 pub use executor::GraphExecutor;
 pub use parser::{GraphParser, agent_has_graph};
 use serde_json::Value;
+use std::time::Duration;
 pub use types::{Graph, NodeType};
 
 pub const GRAPH_SCHEMA_VERSION: &str = "1.0";
 
 pub const DEFAULT_MAX_LOOP_ITERATIONS: usize = 100;
+
+/// A timeout of `0` disables the wall-clock bound.
+pub(crate) fn wall_clock(secs: u64) -> Option<Duration> {
+    (secs != 0).then(|| Duration::from_secs(secs))
+}
 
 pub const MAX_STATE_SIZE_BYTES: usize = 32 * 1024;
 
@@ -38,5 +44,20 @@ pub(in crate::graph) fn type_name(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wall_clock_zero_is_no_bound() {
+        assert!(wall_clock(0).is_none());
+    }
+
+    #[test]
+    fn wall_clock_nonzero_is_that_many_seconds() {
+        assert_eq!(wall_clock(7), Some(Duration::from_secs(7)));
     }
 }
