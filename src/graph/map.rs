@@ -293,7 +293,7 @@ fn wants_peer_identity(node: &Node) -> bool {
 
 /// A templated cap is resolved against the parent state right before the
 /// fan-out. Scripts often emit numbers as strings, so a numeric string is
-/// accepted; anything else — including 0 — is the author's bug and surfaces
+/// accepted; anything else, including 0, is the author's bug and surfaces
 /// as an error rather than being clamped.
 fn resolve_max_concurrency(
     node: &MapNode,

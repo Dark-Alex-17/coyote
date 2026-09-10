@@ -631,8 +631,8 @@ impl GraphValidator {
                     if fallback_targets.contains(id) {
                         message.push_str(
                             "; a branch's `fallback` must stay inside the branch subgraph; \
-                             before this release `fallback` on a map branch was accepted but \
-                             never honored — remove it or point it at a branch-local node",
+                             `fallback` on a map branch was previously accepted but \
+                             never honored. Remove it or point it at a branch-local node",
                         );
                     }
                     result.error(ValidationError::with_node(map_id, message));
@@ -929,7 +929,7 @@ fn main_flow_reachable(graph: &Graph) -> HashSet<String> {
 
 /// Nodes reachable from `entry` over the edges a chain can follow at run
 /// time: `next` targets and script/llm `fallback`s. Approval routes and a
-/// nested map's `branch` are not followed — neither may appear inside a
+/// nested map's `branch` are not followed. Neither may appear inside a
 /// branch, and the validator reports them separately.
 pub(super) fn branch_subgraph(graph: &Graph, entry: &str) -> HashSet<String> {
     let mut reachable: HashSet<String> = HashSet::new();
