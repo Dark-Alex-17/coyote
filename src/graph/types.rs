@@ -426,11 +426,58 @@ pub struct MapNode {
     pub collect_into: String,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_concurrency: Option<usize>,
+    pub max_concurrency: Option<ConcurrencyCap>,
 }
 
 fn default_map_output_key() -> String {
     "output".to_string()
+}
+
+/// A map node's per-item concurrency cap: either a literal integer or a
+/// `{{template}}` resolved against graph state when the map runs.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum ConcurrencyCap {
+    Fixed(usize),
+    Template(String),
+}
+
+// Hand-written so a malformed value (`-1`, `4.5`, `true`) reports what was
+// received and what is accepted, instead of serde's untagged-enum "did not
+// match any variant".
+impl<'de> Deserialize<'de> for ConcurrencyCap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CapVisitor;
+
+        impl serde::de::Visitor<'_> for CapVisitor {
+            type Value = ConcurrencyCap;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a positive integer or a `{{template}}` string for max_concurrency")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                usize::try_from(v)
+                    .map(ConcurrencyCap::Fixed)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(v), &self))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                usize::try_from(v)
+                    .map(ConcurrencyCap::Fixed)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(v), &self))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(ConcurrencyCap::Template(v.to_owned()))
+            }
+        }
+
+        deserializer.deserialize_any(CapVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -1232,7 +1279,7 @@ next: rank
         assert_eq!(map.branch, "research_subject");
         assert_eq!(map.output_key, "research_result");
         assert_eq!(map.collect_into, "research_results");
-        assert_eq!(map.max_concurrency, Some(5));
+        assert_eq!(map.max_concurrency, Some(ConcurrencyCap::Fixed(5)));
     }
 
     #[test]
@@ -1254,6 +1301,78 @@ collect_into: results
 
         assert_eq!(map.output_key, "output");
         assert!(map.max_concurrency.is_none());
+    }
+
+    fn map_node_yaml_with_cap(cap: &str) -> String {
+        format!(
+            "id: fan_out\ntype: map\nover: \"{{{{items}}}}\"\nas: item\nbranch: process\n\
+             collect_into: results\nmax_concurrency: {cap}\n"
+        )
+    }
+
+    fn parse_map_cap(cap: &str) -> Option<ConcurrencyCap> {
+        let node: Node = serde_yaml::from_str(&map_node_yaml_with_cap(cap)).unwrap();
+        match node.node_type {
+            NodeType::Map(m) => m.max_concurrency,
+            _ => panic!("expected Map variant"),
+        }
+    }
+
+    #[test]
+    fn map_max_concurrency_integer_parses_as_fixed() {
+        assert_eq!(parse_map_cap("4"), Some(ConcurrencyCap::Fixed(4)));
+    }
+
+    #[test]
+    fn map_max_concurrency_zero_parses_as_fixed_zero() {
+        assert_eq!(parse_map_cap("0"), Some(ConcurrencyCap::Fixed(0)));
+    }
+
+    #[test]
+    fn map_max_concurrency_string_parses_as_template() {
+        assert_eq!(
+            parse_map_cap("\"{{budget}}\""),
+            Some(ConcurrencyCap::Template("{{budget}}".into()))
+        );
+    }
+
+    #[test]
+    fn map_max_concurrency_quoted_integer_parses_as_template() {
+        assert_eq!(
+            parse_map_cap("\"4\""),
+            Some(ConcurrencyCap::Template("4".into()))
+        );
+    }
+
+    #[test]
+    fn map_max_concurrency_malformed_values_name_accepted_forms() {
+        for bad in ["-1", "4.5", "true", "[4]", "{n: 4}"] {
+            let err = serde_yaml::from_str::<Node>(&map_node_yaml_with_cap(bad))
+                .expect_err(&format!("max_concurrency: {bad} should fail to parse"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("a positive integer or a `{{template}}` string for max_concurrency"),
+                "max_concurrency: {bad} produced an unhelpful error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_max_concurrency_negative_error_names_offending_value() {
+        let err = serde_yaml::from_str::<Node>(&map_node_yaml_with_cap("-1")).unwrap_err();
+        assert!(err.to_string().contains("-1"), "{err}");
+    }
+
+    #[test]
+    fn concurrency_cap_serializes_as_bare_scalar() {
+        assert_eq!(
+            serde_json::to_value(ConcurrencyCap::Fixed(4)).unwrap(),
+            serde_json::json!(4)
+        );
+        assert_eq!(
+            serde_json::to_value(ConcurrencyCap::Template("{{k}}".into())).unwrap(),
+            serde_json::json!("{{k}}")
+        );
     }
 
     #[test]

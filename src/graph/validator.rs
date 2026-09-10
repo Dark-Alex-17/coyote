@@ -1,5 +1,5 @@
 use super::state::template_root_keys;
-use super::types::{Graph, Node, NodeType};
+use super::types::{ConcurrencyCap, Graph, Node, NodeType};
 use crate::client::{Model, ModelType};
 use crate::config;
 use crate::config::{Agent, AppConfig, paths};
@@ -176,6 +176,7 @@ impl GraphValidator {
         self.validate_llm_nodes(graph, &mut result);
         self.validate_llm_skills(graph, &mut result);
         self.validate_max_concurrency(graph, &mut result);
+        self.validate_max_concurrency_template(graph, &mut result);
         self.validate_orchestration_limits(graph, &mut result);
         self.validate_map_branches(graph, &mut result);
         self.validate_parallel_user_interaction(graph, &mut result);
@@ -519,12 +520,29 @@ impl GraphValidator {
 
         for (node_id, node) in &graph.nodes {
             if let NodeType::Map(m) = &node.node_type
-                && let Some(0) = m.max_concurrency
+                && let Some(ConcurrencyCap::Fixed(0)) = m.max_concurrency
             {
                 result.error(ValidationError::with_node(
                     node_id,
                     "map node's `max_concurrency` must be >= 1 (got 0); a zero cap \
                      would deadlock the executor",
+                ));
+            }
+        }
+    }
+
+    // A string cap that never interpolates would only fail at run time, after the
+    // map's inputs were already computed; catch the typo (`"4"` for `4`) at load.
+    fn validate_max_concurrency_template(&self, graph: &Graph, result: &mut ValidationResult) {
+        for (node_id, node) in &graph.nodes {
+            if let NodeType::Map(m) = &node.node_type
+                && let Some(ConcurrencyCap::Template(t)) = &m.max_concurrency
+                && !contains_template(t)
+            {
+                result.error(ValidationError::with_node(
+                    node_id,
+                    "map node's `max_concurrency` is a string but not a template; write \
+                     an integer or a `{{key}}` template",
                 ));
             }
         }
@@ -940,9 +958,20 @@ fn primary_templated_fields(node: &Node) -> Vec<String> {
             v
         }
         NodeType::End(n) => vec![n.output.clone()],
-        NodeType::Map(n) => vec![n.over.clone()],
+        NodeType::Map(n) => {
+            let mut v = vec![n.over.clone()];
+            if let Some(ConcurrencyCap::Template(t)) = &n.max_concurrency {
+                v.push(t.clone());
+            }
+            v
+        }
         NodeType::Script(_) => Vec::new(),
     }
+}
+
+fn contains_template(s: &str) -> bool {
+    s.find("{{")
+        .is_some_and(|open| s[open + 2..].contains("}}"))
 }
 
 fn node_state_updates_map(node: &Node) -> Option<&std::collections::HashMap<String, String>> {
@@ -2673,7 +2702,7 @@ mod tests {
     fn map_max_concurrency_zero_errors() {
         let mut map = map_node_basic("m", "br", Some("end"));
         if let NodeType::Map(ref mut mm) = map.node_type {
-            mm.max_concurrency = Some(0);
+            mm.max_concurrency = Some(ConcurrencyCap::Fixed(0));
         }
         let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
         let graph = graph_with(
@@ -2710,6 +2739,109 @@ mod tests {
                 .iter()
                 .any(|e| e.message.contains("max_concurrency")),
             "map without max_concurrency should not error: {:?}",
+            result.errors
+        );
+    }
+
+    fn map_with_cap(id: &str, branch: &str, next: Option<&str>, cap: &str) -> Node {
+        let mut map = map_node_basic(id, branch, next);
+        if let NodeType::Map(ref mut mm) = map.node_type {
+            mm.max_concurrency = Some(ConcurrencyCap::Template(cap.into()));
+        }
+        map
+    }
+
+    #[test]
+    fn map_max_concurrency_non_template_string_errors() {
+        let map = map_with_cap("m", "br", Some("end"), "4");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e
+                .message
+                .contains("`max_concurrency` is a string but not a template")
+                && e.node_id.as_deref() == Some("m")),
+            "expected non-template string cap error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_max_concurrency_template_string_is_valid() {
+        let map = map_with_cap("m", "br", Some("end"), "{{k}}");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("max_concurrency")),
+            "templated cap should not error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_max_concurrency_unclosed_template_errors() {
+        let map = map_with_cap("m", "br", Some("end"), "{{k");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("is a string but not a template")),
+            "expected unclosed-template cap error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_max_concurrency_template_reading_sibling_write_errors() {
+        let mut start = end_node("start");
+        start.next = Some(NextTargets::Many(vec!["m".into(), "worker_b".into()]));
+        let map = map_with_cap("m", "br", Some("end"), "{{summary}}");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let writer = llm_with_state_updates("worker_b", &[("summary", "static")], Some("end"));
+        let graph = graph_with(
+            vec![
+                ("start", start),
+                ("m", map),
+                ("br", branch),
+                ("worker_b", writer),
+                ("end", end_node("end")),
+            ],
+            "start",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("reads state key(s) `summary`")
+                    && e.message.contains("'worker_b'")
+                    && e.node_id.as_deref() == Some("m")),
+            "expected cross-branch read error for templated cap: {:?}",
             result.errors
         );
     }

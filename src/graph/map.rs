@@ -3,7 +3,7 @@ use super::executor::StepContext;
 use super::llm::LlmNodeExecutor;
 use super::rag::RagNodeExecutor;
 use super::state::StateManager;
-use super::types::{MapNode, NodeType};
+use super::types::{ConcurrencyCap, MapNode, NodeType};
 use crate::config::{RenderMode, RequestContext};
 use crate::graph::type_name;
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
@@ -49,10 +49,7 @@ impl MapNodeExecutor {
             })?
             .clone();
 
-        let max_conc = node
-            .max_concurrency
-            .unwrap_or(step_ctx.max_concurrency)
-            .max(1);
+        let max_conc = resolve_max_concurrency(node, state, step_ctx.max_concurrency, node_id)?;
         let semaphore = Arc::new(Semaphore::new(max_conc));
         let mut sub_tasks = Vec::with_capacity(items.len());
 
@@ -160,6 +157,42 @@ impl MapNodeExecutor {
     }
 }
 
+/// A templated cap is resolved against the parent state right before the
+/// fan-out. Scripts often emit numbers as strings, so a numeric string is
+/// accepted; anything else — including 0 — is the author's bug and surfaces
+/// as an error rather than being clamped.
+fn resolve_max_concurrency(
+    node: &MapNode,
+    state: &StateManager,
+    default: usize,
+    node_id: &str,
+) -> Result<usize> {
+    let template = match &node.max_concurrency {
+        None => return Ok(default.max(1)),
+        Some(ConcurrencyCap::Fixed(n)) => return Ok((*n).max(1)),
+        Some(ConcurrencyCap::Template(t)) => t,
+    };
+
+    let value = state
+        .interpolate_raw(template)
+        .with_context(|| format!("map node '{node_id}': evaluating `max_concurrency` template"))?;
+
+    let resolved = match &value {
+        Value::Number(n) => n.as_u64().and_then(|n| usize::try_from(n).ok()),
+        Value::String(s) => s.trim().parse::<usize>().ok(),
+        _ => None,
+    };
+
+    match resolved {
+        Some(n) if n >= 1 => Ok(n),
+        _ => Err(anyhow!(
+            "map node '{node_id}': max_concurrency template \"{template}\" resolved to \
+             {value} ({}); expected a positive integer",
+            type_name(&value)
+        )),
+    }
+}
+
 /// Pre-provision teammate identities before any branch starts, so a fast
 /// sibling can message one still waiting on the semaphore (the message
 /// queues in the pre-created inbox). A single-item fan-out has no peers, so
@@ -237,5 +270,99 @@ mod tests {
             state_updates: None,
         });
         assert!(provision_map_peers(&branch, "shards", 3).is_none());
+    }
+
+    fn map_with_cap(cap: Option<ConcurrencyCap>) -> MapNode {
+        MapNode {
+            over: "{{items}}".into(),
+            as_name: "item".into(),
+            branch: "br".into(),
+            output_key: "output".into(),
+            collect_into: "results".into(),
+            max_concurrency: cap,
+        }
+    }
+
+    fn state_with(key: &str, value: Value) -> StateManager {
+        StateManager::new(HashMap::from([(key.to_string(), value)]))
+    }
+
+    fn resolve(cap: Option<ConcurrencyCap>, state: &StateManager) -> Result<usize> {
+        resolve_max_concurrency(&map_with_cap(cap), state, 8, "m")
+    }
+
+    #[test]
+    fn resolve_max_concurrency_fixed_uses_literal() {
+        let state = StateManager::new(HashMap::new());
+        assert_eq!(resolve(Some(ConcurrencyCap::Fixed(4)), &state).unwrap(), 4);
+    }
+
+    #[test]
+    fn resolve_max_concurrency_none_falls_back_to_step_default() {
+        let state = StateManager::new(HashMap::new());
+        assert_eq!(resolve(None, &state).unwrap(), 8);
+    }
+
+    #[test]
+    fn resolve_max_concurrency_template_accepts_integer_value() {
+        let state = state_with("budget", Value::from(3));
+        let cap = Some(ConcurrencyCap::Template("{{budget}}".into()));
+        assert_eq!(resolve(cap, &state).unwrap(), 3);
+    }
+
+    #[test]
+    fn resolve_max_concurrency_template_accepts_numeric_string() {
+        let state = state_with("budget", Value::from("3"));
+        let cap = Some(ConcurrencyCap::Template("{{budget}}".into()));
+        assert_eq!(resolve(cap, &state).unwrap(), 3);
+    }
+
+    #[test]
+    fn resolve_max_concurrency_template_rejects_non_numeric_string() {
+        let state = state_with("budget", Value::from("high"));
+        let cap = Some(ConcurrencyCap::Template("{{budget}}".into()));
+        let msg = resolve(cap, &state).unwrap_err().to_string();
+        assert!(msg.contains("map node 'm'"), "{msg}");
+        assert!(msg.contains("\"{{budget}}\""), "{msg}");
+        assert!(msg.contains("resolved to \"high\" (string)"), "{msg}");
+        assert!(msg.contains("expected a positive integer"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_max_concurrency_template_rejects_zero() {
+        let state = state_with("budget", Value::from(0));
+        let cap = Some(ConcurrencyCap::Template("{{budget}}".into()));
+        let msg = resolve(cap, &state).unwrap_err().to_string();
+        assert!(msg.contains("resolved to 0 (number)"), "{msg}");
+        assert!(msg.contains("expected a positive integer"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_max_concurrency_template_rejects_non_integer_number() {
+        let state = state_with("budget", Value::from(2.5));
+        let cap = Some(ConcurrencyCap::Template("{{budget}}".into()));
+        let msg = resolve(cap, &state).unwrap_err().to_string();
+        assert!(msg.contains("resolved to 2.5 (number)"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_max_concurrency_template_rejects_array() {
+        let state = state_with("budget", Value::Array(vec![Value::from(3)]));
+        let cap = Some(ConcurrencyCap::Template("{{budget}}".into()));
+        let msg = resolve(cap, &state).unwrap_err().to_string();
+        assert!(msg.contains("(array)"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_max_concurrency_template_missing_key_names_map_node() {
+        let state = StateManager::new(HashMap::new());
+        let cap = Some(ConcurrencyCap::Template("{{budget}}".into()));
+        let err = resolve(cap, &state).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("map node 'm': evaluating `max_concurrency` template"),
+            "{chain}"
+        );
+        assert!(chain.contains("budget"), "{chain}");
     }
 }
