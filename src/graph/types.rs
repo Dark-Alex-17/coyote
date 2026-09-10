@@ -499,7 +499,6 @@ pub enum Reducer {
 #[derive(Debug, Clone, Default)]
 pub struct GraphState {
     data: HashMap<String, Value>,
-    /// Ordered visit log, kept for test assertions only.
     #[cfg(test)]
     history: Vec<String>,
     loop_counts: HashMap<String, usize>,
