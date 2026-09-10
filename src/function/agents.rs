@@ -543,6 +543,26 @@ pub fn run_child_agent(
     run_child_agent_with_graph_inputs(child_ctx, initial_input, abort_signal, None)
 }
 
+/// Stops a child agent's own spawned subagents if the future running the
+/// child is dropped mid-flight (parent timeout, abort) or the child fails
+/// before reaching its own cleanup. Disarmed on the success paths, which
+/// already cancel explicitly.
+struct CancelOnDrop(Option<Arc<RwLock<Supervisor>>>);
+
+impl CancelOnDrop {
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(supervisor) = self.0.take() {
+            supervisor.read().cancel_recursive();
+        }
+    }
+}
+
 /// Runs a child agent to completion. When the child is a graph agent,
 /// `graph_inputs` is overlaid on its `initial_state` before the graph
 /// starts; it is ignored for config-only agents.
@@ -553,14 +573,19 @@ fn run_child_agent_with_graph_inputs(
     graph_inputs: Option<HashMap<String, Value>>,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
+        let mut cancel_on_drop = CancelOnDrop(child_ctx.supervisor.clone());
         if graph::active_agent_graph_name(&child_ctx).is_some() {
-            return graph::run_active_agent_graph_with_inputs(
+            let result = graph::run_active_agent_graph_with_inputs(
                 &mut child_ctx,
                 &initial_input.text(),
                 abort_signal,
                 graph_inputs,
             )
             .await;
+            if result.is_ok() {
+                cancel_on_drop.disarm();
+            }
+            return result;
         }
 
         let mut accumulated_output = String::new();
@@ -620,6 +645,7 @@ fn run_child_agent_with_graph_inputs(
         if let Some(supervisor) = child_ctx.supervisor.clone() {
             supervisor.read().cancel_recursive();
         }
+        cancel_on_drop.disarm();
 
         Ok(accumulated_output)
     })
@@ -774,6 +800,7 @@ pub async fn run_agent_for_graph(
         Arc::clone(&child_inbox),
         agent_id.clone(),
     );
+    child_ctx.session_abort = parent_ctx.session_abort.clone();
     child_ctx.rag = agent.rag();
     child_ctx.agent = Some(agent);
     if graph_inputs.is_some() && graph::active_agent_graph_name(&child_ctx).is_none() {
@@ -2023,6 +2050,29 @@ mod tests {
                 "agent '{agent_name}': `inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)"
             )
         );
+    }
+
+    #[test]
+    fn cancel_on_drop_guard_cancels_when_armed_and_not_when_disarmed() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let armed_abort = register_running_agent(&mut ctx, "a1", "explore");
+            drop(CancelOnDrop(ctx.supervisor.clone()));
+            assert!(
+                armed_abort.aborted(),
+                "an armed guard cancels the supervisor's agents when dropped"
+            );
+
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let disarmed_abort = register_running_agent(&mut ctx, "a2", "explore");
+            let mut guard = CancelOnDrop(ctx.supervisor.clone());
+            guard.disarm();
+            drop(guard);
+            assert!(
+                !disarmed_abort.aborted(),
+                "a disarmed guard leaves the supervisor's agents running"
+            );
+        });
     }
 
     fn auto_continue_ctx() -> RequestContext {
