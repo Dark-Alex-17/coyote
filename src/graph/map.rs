@@ -740,6 +740,119 @@ nodes:
         assert_eq!(collected(&result), vec![json!(3), json!(5), json!(7)]);
     }
 
+    const RETRY_CHAIN_GRAPH: &str = r#"
+name: retry-chain
+start: fan_out
+settings:
+  validate_before_run: true
+initial_state:
+  items: ["a", "b", "c"]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: draft
+    output_key: result
+    collect_into: results
+    next: done
+  draft:
+    type: script
+    script: draft.py
+    next: check
+  check:
+    type: script
+    script: check.py
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+
+    fn write_retry_chain_scripts(ws: &TestWorkspace) {
+        ws.write_py(
+            "draft.py",
+            r##"attempts = state.get("attempts", 0) + 1
+print(json.dumps({"attempts": attempts, "draft": f"{state['item']}#{attempts}"}))"##,
+        );
+        ws.write_py(
+            "check.py",
+            r#"if state["attempts"] < 2:
+    print(json.dumps({"_next": "draft"}))
+else:
+    print(json.dumps({"result": {"item": state["item"], "draft": state["draft"], "attempts": state["attempts"]}}))"#,
+        );
+    }
+
+    fn retry_chain_results() -> Vec<Value> {
+        ["a", "b", "c"]
+            .iter()
+            .map(|item| json!({"item": item, "draft": format!("{item}#2"), "attempts": 2}))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn map_chain_retries_via_script_next_until_check_accepts() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        write_retry_chain_scripts(&ws);
+
+        let result = run_graph(RETRY_CHAIN_GRAPH, &ws)
+            .await
+            .unwrap_or_else(|e| panic!("validated retry chain failed: {e:#}"));
+
+        assert_eq!(collected(&result), retry_chain_results());
+    }
+
+    #[tokio::test]
+    async fn map_chain_retries_leave_parent_state_and_loop_counts_untouched() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        write_retry_chain_scripts(&ws);
+        let graph: Arc<Graph> = Arc::new(serde_yaml::from_str(RETRY_CHAIN_GRAPH).unwrap());
+        let NodeType::Map(map_node) = &graph.get_node("fan_out").unwrap().node_type else {
+            panic!("fan_out should be a map node");
+        };
+        let script = ScriptExecutor::new(&ws.dir);
+        let abort = create_abort_signal();
+        let step_ctx = StepContext {
+            graph: Arc::clone(&graph),
+            script_executor: &script,
+            max_concurrency: 4,
+            abort_signal: &abort,
+            branch_mode: false,
+        };
+        let items = json!(["a", "b", "c"]);
+        let mut parent = StateManager::new(HashMap::from([("items".to_string(), items.clone())]));
+        let mut ctx = silent_ctx();
+
+        MapNodeExecutor::execute(map_node, &mut parent, &mut ctx, &step_ctx, "fan_out")
+            .await
+            .unwrap_or_else(|e| panic!("map failed: {e:#}"));
+
+        // Only `collect_into` lands on the parent: the per-item `attempts`,
+        // `draft` and `result` writes were fork-local scratch.
+        assert_eq!(
+            *parent.state().data(),
+            HashMap::from([
+                ("items".to_string(), items),
+                ("results".to_string(), Value::Array(retry_chain_results())),
+            ])
+        );
+        for node in ["fan_out", "draft", "check"] {
+            assert_eq!(
+                parent.state().loop_count(node),
+                0,
+                "parent loop count for '{node}'"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn map_chain_script_next_loop_is_bounded_by_max_loop_iterations() {
         if !cmd_available("python3") {

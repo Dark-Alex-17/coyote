@@ -8076,7 +8076,28 @@ mod tests {
     #[serial]
     fn bundled_graph_agents_parse_and_validate() {
         use crate::graph::GraphParser;
-        use crate::graph::validator::GraphValidator;
+        use crate::graph::validator::{GraphValidator, ValidationResult};
+        use std::collections::BTreeMap;
+
+        const UNREACHABLE: &str = "Node is unreachable from the start node via declared edges \
+                                   (script `_next` routing is not analyzed)";
+
+        fn warning_lines(result: &ValidationResult) -> Vec<String> {
+            let mut lines: Vec<String> = result
+                .warnings
+                .iter()
+                .map(|w| format!("{}: {}", w.node_id.as_deref().unwrap_or("-"), w.message))
+                .collect();
+            lines.sort();
+            lines
+        }
+
+        fn unreachable(node_ids: &[&str]) -> Vec<String> {
+            node_ids
+                .iter()
+                .map(|id| format!("{id}: {UNREACHABLE}"))
+                .collect()
+        }
 
         let _guard = TestConfigDirGuard::new();
 
@@ -8084,6 +8105,7 @@ mod tests {
         Skill::install_builtin_skills(false).unwrap();
 
         let mut checked = Vec::new();
+        let mut warnings_by_agent = BTreeMap::new();
         for entry in std::fs::read_dir(paths::agents_data_dir()).unwrap() {
             let dir = entry.unwrap().path();
             let graph_path = dir.join("graph.yaml");
@@ -8100,6 +8122,7 @@ mod tests {
                 "graph.yaml for '{name}' failed validation: {:#?}",
                 result.errors
             );
+            warnings_by_agent.insert(name.clone(), warning_lines(&result));
             checked.push(name);
         }
         checked.sort();
@@ -8109,6 +8132,89 @@ mod tests {
                 "expected bundled graph agent '{expected}' to be checked; found {checked:?}"
             );
         }
+
+        // Warning parity with the pre-subgraph validator: the only warnings any
+        // bundled graph emits are the `_next`-routed unreachable nodes. A new
+        // rule that fires on a shipped asset (or a new bundled graph) must be
+        // recorded here deliberately.
+        let expected_warnings = BTreeMap::from([
+            (
+                "coder".to_string(),
+                unreachable(&[
+                    "analyze_request",
+                    "end_rejected",
+                    "end_success",
+                    "fix_loop_gate",
+                    "gate_approval",
+                    "implement",
+                    "route_complexity",
+                    "route_review_result",
+                    "self_review",
+                    "verify_build",
+                    "verify_tests",
+                ]),
+            ),
+            ("deep-research".to_string(), unreachable(&["ask_topic"])),
+            ("finding-verifier".to_string(), Vec::new()),
+            ("librarian".to_string(), Vec::new()),
+            (
+                "step-runner".to_string(),
+                unreachable(&[
+                    "check_handoff",
+                    "edge_case_sweep",
+                    "end_blocked",
+                    "end_rejected",
+                    "end_success",
+                    "fix_loop_gate",
+                    "gate_blocked",
+                    "gate_deviation",
+                    "gate_user_review",
+                    "get_revision",
+                    "independent_review",
+                    "revise_from_choice",
+                    "route_review",
+                    "route_sweep",
+                    "verify_build",
+                    "verify_format_lint",
+                    "verify_tests",
+                    "write_handoff",
+                ]),
+            ),
+        ]);
+        assert_eq!(
+            warnings_by_agent, expected_warnings,
+            "bundled graph validator warnings drifted from the recorded baseline"
+        );
+
+        // The shipped reference graph must load through the real parser and
+        // validate cleanly too; its `scripts/synthesize.py` only has to exist.
+        let base = _guard.path.join("example-base");
+        create_dir_all(base.join("scripts")).unwrap();
+        write(base.join("scripts").join("synthesize.py"), "").unwrap();
+        let example = GraphParser::new(&base)
+            .load_from_string(include_str!("../../graph.example.yaml"))
+            .unwrap_or_else(|e| panic!("graph.example.yaml failed to parse: {e}"));
+        let result = GraphValidator::new(&base).validate(&example);
+        assert!(
+            result.errors.is_empty(),
+            "graph.example.yaml failed validation: {:#?}",
+            result.errors
+        );
+        let example_warnings = warning_lines(&result);
+        assert!(
+            example_warnings.iter().all(|w| !w.contains("output_key")),
+            "graph.example.yaml's map must declare a writer for its output_key: {example_warnings:#?}"
+        );
+        assert_eq!(
+            example_warnings,
+            unreachable(&[
+                "aggregate_subjects",
+                "deep_dive",
+                "research_subject",
+                "subjects_map",
+            ]),
+            "graph.example.yaml validator warnings drifted from the recorded baseline"
+        );
     }
 
     #[test]
