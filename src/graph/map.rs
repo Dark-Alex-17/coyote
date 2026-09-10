@@ -251,7 +251,11 @@ async fn run_chain_step(
         ctx.peer_assignment = Some(assignment.clone());
     }
 
-    match step(node, state, ctx, step_ctx, current).await? {
+    let result = step(node, state, ctx, step_ctx, current).await;
+    ctx.peer_registry = None;
+    ctx.peer_assignment = None;
+
+    match result? {
         StepResult::Continue(targets) => match targets.as_slice() {
             [] => {
                 debug!(
@@ -1685,6 +1689,81 @@ nodes:
         assert!(registry.is_finished(&assignments[0].0));
         assert!(!registry.is_finished(&assignments[1].0));
         assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_item_chain_clears_peer_fields_after_flagged_agent_then_script() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new();
+        materialize_probe_agent(0.0);
+        let h = Harness::new(&format!(
+            r#"
+name: t
+start: worker
+nodes:
+  worker:
+    type: agent
+    agent: {PROBE_AGENT}
+    prompt: "p"
+    teammates: true
+    state_updates:
+      output: "{{{{output}}}}"
+    next: finish
+  finish:
+    type: script
+    script: finish.py
+"#
+        ));
+        h.ws.write_py(
+            "finish.py",
+            r#"print(json.dumps({"output": state["output"] + "+finished"}))"#,
+        );
+        let peers = manual_peer("worker");
+        let mut state = item_state(json!(0));
+        let mut ctx = silent_ctx();
+
+        h.run("worker", Some(&peers), &mut state, &mut ctx)
+            .await
+            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+
+        assert_eq!(state.state().get("output"), Some(&json!("held+finished")));
+        assert!(peers.0.is_finished(&peers.1.0));
+        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+    }
+
+    /// The prompt fails to interpolate before `run_agent_for_graph` can take
+    /// the peer fields, so only the chain runner's reset can clear them.
+    #[tokio::test]
+    async fn run_item_chain_clears_peer_fields_when_agent_step_fails_before_takeover() {
+        let h = Harness::new(
+            r#"
+name: t
+start: worker
+nodes:
+  worker:
+    type: agent
+    agent: no-such-agent
+    prompt: "{{nope}}"
+    teammates: true
+"#,
+        );
+        let peers = manual_peer("worker");
+        let mut state = item_state(json!(0));
+        let mut ctx = silent_ctx();
+
+        let chain = unwrap_err_chain(h.run("worker", Some(&peers), &mut state, &mut ctx).await);
+
+        assert!(
+            chain.contains("Failed to interpolate prompt for agent 'no-such-agent'"),
+            "{chain}"
+        );
+        assert!(chain.contains("'nope' not found in state"), "{chain}");
+        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+        assert!(peers.0.is_finished(&peers.1.0));
     }
 
     #[tokio::test]
