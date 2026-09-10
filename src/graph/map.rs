@@ -8,7 +8,7 @@ use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agen
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::{BoxFuture, join_all};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -334,7 +334,9 @@ fn resolve_max_concurrency(
 /// fast sibling can message one still waiting on the semaphore (the message
 /// queues in the pre-created inbox). The identity lives for the item's whole
 /// chain; every `teammates: true` agent step in it speaks as that item. A
-/// single-item fan-out has no peers, so it gets no registry.
+/// single-item fan-out has no peers, so it gets no registry. The identity is
+/// named after the first `teammates: true` agent found by BFS from the entry,
+/// so the pick follows the chain as a reader traces it, not YAML order.
 fn provision_map_peers(
     graph: &Graph,
     subgraph: &HashSet<String>,
@@ -344,17 +346,7 @@ fn provision_map_peers(
     if item_count < 2 {
         return None;
     }
-    let flagged_agent = |node_id: &str| match graph.get_node(node_id).map(|n| &n.node_type) {
-        Some(NodeType::Agent(a)) if a.teammates => Some(a.agent.as_str()),
-        _ => None,
-    };
-    let agent_name = flagged_agent(entry).or_else(|| {
-        graph
-            .nodes
-            .keys()
-            .filter(|id| subgraph.contains(*id))
-            .find_map(|id| flagged_agent(id))
-    })?;
+    let agent_name = first_flagged_agent_by_bfs(graph, subgraph, entry)?;
 
     let registry = Arc::new(PeerRegistry::new());
     let assignments = (0..item_count)
@@ -366,6 +358,45 @@ fn provision_map_peers(
         })
         .collect();
     Some((registry, assignments))
+}
+
+fn first_flagged_agent_by_bfs<'g>(
+    graph: &'g Graph,
+    subgraph: &HashSet<String>,
+    entry: &str,
+) -> Option<&'g str> {
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut queue: VecDeque<&str> = VecDeque::new();
+    if subgraph.contains(entry) {
+        visited.insert(entry);
+        queue.push_back(entry);
+    }
+    while let Some(id) = queue.pop_front() {
+        let Some(node) = graph.get_node(id) else {
+            continue;
+        };
+        if let NodeType::Agent(a) = &node.node_type
+            && a.teammates
+        {
+            return Some(a.agent.as_str());
+        }
+        let mut edges: Vec<&String> = node
+            .next
+            .as_ref()
+            .map(|t| t.as_slice().iter().collect())
+            .unwrap_or_default();
+        match &node.node_type {
+            NodeType::Script(s) => edges.extend(s.fallback.as_ref()),
+            NodeType::Llm(l) => edges.extend(l.fallback.as_ref()),
+            _ => {}
+        }
+        for next in edges {
+            if subgraph.contains(next) && visited.insert(next) {
+                queue.push_back(next);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1809,6 +1840,38 @@ nodes:
         assert_eq!(roster[1].1, "gate[1]");
         for (id, _) in &assignments {
             assert!(id.starts_with("graph_agent_no-such-agent_"), "{id}");
+        }
+    }
+
+    #[test]
+    fn provision_map_peers_picks_flagged_agent_nearest_to_entry_not_yaml_order() {
+        let h = Harness::new(
+            r#"
+name: t
+start: gate
+nodes:
+  far:
+    type: agent
+    agent: far-agent
+    prompt: "p"
+    teammates: true
+  gate:
+    type: script
+    script: gate.py
+    next: near
+  near:
+    type: agent
+    agent: near-agent
+    prompt: "p"
+    teammates: true
+    next: far
+"#,
+        );
+
+        let (_, assignments) = h.provision("gate", 2);
+
+        for (id, _) in &assignments {
+            assert!(id.starts_with("graph_agent_near-agent_"), "{id}");
         }
     }
 
