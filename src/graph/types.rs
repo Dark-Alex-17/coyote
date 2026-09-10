@@ -1509,4 +1509,20 @@ nodes:
 
         assert!(!serde_yaml::to_string(&graph).unwrap().contains("driver"));
     }
+
+    #[test]
+    fn graph_state_remove_returns_previous_value_and_drops_key() {
+        let mut state = GraphState::new(HashMap::from([("k".to_string(), json!(1))]));
+
+        assert_eq!(state.remove("k"), Some(json!(1)));
+        assert_eq!(state.get("k"), None);
+        assert!(state.data().is_empty());
+    }
+
+    #[test]
+    fn graph_state_remove_missing_key_is_none() {
+        let mut state = GraphState::new(HashMap::new());
+
+        assert_eq!(state.remove("k"), None);
+    }
 }

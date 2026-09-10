@@ -537,7 +537,7 @@ fn apply_simple_state_updates(updates: Option<&HashMap<String, String>>, state: 
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{AgentNode, GraphSettings};
+    use super::super::types::{AgentNode, GraphSettings, NextTargets};
     use super::*;
     use indexmap::IndexMap;
     use serde_json::json;
@@ -749,6 +749,40 @@ mod tests {
 
         assert!(registry.is_none());
         assert!(assignments.is_empty());
+    }
+
+    #[test]
+    fn static_next_targets_branch_mode_treats_missing_next_as_terminal() {
+        let node = agent_node("n", false);
+
+        let targets = static_next_targets(&node, "n", "agent", true).unwrap();
+
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn static_next_targets_main_flow_still_errors_without_next() {
+        let node = agent_node("n", false);
+
+        let msg = static_next_targets(&node, "n", "agent", false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            msg.contains("agent node 'n' has no `next` and is not an end node"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn static_next_targets_returns_declared_targets_in_both_modes() {
+        let mut node = agent_node("n", false);
+        node.next = Some(NextTargets::Many(vec!["a".into(), "b".into()]));
+
+        for branch_mode in [false, true] {
+            let targets = static_next_targets(&node, "n", "agent", branch_mode).unwrap();
+            assert_eq!(targets, vec!["a".to_string(), "b".to_string()]);
+        }
     }
 }
 

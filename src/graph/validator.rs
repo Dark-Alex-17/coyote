@@ -3019,4 +3019,62 @@ mod tests {
             result.errors
         );
     }
+
+    fn ids(subgraph: &HashSet<String>) -> Vec<&str> {
+        let mut ids: Vec<&str> = subgraph.iter().map(String::as_str).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn branch_subgraph_follows_next_and_fallback_edges() {
+        let mut a = script_node("a", "a.sh", Some("c"));
+        a.next = Some("b".to_string().into());
+        let graph = graph_with(
+            vec![
+                ("a", a),
+                ("b", llm_node("b", Some("d"), None)),
+                ("c", script_node("c", "c.sh", None)),
+                ("d", script_node("d", "d.sh", None)),
+                ("e", script_node("e", "e.sh", None)),
+            ],
+            "a",
+        );
+
+        assert_eq!(ids(&branch_subgraph(&graph, "a")), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn branch_subgraph_does_not_follow_approval_routes_or_nested_map_branch() {
+        let mut a = script_node("a", "a.sh", None);
+        a.next = Some(NextTargets::Many(vec!["m".into(), "p".into()]));
+        let graph = graph_with(
+            vec![
+                ("a", a),
+                ("m", map_node_basic("m", "inner", None)),
+                ("inner", script_node("inner", "inner.sh", None)),
+                ("p", approval_node("p", &["yes"], &[("yes", "q")], "q")),
+                ("q", script_node("q", "q.sh", None)),
+            ],
+            "a",
+        );
+
+        assert_eq!(ids(&branch_subgraph(&graph, "a")), vec!["a", "m", "p"]);
+    }
+
+    #[test]
+    fn branch_subgraph_of_unknown_entry_is_empty() {
+        let graph = graph_with(vec![("a", script_node("a", "a.sh", None))], "a");
+
+        assert!(branch_subgraph(&graph, "nope").is_empty());
+    }
+
+    #[test]
+    fn branch_subgraph_skips_undeclared_targets() {
+        let mut a = script_node("a", "a.sh", Some("ghost_fallback"));
+        a.next = Some("ghost_next".to_string().into());
+        let graph = graph_with(vec![("a", a)], "a");
+
+        assert_eq!(ids(&branch_subgraph(&graph, "a")), vec!["a"]);
+    }
 }

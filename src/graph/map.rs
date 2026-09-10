@@ -1,6 +1,6 @@
 use super::executor::{StepContext, StepResult, step};
 use super::state::StateManager;
-use super::types::{ConcurrencyCap, Graph, MapNode, NodeType};
+use super::types::{ConcurrencyCap, Graph, MapNode, Node, NodeType};
 use super::validator::branch_subgraph;
 use crate::config::{RenderMode, RequestContext};
 use crate::graph::type_name;
@@ -241,8 +241,8 @@ async fn run_chain_step(
         );
     }
 
-    if let (Some((registry, assignment)), NodeType::Agent(a)) = (chain.peers, &node.node_type)
-        && a.teammates
+    if let Some((registry, assignment)) = chain.peers
+        && wants_peer_identity(node)
     {
         ctx.peer_registry = Some(Arc::clone(registry));
         ctx.peer_assignment = Some(assignment.clone());
@@ -285,6 +285,10 @@ async fn run_chain_step(
             "map node '{map_id}': sub-branch [{idx}] reached end node '{current}' inside a map branch"
         ),
     }
+}
+
+fn wants_peer_identity(node: &Node) -> bool {
+    matches!(&node.node_type, NodeType::Agent(a) if a.teammates)
 }
 
 /// A templated cap is resolved against the parent state right before the
@@ -556,5 +560,866 @@ mod tests {
             "{chain}"
         );
         assert!(chain.contains("budget"), "{chain}");
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::super::executor::GraphExecutor;
+    use super::super::script::ScriptExecutor;
+    use super::*;
+    use crate::config::{AppState, Role, WorkingMode};
+    use crate::utils::{AbortSignal, create_abort_signal, temp_file};
+    use indexmap::IndexMap;
+    use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn cmd_available(name: &str) -> bool {
+        which::which(name).is_ok()
+    }
+
+    struct TestWorkspace {
+        dir: PathBuf,
+    }
+
+    impl TestWorkspace {
+        fn new() -> Self {
+            let dir = temp_file("-graph-map-", "");
+            fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn write_script(&self, name: &str, contents: &str) {
+            fs::write(self.dir.join(name), contents).unwrap();
+        }
+
+        fn write_py(&self, name: &str, body: &str) {
+            self.write_script(
+                name,
+                &format!(
+                    "#!/usr/bin/env python3\nimport os, json\n\
+                     state = json.loads(os.environ.get(\"GRAPH_STATE\", \"{{}}\"))\n{body}\n"
+                ),
+            );
+        }
+    }
+
+    impl Drop for TestWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn make_ctx() -> RequestContext {
+        RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
+    }
+
+    async fn run_graph(yaml: &str, ws: &TestWorkspace) -> Result<String> {
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, create_abort_signal())
+            .await
+    }
+
+    fn collected(result: &str) -> Vec<Value> {
+        serde_json::from_str::<Value>(result)
+            .unwrap_or_else(|_| panic!("expected JSON array, got: {result}"))
+            .as_array()
+            .expect("collected results should be an array")
+            .clone()
+    }
+
+    fn error_chain(result: Result<String>) -> String {
+        match result {
+            Ok(out) => panic!("expected failure, got output: {out}"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn map_chain_two_script_steps_route_via_next() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_py(
+            "step_one.py",
+            r#"print(json.dumps({"draft": state["item"] * 2}))"#,
+        );
+        ws.write_py(
+            "step_two.py",
+            r#"print(json.dumps({"output": state["draft"] + 1}))"#,
+        );
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  validate_before_run: false
+initial_state:
+  items: [1, 2, 3]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: step_one
+    collect_into: results
+    next: done
+  step_one:
+    type: script
+    script: step_one.py
+    next: step_two
+  step_two:
+    type: script
+    script: step_two.py
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let result = run_graph(yaml, &ws)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(collected(&result), vec![json!(3), json!(5), json!(7)]);
+    }
+
+    #[tokio::test]
+    async fn map_chain_script_next_loop_is_bounded_by_max_loop_iterations() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_py("looper.py", r#"print(json.dumps({"_next": "looper"}))"#);
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  max_loop_iterations: 3
+  validate_before_run: false
+initial_state:
+  items: [1]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: looper
+    collect_into: results
+    next: done
+  looper:
+    type: script
+    script: looper.py
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let chain = error_chain(run_graph(yaml, &ws).await);
+
+        assert!(
+            chain.contains("map node 'fan_out': sub-branch [0] failed at node 'looper' (step 4)"),
+            "{chain}"
+        );
+        assert!(
+            chain.contains(
+                "node 'looper' visited 4 times in map branch [0] (max_loop_iterations=3)"
+            ),
+            "{chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_chain_next_outside_subgraph_fails_item() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_py("gate.py", r#"print(json.dumps({"_next": "done"}))"#);
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  validate_before_run: false
+initial_state:
+  items: [1]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: gate
+    collect_into: results
+    next: done
+  gate:
+    type: script
+    script: gate.py
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let chain = error_chain(run_graph(yaml, &ws).await);
+
+        assert!(
+            chain.contains(
+                "routed to 'done' which is outside the branch subgraph rooted at 'gate' \
+                 (branch nodes: gate)"
+            ),
+            "{chain}"
+        );
+        assert!(
+            chain.contains(
+                "Script `_next` targets inside a map branch must stay within the branch."
+            ),
+            "{chain}"
+        );
+        assert!(chain.contains("failed at node 'gate' (step 1)"), "{chain}");
+    }
+
+    #[tokio::test]
+    async fn map_chain_not_writing_output_key_errors_with_hint() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_py("worker.py", r#"print(json.dumps({"other": 1}))"#);
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  validate_before_run: false
+initial_state:
+  items: [1]
+  output: stale
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: worker
+    collect_into: results
+    next: done
+  worker:
+    type: script
+    script: worker.py
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let chain = error_chain(run_graph(yaml, &ws).await);
+
+        assert!(
+            chain.contains("sub-branch [0] did not write output_key 'output'"),
+            "{chain}"
+        );
+        assert!(
+            chain.contains("the parent's value is not inherited inside a map branch"),
+            "{chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_chain_output_equal_to_parent_value_is_collected() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_py("worker.py", r#"print(json.dumps({"output": 7}))"#);
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  validate_before_run: false
+initial_state:
+  items: [7, 7]
+  output: 7
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: worker
+    collect_into: results
+    next: done
+  worker:
+    type: script
+    script: worker.py
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let result = run_graph(yaml, &ws)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(collected(&result), vec![json!(7), json!(7)]);
+    }
+
+    #[tokio::test]
+    async fn map_chain_state_updates_reading_output_key_sees_empty_string() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_py("worker.py", r#"print(json.dumps({"draft": "d"}))"#);
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  validate_before_run: false
+initial_state:
+  items: ["a"]
+  summary: parent
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: worker
+    output_key: summary
+    collect_into: results
+    next: done
+  worker:
+    type: script
+    script: worker.py
+    state_updates:
+      summary: "{{summary}}|{{draft}}"
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let result = run_graph(yaml, &ws)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(collected(&result), vec![json!("|d")]);
+    }
+
+    #[tokio::test]
+    async fn map_chain_pre_check_rejects_approval_node() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_py("gate.py", r#"print(json.dumps({}))"#);
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  validate_before_run: false
+initial_state:
+  items: [1]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: gate
+    collect_into: results
+    next: done
+  gate:
+    type: script
+    script: gate.py
+    next: ask
+  ask:
+    type: approval
+    question: "ok?"
+    options: ["yes", "no"]
+    routes:
+      "yes": gate
+    on_other: gate
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let chain = error_chain(run_graph(yaml, &ws).await);
+
+        assert!(
+            chain.contains("map branch 'ask' has type that cannot run inside a map"),
+            "{chain}"
+        );
+        assert!(chain.contains("failed at node 'ask' (step 2)"), "{chain}");
+    }
+
+    #[tokio::test]
+    async fn map_chain_script_error_routes_to_fallback() {
+        if !cmd_available("python3") || !cmd_available("bash") {
+            eprintln!("skipping: python3 or bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("worker.sh", "#!/bin/bash\necho boom >&2\nexit 1\n");
+        ws.write_py(
+            "recover.py",
+            r#"print(json.dumps({"output": "recovered"}))"#,
+        );
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  validate_before_run: false
+initial_state:
+  items: [1, 2]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: worker
+    collect_into: results
+    next: done
+  worker:
+    type: script
+    script: worker.sh
+    fallback: recover
+  recover:
+    type: script
+    script: recover.py
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let result = run_graph(yaml, &ws)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(
+            collected(&result),
+            vec![json!("recovered"), json!("recovered")]
+        );
+    }
+
+    #[tokio::test]
+    async fn map_chain_llm_failure_routes_to_fallback() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_py("recover.py", r#"print(json.dumps({"output": "fb"}))"#);
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  validate_before_run: false
+initial_state:
+  items: [1]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: check
+    collect_into: results
+    next: done
+  check:
+    type: llm
+    prompt: "hi"
+    fallback: recover
+  recover:
+    type: script
+    script: recover.py
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let result = run_graph(yaml, &ws)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(collected(&result), vec![json!("fb")]);
+    }
+
+    struct Harness {
+        ws: TestWorkspace,
+        graph: Arc<Graph>,
+        abort: AbortSignal,
+    }
+
+    impl Harness {
+        fn new(yaml: &str) -> Self {
+            Self {
+                ws: TestWorkspace::new(),
+                graph: Arc::new(serde_yaml::from_str(yaml).unwrap()),
+                abort: create_abort_signal(),
+            }
+        }
+
+        fn subgraph(&self, entry: &str) -> HashSet<String> {
+            branch_subgraph(&self.graph, entry)
+        }
+
+        fn provision(&self, entry: &str, n: usize) -> (Arc<PeerRegistry>, Vec<PeerAssignment>) {
+            provision_map_peers(&self.graph, &self.subgraph(entry), entry, n)
+                .expect("subgraph with a flagged agent should provision peers")
+        }
+
+        async fn run(
+            &self,
+            entry: &str,
+            peers: Option<&(Arc<PeerRegistry>, PeerAssignment)>,
+            state: &mut StateManager,
+            ctx: &mut RequestContext,
+        ) -> Result<()> {
+            let script = ScriptExecutor::new(&self.ws.dir);
+            let step_ctx = StepContext {
+                graph: Arc::clone(&self.graph),
+                script_executor: &script,
+                max_concurrency: 4,
+                abort_signal: &self.abort,
+                branch_mode: true,
+            };
+            let subgraph = self.subgraph(entry);
+            let chain = ItemChain {
+                map_id: "fan_out",
+                entry,
+                subgraph: &subgraph,
+                idx: 0,
+                peers,
+            };
+            run_item_chain(&chain, state, ctx, &step_ctx).await
+        }
+    }
+
+    fn item_state(item: Value) -> StateManager {
+        StateManager::new(HashMap::from([("item".to_string(), item)]))
+    }
+
+    fn silent_ctx() -> RequestContext {
+        let mut ctx = make_ctx();
+        ctx.render_mode = RenderMode::Silent;
+        ctx
+    }
+
+    fn manual_peer(label: &str) -> (Arc<PeerRegistry>, PeerAssignment) {
+        let registry = Arc::new(PeerRegistry::new());
+        let id = graph_agent_id(label);
+        let inbox = Arc::new(Inbox::new());
+        registry.insert(id.clone(), format!("{label}[0]"), Arc::clone(&inbox));
+        (registry, (id, inbox))
+    }
+
+    fn unwrap_err_chain(result: Result<()>) -> String {
+        match result {
+            Ok(()) => panic!("expected the chain to fail"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    const DOUBLER_GRAPH: &str = r#"
+name: t
+start: doubler
+nodes:
+  doubler:
+    type: script
+    script: doubler.py
+"#;
+
+    const GATE_WORKER_FINISH_GRAPH: &str = r#"
+name: t
+start: gate
+nodes:
+  gate:
+    type: script
+    script: gate.py
+    next: worker
+  worker:
+    type: agent
+    agent: no-such-agent
+    prompt: "p"
+    teammates: true
+    next: finish
+  finish:
+    type: script
+    script: finish.py
+"#;
+
+    const FLAGGED_WORKER_GRAPH: &str = r#"
+name: t
+start: worker
+nodes:
+  worker:
+    type: agent
+    agent: no-such-agent
+    prompt: "p"
+    teammates: true
+"#;
+
+    #[tokio::test]
+    async fn run_item_chain_single_script_branch_final_fork_state() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let h = Harness::new(DOUBLER_GRAPH);
+        h.ws.write_py(
+            "doubler.py",
+            r#"print(json.dumps({"output": state["item"] * 2}))"#,
+        );
+        let mut state = item_state(json!(3));
+        let mut ctx = silent_ctx();
+
+        h.run("doubler", None, &mut state, &mut ctx)
+            .await
+            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+
+        assert_eq!(
+            *state.state().data(),
+            HashMap::from([
+                ("item".to_string(), json!(3)),
+                ("output".to_string(), json!(6)),
+            ])
+        );
+        assert_eq!(state.state().loop_count("doubler"), 1);
+        assert_eq!(state.state().current_node(), Some("doubler"));
+        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_item_chain_aborted_before_first_step_touches_nothing() {
+        let h = Harness::new(DOUBLER_GRAPH);
+        h.ws.write_py(
+            "doubler.py",
+            r#"print(json.dumps({"output": state["item"] * 2}))"#,
+        );
+        let peers = manual_peer("doubler");
+        let mut state = item_state(json!(3));
+        let mut ctx = silent_ctx();
+        h.abort.set_ctrlc();
+
+        let chain = unwrap_err_chain(h.run("doubler", Some(&peers), &mut state, &mut ctx).await);
+
+        assert!(chain.contains("map sub-branch [0] aborted"), "{chain}");
+        assert!(
+            chain.contains("failed at node 'doubler' (step 1)"),
+            "{chain}"
+        );
+        assert_eq!(state.state().loop_count("doubler"), 0);
+        assert!(state.state().get("output").is_none());
+        assert!(peers.0.is_finished(&peers.1.0));
+    }
+
+    #[tokio::test]
+    async fn run_item_chain_marks_identity_finished_on_success_without_arming_script_steps() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let h = Harness::new(GATE_WORKER_FINISH_GRAPH);
+        h.ws.write_py("gate.py", r#"print(json.dumps({"_next": "finish"}))"#);
+        h.ws.write_py("finish.py", r#"print(json.dumps({"output": "ok"}))"#);
+        let (registry, assignments) = h.provision("gate", 2);
+        let peers = (Arc::clone(&registry), assignments[0].clone());
+        let mut state = item_state(json!(0));
+        let mut ctx = silent_ctx();
+
+        h.run("gate", Some(&peers), &mut state, &mut ctx)
+            .await
+            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+
+        assert_eq!(state.state().get("output"), Some(&json!("ok")));
+        assert!(registry.is_finished(&assignments[0].0));
+        assert!(!registry.is_finished(&assignments[1].0));
+        // Fork-time arming would have left these Some: script steps never hold the identity.
+        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_item_chain_marks_identity_finished_when_agent_step_errors() {
+        let h = Harness::new(FLAGGED_WORKER_GRAPH);
+        let (registry, assignments) = h.provision("worker", 2);
+        let peers = (Arc::clone(&registry), assignments[0].clone());
+        let mut state = item_state(json!(0));
+        let mut ctx = silent_ctx();
+
+        let chain = unwrap_err_chain(h.run("worker", Some(&peers), &mut state, &mut ctx).await);
+
+        assert!(
+            chain.contains("failed at node 'worker' (step 1)"),
+            "{chain}"
+        );
+        assert!(chain.contains("Agent 'no-such-agent' failed"), "{chain}");
+        assert!(registry.is_finished(&assignments[0].0));
+        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_item_chain_reaches_flagged_agent_after_script_step() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let h = Harness::new(
+            r#"
+name: t
+start: prep
+nodes:
+  prep:
+    type: script
+    script: prep.py
+    next: worker
+  worker:
+    type: agent
+    agent: no-such-agent
+    prompt: "p"
+    teammates: true
+"#,
+        );
+        h.ws.write_py("prep.py", r#"print(json.dumps({"draft": "x"}))"#);
+        let (registry, assignments) = h.provision("prep", 2);
+        let peers = (Arc::clone(&registry), assignments[0].clone());
+        let mut state = item_state(json!(0));
+        let mut ctx = silent_ctx();
+
+        let chain = unwrap_err_chain(h.run("prep", Some(&peers), &mut state, &mut ctx).await);
+
+        assert!(
+            chain.contains("failed at node 'worker' (step 2)"),
+            "{chain}"
+        );
+        assert_eq!(state.state().get("draft"), Some(&json!("x")));
+        assert!(registry.is_finished(&assignments[0].0));
+    }
+
+    #[tokio::test]
+    async fn run_item_chain_never_arms_unflagged_agent() {
+        let h = Harness::new(
+            r#"
+name: t
+start: worker
+nodes:
+  worker:
+    type: agent
+    agent: no-such-agent
+    prompt: "p"
+    teammates: false
+"#,
+        );
+        let peers = manual_peer("worker");
+        let mut state = item_state(json!(0));
+        let mut ctx = silent_ctx();
+
+        let chain = unwrap_err_chain(h.run("worker", Some(&peers), &mut state, &mut ctx).await);
+
+        assert!(chain.contains("Agent 'no-such-agent' failed"), "{chain}");
+        assert!(peers.0.is_finished(&peers.1.0));
+    }
+
+    #[test]
+    fn wants_peer_identity_only_for_flagged_agent_nodes() {
+        let graph: Graph = serde_yaml::from_str(
+            r#"
+name: t
+start: s
+nodes:
+  s:
+    type: script
+    script: s.py
+    next: l
+  l:
+    type: llm
+    prompt: "p"
+    next: plain
+  plain:
+    type: agent
+    agent: a
+    prompt: "p"
+    next: flagged
+  flagged:
+    type: agent
+    agent: a
+    prompt: "p"
+    teammates: true
+    next: e
+  e:
+    type: end
+    output: ""
+"#,
+        )
+        .unwrap();
+        let node = |id: &str| graph.get_node(id).unwrap();
+
+        assert!(!wants_peer_identity(node("s")));
+        assert!(!wants_peer_identity(node("l")));
+        assert!(!wants_peer_identity(node("plain")));
+        assert!(!wants_peer_identity(node("e")));
+        assert!(wants_peer_identity(node("flagged")));
+    }
+
+    #[tokio::test]
+    async fn run_item_chain_llm_step_leaves_ctx_role_and_scopes_unchanged() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let h = Harness::new(
+            r#"
+name: t
+start: check
+nodes:
+  check:
+    type: llm
+    prompt: "hi"
+    fallback: finish
+  finish:
+    type: script
+    script: finish.py
+"#,
+        );
+        h.ws.write_py("finish.py", r#"print(json.dumps({"output": "ok"}))"#);
+        let mut state = item_state(json!(0));
+        let mut ctx = silent_ctx();
+        ctx.role = Some(Role::new("marker", "x"));
+        ctx.node_job_scope = Some(vec!["j".to_string()]);
+        let mcp_tools = Some(("n".to_string(), IndexMap::new()));
+        ctx.active_node_mcp_tools = mcp_tools.clone();
+
+        h.run("check", None, &mut state, &mut ctx)
+            .await
+            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+
+        assert_eq!(state.state().get("output"), Some(&json!("ok")));
+        assert_eq!(ctx.role.as_ref().map(Role::name), Some("marker"));
+        assert_eq!(ctx.node_job_scope, Some(vec!["j".to_string()]));
+        assert_eq!(ctx.active_node_mcp_tools, mcp_tools);
+    }
+
+    #[test]
+    fn provision_map_peers_flagged_agent_anywhere_in_subgraph() {
+        let h = Harness::new(GATE_WORKER_FINISH_GRAPH);
+
+        let (registry, assignments) = h.provision("gate", 2);
+
+        assert_eq!(assignments.len(), 2);
+        let roster = registry.roster();
+        assert_eq!(roster[0].1, "gate[0]");
+        assert_eq!(roster[1].1, "gate[1]");
+        for (id, _) in &assignments {
+            assert!(id.starts_with("graph_agent_no-such-agent_"), "{id}");
+        }
+    }
+
+    #[test]
+    fn provision_map_peers_ignores_flagged_agent_outside_subgraph() {
+        let h = Harness::new(GATE_WORKER_FINISH_GRAPH);
+        let subgraph = HashSet::from(["gate".to_string()]);
+
+        assert!(provision_map_peers(&h.graph, &subgraph, "gate", 2).is_none());
     }
 }
