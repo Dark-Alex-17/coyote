@@ -1,5 +1,5 @@
 use super::state::template_root_keys;
-use super::types::{ConcurrencyCap, Graph, Node, NodeType};
+use super::types::{ConcurrencyCap, Graph, NextTargets, Node, NodeType};
 use crate::client::{Model, ModelType};
 use crate::config;
 use crate::config::{Agent, AppConfig, paths};
@@ -178,7 +178,7 @@ impl GraphValidator {
         self.validate_max_concurrency(graph, &mut result);
         self.validate_max_concurrency_template(graph, &mut result);
         self.validate_orchestration_limits(graph, &mut result);
-        self.validate_map_branches(graph, &mut result);
+        self.validate_map_subgraphs(graph, &mut result);
         self.validate_parallel_user_interaction(graph, &mut result);
         self.validate_parallel_writes(graph, &mut result);
         self.validate_parallel_reads(graph, &mut result);
@@ -506,8 +506,8 @@ impl GraphValidator {
     // Parallel-execution validation.
     //
     // The v1 algorithm uses immediate-successor analysis only: a parallel group is the set of `next:` targets of a
-    // single fan-out node. Map nodes are checked separately by `validate_map_branches` (the branch is self-parallel,
-    // but enforcement comes from strict-mode rules on the branch node, not from group membership). Transitive parallel
+    // single fan-out node. Map branch subgraphs are checked separately by `validate_map_subgraphs` (per-item forks
+    // never race each other, so their nodes are not group members). Transitive parallel
     // groups (deeper fan-out chains) are a v2 enhancement; v1 over-reports rather than under-reports. A false positive
     // forces an unneeded reducer (mild annoyance); a false negative allows silent data races (catastrophic).
     fn validate_max_concurrency(&self, graph: &Graph, result: &mut ValidationResult) {
@@ -565,107 +565,136 @@ impl GraphValidator {
         }
     }
 
-    fn validate_map_branches(&self, graph: &Graph, result: &mut ValidationResult) {
+    /// Rules for the per-item subgraph rooted at each map's `branch`. Every
+    /// error is attributed to the map node; the offending branch node is
+    /// named in the message.
+    fn validate_map_subgraphs(&self, graph: &Graph, result: &mut ValidationResult) {
+        let main_flow = main_flow_reachable(graph);
+
         for (map_id, node) in &graph.nodes {
             let NodeType::Map(m) = &node.node_type else {
                 continue;
             };
-            let Some(branch) = graph.get_node(&m.branch) else {
+            // A missing entry is reported by `validate_node_references`.
+            let mut members: Vec<String> = branch_subgraph(graph, &m.branch).into_iter().collect();
+            if members.is_empty() {
                 continue;
-            };
+            }
+            members.sort();
+            let members: Vec<(&str, &Node)> = members
+                .iter()
+                .filter_map(|id| graph.get_node(id).map(|n| (id.as_str(), n)))
+                .collect();
 
-            match &branch.node_type {
-                NodeType::Approval(_) => {
+            let fallback_targets: HashSet<&str> = members
+                .iter()
+                .filter_map(|(_, n)| match &n.node_type {
+                    NodeType::Script(s) => s.fallback.as_deref(),
+                    NodeType::Llm(l) => l.fallback.as_deref(),
+                    _ => None,
+                })
+                .collect();
+
+            let mut has_disallowed_node = false;
+            for (id, member) in &members {
+                let disallowed = match &member.node_type {
+                    NodeType::Approval(_) => Some(
+                        "an approval node; approval/input nodes cannot run inside a parallel \
+                         map branch (the CLI would prompt the user N times concurrently)",
+                    ),
+                    NodeType::Input(_) => {
+                        Some("an input node; input nodes cannot run inside a parallel map branch")
+                    }
+                    NodeType::End(_) => Some(
+                        "an end node; map branches terminate via the map's collect \
+                         mechanism, not via end nodes",
+                    ),
+                    NodeType::Map(_) => {
+                        Some("itself a map node; nested map fan-outs are not supported in v1")
+                    }
+                    NodeType::Agent(_)
+                    | NodeType::Llm(_)
+                    | NodeType::Rag(_)
+                    | NodeType::Script(_) => None,
+                };
+                if let Some(reason) = disallowed {
+                    has_disallowed_node = true;
+                    let mut message = if *id == m.branch {
+                        format!("map node points to branch '{id}' which is {reason}")
+                    } else {
+                        format!(
+                            "map node's branch subgraph (entry '{}') reaches '{id}', which is \
+                             {reason}",
+                            m.branch
+                        )
+                    };
+                    if fallback_targets.contains(id) {
+                        message.push_str(
+                            "; a branch's `fallback` must stay inside the branch subgraph; \
+                             before this release `fallback` on a map branch was accepted but \
+                             never honored — remove it or point it at a branch-local node",
+                        );
+                    }
+                    result.error(ValidationError::with_node(map_id, message));
+                }
+
+                if member.next.as_ref().is_some_and(NextTargets::is_fan_out) {
                     result.error(ValidationError::with_node(
                         map_id,
                         format!(
-                            "map node points to branch '{}' which is an approval node; \
-                             approval/input nodes cannot run inside a parallel map branch \
-                             (the CLI would prompt the user N times concurrently)",
+                            "node '{id}' inside the branch subgraph (entry '{}') declares a \
+                             fan-out `next`; fan-out inside a map branch is not supported in \
+                             v1; use a nested map after the join",
                             m.branch
                         ),
                     ));
-                    continue;
                 }
-                NodeType::Input(_) => {
-                    result.error(ValidationError::with_node(
-                        map_id,
-                        format!(
-                            "map node points to branch '{}' which is an input node; \
-                             input nodes cannot run inside a parallel map branch",
-                            m.branch
-                        ),
-                    ));
-                    continue;
-                }
-                NodeType::End(_) => {
-                    result.error(ValidationError::with_node(
-                        map_id,
-                        format!(
-                            "map node points to branch '{}' which is an end node; \
-                             map branches terminate via the map's collect mechanism, \
-                             not via end nodes",
-                            m.branch
-                        ),
-                    ));
-                    continue;
-                }
-                NodeType::Map(_) => {
-                    result.error(ValidationError::with_node(
-                        map_id,
-                        format!(
-                            "map node points to branch '{}' which is itself a map node; \
-                             nested map fan-outs are not supported in v1",
-                            m.branch
-                        ),
-                    ));
-                    continue;
-                }
-                _ => {}
             }
 
-            if branch.next.is_some() {
+            let shared: Vec<&str> = members
+                .iter()
+                .filter(|(id, _)| main_flow.contains(*id))
+                .map(|(id, _)| *id)
+                .collect();
+            if !shared.is_empty() {
                 result.error(ValidationError::with_node(
-                    m.branch.clone(),
+                    map_id,
                     format!(
-                        "branch node '{}' has a `next` declared, but map branches must be \
-                         atomic (one node, one execution per item). Remove `next` or \
-                         restructure the workflow so any chaining happens after the map.",
-                        m.branch
+                        "branch subgraph (entry '{}') shares node(s) [{}] with the main flow \
+                         (reachable from start '{}' without entering a map branch); a branch \
+                         node that is also on the main path would run standalone without the \
+                         `as` binding and could route into the branch mid-chain. Give the \
+                         branch its own nodes, or move the shared step after the map.",
+                        m.branch,
+                        shared.join(", "),
+                        graph.start
                     ),
                 ));
             }
 
-            if let Some(updates) = node_state_updates_keys(branch) {
-                for k in &updates {
-                    if k != &m.output_key {
-                        result.error(ValidationError::with_node(
-                            m.branch.clone(),
-                            format!(
-                                "branch node '{}' writes state key '{}' via state_updates, \
-                                 but map branches may only write through their `output_key` \
-                                 ('{}'). Rename the write, or move the side effect outside \
-                                 the map.",
-                                m.branch, k, m.output_key
-                            ),
-                        ));
-                    }
-                }
+            if has_disallowed_node {
+                continue;
             }
 
-            let schema_keys = output_schema_top_level_keys(branch);
-            if !schema_keys.is_empty() {
-                let mut keys_sorted: Vec<String> = schema_keys.into_iter().collect();
-                keys_sorted.sort();
-                result.error(ValidationError::with_node(
-                    m.branch.clone(),
+            // A script may write any key through its JSON output, so its
+            // presence makes the subgraph's write set unknowable.
+            let has_script = members
+                .iter()
+                .any(|(_, n)| matches!(n.node_type, NodeType::Script(_)));
+            if has_script {
+                continue;
+            }
+            let declares_output_key = members.iter().any(|(_, n)| {
+                node_state_updates_keys(n).is_some_and(|keys| keys.contains(&m.output_key))
+                    || output_schema_top_level_keys(n).contains(&m.output_key)
+            });
+            if !declares_output_key {
+                result.warning(ValidationError::with_node(
+                    map_id,
                     format!(
-                        "branch node '{}' has an `output_schema` with top-level \
-                         properties ({}); map branches must write only through their \
-                         `output_key` ('{}'). Remove `output_schema`, or use state_updates \
-                         to map the output explicitly.",
-                        m.branch,
-                        keys_sorted.join(", "),
+                        "no node in the branch subgraph of map '{map_id}' declares a write to \
+                         output_key '{}'; the map will error at runtime if the chain does not \
+                         write it",
                         m.output_key
                     ),
                 ));
@@ -862,6 +891,42 @@ fn find_reachable_nodes(graph: &Graph) -> HashSet<String> {
     reachable
 }
 
+/// Nodes reachable from the start node without entering any map's branch:
+/// the path the frontier itself walks. A map node contributes only its
+/// `next` edges here, so per-item subgraphs can be checked for overlap
+/// with the main flow.
+fn main_flow_reachable(graph: &Graph) -> HashSet<String> {
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+
+    if !graph.has_node(&graph.start) {
+        return reachable;
+    }
+
+    reachable.insert(graph.start.clone());
+    queue.push_back(graph.start.clone());
+
+    while let Some(id) = queue.pop_front() {
+        let Some(node) = graph.get_node(&id) else {
+            continue;
+        };
+        let edges: Vec<String> = match &node.node_type {
+            NodeType::Map(_) => node
+                .next
+                .as_ref()
+                .map(|t| t.as_slice().to_vec())
+                .unwrap_or_default(),
+            _ => outgoing_node_ids(node),
+        };
+        for next in edges {
+            if graph.has_node(&next) && reachable.insert(next.clone()) {
+                queue.push_back(next);
+            }
+        }
+    }
+    reachable
+}
+
 /// Nodes reachable from `entry` over the edges a chain can follow at run
 /// time: `next` targets and script/llm `fallback`s. Approval routes and a
 /// nested map's `branch` are not followed — neither may appear inside a
@@ -901,8 +966,8 @@ pub(super) fn branch_subgraph(graph: &Graph, entry: &str) -> HashSet<String> {
 }
 
 // v1 parallel-group detection: only the immediate `next` targets of a fan-out node count as a parallel group. Map
-// branches are handled separately by `validate_map_branches` (the branch's self-parallelism is checked via strict-mode
-// rules on the branch node itself, not via group membership).
+// branch subgraphs are handled separately by `validate_map_subgraphs` (per-item forks never race each other, so
+// their nodes are not group members).
 //
 // Returns one HashSet per fan-out source; deeper transitive parallelism is intentionally out of scope for v1.
 fn compute_parallel_groups(graph: &Graph) -> Vec<HashSet<String>> {
@@ -2500,7 +2565,31 @@ mod tests {
     }
 
     #[test]
-    fn map_branch_cannot_have_next_declared() {
+    fn map_branch_with_in_subgraph_next_passes() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, Some("br2"));
+        let br2 = llm_with_state_updates("br2", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("br2", br2),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.is_empty(),
+            "a branch chaining to a node inside its own subgraph is valid: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_branch_next_to_end_node_errors() {
         let map = map_node_basic("m", "br", Some("end"));
         let branch = llm_with_state_updates("br", &[("output", "{{output}}")], Some("somewhere"));
         let graph = graph_with(
@@ -2519,10 +2608,38 @@ mod tests {
             result
                 .errors
                 .iter()
-                .any(|e| e.message.contains("has a `next` declared")
-                    && e.message.contains("atomic")
-                    && e.node_id.as_deref() == Some("br")),
-            "expected branch-has-next error: {:?}",
+                .any(|e| e.message.contains("'somewhere'")
+                    && e.message.contains("end node")
+                    && e.message.contains("collect mechanism")
+                    && !e.message.contains("never honored")
+                    && e.node_id.as_deref() == Some("m")),
+            "expected end-node-in-subgraph error attributed to the map: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_branch_next_escaping_to_main_flow_errors() {
+        let map = map_node_basic("m", "br", Some("after"));
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], Some("after"));
+        let after = llm_node("after", None, Some("end"));
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("after", after),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("main flow")
+                && e.message.contains("[after")
+                && e.node_id.as_deref() == Some("m")),
+            "expected shared-with-main-flow error naming 'after': {:?}",
             result.errors
         );
     }
@@ -2548,7 +2665,7 @@ mod tests {
     }
 
     #[test]
-    fn map_branch_state_updates_wrong_key_errors() {
+    fn map_branch_state_updates_scratch_key_passes() {
         let map = map_node_basic("m", "br", Some("end"));
         let branch = llm_with_state_updates("br", &[("not_output", "{{output}}")], None);
         let graph = graph_with(
@@ -2559,19 +2676,14 @@ mod tests {
         let result = validator().validate(&graph);
 
         assert!(
-            result
-                .errors
-                .iter()
-                .any(|e| e.message.contains("writes state key 'not_output'")
-                    && e.message.contains("'output'")
-                    && e.node_id.as_deref() == Some("br")),
-            "expected wrong-key error: {:?}",
+            result.errors.is_empty(),
+            "branch-local scratch writes are allowed: {:?}",
             result.errors
         );
     }
 
     #[test]
-    fn map_branch_with_output_schema_errors() {
+    fn map_branch_with_output_schema_passes() {
         let map = map_node_basic("m", "br", Some("end"));
         let branch = llm_with_output_schema("br", &["foo", "bar"], None);
         let graph = graph_with(
@@ -2582,15 +2694,306 @@ mod tests {
         let result = validator().validate(&graph);
 
         assert!(
-            result
-                .errors
-                .iter()
-                .any(|e| e.message.contains("output_schema")
-                    && e.message.contains("top-level properties")
-                    && e.node_id.as_deref() == Some("br")),
-            "expected output_schema-forbidden error: {:?}",
+            result.errors.is_empty(),
+            "an output_schema on a branch node is allowed: {:?}",
             result.errors
         );
+    }
+
+    #[test]
+    fn map_branch_disallowed_node_reached_via_fallback_gets_hint() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", Some("end"), None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("'end'")
+                && e.message.contains("end node")
+                && e.message.contains("never honored")
+                && e.node_id.as_deref() == Some("m")),
+            "expected end-node error with the fallback hint: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_branch_deep_approval_node_errors_on_the_map() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, Some("gate"));
+        let gate = approval_node("gate", &["yes"], &[("yes", "end")], "end");
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("gate", gate),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("'gate'")
+                && e.message.contains("approval node")
+                && e.message.contains("map branch")
+                && e.node_id.as_deref() == Some("m")),
+            "expected deep approval error attributed to the map: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_branch_fan_out_inside_subgraph_errors() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let mut branch = llm_node("br", None, None);
+        branch.next = Some(NextTargets::Many(vec!["x".into(), "y".into()]));
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("x", llm_node("x", None, None)),
+                ("y", llm_node("y", None, None)),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("'br'")
+                && e.message.contains("fan-out inside a map branch")
+                && e.node_id.as_deref() == Some("m")),
+            "expected fan-out-in-branch error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_branch_sharing_node_with_main_flow_errors() {
+        let mut start = llm_node("s", None, None);
+        start.next = Some(NextTargets::Many(vec!["m".into(), "shared".into()]));
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, Some("shared"));
+        let shared = llm_with_state_updates("shared", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![
+                ("s", start),
+                ("m", map),
+                ("br", branch),
+                ("shared", shared),
+                ("end", end_node("end")),
+            ],
+            "s",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("main flow")
+                && e.message.contains("[shared]")
+                && e.node_id.as_deref() == Some("m")),
+            "expected shared-node error naming only 'shared': {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn two_maps_sharing_a_subgraph_pass() {
+        let first = map_node_basic("m1", "br", Some("m2"));
+        let second = map_node_basic("m2", "br", Some("end"));
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![
+                ("m1", first),
+                ("m2", second),
+                ("br", branch),
+                ("end", end_node("end")),
+            ],
+            "m1",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.is_empty(),
+            "two maps may share a branch subgraph: {:?}",
+            result.errors
+        );
+    }
+
+    fn output_key_warnings(result: &ValidationResult) -> Vec<&ValidationError> {
+        result
+            .warnings
+            .iter()
+            .filter(|w| w.message.contains("declares a write to output_key"))
+            .collect()
+    }
+
+    #[test]
+    fn map_branch_without_declared_output_writer_warns() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let warnings = output_key_warnings(&result);
+        assert_eq!(warnings.len(), 1, "{:?}", result.warnings);
+        assert_eq!(warnings[0].node_id.as_deref(), Some("m"));
+        assert!(
+            warnings[0]
+                .message
+                .contains("branch subgraph of map 'm' declares a write to output_key 'output'"),
+            "{}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    fn map_branch_script_in_subgraph_suppresses_missing_writer_warning() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, Some("finish"));
+        let finish = script_node("finish", "Cargo.toml", None);
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("finish", finish),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            output_key_warnings(&result).is_empty(),
+            "a script anywhere in the subgraph may write the key: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn map_branch_state_updates_deeper_in_chain_suppress_missing_writer_warning() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, Some("br2"));
+        let br2 = llm_with_state_updates("br2", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("br2", br2),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            output_key_warnings(&result).is_empty(),
+            "state_updates naming output_key anywhere in the chain is a declared write: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn map_branch_output_schema_naming_output_key_suppresses_missing_writer_warning() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_with_output_schema("br", &["output", "notes"], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            output_key_warnings(&result).is_empty(),
+            "an output_schema property naming output_key is a declared write: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn map_branch_three_node_chain_validates_clean() {
+        let map = map_node_basic("m", "a", Some("end"));
+        let a = llm_node("a", None, Some("b"));
+        let b = llm_with_state_updates("b", &[("draft", "{{output}}")], Some("c"));
+        let c = llm_with_state_updates("c", &[("output", "{{draft}}")], None);
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("a", a),
+                ("b", b),
+                ("c", c),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            output_key_warnings(&result).is_empty(),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn main_flow_reachable_does_not_enter_map_branches() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, Some("br2"));
+        let br2 = llm_node("br2", Some("end"), None);
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("br2", br2),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        assert_eq!(ids(&main_flow_reachable(&graph)), vec!["end", "m"]);
+        assert_eq!(
+            ids(&find_reachable_nodes(&graph)),
+            vec!["br", "br2", "end", "m"]
+        );
+    }
+
+    #[test]
+    fn main_flow_reachable_follows_approval_routes() {
+        let gate = approval_node("gate", &["yes"], &[("yes", "m")], "end");
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![
+                ("gate", gate),
+                ("m", map),
+                ("br", branch),
+                ("end", end_node("end")),
+            ],
+            "gate",
+        );
+
+        assert_eq!(ids(&main_flow_reachable(&graph)), vec!["end", "gate", "m"]);
     }
 
     #[test]
