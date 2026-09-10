@@ -643,6 +643,16 @@ impl GraphValidator {
             let NodeType::Map(m) = &node.node_type else {
                 continue;
             };
+            if m.as_name == m.output_key {
+                result.error(ValidationError::with_node(
+                    map_id,
+                    format!(
+                        "map node '{map_id}': `as` and `output_key` are both '{}'; the item \
+                         binding would be collected as the chain's result",
+                        m.as_name
+                    ),
+                ));
+            }
             // A missing entry is reported by `validate_node_references`.
             let mut members: Vec<String> = branch_subgraph(graph, &m.branch).into_iter().collect();
             if members.is_empty() {
@@ -3503,6 +3513,56 @@ mod tests {
             mm.max_concurrency = Some(ConcurrencyCap::Template(cap.into()));
         }
         map
+    }
+
+    fn map_with_as(id: &str, branch: &str, next: Option<&str>, as_name: &str) -> Node {
+        let mut map = map_node_basic(id, branch, next);
+        if let NodeType::Map(ref mut mm) = map.node_type {
+            mm.as_name = as_name.into();
+        }
+        map
+    }
+
+    #[test]
+    fn map_as_equal_output_key_errors() {
+        let map = map_with_as("m", "br", Some("end"), "output");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message
+                == "map node 'm': `as` and `output_key` are both 'output'; the item binding \
+                    would be collected as the chain's result"
+                && e.node_id.as_deref() == Some("m")),
+            "expected as/output_key collision error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_as_distinct_from_output_key_passes() {
+        let map = map_with_as("m", "br", Some("end"), "item");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("`as` and `output_key`")),
+            "distinct as/output_key must not error: {:?}",
+            result.errors
+        );
     }
 
     #[test]

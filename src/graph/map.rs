@@ -55,6 +55,13 @@ async fn run_map(
             node.branch
         );
     }
+    if node.as_name == node.output_key {
+        bail!(
+            "map node '{node_id}': `as` and `output_key` are both '{}'; the item binding \
+             would be collected as the chain's result",
+            node.as_name
+        );
+    }
     let subgraph = Arc::new(branch_subgraph(&step_ctx.graph, &node.branch));
 
     let max_conc = resolve_max_concurrency(node, state, step_ctx.max_concurrency, node_id)?;
@@ -808,6 +815,55 @@ nodes:
                 "item chain {n} kept running after the abort cancelled the map task"
             );
         }
+    }
+
+    /// With validation off, the collision is still caught before any item
+    /// forks: the branch never runs.
+    #[tokio::test]
+    async fn map_as_equal_output_key_fails_at_runtime() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        let sentinel = ws.dir.join("ran");
+        ws.write_script(
+            "mark.sh",
+            &format!("#!/bin/bash\ntouch '{}'\necho '{{}}'\n", sentinel.display()),
+        );
+
+        let yaml = r#"
+name: as_output_collision_test
+start: fan_out
+settings:
+  validate_before_run: false
+initial_state:
+  items: [1, 2]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: output
+    branch: mark
+    collect_into: results
+    next: done
+  mark:
+    type: script
+    script: mark.sh
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let chain = error_chain(run_graph(yaml, &ws).await);
+
+        assert!(
+            chain.contains(
+                "map node 'fan_out': `as` and `output_key` are both 'output'; the item binding \
+                 would be collected as the chain's result"
+            ),
+            "{chain}"
+        );
+        assert!(!sentinel.exists(), "no item chain may start");
     }
 
     #[tokio::test]
