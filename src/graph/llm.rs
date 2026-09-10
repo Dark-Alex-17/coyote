@@ -1,7 +1,5 @@
 use super::state::StateManager;
 use super::state_updates;
-#[cfg(test)]
-use super::state_updates::OUTPUT_KEY;
 use super::structured;
 use super::types::LlmNode;
 use crate::client::{Model, ModelType, call_chat_completions};
@@ -475,6 +473,7 @@ fn format_schema_hint(schema: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::state_updates::OUTPUT_KEY;
     use super::super::types::*;
     use super::*;
     use serde_json::json;
