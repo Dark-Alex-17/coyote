@@ -116,7 +116,7 @@ variables:
 # ---------------------------------------------------------------------------
 settings:
   max_loop_iterations: 100   # Per-node visit cap. If one node id is entered more
-                             # than this many times, execution aborts. Default 100.
+                             # than this many times, execution aborts. Default 100; 0 = no cap.
   timeout: 600               # Optional wall-clock cap (seconds) on the whole run,
                              # checked between node transitions. 0 = no bound.
   log_state_snapshots: true  # Log state before each node (debug/trace). Default true.
@@ -389,7 +389,7 @@ nodes:
   # Not supported inside a branch chain (validator errors): fan-out `next:`
   # lists, another `map`, `end`, `approval`, `input`. A branch node must not
   # also be reachable from `start` on the main flow. Per-item loops are script
-  # `_next` loops (bounded by settings.max_loop_iterations on the fork); a
+  # `_next` loops (bounded by settings.max_loop_iterations on the fork; `0` = unbounded); a
   # declared `next`/`fallback` edge back to an earlier chain node is a cycle.
   #
   # Reach via `synthesize`'s `_next: subjects_map`. The producer is expected
