@@ -337,7 +337,7 @@ fn resolve_max_concurrency(
         Some(ConcurrencyCap::Fixed(0)) => {
             bail!("map node '{node_id}': max_concurrency 0; expected a positive integer")
         }
-        Some(ConcurrencyCap::Fixed(n)) => return Ok(*n),
+        Some(ConcurrencyCap::Fixed(n)) => return bounded_cap(node_id, *n),
         Some(ConcurrencyCap::Template(t)) => t,
     };
 
@@ -359,13 +359,25 @@ fn resolve_max_concurrency(
     };
 
     match resolved {
-        Some(n) if n >= 1 => Ok(n),
+        Some(n) if n >= 1 => bounded_cap(node_id, n),
         _ => Err(anyhow!(
             "map node '{node_id}': max_concurrency template \"{template}\" resolved to \
              {value} ({}); expected a positive integer",
             type_name(&value)
         )),
     }
+}
+
+/// `Semaphore::new` panics above `MAX_PERMITS`; a cap that large is a
+/// configuration error, not a crash.
+fn bounded_cap(node_id: &str, n: usize) -> Result<usize> {
+    if n > Semaphore::MAX_PERMITS {
+        bail!(
+            "map node '{node_id}': max_concurrency {n} exceeds the runtime limit of {}",
+            Semaphore::MAX_PERMITS
+        );
+    }
+    Ok(n)
 }
 
 /// Pre-provision one teammate identity per item before any chain starts, so a
@@ -684,6 +696,32 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("map node 'm': max_concurrency \"4\""), "{msg}");
+    }
+
+    #[test]
+    fn resolve_max_concurrency_fixed_above_semaphore_limit_errors() {
+        let state = StateManager::new(HashMap::new());
+        let cap = Some(ConcurrencyCap::Fixed(Semaphore::MAX_PERMITS + 1));
+        let msg = resolve(cap, &state).unwrap_err().to_string();
+        assert_eq!(
+            msg,
+            format!(
+                "map node 'm': max_concurrency {} exceeds the runtime limit of {}",
+                Semaphore::MAX_PERMITS + 1,
+                Semaphore::MAX_PERMITS
+            )
+        );
+        // The limit itself is fine.
+        let cap = Some(ConcurrencyCap::Fixed(Semaphore::MAX_PERMITS));
+        assert_eq!(resolve(cap, &state).unwrap(), Semaphore::MAX_PERMITS);
+    }
+
+    #[test]
+    fn resolve_max_concurrency_template_above_semaphore_limit_errors() {
+        let state = state_with("budget", Value::from((Semaphore::MAX_PERMITS as u64) + 1));
+        let cap = Some(ConcurrencyCap::Template("{{budget}}".into()));
+        let msg = resolve(cap, &state).unwrap_err().to_string();
+        assert!(msg.contains("exceeds the runtime limit of"), "{msg}");
     }
 
     #[test]

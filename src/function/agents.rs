@@ -565,7 +565,8 @@ impl Drop for CancelOnDrop {
 
 /// Runs a child agent to completion. When the child is a graph agent,
 /// `graph_inputs` is overlaid on its `initial_state` before the graph
-/// starts; it is ignored for config-only agents.
+/// starts. Passing inputs to a config-only agent is rejected before the
+/// child runs, since nothing could consume them.
 fn run_child_agent_with_graph_inputs(
     mut child_ctx: RequestContext,
     initial_input: Input,

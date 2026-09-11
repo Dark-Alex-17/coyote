@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone)]
 pub struct ValidationError {
@@ -537,6 +538,12 @@ impl GraphValidator {
                  deadlock the executor",
             ));
         }
+        if graph.settings.max_concurrency > Semaphore::MAX_PERMITS {
+            result.error(ValidationError::new(format!(
+                "settings.max_concurrency must be <= {} (got {}); the runtime cannot allocate more permits",
+                Semaphore::MAX_PERMITS, graph.settings.max_concurrency
+            )));
+        }
 
         for (node_id, node) in &graph.nodes {
             if let NodeType::Map(m) = &node.node_type
@@ -546,6 +553,18 @@ impl GraphValidator {
                     node_id,
                     "map node's `max_concurrency` must be >= 1 (got 0); a zero cap \
                      would deadlock the executor",
+                ));
+            }
+            if let NodeType::Map(m) = &node.node_type
+                && let Some(ConcurrencyCap::Fixed(n)) = m.max_concurrency
+                && n > Semaphore::MAX_PERMITS
+            {
+                result.error(ValidationError::with_node(
+                    node_id,
+                    format!(
+                        "map node's `max_concurrency` must be <= {} (got {n}); the runtime cannot allocate more permits",
+                        Semaphore::MAX_PERMITS
+                    ),
                 ));
             }
         }
@@ -3159,6 +3178,24 @@ mod tests {
     }
 
     #[test]
+    fn settings_max_concurrency_above_semaphore_limit_errors() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.settings.max_concurrency = Semaphore::MAX_PERMITS + 1;
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains(&format!(
+                "settings.max_concurrency must be <= {} (got {})",
+                Semaphore::MAX_PERMITS,
+                Semaphore::MAX_PERMITS + 1
+            ))),
+            "expected graph-level max_concurrency upper-bound error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
     fn settings_max_concurrency_default_is_valid() {
         let graph = graph_with(vec![("e", end_node("e"))], "e");
 
@@ -3456,6 +3493,30 @@ mod tests {
         );
         assert_eq!(w[0].node_id.as_deref(), Some("l"));
         assert_eq!(w[1].node_id.as_deref(), Some("l"));
+    }
+
+    #[test]
+    fn map_max_concurrency_above_semaphore_limit_errors() {
+        let mut map = map_node_basic("m", "br", Some("end"));
+        if let NodeType::Map(ref mut mm) = map.node_type {
+            mm.max_concurrency = Some(ConcurrencyCap::Fixed(Semaphore::MAX_PERMITS + 1));
+        }
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e
+                .message
+                .contains(&format!("must be <= {}", Semaphore::MAX_PERMITS))
+                && e.node_id.as_deref() == Some("m")),
+            "expected map max_concurrency upper-bound error: {:?}",
+            result.errors
+        );
     }
 
     #[test]

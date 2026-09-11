@@ -109,6 +109,13 @@ impl GraphExecutor {
         let max_iterations = graph.settings.max_loop_iterations;
         let graph_timeout = graph.settings.timeout.and_then(wall_clock);
         let max_concurrency = graph.settings.max_concurrency;
+        if max_concurrency > Semaphore::MAX_PERMITS {
+            bail!(
+                "Graph '{}': settings.max_concurrency {max_concurrency} exceeds the runtime limit of {}",
+                graph.name,
+                Semaphore::MAX_PERMITS
+            );
+        }
         let graph = Arc::new(graph);
         let start = Instant::now();
 
@@ -1360,6 +1367,30 @@ nodes:
             "error should report during-super-step timeout: {err}"
         );
         assert!(err.contains("sleeper"), "error should name frontier: {err}");
+    }
+
+    #[tokio::test]
+    async fn settings_max_concurrency_above_semaphore_limit_errors_instead_of_panicking() {
+        let ws = TestWorkspace::new();
+        let yaml = r#"
+name: oversized_cap_test
+start: done
+settings:
+  validate_before_run: false
+nodes:
+  done:
+    type: end
+    output: "done"
+"#;
+        let mut graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        graph.settings.max_concurrency = Semaphore::MAX_PERMITS + 1;
+        let mut ctx = make_ctx();
+        let err = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, create_abort_signal())
+            .await
+            .expect_err("an oversized cap is an error, not a panic");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("exceeds the runtime limit of"), "{msg}");
     }
 
     #[tokio::test]
