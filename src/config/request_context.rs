@@ -8040,6 +8040,86 @@ mod tests {
 
     #[test]
     #[serial]
+    fn install_builtin_agents_removes_stale_definition_files() {
+        let _guard = TestConfigDirGuard::new();
+
+        Agent::install_builtin_agents(false).unwrap();
+
+        let agents_dir = paths::agents_data_dir();
+        // Simulate an upgrade from an older install: coder used to ship
+        // config.yaml + tools.py (now graph.yaml + tools.sh) and demo used
+        // to ship tools.sh (now tools.py + tools.sh.bak).
+        write(agents_dir.join("coder").join("config.yaml"), "stale").unwrap();
+        write(agents_dir.join("coder").join("tools.py"), "stale").unwrap();
+        write(agents_dir.join("demo").join("tools.sh"), "stale").unwrap();
+        // Reconciliation must never touch subdirectories, non-definition
+        // root files, or agents that aren't part of the bundle.
+        create_dir_all(agents_dir.join("coder").join("sessions")).unwrap();
+        write(
+            agents_dir.join("coder").join("sessions").join("keep.yaml"),
+            "keep",
+        )
+        .unwrap();
+        write(agents_dir.join("coder").join(".env"), "keep").unwrap();
+        create_dir_all(agents_dir.join("myagent")).unwrap();
+        write(agents_dir.join("myagent").join("config.yaml"), "keep").unwrap();
+
+        Agent::install_builtin_agents(false).unwrap();
+
+        assert!(
+            !agents_dir.join("coder").join("config.yaml").exists(),
+            "stale config.yaml must be removed for a graph-based bundled agent"
+        );
+        assert!(
+            !agents_dir.join("coder").join("tools.py").exists(),
+            "stale tools script must be removed when the bundle no longer ships it"
+        );
+        assert!(
+            !agents_dir.join("demo").join("tools.sh").exists(),
+            "stale tools.sh must be removed when the bundle only ships tools.py"
+        );
+        assert!(agents_dir.join("coder").join("graph.yaml").exists());
+        assert!(agents_dir.join("coder").join("tools.sh").exists());
+        assert!(agents_dir.join("demo").join("tools.py").exists());
+        assert!(
+            agents_dir
+                .join("coder")
+                .join("sessions")
+                .join("keep.yaml")
+                .exists(),
+            "files in agent subdirectories must survive reconciliation"
+        );
+        assert!(
+            agents_dir.join("coder").join(".env").exists(),
+            "non-definition root files must survive reconciliation"
+        );
+        assert!(
+            agents_dir.join("myagent").join("config.yaml").exists(),
+            "custom agents outside the bundle must survive reconciliation"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_agents_removes_stale_graph_for_config_agent() {
+        let _guard = TestConfigDirGuard::new();
+
+        Agent::install_builtin_agents(false).unwrap();
+
+        let agents_dir = paths::agents_data_dir();
+        write(agents_dir.join("architect").join("graph.yaml"), "stale").unwrap();
+
+        Agent::install_builtin_agents(false).unwrap();
+
+        assert!(
+            !agents_dir.join("architect").join("graph.yaml").exists(),
+            "stale graph.yaml must be removed for a config-based bundled agent"
+        );
+        assert!(agents_dir.join("architect").join("config.yaml").exists());
+    }
+
+    #[test]
+    #[serial]
     fn install_builtin_skills_force_overwrites_only_with_force() {
         let _guard = TestConfigDirGuard::new();
 
@@ -8141,6 +8221,8 @@ mod tests {
         // rule that fires on a shipped asset (or a new bundled graph) must be
         // recorded here deliberately.
         let expected_warnings = BTreeMap::from([
+            ("adversary".to_string(), Vec::new()),
+            ("code-reviewer".to_string(), Vec::new()),
             (
                 "coder".to_string(),
                 unreachable(&[
@@ -8160,6 +8242,7 @@ mod tests {
             ("deep-research".to_string(), unreachable(&["ask_topic"])),
             ("finding-verifier".to_string(), Vec::new()),
             ("librarian".to_string(), Vec::new()),
+            ("review-gauntlet".to_string(), Vec::new()),
             (
                 "step-runner".to_string(),
                 unreachable(&[

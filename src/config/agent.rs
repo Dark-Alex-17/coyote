@@ -31,6 +31,15 @@ use std::{env, ffi::OsStr, path::Path};
 
 const DEFAULT_AGENT_NAME: &str = "rag";
 
+const AGENT_DEFINITION_FILES: [&str; 6] = [
+    "config.yaml",
+    "graph.yaml",
+    "tools.sh",
+    "tools.py",
+    "tools.ts",
+    "tools.js",
+];
+
 pub type AgentVariables = IndexMap<String, String>;
 
 #[derive(Embed)]
@@ -92,6 +101,36 @@ impl Agent {
             if is_script {
                 use std::{fs, os::unix::fs::PermissionsExt};
                 fs::set_permissions(&file_path, fs::Permissions::from_mode(0o755))?;
+            }
+        }
+
+        let mut bundled_files: HashMap<String, HashSet<String>> = HashMap::new();
+        for file in AgentAssets::iter() {
+            if let Some((agent, rest)) = file.as_ref().split_once('/') {
+                bundled_files
+                    .entry(agent.to_string())
+                    .or_default()
+                    .insert(rest.to_string());
+            }
+        }
+        for (agent, files) in &bundled_files {
+            for candidate in AGENT_DEFINITION_FILES {
+                if files.contains(candidate) {
+                    continue;
+                }
+                let stale_path = paths::agents_data_dir().join(agent).join(candidate);
+                if stale_path.exists() {
+                    info!(
+                        "Removing stale file no longer shipped by built-in agent '{agent}': {}",
+                        stale_path.display()
+                    );
+                    if let Err(err) = std::fs::remove_file(&stale_path) {
+                        warn!(
+                            "Failed to remove stale agent file {}: {err}",
+                            stale_path.display()
+                        );
+                    }
+                }
             }
         }
 

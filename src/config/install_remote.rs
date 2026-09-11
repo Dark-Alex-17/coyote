@@ -464,10 +464,9 @@ fn owned_unmodified_mcp_keys(
 enum ObsoleteAction {
     Keep,
     Delete,
+    Backup,
 }
 
-/// Kept files stay in the record, so a later uninstall still offers to
-/// remove them.
 fn handle_obsolete_files(
     store: &mut BundleStore,
     bundle: &str,
@@ -479,21 +478,21 @@ fn handle_obsolete_files(
         .iter()
         .map(|planned| provenance_path(&planned.dst))
         .collect();
-    let obsolete: Vec<String> = store
+    let obsolete: Vec<(String, String)> = store
         .get(bundle)
         .map(|record| {
             record
                 .files
                 .iter()
-                .map(|file| file.path.clone())
-                .filter(|path| !planned.contains(path))
+                .filter(|file| !planned.contains(&file.path))
+                .map(|file| (file.path.clone(), file.sha256.clone()))
                 .collect()
         })
         .unwrap_or_default();
 
     let config_dir = paths::config_dir();
     let mut sticky: Option<ObsoleteAction> = assume_yes.then_some(ObsoleteAction::Keep);
-    for path in obsolete {
+    for (path, recorded_sha) in obsolete {
         if !is_safe_relative_path(&path) {
             eprintln!("skipping suspicious recorded path {path}; keeping its record");
             continue;
@@ -506,11 +505,31 @@ fn handle_obsolete_files(
             continue;
         }
 
-        let action = resolve_obsolete(&path, &mut sticky)?;
-        apply_obsolete_action(store, bundle, &path, &full, &config_dir, action)?;
+        let modified = hash_file(&full)? != recorded_sha;
+        let action = match (modified, agent_definition_conflict(&path, &planned)) {
+            (false, _) => ObsoleteAction::Delete,
+            (true, true) => ObsoleteAction::Backup,
+            (true, false) => resolve_obsolete(&path, &mut sticky)?,
+        };
+        apply_obsolete_action(store, bundle, &path, &full, &config_dir, action, modified)?;
     }
 
     Ok(())
+}
+
+fn agent_definition_conflict(path: &str, planned: &HashSet<String>) -> bool {
+    let Some(rest) = path.strip_prefix("agents/") else {
+        return false;
+    };
+    let Some((agent, file)) = rest.split_once('/') else {
+        return false;
+    };
+    let counterpart = match file {
+        "config.yaml" => "graph.yaml",
+        "graph.yaml" => "config.yaml",
+        _ => return false,
+    };
+    planned.contains(&format!("agents/{agent}/{counterpart}"))
 }
 
 fn resolve_obsolete(path: &str, sticky: &mut Option<ObsoleteAction>) -> Result<ObsoleteAction> {
@@ -522,7 +541,9 @@ fn resolve_obsolete(path: &str, sticky: &mut Option<ObsoleteAction>) -> Result<O
         return Ok(ObsoleteAction::Keep);
     }
 
-    let prompt = format!("Obsolete file {path} is no longer shipped by the bundle");
+    let prompt = format!(
+        "Obsolete file {path} is no longer shipped by the bundle and has local modifications"
+    );
     let choice = Select::new(&prompt, vec!["keep", "delete", "keep-all", "delete-all"])
         .prompt()
         .with_context(|| "failed to read obsolete-file choice")?;
@@ -549,6 +570,7 @@ fn apply_obsolete_action(
     full: &Path,
     config_dir: &Path,
     action: ObsoleteAction,
+    modified: bool,
 ) -> Result<()> {
     match action {
         ObsoleteAction::Keep => {
@@ -559,7 +581,29 @@ fn apply_obsolete_action(
                 .with_context(|| format!("failed to delete obsolete file {}", full.display()))?;
             store.remove_file_record(bundle, path)?;
             prune_empty_dirs(full, config_dir);
-            println!("deleted obsolete file {path}");
+            if modified {
+                println!("deleted obsolete file {path}");
+            } else {
+                println!("deleted obsolete file {path} (unchanged since install)");
+            }
+        }
+        ObsoleteAction::Backup => {
+            let mut backup_name = full.as_os_str().to_os_string();
+            backup_name.push(".bak");
+            let backup = PathBuf::from(backup_name);
+            if backup.exists() {
+                fs::remove_file(&backup).with_context(|| {
+                    format!("failed to remove stale backup {}", backup.display())
+                })?;
+            }
+            fs::rename(full, &backup)
+                .with_context(|| format!("failed to back up obsolete file {}", full.display()))?;
+            store.remove_file_record(bundle, path)?;
+            println!(
+                "moved obsolete file {path} to {path}.bak: keeping it would break the agent \
+                 (both config.yaml and graph.yaml present); your local modifications are \
+                 preserved in the backup"
+            );
         }
     }
 
@@ -847,6 +891,9 @@ fn apply_uninstall_file_action(
         ObsoleteAction::Delete => {
             delete_owned_file(store, bundle, path, full, config_dir, summary)?;
         }
+        ObsoleteAction::Backup => {
+            unreachable!("uninstall never resolves to a backup action")
+        }
     }
 
     Ok(())
@@ -1017,6 +1064,9 @@ fn uninstall_mcp_entries(
                 println!("removed server '{key}'");
                 released.push(key.clone());
                 summary.removed.push(key);
+            }
+            ObsoleteAction::Backup => {
+                unreachable!("uninstall never resolves to a backup action")
             }
         }
     }
@@ -3892,10 +3942,34 @@ mod tests {
 
     #[test]
     #[serial]
-    fn update_keeps_obsolete_files_non_interactively() {
+    fn update_deletes_unmodified_obsolete_files() {
+        let _guard = TestVaultConfigGuard::new("upd-obsolete-del");
+        let src_root = fresh_temp_dir("upd-obsolete-del-src-");
+        let repo = src_root.join("bundle");
+        write_src(&repo, BUNDLE_MANIFEST_FILE, "name: obs-del\n");
+        write_src(&repo, "macros/keep.yaml", "k\n");
+        write_src(&repo, "macros/gone.yaml", "g\n");
+        init_bundle_repo(&repo);
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        fs::remove_file(repo.join("macros/gone.yaml")).unwrap();
+        commit_file(&repo, "macros/keep.yaml", "k2\n");
+
+        update_bundle("obs-del", false).unwrap();
+
+        assert!(!paths::macros_dir().join("gone.yaml").exists());
+        let store = BundleStore::load().unwrap();
+        let record = store.get("obs-del").unwrap();
+        assert!(record.files.iter().all(|f| f.path != "macros/gone.yaml"));
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    #[serial]
+    fn update_keeps_modified_obsolete_files_non_interactively() {
         if *IS_STDOUT_TERMINAL {
             eprintln!(
-                "Skipping update_keeps_obsolete_files_non_interactively: requires non-TTY stdout"
+                "Skipping update_keeps_modified_obsolete_files_non_interactively: \
+                 requires non-TTY stdout"
             );
             return;
         }
@@ -3907,6 +3981,7 @@ mod tests {
         write_src(&repo, "macros/gone.yaml", "g\n");
         init_bundle_repo(&repo);
         install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        fs::write(paths::macros_dir().join("gone.yaml"), "g-local\n").unwrap();
         fs::remove_file(repo.join("macros/gone.yaml")).unwrap();
         commit_file(&repo, "macros/keep.yaml", "k2\n");
 
@@ -3914,7 +3989,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(paths::macros_dir().join("gone.yaml")).unwrap(),
-            "g\n"
+            "g-local\n"
         );
         let store = BundleStore::load().unwrap();
         let record = store.get("obs-keep").unwrap();
@@ -3944,8 +4019,16 @@ mod tests {
             )
             .unwrap();
 
-        apply_obsolete_action(&mut store, "omc", &path, &dst, &dir, ObsoleteAction::Delete)
-            .unwrap();
+        apply_obsolete_action(
+            &mut store,
+            "omc",
+            &path,
+            &dst,
+            &dir,
+            ObsoleteAction::Delete,
+            false,
+        )
+        .unwrap();
 
         assert!(!dst.exists());
         let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -4011,6 +4094,189 @@ mod tests {
 
         assert_eq!(store.get("omc").unwrap().files.len(), 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn handle_obsolete_deletes_unmodified_files_without_prompting() {
+        let _guard = TestVaultConfigGuard::new("upd-obsolete-unmod");
+        let dir = paths::config_dir();
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let dst = dir.join("macros/gone.yaml");
+        write_src(&dir, "macros/gone.yaml", "g");
+        store
+            .record_file(
+                "omc",
+                FileRecord {
+                    path: "macros/gone.yaml".to_string(),
+                    category: "macros".to_string(),
+                    sha256: hash_file(&dst).unwrap(),
+                    action: FileAction::New,
+                },
+            )
+            .unwrap();
+        let plan = InstallPlan {
+            files: Vec::new(),
+            mcp_json: None,
+        };
+
+        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+
+        assert!(!dst.exists());
+        assert!(store.get("omc").unwrap().files.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn handle_obsolete_keeps_modified_files_non_interactively() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping handle_obsolete_keeps_modified_files_non_interactively: \
+                 requires non-TTY stdout"
+            );
+            return;
+        }
+        let _guard = TestVaultConfigGuard::new("upd-obsolete-mod");
+        let dir = paths::config_dir();
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let dst = dir.join("macros/gone.yaml");
+        write_src(&dir, "macros/gone.yaml", "local edits");
+        store
+            .record_file(
+                "omc",
+                FileRecord {
+                    path: "macros/gone.yaml".to_string(),
+                    category: "macros".to_string(),
+                    sha256: "0".repeat(64),
+                    action: FileAction::New,
+                },
+            )
+            .unwrap();
+        let plan = InstallPlan {
+            files: Vec::new(),
+            mcp_json: None,
+        };
+
+        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "local edits");
+        assert_eq!(store.get("omc").unwrap().files.len(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn handle_obsolete_backs_up_modified_agent_definition_conflicts() {
+        let _guard = TestVaultConfigGuard::new("upd-obsolete-agent-bak");
+        let dir = paths::config_dir();
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let dst = dir.join("agents/foo/config.yaml");
+        write_src(&dir, "agents/foo/config.yaml", "local edits");
+        store
+            .record_file(
+                "omc",
+                FileRecord {
+                    path: "agents/foo/config.yaml".to_string(),
+                    category: "agents".to_string(),
+                    sha256: "0".repeat(64),
+                    action: FileAction::New,
+                },
+            )
+            .unwrap();
+        let plan = InstallPlan {
+            files: vec![PlannedFile {
+                src: dir.join("bundle-src/agents/foo/graph.yaml"),
+                dst: dir.join("agents/foo/graph.yaml"),
+                kind: PlannedKind::New,
+                top_category: TopCategory::Agents,
+            }],
+            mcp_json: None,
+        };
+
+        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+
+        assert!(!dst.exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("agents/foo/config.yaml.bak")).unwrap(),
+            "local edits"
+        );
+        assert!(store.get("omc").unwrap().files.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn handle_obsolete_deletes_unmodified_agent_definition_conflicts() {
+        let _guard = TestVaultConfigGuard::new("upd-obsolete-agent-del");
+        let dir = paths::config_dir();
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let dst = dir.join("agents/foo/config.yaml");
+        write_src(&dir, "agents/foo/config.yaml", "shipped content");
+        store
+            .record_file(
+                "omc",
+                FileRecord {
+                    path: "agents/foo/config.yaml".to_string(),
+                    category: "agents".to_string(),
+                    sha256: hash_file(&dst).unwrap(),
+                    action: FileAction::New,
+                },
+            )
+            .unwrap();
+        let plan = InstallPlan {
+            files: vec![PlannedFile {
+                src: dir.join("bundle-src/agents/foo/graph.yaml"),
+                dst: dir.join("agents/foo/graph.yaml"),
+                kind: PlannedKind::New,
+                top_category: TopCategory::Agents,
+            }],
+            mcp_json: None,
+        };
+
+        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+
+        assert!(!dst.exists());
+        assert!(!dir.join("agents/foo/config.yaml.bak").exists());
+        assert!(store.get("omc").unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn agent_definition_conflict_matches_only_planned_counterparts() {
+        let planned: HashSet<String> = [
+            "agents/foo/graph.yaml".to_string(),
+            "agents/bar/config.yaml".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(agent_definition_conflict(
+            "agents/foo/config.yaml",
+            &planned
+        ));
+        assert!(agent_definition_conflict("agents/bar/graph.yaml", &planned));
+        assert!(!agent_definition_conflict(
+            "agents/foo/graph.yaml",
+            &planned
+        ));
+        assert!(!agent_definition_conflict(
+            "agents/baz/config.yaml",
+            &planned
+        ));
+        assert!(!agent_definition_conflict(
+            "agents/foo/scripts/config.yaml",
+            &planned
+        ));
+        assert!(!agent_definition_conflict("macros/config.yaml", &planned));
     }
 
     #[test]
