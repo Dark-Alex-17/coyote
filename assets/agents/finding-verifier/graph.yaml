@@ -147,9 +147,8 @@ nodes:
       - fs_grep
     max_iterations: 8
     max_attempts: 2
-    temperature: 0.1
     state_updates:
-      verdict: "{{output}}"
+      verdict: '{{output}}'
 
   done:
     id: done
