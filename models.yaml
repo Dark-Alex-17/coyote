@@ -2985,6 +2985,36 @@
     - high
     - xhigh
     - max
+  - name: in.openai.gpt-5.6-luna
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 0.22
+    output_price: 1.32
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - none
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
+  - name: in.openai.gpt-5.6-terra
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 2.2
+    output_price: 13.2
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - none
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
   - name: openai.gpt-5.6-luna
     type: chat
     max_input_tokens: 1050000
@@ -3418,6 +3448,39 @@
     - xhigh
     - max
     default_reasoning_effort: high
+  - name: google.gemma-4-26b-a4b
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.13
+    output_price: 0.4
+    max_output_tokens: 32768
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - none
+    - high
+  - name: google.gemma-4-31b
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.14
+    output_price: 0.4
+    max_output_tokens: 32768
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - none
+    - high
+  - name: google.gemma-4-e2b
+    type: chat
+    max_input_tokens: 131072
+    input_price: 0.04
+    output_price: 0.08
+    max_output_tokens: 8192
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - none
+    - high
   - name: minimax.minimax-m2.5
     type: chat
     max_input_tokens: 196608
@@ -3695,6 +3758,54 @@
     output_price: 2.2
     max_output_tokens: 131072
     supports_function_calling: true
+  - name: amazon.nova-2-lite-v1:0
+    type: chat
+    max_input_tokens: 1000000
+    input_price: 0.33
+    output_price: 2.75
+    max_output_tokens: 65535
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
+  - name: eu.amazon.nova-2-lite-v1:0
+    type: chat
+    max_input_tokens: 1000000
+    input_price: 0.374
+    output_price: 3.157
+    max_output_tokens: 65535
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
+  - name: global.amazon.nova-2-lite-v1:0
+    type: chat
+    max_input_tokens: 1000000
+    input_price: 0.3
+    output_price: 2.5
+    max_output_tokens: 65535
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
+  - name: jp.amazon.nova-2-lite-v1:0
+    type: chat
+    max_input_tokens: 1000000
+    input_price: 0.396
+    output_price: 3.311
+    max_output_tokens: 65535
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
   - name: mistral.magistral-small-2509
     type: chat
     max_input_tokens: 128000
@@ -3726,48 +3837,12 @@
     output_price: 2.5
     max_output_tokens: 16000
     supports_function_calling: true
-  - name: eu.amazon.nova-2-lite-v1:0
-    type: chat
-    max_input_tokens: 1000000
-    input_price: 0.374
-    output_price: 3.157
-    max_output_tokens: 64000
-    supports_vision: true
-    supports_function_calling: true
-    reasoning_levels:
-    - low
-    - medium
-    - high
-  - name: global.amazon.nova-2-lite-v1:0
-    type: chat
-    max_input_tokens: 1000000
-    input_price: 0.3
-    output_price: 2.5
-    max_output_tokens: 64000
-    supports_vision: true
-    supports_function_calling: true
-    reasoning_levels:
-    - low
-    - medium
-    - high
-  - name: jp.amazon.nova-2-lite-v1:0
-    type: chat
-    max_input_tokens: 1000000
-    input_price: 0.396
-    output_price: 3.311
-    max_output_tokens: 64000
-    supports_vision: true
-    supports_function_calling: true
-    reasoning_levels:
-    - low
-    - medium
-    - high
   - name: us.amazon.nova-2-lite-v1:0
     type: chat
     max_input_tokens: 1000000
     input_price: 0.33
     output_price: 2.75
-    max_output_tokens: 64000
+    max_output_tokens: 65535
     supports_vision: true
     supports_function_calling: true
     reasoning_levels:
@@ -3848,6 +3923,10 @@
     output_price: 0.6
     max_output_tokens: 16384
     supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
   - name: openai.gpt-oss-safeguard-20b
     type: chat
     max_input_tokens: 128000
@@ -3855,6 +3934,10 @@
     output_price: 0.2
     max_output_tokens: 16384
     supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
   - name: minimax.minimax-m2
     type: chat
     max_input_tokens: 204608
@@ -4098,6 +4181,28 @@
     - low
     - medium
     - high
+  - name: us-gov.openai.gpt-oss-120b-1:0
+    type: chat
+    max_input_tokens: 128000
+    input_price: 0.18
+    output_price: 0.72
+    max_output_tokens: 16384
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
+  - name: us-gov.openai.gpt-oss-20b-1:0
+    type: chat
+    max_input_tokens: 128000
+    input_price: 0.084
+    output_price: 0.36
+    max_output_tokens: 16384
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
   - name: us.anthropic.claude-opus-4-1-20250805-v1:0
     type: chat
     max_input_tokens: 200000
@@ -4107,20 +4212,20 @@
     require_max_tokens: true
     supports_vision: true
     supports_function_calling: true
-  - name: google.gemma-3-27b-it
-    type: chat
-    max_input_tokens: 202752
-    input_price: 0.12
-    output_price: 0.2
-    max_output_tokens: 8192
-    supports_vision: true
-    supports_function_calling: true
   - name: mistral.voxtral-small-24b-2507
     type: chat
     max_input_tokens: 32000
     input_price: 0.15
     output_price: 0.35
     max_output_tokens: 8192
+    supports_function_calling: true
+  - name: us.amazon.nova-premier-v1:0
+    type: chat
+    max_input_tokens: 300000
+    input_price: 2.5
+    output_price: 12.5
+    max_output_tokens: 5120
+    supports_vision: true
     supports_function_calling: true
   - name: us.writer.palmyra-x4-v1:0
     type: chat
@@ -4208,6 +4313,27 @@
     require_max_tokens: true
     supports_vision: true
     supports_function_calling: true
+  - name: google.gemma-3-12b-it
+    type: chat
+    max_input_tokens: 131072
+    input_price: 0.09
+    output_price: 0.29
+    max_output_tokens: 8192
+    supports_vision: true
+  - name: google.gemma-3-27b-it
+    type: chat
+    max_input_tokens: 202752
+    input_price: 0.23
+    output_price: 0.38
+    max_output_tokens: 8192
+    supports_vision: true
+  - name: google.gemma-3-4b-it
+    type: chat
+    max_input_tokens: 131072
+    input_price: 0.04
+    output_price: 0.08
+    max_output_tokens: 4096
+    supports_vision: true
   - name: deepseek.r1-v1:0
     type: chat
     max_input_tokens: 128000
@@ -4242,7 +4368,7 @@
     max_input_tokens: 300000
     input_price: 0.06
     output_price: 0.24
-    max_output_tokens: 8192
+    max_output_tokens: 10000
     supports_vision: true
     supports_function_calling: true
   - name: amazon.nova-micro-v1:0
@@ -4250,14 +4376,14 @@
     max_input_tokens: 128000
     input_price: 0.035
     output_price: 0.14
-    max_output_tokens: 8192
+    max_output_tokens: 10000
     supports_function_calling: true
   - name: amazon.nova-pro-v1:0
     type: chat
     max_input_tokens: 300000
     input_price: 0.8
     output_price: 3.2
-    max_output_tokens: 8192
+    max_output_tokens: 10000
     supports_vision: true
     supports_function_calling: true
   - name: apac.amazon.nova-lite-v1:0
@@ -4265,7 +4391,7 @@
     max_input_tokens: 300000
     input_price: 0.063
     output_price: 0.252
-    max_output_tokens: 8192
+    max_output_tokens: 10000
     supports_vision: true
     supports_function_calling: true
   - name: apac.amazon.nova-micro-v1:0
@@ -4273,14 +4399,14 @@
     max_input_tokens: 128000
     input_price: 0.037
     output_price: 0.148
-    max_output_tokens: 8192
+    max_output_tokens: 10000
     supports_function_calling: true
   - name: apac.amazon.nova-pro-v1:0
     type: chat
     max_input_tokens: 300000
     input_price: 0.84
     output_price: 3.36
-    max_output_tokens: 8192
+    max_output_tokens: 10000
     supports_vision: true
     supports_function_calling: true
   - name: ca.amazon.nova-lite-v1:0
@@ -4288,7 +4414,7 @@
     max_input_tokens: 300000
     input_price: 0.064
     output_price: 0.256
-    max_output_tokens: 8192
+    max_output_tokens: 10000
     supports_vision: true
     supports_function_calling: true
   - name: eu.amazon.nova-lite-v1:0
@@ -4296,7 +4422,7 @@
     max_input_tokens: 300000
     input_price: 0.069
     output_price: 0.276
-    max_output_tokens: 8192
+    max_output_tokens: 10000
     supports_vision: true
     supports_function_calling: true
   - name: eu.amazon.nova-micro-v1:0
@@ -4304,14 +4430,14 @@
     max_input_tokens: 128000
     input_price: 0.04
     output_price: 0.16
-    max_output_tokens: 8192
+    max_output_tokens: 10000
     supports_function_calling: true
   - name: eu.amazon.nova-pro-v1:0
     type: chat
     max_input_tokens: 300000
     input_price: 0.92
     output_price: 3.68
-    max_output_tokens: 8192
+    max_output_tokens: 10000
     supports_vision: true
     supports_function_calling: true
   - name: us.amazon.nova-lite-v1:0
@@ -4335,33 +4461,6 @@
     input_price: 0.8
     output_price: 3.2
     max_output_tokens: 5120
-    supports_vision: true
-    supports_function_calling: true
-  - name: amazon.nova-2-lite-v1:0
-    type: chat
-    max_input_tokens: 128000
-    input_price: 0.33
-    output_price: 2.75
-    max_output_tokens: 4096
-    supports_vision: true
-    supports_function_calling: true
-    reasoning_levels:
-    - low
-    - medium
-    - high
-  - name: google.gemma-3-12b-it
-    type: chat
-    max_input_tokens: 131072
-    input_price: 0.05
-    output_price: 0.1
-    max_output_tokens: 8192
-    supports_vision: true
-  - name: google.gemma-3-4b-it
-    type: chat
-    max_input_tokens: 128000
-    input_price: 0.04
-    output_price: 0.08
-    max_output_tokens: 4096
     supports_vision: true
     supports_function_calling: true
   - name: mistral.ministral-3-14b-instruct
@@ -4442,12 +4541,6 @@
     max_tokens_per_chunk: 512
     default_chunk_size: 1000
     max_batch_size: 96
-  - name: us.amazon.nova-premier-v1:0
-    type: chat
-    max_input_tokens: 300000
-    input_price: 2.5
-    output_price: 12.5
-    max_output_tokens: 5120
 - provider: cloudflare
   models:
   - name: '@cf/zai-org/glm-5.3-flash'
@@ -6202,8 +6295,8 @@
   - name: deepseek/deepseek-chat-v3-0324
     type: chat
     max_input_tokens: 163840
-    input_price: 0.29
-    output_price: 1.14
+    input_price: 0.25
+    output_price: 1.0
     max_output_tokens: 147456
     supports_function_calling: true
   - name: deepseek/deepseek-chat-v3.1
@@ -6301,9 +6394,9 @@
   - name: deepseek/deepseek-v4-pro-0813
     type: chat
     max_input_tokens: 1048576
-    input_price: 1.0494
-    output_price: 3.1482
-    max_output_tokens: 384000
+    input_price: 0.66
+    output_price: 1.98
+    max_output_tokens: 943718
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813:batch
     type: chat
@@ -6801,9 +6894,9 @@
   - name: meta-llama/llama-3.1-70b-instruct
     type: chat
     max_input_tokens: 131072
-    input_price: 0.72
-    output_price: 0.72
-    max_output_tokens: 8192
+    input_price: 0.4
+    output_price: 0.4
+    max_output_tokens: 16384
     supports_function_calling: true
   - name: meta-llama/llama-3.1-8b-instruct
     type: chat
@@ -7222,8 +7315,8 @@
   - name: moonshotai/kimi-k3
     type: chat
     max_input_tokens: 1048576
-    input_price: 2.6
-    output_price: 13.0
+    input_price: 2.34
+    output_price: 11.7
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -8754,7 +8847,23 @@
     output_price: 3.0
     max_output_tokens: 128000
     supports_function_calling: true
+  - name: sakana/fugu-max
+    type: chat
+    max_input_tokens: 1000000
+    input_price: 2.0
+    output_price: 6.0
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
   - name: sakana/fugu-ultra
+    type: chat
+    max_input_tokens: 1000000
+    input_price: 5.0
+    output_price: 30.0
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+  - name: sakana/fugu-ultra-v2
     type: chat
     max_input_tokens: 1000000
     input_price: 5.0
@@ -9194,8 +9303,8 @@
   - name: ~moonshotai/kimi-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 2.4
-    output_price: 12.0
+    input_price: 2.34
+    output_price: 11.7
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -9234,9 +9343,9 @@
   - name: ~z-ai/glm-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.7
-    output_price: 2.2
-    max_output_tokens: 128000
+    input_price: 0.97
+    output_price: 3.3077
+    max_output_tokens: 943718
     supports_function_calling: true
 - provider: github
   models:
@@ -9344,8 +9453,8 @@
   - name: deepseek-ai/DeepSeek-V4.1-Flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.3
-    output_price: 1.2
+    input_price: 0.2
+    output_price: 0.6
     max_output_tokens: 384000
     supports_vision: true
     supports_function_calling: true
@@ -9560,8 +9669,8 @@
   - name: XiaomiMiMo/MiMo-V2.5
     type: chat
     max_input_tokens: 262144
-    input_price: 0.4
-    output_price: 2.0
+    input_price: 0.14
+    output_price: 0.28
     max_output_tokens: 16384
     supports_vision: true
     supports_function_calling: true
@@ -9867,6 +9976,30 @@
     output_price: 0.9
     max_output_tokens: 163840
     supports_function_calling: true
+  - name: google/gemma-3-12b-it
+    type: chat
+    max_input_tokens: 131072
+    input_price: 0.05
+    output_price: 0.15
+    max_output_tokens: 131072
+    supports_vision: true
+    supports_function_calling: true
+  - name: google/gemma-3-27b-it
+    type: chat
+    max_input_tokens: 131072
+    input_price: 0.1
+    output_price: 0.2
+    max_output_tokens: 131072
+    supports_vision: true
+    supports_function_calling: true
+  - name: google/gemma-3-4b-it
+    type: chat
+    max_input_tokens: 131072
+    input_price: 0.05
+    output_price: 0.1
+    max_output_tokens: 131072
+    supports_vision: true
+    supports_function_calling: true
   - name: deepseek-ai/DeepSeek-V3
     type: chat
     max_input_tokens: 163840
@@ -9945,11 +10078,6 @@
     input_price: 0.18
     output_price: 0.69
     supports_vision: true
-  - name: google/gemma-3-27b-it
-    type: chat
-    max_input_tokens: 131072
-    input_price: 0.1
-    output_price: 0.2
   - name: mistralai/Mistral-Small-3.2-24B-Instruct-2506
     type: chat
     max_input_tokens: 32768
