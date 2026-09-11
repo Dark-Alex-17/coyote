@@ -442,9 +442,8 @@ nodes:
                                 # it absent (prompts fail, state_updates render
                                 # "", scripts get no key) - seed per-item input
                                 # through `as:` instead. Prefer a named key: with
-                                # the default, an llm/agent/rag step whose
-                                # state_updates do not name `output` leaves
-                                # `output: null` and null is what gets collected.
+                                # the default, the collector errors if the chain
+                                # never writes it.
     next: aggregate_subjects    # Where to go after all sub-branches finish.
 
   # Entry node of subjects_map's per-item chain. Each item gets its own copy
