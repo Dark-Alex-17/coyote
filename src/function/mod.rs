@@ -1544,10 +1544,13 @@ impl ToolCall {
         let current_depth = ctx.current_depth;
         let quiet = current_depth > 0;
         let agent_name = agent.as_ref().map(|agent| agent.name().to_owned());
-        let (call_name, cmd_name, mut cmd_args, envs) = match agent.as_ref() {
+        let (call_name, cmd_name, mut cmd_args, mut envs) = match agent.as_ref() {
             Some(agent) => self.extract_call_config_from_agent(&functions, agent)?,
             None => self.extract_call_config_from_ctx(&functions)?,
         };
+
+        envs.entry("COYOTE_CURRENT_MODEL".to_string())
+            .or_insert_with(|| ctx.current_model().id());
 
         let json_data = if self.arguments.is_object() {
             self.arguments.clone()

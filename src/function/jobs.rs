@@ -944,6 +944,8 @@ fn build_env_snapshot(
     envs.insert("LLM_OUTPUT".into(), output_file.display().to_string());
     envs.insert("CLICOLOR_FORCE".into(), "1".into());
     envs.insert("FORCE_COLOR".into(), "1".into());
+    envs.entry("COYOTE_CURRENT_MODEL".to_string())
+        .or_insert_with(|| ctx.current_model().id());
 
     cmd_args.push(arguments.to_string());
 
