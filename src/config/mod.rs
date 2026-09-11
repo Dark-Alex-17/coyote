@@ -190,8 +190,30 @@ const GITIGNORE_FILE_NAME: &str = ".gitignore";
 
 const CLIENTS_FIELD: &str = "clients";
 
-const SUMMARIZATION_PROMPT: &str =
-    "Summarize the discussion briefly in 200 words or less to use as a prompt for future context.";
+const SUMMARIZATION_PROMPT: &str = r#"The conversation above is about to be compressed: everything except the most recent messages will be replaced by your summary, which becomes the only memory of that history. Write a handoff summary that lets the assistant continue seamlessly.
+
+Use exactly these markdown sections, omitting any that do not apply:
+
+## Goal
+The user's overall objective and any stated success criteria.
+
+## Current state
+What has been accomplished so far and what is in progress right now.
+
+## Key facts
+Files and paths touched or read (with a brief note on each), commands run and their outcomes, and identifiers that must survive verbatim: session/agent IDs, branch names, URLs, config keys, error messages.
+
+## Decisions and constraints
+Choices made and why, user preferences and directives, and approaches that were rejected or failed and must not be retried.
+
+## Next steps
+Remaining work in order, plus any open questions awaiting the user.
+
+Rules:
+- If the context already contains a summary of earlier history, fold its still-relevant content into this summary — it will be discarded otherwise.
+- Copy identifiers, paths, and error text verbatim; never paraphrase them.
+- Be dense and factual; prefer bullet points; no preamble or commentary before or after the summary.
+- Keep it under roughly 400 words unless critical details would otherwise be lost."#;
 const SUMMARY_CONTEXT_PROMPT: &str = "This is a summary of the chat history as a recap: ";
 
 const LEFT_PROMPT: &str = "{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} ";

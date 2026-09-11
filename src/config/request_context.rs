@@ -969,6 +969,13 @@ impl RequestContext {
             .unwrap_or_default()
     }
 
+    pub fn compression_keep_last(&self) -> usize {
+        self.agent
+            .as_ref()
+            .and_then(|a| a.compression_keep_last())
+            .unwrap_or(self.app.config.compression_keep_last)
+    }
+
     pub fn role_like_mut(&mut self) -> Option<&mut dyn RoleLike> {
         if let Some(session) = self.session.as_mut() {
             Some(session)
@@ -5026,11 +5033,7 @@ impl RequestContext {
             String::new()
         };
 
-        let keep_last = self
-            .agent
-            .as_ref()
-            .and_then(|a| a.compression_keep_last())
-            .unwrap_or(self.app.config.compression_keep_last);
+        let keep_last = self.compression_keep_last();
         if let Some(session) = self.session.as_mut() {
             session.compress(
                 format!("{todo_prefix}{summary_context_prompt}{summary}"),

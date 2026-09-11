@@ -18,6 +18,11 @@ static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}
 
 pub const INTERRUPTED_RESPONSE_TEXT: &str = "[Response interrupted due to error]";
 
+/// Auto-compression only fires when at least `threshold / 5` (20%) of the
+/// threshold is reclaimable, so each compression folds a meaningful batch
+/// instead of thrashing every turn.
+const COMPRESSION_MIN_RECLAIM_DIVISOR: usize = 5;
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Session {
     #[serde(rename(serialize = "model", deserialize = "model"))]
@@ -84,6 +89,8 @@ pub struct Session {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     compressed_messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compressed_system_prompt: Option<String>,
     messages: Vec<Message>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     data_urls: HashMap<String, String>,
@@ -587,7 +594,7 @@ impl Session {
         }
     }
 
-    pub fn needs_compression(&self, global_compression_threshold: usize) -> bool {
+    pub fn needs_compression(&self, global_compression_threshold: usize, keep_last: usize) -> bool {
         if self.compressing {
             return false;
         }
@@ -597,7 +604,29 @@ impl Session {
         if threshold < 1 {
             return false;
         }
-        self.tokens() > threshold
+        if self.tokens() <= threshold {
+            return false;
+        }
+        // Compression re-embeds the leading system message's content in the
+        // summary message and keeps the last `keep_last` messages verbatim, so
+        // only the messages between them are actually reclaimable. Without this
+        // guard, a session whose sticky floor (system prompt + kept tail) sits
+        // near the threshold re-compresses after every single turn, burning a
+        // summarization LLM call each time for almost no reduction.
+        self.reclaimable_tokens(keep_last) >= (threshold / COMPRESSION_MIN_RECLAIM_DIVISOR).max(1)
+    }
+
+    /// Estimated tokens of the messages that compression would actually fold
+    /// away: everything except the leading system message (whose content is
+    /// carried into the summary message) and the `keep_last` tail (kept verbatim).
+    fn reclaimable_tokens(&self, keep_last: usize) -> usize {
+        let start = usize::from(
+            self.messages
+                .first()
+                .is_some_and(|v| v.role == MessageRole::System),
+        );
+        let end = self.messages.len().saturating_sub(keep_last).max(start);
+        self.model().total_tokens(&self.messages[start..end])
     }
 
     pub fn compressing(&self) -> bool {
@@ -609,16 +638,25 @@ impl Session {
     }
 
     pub fn compress(&mut self, mut prompt: String, keep_last: usize) {
-        if let Some(system_prompt) = self.messages.first().and_then(|v| {
-            if MessageRole::System == v.role {
-                let content = v.content.to_text();
-                if !content.is_empty() {
-                    return Some(content);
-                }
-            }
-            None
-        }) {
-            prompt = format!("{system_prompt}\n\n{prompt}",);
+        // Capture the session's original system prompt the first time we compress.
+        // On subsequent compressions `messages[0]` is the summary message built
+        // below; re-reading it would re-embed every prior recap+summary, growing
+        // the message — and the post-compression token floor — without bound.
+        if self.compressed_system_prompt.is_none() {
+            let system_prompt = self
+                .messages
+                .first()
+                .filter(|v| v.role == MessageRole::System)
+                .map(|v| v.content.to_text())
+                .unwrap_or_default();
+            self.compressed_system_prompt = Some(system_prompt);
+        }
+        if let Some(system_prompt) = self
+            .compressed_system_prompt
+            .as_deref()
+            .filter(|v| !v.is_empty())
+        {
+            prompt = format!("{system_prompt}\n\n{prompt}");
         }
         let messages_to_keep = if keep_last > 0 && keep_last < self.messages.len() {
             self.messages.split_off(self.messages.len() - keep_last)
@@ -804,6 +842,7 @@ impl Session {
     pub fn clear_messages(&mut self) {
         self.messages.clear();
         self.compressed_messages.clear();
+        self.compressed_system_prompt = None;
         self.data_urls.clear();
         self.autoname = None;
         self.dirty = true;
@@ -1205,7 +1244,7 @@ mod tests {
     fn session_needs_compression_threshold() {
         let session = Session::default();
 
-        assert!(!session.needs_compression(4000));
+        assert!(!session.needs_compression(4000, 0));
     }
 
     #[test]
@@ -1214,14 +1253,36 @@ mod tests {
 
         session.set_compressing(true);
 
-        assert!(!session.needs_compression(0));
+        assert!(!session.needs_compression(0, 0));
     }
 
     #[test]
     fn session_needs_compression_returns_false_when_threshold_zero() {
         let session = Session::default();
 
-        assert!(!session.needs_compression(0));
+        assert!(!session.needs_compression(0, 0));
+    }
+
+    #[test]
+    fn session_needs_compression_requires_reclaimable_tokens() {
+        let mut session = Session::default();
+        session.messages.push(Message::new(
+            MessageRole::System,
+            MessageContent::Text("x".repeat(4000)),
+        ));
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("y".repeat(4000)),
+        ));
+        session.messages.push(Message::new(
+            MessageRole::Assistant,
+            MessageContent::Text("ok".to_string()),
+        ));
+        session.update_tokens();
+
+        assert!(session.tokens() > 100);
+        assert!(!session.needs_compression(100, 2));
+        assert!(session.needs_compression(100, 1));
     }
 
     #[test]
@@ -1274,6 +1335,57 @@ mod tests {
         assert!(!session.compressed_messages.is_empty());
         assert_eq!(session.messages.len(), 1);
         assert!(session.dirty());
+    }
+
+    #[test]
+    fn session_compress_does_not_accumulate_summaries() {
+        let mut session = Session::default();
+        session.messages.push(Message::new(
+            MessageRole::System,
+            MessageContent::Text("SYSTEM PROMPT".to_string()),
+        ));
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("hello".to_string()),
+        ));
+
+        session.compress("recap one".to_string(), 0);
+
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("more".to_string()),
+        ));
+        session.messages.push(Message::new(
+            MessageRole::Assistant,
+            MessageContent::Text("reply".to_string()),
+        ));
+
+        session.compress("recap two".to_string(), 0);
+
+        assert_eq!(
+            session.messages[0].content.to_text(),
+            "SYSTEM PROMPT\n\nrecap two"
+        );
+    }
+
+    #[test]
+    fn session_compress_without_system_message_does_not_capture_summary() {
+        let mut session = Session::default();
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("hello".to_string()),
+        ));
+
+        session.compress("recap one".to_string(), 0);
+
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("more".to_string()),
+        ));
+
+        session.compress("recap two".to_string(), 0);
+
+        assert_eq!(session.messages[0].content.to_text(), "recap two");
     }
 
     #[test]

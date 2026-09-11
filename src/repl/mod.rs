@@ -1569,10 +1569,11 @@ async fn ask(
             }
         }
 
+        let keep_last = ctx.compression_keep_last();
         let needs_compression = ctx
             .session
             .as_ref()
-            .is_some_and(|s| s.needs_compression(app.compression_threshold));
+            .is_some_and(|s| s.needs_compression(app.compression_threshold, keep_last));
 
         if needs_compression {
             let agent_can_continue_after_compress =
