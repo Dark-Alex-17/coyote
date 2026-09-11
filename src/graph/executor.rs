@@ -1815,7 +1815,18 @@ nodes:
         let _guard = TestConfigDirGuard::new();
         materialize_probe_agent(5.0);
         let ws = TestWorkspace::new();
-        ws.write_script("dispatcher.sh", "#!/bin/bash\necho '{}'\n");
+        // The abort must land after the worker tasks exist (their retirement
+        // guards are created at spawn), i.e. after the dispatcher super-step
+        // has run. A fixed delay races bash start-up on slow runners, so the
+        // dispatcher leaves a marker and the trigger waits for it.
+        let dispatched = ws.dir.join("dispatched");
+        ws.write_script(
+            "dispatcher.sh",
+            &format!(
+                "#!/bin/bash\necho '{{}}'\ntouch '{}'\n",
+                dispatched.display()
+            ),
+        );
 
         let yaml = format!(
             r#"
@@ -1869,8 +1880,12 @@ nodes:
 
         let trigger = {
             let abort = abort.clone();
+            let dispatched = dispatched.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                while !dispatched.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 abort.set_ctrlc();
             })
         };
