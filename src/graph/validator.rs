@@ -477,6 +477,15 @@ impl GraphValidator {
                             a.agent
                         ),
                     ));
+                } else if has_config && has_graph {
+                    result.error(ValidationError::with_node(
+                        node_id,
+                        format!(
+                            "Agent '{}' has both config.yaml and graph.yaml; a graph agent is \
+                             defined by graph.yaml alone — remove one of the two files",
+                            a.agent
+                        ),
+                    ));
                 }
                 if let Some(inputs) = &a.inputs {
                     if has_config && !has_graph {
@@ -4044,6 +4053,27 @@ mod tests {
 
         assert!(result.is_valid(), "{:?}", result.errors);
         assert!(!inputs_requires_graph_agent_error(&result, "a"));
+    }
+
+    #[test]
+    #[serial]
+    fn agent_with_both_config_and_graph_errors() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_config_only_agent("mixed-agent");
+        materialize_graph_agent("mixed-agent");
+        let node = agent_node_with_inputs("a", "mixed-agent", &[("x", "{{k}}")]);
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e
+                .message
+                .starts_with("Agent 'mixed-agent' has both config.yaml and graph.yaml")
+                && e.node_id.as_deref() == Some("a")),
+            "{:?}",
+            result.errors
+        );
     }
 
     #[test]
