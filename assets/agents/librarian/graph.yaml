@@ -32,9 +32,6 @@ settings:
   log_state_snapshots: true
   timeout: 600
 
-reducers:
-  output: overwrite
-
 initial_state:
   language_ecosystem: 'general'
   doc_domain_hints: ''

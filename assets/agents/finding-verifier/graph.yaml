@@ -27,9 +27,6 @@ settings:
   log_state_snapshots: true
   timeout: 900
 
-reducers:
-  output: overwrite
-
 initial_state:
   findings_list: []
   verdicts: []
