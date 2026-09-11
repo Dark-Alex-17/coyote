@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
+use tokio::task::{AbortHandle, JoinHandle};
 
 /// Test-only hook invoked inside a frontier branch task right after its
 /// teammate identity is retired, with the super-step's registry and the
@@ -473,12 +474,10 @@ fn provision_frontier_peers(
     (Some(registry), assignments)
 }
 
-/// Aborts every owned task when dropped. Aborting a task that has already
-/// finished is a no-op, so the success path is unaffected.
-pub(super) struct TaskCancelGuard(Vec<tokio::task::AbortHandle>);
+pub(super) struct TaskCancelGuard(Vec<AbortHandle>);
 
 impl TaskCancelGuard {
-    pub(super) fn new<T>(tasks: &[tokio::task::JoinHandle<T>]) -> Self {
+    pub(super) fn new<T>(tasks: &[JoinHandle<T>]) -> Self {
         Self(tasks.iter().map(|task| task.abort_handle()).collect())
     }
 

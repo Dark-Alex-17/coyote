@@ -482,7 +482,7 @@ impl GraphValidator {
                         node_id,
                         format!(
                             "Agent '{}' has both config.yaml and graph.yaml; a graph agent is \
-                             defined by graph.yaml alone — remove one of the two files",
+                             defined by graph.yaml alone. Remove one of the two files",
                             a.agent
                         ),
                     ));
