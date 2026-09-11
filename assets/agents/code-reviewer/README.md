@@ -1,5 +1,35 @@
 # Code Reviewer
 
+> [!IMPORTANT]
+> **v3: now a GRAPH agent.** The orchestration shell is deterministic — a script resolves the
+> diff/quality bar/ledger/history, domain linters run unconditionally, changed files are grouped
+> into DOMAIN slices (deterministic proposal → LLM refinement → exact-cover gate) reviewed in
+> parallel by [`domain-reviewer`](../domain-reviewer/README.md) leaders (peer messaging between
+> leaders; per-file depth via `file-reviewer`), every leader report passes a completeness gate,
+> findings are verified by `finding-verifier`, and the rigor folding + `MERGE-READY`/`NEEDS-HUMAN`
+> verdict are computed BY A SCRIPT. Judgment stays in the agents; discipline lives in the graph.
+> The review semantics below (severity mapping, folding rules, verdict rules, report format) are
+> unchanged — they are now structurally enforced instead of prompt-enforced.
+
+```mermaid
+flowchart TD
+    A["parse (llm)"] --> B["facts (script): diff, quality bar, ledger, history, trigger signals"]
+    B --> C["linters (script): tflint / hadolint / actionlint / buf breaking"]
+    C --> D["group_domains (script) --> refine_groups (llm) --> cover_gate (script: exact cover)"]
+    D --> E["map over domain slices (parallel): domain-reviewer leaders, teammates on"]
+    D --> F["aux_lanes (llm): org-context + prior-art spawns"]
+    D --> G["downstream_sweep (script)"]
+    E --> H["completeness_gate (script): required sections even when clean"]
+    H -. "reject-retry once" .-> E
+    H --> I["synthesize (llm: dedup + prose, NO verdict authority)"]
+    F --> I
+    G --> I
+    I --> J["verify: finding-verifier (agent node, unskippable)"]
+    J --> K["verdict (script): FALSE-drops, rigor folding, MERGE-READY / NEEDS-HUMAN arithmetic"]
+    K --> L["render (script): the standard report"]
+```
+
+
 A CodeRabbit-style code review orchestrator that coordinates per-file reviews and synthesizes findings into a unified 
 report.
 

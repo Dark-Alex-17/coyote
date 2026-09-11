@@ -9,7 +9,7 @@ or confirmation-bias the check. A graph can't: the structure IS the discipline.
 
 ```
 parse (llm) ──▶ verify_each (map, max_concurrency 4) ──▶ done (end)
-                     └─▶ verify_one (llm + fs_read/fs_cat/fs_grep), one branch PER finding
+                     └─▶ verify_one (llm + fs tools) ──▶ verdict_gate (script), one CHAIN per finding
 ```
 
 1. **parse** — extracts every 🔴/🟡 finding from the spawn prompt into a structured list
@@ -23,6 +23,12 @@ parse (llm) ──▶ verify_each (map, max_concurrency 4) ──▶ done (end)
    - `FALSE` — the code doesn't exist anywhere or provably doesn't do what the claim says.
      Requires PROOF, not disagreement — doubt never lands here.
    - `UNVERIFIABLE` — couldn't establish either way (runtime behavior, external systems).
+
+   Each branch is a chain: `verify_one → verdict_gate`. The gate machine-validates the JSON
+   contract (verdict enum; evidence required for VERIFIED/FALSE; note for UNVERIFIABLE),
+   stamps the authoritative id FROM the finding item (the model's echo is never trusted),
+   rejects back to `verify_one` exactly once with the reason, and on a second failure records
+   UNVERIFIABLE — a malformed branch never sinks the map.
      Kept, marked unverified.
 4. **done** — a deterministic `end` node emits the raw verdict list plus the caller
    contract (VERIFIED = keep + paste evidence; FALSE = drop + tally; UNVERIFIABLE = keep,

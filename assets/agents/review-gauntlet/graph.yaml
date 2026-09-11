@@ -1,0 +1,350 @@
+name: review-gauntlet
+description: |
+  Graph-based post-implementation review gate — "the done gate". Given a diff
+  spec and the work's context (plan/acceptance criteria, rigor, security
+  posture), it deterministically computes diff signals, selects the applicable
+  independent review lanes — code-reviewer (always), adversary (when a
+  spec/plan exists), security-reviewer (attack-surface signals), probe
+  (consumer-facing surface with a local-run recipe) — runs the selected lanes
+  IN PARALLEL as isolated sub-agents, and machine-parses their verdict
+  sentinels into one deterministic verdict: GAUNTLET: PASS or
+  GAUNTLET: BLOCKED. An orchestrator that must not claim "done" without green
+  reviews spawns this once instead of judging trigger rules and parsing
+  verdicts itself — the graph structure makes skipping a lane or misreading a
+  verdict impossible. Invariants: lane selection can only be WIDENED by LLM
+  judgment, never narrowed (deterministic rules are the floor); a missing
+  verdict sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks
+  with an environment note (it is never PASS or FAIL); reviewer lanes run
+  verdict-independent — no cross-lane messaging.
+
+version: '1.0'
+
+max_agent_depth: 4
+max_concurrent_agents: 12
+
+variables:
+  - name: project_dir
+    description: Repository the change lives in; signals and every review lane run against it.
+    default: '.'
+
+settings:
+  max_loop_iterations: 10
+  log_state_snapshots: true
+  timeout: 10800
+
+initial_state:
+  diff_spec: worktree
+  plan_context: ''
+  rigor: production
+  security_posture: standard
+  probe_context: ''
+  extra_context: ''
+  forced_lanes: []
+  changed_files: []
+  file_count: 0
+  signals_summary: ''
+  signals_error: ''
+  touches_auth: false
+  touches_deps: false
+  touches_exec: false
+  touches_proto: false
+  touches_migrations: false
+  consumer_surface: false
+  docs_only: false
+  add_code_review: false
+  add_adversary: false
+  add_security: false
+  add_probe: false
+  lane_reasons: ''
+  code_review_items: []
+  adversary_items: []
+  security_items: []
+  probe_items: []
+  code_review_results: []
+  adversary_results: []
+  security_results: []
+  probe_results: []
+  lanes_summary: ''
+  gauntlet_verdict: ''
+  gauntlet_report: ''
+
+start: parse
+
+nodes:
+  parse:
+    id: parse
+    type: llm
+    description: Extract the review request's facts from the spawn prompt. Extraction only — no judging, no lane selection.
+    instructions: |
+      You extract the facts of a review request into structured fields.
+      EXTRACTION ONLY — do not decide which review lanes should run.
+
+      - `diff_spec`: the git diff specification the caller named — a ref
+        range ("main...HEAD", "HEAD~3..HEAD"), a single ref, or the literal
+        "worktree" for uncommitted changes against HEAD. When the caller
+        did not name one, use "worktree".
+      - `plan_context`: the plan / spec / acceptance-criteria text the
+        implementation must satisfy, verbatim (or a file path the caller
+        pointed at). Empty string when the caller supplied none.
+      - `rigor`: poc | prototype | production. Default "production" when
+        not stated.
+      - `security_posture`: prototype | standard | hardened. Default
+        "standard" when not stated.
+      - `probe_context`: the local-run recipe and/or existing usage-suite
+        pointers for black-box probing (how to boot the service, where the
+        suites live). Empty string when the caller supplied none.
+      - `forced_lanes`: lanes the caller explicitly demanded (verbatim
+        names). Empty array = automatic selection.
+      - `extra_context`: any remaining caller context reviewers should see,
+        condensed.
+    prompt: |
+      Extract the review-request facts from this request:
+
+      {{initial_prompt}}
+    tools: []
+    output_schema:
+      type: object
+      properties:
+        diff_spec:
+          type: string
+        plan_context:
+          type: string
+        rigor:
+          type: string
+        security_posture:
+          type: string
+        probe_context:
+          type: string
+        forced_lanes:
+          type: array
+          items:
+            type: string
+        extra_context:
+          type: string
+      required: [diff_spec, plan_context, rigor, security_posture, probe_context, forced_lanes, extra_context]
+    max_iterations: 3
+    max_attempts: 2
+    next: signals
+
+  signals:
+    id: signals
+    type: script
+    description: Deterministic diff signals — file list, attack-surface and consumer-surface indicators. Pure git; no LLM judgment.
+    script: scripts/signals.py
+    timeout: 120
+    next: select_lanes
+
+  select_lanes:
+    id: select_lanes
+    type: llm
+    description: Additive-only lane judgment on top of the deterministic rules. It can WIDEN the gauntlet, never narrow it.
+    instructions: |
+      You look at a change's deterministic diff signals and decide whether any
+      review lane the hard rules might have missed should ALSO run. You can
+      only ADD lanes — the deterministic floor (enforced downstream, not by
+      you) is: code-review always runs; adversary runs when a plan/spec is
+      present; security runs on attack-surface signals or hardened posture;
+      probe runs when consumer-facing surface changed and a local-run recipe
+      exists. Setting a flag to false NEVER removes a lane the rules selected.
+
+      Reasons to add:
+      - `add_security`: the diff handles external/untrusted input, touches
+        crypto/secrets handling, or changes trust boundaries in ways the
+        path-based signals missed.
+      - `add_adversary`: the request references behavior it must preserve or
+        criteria scattered in prose that amount to a spec, even without a
+        formal plan.
+      - `add_probe`: the change alters observable API/CLI behavior even
+        though the path signals missed it (only useful when a local-run
+        recipe exists — the builder skips it otherwise, noting why).
+      - `add_code_review`: always selected by the rules; flag exists only
+        for forced-lane configurations.
+
+      Put one line per added lane into `lane_reasons`. When nothing needs
+      adding, all flags false and empty reasons is the correct answer.
+    prompt: |
+      Change signals (deterministic):
+      - diff spec: {{diff_spec}}
+      - files changed: {{file_count}}
+      - changed files (first 200): {{changed_files}}
+      - touches auth paths/content: {{touches_auth}}
+      - touches dependency manifests: {{touches_deps}}
+      - adds exec/shell/subprocess calls: {{touches_exec}}
+      - touches protobuf/contracts: {{touches_proto}}
+      - touches migrations: {{touches_migrations}}
+      - consumer-facing surface paths: {{consumer_surface}}
+      - docs-only diff: {{docs_only}}
+      - {{signals_summary}}
+      {{signals_error}}
+
+      Caller context:
+      - rigor: {{rigor}}; security posture: {{security_posture}}
+      - plan/spec present: {{plan_context}}
+      - probe recipe present: {{probe_context}}
+      - extra: {{extra_context}}
+    tools: []
+    output_schema:
+      type: object
+      properties:
+        add_code_review:
+          type: boolean
+        add_adversary:
+          type: boolean
+        add_security:
+          type: boolean
+        add_probe:
+          type: boolean
+        lane_reasons:
+          type: string
+      required: [add_code_review, add_adversary, add_security, add_probe, lane_reasons]
+    max_iterations: 3
+    max_attempts: 2
+    next: build_items
+
+  build_items:
+    id: build_items
+    type: script
+    description: Deterministic lane builder — hard rules are the floor, LLM flags may only add, forced lanes override exactly. Emits one 0-or-1-item list per lane; an empty list skips that lane's map.
+    script: scripts/build_items.py
+    timeout: 30
+    next: [map_code_review, map_adversary, map_security, map_probe]
+
+  map_code_review:
+    id: map_code_review
+    type: map
+    over: '{{code_review_items}}'
+    as: lane_ctx
+    branch: run_code_review
+    output_key: lane_out
+    collect_into: code_review_results
+    max_concurrency: 1
+    next: verdict_gate
+
+  map_adversary:
+    id: map_adversary
+    type: map
+    over: '{{adversary_items}}'
+    as: lane_ctx
+    branch: run_adversary
+    output_key: lane_out
+    collect_into: adversary_results
+    max_concurrency: 1
+    next: verdict_gate
+
+  map_security:
+    id: map_security
+    type: map
+    over: '{{security_items}}'
+    as: lane_ctx
+    branch: run_security
+    output_key: lane_out
+    collect_into: security_results
+    max_concurrency: 1
+    next: verdict_gate
+
+  map_probe:
+    id: map_probe
+    type: map
+    over: '{{probe_items}}'
+    as: lane_ctx
+    branch: run_probe
+    output_key: lane_out
+    collect_into: probe_results
+    max_concurrency: 1
+    next: verdict_gate
+
+  run_code_review:
+    id: run_code_review
+    type: agent
+    description: Independent code-quality review lane.
+    agent: code-reviewer
+    timeout: 7200
+    prompt: |
+      Review the code changes in {{project_dir}} (diff: {{diff_spec}}) as an
+      independent post-implementation review.
+
+      Quality bar: rigor={{rigor}}.
+
+      Plan / acceptance-criteria context (may be empty):
+      {{plan_context}}
+
+      {{extra_context}}
+
+      Close your report with your Review Verdict line.
+    state_updates:
+      lane_out: '{{output}}'
+
+  run_adversary:
+    id: run_adversary
+    type: agent
+    description: Plan-conformance review lane.
+    agent: adversary
+    timeout: 7200
+    prompt: |
+      Adversarial plan-conformance review in {{project_dir}}.
+
+      The implementation to check: diff {{diff_spec}}.
+
+      The spec / plan / acceptance criteria it must satisfy:
+      {{plan_context}}
+
+      {{extra_context}}
+
+      Return your ADVERSARIAL_REVIEW verdict.
+    state_updates:
+      lane_out: '{{output}}'
+
+  run_security:
+    id: run_security
+    type: agent
+    description: Security review lane.
+    agent: security-reviewer
+    timeout: 7200
+    prompt: |
+      Security review of the code changes in {{project_dir}} (diff: {{diff_spec}}).
+
+      Security posture: {{security_posture}}.
+
+      {{extra_context}}
+
+      Return your SECURITY_REVIEW verdict.
+    state_updates:
+      lane_out: '{{output}}'
+
+  run_probe:
+    id: run_probe
+    type: agent
+    description: Black-box usage-pattern verification lane.
+    agent: probe
+    timeout: 7200
+    prompt: |
+      Usage-pattern verification (black-box probe) of the changes in
+      {{project_dir}} (diff: {{diff_spec}}).
+
+      Local-run recipe / existing usage suites:
+      {{probe_context}}
+
+      Plan / acceptance-criteria context:
+      {{plan_context}}
+
+      Derive expected behaviors from the plan/contract BEFORE reading
+      implementation code, run existing suites first, then author spec-first
+      tests for the uncovered delta. Return your USAGE_PROBE verdict.
+    state_updates:
+      lane_out: '{{output}}'
+
+  verdict_gate:
+    id: verdict_gate
+    type: script
+    description: Deterministic sentinel parser and gate. A missing sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks with an environment note; 🔴 findings block regardless of the lane's own verdict line.
+    script: scripts/verdict_gate.py
+    timeout: 60
+    next: done
+
+  done:
+    id: done
+    type: end
+    output: |
+      GAUNTLET: {{gauntlet_verdict}}
+
+      {{gauntlet_report}}

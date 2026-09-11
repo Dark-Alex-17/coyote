@@ -1,5 +1,15 @@
 # Adversary
 
+> [!IMPORTANT]
+> **v2: now a GRAPH agent.** The plan's acceptance criteria are extracted into a list and the graph
+> fans out ONE fresh-context verification branch per criterion — partial coverage ("checked 8 of 12")
+> is structurally impossible. Each verdict passes a deterministic contract gate (MET requires
+> evidence including a proving test; no test = at best PARTIAL), a holistic ADDITIVE-only pass hunts
+> absence/scope-drift/substitution/gamed-tests, and the CONFORMS/DIVERGES sentinel is computed by a
+> script (missing plan = DIVERGES, fail-closed). The conformance doctrine below is unchanged — now
+> structurally enforced.
+
+
 An **adversarial plan-conformance reviewer**. Where [`code-reviewer`](../code-reviewer/README.md)
 asks *"is this code good?"*, `adversary` asks a different, harder question:
 
@@ -48,9 +58,21 @@ violation) and cites `file:line`. Vague complaints are not emitted.
 
 ## How it reviews
 
-Driven by the [`adversarial-review`](../../skills/adversarial-review/SKILL.md) skill:
+```mermaid
+flowchart TD
+    A["parse (llm): extract acceptance criteria"] --> B["diff_facts (script): resolve + bound the diff"]
+    B --> C["map over criteria: one fresh-context branch each (parallel)"]
+    C --> D["check_criterion (llm + fs/ast tools)"]
+    D --> E["crit_gate (script): MET needs change+test evidence"]
+    E -. "reject-retry once; exhausted = PARTIAL" .-> D
+    E --> F["holistic (llm): ADDITIVE-only hunt - absence, scope drift, substitution, gamed tests"]
+    F --> G["verdict (script): CONFORMS iff ALL MET + zero extras; no criteria = DIVERGES"]
+    G --> H(["ADVERSARIAL_REVIEW: CONFORMS | DIVERGES"])
+```
 
-1. Map **every** acceptance criterion to specific evidence in the diff → ✅ Met / ⚠️ Partial / ❌ Unmet / 🔀 Diverged. No test proving the behavior ⇒ at best ⚠️ Partial.
+The conformance doctrine is baked into the graph's own nodes:
+
+1. **Every** acceptance criterion gets its own fresh-context verification branch — MET / PARTIAL / UNMET / DIVERGED, machine-gated (MET requires the satisfying change AND the proving test, cited). No test ⇒ at best PARTIAL. Partial coverage of the criteria list is structurally impossible.
 2. Ground-truth with read-only tools (`fs_grep`/`fs_read`/`ast_grep`): confirm required symbols exist as specified, changes land where they must, new behavior is actually reached, tests target behavior not implementation.
 3. Hunt adversarially for the **absent**: skipped criteria, scope creep, interface/approach substitution, out-of-scope touches, downstream contract breakage.
 
@@ -83,12 +105,10 @@ coyote -a adversary --agent-variable project_dir /path/to/repo \
 
 ### Tools
 
-- `get_diff [--base <ref>]` — staged → unstaged → `HEAD~1` fallback (or an explicit base/PR branch).
-- `get_changed_files [--base <ref>]` — quick changed-file map.
-- Plus read-only `fs_*` and `ast_grep` for ground-truth checks.
+- The graph's `diff_facts` script resolves the diff itself (staged → unstaged → `HEAD~1`, or an explicit ref/range named in the prompt) — there is no `get_diff` tool anymore.
+- Criterion branches carry read-only `fs_read`/`fs_cat`/`fs_grep`/`ast_grep` for ground-truth checks.
 
 ## Related
 
-- [`adversarial-review`](../../skills/adversarial-review/SKILL.md) — the conformance methodology it runs on.
 - [`code-reviewer`](../code-reviewer/README.md) — the quality reviewer it runs alongside.
 - [`plan-review`](../../skills/plan-review/SKILL.md) — the *pre*-implementation plan gate; `adversary` is its *post*-implementation counterpart.

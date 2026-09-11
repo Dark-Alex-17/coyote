@@ -1,0 +1,493 @@
+name: code-reviewer
+description: |
+  Graph-based review orchestrator — the deterministic shell around LLM review
+  judgment. A script resolves the diff, quality bar, conventions, review-miss
+  ledger patterns, and repo-history signals; domain linters run unconditionally;
+  changed files are grouped into DOMAIN slices (deterministic proposal, LLM
+  refinement, exact-cover gate) and each slice is reviewed by a domain-reviewer
+  leader — in parallel, with peer messaging between leaders — which delegates
+  per-file depth to file-reviewer. Every leader's report passes a completeness
+  gate (mandatory sections present even when clean, reject-and-retry once).
+  Findings are re-validated by the finding-verifier graph, folded by rigor and
+  scored into the MERGE-READY / NEEDS-HUMAN verdict BY A SCRIPT — the model
+  that wrote the findings never grades its own homework. Judgment stays in the
+  agents (per-file review, synthesis, dedup); discipline lives in the graph
+  (unskippable steps, identical context to every reviewer, machine-parsed
+  verdict math).
+
+version: '1.0'
+
+can_spawn_agents: true
+max_agent_depth: 3
+max_concurrent_agents: 16
+
+variables:
+  - name: project_dir
+    description: Project directory containing the changes to review
+    default: '.'
+  - name: rigor
+    description: Quality bar rigor (poc|prototype|production); empty = resolve from plan frontmatter or default to production
+    default: ''
+  - name: surfaces
+    description: Comma-separated surface list governing skill routing; empty = detect from the diff
+    default: ''
+  - name: prior_art_agent
+    description: Agent for the operational-history lane (incident prior art); empty = skip the agent lane
+    default: ''
+  - name: org_context_agent
+    description: Agent for the org-context lane (recorded decisions, PRDs); empty = skip the lane
+    default: ''
+  - name: consumers_root
+    description: Directory of sibling consumer checkouts for the downstream sweep; empty = skip the local probe
+    default: ''
+  - name: github_org
+    description: GitHub org for the downstream code-search probe; empty = skip it
+    default: ''
+
+settings:
+  max_loop_iterations: 12
+  log_state_snapshots: false
+  timeout: 10800
+
+initial_state:
+  diff_spec: auto
+  intent: ''
+  rigor_in: ''
+  surfaces_in: ''
+  extra_context: ''
+  resolved_rigor: production
+  resolved_surfaces: ''
+  bar_provenance: detected-default
+  resolved_diff_spec: ''
+  changed_files: []
+  file_count: 0
+  facts_note: ''
+  conventions: ''
+  ledger_matches: ''
+  history_notes: ''
+  touches_auth: false
+  destructive_migration: false
+  consumer_surface: false
+  linter_notes: ''
+  proposed_groups: []
+  groups_note: ''
+  group_items: []
+  domain_reports: []
+  org_context_notes: ''
+  prior_art_notes: ''
+  aux_note: ''
+  downstream_notes: ''
+  walkthrough: ''
+  changes_rows: []
+  findings: []
+  cross_file: ''
+  operational_history: ''
+  org_context_section: ''
+  attention_flags: []
+  placement_notes: ''
+  verifier_output: ''
+  verdict_out: {}
+  final_report: ''
+  gate_feedback: ''
+  gate_attempts: 0
+
+start: parse
+
+nodes:
+  parse:
+    id: parse
+    type: llm
+    description: Extract the review request's facts from the spawn prompt. Extraction only — no judging.
+    instructions: |
+      You extract the facts of a code-review request. EXTRACTION ONLY.
+
+      - `diff_spec`: the git diff basis the caller named — a range ("main...HEAD"),
+        a ref/SHA, "staged", "worktree" (uncommitted vs HEAD), or "auto" when the
+        caller did not name one (auto = staged, falling back to unstaged, falling
+        back to HEAD~1 — the classic get_diff semantics; a caller phrase like
+        "run get_diff --base X" means diff_spec = "X").
+      - `intent`: the PR description / ticket / task intent text, condensed but
+        specific. Empty string when the caller gave none.
+      - `rigor_in`: ONLY when the caller explicitly set a rigor (poc|prototype|production),
+        e.g. via a "Quality bar:" line; else empty string.
+      - `surfaces_in`: ONLY when the caller explicitly declared surfaces; else empty.
+      - `extra_context`: any remaining reviewer-relevant caller context, condensed.
+    prompt: |
+      Extract the review-request facts from this request:
+
+      {{initial_prompt}}
+    tools: []
+    output_schema:
+      type: object
+      properties:
+        diff_spec:
+          type: string
+        intent:
+          type: string
+        rigor_in:
+          type: string
+        surfaces_in:
+          type: string
+        extra_context:
+          type: string
+      required: [diff_spec, intent, rigor_in, surfaces_in, extra_context]
+    max_iterations: 3
+    max_attempts: 2
+    next: facts
+
+  facts:
+    id: facts
+    type: script
+    description: Deterministic facts — diff resolution, changed files, quality-bar resolution (passed → plan frontmatter → detected), conventions pointer, review-miss ledger matches, repo-history sweep, verdict-trigger signals. Pure git/gh/filesystem; no LLM.
+    script: scripts/facts.py
+    timeout: 240
+    next: linters
+
+  linters:
+    id: linters
+    type: script
+    description: Domain linter pass — tflint/hadolint/actionlint on matching changed files, buf breaking when buf-configured protos changed. Only tools already on PATH; never installs; degrades silently per tool.
+    script: scripts/linters.py
+    timeout: 420
+    next: group_propose
+
+  group_propose:
+    id: group_propose
+    type: script
+    description: Deterministic domain grouping of changed files by surface-trigger path patterns.
+    script: scripts/group_domains.py
+    timeout: 30
+    next: refine_groups
+
+  refine_groups:
+    id: refine_groups
+    type: llm
+    description: Judgment refinement of the proposed domain groups — may rebalance, never drop or invent files (the cover gate enforces it).
+    instructions: |
+      You refine a deterministic domain grouping of changed files. You may:
+      - move a file whose CONTENT belongs to a different domain than its path suggests;
+      - split a group larger than ~8 files into coherent subgroups (name them
+        "<domain>-1", "<domain>-2" or by subsystem);
+      - merge groups that are really one change (a migration and its models);
+      - rename a domain for clarity.
+
+      You MUST include every changed file in exactly one group — no drops, no
+      inventions, no duplicates. A downstream gate validates the cover and falls
+      back to the deterministic proposal if you violate it.
+    prompt: |
+      Proposed groups (deterministic):
+      {{proposed_groups}}
+
+      All changed files (every one must appear in exactly one group):
+      {{changed_files}}
+
+      Change intent: {{intent}}
+    tools: []
+    output_schema:
+      type: object
+      properties:
+        groups:
+          type: array
+          items:
+            type: object
+            properties:
+              domain:
+                type: string
+              files:
+                type: array
+                items:
+                  type: string
+              rationale:
+                type: string
+            required: [domain, files]
+      required: [groups]
+    max_iterations: 3
+    max_attempts: 2
+    next: cover_gate
+
+  cover_gate:
+    id: cover_gate
+    type: script
+    description: Exact-cover validation of the refined groups — every changed file in exactly one group, no unknown files. Violations fall back to the deterministic proposal (noted). Emits the map items.
+    script: scripts/cover_gate.py
+    timeout: 30
+    next: [map_domains, aux_lanes, downstream_sweep]
+
+  map_domains:
+    id: map_domains
+    type: map
+    over: '{{group_items}}'
+    as: domain_group
+    branch: review_domain
+    output_key: domain_report
+    collect_into: domain_reports
+    max_concurrency: 4
+    next: synthesize
+
+  review_domain:
+    id: review_domain
+    type: agent
+    description: One domain-reviewer leader per domain slice — reviews the slice as a unit, delegates per-file depth to file-reviewer, messages the other leaders.
+    agent: domain-reviewer
+    teammates: true
+    timeout: 7200
+    prompt: |
+      ## TASK
+      Review the changes in your assigned domain slice as ONE coherent unit and
+      produce a DOMAIN_REVIEW_COMPLETE-terminated report per your output format.
+
+      ## ASSIGNMENT (JSON)
+      {{domain_group}}
+
+      ## MUST DO
+      - Fetch your slice's diff yourself: `get_diff --files <your files, comma-separated>`
+        (diff spec: {{resolved_diff_spec}} — pass it as `--base` when it is a ref or range;
+        omit `--base` for staged/unstaged specs)
+      - Apply your domain charter: per-file review depth per your sizing rules, PLUS the
+        domain-level pass (guard symmetry across the slice, literal/enum drift,
+        schema↔usage mismatch, slice-level blast radius / test adequacy / removed guards)
+      - Report the mandatory checks EVEN WHEN CLEAN
+      - Message the other domain leaders when your slice changes something their domain consumes
+      {{gate_feedback}}
+
+      ## MUST NOT DO
+      - No file modification; no findings omitted; never rewrite severities
+
+      ## CONTEXT
+      Project: {{project_dir}}
+      Rigor: {{resolved_rigor}} (provenance: {{bar_provenance}})
+      Surfaces: {{resolved_surfaces}}
+      Intent: {{intent}}
+      Conventions: {{conventions}}
+      Review-miss patterns (run as FIRST-CLASS checks; cite MISS-NNN in the finding title when one fires):
+      {{ledger_matches}}
+      Repo-history signals:
+      {{history_notes}}
+      Linter output (extract the lines for your files):
+      {{linter_notes}}
+      {{extra_context}}
+    state_updates:
+      domain_report: '{{output}}'
+    next: completeness_gate
+
+  completeness_gate:
+    id: completeness_gate
+    type: script
+    description: Deterministic report-contract gate — required sections present (even when clean) and the completion sentinel. Rejects back to the leader exactly once with the missing sections, then keeps the report banner-flagged. Never sinks the map.
+    script: scripts/completeness_gate.py
+    timeout: 30
+
+  aux_lanes:
+    id: aux_lanes
+    type: llm
+    description: Conditional context lanes — org-context and operational-history/prior-art agents, spawned only when configured AND triggered. Additive context; never blocks.
+    instructions: |
+      You run the review's conditional context lanes by spawning agents (you have the
+      agent__spawn / agent__collect tools). Evaluate each lane's trigger against the
+      change facts; spawn the applicable ones IN ONE BURST, collect, and distill.
+
+      **Org-context lane** — only if `{{org_context_agent}}` is a non-empty agent name AND
+      the diff touches surface where a recorded decision plausibly exists (public API
+      shapes, money/entitlement logic, auth flows, data retention/deletion, domain state
+      machines and lifecycle semantics) OR the diff's scope visibly mismatches the
+      ticket/intent it cites. Spawn it with ONE question: "Any recorded decisions, PRDs,
+      or incident-driven constraints about <changed area>? Return quoted decisions with
+      dates/sources." (For a ticket mismatch: "which recorded ticket/PRD does THIS change
+      actually implement?") Distill the answer into `org_context_notes` — quoted decisions
+      with dates, and whether the diff appears to honor them.
+
+      **Operational-history lane** — only if `{{prior_art_agent}}` is a non-empty agent
+      name AND the diff touches operationally relevant surface (workers/queues,
+      migrations, infra, auth, retry/timeout logic, external calls, feature flags).
+      Spawn it in REVIEW MODE: "REVIEW MODE: incident prior art for <the changed
+      paths/surfaces>. Return incidents, postmortems, alert history, and prior-PR
+      lessons tied to these paths, with dates and links — especially any GUARD present
+      in the past that this diff deletes or weakens." Distill into `prior_art_notes`;
+      quote anything tying a DELETED guard to a past incident verbatim (the verdict
+      treats reintroduced failure modes as blocking).
+
+      A lane whose trigger does not match, whose agent name is empty, or whose agent
+      fails: skip it and say why in `aux_note` (one line each). Never invent lane
+      content; empty results are valid results.
+    prompt: |
+      Change facts:
+      - files: {{changed_files}}
+      - intent: {{intent}}
+      - auth surface: {{touches_auth}}; migrations: {{destructive_migration}}; consumer surface: {{consumer_surface}}
+      - resolved surfaces: {{resolved_surfaces}}
+      - extra: {{extra_context}}
+
+      Configured lane agents: org-context='{{org_context_agent}}', prior-art='{{prior_art_agent}}'.
+      Project: {{project_dir}}
+    output_schema:
+      type: object
+      properties:
+        org_context_notes:
+          type: string
+        prior_art_notes:
+          type: string
+        aux_note:
+          type: string
+      required: [org_context_notes, prior_art_notes, aux_note]
+    max_iterations: 10
+    max_attempts: 2
+    timeout: 3600
+    next: synthesize
+
+  downstream_sweep:
+    id: downstream_sweep
+    type: script
+    description: Downstream-consumers sweep — deterministic contract-token extraction from the diff, grep of sibling checkouts, bounded org code search. Runs only when consumer-facing surface changed; degrades silently.
+    script: scripts/downstream_sweep.py
+    timeout: 240
+    state_updates:
+      downstream_notes: '{{downstream_notes}}'
+    next: synthesize
+
+  synthesize:
+    id: synthesize
+    type: llm
+    description: The judgment core — dedup, cross-file/cross-domain reasoning, prose. Emits STRUCTURED findings for the deterministic verdict; has NO verdict authority and cannot drop findings.
+    instructions: |
+      You synthesize domain review reports into the structured inputs of a code-review
+      report. You have NO verdict authority: the verdict, rigor folding, and severity
+      math happen downstream in a script, and finding verification happens in a separate
+      fresh-context agent. Your job is judgment, not grading.
+
+      Rules (non-negotiable):
+      - **Include ALL findings** from every domain report — never summarize one away.
+        Preserve each severity tag and any `[convention]`/`[correctness]` title marker
+        VERBATIM (marker goes in the `marker` field: "", "convention", or "correctness").
+      - **Dedup**: an identical finding reported twice (e.g. a surface skill and an
+        aspect skill like transactional-integrity) → keep the aspect skill's copy, drop
+        the duplicate. Dedup is the ONLY permitted removal.
+      - **Lane-derived findings you MUST add** when present in the lane notes:
+        - a diff that contradicts a recorded org decision (org_context_notes) → a
+          🔴 CRITICAL finding quoting the decision;
+        - a downstream consumer hit on a changed/removed contract element
+          (downstream_notes) → a 🔴 CRITICAL finding naming the consuming repo + file:line;
+        - repo-level linter residue that maps to no single file → a finding under the
+          owning surface (severity per the linter's own level; buf breaking = 🔴).
+      - **Every finding needs**: id (f1, f2, …), severity (icon + word verbatim, e.g.
+        "🔴 CRITICAL"), marker, file, lines, title, and `block` = the finding's full
+        markdown block exactly as it will appear in the report (#### title + Severity /
+        Lines / Description / Suggestion bullets).
+      - **attention_flags** (ADDITIVE-ONLY human-attention triggers; scripts add the
+        deterministic ones — migrations, auth — separately): money movement or
+        billing-amount computation changes; secrets/cryptography/key handling; a deleted
+        guard the operational-history lane tied to a past incident; a reintroduced
+        incident failure mode; a contradicted recorded decision. One short line each.
+      - **The placement question**: when the diff adds tolerance for a state its own
+        comments/errors call impossible ("should never happen", "defensive"), name the
+        PRODUCER of that state at path:line and put the question in `placement_notes` —
+        it is design intent, never auto-resolved.
+      - Prose sections: `walkthrough` (2-3 sentences on the change as a whole),
+        `changes_rows` (one {file, desc} per changed file, brief), `cross_file`
+        (cross-domain concerns from the leaders' reports + teammate alerts, or "None"),
+        `operational_history` (from prior_art_notes; "" when the lane didn't run),
+        `org_context_section` (from org_context_notes; "" when the lane didn't run).
+    prompt: |
+      Domain reports ({{file_count}} changed files, grouped into the domain slices below):
+      {{domain_reports}}
+
+      Lane notes:
+      - org context: {{org_context_notes}}
+      - operational history / prior art: {{prior_art_notes}}
+      - downstream consumers: {{downstream_notes}}
+      - lane skips: {{aux_note}}
+      - linter summary: {{linter_notes}}
+      - facts notes: {{facts_note}} {{groups_note}}
+
+      Intent: {{intent}}
+      Rigor: {{resolved_rigor}}; surfaces: {{resolved_surfaces}}
+    output_schema:
+      type: object
+      properties:
+        walkthrough:
+          type: string
+        changes_rows:
+          type: array
+          items:
+            type: object
+            properties:
+              file:
+                type: string
+              desc:
+                type: string
+            required: [file, desc]
+        findings:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              severity:
+                type: string
+              marker:
+                type: string
+              file:
+                type: string
+              lines:
+                type: string
+              title:
+                type: string
+              block:
+                type: string
+            required: [id, severity, marker, file, lines, title, block]
+        cross_file:
+          type: string
+        operational_history:
+          type: string
+        org_context_section:
+          type: string
+        attention_flags:
+          type: array
+          items:
+            type: string
+        placement_notes:
+          type: string
+      required: [walkthrough, changes_rows, findings, cross_file, operational_history, org_context_section, attention_flags, placement_notes]
+    max_iterations: 6
+    max_attempts: 2
+    next: verify
+
+  verify:
+    id: verify
+    type: agent
+    description: Independent fresh-context verification of every 🔴/🟡 finding — structurally on the path to the report; cannot be skipped.
+    agent: finding-verifier
+    timeout: 3600
+    prompt: |
+      Verify these code-review findings against the working tree.
+
+      Project: {{project_dir}}
+
+      Findings (JSON; verify every 🔴 and 🟡 entry — id, severity, path, lines, claim
+      are the fields; `title` + `block` together are the claim):
+      {{findings}}
+    state_updates:
+      verifier_output: '{{output}}'
+    next: verdict
+
+  verdict:
+    id: verdict
+    type: script
+    description: Deterministic verdict math — applies verifier drops (FALSE, tallied), attaches evidence, folds by rigor, computes MERGE-READY/NEEDS-HUMAN from severity counts + always-human triggers. The model never grades its own homework.
+    script: scripts/verdict.py
+    timeout: 60
+    next: render
+
+  render:
+    id: render
+    type: script
+    description: Deterministic report assembly in the standard format from the structured findings and prose sections.
+    script: scripts/render.py
+    timeout: 30
+    next: done
+
+  done:
+    id: done
+    type: end
+    output: |
+      {{final_report}}

@@ -81,10 +81,15 @@ Record via the `record-miss` macro (`coyote --macro record-miss "<what escaped>"
 appends a numbered skeleton entry and prompts for the remaining fields. Or append by hand
 in the entry format above.
 
-To BOOTSTRAP a ledger from scratch (new team, new org, new environment), the
-`mine-review-misses` macro (`coyote --macro mine-review-misses "<org | repo list | .>"`)
-pulls real PR review history, mines the defect classes human reviewers keep enforcing,
-and appends the candidates you approve — same entry format, same idempotent numbering.
+Collection is otherwise AUTOMATIC — no mining pass needed:
+
+- **whetstone** classifies every externally-raised finding after a run addresses review
+  feedback, and proposes ledger entries (approval-gated) or drops one-offs into the
+  candidates inbox (`<config>/share/review-miss-candidates.jsonl`) as recurrence evidence.
+- **PR-review reconciliation** (where a re-review compares what humans said against what
+  the panel found) records each human-caught, panel-missed defect into the same candidates
+  inbox. The inbox is raw material, never authority: nothing enters the LEDGER without
+  your approval — that curation is the noise firewall that keeps the ledger trustworthy.
 
 Rules for good entries:
 

@@ -1,0 +1,18 @@
+# Record a standing ruling — a pre-delegated decision that agents running with
+# escalation_policy: autonomous may apply INSTEAD of escalating — in
+# ~/.config/coyote/share/standing-rulings.md. The first step appends a numbered
+# skeleton entry deterministically (zero tokens); the second has the agent interview
+# you to fill in the <fill> fields — the trigger is the payload: it must be narrow
+# enough that a matching decision is unmistakable.
+# Run as:
+#   coyote --macro record-ruling "<one line: when X happens, resolve by Y>"
+# (avoid double quotes inside the description; it is spliced into a shell string)
+variables:
+  - name: description
+    description: One line stating the ruling — when <situation>, resolve by <action>
+isolated: false
+steps:
+  - |-
+    !f="$HOME/.config/coyote/share/standing-rulings.md"; mkdir -p "$(dirname "$f")"; [ -f "$f" ] || printf '# Standing rulings\n\nPre-delegated decisions for escalation_policy: autonomous — an agent applies a ruling\nINSTEAD of escalating when its trigger genuinely matches. Hard triggers (secrets, money\nmovement, destructive/irreversible actions) can never be delegated here. Every autonomous\napplication is reported in the run digest.\n' > "$f"; n=$(grep -c '^## R-' "$f" 2>/dev/null || true); n=$((${n:-0}+1)); id=$(printf 'R-%03d' "$n"); printf '\n## %s — {{description}}\n- date: %s\n- trigger: <fill the narrow situation this covers — matching must be unmistakable>\n- resolution: <fill exactly what to do, including whether plan/spec text gets amended>\n- scope: <fill any|repo/surface limits>\n- provenance: <fill the escalation/PR/incident this came from>\n' "$id" "$(date +%F)" >> "$f"; echo "Appended $id to $f"
+  - |-
+    Open `$HOME/.config/coyote/share/standing-rulings.md` and find the newest `## R-` entry (just appended: "{{description}}"). Interview me briefly — one focused question at a time — to fill in the `<fill …>` fields, then write the completed entry back. Push hardest on the **trigger**: it must be narrow and unambiguous — a ruling that could plausibly match unrelated decisions is worse than no ruling, because agents apply these unsupervised. Confirm the resolution states whether plan/spec text gets amended. REFUSE to record a ruling that would delegate a hard trigger (secrets/credentials, money movement, destructive or irreversible actions) — those always escalate, by design. If the ruling matches an existing entry's class, propose sharpening that entry instead of keeping a duplicate.

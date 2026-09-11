@@ -30,6 +30,8 @@ settings:
 initial_state:
   findings_list: []
   verdicts: []
+  gate_feedback: ''
+  gate_attempts: 0
 
 start: parse
 
@@ -136,11 +138,18 @@ nodes:
       VERIFIED and FALSE, empty string for UNVERIFIABLE>",
        "note": "<one line — for FALSE the disproof in words, for UNVERIFIABLE
       why it could not be established; empty string otherwise>"}
+
+      Your response is machine-validated by a deterministic gate: a malformed
+      response (wrong shape, unknown verdict value, missing required
+      evidence/note) is rejected back to you exactly once with the reason,
+      then recorded as UNVERIFIABLE. The `id` you echo is informative only —
+      the gate stamps the authoritative id from the finding itself.
     prompt: |
       Repository: {{project_dir}}
 
       Verify this single finding:
       {{finding}}
+      {{gate_feedback}}
     tools:
       - fs_read
       - fs_cat
@@ -149,6 +158,14 @@ nodes:
     max_attempts: 2
     state_updates:
       verdict: '{{output}}'
+    next: verdict_gate
+
+  verdict_gate:
+    id: verdict_gate
+    type: script
+    description: Deterministic contract gate for each verdict — validates shape, verdict enum, and evidence/note rules; rejects back to verify_one exactly once with the reason, then records UNVERIFIABLE. No LLM judgment.
+    script: scripts/verdict_gate.py
+    timeout: 30
 
   done:
     id: done

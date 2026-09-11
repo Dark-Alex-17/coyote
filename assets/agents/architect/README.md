@@ -137,6 +137,7 @@ coyote -a architect \
 | `design_doc` | *(empty)* | Path to the design doc; asked for if unset. |
 | `base_branch` | `main` | Branch the run branch forks from and the PR targets. |
 | `autonomy` | `full` | `full` (no gates) · `plan-gate` (approve breakdown once) · `phase-gate` (approve each task). |
+| `escalation_policy` | `interactive` | `interactive` (pause and ask) · `autonomous` (self-resolve decisions covered by a standing ruling in `~/.config/coyote/share/standing-rulings.md` or a clearly recommended option; everything self-resolved lands in a “Decisions taken autonomously” digest in the Phase F report and PR body; secrets/money/destructive actions and novel conflicts still escalate). |
 | `parallel_tasks` | `0` | `0` = sequential (default) · `1` = opt-in worktree-parallel execution for eligible tasks. |
 | `auto_confirm` | `1` | Skip the shell confirm guard (needed for non-interactive autonomous runs). |
 
@@ -173,6 +174,7 @@ By default (`parallel_tasks: 0`) tasks run **sequentially** on the single run br
 | [`explore`](../explore/README.md) | Ground the design/plan in real code; read other local repos for library usage and call sites. |
 | [`librarian`](../librarian/README.md) | External docs / OSS examples for unfamiliar libraries. |
 | [`whetstone`](../whetstone/README.md) | Continuous improvement — spawned once before the final report when the run addressed PR review feedback from outside its own lanes; converts review misses into user-approved suite edits / ledger entries. Never blocks the run. |
+| [`review-gauntlet`](../review-gauntlet/README.md) | Preferred per-task conformance gate — one spawn running adversary (+ probe for consumer-facing tasks) with a machine-parsed GAUNTLET: PASS/BLOCKED verdict; direct adversary/probe spawns remain the fallback. |
 
 ## Related skills
 
@@ -180,4 +182,3 @@ By default (`parallel_tasks: 0`) tasks run **sequentially** on the single run br
 - [`task-tracking`](../../skills/task-tracking/SKILL.md) — the task-file schema, lifecycle, and consistency checks.
 - [`plan-gatekeeping`](../../skills/plan-gatekeeping/SKILL.md) — the gatekeeper's self-containedness manifest.
 - [`plan-authoring`](../../skills/plan-authoring/SKILL.md) / [`plan-review`](../../skills/plan-review/SKILL.md) — plan schema + oracle's executability review.
-- [`adversarial-review`](../../skills/adversarial-review/SKILL.md) — the adversary's conformance methodology.

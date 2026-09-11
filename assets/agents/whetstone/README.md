@@ -15,8 +15,7 @@ cluster into learnable classes — and that a miss, once *recorded*, converts to
 the next review. The study was a one-time manual harvest; whetstone is the same loop run
 continuously, at the moment the signal is strongest: when human feedback on a PR is being
 addressed, the spawner (sisyphus/architect) knows BOTH what the humans said and what the
-suite's own lanes flagged — ground truth the periodic `mine-review-misses` macro has to
-re-infer from comment formats.
+suite's own lanes flagged — ground truth that offline comment mining could only re-infer from formats.
 
 ## How it fits
 
@@ -50,12 +49,13 @@ re-infer from comment formats.
 | Tool | Sees | When |
 |------|------|------|
 | `whetstone` | Human feedback on PRs YOUR runs addressed, with suite ground truth | Real-time, per run |
-| `mine-review-misses` | All human comments across an org/repo set, historical | Periodic batch / bootstrap |
+| Review-round reconciliation | Human-caught, panel-missed defects on any PR the panel re-reviews → candidates inbox (`share/review-miss-candidates.jsonl`) | Automatic, every round |
 | `record-miss` | Defects that escaped review entirely (prod, incidents) | One-off, when it bites |
 
-Whetstone narrows what the miner finds on your own PRs, but doesn't replace it: the miner
-harvests teammates' PRs, repos you don't code in, and years of history in one run — and
-`record-miss` covers the misses no one ever commented on.
+Collection is automatic end to end: whetstone captures misses the moment feedback is
+addressed, round reconciliation captures them on any PR the panel re-reviews (teammates'
+PRs included), and `record-miss` covers the misses no one ever commented on. Nothing
+auto-appends to the LEDGER itself — candidates wait in the inbox until a human promotes them.
 
 ## Rules that keep it safe
 

@@ -1,0 +1,285 @@
+name: adversary
+description: |
+  Graph-based adversarial plan-conformance reviewer. The plan's acceptance
+  criteria are extracted into a list and the graph mechanically fans out ONE
+  fresh-context verification branch per criterion — "checked 8 of 12 and waved
+  the rest through" becomes structurally impossible. Each criterion verdict
+  (MET / PARTIAL / UNMET / DIVERGED) passes a deterministic contract gate
+  (MET requires evidence including a test proving the behavior — no test means
+  at best PARTIAL). A holistic pass then hunts what per-criterion checks cannot
+  see: absence (the dog that didn't bark), scope drift, interface substitution,
+  silently-overridden recorded decisions, out-of-scope touches, and gamed
+  tests — ADDITIVE-only: it can add complaints, never flip a criterion verdict.
+  The final CONFORMS/DIVERGES sentinel is computed by a script: CONFORMS
+  requires every criterion MET and zero holistic complaints. Missing plan =
+  DIVERGES (fail-closed) naming the missing spec.
+
+version: '1.0'
+
+global_tools:
+  - ast_grep.sh
+  - fs_read.sh
+  - fs_cat.sh
+  - fs_grep.sh
+
+variables:
+  - name: project_dir
+    description: Project directory containing the changes under review
+    default: '.'
+
+settings:
+  max_loop_iterations: 10
+  log_state_snapshots: false
+  timeout: 5400
+
+initial_state:
+  criteria: []
+  diff_spec: auto
+  plan_notes: ''
+  scope_notes: ''
+  extra_context: ''
+  changed_files: []
+  diff_text: ''
+  diff_note: ''
+  crit_verdicts: []
+  extra_complaints: []
+  observations: ''
+  adv_report: ''
+  gate_feedback: ''
+  gate_attempts: 0
+
+start: parse
+
+nodes:
+  parse:
+    id: parse
+    type: llm
+    description: Extract the acceptance criteria and plan facts from the spawn prompt. Extraction only — no judging, no criteria invented.
+    instructions: |
+      You extract a plan-conformance review request into structured fields.
+      EXTRACTION ONLY — never invent criteria, never guess intent.
+
+      - `criteria`: every acceptance criterion from the plan/task, one entry each,
+        with a short id (c1, c2, …) and SELF-CONTAINED text (what observable
+        behavior is promised, including any test expectations the plan states).
+        Split compound criteria ("A and B") into separate entries when they are
+        independently verifiable. When the caller supplied NO plan/criteria at
+        all, emit an empty array — downstream fails closed.
+      - `diff_spec`: the git diff basis the caller named — a range, a ref/SHA,
+        "staged", "worktree", or "auto" when unnamed (a caller phrase like
+        "get_diff --base X" means diff_spec = "X").
+      - `plan_notes`: recorded decisions the plan states ("do X not Y because Z"),
+        verbatim — the holistic pass checks the diff didn't silently override them.
+      - `scope_notes`: what the plan says NOT to touch / explicit boundaries.
+      - `extra_context`: anything else conformance-relevant, condensed.
+    prompt: |
+      Extract the conformance-review facts from this request:
+
+      {{initial_prompt}}
+    tools: []
+    output_schema:
+      type: object
+      properties:
+        criteria:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              text:
+                type: string
+            required: [id, text]
+        diff_spec:
+          type: string
+        plan_notes:
+          type: string
+        scope_notes:
+          type: string
+        extra_context:
+          type: string
+      required: [criteria, diff_spec, plan_notes, scope_notes, extra_context]
+    max_iterations: 3
+    max_attempts: 2
+    next: facts
+
+  facts:
+    id: facts
+    type: script
+    description: Deterministic diff resolution — changed files and the (bounded) diff text every criterion branch verifies against.
+    script: scripts/diff_facts.py
+    timeout: 120
+    next: map_criteria
+
+  map_criteria:
+    id: map_criteria
+    type: map
+    over: '{{criteria}}'
+    as: criterion
+    branch: check_criterion
+    output_key: crit_verdict
+    collect_into: crit_verdicts
+    max_concurrency: 4
+    next: holistic
+
+  check_criterion:
+    id: check_criterion
+    type: llm
+    description: Fresh-context verification of ONE acceptance criterion against the diff and the working tree.
+    instructions: |
+      You verify ONE acceptance criterion against a code change. Fresh context,
+      one criterion, full suspicion: assume the implementer drifted, cut a
+      corner, or misread the plan until the diff proves otherwise.
+
+      Classification (exactly one):
+      - `MET` — the diff satisfies the criterion AND a test proves the promised
+        behavior. Evidence MUST cite both: the satisfying change (file:line) and
+        the test targeting the behavior (file:line). No test ⇒ NOT MET — at best
+        PARTIAL (a criterion is a promise of observable behavior; unproven
+        behavior is unverified behavior).
+      - `PARTIAL` — partially satisfied, or satisfied but unproven (missing/weak
+        test), or you could not establish it either way (say why — doubt lands
+        here, never in MET).
+      - `UNMET` — the plan requires it and the diff does not do it. Absence is a
+        finding: review what SHOULD be there, not only what IS.
+      - `DIVERGED` — the diff does something ELSE instead (interface substituted,
+        approach swapped, criterion reinterpreted).
+
+      Ground-truth discipline: fs_grep the symbols the criterion names (confirm
+      they exist spelled as specified), fs_read around the relevant hunks to
+      confirm the change makes the criterion true, confirm the test targets
+      BEHAVIOR (not implementation echo), use ast_grep for structural claims.
+      Watch for gamed evidence: a test weakened/deleted so it passes, hardcoded
+      values shaped to the criterion's example, TODO/stub presented as done —
+      those are PARTIAL or DIVERGED with the gaming named in the complaint.
+
+      Output format — respond with ONLY this JSON object, no prose around it:
+      {"id": "<the criterion's id, echoed>",
+       "status": "MET" | "PARTIAL" | "UNMET" | "DIVERGED",
+       "evidence": "<for MET: the satisfying change file:line AND the proving test
+      file:line, quoted decisively; otherwise the closest relevant citations or empty>",
+       "complaint": "<required for non-MET: what the diff does/omits (file:line) and
+      what would make it conform; empty string for MET>"}
+
+      Your response is machine-validated: a malformed response is rejected back
+      to you exactly once with the reason, then recorded as PARTIAL (unproven).
+      The id is stamped from the criterion itself — your echo is informative only.
+    prompt: |
+      Repository: {{project_dir}}
+      Changed files: {{changed_files}}
+
+      Criterion to verify (JSON):
+      {{criterion}}
+
+      Plan-recorded decisions (context): {{plan_notes}}
+      {{extra_context}}
+
+      The diff{{diff_note}}:
+      {{diff_text}}
+      {{gate_feedback}}
+    tools:
+      - fs_read
+      - fs_cat
+      - fs_grep
+      - ast_grep
+    max_iterations: 10
+    max_attempts: 2
+    state_updates:
+      crit_verdict: '{{output}}'
+    next: crit_gate
+
+  crit_gate:
+    id: crit_gate
+    type: script
+    description: Deterministic contract gate per criterion verdict — status enum, MET requires evidence, non-MET requires a complaint; reject-and-retry once, then record PARTIAL (unproven). Never sinks the map.
+    script: scripts/crit_gate.py
+    timeout: 30
+
+  holistic:
+    id: holistic
+    type: llm
+    description: Cross-criterion adversarial pass — hunts what per-criterion checks cannot see. ADDITIVE-only; cannot flip criterion verdicts.
+    instructions: |
+      You run the holistic adversarial pass over a whole change AFTER each
+      acceptance criterion was independently verified. You hunt what
+      per-criterion checks cannot see. You are ADDITIVE-ONLY: you may add
+      complaints; you may NOT flip, soften, or re-judge any criterion verdict.
+
+      The checklist (each hit becomes one complaint with kind, file:line
+      location, the violation, and the fix):
+      - **Absence** — something the PLAN requires that maps to no criterion and
+        never showed up in the diff (the dog that didn't bark).
+      - **Scope drift / out-of-scope** — the diff touches what the plan's scope
+        notes say not to touch, or quietly does extra unplanned work.
+      - **Interface/approach substitution** — the plan named an interface,
+        library, or approach; the diff substituted another without the plan
+        recording that decision.
+      - **Silently overridden recorded decision** — plan says "do X not Y
+        because Z"; diff does Y.
+      - **Downstream contract breakage** — the diff changes a contract the plan
+        promised to preserve.
+      - **Gamed tests** — tests weakened, deleted, or shaped (hardcoded
+        expectations, skipped assertions) so the criteria APPEAR met.
+      - **The plan itself is the culprit** — impossible or self-contradictory
+        requirements: that is a complaint naming the PLAN as root cause; never
+        silently judge against a corrected version of it.
+
+      Be terse and decisive: three real complaints beat fifteen weak ones. A
+      complaint with no location and no criterion/scope reference is noise — do
+      not emit it. When everything is a nitpick, emit zero complaints and put
+      1-3 non-blocking notes in `observations`.
+    prompt: |
+      Repository: {{project_dir}}
+      Changed files: {{changed_files}}
+
+      Acceptance criteria: {{criteria}}
+      Per-criterion verdicts (already final): {{crit_verdicts}}
+
+      Plan-recorded decisions: {{plan_notes}}
+      Scope boundaries: {{scope_notes}}
+      {{extra_context}}
+
+      The diff{{diff_note}}:
+      {{diff_text}}
+    tools:
+      - fs_read
+      - fs_cat
+      - fs_grep
+      - ast_grep
+    output_schema:
+      type: object
+      properties:
+        extra_complaints:
+          type: array
+          items:
+            type: object
+            properties:
+              kind:
+                type: string
+              location:
+                type: string
+              violation:
+                type: string
+              fix:
+                type: string
+            required: [kind, location, violation, fix]
+        observations:
+          type: string
+      required: [extra_complaints, observations]
+    max_iterations: 10
+    max_attempts: 2
+    next: verdict
+
+  verdict:
+    id: verdict
+    type: script
+    description: Deterministic verdict — CONFORMS requires every criterion MET and zero holistic complaints; no criteria at all fails closed. Assembles the exact sentinel format.
+    script: scripts/verdict.py
+    timeout: 30
+    next: done
+
+  done:
+    id: done
+    type: end
+    output: |
+      {{adv_report}}

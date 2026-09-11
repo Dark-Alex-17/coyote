@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.11.0
+version: 3.13.0
 
 agent_session: temp
 auto_continue: true
@@ -17,11 +17,12 @@ spawnable_agents:
   - adversary
   - security-reviewer
   - probe
+  - review-gauntlet
   - architecture-reviewer
   - step-runner
   - whetstone
 max_concurrent_agents: 40
-max_agent_depth: 3
+max_agent_depth: 5
 inject_spawn_instructions: true
 summarization_threshold: 80000
 
@@ -55,6 +56,9 @@ variables:
   - name: auto_confirm
     description: Auto-confirm command execution
     default: '1'
+  - name: escalation_policy
+    description: "How escalation-worthy decisions are handled mid-run: 'interactive' pauses and asks the user; 'autonomous' self-resolves decisions covered by a standing ruling or a clearly recommended option, reports them in a final-report digest, and only pings on hard triggers or novel conflicts"
+    default: 'interactive'
 
 mcp_servers:
   - ddg-search
@@ -291,6 +295,38 @@ instructions: |
   - Never state that a lint, build, or test passed unless you can paste its literal command and exit code. A gate that did not run is UNVERIFIED — report it as not run, never as "covered by" something else.
   - Never reuse a verification claim from an earlier report (yours or another agent's) without re-running the command yourself. Prior reports are unverified context, not evidence.
   - An honest failure — "gate X failed / could not run, here is the verbatim error" — is an acceptable, preferable deliverable. A success-shaped report with missing evidence poisons every downstream consumer.
+
+  ### The review gauntlet (preferred): one spawn, every review lane, machine-parsed verdicts
+
+  When the `review-gauntlet` agent is installed, run the post-implementation review passes through
+  it instead of spawning the individual reviewers yourself. Spawn it ONCE whenever the work was
+  non-trivial (any trigger in the reviewer sections below would fire, or you are unsure whether one
+  would):
+
+  ```
+  agent__spawn --agent review-gauntlet --prompt "Post-implementation review gate.
+  Project: <absolute repo path>
+  Diff: <git range like main...HEAD, or 'worktree' for uncommitted changes>
+  Rigor: <rigor>   Security posture: <posture>
+  Plan / acceptance criteria: <pasted verbatim — enables the adversary lane; omit when none>
+  Local-run recipe / usage suites: <from the plan — enables the probe lane; omit when none>"
+  ```
+
+  It computes diff signals deterministically, selects lanes (code-review always; adversary when a
+  spec/plan is present; security on attack-surface signals; probe on consumer-facing surface with a
+  run recipe — judgment can only WIDEN the selection, never narrow it), runs the selected lanes in
+  parallel verdict-independent, and returns a machine-parsed `GAUNTLET: PASS` or `GAUNTLET: BLOCKED`
+  with a lane table, blockers, attention items, and every lane's full report.
+
+  - `GAUNTLET: BLOCKED` blocks completion. Route each blocker through the findings-handling rules in
+    the reviewer sections below (🔴 → coder fix in the SAME session; DIVERGES → the adversary rules;
+    security FAIL → the security rules; probe INCONCLUSIVE → fix the ENVIRONMENT per the plan's
+    local-run recipe first — it is never a code verdict). Then spawn a FRESH gauntlet run; lane
+    selection re-runs from the new diff.
+  - `GAUNTLET: PASS` with a "Human attention required" section: finish the work and carry those
+    items into your final report verbatim.
+  - The reviewer sections below remain authoritative for HANDLING each lane's findings, and are the
+    spawn fallback when `review-gauntlet` is not installed.
 
   ### Independent code review (post-coder, non-trivial work)
 
@@ -587,9 +623,49 @@ instructions: |
   - Writing non-trivial code → always `coder` (graph agent runs verification internally)
   - Multi-angle exploration → fan out `explore` agents
 
+  ## Escalation policy: {{escalation_policy}}
+
+  Every "ASK the user" / "STOP and escalate" instruction in this config is subject to this policy.
+
+  - **interactive** (default) — pause and ask exactly as written throughout this config.
+  - **autonomous** — the user pre-delegated decision-making for this run ("here's the spec — go").
+    When an escalation-worthy decision arises, work this ladder IN ORDER:
+
+    1. **Hard triggers — ALWAYS escalate; no ruling or policy can delegate these:** decisions about
+       secrets/credentials, money movement, destructive or irreversible actions (data loss,
+       force-push, dropping data or public API without a migration path), anything the Hard Blocks
+       section forbids — and any decision that already failed once after an autonomous resolution
+       (a ruling that did not survive one fix cycle goes to a human, never into a retry loop).
+    2. **Standing rulings** — read `$HOME/.config/coyote/share/standing-rulings.md` (skip silently
+       if absent). If a ruling's trigger GENUINELY matches the decision at hand, apply its
+       resolution. Match on substance, not resemblance — a ruling about security-vs-spec conflicts
+       does not authorize scope changes. Unsure whether it matches? Then it does not.
+    3. **Clearly recommended option** — if you would have presented options with one marked
+       `(Recommended)` backed by concrete evidence (a reviewer's proposed fix, a failing test that
+       names the cause, a repo convention), take the recommended option.
+    4. **Otherwise — escalate** exactly as interactive mode would. A genuinely novel conflict or a
+       decision with no defensible recommendation still reaches the user; autonomy never converts
+       "I don't know" into a guess.
+
+    **Plan amendments taken autonomously.** When a resolution amends the spec/plan/acceptance
+    criteria (e.g. a security fix conflicts with a criterion's wording), REWRITE the affected
+    criterion text in your working plan context BEFORE re-running any reviewer or the gauntlet —
+    the adversary must verify the plan-as-amended, not the stale wording. The amendment is always
+    a visible artifact, never implied.
+
+    **The digest (MANDATORY when any autonomous decision was taken).** Your final report — and the
+    PR body, when you open one — MUST include a `## Decisions taken autonomously` section: one line
+    per decision stating what was decided, the basis (`ruling: <id/title>` or `recommended option`),
+    and what changed (including any plan amendment). Zero autonomous decisions → omit the section.
+    This converts interrupt-driven review into digest-driven review — never into silence.
+
+    **Close the loop.** When a decision DID reach the user (step 4), suggest in your final report
+    that they record the resolution with `coyote --macro record-ruling` so that class of decision
+    never asks again.
+
   ## User Interaction (get buy-in before major decisions)
 
-  Use `user__ask`, `user__confirm`, `user__checkbox`, `user__input` to clarify ambiguities interactively. **Do NOT guess when you can ask.**
+  Use `user__ask`, `user__confirm`, `user__checkbox`, `user__input` to clarify ambiguities interactively. **Do NOT guess when you can ask.** When `escalation_policy` is `autonomous`, the Escalation policy section above governs which of these actually pause the run — autonomy substitutes standing rulings and evidence-backed recommendations for the pause; it never substitutes guessing.
 
   | Situation | Tool |
   |-----------|------|
@@ -620,6 +696,11 @@ instructions: |
 
   If you see `pending_escalations` in tool results, a child agent needs user input and is blocked. Reply promptly via `agent__reply_escalation`. You can answer from context, or prompt the user yourself first and relay the answer.
 
+  In `autonomous` escalation policy, work the Escalation-policy ladder before prompting the user: a
+  matching standing ruling or a clearly recommended option in the child's escalation answers it
+  directly via `agent__reply_escalation` (hard triggers always go to the user). Replies that amend a
+  plan/spec follow the amendment rule above, and every autonomous reply lands in the digest.
+
   ## Anti-Patterns (BLOCKING)
 
   - Skipping intent verbalization → unclear routing, wasted turns
@@ -647,6 +728,7 @@ instructions: |
 
   ## Context
   - Project: {{project_dir}}
+  - Escalation policy: {{escalation_policy}}
   - OS: {{__os__}}
   - Shell: {{__shell__}}
   - CWD: {{__cwd__}}

@@ -6,7 +6,7 @@ description: |
   plan-conformance check (plus a black-box usage-pattern probe for consumer-facing surface), and
   finishes with ONE draft PR (CI checks watched to green) plus tracked follow-up tasks. Task state
   lives on disk in a plans directory, so runs survive context compression.
-version: 2.3.0
+version: 2.5.0
 agent_session: temp
 auto_continue: true
 max_auto_continues: 100
@@ -20,6 +20,7 @@ spawnable_agents:
   - librarian
   - adversary
   - probe
+  - review-gauntlet
   - gatekeeper
   - whetstone
 max_concurrent_agents: 10
@@ -53,6 +54,9 @@ variables:
   - name: autonomy
     description: 'How autonomous the run is: full (no gates), plan-gate (approve breakdown once, then autonomous), phase-gate (approve each task)'
     default: full
+  - name: escalation_policy
+    description: "How escalation-worthy decisions (yours and relayed child escalations) are handled: 'interactive' pauses and asks the user; 'autonomous' self-resolves decisions covered by a standing ruling or a clearly recommended option, reports them in the Phase F digest, and only pings on hard triggers or novel conflicts"
+    default: 'interactive'
   - name: auto_confirm
     description: Auto-confirm command execution (1 = skip the shell guard_operation TTY prompt, needed for non-interactive autonomous runs)
     default: '1'
@@ -113,6 +117,37 @@ instructions: |
   branches). Exception: in parallel mode, removing a task's worktree and deleting its task branch
   AFTER its merge landed and integration tests passed is routine documented cleanup, not a
   destructive action.
+
+  ## Escalation policy: {{escalation_policy}}
+
+  Orthogonal to autonomy mode: autonomy decides which GATES pause the run; escalation policy decides
+  what happens when a genuine decision point fires — yours, or a child agent's escalation.
+
+  - **interactive** (default) — escalate to the user exactly as written throughout this config.
+  - **autonomous** — the user pre-delegated decision-making. Before pinging the user (and before
+    relaying any child `pending_escalations` to them), work this ladder IN ORDER:
+    1. **Hard triggers — ALWAYS the user's; no ruling can delegate them:** secrets/credentials,
+       money movement, destructive or irreversible actions, anything the Hard blocks / Anti-patterns
+       sections forbid — and any decision that already failed once after an autonomous resolution.
+    2. **Standing rulings** — read `$HOME/.config/coyote/share/standing-rulings.md` (skip silently
+       if absent). A ruling whose trigger GENUINELY matches resolves the decision: apply it, or
+       answer the blocked child via `agent__reply_escalation`. Match on substance, not resemblance;
+       unsure means no match.
+    3. **Clearly recommended option** — if the decision carries options with one clearly recommended
+       on concrete evidence (a reviewer's proposed fix, a repo convention), take it.
+    4. **Otherwise — escalate** as interactive mode would. Autonomy never converts "I don't know"
+       into a guess.
+
+    When a resolution amends a plan/task's acceptance criteria, the criterion TEXT must be rewritten
+    before any conformance re-run — when the decision was a child's, your `agent__reply_escalation`
+    reply must instruct it to amend its plan context (the adversary verifies the plan-as-amended,
+    not the stale wording).
+
+    Every autonomous resolution — yours and the ones you replied to children — gets one line in
+    Phase F's `## Decisions taken autonomously` rollup: what was decided, the basis (`ruling:
+    <id/title>` or `recommended option`), and what changed (including plan amendments). When a novel
+    decision DID reach the user, suggest `coyote --macro record-ruling` in the final report so that
+    class never asks again.
 
   ## The pipeline (drive this to completion)
 
@@ -288,6 +323,21 @@ instructions: |
 
   4. **Verify against the plan (divergence check).** When Sisyphus returns, do NOT trust its
      self-report — get an INDEPENDENT conformance verdict:
+     - **Preferred: run the conformance checks through `review-gauntlet`** when it is installed —
+       ONE spawn instead of separate adversary/probe spawns, with machine-parsed verdicts:
+
+       ```
+       agent__spawn --agent review-gauntlet --prompt "Post-implementation review gate.
+       Project: <the code repo the task's changes landed in>
+       Diff: <the task's BASE SHA from its started log entry>..HEAD
+       Forced lanes: adversary<, probe — add probe when the task changed consumer-facing surface and the plan carries a local-run recipe>
+       Plan / acceptance criteria: <the task's acceptance criteria, pasted verbatim>
+       Local-run recipe / usage suites: <from the plan, when present>"
+       ```
+
+       It returns `GAUNTLET: PASS/BLOCKED`. On BLOCKED apply the same fix-and-rerun rules as below
+       (resume the SAME Sisyphus session with the findings verbatim, then a FRESH gauntlet run).
+       The direct `adversary`/probe spawns below are the FALLBACK when the gauntlet is not installed.
      - **Spawn `adversary`** with the diff base and the criteria pasted in:
 
        ```
@@ -428,6 +478,9 @@ instructions: |
      - a checklist of every TASK-NNN (title + commit SHAs),
      - a **`## Review decisions`** section: one line per collected `rejected-finding:` entry;
        omit the section entirely when there are none,
+     - a **`## Decisions taken autonomously`** section (only when `escalation_policy: autonomous`
+       resolved anything): one line per self-resolved decision with its basis and what changed —
+       rolled up from your own resolutions and each Sisyphus report's section; omit otherwise,
      - a **`## Follow-up / manual actions`** section: one checkbox line per follow-up (WHAT, WHERE,
        WHY, WHEN — pre-merge items FIRST and clearly marked), or "None." if there are none. This
        section is the reviewer's contract for what the code does NOT do by itself.
@@ -453,7 +506,8 @@ instructions: |
      the run branch (`chore(plan): ...`) — they become part of the PR.
   6. Run the `task-tracking` consistency checks; fix anything you introduced.
   7. Report: the PLAN, every TASK-NNN with its commits, the single draft PR URL with checks green,
-     the follow-up TASKs created (with their WHEN), and anything deferred/escalated. STOP.
+     the follow-up TASKs created (with their WHEN), and anything deferred/escalated — plus the
+     `## Decisions taken autonomously` rollup when the escalation policy resolved anything. STOP.
 
   Continuous improvement: if any part of this run addressed PR review feedback that did not come
   from the run's own reviewer lanes — humans, a teammate's review agent, another team's bot — spawn
@@ -491,6 +545,11 @@ instructions: |
   If `pending_escalations` appears in a tool result, a spawned Sisyphus is blocked on user input.
   Answer from context if you can, else prompt the user, then `agent__reply_escalation` to unblock the
   child. Do not leave a child hanging.
+
+  In `autonomous` escalation policy, work the Escalation-policy ladder BEFORE prompting the user: a
+  matching standing ruling or a clearly recommended option answers the child directly (hard triggers
+  always go to the user), plan-amending replies instruct the child to rewrite the criterion text
+  first, and every autonomous reply lands in the Phase F digest.
 
   ## Anti-patterns (BLOCKING)
 
@@ -542,6 +601,7 @@ instructions: |
   - Design doc: {{design_doc}}
   - Base branch: {{base_branch}}
   - Autonomy: {{autonomy}}
+  - Escalation policy: {{escalation_policy}}
   - Parallel tasks: {{parallel_tasks}} (0 = sequential, 1 = worktree-parallel)
   - OS: {{__os__}}  Shell: {{__shell__}}  CWD: {{__cwd__}}  Now: {{__now__}}
 

@@ -47,6 +47,7 @@ Spawnable sub-agents (from `config.yaml`):
 - **[code-reviewer](../code-reviewer/README.md)** — independent post-implementation review; fires when the change is broad (2+ coders, 5+ files) or crosses architectural boundaries.
 - **[adversary](../adversary/README.md)** — plan-conformance review; fires whenever the change implements a written spec, plan step, or acceptance-criteria list. Orthogonal to `code-reviewer` — both can run.
 - **[security-reviewer](../security-reviewer/README.md)** — security analysis; fires when the change touches attack surface (external input, auth/secrets, shell/file-path sinks, new dependencies). Verdict is posture-gated (`prototype`/`standard`/`hardened`) so POCs aren't held to production strictness, but Critical findings (committed secrets, host-endangering code) block in every posture. Orthogonal to both other reviewers — all three can run.
+- **[review-gauntlet](../review-gauntlet/README.md)** — preferred single entry point for the post-implementation review passes: a graph that computes diff signals deterministically, runs the applicable lanes (code-reviewer / adversary / security-reviewer / probe) in parallel, and machine-parses their verdict sentinels into GAUNTLET: PASS/BLOCKED — skipping a lane or misreading a verdict becomes structurally impossible. The reviewer bullets above describe the lanes it runs and remain the spawn fallback when it is not installed.
 - **[step-runner](../step-runner/README.md)** — graph agent that executes one step of a phased plan repo. Internally delegates to `coder` for implementation and optionally to `code-reviewer` for review.
 - **[whetstone](../whetstone/README.md)** — continuous improvement; spawned ONCE at the end of a run that addressed review feedback from outside Sisyphus's own lanes (humans, or a teammate's independent review agent — never its own reviewers' output). Classifies each piece of feedback CATCH/PARTIAL/MISS against what the run's own reviewers flagged and converts the misses into user-approved suite improvements (skill edits, ledger entries). Never blocks run completion.
 
@@ -57,6 +58,7 @@ Spawnable sub-agents (from `config.yaml`):
 - 🔄 **Task Management**: Tracks progress and context across complex operations.
 - 🛠️ **Tool Integration**: Seamlessly uses system tools for building, testing, and file manipulation.
 - 📋 **Plan-Driven Workflows**: Authors, reviews, and executes phased implementation plans with handoffs between steps.
+- 🚦 **Escalation policy**: `escalation_policy=autonomous` pre-delegates decision-making — standing rulings (`~/.config/coyote/share/standing-rulings.md`, recorded via `coyote --macro record-ruling`) and evidence-backed recommended options are taken without pausing and batched into a “Decisions taken autonomously” digest; secrets, money movement, and destructive actions always escalate.
 
 ## Plan-Driven Workflows
 
