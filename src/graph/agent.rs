@@ -291,7 +291,7 @@ mod tests {
 
         apply_state_updates(&node, &mut state, &json!("anything"));
 
-        assert_eq!(state.state().get("output"), Some(&Value::Null));
+        assert!(state.state().get("output").is_none());
     }
 
     #[test]

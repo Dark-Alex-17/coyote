@@ -1922,6 +1922,55 @@ nodes:
         assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
     }
 
+    /// An agent step whose `state_updates` name only other keys leaves the
+    /// default `output_key` unwritten, so the collector reports the missing
+    /// key instead of collecting a manufactured `null`.
+    #[tokio::test]
+    #[serial]
+    async fn map_branch_with_unrelated_state_updates_errors_instead_of_null() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new();
+        materialize_probe_agent(0.0);
+        let ws = TestWorkspace::new();
+        let yaml = format!(
+            r#"
+name: t
+settings:
+  validate_before_run: false
+initial_state:
+  items: [1]
+start: fan_out
+nodes:
+  fan_out:
+    type: map
+    over: "{{{{items}}}}"
+    as: item
+    branch: worker
+    collect_into: results
+    next: done
+  worker:
+    type: agent
+    agent: {PROBE_AGENT}
+    prompt: "p"
+    state_updates:
+      note: "{{{{output}}}}"
+  done:
+    type: end
+    output: "{{{{results}}}}"
+"#
+        );
+
+        let chain = error_chain(run_graph(&yaml, &ws).await);
+
+        assert!(
+            chain.contains("sub-branch [0] did not write output_key 'output'"),
+            "{chain}"
+        );
+    }
+
     /// The materialized agent's graph holds its script step open for seconds,
     /// so the 1s timer fires while that step is still pending: the agent
     /// future is dropped mid-flight and the chain runner alone retires the

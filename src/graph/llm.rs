@@ -555,7 +555,7 @@ mod tests {
 
         apply_state_updates_with_output(&node, &mut state, &json!("anything"));
 
-        assert_eq!(state.state().get(OUTPUT_KEY), Some(&json!(null)));
+        assert!(state.state().get(OUTPUT_KEY).is_none());
     }
 
     #[test]

@@ -6,7 +6,8 @@ pub(super) const OUTPUT_KEY: &str = "output";
 
 /// Merge `output_schema` top-level keys (when `has_schema`) and apply `state_updates` with
 /// `{{output}}` bound to `output` for the duration of interpolation only. An explicit `output`
-/// key in `updates` is honored; otherwise `output` is restored to its prior value (or `null`).
+/// key in `updates` is honored; otherwise `output` is restored to its prior value, or removed
+/// again if it was absent.
 pub(super) fn apply(
     state_manager: &mut StateManager,
     output: &Value,
@@ -37,9 +38,12 @@ pub(super) fn apply(
         })
         .collect();
 
-    state_manager
-        .state_mut()
-        .set(OUTPUT_KEY.into(), prev_output.unwrap_or(Value::Null));
+    match prev_output {
+        Some(prev) => state_manager.state_mut().set(OUTPUT_KEY.into(), prev),
+        None => {
+            state_manager.state_mut().remove(OUTPUT_KEY);
+        }
+    }
 
     for (key, value) in computed {
         state_manager.state_mut().set(key, value);
@@ -112,9 +116,20 @@ mod tests {
     }
 
     #[test]
-    fn output_is_restored_to_null_when_absent() {
+    fn output_is_removed_when_absent() {
         let u = updates(&[("response", "{{output}}")]);
         let mut state = manager_with(&[]);
+
+        apply(&mut state, &json!("new"), false, Some(&u));
+
+        assert_eq!(state.state().get("response"), Some(&json!("new")));
+        assert!(state.state().get(OUTPUT_KEY).is_none());
+    }
+
+    #[test]
+    fn explicit_null_prior_output_is_restored_as_null() {
+        let u = updates(&[("response", "{{output}}")]);
+        let mut state = manager_with(&[("output", json!(null))]);
 
         apply(&mut state, &json!("new"), false, Some(&u));
 
@@ -148,6 +163,6 @@ mod tests {
         assert!(state.state().get("context").is_none());
         assert!(state.state().get("sources").is_none());
         assert_eq!(state.state().get("ctx"), Some(&json!("c")));
-        assert_eq!(state.state().get(OUTPUT_KEY), Some(&json!(null)));
+        assert!(state.state().get(OUTPUT_KEY).is_none());
     }
 }

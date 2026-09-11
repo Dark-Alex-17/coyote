@@ -1002,6 +1002,63 @@ nodes:
         assert!(strs.contains(&"beta"), "missing 'beta' in {strs:?}");
     }
 
+    /// Two parallel agent branches whose `state_updates` only read `{{output}}`
+    /// leave the key as they found it (absent), so the join sees no write to
+    /// `output` from either side and needs no reducer for it.
+    #[tokio::test]
+    #[serial]
+    async fn parallel_state_updates_branches_do_not_contend_on_output() {
+        if !cmd_available("bash") || !cmd_available("python3") {
+            eprintln!("skipping: bash or python3 not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new();
+        materialize_probe_agent(0.0);
+        let ws = TestWorkspace::new();
+        ws.write_script("dispatcher.sh", "#!/bin/bash\necho '{}'\n");
+
+        let yaml = format!(
+            r#"
+name: t
+settings:
+  validate_before_run: false
+start: dispatcher
+nodes:
+  dispatcher:
+    type: script
+    script: dispatcher.sh
+    state_updates: {{}}
+    next: [a, b]
+  a:
+    type: agent
+    agent: {PROBE_AGENT}
+    prompt: "p"
+    state_updates:
+      note_a: "{{{{output}}}}"
+    next: join
+  b:
+    type: agent
+    agent: {PROBE_AGENT}
+    prompt: "p"
+    state_updates:
+      note_b: "{{{{output}}}}"
+    next: join
+  join:
+    type: end
+    output: "{{{{note_a}}}}|{{{{note_b}}}}"
+"#
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(result, "held|held");
+    }
+
     #[tokio::test]
     async fn map_over_list_collects_outputs_in_input_order() {
         if !cmd_available("python3") {
