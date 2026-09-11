@@ -628,8 +628,8 @@ impl GraphValidator {
         if graph.settings.timeout == Some(0) {
             result.warning(ValidationError::new(
                 "settings.timeout: 0 disables the graph wall-clock bound; the run \
-                 ends only when the graph completes, is aborted, or hits \
-                 max_loop_iterations",
+                 ends only when the graph completes, is aborted, or another \
+                 limit stops it",
             ));
         }
         for (node_id, node) in &graph.nodes {
@@ -655,7 +655,8 @@ impl GraphValidator {
                 node_id,
                 format!(
                     "timeout: 0 disables the wall-clock bound for {kind} node \
-                     '{node_id}'; it runs until it returns"
+                     '{node_id}'; it runs until it returns or an enclosing bound \
+                     (settings.timeout, an outer agent node's timeout, or abort) ends it"
                 ),
             ));
         }
@@ -3293,7 +3294,7 @@ mod tests {
         assert_eq!(
             w[0].message,
             "settings.timeout: 0 disables the graph wall-clock bound; the run ends only when \
-             the graph completes, is aborted, or hits max_loop_iterations"
+             the graph completes, is aborted, or another limit stops it"
         );
     }
 
@@ -3312,7 +3313,8 @@ mod tests {
         assert_eq!(w[0].node_id.as_deref(), Some("a"));
         assert_eq!(
             w[0].message,
-            "timeout: 0 disables the wall-clock bound for agent node 'a'; it runs until it returns"
+            "timeout: 0 disables the wall-clock bound for agent node 'a'; it runs until it returns \
+             or an enclosing bound (settings.timeout, an outer agent node's timeout, or abort) ends it"
         );
     }
 
@@ -3332,7 +3334,8 @@ mod tests {
         assert_eq!(w[0].node_id.as_deref(), Some("s"));
         assert_eq!(
             w[0].message,
-            "timeout: 0 disables the wall-clock bound for script node 's'; it runs until it returns"
+            "timeout: 0 disables the wall-clock bound for script node 's'; it runs until it returns \
+             or an enclosing bound (settings.timeout, an outer agent node's timeout, or abort) ends it"
         );
     }
 
@@ -3352,7 +3355,8 @@ mod tests {
         assert_eq!(w[0].node_id.as_deref(), Some("l"));
         assert_eq!(
             w[0].message,
-            "timeout: 0 disables the wall-clock bound for llm node 'l'; it runs until it returns"
+            "timeout: 0 disables the wall-clock bound for llm node 'l'; it runs until it returns \
+             or an enclosing bound (settings.timeout, an outer agent node's timeout, or abort) ends it"
         );
     }
 
@@ -3372,7 +3376,8 @@ mod tests {
         assert_eq!(w[0].node_id.as_deref(), Some("r"));
         assert_eq!(
             w[0].message,
-            "timeout: 0 disables the wall-clock bound for rag node 'r'; it runs until it returns"
+            "timeout: 0 disables the wall-clock bound for rag node 'r'; it runs until it returns \
+             or an enclosing bound (settings.timeout, an outer agent node's timeout, or abort) ends it"
         );
     }
 

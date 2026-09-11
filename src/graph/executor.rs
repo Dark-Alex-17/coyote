@@ -247,20 +247,21 @@ impl GraphExecutor {
                 #[cfg(test)]
                 let observer = frontier_observer.clone();
 
+                // Retires the teammate identity however this task ends:
+                // dropped explicitly right after step() on the normal path,
+                // by unwinding on the abort return, task abort, or panic.
+                // Built before the spawn so a task aborted before its first
+                // poll still drops it with the future.
+                let retire = registry_for_task
+                    .zip(peer_id)
+                    .map(|(registry, id)| PeerRetireGuard {
+                        registry,
+                        id,
+                        #[cfg(test)]
+                        observer,
+                    });
                 let task = tokio::spawn(async move {
-                    // Retires the teammate identity however this task ends:
-                    // dropped explicitly right after step() on the normal
-                    // path, by unwinding on the abort return, task abort, or
-                    // panic.
-                    let retire =
-                        registry_for_task
-                            .zip(peer_id)
-                            .map(|(registry, id)| PeerRetireGuard {
-                                registry,
-                                id,
-                                #[cfg(test)]
-                                observer,
-                            });
+                    let retire = retire;
                     let _permit = sem_clone
                         .acquire()
                         .await
@@ -1720,6 +1721,48 @@ nodes:
             "the aborted task's identity is retired by the guard"
         );
         assert!(!registry.is_finished(&id_b), "the sibling is untouched");
+    }
+
+    /// A task aborted before its first poll never runs its body, so a guard
+    /// built inside the future would never exist. Built outside and moved in,
+    /// it drops with the unpolled future and still retires the identity.
+    #[tokio::test]
+    async fn peer_retire_guard_fires_when_task_is_aborted_before_first_poll() {
+        let (registry, assignments) = provision_frontier_peers(vec![
+            ("a".to_string(), "worker".to_string()),
+            ("b".to_string(), "worker".to_string()),
+        ]);
+        let registry = registry.expect("two flagged nodes should get a registry");
+        let id_a = assignments["a"].0.clone();
+        let id_b = assignments["b"].0.clone();
+
+        let outside = PeerRetireGuard {
+            registry: Arc::clone(&registry),
+            id: id_a.clone(),
+            observer: None,
+        };
+        let inside_registry = Arc::clone(&registry);
+        let inside_id = id_b.clone();
+        let task = tokio::spawn(async move {
+            let _outside = outside;
+            let _inside = PeerRetireGuard {
+                registry: inside_registry,
+                id: inside_id,
+                observer: None,
+            };
+            std::future::pending::<()>().await;
+        });
+        // No await between spawn and abort: on the current-thread test
+        // runtime the task has not been polled yet.
+        task.abort();
+        let err = task.await.expect_err("the task was aborted");
+
+        assert!(err.is_cancelled(), "{err}");
+        assert!(registry.is_finished(&id_a), "the moved-in guard retires");
+        assert!(
+            !registry.is_finished(&id_b),
+            "a guard built inside never existed"
+        );
     }
 
     /// A session already aborted when the run starts trips the synchronous

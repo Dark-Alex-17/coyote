@@ -92,18 +92,20 @@ async fn run_map(
         let sem = semaphore.clone();
         let abort = step_ctx.abort_signal.clone();
 
+        // Cancellation net behind the chain runner's own retirement: a task
+        // aborted before or during its chain still leaves the item's identity
+        // finished. Built before the spawn so a task aborted before its first
+        // poll drops it with the future.
+        let retire = item_peers
+            .as_ref()
+            .map(|(registry, assignment)| PeerRetireGuard {
+                registry: Arc::clone(registry),
+                id: assignment.0.clone(),
+                #[cfg(test)]
+                observer: None,
+            });
         let task = tokio::spawn(async move {
-            // Cancellation net behind the chain runner's own retirement: a
-            // task aborted before or during its chain still leaves the item's
-            // identity finished.
-            let _retire = item_peers
-                .as_ref()
-                .map(|(registry, assignment)| PeerRetireGuard {
-                    registry: Arc::clone(registry),
-                    id: assignment.0.clone(),
-                    #[cfg(test)]
-                    observer: None,
-                });
+            let _retire = retire;
             let _permit = sem
                 .acquire()
                 .await
