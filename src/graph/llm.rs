@@ -262,7 +262,7 @@ async fn run_with_retries(
 
 /// Whether `turn` (0-based) is the final turn the node's cap allows. A cap of 0 means no cap.
 pub(crate) fn is_last_turn(turn: u32, max_iterations: u32) -> bool {
-    max_iterations > 0 && turn + 1 == max_iterations
+    max_iterations > 0 && turn == max_iterations - 1
 }
 
 async fn run_chat_loop(
@@ -766,6 +766,12 @@ mod tests {
         assert!(!is_last_turn(0, 0));
         assert!(!is_last_turn(9, 0));
         assert!(!is_last_turn(u32::MAX, 0));
+    }
+
+    #[test]
+    fn is_last_turn_at_u32_max_does_not_overflow() {
+        assert!(is_last_turn(u32::MAX - 1, u32::MAX));
+        assert!(!is_last_turn(u32::MAX, u32::MAX));
     }
 
     /// The turn-top abort check runs before any client is created, so an

@@ -1,5 +1,5 @@
 use super::executor::{PeerRetireGuard, StepContext, StepResult, TaskCancelGuard, step};
-use super::state::StateManager;
+use super::state::{StateManager, is_lone_template};
 use super::types::{ConcurrencyCap, Graph, MapNode, Node, NodeType};
 use super::validator::branch_subgraph;
 use crate::config::{RenderMode, RequestContext};
@@ -324,7 +324,8 @@ fn wants_peer_identity(node: &Node) -> bool {
 /// accepted; anything else is the author's bug and surfaces as an error
 /// rather than being clamped. A literal 0 is rejected the same way, so a
 /// graph loaded with validation off fails here instead of silently running
-/// one item at a time. Only the absent-cap default is clamped.
+/// one item at a time, and a string that is not exactly one `{{key}}` is
+/// rejected before interpolation for the same reason. Only the absent-cap default is clamped.
 fn resolve_max_concurrency(
     node: &MapNode,
     state: &StateManager,
@@ -339,6 +340,13 @@ fn resolve_max_concurrency(
         Some(ConcurrencyCap::Fixed(n)) => return Ok(*n),
         Some(ConcurrencyCap::Template(t)) => t,
     };
+
+    if !is_lone_template(template) {
+        bail!(
+            "map node '{node_id}': max_concurrency \"{template}\" is a string but not a template; \
+             write an integer or exactly one `{{{{key}}}}` with nothing around it"
+        );
+    }
 
     let value = state
         .interpolate_raw(template)
@@ -661,6 +669,28 @@ mod tests {
             "{chain}"
         );
         assert!(chain.contains("budget"), "{chain}");
+    }
+
+    #[test]
+    fn resolve_max_concurrency_rejects_non_template_string() {
+        let state = state_with("budget", Value::from(3));
+        let cap = Some(ConcurrencyCap::Template("4".into()));
+        let msg = resolve(cap, &state).unwrap_err().to_string();
+        assert!(
+            msg.contains(
+                "is a string but not a template; write an integer or exactly one `{{key}}` \
+                 with nothing around it"
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("map node 'm': max_concurrency \"4\""), "{msg}");
+    }
+
+    #[test]
+    fn resolve_max_concurrency_accepts_padded_template() {
+        let state = state_with("budget", Value::from(3));
+        let cap = Some(ConcurrencyCap::Template("  {{budget}}  ".into()));
+        assert_eq!(resolve(cap, &state).unwrap(), 3);
     }
 }
 

@@ -3648,6 +3648,27 @@ mod tests {
     }
 
     #[test]
+    fn map_max_concurrency_non_numeric_index_errors() {
+        let map = map_with_cap("m", "br", Some("end"), "{{limits[foo]}}");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message
+                == "map node's `max_concurrency` is a string but not a template; write \
+                    an integer or exactly one `{{key}}` with nothing around it"
+                && e.node_id.as_deref() == Some("m")),
+            "a non-numeric index can never resolve and must fail at load: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
     fn map_max_concurrency_lone_template_forms_pass() {
         for cap in ["{{budget}}", "{{cfg.limits[0]}}", "  {{budget}}  "] {
             let map = map_with_cap("m", "br", Some("end"), cap);
