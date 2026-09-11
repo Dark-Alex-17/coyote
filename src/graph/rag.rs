@@ -1,13 +1,13 @@
 use super::state::StateManager;
+use super::state_updates;
 use super::types::RagNode;
+use super::wall_clock;
 use crate::config::RequestContext;
 use crate::utils::create_abort_signal;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value};
-use std::time::Duration;
 use tokio::time::timeout;
 
-const OUTPUT_KEY: &str = "output";
 const DEFAULT_QUERY: &str = "{{initial_prompt}}";
 const DEFAULT_RAG_TIMEOUT_SECS: u64 = 120;
 
@@ -34,18 +34,16 @@ impl RagNodeExecutor {
         let top_k = node.top_k.unwrap_or_else(|| rag.configured_top_k());
         let rerank = rag.configured_reranker();
 
-        let timeout_dur = Duration::from_secs(node.timeout.unwrap_or(DEFAULT_RAG_TIMEOUT_SECS));
+        let secs = node.timeout.unwrap_or(DEFAULT_RAG_TIMEOUT_SECS);
+        let bound = wall_clock(secs);
         let abort = create_abort_signal();
-        let (context, sources_str, _ids) =
-            timeout(timeout_dur, rag.search(&query, top_k, rerank, abort))
-                .await
-                .with_context(|| {
-                    format!(
-                        "rag node '{node_id}' timed out after {}s",
-                        timeout_dur.as_secs()
-                    )
-                })?
-                .with_context(|| format!("rag node '{node_id}' retrieval failed"))?;
+        let fut = rag.search(&query, top_k, rerank, abort);
+        let (context, sources_str, _ids) = match bound {
+            Some(d) => timeout(d, fut).await,
+            None => Ok(fut.await),
+        }
+        .with_context(|| format!("rag node '{node_id}' timed out after {secs}s"))?
+        .with_context(|| format!("rag node '{node_id}' retrieval failed"))?;
 
         let output = build_rag_output(context, &sources_str);
         apply_state_updates(node, state_manager, &output);
@@ -70,33 +68,14 @@ fn build_rag_output(context: String, sources_str: &str) -> Value {
 }
 
 fn apply_state_updates(node: &RagNode, state_manager: &mut StateManager, output: &Value) {
-    let Some(updates) = &node.state_updates else {
-        return;
-    };
-    let prev_output = state_manager.state().get(OUTPUT_KEY).cloned();
-    state_manager
-        .state_mut()
-        .set(OUTPUT_KEY.into(), output.clone());
-
-    for (key, template) in updates {
-        let value = state_manager.interpolate_lenient(template);
-        state_manager
-            .state_mut()
-            .set(key.clone(), Value::String(value));
-    }
-
-    match prev_output {
-        Some(v) => state_manager.state_mut().set(OUTPUT_KEY.into(), v),
-        None => state_manager
-            .state_mut()
-            .set(OUTPUT_KEY.into(), Value::Null),
-    }
+    state_updates::apply(state_manager, output, false, node.state_updates.as_ref());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
 
     #[test]
     fn build_rag_output_splits_bullet_sources_into_array() {
@@ -125,5 +104,16 @@ mod tests {
         let out = build_rag_output("c".into(), "plain/path");
 
         assert_eq!(out["sources"], json!(["plain/path"]));
+    }
+
+    /// Mirrors the resolution expression in `execute`.
+    fn resolve(timeout: Option<u64>) -> Option<Duration> {
+        wall_clock(timeout.unwrap_or(DEFAULT_RAG_TIMEOUT_SECS))
+    }
+
+    #[test]
+    fn zero_timeout_resolves_to_no_bound() {
+        assert!(resolve(Some(0)).is_none());
+        assert_eq!(resolve(None), Some(Duration::from_secs(120)));
     }
 }

@@ -2,6 +2,11 @@ use super::{AbortSignal, IS_STDOUT_TERMINAL, poll_abort_signal, wait_abort_signa
 
 use anyhow::{Result, bail};
 use crossterm::{cursor, queue, style, terminal};
+#[cfg(test)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::{
     future::Future,
     io::{Write, stdout},
@@ -19,10 +24,21 @@ use tokio::{
 pub struct SpinnerInner {
     index: usize,
     message: String,
+    #[cfg(test)]
+    cleared: Option<Arc<AtomicUsize>>,
 }
 
 impl SpinnerInner {
     const DATA: [&'static str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+    #[cfg(test)]
+    fn observed(cleared: Arc<AtomicUsize>) -> Self {
+        Self {
+            index: 0,
+            message: String::new(),
+            cleared: Some(cleared),
+        }
+    }
 
     fn step(&mut self) -> Result<()> {
         if !*IS_STDOUT_TERMINAL || self.message.is_empty() {
@@ -50,10 +66,17 @@ impl SpinnerInner {
     }
 
     fn clear_message(&mut self) -> Result<()> {
-        if !*IS_STDOUT_TERMINAL || self.message.is_empty() {
+        if self.message.is_empty() {
             return Ok(());
         }
         self.message.clear();
+        #[cfg(test)]
+        if let Some(cleared) = &self.cleared {
+            cleared.fetch_add(1, Ordering::SeqCst);
+        }
+        if !*IS_STDOUT_TERMINAL {
+            return Ok(());
+        }
         let mut writer = stdout();
         queue!(
             writer,
@@ -63,6 +86,17 @@ impl SpinnerInner {
         )?;
         writer.flush()?;
         Ok(())
+    }
+}
+
+/// Restores the terminal when the spinner goes away by any route, not just the
+/// loop's normal exit: a future cancelled mid-spin (the surrounding task was
+/// aborted) or an early `?` return would otherwise leave the last frame on
+/// screen and the cursor hidden. `clear_message` is a no-op once the message
+/// is gone, so a normal-path clear leaves nothing for the drop to redo.
+impl Drop for SpinnerInner {
+    fn drop(&mut self) {
+        let _ = self.clear_message();
     }
 }
 
@@ -214,4 +248,66 @@ async fn run_abortable_spinner(
 
     spinner.clear_message()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observed(message: &str) -> (SpinnerInner, Arc<AtomicUsize>) {
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let mut spinner = SpinnerInner::observed(cleared.clone());
+        spinner.set_message(message.to_string()).unwrap();
+        (spinner, cleared)
+    }
+
+    #[test]
+    fn drop_with_active_message_clears_once() {
+        let (spinner, cleared) = observed("Thinking");
+        assert_eq!(cleared.load(Ordering::SeqCst), 0);
+        drop(spinner);
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn explicit_clear_then_drop_clears_exactly_once() {
+        let (mut spinner, cleared) = observed("Thinking");
+        spinner.clear_message().unwrap();
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+        drop(spinner);
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drop_without_message_is_silent() {
+        let (spinner, cleared) = observed("");
+
+        drop(spinner);
+
+        assert_eq!(cleared.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn set_message_replaces_and_clears_previous_once() {
+        let (mut spinner, cleared) = observed("Thinking");
+        spinner.set_message("Fetching".to_string()).unwrap();
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+        drop(spinner);
+        assert_eq!(cleared.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_restores_terminal_on_drop() {
+        let (spinner, cleared) = observed("Thinking");
+        let task = tokio::spawn(async move {
+            let _spinner = spinner;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(cleared.load(Ordering::SeqCst), 0);
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+    }
 }

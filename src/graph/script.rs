@@ -1,5 +1,6 @@
 use super::state::{StateManager, StateRepresentation};
 use super::types::ScriptNode;
+use super::wall_clock;
 use crate::config::paths;
 use crate::function::Language;
 use anyhow::{Context, Result, anyhow, bail};
@@ -8,7 +9,6 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -66,22 +66,25 @@ impl ScriptExecutor {
             }
         }
 
-        let timeout_dur = Duration::from_secs(node.timeout);
-        let output = timeout(timeout_dur, cmd.output())
-            .await
-            .with_context(|| {
-                format!(
-                    "Script '{}' timed out after {}s",
-                    script_path.display(),
-                    node.timeout
-                )
-            })?
-            .with_context(|| {
-                format!(
-                    "Failed to spawn script process for '{}'",
-                    script_path.display()
-                )
-            })?;
+        let bound = wall_clock(node.timeout);
+        let fut = cmd.output();
+        let output = match bound {
+            Some(d) => timeout(d, fut).await,
+            None => Ok(fut.await),
+        }
+        .with_context(|| {
+            format!(
+                "Script '{}' timed out after {}s",
+                script_path.display(),
+                node.timeout
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "Failed to spawn script process for '{}'",
+                script_path.display()
+            )
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -257,6 +260,33 @@ echo '{"quality": 0.85, "issues": 3, "_next": "approve"}'
         assert_eq!(state.state().get("quality"), Some(&json!(0.85)));
         assert_eq!(state.state().get("issues"), Some(&json!(3)));
         assert!(state.state().get("_next").is_none());
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_is_unbounded() {
+        if !cmd_available("bash") {
+            return;
+        }
+        let (dir, path) = write_script(
+            r#"#!/bin/bash
+sleep 1.5
+echo '{"ok":true}'
+"#,
+            "sh",
+        );
+        let mut state = StateManager::new(HashMap::new());
+        let executor = ScriptExecutor::new(&dir);
+
+        executor
+            .execute(
+                &node_for(path.file_name().unwrap().to_str().unwrap(), 0),
+                &mut state,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("zero timeout should not bound the script: {e:#}"));
+
+        assert_eq!(state.state().get("ok"), Some(&json!(true)));
         cleanup(&dir);
     }
 

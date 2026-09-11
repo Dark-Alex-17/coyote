@@ -18,6 +18,7 @@ use indexmap::IndexMap;
 use log::{debug, warn};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -535,18 +536,57 @@ pub async fn handle_agent_tool(
 }
 
 pub fn run_child_agent(
-    mut child_ctx: RequestContext,
+    child_ctx: RequestContext,
     initial_input: Input,
     abort_signal: AbortSignal,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
+    run_child_agent_with_graph_inputs(child_ctx, initial_input, abort_signal, None)
+}
+
+/// Stops a child agent's own spawned subagents if the future running the
+/// child is dropped mid-flight (parent timeout, abort) or the child fails
+/// before reaching its own cleanup. Disarmed on the success paths, which
+/// already cancel explicitly.
+struct CancelOnDrop(Option<Arc<RwLock<Supervisor>>>);
+
+impl CancelOnDrop {
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(supervisor) = self.0.take() {
+            supervisor.read().cancel_recursive();
+        }
+    }
+}
+
+/// Runs a child agent to completion. When the child is a graph agent,
+/// `graph_inputs` is overlaid on its `initial_state` before the graph
+/// starts. Passing inputs to a config-only agent is rejected before the
+/// child runs, since nothing could consume them.
+fn run_child_agent_with_graph_inputs(
+    mut child_ctx: RequestContext,
+    initial_input: Input,
+    abort_signal: AbortSignal,
+    graph_inputs: Option<HashMap<String, Value>>,
+) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
+        let mut cancel_on_drop = CancelOnDrop(child_ctx.supervisor.clone());
         if graph::active_agent_graph_name(&child_ctx).is_some() {
-            return graph::run_active_agent_graph(
+            let result = graph::run_active_agent_graph_with_inputs(
                 &mut child_ctx,
                 &initial_input.text(),
                 abort_signal,
+                graph_inputs,
             )
             .await;
+            if result.is_ok() {
+                cancel_on_drop.disarm();
+            }
+            return result;
         }
 
         let mut accumulated_output = String::new();
@@ -606,6 +646,7 @@ pub fn run_child_agent(
         if let Some(supervisor) = child_ctx.supervisor.clone() {
             supervisor.read().cancel_recursive();
         }
+        cancel_on_drop.disarm();
 
         Ok(accumulated_output)
     })
@@ -685,10 +726,13 @@ fn effective_max_agent_depth(parent_ctx: &RequestContext) -> usize {
 /// output. This is similar to `handle_spawn` but runs the child agent in the
 /// current task (no tokio::spawn, no supervisor handle registration) so the
 /// graph executor can sequence agent nodes directly.
+/// `graph_inputs` seeds the child's graph state and is only accepted when the
+/// target is a graph agent.
 pub async fn run_agent_for_graph(
     parent_ctx: &mut RequestContext,
     agent_name: &str,
     prompt: &str,
+    graph_inputs: Option<HashMap<String, Value>>,
 ) -> Result<String> {
     let peer_assignment = parent_ctx.peer_assignment.take();
     let assigned_peer = peer_assignment.is_some();
@@ -757,8 +801,22 @@ pub async fn run_agent_for_graph(
         Arc::clone(&child_inbox),
         agent_id.clone(),
     );
+    child_ctx.session_abort = parent_ctx.session_abort.clone();
     child_ctx.rag = agent.rag();
     child_ctx.agent = Some(agent);
+    if graph_inputs.is_some() && graph::active_agent_graph_name(&child_ctx).is_none() {
+        bail!(
+            "agent '{agent_name}' has no graph.yaml; `inputs:` is only valid on agent nodes that target a graph agent"
+        );
+    }
+    if graph_inputs
+        .as_ref()
+        .is_some_and(|inputs| inputs.contains_key("initial_prompt"))
+    {
+        bail!(
+            "agent '{agent_name}': `inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)"
+        );
+    }
     if assigned_peer {
         child_ctx.peer_registry = peer_registry.clone();
     }
@@ -786,13 +844,7 @@ pub async fn run_agent_for_graph(
 
     debug!("Spawning agent '{agent_name}' for graph node as '{agent_id}'");
 
-    let result = run_child_agent(child_ctx, input, child_abort).await;
-
-    if let Some(registry) = &peer_registry {
-        registry.mark_finished(&agent_id);
-    }
-
-    result
+    run_child_agent_with_graph_inputs(child_ctx, input, child_abort, graph_inputs).await
 }
 
 async fn populate_agent_mcp_runtime(ctx: &mut RequestContext, server_ids: &[String]) -> Result<()> {
@@ -1917,6 +1969,141 @@ mod tests {
 
         assert!(ctx.supervisor.is_none());
         assert_eq!(effective_max_agent_depth(&ctx), 5);
+    }
+
+    fn unique_agent_name(prefix: &str) -> String {
+        format!(
+            "{prefix}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    fn write_config_only_agent(agent_name: &str) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_graph_agent(agent_name: &str) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\nstart: done\nnodes:\n  done:\n    type: end\n    output: done\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn run_agent_for_graph_error(
+        agent_name: &str,
+        graph_inputs: Option<HashMap<String, Value>>,
+    ) -> String {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let err = run_async(run_agent_for_graph(
+            &mut ctx,
+            agent_name,
+            "hi",
+            graph_inputs,
+        ))
+        .expect_err("run_agent_for_graph should reject the inputs");
+        format!("{err:#}")
+    }
+
+    #[test]
+    #[serial]
+    fn run_agent_for_graph_rejects_inputs_for_config_only_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_inputs_plain_agent");
+        write_config_only_agent(&agent_name);
+
+        let chain = run_agent_for_graph_error(&agent_name, Some(HashMap::new()));
+
+        assert_eq!(
+            chain,
+            format!(
+                "agent '{agent_name}' has no graph.yaml; `inputs:` is only valid on agent nodes that target a graph agent"
+            )
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn run_agent_for_graph_rejects_initial_prompt_input_on_graph_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_inputs_graph_agent");
+        write_graph_agent(&agent_name);
+        let inputs = HashMap::from([("initial_prompt".to_string(), json!("x"))]);
+
+        let chain = run_agent_for_graph_error(&agent_name, Some(inputs));
+
+        assert_eq!(
+            chain,
+            format!(
+                "agent '{agent_name}': `inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)"
+            )
+        );
+    }
+
+    /// The child ctx must carry the parent's session flag: a session already
+    /// aborted before the child starts trips the child graph's own pre-check,
+    /// so it never reaches its (otherwise trivially successful) end node.
+    /// Without the inheritance the child sees `None` and returns "done".
+    #[test]
+    #[serial]
+    fn run_agent_for_graph_child_inherits_session_abort() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_session_abort_graph_agent");
+        write_graph_agent(&agent_name);
+        let session = create_abort_signal();
+        session.set_ctrlc();
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.session_abort = Some(Arc::clone(&session));
+
+        let err = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None))
+            .expect_err("the inherited session abort must end the child graph");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(&format!("Graph execution failed for agent '{agent_name}'")),
+            "{chain}"
+        );
+        assert!(chain.contains("aborted before super-step"), "{chain}");
+        assert!(
+            Arc::ptr_eq(ctx.session_abort.as_ref().unwrap(), &session),
+            "the parent's own session signal is untouched"
+        );
+    }
+
+    #[test]
+    fn cancel_on_drop_guard_cancels_when_armed_and_not_when_disarmed() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let armed_abort = register_running_agent(&mut ctx, "a1", "explore");
+            drop(CancelOnDrop(ctx.supervisor.clone()));
+            assert!(
+                armed_abort.aborted(),
+                "an armed guard cancels the supervisor's agents when dropped"
+            );
+
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let disarmed_abort = register_running_agent(&mut ctx, "a2", "explore");
+            let mut guard = CancelOnDrop(ctx.supervisor.clone());
+            guard.disarm();
+            drop(guard);
+            assert!(
+                !disarmed_abort.aborted(),
+                "a disarmed guard leaves the supervisor's agents running"
+            );
+        });
     }
 
     fn auto_continue_ctx() -> RequestContext {

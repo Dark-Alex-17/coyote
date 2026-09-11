@@ -320,6 +320,26 @@ pub(super) fn template_root_keys(template: &str) -> Vec<String> {
         .collect()
 }
 
+// Whether `s` is exactly one `{{key}}` reference and nothing else (after the
+// same trim `interpolate_raw` applies) whose path parses with the grammar
+// `get_nested_value` uses, so this accepts exactly the strings the runtime
+// can resolve as a pure reference.
+pub(super) fn is_lone_template(s: &str) -> bool {
+    let s = s.trim();
+    let Ok(Some(m)) = TEMPLATE_VAR_RE.captures(s) else {
+        return false;
+    };
+    let whole = m.get(0).expect("group 0 always present");
+    if whole.start() != 0 || whole.end() != s.len() {
+        return false;
+    }
+    let path = m.get(1).expect("template regex has one group").as_str();
+    let mut parts = path.split('.');
+    let first = parts.next().and_then(split_indices);
+    first.is_some_and(|(name, _)| !name.is_empty())
+        && parts.all(|part| split_indices(part).is_some())
+}
+
 fn value_to_string(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -929,6 +949,60 @@ mod tests {
         let result = manager.interpolate_raw("  {{k}}  ").unwrap();
 
         assert_eq!(result, json!("v"));
+    }
+
+    #[test]
+    fn is_lone_template_cases() {
+        for accepted in [
+            "{{budget}}",
+            "{{cfg.limits[0]}}",
+            "  {{budget}}  ",
+            "\n{{k}}\t",
+        ] {
+            assert!(
+                is_lone_template(accepted),
+                "{accepted:?} should be a lone template"
+            );
+        }
+        for rejected in [
+            "",
+            "4",
+            "{{}}",
+            "{{ key }}",
+            "n={{k}}",
+            "{{k}}x",
+            "{{a}} {{b",
+            "{{a}}{{b}}",
+            "{{a-b}}",
+            "{{k",
+        ] {
+            assert!(
+                !is_lone_template(rejected),
+                "{rejected:?} must not be a lone template"
+            );
+        }
+    }
+
+    #[test]
+    fn is_lone_template_matches_runtime_path_grammar() {
+        for accepted in [
+            "{{a.b[0][1].c}}",
+            "{{a[0][1]}}",
+            "{{a.}}",
+            "{{a..b}}",
+            "{{a.[0]}}",
+        ] {
+            assert!(
+                is_lone_template(accepted),
+                "{accepted:?} resolves at run time and must be accepted"
+            );
+        }
+        for rejected in ["{{limits[foo]}}", "{{a[]}}", "{{a[0}}", "{{.a}}"] {
+            assert!(
+                !is_lone_template(rejected),
+                "{rejected:?} never resolves at run time and must be rejected"
+            );
+        }
     }
 
     #[test]

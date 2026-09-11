@@ -633,6 +633,7 @@ impl Agent {
             Some(self.name().to_string()),
             tool_timeout,
             false,
+            None,
         )?;
         match value {
             Some(v) => Ok(v),

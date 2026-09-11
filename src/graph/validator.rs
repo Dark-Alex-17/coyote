@@ -1,5 +1,5 @@
-use super::state::template_root_keys;
-use super::types::{Graph, Node, NodeType};
+use super::state::{is_lone_template, template_root_keys};
+use super::types::{ConcurrencyCap, Graph, NextTargets, Node, NodeType};
 use crate::client::{Model, ModelType};
 use crate::config;
 use crate::config::{Agent, AppConfig, paths};
@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone)]
 pub struct ValidationError {
@@ -176,8 +177,10 @@ impl GraphValidator {
         self.validate_llm_nodes(graph, &mut result);
         self.validate_llm_skills(graph, &mut result);
         self.validate_max_concurrency(graph, &mut result);
+        self.validate_max_concurrency_template(graph, &mut result);
         self.validate_orchestration_limits(graph, &mut result);
-        self.validate_map_branches(graph, &mut result);
+        self.validate_timeouts(graph, &mut result);
+        self.validate_map_subgraphs(graph, &mut result);
         self.validate_parallel_user_interaction(graph, &mut result);
         self.validate_parallel_writes(graph, &mut result);
         self.validate_parallel_reads(graph, &mut result);
@@ -474,6 +477,34 @@ impl GraphValidator {
                             a.agent
                         ),
                     ));
+                } else if has_config && has_graph {
+                    result.error(ValidationError::with_node(
+                        node_id,
+                        format!(
+                            "Agent '{}' has both config.yaml and graph.yaml; a graph agent is \
+                             defined by graph.yaml alone. Remove one of the two files",
+                            a.agent
+                        ),
+                    ));
+                }
+                if let Some(inputs) = &a.inputs {
+                    if has_config && !has_graph {
+                        result.error(ValidationError::with_node(
+                            node_id,
+                            format!(
+                                "agent node '{node_id}': `inputs:` requires agent '{}' to be a graph agent (no graph.yaml found)",
+                                a.agent
+                            ),
+                        ));
+                    }
+                    if inputs.contains_key("initial_prompt") {
+                        result.error(ValidationError::with_node(
+                            node_id,
+                            format!(
+                                "agent node '{node_id}': `inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)"
+                            ),
+                        ));
+                    }
                 }
             }
         }
@@ -505,8 +536,8 @@ impl GraphValidator {
     // Parallel-execution validation.
     //
     // The v1 algorithm uses immediate-successor analysis only: a parallel group is the set of `next:` targets of a
-    // single fan-out node. Map nodes are checked separately by `validate_map_branches` (the branch is self-parallel,
-    // but enforcement comes from strict-mode rules on the branch node, not from group membership). Transitive parallel
+    // single fan-out node. Map branch subgraphs are checked separately by `validate_map_subgraphs` (per-item forks
+    // never race each other, so their nodes are not group members). Transitive parallel
     // groups (deeper fan-out chains) are a v2 enhancement; v1 over-reports rather than under-reports. A false positive
     // forces an unneeded reducer (mild annoyance); a false negative allows silent data races (catastrophic).
     fn validate_max_concurrency(&self, graph: &Graph, result: &mut ValidationResult) {
@@ -516,15 +547,50 @@ impl GraphValidator {
                  deadlock the executor",
             ));
         }
+        if graph.settings.max_concurrency > Semaphore::MAX_PERMITS {
+            result.error(ValidationError::new(format!(
+                "settings.max_concurrency must be <= {} (got {}); the runtime cannot allocate more permits",
+                Semaphore::MAX_PERMITS, graph.settings.max_concurrency
+            )));
+        }
 
         for (node_id, node) in &graph.nodes {
             if let NodeType::Map(m) = &node.node_type
-                && let Some(0) = m.max_concurrency
+                && let Some(ConcurrencyCap::Fixed(0)) = m.max_concurrency
             {
                 result.error(ValidationError::with_node(
                     node_id,
                     "map node's `max_concurrency` must be >= 1 (got 0); a zero cap \
                      would deadlock the executor",
+                ));
+            }
+            if let NodeType::Map(m) = &node.node_type
+                && let Some(ConcurrencyCap::Fixed(n)) = m.max_concurrency
+                && n > Semaphore::MAX_PERMITS
+            {
+                result.error(ValidationError::with_node(
+                    node_id,
+                    format!(
+                        "map node's `max_concurrency` must be <= {} (got {n}); the runtime cannot allocate more permits",
+                        Semaphore::MAX_PERMITS
+                    ),
+                ));
+            }
+        }
+    }
+
+    // A string cap that never interpolates would only fail at run time, after the
+    // map's inputs were already computed; catch the typo (`"4"` for `4`) at load.
+    fn validate_max_concurrency_template(&self, graph: &Graph, result: &mut ValidationResult) {
+        for (node_id, node) in &graph.nodes {
+            if let NodeType::Map(m) = &node.node_type
+                && let Some(ConcurrencyCap::Template(t)) = &m.max_concurrency
+                && !is_lone_template(t)
+            {
+                result.error(ValidationError::with_node(
+                    node_id,
+                    "map node's `max_concurrency` is a string but not a template; write \
+                     an integer or exactly one `{{key}}` with nothing around it",
                 ));
             }
         }
@@ -547,107 +613,196 @@ impl GraphValidator {
         }
     }
 
-    fn validate_map_branches(&self, graph: &Graph, result: &mut ValidationResult) {
+    /// Explicit `0` opt-outs on `settings` and node bounds: a `timeout: 0`
+    /// disables the wall-clock bound, `max_loop_iterations: 0` disables the
+    /// per-node visit cap, and an llm node's `max_iterations: 0` disables its
+    /// tool-call-loop turn cap. All are legal; the warnings only make the
+    /// choice visible.
+    fn validate_timeouts(&self, graph: &Graph, result: &mut ValidationResult) {
+        if graph.settings.max_loop_iterations == 0 {
+            result.warning(ValidationError::new(
+                "settings.max_loop_iterations: 0 disables the per-node visit cap; a \
+                 non-converging loop runs until an enclosing timeout or abort",
+            ));
+        }
+        if graph.settings.timeout == Some(0) {
+            result.warning(ValidationError::new(
+                "settings.timeout: 0 disables the graph wall-clock bound; the run \
+                 ends only when the graph completes, is aborted, or another \
+                 limit stops it",
+            ));
+        }
+        for (node_id, node) in &graph.nodes {
+            if let NodeType::Llm(l) = &node.node_type
+                && l.max_iterations == 0
+            {
+                result.warning(ValidationError::with_node(
+                    node_id,
+                    format!(
+                        "max_iterations: 0 disables the turn cap for llm node '{node_id}'; it runs \
+                         until the model concludes, the context window fills, an enclosing timeout, or abort"
+                    ),
+                ));
+            }
+            let kind = match &node.node_type {
+                NodeType::Agent(a) if a.timeout == Some(0) => "agent",
+                NodeType::Script(s) if s.timeout == 0 => "script",
+                NodeType::Llm(l) if l.timeout == Some(0) => "llm",
+                NodeType::Rag(r) if r.timeout == Some(0) => "rag",
+                _ => continue,
+            };
+            result.warning(ValidationError::with_node(
+                node_id,
+                format!(
+                    "timeout: 0 disables the wall-clock bound for {kind} node \
+                     '{node_id}'; it runs until it returns or an enclosing bound \
+                     (settings.timeout, an outer agent node's timeout, or abort) ends it"
+                ),
+            ));
+        }
+    }
+
+    /// Rules for the per-item subgraph rooted at each map's `branch`. Every
+    /// error is attributed to the map node; the offending branch node is
+    /// named in the message.
+    fn validate_map_subgraphs(&self, graph: &Graph, result: &mut ValidationResult) {
+        let main_flow = main_flow_reachable(graph);
+
         for (map_id, node) in &graph.nodes {
             let NodeType::Map(m) = &node.node_type else {
                 continue;
             };
-            let Some(branch) = graph.get_node(&m.branch) else {
+            if m.as_name == m.output_key {
+                result.error(ValidationError::with_node(
+                    map_id,
+                    format!(
+                        "map node '{map_id}': `as` and `output_key` are both '{}'; the item \
+                         binding would be collected as the chain's result",
+                        m.as_name
+                    ),
+                ));
+            }
+            // A missing entry is reported by `validate_node_references`.
+            let mut member_ids: Vec<String> =
+                branch_subgraph(graph, &m.branch).into_iter().collect();
+            if member_ids.is_empty() {
                 continue;
-            };
+            }
+            member_ids.sort();
+            let members: Vec<(&str, &Node)> = member_ids
+                .iter()
+                .filter_map(|id| graph.get_node(id).map(|n| (id.as_str(), n)))
+                .collect();
 
-            match &branch.node_type {
-                NodeType::Approval(_) => {
+            let fallback_targets: HashSet<&str> = members
+                .iter()
+                .filter_map(|(_, n)| match &n.node_type {
+                    NodeType::Script(s) => s.fallback.as_deref(),
+                    NodeType::Llm(l) => l.fallback.as_deref(),
+                    _ => None,
+                })
+                .collect();
+
+            let mut has_disallowed_node = false;
+            for (id, member) in &members {
+                let disallowed = match &member.node_type {
+                    NodeType::Approval(_) => Some(
+                        "an approval node; approval/input nodes cannot run inside a parallel \
+                         map branch (the CLI would prompt the user N times concurrently)",
+                    ),
+                    NodeType::Input(_) => {
+                        Some("an input node; input nodes cannot run inside a parallel map branch")
+                    }
+                    NodeType::End(_) => Some(
+                        "an end node; map branches terminate via the map's collect \
+                         mechanism, not via end nodes",
+                    ),
+                    NodeType::Map(_) => {
+                        Some("itself a map node; nested map fan-outs are not supported in v1")
+                    }
+                    NodeType::Agent(_)
+                    | NodeType::Llm(_)
+                    | NodeType::Rag(_)
+                    | NodeType::Script(_) => None,
+                };
+                if let Some(reason) = disallowed {
+                    has_disallowed_node = true;
+                    let mut message = if *id == m.branch {
+                        format!("map node points to branch '{id}' which is {reason}")
+                    } else {
+                        format!(
+                            "map node's branch subgraph (entry '{}') reaches '{id}', which is \
+                             {reason}",
+                            m.branch
+                        )
+                    };
+                    if fallback_targets.contains(id) {
+                        message.push_str(
+                            "; a branch's `fallback` must stay inside the branch subgraph; \
+                             `fallback` on a map branch was previously accepted but \
+                             never honored. Remove it or point it at a branch-local node",
+                        );
+                    }
+                    result.error(ValidationError::with_node(map_id, message));
+                }
+
+                if member.next.as_ref().is_some_and(NextTargets::is_fan_out) {
                     result.error(ValidationError::with_node(
                         map_id,
                         format!(
-                            "map node points to branch '{}' which is an approval node; \
-                             approval/input nodes cannot run inside a parallel map branch \
-                             (the CLI would prompt the user N times concurrently)",
+                            "node '{id}' inside the branch subgraph (entry '{}') declares a \
+                             fan-out `next`; fan-out inside a map branch is not supported in \
+                             v1; use a nested map after the join",
                             m.branch
                         ),
                     ));
-                    continue;
                 }
-                NodeType::Input(_) => {
-                    result.error(ValidationError::with_node(
-                        map_id,
-                        format!(
-                            "map node points to branch '{}' which is an input node; \
-                             input nodes cannot run inside a parallel map branch",
-                            m.branch
-                        ),
-                    ));
-                    continue;
-                }
-                NodeType::End(_) => {
-                    result.error(ValidationError::with_node(
-                        map_id,
-                        format!(
-                            "map node points to branch '{}' which is an end node; \
-                             map branches terminate via the map's collect mechanism, \
-                             not via end nodes",
-                            m.branch
-                        ),
-                    ));
-                    continue;
-                }
-                NodeType::Map(_) => {
-                    result.error(ValidationError::with_node(
-                        map_id,
-                        format!(
-                            "map node points to branch '{}' which is itself a map node; \
-                             nested map fan-outs are not supported in v1",
-                            m.branch
-                        ),
-                    ));
-                    continue;
-                }
-                _ => {}
             }
 
-            if branch.next.is_some() {
+            let shared: Vec<&str> = members
+                .iter()
+                .filter(|(id, _)| main_flow.contains(*id))
+                .map(|(id, _)| *id)
+                .collect();
+            if !shared.is_empty() {
                 result.error(ValidationError::with_node(
-                    m.branch.clone(),
+                    map_id,
                     format!(
-                        "branch node '{}' has a `next` declared, but map branches must be \
-                         atomic (one node, one execution per item). Remove `next` or \
-                         restructure the workflow so any chaining happens after the map.",
-                        m.branch
+                        "branch subgraph (entry '{}') shares node(s) [{}] with the main flow \
+                         (reachable from start '{}' without entering a map branch); a branch \
+                         node that is also on the main path would run standalone without the \
+                         `as` binding and could route into the branch mid-chain. Give the \
+                         branch its own nodes, or move the shared step after the map.",
+                        m.branch,
+                        shared.join(", "),
+                        graph.start
                     ),
                 ));
             }
 
-            if let Some(updates) = node_state_updates_keys(branch) {
-                for k in &updates {
-                    if k != &m.output_key {
-                        result.error(ValidationError::with_node(
-                            m.branch.clone(),
-                            format!(
-                                "branch node '{}' writes state key '{}' via state_updates, \
-                                 but map branches may only write through their `output_key` \
-                                 ('{}'). Rename the write, or move the side effect outside \
-                                 the map.",
-                                m.branch, k, m.output_key
-                            ),
-                        ));
-                    }
-                }
+            if has_disallowed_node {
+                continue;
             }
 
-            let schema_keys = output_schema_top_level_keys(branch);
-            if !schema_keys.is_empty() {
-                let mut keys_sorted: Vec<String> = schema_keys.into_iter().collect();
-                keys_sorted.sort();
-                result.error(ValidationError::with_node(
-                    m.branch.clone(),
+            // A script may write any key through its JSON output, so its
+            // presence makes the subgraph's write set unknowable.
+            let has_script = members
+                .iter()
+                .any(|(_, n)| matches!(n.node_type, NodeType::Script(_)));
+            if has_script {
+                continue;
+            }
+            let declares_output_key = members.iter().any(|(_, n)| {
+                node_state_updates_keys(n).is_some_and(|keys| keys.contains(&m.output_key))
+                    || output_schema_top_level_keys(n).contains(&m.output_key)
+            });
+            if !declares_output_key {
+                result.warning(ValidationError::with_node(
+                    map_id,
                     format!(
-                        "branch node '{}' has an `output_schema` with top-level \
-                         properties ({}); map branches must write only through their \
-                         `output_key` ('{}'). Remove `output_schema`, or use state_updates \
-                         to map the output explicitly.",
-                        m.branch,
-                        keys_sorted.join(", "),
+                        "no node in the branch subgraph of map '{map_id}' declares a write to \
+                         output_key '{}'; the map will error at runtime if the chain does not \
+                         write it",
                         m.output_key
                     ),
                 ));
@@ -844,9 +999,83 @@ fn find_reachable_nodes(graph: &Graph) -> HashSet<String> {
     reachable
 }
 
+/// Nodes reachable from the start node without entering any map's branch:
+/// the path the frontier itself walks. A map node contributes only its
+/// `next` edges here, so per-item subgraphs can be checked for overlap
+/// with the main flow.
+fn main_flow_reachable(graph: &Graph) -> HashSet<String> {
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+
+    if !graph.has_node(&graph.start) {
+        return reachable;
+    }
+
+    reachable.insert(graph.start.clone());
+    queue.push_back(graph.start.clone());
+
+    while let Some(id) = queue.pop_front() {
+        let Some(node) = graph.get_node(&id) else {
+            continue;
+        };
+        let edges: Vec<String> = match &node.node_type {
+            NodeType::Map(_) => node
+                .next
+                .as_ref()
+                .map(|t| t.as_slice().to_vec())
+                .unwrap_or_default(),
+            _ => outgoing_node_ids(node),
+        };
+        for next in edges {
+            if graph.has_node(&next) && reachable.insert(next.clone()) {
+                queue.push_back(next);
+            }
+        }
+    }
+    reachable
+}
+
+/// Nodes reachable from `entry` over the edges a chain can follow at run
+/// time: `next` targets and script/llm `fallback`s. Approval routes and a
+/// nested map's `branch` are not followed. Neither may appear inside a
+/// branch, and the validator reports them separately.
+pub(super) fn branch_subgraph(graph: &Graph, entry: &str) -> HashSet<String> {
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+
+    if !graph.has_node(entry) {
+        return reachable;
+    }
+
+    reachable.insert(entry.to_string());
+    queue.push_back(entry.to_string());
+
+    while let Some(id) = queue.pop_front() {
+        let Some(node) = graph.get_node(&id) else {
+            continue;
+        };
+        let mut edges: Vec<&String> = node
+            .next
+            .as_ref()
+            .map(|t| t.as_slice().iter().collect())
+            .unwrap_or_default();
+        match &node.node_type {
+            NodeType::Script(s) => edges.extend(s.fallback.as_ref()),
+            NodeType::Llm(l) => edges.extend(l.fallback.as_ref()),
+            _ => {}
+        }
+        for next in edges {
+            if graph.has_node(next) && reachable.insert(next.clone()) {
+                queue.push_back(next.clone());
+            }
+        }
+    }
+    reachable
+}
+
 // v1 parallel-group detection: only the immediate `next` targets of a fan-out node count as a parallel group. Map
-// branches are handled separately by `validate_map_branches` (the branch's self-parallelism is checked via strict-mode
-// rules on the branch node itself, not via group membership).
+// branch subgraphs are handled separately by `validate_map_subgraphs` (per-item forks never race each other, so
+// their nodes are not group members).
 //
 // Returns one HashSet per fan-out source; deeper transitive parallelism is intentionally out of scope for v1.
 fn compute_parallel_groups(graph: &Graph) -> Vec<HashSet<String>> {
@@ -923,7 +1152,13 @@ fn primary_templated_fields(node: &Node) -> Vec<String> {
             }
             v
         }
-        NodeType::Agent(n) => vec![n.prompt.clone()],
+        NodeType::Agent(n) => {
+            let mut v = vec![n.prompt.clone()];
+            if let Some(inputs) = &n.inputs {
+                v.extend(inputs.values().cloned());
+            }
+            v
+        }
         NodeType::Rag(n) => {
             vec![
                 n.query
@@ -940,7 +1175,13 @@ fn primary_templated_fields(node: &Node) -> Vec<String> {
             v
         }
         NodeType::End(n) => vec![n.output.clone()],
-        NodeType::Map(n) => vec![n.over.clone()],
+        NodeType::Map(n) => {
+            let mut v = vec![n.over.clone()];
+            if let Some(ConcurrencyCap::Template(t)) = &n.max_concurrency {
+                v.push(t.clone());
+            }
+            v
+        }
         NodeType::Script(_) => Vec::new(),
     }
 }
@@ -1026,9 +1267,14 @@ fn detect_cycle_dfs(
 mod tests {
     use super::super::types::*;
     use super::*;
+    use crate::utils::get_env_name;
     use indexmap::IndexMap;
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn graph_with(nodes: Vec<(&str, Node)>, start: &str) -> Graph {
         let mut map: IndexMap<String, Node> = IndexMap::new();
@@ -1658,6 +1904,7 @@ mod tests {
                 state_updates: None,
                 output_schema: None,
                 timeout: None,
+                inputs: None,
                 teammates: false,
             }),
             next: next.map(NextTargets::from),
@@ -2433,7 +2680,31 @@ mod tests {
     }
 
     #[test]
-    fn map_branch_cannot_have_next_declared() {
+    fn map_branch_with_in_subgraph_next_passes() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, Some("br2"));
+        let br2 = llm_with_state_updates("br2", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("br2", br2),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.is_empty(),
+            "a branch chaining to a node inside its own subgraph is valid: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_branch_next_to_end_node_errors() {
         let map = map_node_basic("m", "br", Some("end"));
         let branch = llm_with_state_updates("br", &[("output", "{{output}}")], Some("somewhere"));
         let graph = graph_with(
@@ -2452,10 +2723,38 @@ mod tests {
             result
                 .errors
                 .iter()
-                .any(|e| e.message.contains("has a `next` declared")
-                    && e.message.contains("atomic")
-                    && e.node_id.as_deref() == Some("br")),
-            "expected branch-has-next error: {:?}",
+                .any(|e| e.message.contains("'somewhere'")
+                    && e.message.contains("end node")
+                    && e.message.contains("collect mechanism")
+                    && !e.message.contains("never honored")
+                    && e.node_id.as_deref() == Some("m")),
+            "expected end-node-in-subgraph error attributed to the map: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_branch_next_escaping_to_main_flow_errors() {
+        let map = map_node_basic("m", "br", Some("after"));
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], Some("after"));
+        let after = llm_node("after", None, Some("end"));
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("after", after),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("main flow")
+                && e.message.contains("[after")
+                && e.node_id.as_deref() == Some("m")),
+            "expected shared-with-main-flow error naming 'after': {:?}",
             result.errors
         );
     }
@@ -2481,7 +2780,7 @@ mod tests {
     }
 
     #[test]
-    fn map_branch_state_updates_wrong_key_errors() {
+    fn map_branch_state_updates_scratch_key_passes() {
         let map = map_node_basic("m", "br", Some("end"));
         let branch = llm_with_state_updates("br", &[("not_output", "{{output}}")], None);
         let graph = graph_with(
@@ -2492,19 +2791,14 @@ mod tests {
         let result = validator().validate(&graph);
 
         assert!(
-            result
-                .errors
-                .iter()
-                .any(|e| e.message.contains("writes state key 'not_output'")
-                    && e.message.contains("'output'")
-                    && e.node_id.as_deref() == Some("br")),
-            "expected wrong-key error: {:?}",
+            result.errors.is_empty(),
+            "branch-local scratch writes are allowed: {:?}",
             result.errors
         );
     }
 
     #[test]
-    fn map_branch_with_output_schema_errors() {
+    fn map_branch_with_output_schema_passes() {
         let map = map_node_basic("m", "br", Some("end"));
         let branch = llm_with_output_schema("br", &["foo", "bar"], None);
         let graph = graph_with(
@@ -2515,15 +2809,306 @@ mod tests {
         let result = validator().validate(&graph);
 
         assert!(
-            result
-                .errors
-                .iter()
-                .any(|e| e.message.contains("output_schema")
-                    && e.message.contains("top-level properties")
-                    && e.node_id.as_deref() == Some("br")),
-            "expected output_schema-forbidden error: {:?}",
+            result.errors.is_empty(),
+            "an output_schema on a branch node is allowed: {:?}",
             result.errors
         );
+    }
+
+    #[test]
+    fn map_branch_disallowed_node_reached_via_fallback_gets_hint() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", Some("end"), None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("'end'")
+                && e.message.contains("end node")
+                && e.message.contains("never honored")
+                && e.node_id.as_deref() == Some("m")),
+            "expected end-node error with the fallback hint: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_branch_deep_approval_node_errors_on_the_map() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, Some("gate"));
+        let gate = approval_node("gate", &["yes"], &[("yes", "end")], "end");
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("gate", gate),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("'gate'")
+                && e.message.contains("approval node")
+                && e.message.contains("map branch")
+                && e.node_id.as_deref() == Some("m")),
+            "expected deep approval error attributed to the map: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_branch_fan_out_inside_subgraph_errors() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let mut branch = llm_node("br", None, None);
+        branch.next = Some(NextTargets::Many(vec!["x".into(), "y".into()]));
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("x", llm_node("x", None, None)),
+                ("y", llm_node("y", None, None)),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("'br'")
+                && e.message.contains("fan-out inside a map branch")
+                && e.node_id.as_deref() == Some("m")),
+            "expected fan-out-in-branch error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_branch_sharing_node_with_main_flow_errors() {
+        let mut start = llm_node("s", None, None);
+        start.next = Some(NextTargets::Many(vec!["m".into(), "shared".into()]));
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, Some("shared"));
+        let shared = llm_with_state_updates("shared", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![
+                ("s", start),
+                ("m", map),
+                ("br", branch),
+                ("shared", shared),
+                ("end", end_node("end")),
+            ],
+            "s",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("main flow")
+                && e.message.contains("[shared]")
+                && e.node_id.as_deref() == Some("m")),
+            "expected shared-node error naming only 'shared': {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn two_maps_sharing_a_subgraph_pass() {
+        let first = map_node_basic("m1", "br", Some("m2"));
+        let second = map_node_basic("m2", "br", Some("end"));
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![
+                ("m1", first),
+                ("m2", second),
+                ("br", branch),
+                ("end", end_node("end")),
+            ],
+            "m1",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.is_empty(),
+            "two maps may share a branch subgraph: {:?}",
+            result.errors
+        );
+    }
+
+    fn output_key_warnings(result: &ValidationResult) -> Vec<&ValidationError> {
+        result
+            .warnings
+            .iter()
+            .filter(|w| w.message.contains("declares a write to output_key"))
+            .collect()
+    }
+
+    #[test]
+    fn map_branch_without_declared_output_writer_warns() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let warnings = output_key_warnings(&result);
+        assert_eq!(warnings.len(), 1, "{:?}", result.warnings);
+        assert_eq!(warnings[0].node_id.as_deref(), Some("m"));
+        assert!(
+            warnings[0]
+                .message
+                .contains("branch subgraph of map 'm' declares a write to output_key 'output'"),
+            "{}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    fn map_branch_script_in_subgraph_suppresses_missing_writer_warning() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, Some("finish"));
+        let finish = script_node("finish", "Cargo.toml", None);
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("finish", finish),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            output_key_warnings(&result).is_empty(),
+            "a script anywhere in the subgraph may write the key: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn map_branch_state_updates_deeper_in_chain_suppress_missing_writer_warning() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, Some("br2"));
+        let br2 = llm_with_state_updates("br2", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("br2", br2),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            output_key_warnings(&result).is_empty(),
+            "state_updates naming output_key anywhere in the chain is a declared write: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn map_branch_output_schema_naming_output_key_suppresses_missing_writer_warning() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_with_output_schema("br", &["output", "notes"], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            output_key_warnings(&result).is_empty(),
+            "an output_schema property naming output_key is a declared write: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn map_branch_three_node_chain_validates_clean() {
+        let map = map_node_basic("m", "a", Some("end"));
+        let a = llm_node("a", None, Some("b"));
+        let b = llm_with_state_updates("b", &[("draft", "{{output}}")], Some("c"));
+        let c = llm_with_state_updates("c", &[("output", "{{draft}}")], None);
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("a", a),
+                ("b", b),
+                ("c", c),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            output_key_warnings(&result).is_empty(),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn main_flow_reachable_does_not_enter_map_branches() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", None, Some("br2"));
+        let br2 = llm_node("br2", Some("end"), None);
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("br2", br2),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        assert_eq!(ids(&main_flow_reachable(&graph)), vec!["end", "m"]);
+        assert_eq!(
+            ids(&find_reachable_nodes(&graph)),
+            vec!["br", "br2", "end", "m"]
+        );
+    }
+
+    #[test]
+    fn main_flow_reachable_follows_approval_routes() {
+        let gate = approval_node("gate", &["yes"], &[("yes", "m")], "end");
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![
+                ("gate", gate),
+                ("m", map),
+                ("br", branch),
+                ("end", end_node("end")),
+            ],
+            "gate",
+        );
+
+        assert_eq!(ids(&main_flow_reachable(&graph)), vec!["end", "gate", "m"]);
     }
 
     #[test]
@@ -2603,6 +3188,24 @@ mod tests {
     }
 
     #[test]
+    fn settings_max_concurrency_above_semaphore_limit_errors() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.settings.max_concurrency = Semaphore::MAX_PERMITS + 1;
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains(&format!(
+                "settings.max_concurrency must be <= {} (got {})",
+                Semaphore::MAX_PERMITS,
+                Semaphore::MAX_PERMITS + 1
+            ))),
+            "expected graph-level max_concurrency upper-bound error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
     fn settings_max_concurrency_default_is_valid() {
         let graph = graph_with(vec![("e", end_node("e"))], "e");
 
@@ -2669,11 +3272,272 @@ mod tests {
         );
     }
 
+    fn timeout_warnings(result: &ValidationResult) -> Vec<&ValidationError> {
+        result
+            .warnings
+            .iter()
+            .filter(|w| w.message.contains("disables the"))
+            .collect()
+    }
+
+    #[test]
+    fn settings_timeout_zero_warns() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.settings.timeout = Some(0);
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid());
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id, None);
+        assert_eq!(
+            w[0].message,
+            "settings.timeout: 0 disables the graph wall-clock bound; the run ends only when \
+             the graph completes, is aborted, or another limit stops it"
+        );
+    }
+
+    #[test]
+    fn agent_timeout_zero_warns() {
+        let mut a = agent_node("a", "worker", Some("end"));
+        if let NodeType::Agent(ref mut an) = a.node_type {
+            an.timeout = Some(0);
+        }
+        let graph = graph_with(vec![("a", a), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id.as_deref(), Some("a"));
+        assert_eq!(
+            w[0].message,
+            "timeout: 0 disables the wall-clock bound for agent node 'a'; it runs until it returns \
+             or an enclosing bound (settings.timeout, an outer agent node's timeout, or abort) ends it"
+        );
+    }
+
+    #[test]
+    fn script_timeout_zero_warns() {
+        let mut s = script_node("s", "does-not-exist.py", None);
+        if let NodeType::Script(ref mut sn) = s.node_type {
+            sn.timeout = 0;
+        }
+        s.next = Some("end".into());
+        let graph = graph_with(vec![("s", s), ("end", end_node("end"))], "s");
+
+        let result = validator().validate(&graph);
+
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id.as_deref(), Some("s"));
+        assert_eq!(
+            w[0].message,
+            "timeout: 0 disables the wall-clock bound for script node 's'; it runs until it returns \
+             or an enclosing bound (settings.timeout, an outer agent node's timeout, or abort) ends it"
+        );
+    }
+
+    #[test]
+    fn llm_timeout_zero_warns() {
+        let mut l = llm_node("l", None, Some("end"));
+        if let NodeType::Llm(ref mut ln) = l.node_type {
+            ln.timeout = Some(0);
+        }
+        let graph = graph_with(vec![("l", l), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id.as_deref(), Some("l"));
+        assert_eq!(
+            w[0].message,
+            "timeout: 0 disables the wall-clock bound for llm node 'l'; it runs until it returns \
+             or an enclosing bound (settings.timeout, an outer agent node's timeout, or abort) ends it"
+        );
+    }
+
+    #[test]
+    fn rag_timeout_zero_warns() {
+        let mut r = rag_node("r", &["docs/"], true);
+        if let NodeType::Rag(ref mut rn) = r.node_type {
+            rn.timeout = Some(0);
+        }
+        let graph = graph_with(vec![("r", r), ("end", end_node("end"))], "r");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id.as_deref(), Some("r"));
+        assert_eq!(
+            w[0].message,
+            "timeout: 0 disables the wall-clock bound for rag node 'r'; it runs until it returns \
+             or an enclosing bound (settings.timeout, an outer agent node's timeout, or abort) ends it"
+        );
+    }
+
+    #[test]
+    fn nonzero_and_unset_timeouts_do_not_warn() {
+        let mut a = agent_node("a", "worker", Some("s"));
+        if let NodeType::Agent(ref mut an) = a.node_type {
+            an.timeout = Some(600);
+        }
+        let mut s = script_node("s", "does-not-exist.py", None);
+        s.next = Some("l".into());
+        let l = llm_node("l", None, Some("end"));
+        let mut graph = graph_with(
+            vec![("a", a), ("s", s), ("l", l), ("end", end_node("end"))],
+            "a",
+        );
+        graph.settings.timeout = Some(30);
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            timeout_warnings(&result).is_empty(),
+            "non-zero and unset timeouts should not warn: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn max_loop_iterations_zero_warns() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.settings.max_loop_iterations = 0;
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid());
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert!(w[0].node_id.is_none());
+        assert_eq!(
+            w[0].message,
+            "settings.max_loop_iterations: 0 disables the per-node visit cap; a non-converging \
+             loop runs until an enclosing timeout or abort"
+        );
+    }
+
+    #[test]
+    fn max_loop_iterations_nonzero_does_not_warn() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.settings.max_loop_iterations = 5;
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("max_loop_iterations: 0")),
+            "non-zero cap should not warn: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn llm_max_iterations_zero_warns() {
+        let mut l = llm_node("l", None, Some("end"));
+        if let NodeType::Llm(ref mut ln) = l.node_type {
+            ln.max_iterations = 0;
+        }
+        let graph = graph_with(vec![("l", l), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id.as_deref(), Some("l"));
+        assert_eq!(
+            w[0].message,
+            "max_iterations: 0 disables the turn cap for llm node 'l'; it runs until the model \
+             concludes, the context window fills, an enclosing timeout, or abort"
+        );
+    }
+
+    #[test]
+    fn llm_max_iterations_nonzero_does_not_warn() {
+        let graph = graph_with(
+            vec![
+                ("l", llm_node("l", None, Some("end"))),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("max_iterations: 0")),
+            "non-zero cap should not warn: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn llm_zero_cap_and_zero_timeout_warn_in_order() {
+        let mut l = llm_node("l", None, Some("end"));
+        if let NodeType::Llm(ref mut ln) = l.node_type {
+            ln.max_iterations = 0;
+            ln.timeout = Some(0);
+        }
+        let graph = graph_with(vec![("l", l), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+        let w = timeout_warnings(&result);
+        assert_eq!(w.len(), 2, "{:?}", result.warnings);
+        assert!(
+            w[0].message
+                .starts_with("max_iterations: 0 disables the turn cap")
+        );
+        assert!(
+            w[1].message
+                .starts_with("timeout: 0 disables the wall-clock bound")
+        );
+        assert_eq!(w[0].node_id.as_deref(), Some("l"));
+        assert_eq!(w[1].node_id.as_deref(), Some("l"));
+    }
+
+    #[test]
+    fn map_max_concurrency_above_semaphore_limit_errors() {
+        let mut map = map_node_basic("m", "br", Some("end"));
+        if let NodeType::Map(ref mut mm) = map.node_type {
+            mm.max_concurrency = Some(ConcurrencyCap::Fixed(Semaphore::MAX_PERMITS + 1));
+        }
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e
+                .message
+                .contains(&format!("must be <= {}", Semaphore::MAX_PERMITS))
+                && e.node_id.as_deref() == Some("m")),
+            "expected map max_concurrency upper-bound error: {:?}",
+            result.errors
+        );
+    }
+
     #[test]
     fn map_max_concurrency_zero_errors() {
         let mut map = map_node_basic("m", "br", Some("end"));
         if let NodeType::Map(ref mut mm) = map.node_type {
-            mm.max_concurrency = Some(0);
+            mm.max_concurrency = Some(ConcurrencyCap::Fixed(0));
         }
         let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
         let graph = graph_with(
@@ -2710,6 +3574,226 @@ mod tests {
                 .iter()
                 .any(|e| e.message.contains("max_concurrency")),
             "map without max_concurrency should not error: {:?}",
+            result.errors
+        );
+    }
+
+    fn map_with_cap(id: &str, branch: &str, next: Option<&str>, cap: &str) -> Node {
+        let mut map = map_node_basic(id, branch, next);
+        if let NodeType::Map(ref mut mm) = map.node_type {
+            mm.max_concurrency = Some(ConcurrencyCap::Template(cap.into()));
+        }
+        map
+    }
+
+    fn map_with_as(id: &str, branch: &str, next: Option<&str>, as_name: &str) -> Node {
+        let mut map = map_node_basic(id, branch, next);
+        if let NodeType::Map(ref mut mm) = map.node_type {
+            mm.as_name = as_name.into();
+        }
+        map
+    }
+
+    #[test]
+    fn map_as_equal_output_key_errors() {
+        let map = map_with_as("m", "br", Some("end"), "output");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message
+                == "map node 'm': `as` and `output_key` are both 'output'; the item binding \
+                    would be collected as the chain's result"
+                && e.node_id.as_deref() == Some("m")),
+            "expected as/output_key collision error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_as_distinct_from_output_key_passes() {
+        let map = map_with_as("m", "br", Some("end"), "item");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("`as` and `output_key`")),
+            "distinct as/output_key must not error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_max_concurrency_non_template_string_errors() {
+        let map = map_with_cap("m", "br", Some("end"), "4");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e
+                .message
+                .contains("`max_concurrency` is a string but not a template")
+                && e.node_id.as_deref() == Some("m")),
+            "expected non-template string cap error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_max_concurrency_template_string_is_valid() {
+        let map = map_with_cap("m", "br", Some("end"), "{{k}}");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("max_concurrency")),
+            "templated cap should not error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_max_concurrency_unclosed_template_errors() {
+        let map = map_with_cap("m", "br", Some("end"), "{{k");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("is a string but not a template")),
+            "expected unclosed-template cap error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_max_concurrency_malformed_templates_error() {
+        for cap in ["{{}}", "{{ key }}", "n={{k}}", "{{a}} {{b", "{{a-b}}"] {
+            let map = map_with_cap("m", "br", Some("end"), cap);
+            let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+            let graph = graph_with(
+                vec![("m", map), ("br", branch), ("end", end_node("end"))],
+                "m",
+            );
+
+            let result = validator().validate(&graph);
+
+            assert!(
+                result.errors.iter().any(|e| e.message
+                    == "map node's `max_concurrency` is a string but not a template; write \
+                        an integer or exactly one `{{key}}` with nothing around it"
+                    && e.node_id.as_deref() == Some("m")),
+                "cap {cap:?} should fail the whole-string template check: {:?}",
+                result.errors
+            );
+        }
+    }
+
+    #[test]
+    fn map_max_concurrency_non_numeric_index_errors() {
+        let map = map_with_cap("m", "br", Some("end"), "{{limits[foo]}}");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message
+                == "map node's `max_concurrency` is a string but not a template; write \
+                    an integer or exactly one `{{key}}` with nothing around it"
+                && e.node_id.as_deref() == Some("m")),
+            "a non-numeric index can never resolve and must fail at load: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_max_concurrency_lone_template_forms_pass() {
+        for cap in ["{{budget}}", "{{cfg.limits[0]}}", "  {{budget}}  "] {
+            let map = map_with_cap("m", "br", Some("end"), cap);
+            let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+            let graph = graph_with(
+                vec![("m", map), ("br", branch), ("end", end_node("end"))],
+                "m",
+            );
+
+            let result = validator().validate(&graph);
+
+            assert!(
+                !result
+                    .errors
+                    .iter()
+                    .any(|e| e.message.contains("is a string but not a template")),
+                "cap {cap:?} is a lone template and must pass: {:?}",
+                result.errors
+            );
+        }
+    }
+
+    #[test]
+    fn map_max_concurrency_template_reading_sibling_write_errors() {
+        let mut start = end_node("start");
+        start.next = Some(NextTargets::Many(vec!["m".into(), "worker_b".into()]));
+        let map = map_with_cap("m", "br", Some("end"), "{{summary}}");
+        let branch = llm_with_state_updates("br", &[("output", "{{output}}")], None);
+        let writer = llm_with_state_updates("worker_b", &[("summary", "static")], Some("end"));
+        let graph = graph_with(
+            vec![
+                ("start", start),
+                ("m", map),
+                ("br", branch),
+                ("worker_b", writer),
+                ("end", end_node("end")),
+            ],
+            "start",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("reads state key(s) `summary`")
+                    && e.message.contains("'worker_b'")
+                    && e.node_id.as_deref() == Some("m")),
+            "expected cross-branch read error for templated cap: {:?}",
             result.errors
         );
     }
@@ -2848,5 +3932,294 @@ mod tests {
             "expected cross-branch read error for map `over` reading sibling write: {:?}",
             result.errors
         );
+    }
+
+    struct TestConfigDirGuard {
+        key: String,
+        previous: Option<std::ffi::OsString>,
+        path: PathBuf,
+    }
+
+    impl TestConfigDirGuard {
+        fn new() -> Self {
+            let key = get_env_name("config_dir");
+            let previous = env::var_os(&key);
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!("coyote-graph-validator-tests-{unique}"));
+            fs::create_dir_all(&path).unwrap();
+            unsafe {
+                env::set_var(&key, &path);
+            }
+            Self {
+                key,
+                previous,
+                path,
+            }
+        }
+    }
+
+    impl Drop for TestConfigDirGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                unsafe {
+                    env::set_var(&self.key, previous);
+                }
+            } else {
+                unsafe {
+                    env::remove_var(&self.key);
+                }
+            }
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn materialize_config_only_agent(name: &str) {
+        fs::create_dir_all(paths::agent_data_dir(name)).unwrap();
+        fs::write(paths::agent_config_file(name), "").unwrap();
+    }
+
+    fn materialize_graph_agent(name: &str) {
+        fs::create_dir_all(paths::agent_data_dir(name)).unwrap();
+        fs::write(paths::agent_graph_file(name), "").unwrap();
+    }
+
+    fn agent_node_with_inputs(id: &str, agent: &str, inputs: &[(&str, &str)]) -> Node {
+        let mut node = agent_node(id, agent, Some("end"));
+        if let NodeType::Agent(ref mut a) = node.node_type {
+            a.inputs = Some(
+                inputs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            );
+        }
+        node
+    }
+
+    fn inputs_requires_graph_agent_error(result: &ValidationResult, node_id: &str) -> bool {
+        result.errors.iter().any(|e| {
+            e.message.contains("`inputs:` requires agent")
+                && e.message
+                    .contains("to be a graph agent (no graph.yaml found)")
+                && e.node_id.as_deref() == Some(node_id)
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_on_config_only_agent_errors() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_config_only_agent("plain-agent");
+        let node = agent_node_with_inputs("a", "plain-agent", &[("x", "{{k}}")]);
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| {
+                e.message
+                    == "agent node 'a': `inputs:` requires agent 'plain-agent' to be a graph agent (no graph.yaml found)"
+                    && e.node_id.as_deref() == Some("a")
+            }),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn agent_empty_inputs_on_config_only_agent_still_errors() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_config_only_agent("plain-agent");
+        let node = agent_node_with_inputs("a", "plain-agent", &[]);
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            inputs_requires_graph_agent_error(&result, "a"),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_on_graph_agent_passes() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_graph_agent("graph-agent");
+        let node = agent_node_with_inputs("a", "graph-agent", &[("x", "{{k}}")]);
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+    }
+
+    #[test]
+    #[serial]
+    fn agent_with_both_config_and_graph_errors() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_config_only_agent("mixed-agent");
+        materialize_graph_agent("mixed-agent");
+        let node = agent_node_with_inputs("a", "mixed-agent", &[("x", "{{k}}")]);
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e
+                .message
+                .starts_with("Agent 'mixed-agent' has both config.yaml and graph.yaml")
+                && e.node_id.as_deref() == Some("a")),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_missing_agent_dir_gets_only_the_not_found_error() {
+        let _guard = TestConfigDirGuard::new();
+        let node = agent_node_with_inputs("a", "ghost-agent", &[("x", "{{k}}")]);
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("Agent 'ghost-agent' not found")),
+            "{:?}",
+            result.errors
+        );
+        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_initial_prompt_is_reserved() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_graph_agent("graph-agent");
+        let node = agent_node_with_inputs(
+            "a",
+            "graph-agent",
+            &[("initial_prompt", "{{k}}"), ("x", "{{k}}")],
+        );
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| {
+                e.message
+                    == "agent node 'a': `inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)"
+                    && e.node_id.as_deref() == Some("a")
+            }),
+            "{:?}",
+            result.errors
+        );
+        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+    }
+
+    #[test]
+    fn agent_inputs_reading_sibling_write_errors() {
+        let reader = agent_node_with_inputs("worker_a", "some-agent", &[("x", "{{k}}")]);
+        let writer = llm_with_state_updates("worker_b", &[("k", "static")], Some("end"));
+        let graph = fan_out_graph_with_two_workers(reader, writer);
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("reads state key(s) `k`")
+                    && e.message.contains("'worker_b'")
+                    && e.node_id.as_deref() == Some("worker_a")),
+            "expected cross-branch read error for agent inputs: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn agent_inputs_reading_upstream_key_passes() {
+        let reader = agent_node_with_inputs("worker_a", "some-agent", &[("x", "{{k}}")]);
+        let writer = llm_with_state_updates("worker_b", &[("other", "static")], Some("end"));
+        let graph = fan_out_graph_with_two_workers(reader, writer);
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("reads state key")),
+            "upstream `k` shouldn't trigger cross-branch read error: {:?}",
+            result.errors
+        );
+    }
+
+    fn ids(subgraph: &HashSet<String>) -> Vec<&str> {
+        let mut ids: Vec<&str> = subgraph.iter().map(String::as_str).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn branch_subgraph_follows_next_and_fallback_edges() {
+        let mut a = script_node("a", "a.sh", Some("c"));
+        a.next = Some("b".to_string().into());
+        let graph = graph_with(
+            vec![
+                ("a", a),
+                ("b", llm_node("b", Some("d"), None)),
+                ("c", script_node("c", "c.sh", None)),
+                ("d", script_node("d", "d.sh", None)),
+                ("e", script_node("e", "e.sh", None)),
+            ],
+            "a",
+        );
+
+        assert_eq!(ids(&branch_subgraph(&graph, "a")), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn branch_subgraph_does_not_follow_approval_routes_or_nested_map_branch() {
+        let mut a = script_node("a", "a.sh", None);
+        a.next = Some(NextTargets::Many(vec!["m".into(), "p".into()]));
+        let graph = graph_with(
+            vec![
+                ("a", a),
+                ("m", map_node_basic("m", "inner", None)),
+                ("inner", script_node("inner", "inner.sh", None)),
+                ("p", approval_node("p", &["yes"], &[("yes", "q")], "q")),
+                ("q", script_node("q", "q.sh", None)),
+            ],
+            "a",
+        );
+
+        assert_eq!(ids(&branch_subgraph(&graph, "a")), vec!["a", "m", "p"]);
+    }
+
+    #[test]
+    fn branch_subgraph_of_unknown_entry_is_empty() {
+        let graph = graph_with(vec![("a", script_node("a", "a.sh", None))], "a");
+
+        assert!(branch_subgraph(&graph, "nope").is_empty());
+    }
+
+    #[test]
+    fn branch_subgraph_skips_undeclared_targets() {
+        let mut a = script_node("a", "a.sh", Some("ghost_fallback"));
+        a.next = Some("ghost_next".to_string().into());
+        let graph = graph_with(vec![("a", a)], "a");
+
+        assert_eq!(ids(&branch_subgraph(&graph, "a")), vec!["a"]);
     }
 }

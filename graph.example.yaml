@@ -116,9 +116,12 @@ variables:
 # ---------------------------------------------------------------------------
 settings:
   max_loop_iterations: 100   # Per-node visit cap. If one node id is entered more
-                             # than this many times, execution aborts. Default 100.
+                             # than this many times, execution aborts. Default 100; 0 = no cap.
   timeout: 600               # Optional wall-clock cap (seconds) on the whole run,
-                             # checked between node transitions.
+                             # checked between node transitions. 0 = no bound.
+                             # Ctrl-C (or the enclosing turn aborting) ends the run
+                             # promptly from anywhere: in-flight branches, tools, and
+                             # child graph agents are cancelled with it.
   log_state_snapshots: true  # Log state before each node (debug/trace). Default true.
   validate_before_run: true  # Run the graph validator at startup. Default true.
   max_concurrency: 4         # Cap on simultaneously running branches in any
@@ -242,7 +245,7 @@ nodes:
       - https://example.com/reference
     query: "{{topic}}"         # Retrieval query (templated). Default: {{initial_prompt}}.
     top_k: 5                   # Chunks to retrieve. Default = the KB's own top_k.
-    timeout: 120               # Retrieval timeout in seconds. Default 120.
+    timeout: 120               # Retrieval timeout in seconds. Default 120; 0 = no bound.
     # Knowledge-base build config (optional; used only when the KB is first
     # built). When embedding_model + chunk_size + chunk_overlap are all set,
     # the KB builds with no interactive prompts (works in non-interactive runs).
@@ -311,7 +314,7 @@ nodes:
     id: synthesize
     type: script
     script: scripts/synthesize.py  # Path relative to the agent directory
-    timeout: 30                # Seconds. Default 30.
+    timeout: 30                # Seconds. Default 30; 0 = no bound.
     state_updates:             # Applied after the stdout JSON is merged
       decided_for: "{{topic}}"
     next: summarize            # Default route if the script emits no `_next`
@@ -333,7 +336,21 @@ nodes:
     prompt: |                  # User message sent to the child (templated)
       Research {{topic}} in depth. Existing context:
       {{context}}
-    timeout: 600               # Optional wall-clock cap, seconds. Default 300.
+    # inputs:                  # Optional. Only valid when `agent` is a GRAPH agent
+    #   max_parallel: "{{n}}"  # (has a graph.yaml; deep-research is one). Each value
+    #   context: "Repo: {{r}}" # is a template against THIS graph's state. The resolved
+    #                          # map is overlaid on the child's `initial_state` before
+    #                          # its graph starts, so the child can read {{max_parallel}}
+    #                          # and {{context}} from its first node on. A lone {{key}}
+    #                          # keeps the value's JSON type (numbers stay numbers, lists
+    #                          # stay lists, null overlays the child's default); mixed text
+    #                          # becomes a string. `initial_prompt` is reserved (always
+    #                          # seeded from `prompt:`) and is rejected as an input key.
+    #                          # `inputs:` on a config-only agent is a load-time error,
+    #                          # and `inputs` values count as reads for the cross-branch
+    #                          # read check. See the wiki: Graph Agents -> "Passing state
+    #                          # into a child graph agent (inputs)".
+    timeout: 600               # Optional wall-clock cap, seconds. Default 300; 0 = no bound.
     teammates: false           # Optional. When true and this node runs concurrently
                                # with other flagged agent nodes (map fan-out branches
                                # or the same super-step), the siblings can message
@@ -343,7 +360,13 @@ nodes:
                                # super-step frontier form two separate teams and cannot
                                # message each other. Peers only span a single map
                                # node's branches or a single super-step's flagged
-                               # agent nodes.
+                               # agent nodes. Inside a map branch chain the identity
+                               # belongs to the ITEM, not the node: it lives for the
+                               # item's whole chain, is handed to each `teammates: true`
+                               # agent step in that chain (unflagged steps never see it),
+                               # and is retired when the chain ends. A message delivered
+                               # after the chain's last flagged agent step is accepted
+                               # but never read.
     output_schema:             # Optional. Same extraction as llm nodes
       type: object
       properties:
@@ -357,9 +380,20 @@ nodes:
     next: review               # Required for agent nodes
 
   # --- map node (Dynamic fan-out. Think: LangGraph's `Send` API) ----------------
-  # Spawns one parallel sub-branch per item in `over`. Each sub-branch runs
-  # the node referenced by `branch:` with the item bound to `as:`. Outputs
-  # collect into the array named by `collect_into:`, preserving input order.
+  # Spawns one parallel sub-branch per item in `over`. Each sub-branch runs a
+  # per-item CHAIN of nodes on a private fork of the state: it starts at the
+  # node referenced by `branch:` (with the item bound to `as:`) and follows
+  # that node's `next:` / script `_next` / `fallback` edges until it reaches a
+  # node with no `next` and no `_next`. When every chain has finished, the
+  # value of `output_key` from each item's final fork state is collected into
+  # the array named by `collect_into:`, preserving input order. Everything
+  # else the chain wrote is fork-local scratch and is discarded at collect.
+  #
+  # Not supported inside a branch chain (validator errors): fan-out `next:`
+  # lists, another `map`, `end`, `approval`, `input`. A branch node must not
+  # also be reachable from `start` on the main flow. Per-item loops are script
+  # `_next` loops (bounded by settings.max_loop_iterations on the fork; `0` = unbounded); a
+  # declared `next`/`fallback` edge back to an earlier chain node is a cycle.
   #
   # Reach via `synthesize`'s `_next: subjects_map`. The producer is expected
   # to have written a list at `subjects` (e.g. an upstream LLM node with an
@@ -371,31 +405,53 @@ nodes:
                                 # Empty list is allowed. It means no branches spawn,
                                 # and thus `collect_into` is written as [].
     as: subject                 # Required. Per-branch state key holding the
-                                # current item. Read with {{subject}} inside
-                                # the branch node's prompt.
-    branch: research_subject    # Required. Node id to invoke per item.
-                                # Must point to an llm | agent | rag | script
-                                # node satisfying the map branch contract:
-                                #   - no `next:` (atomic, joined at map exit)
-                                #   - no `state_updates:` other than via the
-                                #     map's `collect_into` channel
-                                #   - no `output_schema:` (top-level merge
-                                #     would clash with collect_into)
-                                # Validator enforces all three.
+                                # current item. Read with {{subject}} from any
+                                # node in the branch chain. Must differ from
+                                # `output_key` (load-time error otherwise).
+    branch: research_subject    # Required. ENTRY node of the per-item chain.
+                                # Every node reachable from it via `next:` /
+                                # `fallback:` is part of the chain and must be
+                                # an llm | agent | rag | script node. Chain
+                                # nodes may use `next:`, `state_updates:`
+                                # (fork-local scratch such as a draft or a
+                                # retry counter), `output_schema:`, and
+                                # `fallback:` (honored per item; it must point
+                                # at a node inside the chain, never at an
+                                # `end_*` node). A script's `_next` must also
+                                # stay inside the chain; routing out of it
+                                # fails the item.
     collect_into: subject_findings  # Required. State key for the array of
                                     # per-branch outputs, in input order
                                     # (not spawn-finish order).
-    max_concurrency: 3          # Optional per-map cap. Defaults to
-                                # settings.max_concurrency above.
-    output_key: output          # Optional. State key the branch's output
-                                # appears under. Default "output". Useful
-                                # only if the branch reads its own bound
-                                # name back (rare).
+    max_concurrency: 3          # Optional cap on items in flight (one slot is
+                                # held for an item's WHOLE chain). Defaults to
+                                # settings.max_concurrency above. Accepts an
+                                # integer or a template that is exactly one
+                                # "{{key}}" (surrounding whitespace allowed,
+                                # nothing else) and resolves to a positive integer,
+                                # e.g. `max_concurrency: "{{research_budget}}"`.
+    output_key: subject_summary # Optional. State key whose value in the item's
+                                # FINAL fork state becomes the item's result.
+                                # Default "output"; must differ from `as:`. The
+                                # key is removed from the fork before the chain
+                                # starts, so the chain
+                                # must write it (via state_updates, an
+                                # output_schema property, or a script's JSON);
+                                # an item that never writes it is an error, and
+                                # a chain that reads it before writing it sees
+                                # it absent (prompts fail, state_updates render
+                                # "", scripts get no key) - seed per-item input
+                                # through `as:` instead. Prefer a named key: with
+                                # the default, the collector errors if the chain
+                                # never writes it.
     next: aggregate_subjects    # Where to go after all sub-branches finish.
 
-  # Branch node for subjects_map. Each invocation receives a different
-  # `subject` in state. The branch is "atomic", meaning it cannot route on
-  # its own; the surrounding `map` joins after all invocations finish.
+  # Entry node of subjects_map's per-item chain. Each item gets its own copy
+  # of this node with a different `subject` in state. With no `next:` it is
+  # also the LAST chain node, so the chain is a single step; give it `next:`
+  # (or emit `_next` from a script step) to extend the chain, e.g.
+  # research -> verify -> gate-script that re-emits `_next: research_subject`
+  # until the draft passes or a retry counter in fork state runs out.
   research_subject:
     id: research_subject
     type: llm
@@ -403,8 +459,11 @@ nodes:
     prompt: "Research {{subject}}: pull the key facts and one citation."
     tools:
       - web_search_coyote
-    # No `next:`, `state_updates:`, or `output_schema:` here. Map branches
-    # have a strict contract (see `subjects_map.branch` comment).
+    # Recommended pattern: write the completion to a named key via
+    # `state_updates` and point the map's `output_key` at that same key.
+    # `{{output}}` is bound only while these templates render.
+    state_updates:
+      subject_summary: "{{output}}"
 
   # Aggregator that runs after the map joins. Reads the collected list.
   aggregate_subjects:
@@ -434,9 +493,9 @@ nodes:
     temperature: 0.3           # Optional per-node sampling override
     reasoning_effort: null     # Optional per-node reasoning effort override (e.g. low, medium, high)
     max_attempts: 2            # Retry count on transient errors only. Default 1.
-    max_iterations: 10         # Tool-call-loop turn cap. Default 10.
+    max_iterations: 10         # Tool-call-loop turn cap. Default 10; 0 = no cap.
     fallback: review           # Route here if all attempts fail
-    timeout: 300               # Optional node wall-clock cap, seconds (unset = no timeout)
+    timeout: 300               # Optional node wall-clock cap, seconds (unset or 0 = no timeout)
     state_updates:
       research: "{{output}}"
     next: review               # Required for llm nodes: the success route

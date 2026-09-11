@@ -240,6 +240,9 @@ pub struct AgentNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<HashMap<String, String>>,
+
     #[serde(default)]
     pub teammates: bool,
 }
@@ -426,11 +429,58 @@ pub struct MapNode {
     pub collect_into: String,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_concurrency: Option<usize>,
+    pub max_concurrency: Option<ConcurrencyCap>,
 }
 
 fn default_map_output_key() -> String {
     "output".to_string()
+}
+
+/// A map node's per-item concurrency cap: either a literal integer or a
+/// `{{template}}` resolved against graph state when the map runs.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum ConcurrencyCap {
+    Fixed(usize),
+    Template(String),
+}
+
+// Hand-written so a malformed value (`-1`, `4.5`, `true`) reports what was
+// received and what is accepted, instead of serde's untagged-enum "did not
+// match any variant".
+impl<'de> Deserialize<'de> for ConcurrencyCap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CapVisitor;
+
+        impl serde::de::Visitor<'_> for CapVisitor {
+            type Value = ConcurrencyCap;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a positive integer or a `{{template}}` string for max_concurrency")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                usize::try_from(v)
+                    .map(ConcurrencyCap::Fixed)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(v), &self))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                usize::try_from(v)
+                    .map(ConcurrencyCap::Fixed)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(v), &self))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(ConcurrencyCap::Template(v.to_owned()))
+            }
+        }
+
+        deserializer.deserialize_any(CapVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -449,6 +499,7 @@ pub enum Reducer {
 #[derive(Debug, Clone, Default)]
 pub struct GraphState {
     data: HashMap<String, Value>,
+    #[cfg(test)]
     history: Vec<String>,
     loop_counts: HashMap<String, usize>,
 }
@@ -457,6 +508,7 @@ impl GraphState {
     pub fn new(initial: HashMap<String, Value>) -> Self {
         Self {
             data: initial,
+            #[cfg(test)]
             history: Vec::new(),
             loop_counts: HashMap::new(),
         }
@@ -470,6 +522,10 @@ impl GraphState {
         self.data.insert(key, value);
     }
 
+    pub fn remove(&mut self, key: &str) -> Option<Value> {
+        self.data.remove(key)
+    }
+
     pub fn merge(&mut self, json_obj: &serde_json::Map<String, Value>) {
         for (key, value) in json_obj {
             self.data.insert(key.clone(), value.clone());
@@ -481,6 +537,7 @@ impl GraphState {
     }
 
     pub fn visit_node(&mut self, node_id: &str) {
+        #[cfg(test)]
         self.history.push(node_id.to_string());
         *self.loop_counts.entry(node_id.to_string()).or_insert(0) += 1;
     }
@@ -581,6 +638,48 @@ nodes:
             NodeType::Agent(n) => assert!(!n.teammates),
             _ => panic!("expected Agent variant"),
         }
+    }
+
+    #[test]
+    fn agent_node_inputs_parse_optionally_and_empty_map_is_some() {
+        let yaml = r#"
+name: g
+start: with_inputs
+nodes:
+  with_inputs:
+    id: with_inputs
+    type: agent
+    agent: helper
+    prompt: hi
+    inputs:
+      width: "{{n}}"
+      note: "Repo: {{repo}}"
+    next: without_inputs
+  without_inputs:
+    id: without_inputs
+    type: agent
+    agent: helper
+    prompt: hi
+    next: empty_inputs
+  empty_inputs:
+    id: empty_inputs
+    type: agent
+    agent: helper
+    prompt: hi
+    inputs: {}
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let inputs_of = |id: &str| match &graph.get_node(id).unwrap().node_type {
+            NodeType::Agent(n) => n.inputs.clone(),
+            _ => panic!("expected Agent variant"),
+        };
+
+        let with = inputs_of("with_inputs").expect("inputs should parse");
+        assert_eq!(with.len(), 2);
+        assert_eq!(with.get("width").map(String::as_str), Some("{{n}}"));
+        assert_eq!(with.get("note").map(String::as_str), Some("Repo: {{repo}}"));
+        assert_eq!(inputs_of("without_inputs"), None);
+        assert_eq!(inputs_of("empty_inputs"), Some(HashMap::new()));
     }
 
     #[test]
@@ -1232,7 +1331,7 @@ next: rank
         assert_eq!(map.branch, "research_subject");
         assert_eq!(map.output_key, "research_result");
         assert_eq!(map.collect_into, "research_results");
-        assert_eq!(map.max_concurrency, Some(5));
+        assert_eq!(map.max_concurrency, Some(ConcurrencyCap::Fixed(5)));
     }
 
     #[test]
@@ -1254,6 +1353,78 @@ collect_into: results
 
         assert_eq!(map.output_key, "output");
         assert!(map.max_concurrency.is_none());
+    }
+
+    fn map_node_yaml_with_cap(cap: &str) -> String {
+        format!(
+            "id: fan_out\ntype: map\nover: \"{{{{items}}}}\"\nas: item\nbranch: process\n\
+             collect_into: results\nmax_concurrency: {cap}\n"
+        )
+    }
+
+    fn parse_map_cap(cap: &str) -> Option<ConcurrencyCap> {
+        let node: Node = serde_yaml::from_str(&map_node_yaml_with_cap(cap)).unwrap();
+        match node.node_type {
+            NodeType::Map(m) => m.max_concurrency,
+            _ => panic!("expected Map variant"),
+        }
+    }
+
+    #[test]
+    fn map_max_concurrency_integer_parses_as_fixed() {
+        assert_eq!(parse_map_cap("4"), Some(ConcurrencyCap::Fixed(4)));
+    }
+
+    #[test]
+    fn map_max_concurrency_zero_parses_as_fixed_zero() {
+        assert_eq!(parse_map_cap("0"), Some(ConcurrencyCap::Fixed(0)));
+    }
+
+    #[test]
+    fn map_max_concurrency_string_parses_as_template() {
+        assert_eq!(
+            parse_map_cap("\"{{budget}}\""),
+            Some(ConcurrencyCap::Template("{{budget}}".into()))
+        );
+    }
+
+    #[test]
+    fn map_max_concurrency_quoted_integer_parses_as_template() {
+        assert_eq!(
+            parse_map_cap("\"4\""),
+            Some(ConcurrencyCap::Template("4".into()))
+        );
+    }
+
+    #[test]
+    fn map_max_concurrency_malformed_values_name_accepted_forms() {
+        for bad in ["-1", "4.5", "true", "[4]", "{n: 4}"] {
+            let err = serde_yaml::from_str::<Node>(&map_node_yaml_with_cap(bad))
+                .expect_err(&format!("max_concurrency: {bad} should fail to parse"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("a positive integer or a `{{template}}` string for max_concurrency"),
+                "max_concurrency: {bad} produced an unhelpful error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_max_concurrency_negative_error_names_offending_value() {
+        let err = serde_yaml::from_str::<Node>(&map_node_yaml_with_cap("-1")).unwrap_err();
+        assert!(err.to_string().contains("-1"), "{err}");
+    }
+
+    #[test]
+    fn concurrency_cap_serializes_as_bare_scalar() {
+        assert_eq!(
+            serde_json::to_value(ConcurrencyCap::Fixed(4)).unwrap(),
+            serde_json::json!(4)
+        );
+        assert_eq!(
+            serde_json::to_value(ConcurrencyCap::Template("{{k}}".into())).unwrap(),
+            serde_json::json!("{{k}}")
+        );
     }
 
     #[test]
@@ -1385,5 +1556,21 @@ nodes:
         let graph: Graph = serde_yaml::from_str(yaml).unwrap();
 
         assert!(!serde_yaml::to_string(&graph).unwrap().contains("driver"));
+    }
+
+    #[test]
+    fn graph_state_remove_returns_previous_value_and_drops_key() {
+        let mut state = GraphState::new(HashMap::from([("k".to_string(), json!(1))]));
+
+        assert_eq!(state.remove("k"), Some(json!(1)));
+        assert_eq!(state.get("k"), None);
+        assert!(state.data().is_empty());
+    }
+
+    #[test]
+    fn graph_state_remove_missing_key_is_none() {
+        let mut state = GraphState::new(HashMap::new());
+
+        assert_eq!(state.remove("k"), None);
     }
 }

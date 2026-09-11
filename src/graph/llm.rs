@@ -1,6 +1,8 @@
 use super::state::StateManager;
+use super::state_updates;
 use super::structured;
 use super::types::LlmNode;
+use super::wall_clock;
 use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use crate::config::{
@@ -9,16 +11,13 @@ use crate::config::{
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::function::jobs::reap_jobs;
 use crate::function::skill::skill_function_declarations;
-use crate::utils::create_abort_signal;
+use crate::utils::AbortSignal;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use log::warn;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::time::timeout;
-
-const OUTPUT_KEY: &str = "output";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum LlmExecutionOutcome {
@@ -34,8 +33,9 @@ impl LlmNodeExecutor {
         node: &LlmNode,
         state_manager: &mut StateManager,
         parent_ctx: &mut RequestContext,
+        abort: &AbortSignal,
     ) -> Result<LlmExecutionOutcome> {
-        let result = run(node_id, node, state_manager, parent_ctx).await;
+        let result = run(node_id, node, state_manager, parent_ctx, abort).await;
         let (output, failure_reason) = match result {
             Ok(raw) => match &node.output_schema {
                 Some(schema) => match structured::extract(&raw, schema, parent_ctx).await {
@@ -84,6 +84,7 @@ async fn run(
     node: &LlmNode,
     state_manager: &mut StateManager,
     parent_ctx: &mut RequestContext,
+    abort: &AbortSignal,
 ) -> Result<String> {
     let mut instructions: Option<String> = match &node.instructions {
         Some(s) => Some(
@@ -186,17 +187,12 @@ async fn run(
         node.mcp_tools.clone().map(|map| (node_id.to_string(), map)),
     );
     parent_ctx.refresh_mcp_tool_filters();
-    let result = match node.timeout {
-        Some(secs) => match timeout(
-            Duration::from_secs(secs),
-            run_with_retries(node, &prompt, parent_ctx),
-        )
-        .await
-        {
+    let result = match node.timeout.and_then(wall_clock) {
+        Some(d) => match timeout(d, run_with_retries(node, &prompt, parent_ctx, abort)).await {
             Ok(r) => r,
-            Err(_) => Err(anyhow!("llm node timed out after {secs}s")),
+            Err(_) => Err(anyhow!("llm node timed out after {}s", d.as_secs())),
         },
-        None => run_with_retries(node, &prompt, parent_ctx).await,
+        None => run_with_retries(node, &prompt, parent_ctx, abort).await,
     };
     parent_ctx.role = saved_role;
     let node_jobs =
@@ -248,10 +244,11 @@ async fn run_with_retries(
     node: &LlmNode,
     prompt: &str,
     ctx: &mut RequestContext,
+    abort: &AbortSignal,
 ) -> Result<String> {
     let mut last_err: Option<Error> = None;
     for attempt in 1..=node.max_attempts {
-        match run_chat_loop(node, prompt, ctx).await {
+        match run_chat_loop(node, prompt, ctx, abort).await {
             Ok(out) => return Ok(out),
             Err(e) if is_transient(&e) && attempt < node.max_attempts => {
                 warn!("llm node attempt {attempt} failed (transient): {e}; retrying");
@@ -263,14 +260,28 @@ async fn run_with_retries(
     Err(last_err.unwrap_or_else(|| anyhow!("llm node exhausted retries")))
 }
 
-async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -> Result<String> {
-    let abort = create_abort_signal();
+/// Whether `turn` (0-based) is the final turn the node's cap allows. A cap of 0 means no cap.
+pub(crate) fn is_last_turn(turn: u32, max_iterations: u32) -> bool {
+    max_iterations > 0 && turn == max_iterations - 1
+}
+
+async fn run_chat_loop(
+    node: &LlmNode,
+    prompt: &str,
+    ctx: &mut RequestContext,
+    abort: &AbortSignal,
+) -> Result<String> {
+    let abort = abort.clone();
     let app_cfg = Arc::clone(&ctx.app.config);
     let role_for_input = ctx.role.clone();
     let mut input = Input::from_str(ctx, prompt, role_for_input)?;
     let mut accumulated = String::new();
 
-    for turn in 0..node.max_iterations {
+    let mut turn: u32 = 0;
+    loop {
+        if abort.aborted() {
+            bail!("llm node aborted");
+        }
         let client = input.create_client()?;
         ctx.before_chat_completion(&input)?;
         let (output, tool_results) =
@@ -297,7 +308,7 @@ async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -
                     return Ok(accumulated);
                 }
                 GuardrailAction::Inject(prompt) => {
-                    if turn + 1 == node.max_iterations {
+                    if is_last_turn(turn, node.max_iterations) {
                         bail!(
                             "llm node hit max_iterations ({}) before LLM concluded",
                             node.max_iterations
@@ -305,22 +316,19 @@ async fn run_chat_loop(node: &LlmNode, prompt: &str, ctx: &mut RequestContext) -
                     }
                     let role = ctx.role.clone();
                     input = Input::from_str(ctx, &prompt, role)?;
-                    continue;
                 }
             }
+        } else {
+            if is_last_turn(turn, node.max_iterations) {
+                bail!(
+                    "llm node hit max_iterations ({}) before LLM concluded",
+                    node.max_iterations
+                );
+            }
+            input = input.merge_tool_results(output, tool_results);
         }
-
-        if turn + 1 == node.max_iterations {
-            bail!(
-                "llm node hit max_iterations ({}) before LLM concluded",
-                node.max_iterations
-            );
-        }
-
-        input = input.merge_tool_results(output, tool_results);
+        turn = turn.saturating_add(1);
     }
-
-    bail!("llm node ended without producing output")
 }
 
 fn build_inline_role(
@@ -456,37 +464,12 @@ fn apply_state_updates_with_output(
     state_manager: &mut StateManager,
     output: &Value,
 ) {
-    if node.output_schema.is_some()
-        && let Some(obj) = output.as_object()
-    {
-        for (k, v) in obj {
-            state_manager.state_mut().set(k.clone(), v.clone());
-        }
-    }
-
-    let Some(updates) = &node.state_updates else {
-        return;
-    };
-    let prev_output = state_manager.state().get(OUTPUT_KEY).cloned();
-    state_manager
-        .state_mut()
-        .set(OUTPUT_KEY.into(), output.clone());
-
-    for (key, template) in updates {
-        let value = state_manager.interpolate_lenient(template);
-        state_manager
-            .state_mut()
-            .set(key.clone(), Value::String(value));
-    }
-
-    match prev_output {
-        Some(v) => state_manager.state_mut().set(OUTPUT_KEY.into(), v),
-        None => {
-            state_manager
-                .state_mut()
-                .set(OUTPUT_KEY.into(), Value::Null);
-        }
-    }
+    state_updates::apply(
+        state_manager,
+        output,
+        node.output_schema.is_some(),
+        node.state_updates.as_ref(),
+    );
 }
 
 fn format_schema_hint(schema: &Value) -> String {
@@ -499,10 +482,14 @@ fn format_schema_hint(schema: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::state_updates::OUTPUT_KEY;
     use super::super::types::*;
     use super::*;
+    use crate::config::{Agent, AgentConfig, AppState, WorkingMode};
+    use crate::utils::create_abort_signal;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn manager_with(pairs: &[(&str, Value)]) -> StateManager {
         let mut map = HashMap::new();
@@ -568,7 +555,7 @@ mod tests {
 
         apply_state_updates_with_output(&node, &mut state, &json!("anything"));
 
-        assert_eq!(state.state().get(OUTPUT_KEY), Some(&json!(null)));
+        assert!(state.state().get(OUTPUT_KEY).is_none());
     }
 
     #[test]
@@ -755,5 +742,65 @@ mod tests {
         )));
         assert!(!is_transient(&anyhow!("hit max_iterations")));
         assert!(!is_transient(&anyhow!("authentication failed")));
+    }
+
+    #[test]
+    fn zero_timeout_resolves_to_no_bound() {
+        assert!(Some(0u64).and_then(wall_clock).is_none());
+        assert_eq!(
+            Some(5u64).and_then(wall_clock),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn is_last_turn_bounded() {
+        assert!(is_last_turn(0, 1));
+        assert!(!is_last_turn(0, 10));
+        assert!(is_last_turn(9, 10));
+        assert!(!is_last_turn(10, 10));
+    }
+
+    #[test]
+    fn is_last_turn_zero_cap_never_fires() {
+        assert!(!is_last_turn(0, 0));
+        assert!(!is_last_turn(9, 0));
+        assert!(!is_last_turn(u32::MAX, 0));
+    }
+
+    #[test]
+    fn is_last_turn_at_u32_max_does_not_overflow() {
+        assert!(is_last_turn(u32::MAX - 1, u32::MAX));
+        assert!(!is_last_turn(u32::MAX, u32::MAX));
+    }
+
+    /// The turn-top abort check runs before any client is created, so an
+    /// already-aborted graph never issues a model call and the node fails
+    /// with the abort reason rather than a connection error.
+    #[tokio::test]
+    async fn run_chat_loop_bails_before_first_call_when_aborted() {
+        let node = node_with(None);
+        let mut state = manager_with(&[]);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let abort = create_abort_signal();
+        abort.set_ctrlc();
+
+        let err = LlmNodeExecutor::execute("think", &node, &mut state, &mut ctx, &abort)
+            .await
+            .expect_err("a pre-set abort must fail the node");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(
+                "LLM node failed and no fallback declared: LLM call failed: llm node aborted"
+            ),
+            "{chain}"
+        );
+        assert_eq!(
+            state.state().get(OUTPUT_KEY),
+            None,
+            "no output is recorded for an aborted node without state_updates"
+        );
     }
 }
