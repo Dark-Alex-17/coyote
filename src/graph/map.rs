@@ -440,6 +440,7 @@ fn first_flagged_agent_by_bfs<'g>(
         match &node.node_type {
             NodeType::Script(s) => edges.extend(s.fallback.as_ref()),
             NodeType::Llm(l) => edges.extend(l.fallback.as_ref()),
+            NodeType::Agent(a) => edges.extend(a.fallback.as_ref()),
             _ => {}
         }
         for next in edges {
@@ -2481,6 +2482,33 @@ nodes:
 
         for (id, _) in &assignments {
             assert!(id.starts_with("graph_agent_near-agent_"), "{id}");
+        }
+    }
+
+    #[test]
+    fn provision_map_peers_finds_flagged_agent_behind_agent_fallback_edge() {
+        let h = Harness::new(
+            r#"
+name: t
+start: gate
+nodes:
+  gate:
+    type: agent
+    agent: gatekeeper
+    prompt: "p"
+    fallback: rescue
+  rescue:
+    type: agent
+    agent: rescue-agent
+    prompt: "p"
+    teammates: true
+"#,
+        );
+
+        let (_, assignments) = h.provision("gate", 2);
+
+        for (id, _) in &assignments {
+            assert!(id.starts_with("graph_agent_rescue-agent_"), "{id}");
         }
     }
 
