@@ -1258,7 +1258,7 @@ fn load_agent_description(name: &str) -> String {
     String::new()
 }
 
-fn load_agent_variables(name: &str) -> Vec<AgentVariable> {
+pub fn load_agent_variables(name: &str) -> Vec<AgentVariable> {
     if let Ok(config) = AgentConfig::load(&paths::agent_config_file(name)) {
         return config.variables;
     }

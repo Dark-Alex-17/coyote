@@ -87,7 +87,7 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     | `agent__spawn` | Spawn a subagent in the background. Returns an `id` immediately. Optional `variables` (string map) sets the target agent's declared variables, overriding inherited values. |
     | `agent__check` | Non-blocking status probe: running or finished. Never returns/consumes the result — use `agent__collect`. |
     | `agent__collect` | Blocking wait: wait for an agent to finish, return its output. |
-    | `agent__list_available` | List all agent types you can spawn (name + description). Use this to discover specialists before calling `agent__spawn`. |
+    | `agent__list_available` | List all agent types you can spawn (name + description + declared variables). Use this to discover specialists and the `variables` they accept before calling `agent__spawn`. |
     | `agent__list_running` | List all subagents YOU have spawned, with their status. |
     | `agent__cancel` | Cancel a running agent by ID. |
     | `agent__task_create` | Create a task in the dependency-aware task queue. Optional `variables` (string map) is passed to the auto-dispatched agent. |

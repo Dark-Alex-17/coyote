@@ -4,7 +4,7 @@ use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::{
     Agent, AgentVariable, AgentVariables, AppState, Input, RequestContext, Role, RoleLike,
     default_max_agent_depth, effective_max_concurrent_jobs, jobs_enabled,
-    list_agents_with_descriptions,
+    list_agents_with_descriptions, load_agent_variables,
 };
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
 use crate::supervisor::notification::agent_notification;
@@ -337,7 +337,7 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                         "variables".to_string(),
                         JsonSchema {
                             type_value: Some("object".to_string()),
-                            description: Some("Values for the target agent's declared variables (its config/graph `variables:` list), e.g. {\"pr\": \"1234\"}. Overrides values inherited from the parent. String values only. Note: if the target agent resumes an existing shared session, the session's stored variable values take precedence and these are ignored.".into()),
+                            description: Some("Values for the target agent's declared variables (its config/graph `variables:` list), e.g. {\"pr\": \"1234\"}. Overrides values inherited from the parent. String values only. Note: if the target agent resumes an existing shared session, the session's stored variable values take precedence and these are ignored. Discover an agent's declared variables via `agent__list_available`.".into()),
                             ..Default::default()
                         },
                     ),
@@ -404,9 +404,11 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{AGENT_FUNCTION_PREFIX}list_available"),
-            description: "List all agent types installed and available to spawn (name + description). Use this to \
-                          discover what specialists exist before calling `agent__spawn` — especially when you're unsure \
-                          which agent to delegate to. This is the discovery counterpart to `agent__list_running` \
+            description: "List all agent types installed and available to spawn (name + description + declared \
+                          variables). Use this to discover what specialists exist before calling `agent__spawn` — \
+                          especially when you're unsure which agent to delegate to. Each agent's `variables` entry \
+                          describes the values to pass via the `variables` parameter of `agent__spawn` or \
+                          `agent__task_create`. This is the discovery counterpart to `agent__list_running` \
                           (which reports agents you have already spawned).".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -490,7 +492,7 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                         "variables".to_string(),
                         JsonSchema {
                             type_value: Some("object".to_string()),
-                            description: Some("Values for the auto-spawned agent's declared variables, e.g. {\"pr\": \"1234\"}. Passed to `agent__spawn` at dispatch time. String values only.".into()),
+                            description: Some("Values for the auto-spawned agent's declared variables, e.g. {\"pr\": \"1234\"}. Passed to `agent__spawn` at dispatch time. String values only. Discover an agent's declared variables via `agent__list_available`.".into()),
                             ..Default::default()
                         },
                     ),
@@ -1443,6 +1445,27 @@ fn handle_list_running(ctx: &mut RequestContext) -> Result<Value> {
     Ok(result)
 }
 
+fn variables_json(vars: &[AgentVariable]) -> Option<Value> {
+    if vars.is_empty() {
+        return None;
+    }
+    Some(Value::Array(
+        vars.iter()
+            .map(|v| {
+                let mut var = json!({
+                    "name": v.name,
+                    "description": v.description,
+                    "required": v.default.is_none(),
+                });
+                if let Some(default) = &v.default {
+                    var["default"] = json!(default);
+                }
+                var
+            })
+            .collect(),
+    ))
+}
+
 fn handle_list_available(ctx: &RequestContext) -> Result<Value> {
     let whitelist: Option<Vec<String>> = ctx
         .agent
@@ -1458,11 +1481,15 @@ fn handle_list_available(ctx: &RequestContext) -> Result<Value> {
     let agents: Vec<Value> = entries
         .into_iter()
         .map(|(name, description)| {
-            if description.is_empty() {
+            let mut agent = if description.is_empty() {
                 json!({ "name": name })
             } else {
                 json!({ "name": name, "description": description })
+            };
+            if let Some(variables) = variables_json(&load_agent_variables(&name)) {
+                agent["variables"] = variables;
             }
+            agent
         })
         .collect();
 
@@ -2633,6 +2660,53 @@ mod tests {
         let full_count = result["count"].as_u64().unwrap();
 
         assert_eq!(full_count as usize, list_agents_with_descriptions().len());
+    }
+
+    #[test]
+    fn variables_json_maps_required_and_default() {
+        let vars = vec![
+            AgentVariable {
+                name: "pr".to_string(),
+                description: "PR number".to_string(),
+                default: None,
+                value: String::new(),
+            },
+            AgentVariable {
+                name: "branch".to_string(),
+                description: "Target branch".to_string(),
+                default: Some("x".to_string()),
+                value: String::new(),
+            },
+        ];
+
+        let result = variables_json(&vars).unwrap();
+
+        assert_eq!(result[0]["name"], "pr");
+        assert_eq!(result[0]["description"], "PR number");
+        assert_eq!(result[0]["required"], true);
+        assert!(result[0].get("default").is_none());
+        assert_eq!(result[1]["name"], "branch");
+        assert_eq!(result[1]["required"], false);
+        assert_eq!(result[1]["default"], "x");
+    }
+
+    #[test]
+    fn variables_json_empty_slice_is_none() {
+        assert!(variables_json(&[]).is_none());
+    }
+
+    #[test]
+    fn variables_json_never_emits_value() {
+        let vars = vec![AgentVariable {
+            name: "pr".to_string(),
+            description: "PR number".to_string(),
+            default: None,
+            value: "resolved".to_string(),
+        }];
+
+        let result = variables_json(&vars).unwrap();
+
+        assert!(result[0].get("value").is_none());
     }
 
     #[test]
