@@ -23,10 +23,12 @@ def load_state():
 
 
 state = load_state()
-proj = state.get("project_dir") or "."
+proj = os.path.expanduser(
+    (state.get("project_dir_in") or "").strip() or state.get("project_dir") or "."
+)
 spec = (state.get("diff_spec") or "auto").strip()
 notes = []
-out = {}
+out = {"project_dir": proj}
 
 
 def git(*args, timeout=60):

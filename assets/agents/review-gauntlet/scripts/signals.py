@@ -21,7 +21,9 @@ def load_state():
 
 
 state = load_state()
-proj = state.get("project_dir") or "."
+proj = os.path.expanduser(
+    (state.get("project_dir_in") or "").strip() or state.get("project_dir") or "."
+)
 spec = (state.get("diff_spec") or "worktree").strip()
 
 
@@ -34,7 +36,7 @@ def git(*args):
     return r.stdout
 
 
-out = {}
+out = {"project_dir": proj}
 try:
     if spec in ("", "worktree"):
         names = git("diff", "--name-only", "HEAD")

@@ -50,6 +50,7 @@ settings:
   timeout: 10800
 
 initial_state:
+  project_dir_in: ''
   diff_spec: auto
   intent: ''
   rigor_in: ''
@@ -111,6 +112,9 @@ nodes:
       - `rigor_in`: ONLY when the caller explicitly set a rigor (poc|prototype|production),
         e.g. via a "Quality bar:" line; else empty string.
       - `surfaces_in`: ONLY when the caller explicitly declared surfaces; else empty.
+      - `project_dir_in`: the directory/worktree path the caller named as
+        holding the code under review (e.g. "in /tmp/pr-review-x", "the repo
+        at ~/code/foo"); empty string when the caller named none.
       - `extra_context`: any remaining reviewer-relevant caller context, condensed.
     prompt: |
       Extract the review-request facts from this request:
@@ -128,9 +132,11 @@ nodes:
           type: string
         surfaces_in:
           type: string
+        project_dir_in:
+          type: string
         extra_context:
           type: string
-      required: [diff_spec, intent, rigor_in, surfaces_in, extra_context]
+      required: [diff_spec, intent, rigor_in, surfaces_in, project_dir_in, extra_context]
     max_iterations: 3
     max_attempts: 2
     next: facts

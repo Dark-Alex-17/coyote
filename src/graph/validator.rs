@@ -180,6 +180,7 @@ impl GraphValidator {
         self.validate_max_concurrency_template(graph, &mut result);
         self.validate_orchestration_limits(graph, &mut result);
         self.validate_timeouts(graph, &mut result);
+        self.validate_variable_shadowing(graph, &mut result);
         self.validate_map_subgraphs(graph, &mut result);
         self.validate_parallel_user_interaction(graph, &mut result);
         self.validate_parallel_writes(graph, &mut result);
@@ -610,6 +611,25 @@ impl GraphValidator {
                  acquire, so agent spawning deadlocks; remove the key or set \
                  it >= 1",
             ));
+        }
+    }
+
+    /// Variable seeding never overwrites an existing state key, so a declared
+    /// variable whose name is also an `initial_state` key never reaches graph
+    /// state: the explicit `initial_state` value wins. Legal; the warning only
+    /// makes the shadowing visible.
+    fn validate_variable_shadowing(&self, graph: &Graph, result: &mut ValidationResult) {
+        for var in &graph.variables {
+            if graph.initial_state.contains_key(&var.name) {
+                result.warning(ValidationError::new(format!(
+                    "declared variable '{}' is shadowed by an explicit `initial_state` key: \
+                     the `initial_state` value wins and the variable's resolved value \
+                     (spawn-provided/CLI/default) is never seeded into graph state; rename \
+                     one of them, or drop the `initial_state` key to let the variable seed \
+                     it (script nodes' `LLM_AGENT_VAR_<NAME>` env is unaffected)",
+                    var.name
+                )));
+            }
         }
     }
 
@@ -3270,6 +3290,72 @@ mod tests {
             "unset limits should not warn: {:?}",
             result.warnings
         );
+    }
+
+    fn variable(name: &str) -> crate::config::AgentVariable {
+        crate::config::AgentVariable {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    fn shadowing_warnings(result: &ValidationResult) -> Vec<&ValidationError> {
+        result
+            .warnings
+            .iter()
+            .filter(|w| w.message.contains("shadowed"))
+            .collect()
+    }
+
+    #[test]
+    fn variable_shadowed_by_initial_state_key_warns() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.variables = vec![variable("region")];
+        graph
+            .initial_state
+            .insert("region".into(), serde_json::json!("us-east-1"));
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid());
+        let w = shadowing_warnings(&result);
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].node_id, None);
+        assert!(w[0].message.contains("'region'"), "{}", w[0].message);
+    }
+
+    #[test]
+    fn disjoint_variables_and_initial_state_do_not_warn() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.variables = vec![variable("region")];
+        graph
+            .initial_state
+            .insert("zone".into(), serde_json::json!("a"));
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            shadowing_warnings(&result).is_empty(),
+            "disjoint names should not warn: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn each_shadowed_variable_warns_once() {
+        let mut graph = graph_with(vec![("e", end_node("e"))], "e");
+        graph.variables = vec![variable("region"), variable("tier")];
+        graph
+            .initial_state
+            .insert("region".into(), serde_json::json!("us"));
+        graph
+            .initial_state
+            .insert("tier".into(), serde_json::json!("gold"));
+
+        let result = validator().validate(&graph);
+
+        let w = shadowing_warnings(&result);
+        assert_eq!(w.len(), 2, "{:?}", result.warnings);
     }
 
     fn timeout_warnings(result: &ValidationResult) -> Vec<&ValidationError> {

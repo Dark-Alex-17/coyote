@@ -33,6 +33,7 @@ settings:
   timeout: 5400
 
 initial_state:
+  project_dir_in: ''
   criteria: []
   diff_spec: auto
   plan_notes: ''
@@ -68,6 +69,8 @@ nodes:
       - `diff_spec`: the git diff basis the caller named — a range, a ref/SHA,
         "staged", "worktree", or "auto" when unnamed (a caller phrase like
         "get_diff --base X" means diff_spec = "X").
+      - `project_dir_in`: the directory/worktree path the caller named as
+        holding the code under review; empty string when the caller named none.
       - `plan_notes`: recorded decisions the plan states ("do X not Y because Z"),
         verbatim — the holistic pass checks the diff didn't silently override them.
       - `scope_notes`: what the plan says NOT to touch / explicit boundaries.
@@ -98,7 +101,9 @@ nodes:
           type: string
         extra_context:
           type: string
-      required: [criteria, diff_spec, plan_notes, scope_notes, extra_context]
+        project_dir_in:
+          type: string
+      required: [criteria, diff_spec, plan_notes, scope_notes, extra_context, project_dir_in]
     max_iterations: 3
     max_attempts: 2
     next: facts

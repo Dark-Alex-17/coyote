@@ -2,8 +2,9 @@ use super::todo::TODO_FUNCTION_PREFIX;
 use super::{FunctionDeclaration, JsonSchema};
 use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::{
-    Agent, AppState, Input, RequestContext, Role, RoleLike, default_max_agent_depth,
-    effective_max_concurrent_jobs, jobs_enabled, list_agents_with_descriptions,
+    Agent, AgentVariable, AgentVariables, AppState, Input, RequestContext, Role, RoleLike,
+    default_max_agent_depth, effective_max_concurrent_jobs, jobs_enabled,
+    list_agents_with_descriptions, load_agent_variables,
 };
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
 use crate::supervisor::notification::agent_notification;
@@ -37,6 +38,77 @@ fn agent_permitted(whitelist: Option<&[String]>, target: &str) -> bool {
         None => true,
         Some(w) => w.iter().any(|a| a == target),
     }
+}
+
+fn parse_variables_arg(args: &Value) -> Result<Option<AgentVariables>, String> {
+    let Some(value) = args.get("variables") else {
+        return Ok(None);
+    };
+    let Some(obj) = value.as_object() else {
+        return Err(
+            "'variables' must be a JSON object mapping variable names to string values, e.g. {\"pr\": \"1234\"}".to_string(),
+        );
+    };
+    let mut variables = AgentVariables::new();
+    for (key, val) in obj {
+        let Some(val) = val.as_str() else {
+            return Err(format!("'variables.{key}' must be a string value"));
+        };
+        variables.insert(key.clone(), val.to_string());
+    }
+    Ok(Some(variables))
+}
+
+fn validate_spawn_variables(
+    agent_name: &str,
+    declared: &[AgentVariable],
+    provided: &AgentVariables,
+) -> Result<(), String> {
+    let unknown: Vec<&str> = provided
+        .keys()
+        .filter(|key| !declared.iter().any(|v| v.name == **key))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    if declared.is_empty() {
+        return Err(format!(
+            "Agent '{agent_name}' declares no variables; remove the 'variables' argument."
+        ));
+    }
+
+    let declared_list = declared
+        .iter()
+        .map(|v| format!("{} ({})", v.name, v.description))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "Unknown variable(s) {unknown:?} for agent '{agent_name}'. Declared variables: {declared_list}"
+    ))
+}
+
+fn merge_spawn_variables(inherited: &mut Option<AgentVariables>, provided: AgentVariables) {
+    if provided.is_empty() {
+        return;
+    }
+
+    inherited
+        .get_or_insert_with(AgentVariables::new)
+        .extend(provided);
+}
+
+fn dispatch_spawn_args(agent: &str, prompt: &str, variables: Option<&AgentVariables>) -> Value {
+    let mut spawn_args = json!({
+        "agent": agent,
+        "prompt": prompt,
+    });
+
+    if let Some(variables) = variables {
+        spawn_args["variables"] = json!(variables);
+    }
+
+    spawn_args
 }
 
 fn is_job_task(supervisor: Option<&Arc<RwLock<Supervisor>>>, id: &str) -> bool {
@@ -265,6 +337,14 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                             ..Default::default()
                         },
                     ),
+                    (
+                        "variables".to_string(),
+                        JsonSchema {
+                            type_value: Some("object".to_string()),
+                            description: Some("Values for the target agent's declared variables (its config/graph `variables:` list), e.g. {\"pr\": \"1234\"}. Overrides values inherited from the parent. String values only. Note: if the target agent resumes an existing shared session, the session's stored variable values take precedence and these are ignored. Discover an agent's declared variables via `agent__list_available`.".into()),
+                            ..Default::default()
+                        },
+                    ),
                 ])),
                 required: Some(vec!["agent".to_string(), "prompt".to_string()]),
                 ..Default::default()
@@ -328,9 +408,11 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{AGENT_FUNCTION_PREFIX}list_available"),
-            description: "List all agent types installed and available to spawn (name + description). Use this to \
-                          discover what specialists exist before calling `agent__spawn` — especially when you're unsure \
-                          which agent to delegate to. This is the discovery counterpart to `agent__list_running` \
+            description: "List all agent types installed and available to spawn (name + description + declared \
+                          variables). Use this to discover what specialists exist before calling `agent__spawn` — \
+                          especially when you're unsure which agent to delegate to. Each agent's `variables` entry \
+                          describes the values to pass via the `variables` parameter of `agent__spawn` or \
+                          `agent__task_create`. This is the discovery counterpart to `agent__list_running` \
                           (which reports agents you have already spawned).".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -407,6 +489,14 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                         JsonSchema {
                             type_value: Some("string".to_string()),
                             description: Some("Prompt to send to the auto-spawned agent. Required if agent is set.".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "variables".to_string(),
+                        JsonSchema {
+                            type_value: Some("object".to_string()),
+                            description: Some("Values for the auto-spawned agent's declared variables, e.g. {\"pr\": \"1234\"}. Passed to `agent__spawn` at dispatch time. String values only. Discover an agent's declared variables via `agent__list_available`.".into()),
                             ..Default::default()
                         },
                     ),
@@ -918,6 +1008,15 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("'prompt' is required"))?
         .to_string();
     let _task_id = args.get("task_id").and_then(Value::as_str);
+    let variables = match parse_variables_arg(args) {
+        Ok(v) => v,
+        Err(message) => {
+            return Ok(json!({
+                "status": "error",
+                "message": message,
+            }));
+        }
+    };
 
     if let Some(parent) = ctx.agent.as_ref()
         && !agent_permitted(parent.spawnable_agents(), &agent_name)
@@ -995,6 +1094,16 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     )
     .await?;
 
+    if let Some(provided) = variables.as_ref()
+        && let Err(message) =
+            validate_spawn_variables(&agent_name, agent.defined_variables(), provided)
+    {
+        return Ok(json!({
+            "status": "error",
+            "message": message,
+        }));
+    }
+
     let agent_mcp_servers = agent.mcp_server_names().to_vec();
     let session = agent.agent_session().map(|v| v.to_string());
     let child_jobs_enabled = jobs_enabled(Some(&agent), app_config.as_ref());
@@ -1019,6 +1128,9 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         child_ctx.supervisor = Some(Arc::new(RwLock::new(
             Supervisor::new(max_concurrent_agents, max_depth).with_max_concurrent_jobs(max_jobs),
         )));
+    }
+    if let Some(provided) = variables {
+        merge_spawn_variables(&mut child_ctx.agent_variables, provided);
     }
 
     if let Some(session) = session {
@@ -1337,6 +1449,27 @@ fn handle_list_running(ctx: &mut RequestContext) -> Result<Value> {
     Ok(result)
 }
 
+fn variables_json(vars: &[AgentVariable]) -> Option<Value> {
+    if vars.is_empty() {
+        return None;
+    }
+    Some(Value::Array(
+        vars.iter()
+            .map(|v| {
+                let mut var = json!({
+                    "name": v.name,
+                    "description": v.description,
+                    "required": v.default.is_none(),
+                });
+                if let Some(default) = &v.default {
+                    var["default"] = json!(default);
+                }
+                var
+            })
+            .collect(),
+    ))
+}
+
 fn handle_list_available(ctx: &RequestContext) -> Result<Value> {
     let whitelist: Option<Vec<String>> = ctx
         .agent
@@ -1352,11 +1485,15 @@ fn handle_list_available(ctx: &RequestContext) -> Result<Value> {
     let agents: Vec<Value> = entries
         .into_iter()
         .map(|(name, description)| {
-            if description.is_empty() {
+            let mut agent = if description.is_empty() {
                 json!({ "name": name })
             } else {
                 json!({ "name": name, "description": description })
+            };
+            if let Some(variables) = variables_json(&load_agent_variables(&name)) {
+                agent["variables"] = variables;
             }
+            agent
         })
         .collect();
 
@@ -1605,6 +1742,16 @@ fn handle_task_create(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         bail!("'prompt' is required when 'agent' is set");
     }
 
+    let variables = match parse_variables_arg(args) {
+        Ok(v) => v,
+        Err(message) => {
+            return Ok(json!({
+                "status": "error",
+                "message": message,
+            }));
+        }
+    };
+
     let supervisor = ctx
         .supervisor
         .as_ref()
@@ -1617,6 +1764,7 @@ fn handle_task_create(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         description.to_string(),
         dispatch_agent.clone(),
         task_prompt,
+        variables,
     );
 
     let mut dep_errors = vec![];
@@ -1664,6 +1812,7 @@ fn handle_task_list(ctx: &mut RequestContext) -> Result<Value> {
                 "blocks": t.blocks.iter().collect::<Vec<_>>(),
                 "agent": t.dispatch_agent,
                 "prompt": t.prompt,
+                "variables": t.variables,
             })
         })
         .collect();
@@ -1688,7 +1837,7 @@ async fn handle_task_complete(ctx: &mut RequestContext, args: &Value) -> Result<
         let newly_runnable_ids = sup.task_queue_mut().complete(task_id);
 
         let mut newly_runnable = Vec::new();
-        let mut to_dispatch: Vec<(String, String, String)> = Vec::new();
+        let mut to_dispatch: Vec<(String, String, String, Option<AgentVariables>)> = Vec::new();
 
         for id in &newly_runnable_ids {
             if let Some(t) = sup.task_queue().get(id) {
@@ -1700,15 +1849,20 @@ async fn handle_task_complete(ctx: &mut RequestContext, args: &Value) -> Result<
                 }));
 
                 if let (Some(agent), Some(prompt)) = (&t.dispatch_agent, &t.prompt) {
-                    to_dispatch.push((id.clone(), agent.clone(), prompt.clone()));
+                    to_dispatch.push((
+                        id.clone(),
+                        agent.clone(),
+                        prompt.clone(),
+                        t.variables.clone(),
+                    ));
                 }
             }
         }
 
         let mut dispatchable = Vec::new();
-        for (tid, agent, prompt) in to_dispatch {
+        for (tid, agent, prompt, variables) in to_dispatch {
             if sup.task_queue_mut().claim(&tid, &format!("auto:{agent}")) {
-                dispatchable.push((agent, prompt));
+                dispatchable.push((agent, prompt, variables));
             }
         }
 
@@ -1716,11 +1870,8 @@ async fn handle_task_complete(ctx: &mut RequestContext, args: &Value) -> Result<
     };
 
     let mut spawned = Vec::new();
-    for (agent, prompt) in &dispatchable {
-        let spawn_args = json!({
-            "agent": agent,
-            "prompt": prompt,
-        });
+    for (agent, prompt, variables) in &dispatchable {
+        let spawn_args = dispatch_spawn_args(agent, prompt, variables.as_ref());
         match handle_spawn(ctx, &spawn_args).await {
             Ok(result) => {
                 let agent_id = result
@@ -2516,6 +2667,53 @@ mod tests {
     }
 
     #[test]
+    fn variables_json_maps_required_and_default() {
+        let vars = vec![
+            AgentVariable {
+                name: "pr".to_string(),
+                description: "PR number".to_string(),
+                default: None,
+                value: String::new(),
+            },
+            AgentVariable {
+                name: "branch".to_string(),
+                description: "Target branch".to_string(),
+                default: Some("x".to_string()),
+                value: String::new(),
+            },
+        ];
+
+        let result = variables_json(&vars).unwrap();
+
+        assert_eq!(result[0]["name"], "pr");
+        assert_eq!(result[0]["description"], "PR number");
+        assert_eq!(result[0]["required"], true);
+        assert!(result[0].get("default").is_none());
+        assert_eq!(result[1]["name"], "branch");
+        assert_eq!(result[1]["required"], false);
+        assert_eq!(result[1]["default"], "x");
+    }
+
+    #[test]
+    fn variables_json_empty_slice_is_none() {
+        assert!(variables_json(&[]).is_none());
+    }
+
+    #[test]
+    fn variables_json_never_emits_value() {
+        let vars = vec![AgentVariable {
+            name: "pr".to_string(),
+            description: "PR number".to_string(),
+            default: None,
+            value: "resolved".to_string(),
+        }];
+
+        let result = variables_json(&vars).unwrap();
+
+        assert!(result[0].get("value").is_none());
+    }
+
+    #[test]
     fn agent_permitted_none_whitelist_allows_all() {
         assert!(agent_permitted(None, "explore"));
         assert!(agent_permitted(None, "anything"));
@@ -2933,6 +3131,32 @@ mod tests {
         .unwrap();
         assert_eq!(result["status"], "ok");
         assert_eq!(result["auto_dispatch"], true);
+    }
+
+    #[test]
+    fn handle_task_create_stores_variables() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let result = handle_task_create(
+            &mut ctx,
+            &json!({"subject": "Auto task", "agent": "coder", "prompt": "do it", "variables": {"pr": "1234"}}),
+        )
+        .unwrap();
+        assert_eq!(result["status"], "ok");
+
+        let list = handle_task_list(&mut ctx).unwrap();
+        let tasks = list["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["variables"]["pr"], "1234");
+    }
+
+    #[test]
+    fn handle_task_create_rejects_non_object_variables() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let result =
+            handle_task_create(&mut ctx, &json!({"subject": "Bad", "variables": ["pr"]})).unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert!(result["message"].as_str().unwrap().contains("JSON object"));
     }
 
     #[test]
@@ -3633,6 +3857,138 @@ mod tests {
                 .unwrap()
                 .contains("spawnable_agents")
         );
+    }
+
+    #[test]
+    fn handle_spawn_non_object_variables_errors() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let result = run_async(handle_spawn(
+            &mut ctx,
+            &json!({"agent": "x", "prompt": "p", "variables": "pr=1234"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert!(result["message"].as_str().unwrap().contains("JSON object"));
+    }
+
+    #[test]
+    fn handle_spawn_non_string_variable_value_errors() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let result = run_async(handle_spawn(
+            &mut ctx,
+            &json!({"agent": "x", "prompt": "p", "variables": {"pr": 1234}}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("'variables.pr'")
+        );
+    }
+
+    #[test]
+    fn parse_variables_arg_absent_returns_none() {
+        assert_eq!(parse_variables_arg(&json!({})).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_variables_arg_accepts_object_of_strings() {
+        let parsed = parse_variables_arg(&json!({"variables": {"pr": "1234", "repo": "coyote"}}))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(parsed.get("pr").map(String::as_str), Some("1234"));
+        assert_eq!(parsed.get("repo").map(String::as_str), Some("coyote"));
+    }
+
+    #[test]
+    fn validate_spawn_variables_unknown_name_lists_declared() {
+        let declared = vec![AgentVariable {
+            name: "pr".into(),
+            description: "PR number".into(),
+            ..Default::default()
+        }];
+
+        let provided = AgentVariables::from([("typo".to_string(), "x".to_string())]);
+
+        let err = validate_spawn_variables("coder", &declared, &provided).unwrap_err();
+        assert!(err.contains("typo"));
+        assert!(err.contains("pr (PR number)"));
+    }
+
+    #[test]
+    fn validate_spawn_variables_none_declared_errors() {
+        let provided = AgentVariables::from([("pr".to_string(), "1".to_string())]);
+
+        let err = validate_spawn_variables("coder", &[], &provided).unwrap_err();
+
+        assert!(err.contains("declares no variables"));
+    }
+
+    #[test]
+    fn validate_spawn_variables_known_names_ok() {
+        let declared = vec![AgentVariable {
+            name: "pr".into(),
+            description: "PR number".into(),
+            ..Default::default()
+        }];
+
+        let provided = AgentVariables::from([("pr".to_string(), "1".to_string())]);
+
+        assert!(validate_spawn_variables("coder", &declared, &provided).is_ok());
+    }
+
+    #[test]
+    fn merge_spawn_variables_overrides_inherited_per_key() {
+        let mut inherited = Some(AgentVariables::from([
+            ("pr".to_string(), "1".to_string()),
+            ("repo".to_string(), "coyote".to_string()),
+        ]));
+
+        merge_spawn_variables(
+            &mut inherited,
+            AgentVariables::from([("pr".to_string(), "2".to_string())]),
+        );
+
+        let merged = inherited.unwrap();
+        assert_eq!(merged.get("pr").map(String::as_str), Some("2"));
+        assert_eq!(merged.get("repo").map(String::as_str), Some("coyote"));
+    }
+
+    #[test]
+    fn merge_spawn_variables_seeds_when_nothing_inherited() {
+        let mut inherited = None;
+
+        merge_spawn_variables(
+            &mut inherited,
+            AgentVariables::from([("pr".to_string(), "2".to_string())]),
+        );
+
+        assert_eq!(inherited.unwrap().get("pr").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn dispatch_spawn_args_includes_variables() {
+        let variables = AgentVariables::from([("pr".to_string(), "1234".to_string())]);
+
+        let args = dispatch_spawn_args("coder", "do it", Some(&variables));
+
+        assert_eq!(args["agent"], "coder");
+        assert_eq!(args["prompt"], "do it");
+        assert_eq!(args["variables"]["pr"], "1234");
+    }
+
+    #[test]
+    fn dispatch_spawn_args_omits_absent_variables() {
+        let args = dispatch_spawn_args("coder", "do it", None);
+
+        assert!(args.get("variables").is_none());
     }
 
     #[test]

@@ -329,6 +329,7 @@ impl Agent {
         agent_variables: &[AgentVariable],
         pre_set_variables: Option<&AgentVariables>,
         no_interaction: bool,
+        interactive: bool,
     ) -> Result<AgentVariables> {
         let mut output = IndexMap::new();
         if agent_variables.is_empty() {
@@ -349,7 +350,7 @@ impl Agent {
             if no_interaction {
                 continue;
             }
-            if *IS_STDOUT_TERMINAL {
+            if interactive && *IS_STDOUT_TERMINAL {
                 if !printed {
                     println!("⚙ Init agent variables...");
                     printed = true;
@@ -1257,7 +1258,7 @@ fn load_agent_description(name: &str) -> String {
     String::new()
 }
 
-fn load_agent_variables(name: &str) -> Vec<AgentVariable> {
+pub fn load_agent_variables(name: &str) -> Vec<AgentVariable> {
     if let Ok(config) = AgentConfig::load(&paths::agent_config_file(name)) {
         return config.variables;
     }

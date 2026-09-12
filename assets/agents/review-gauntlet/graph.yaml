@@ -83,6 +83,9 @@ nodes:
         range ("main...HEAD", "HEAD~3..HEAD"), a single ref, or the literal
         "worktree" for uncommitted changes against HEAD. When the caller
         did not name one, use "worktree".
+      - `project_dir_in`: the repository directory the caller named as holding
+        the change (absolute path preferred); empty string when the caller
+        named none.
       - `plan_context`: the plan / spec / acceptance-criteria text the
         implementation must satisfy, verbatim (or a file path the caller
         pointed at). Empty string when the caller supplied none.
@@ -121,7 +124,9 @@ nodes:
             type: string
         extra_context:
           type: string
-      required: [diff_spec, plan_context, rigor, security_posture, probe_context, forced_lanes, extra_context]
+        project_dir_in:
+          type: string
+      required: [diff_spec, plan_context, rigor, security_posture, probe_context, forced_lanes, extra_context, project_dir_in]
     max_iterations: 3
     max_attempts: 2
     next: signals

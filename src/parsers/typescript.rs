@@ -414,18 +414,19 @@ mod tests {
     use super::*;
     use crate::function::JsonSchema;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static PARSE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn parse_ts_source(
         source: &str,
         file_name: &str,
         parent: &Path,
     ) -> Result<Vec<FunctionDeclaration>> {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("coyote_ts_parser_{file_name}_{unique}.ts"));
+        let pid = std::process::id();
+        let unique = PARSE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("coyote_ts_parser_{file_name}_{pid}_{unique}.ts"));
         fs::write(&path, source).expect("write");
         let file = File::open(&path).expect("open");
         let result = generate_typescript_declarations(file, file_name, Some(parent));

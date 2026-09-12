@@ -1191,6 +1191,7 @@ impl RequestContext {
                 agent.defined_variables(),
                 self.agent_variables.as_ref(),
                 self.info_flag,
+                self.self_agent_id.is_none(),
             )?;
             agent.set_shared_variables(new_variables);
         }
@@ -1213,6 +1214,7 @@ impl RequestContext {
                         agent.defined_variables(),
                         self.agent_variables.as_ref(),
                         self.info_flag,
+                        self.self_agent_id.is_none(),
                     )?;
                     agent.set_shared_variables(new_variables.clone());
                     new_variables
@@ -8182,6 +8184,22 @@ mod tests {
                 .collect()
         }
 
+        fn shadowed(names: &[&str]) -> Vec<String> {
+            names
+                .iter()
+                .map(|name| {
+                    format!(
+                        "-: declared variable '{name}' is shadowed by an explicit \
+                         `initial_state` key: the `initial_state` value wins and the \
+                         variable's resolved value (spawn-provided/CLI/default) is never \
+                         seeded into graph state; rename one of them, or drop the \
+                         `initial_state` key to let the variable seed it (script nodes' \
+                         `LLM_AGENT_VAR_<NAME>` env is unaffected)"
+                    )
+                })
+                .collect()
+        }
+
         let _guard = TestConfigDirGuard::new();
 
         Agent::install_builtin_agents(false).unwrap();
@@ -8216,8 +8234,9 @@ mod tests {
             );
         }
 
-        // Warning parity with the pre-subgraph validator: the only warnings any
-        // bundled graph emits are the `_next`-routed unreachable nodes. A new
+        // Warning baseline for the shipped graphs: `_next`-routed unreachable
+        // nodes, plus variable-shadowing on `coder` and `step-runner` (they
+        // declare variables whose names are also `initial_state` keys). A new
         // rule that fires on a shipped asset (or a new bundled graph) must be
         // recorded here deliberately.
         let expected_warnings = BTreeMap::from([
@@ -8225,19 +8244,23 @@ mod tests {
             ("code-reviewer".to_string(), Vec::new()),
             (
                 "coder".to_string(),
-                unreachable(&[
-                    "analyze_request",
-                    "end_rejected",
-                    "end_success",
-                    "fix_loop_gate",
-                    "gate_approval",
-                    "implement",
-                    "route_complexity",
-                    "route_review_result",
-                    "self_review",
-                    "verify_build",
-                    "verify_tests",
-                ]),
+                [
+                    shadowed(&["project_dir"]),
+                    unreachable(&[
+                        "analyze_request",
+                        "end_rejected",
+                        "end_success",
+                        "fix_loop_gate",
+                        "gate_approval",
+                        "implement",
+                        "route_complexity",
+                        "route_review_result",
+                        "self_review",
+                        "verify_build",
+                        "verify_tests",
+                    ]),
+                ]
+                .concat(),
             ),
             ("deep-research".to_string(), unreachable(&["ask_topic"])),
             ("finding-verifier".to_string(), Vec::new()),
@@ -8245,26 +8268,30 @@ mod tests {
             ("review-gauntlet".to_string(), Vec::new()),
             (
                 "step-runner".to_string(),
-                unreachable(&[
-                    "check_handoff",
-                    "edge_case_sweep",
-                    "end_blocked",
-                    "end_rejected",
-                    "end_success",
-                    "fix_loop_gate",
-                    "gate_blocked",
-                    "gate_deviation",
-                    "gate_user_review",
-                    "get_revision",
-                    "independent_review",
-                    "revise_from_choice",
-                    "route_review",
-                    "route_sweep",
-                    "verify_build",
-                    "verify_format_lint",
-                    "verify_tests",
-                    "write_handoff",
-                ]),
+                [
+                    shadowed(&["plans_dir", "project_dir"]),
+                    unreachable(&[
+                        "check_handoff",
+                        "edge_case_sweep",
+                        "end_blocked",
+                        "end_rejected",
+                        "end_success",
+                        "fix_loop_gate",
+                        "gate_blocked",
+                        "gate_deviation",
+                        "gate_user_review",
+                        "get_revision",
+                        "independent_review",
+                        "revise_from_choice",
+                        "route_review",
+                        "route_sweep",
+                        "verify_build",
+                        "verify_format_lint",
+                        "verify_tests",
+                        "write_handoff",
+                    ]),
+                ]
+                .concat(),
             ),
         ]);
         assert_eq!(

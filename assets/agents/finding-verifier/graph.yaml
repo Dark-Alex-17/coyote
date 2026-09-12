@@ -55,8 +55,12 @@ nodes:
       - `path` and `lines` come from the finding verbatim; if a finding cites
         multiple locations, emit one entry per location with the same id plus
         a `-b`, `-c` suffix.
+      - `project_dir`: the repository directory named in the request (a
+        "Repository:" or "Project:" line). When none is named, echo the
+        default shown in the prompt.
     prompt: |
-      Extract the findings from this verification request:
+      Extract the findings from this verification request (default repository
+      directory when the request names none: {{project_dir}}):
 
       {{initial_prompt}}
     tools: []
@@ -84,7 +88,10 @@ nodes:
                 type: string
                 description: Self-contained statement of what the finding asserts about the code.
             required: [id, severity, path, lines, claim]
-      required: [findings_list]
+        project_dir:
+          type: string
+          description: Repository directory named in the request (echo the prompt default when none).
+      required: [findings_list, project_dir]
     next: verify_each
 
   verify_each:
