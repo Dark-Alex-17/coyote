@@ -8348,6 +8348,228 @@ mod tests {
         );
     }
 
+    // ---- adversary suite-script regression tests (R5) ----
+    //
+    // Fault paths of the adversary's verdict/gate scripts, exercised by
+    // invoking `python3 <script>` with a synthetic GRAPH_STATE env — the same
+    // contract the graph's script executor uses. Guarded on python3 being
+    // available, mirroring src/graph/script.rs's local helper.
+
+    fn cmd_available(name: &str) -> bool {
+        which::which(name).is_ok()
+    }
+
+    fn run_adversary_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/adversary/scripts")
+            .join(script);
+        let out = std::process::Command::new("python3")
+            .arg(&path)
+            .env("GRAPH_STATE", state.to_string())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
+        assert!(
+            out.status.success(),
+            "{script} exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{script} stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    #[test]
+    fn adversary_verdict_pipeline_fault_forces_diverges() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": ["PIPELINE-FAULT: parse failed — cannot review: LLM node failed: boom"],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""},
+                {"id": "c2", "text": "does Y", "status": "UNMET",
+                 "evidence": "", "complaint": "nothing in the diff does Y"}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": ""
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "a pipeline fault must force DIVERGES: {report}"
+        );
+        assert!(
+            report.contains("1. PIPELINE-FAULT: parse failed — cannot review"),
+            "the fault must be complaint #1: {report}"
+        );
+        assert!(
+            report.contains("2. Acceptance criterion \"does Y\""),
+            "per-criterion results must still be reported after the fault: {report}"
+        );
+        assert!(
+            report.contains("Verification runs:"),
+            "the report must carry the Verification runs section: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_holistic_failure_is_a_pipeline_fault() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "holistic_failure": "LLM node failed: provider exploded",
+            "exec_results": ""
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "a holistic-pass failure must force DIVERGES: {report}"
+        );
+        assert!(
+            report.contains(
+                "PIPELINE-FAULT: holistic pass failed — criterion verdicts stand \
+                 but cross-cutting hunt did not run"
+            ),
+            "the holistic failure must become a PIPELINE-FAULT complaint: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_conforms_is_unaffected_without_faults() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // holistic_failure carries the rendered SUCCESS output here — it must
+        // not be mistaken for a failure, and a recorded green run must render
+        // as [PASS] in the Verification runs section.
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "holistic_failure": "{\"extra_complaints\": [], \"observations\": \"\"}",
+            "exec_results": [{"cmd": "cargo test --all", "exit": 0, "duration_s": 42.0, "tail": "ok"}]
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: CONFORMS\nCriteria: 1/1 met"),
+            "non-degraded all-MET semantics must be unchanged: {report}"
+        );
+        assert!(
+            report.contains("Verification runs:") && report.contains("- [PASS] `cargo test --all`"),
+            "a recorded green run must render as PASS evidence: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_run_checks_none_declared_marker() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_adversary_script("run_checks.py", &json!({}));
+        let marker = out["exec_results"].as_str().unwrap();
+        assert!(
+            marker.contains("none declared"),
+            "no verification_commands must degrade to a 'none declared' marker: {marker}"
+        );
+    }
+
+    #[test]
+    fn adversary_run_checks_records_green_and_failing_runs() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({"verification_commands": ["echo ok", "false"]});
+        let out = run_adversary_script("run_checks.py", &state);
+        let results = out["exec_results"].as_array().unwrap();
+        assert_eq!(results.len(), 2, "one record per declared command: {results:?}");
+        assert_eq!(results[0]["cmd"], "echo ok");
+        assert_eq!(results[0]["exit"], 0, "green command must record exit 0");
+        assert!(
+            results[0]["tail"].as_str().unwrap().contains("ok"),
+            "the output tail must be recorded: {results:?}"
+        );
+        assert!(results[0]["duration_s"].is_number());
+        assert_ne!(
+            results[1]["exit"], 0,
+            "failing command must record its nonzero exit: {results:?}"
+        );
+    }
+
+    #[test]
+    fn adversary_crit_gate_contract_regression() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Valid MET verdict passes through with the id stamped from the criterion.
+        let out = run_adversary_script(
+            "crit_gate.py",
+            &json!({
+                "criterion": {"id": "c7", "text": "the spec"},
+                "gate_attempts": 0,
+                "crit_verdict": "{\"id\": \"wrong\", \"status\": \"MET\", \
+                 \"evidence\": \"src/a.rs:1 + test tests/a.rs:5\", \"complaint\": \"\"}"
+            }),
+        );
+        assert_eq!(out["crit_verdict"]["id"], "c7", "id must be stamped: {out}");
+        assert_eq!(out["crit_verdict"]["status"], "MET");
+
+        // Malformed output with retry budget left → reject back to check_criterion.
+        let out = run_adversary_script(
+            "crit_gate.py",
+            &json!({
+                "criterion": {"id": "c7", "text": "the spec"},
+                "gate_attempts": 0,
+                "crit_verdict": "not json at all"
+            }),
+        );
+        assert_eq!(out["_next"], "check_criterion", "first failure must retry: {out}");
+        assert_eq!(out["gate_attempts"], 1);
+
+        // Malformed output with the retry exhausted → recorded PARTIAL (unproven).
+        let out = run_adversary_script(
+            "crit_gate.py",
+            &json!({
+                "criterion": {"id": "c7", "text": "the spec"},
+                "gate_attempts": 1,
+                "crit_verdict": "still not json"
+            }),
+        );
+        assert_eq!(out["crit_verdict"]["status"], "PARTIAL");
+        assert!(
+            out["crit_verdict"]["complaint"]
+                .as_str()
+                .unwrap()
+                .contains("failed machine validation"),
+            "exhausted retries must record the unproven complaint: {out}"
+        );
+    }
+
     #[test]
     #[serial]
     fn install_functions_force_preserves_user_mcp_json() {
