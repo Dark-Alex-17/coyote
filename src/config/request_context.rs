@@ -8200,6 +8200,20 @@ mod tests {
                 .collect()
         }
 
+        fn fallback_capture(node_ids: &[&str]) -> Vec<String> {
+            node_ids
+                .iter()
+                .map(|id| {
+                    format!(
+                        "{id}: llm node declares `fallback` with `output_schema` but no \
+                         `state_updates`; on failure the \"…failed: <chain>\" string is \
+                         only written through `state_updates`, so the fallback node \
+                         cannot see why it was reached"
+                    )
+                })
+                .collect()
+        }
+
         let _guard = TestConfigDirGuard::new();
 
         Agent::install_builtin_agents(false).unwrap();
@@ -8238,7 +8252,9 @@ mod tests {
         // nodes, plus variable-shadowing on `coder` and `step-runner` (they
         // declare variables whose names are also `initial_state` keys). A new
         // rule that fires on a shipped asset (or a new bundled graph) must be
-        // recorded here deliberately.
+        // recorded here deliberately. The fallback-capture warnings on
+        // `step-runner` are true positives, recorded until those nodes gain
+        // `state_updates` that capture the failure string.
         let expected_warnings = BTreeMap::from([
             ("adversary".to_string(), Vec::new()),
             ("code-reviewer".to_string(), Vec::new()),
@@ -8266,9 +8282,8 @@ mod tests {
             ("finding-verifier".to_string(), Vec::new()),
             ("librarian".to_string(), Vec::new()),
             ("review-gauntlet".to_string(), Vec::new()),
-            (
-                "step-runner".to_string(),
-                [
+            ("step-runner".to_string(), {
+                let mut lines = [
                     shadowed(&["plans_dir", "project_dir"]),
                     unreachable(&[
                         "check_handoff",
@@ -8290,9 +8305,12 @@ mod tests {
                         "verify_tests",
                         "write_handoff",
                     ]),
+                    fallback_capture(&["edge_case_sweep", "orient", "write_handoff"]),
                 ]
-                .concat(),
-            ),
+                .concat();
+                lines.sort();
+                lines
+            }),
         ]);
         assert_eq!(
             warnings_by_agent, expected_warnings,

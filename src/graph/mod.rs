@@ -35,13 +35,24 @@ pub(crate) fn wall_clock(secs: u64) -> Option<Duration> {
 }
 
 /// Whether an error looks like a transient transport/provider failure worth
-/// retrying. Providers and HTTP stacks surface these as rendered text rather
-/// than typed errors, so the whole context chain is substring-matched.
+/// retrying. Typed transport errors anywhere in the chain (reqwest
+/// connect/timeout failures and tokio's `Elapsed`) are recognized first;
+/// providers that surface failures only as rendered text fall back to
+/// substring matching over the whole context chain.
 pub(crate) fn is_transient_error(err: &anyhow::Error) -> bool {
+    if err.chain().any(|c| {
+        c.downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_connect() || e.is_timeout())
+            || c.is::<tokio::time::error::Elapsed>()
+    }) {
+        return true;
+    }
     let s = format!("{err:#}");
     s.contains("timed out")
         || s.contains("rate limit")
-        || s.contains("429")
+        || s.contains("HTTP 429")
+        || s.contains("status 429")
+        || s.contains("429 Too Many")
         || s.contains("Connection reset")
         || s.contains("Connection refused")
         || s.contains("produced no output")
@@ -82,7 +93,9 @@ mod tests {
     fn is_transient_error_matches_expected_signatures() {
         assert!(is_transient_error(&anyhow!("request timed out after 30s")));
         assert!(is_transient_error(&anyhow!("rate limit reached")));
-        assert!(is_transient_error(&anyhow!("429 too many requests")));
+        assert!(is_transient_error(&anyhow!("HTTP 429")));
+        assert!(is_transient_error(&anyhow!("status 429")));
+        assert!(is_transient_error(&anyhow!("429 Too Many Requests")));
         assert!(is_transient_error(&anyhow!("Connection reset by peer")));
         assert!(is_transient_error(&anyhow!("Connection refused")));
         assert!(is_transient_error(&anyhow!("llm produced no output")));
@@ -113,5 +126,37 @@ mod tests {
         )));
         assert!(!is_transient_error(&anyhow!("hit max_iterations")));
         assert!(!is_transient_error(&anyhow!("authentication failed")));
+        assert!(!is_transient_error(&anyhow!(
+            "script exited 1: see line 429 in a comment"
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn is_transient_error_recognizes_typed_elapsed_without_matching_text() {
+        let elapsed = tokio::time::timeout(Duration::from_secs(1), std::future::pending::<()>())
+            .await
+            .expect_err("pending future must time out");
+        let err = anyhow::Error::new(elapsed).context("calling provider");
+
+        // "deadline has elapsed" contains no recognized substring, so only
+        // the typed pre-check can classify this as transient.
+        let rendered = format!("{err:#}");
+        assert!(!rendered.contains("timed out"), "{rendered}");
+        assert!(is_transient_error(&err));
+    }
+
+    #[tokio::test]
+    async fn is_transient_error_recognizes_typed_reqwest_connect_error() {
+        // `no_proxy` keeps environments with HTTP(S)_PROXY set from turning
+        // the refused connection into a proxied response.
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let err = client
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .expect_err("closed local port must refuse the connection");
+
+        assert!(err.is_connect());
+        assert!(is_transient_error(&anyhow::Error::new(err)));
     }
 }
