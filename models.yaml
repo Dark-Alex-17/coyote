@@ -3481,20 +3481,6 @@
     reasoning_levels:
     - none
     - high
-  - name: minimax.minimax-m2.5
-    type: chat
-    max_input_tokens: 196608
-    input_price: 0.3
-    output_price: 1.2
-    max_output_tokens: 98304
-    supports_function_calling: true
-  - name: zai.glm-5
-    type: chat
-    max_input_tokens: 202752
-    input_price: 1.0
-    output_price: 3.2
-    max_output_tokens: 101376
-    supports_function_calling: true
   - name: nvidia.nemotron-super-3-120b
     type: chat
     max_input_tokens: 262144
@@ -3622,27 +3608,19 @@
     require_max_tokens: true
     supports_vision: true
     default_reasoning_effort: high
-  - name: deepseek.v3.2
+  - name: minimax.minimax-m2.5
     type: chat
-    max_input_tokens: 163840
-    input_price: 0.62
-    output_price: 1.85
-    max_output_tokens: 81920
+    max_input_tokens: 196608
+    input_price: 0.3
+    output_price: 1.2
+    max_output_tokens: 98304
     supports_function_calling: true
-  - name: moonshotai.kimi-k2.5
+  - name: zai.glm-5
     type: chat
-    max_input_tokens: 262143
-    input_price: 0.6
-    output_price: 3.0
-    max_output_tokens: 16000
-    supports_vision: true
-    supports_function_calling: true
-  - name: qwen.qwen3-coder-next
-    type: chat
-    max_input_tokens: 131072
-    input_price: 0.22
-    output_price: 1.8
-    max_output_tokens: 65536
+    max_input_tokens: 202752
+    input_price: 1.0
+    output_price: 3.2
+    max_output_tokens: 131072
     supports_function_calling: true
   - name: anthropic.claude-opus-4-6-v1
     type: chat
@@ -3730,6 +3708,21 @@
     require_max_tokens: true
     supports_vision: true
     default_reasoning_effort: high
+  - name: qwen.qwen3-coder-next
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.5
+    output_price: 1.2
+    max_output_tokens: 65536
+    supports_function_calling: true
+  - name: moonshotai.kimi-k2.5
+    type: chat
+    max_input_tokens: 262143
+    input_price: 0.6
+    output_price: 3.0
+    max_output_tokens: 16384
+    supports_vision: true
+    supports_function_calling: true
   - name: zai.glm-4.7-flash
     type: chat
     max_input_tokens: 200000
@@ -3744,19 +3737,19 @@
     output_price: 1.2
     max_output_tokens: 131072
     supports_function_calling: true
-  - name: nvidia.nemotron-nano-3-30b
-    type: chat
-    max_input_tokens: 128000
-    input_price: 0.06
-    output_price: 0.24
-    max_output_tokens: 4096
-    supports_function_calling: true
   - name: zai.glm-4.7
     type: chat
     max_input_tokens: 204800
     input_price: 0.6
     output_price: 2.2
     max_output_tokens: 131072
+    supports_function_calling: true
+  - name: nvidia.nemotron-nano-3-30b
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.06
+    output_price: 0.24
+    max_output_tokens: 8192
     supports_function_calling: true
   - name: amazon.nova-2-lite-v1:0
     type: chat
@@ -3830,13 +3823,6 @@
     max_output_tokens: 8192
     supports_vision: true
     supports_function_calling: true
-  - name: moonshot.kimi-k2-thinking
-    type: chat
-    max_input_tokens: 262143
-    input_price: 0.6
-    output_price: 2.5
-    max_output_tokens: 16000
-    supports_function_calling: true
   - name: us.amazon.nova-2-lite-v1:0
     type: chat
     max_input_tokens: 1000000
@@ -3849,6 +3835,13 @@
     - low
     - medium
     - high
+  - name: deepseek.v3.2
+    type: chat
+    max_input_tokens: 163840
+    input_price: 0.62
+    output_price: 1.85
+    max_output_tokens: 81920
+    supports_function_calling: true
   - name: anthropic.claude-opus-4-5-20251101-v1:0
     type: chat
     max_input_tokens: 200000
@@ -3916,6 +3909,13 @@
     max_output_tokens: 24000
     require_max_tokens: true
     supports_vision: true
+  - name: moonshot.kimi-k2-thinking
+    type: chat
+    max_input_tokens: 262143
+    input_price: 0.6
+    output_price: 2.5
+    max_output_tokens: 16000
+    supports_function_calling: true
   - name: openai.gpt-oss-safeguard-120b
     type: chat
     max_input_tokens: 128000
@@ -3938,6 +3938,14 @@
     - low
     - medium
     - high
+  - name: nvidia.nemotron-nano-12b-v2
+    type: chat
+    max_input_tokens: 128000
+    input_price: 0.2
+    output_price: 0.6
+    max_output_tokens: 8192
+    supports_vision: true
+    supports_function_calling: true
   - name: minimax.minimax-m2
     type: chat
     max_input_tokens: 204608
@@ -4012,14 +4020,6 @@
     max_output_tokens: 24000
     require_max_tokens: true
     supports_vision: true
-  - name: qwen.qwen3-vl-235b-a22b
-    type: chat
-    max_input_tokens: 262000
-    input_price: 0.3
-    output_price: 1.5
-    max_output_tokens: 262000
-    supports_vision: true
-    supports_function_calling: true
   - name: anthropic.claude-sonnet-4-5-20250929-v1:0
     type: chat
     max_input_tokens: 200000
@@ -4087,6 +4087,21 @@
     max_output_tokens: 24000
     require_max_tokens: true
     supports_vision: true
+  - name: qwen.qwen3-vl-235b-a22b
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.53
+    output_price: 2.66
+    max_output_tokens: 262000
+    supports_vision: true
+    supports_function_calling: true
+  - name: qwen.qwen3-next-80b-a3b
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.15
+    output_price: 1.2
+    max_output_tokens: 262000
+    supports_function_calling: true
   - name: deepseek.v3-v1:0
     type: chat
     max_input_tokens: 163840
@@ -4094,40 +4109,12 @@
     output_price: 1.68
     max_output_tokens: 81920
     supports_function_calling: true
-  - name: qwen.qwen3-235b-a22b-2507-v1:0
-    type: chat
-    max_input_tokens: 262144
-    input_price: 0.22
-    output_price: 0.88
-    max_output_tokens: 131072
-    supports_function_calling: true
-  - name: qwen.qwen3-32b-v1:0
-    type: chat
-    max_input_tokens: 16384
-    input_price: 0.15
-    output_price: 0.6
-    max_output_tokens: 16384
-    supports_function_calling: true
-  - name: qwen.qwen3-coder-30b-a3b-v1:0
-    type: chat
-    max_input_tokens: 262144
-    input_price: 0.15
-    output_price: 0.6
-    max_output_tokens: 131072
-    supports_function_calling: true
-  - name: qwen.qwen3-coder-480b-a35b-v1:0
+  - name: nvidia.nemotron-nano-9b-v2
     type: chat
     max_input_tokens: 131072
-    input_price: 0.22
-    output_price: 1.8
-    max_output_tokens: 65536
-    supports_function_calling: true
-  - name: qwen.qwen3-next-80b-a3b
-    type: chat
-    max_input_tokens: 262000
-    input_price: 0.14
-    output_price: 1.4
-    max_output_tokens: 262000
+    input_price: 0.06
+    output_price: 0.23
+    max_output_tokens: 8192
     supports_function_calling: true
   - name: anthropic.claude-opus-4-1-20250805-v1:0
     type: chat
@@ -4211,6 +4198,27 @@
     max_output_tokens: 32000
     require_max_tokens: true
     supports_vision: true
+    supports_function_calling: true
+  - name: qwen.qwen3-coder-30b-a3b-v1:0
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.15
+    output_price: 0.6
+    max_output_tokens: 131072
+    supports_function_calling: true
+  - name: qwen.qwen3-coder-480b-a35b-v1:0
+    type: chat
+    max_input_tokens: 131072
+    input_price: 0.45
+    output_price: 1.8
+    max_output_tokens: 65536
+    supports_function_calling: true
+  - name: qwen.qwen3-235b-a22b-2507-v1:0
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.22
+    output_price: 0.88
+    max_output_tokens: 131072
     supports_function_calling: true
   - name: mistral.voxtral-small-24b-2507
     type: chat
@@ -4313,6 +4321,13 @@
     require_max_tokens: true
     supports_vision: true
     supports_function_calling: true
+  - name: qwen.qwen3-32b-v1:0
+    type: chat
+    max_input_tokens: 32768
+    input_price: 0.15
+    output_price: 0.6
+    max_output_tokens: 16384
+    supports_function_calling: true
   - name: google.gemma-3-12b-it
     type: chat
     max_input_tokens: 131072
@@ -4340,14 +4355,12 @@
     input_price: 1.35
     output_price: 5.4
     max_output_tokens: 32768
-    supports_function_calling: true
   - name: us.deepseek.r1-v1:0
     type: chat
     max_input_tokens: 128000
     input_price: 1.35
     output_price: 5.4
     max_output_tokens: 32768
-    supports_function_calling: true
   - name: meta.llama3-3-70b-instruct-v1:0
     type: chat
     max_input_tokens: 128000
@@ -4482,21 +4495,6 @@
     max_input_tokens: 128000
     input_price: 0.04
     output_price: 0.04
-    max_output_tokens: 4096
-    supports_function_calling: true
-  - name: nvidia.nemotron-nano-12b-v2
-    type: chat
-    max_input_tokens: 128000
-    input_price: 0.2
-    output_price: 0.6
-    max_output_tokens: 4096
-    supports_vision: true
-    supports_function_calling: true
-  - name: nvidia.nemotron-nano-9b-v2
-    type: chat
-    max_input_tokens: 128000
-    input_price: 0.06
-    output_price: 0.23
     max_output_tokens: 4096
     supports_function_calling: true
   - name: meta.llama3-1-70b-instruct-v1:0
@@ -6350,8 +6348,8 @@
   - name: deepseek/deepseek-v4-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0886
-    output_price: 0.1772
+    input_price: 0.0676
+    output_price: 0.1352
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731
@@ -6387,16 +6385,16 @@
   - name: deepseek/deepseek-v4-pro
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.9553
-    output_price: 1.9105
+    input_price: 0.8397
+    output_price: 1.6794
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.66
-    output_price: 1.98
-    max_output_tokens: 943718
+    input_price: 0.5782
+    output_price: 1.7345
+    max_output_tokens: 393216
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813:batch
     type: chat
@@ -6849,6 +6847,14 @@
     output_price: 0.0
     max_output_tokens: 32768
     supports_function_calling: true
+  - name: inclusionai/ling-3.0-flash-vl
+    type: chat
+    max_input_tokens: 131072
+    input_price: 0.06
+    output_price: 0.18
+    max_output_tokens: 32768
+    supports_vision: true
+    supports_function_calling: true
   - name: inclusionai/ling-3.0-flash-vl:free
     type: chat
     max_input_tokens: 262144
@@ -6894,9 +6900,9 @@
   - name: meta-llama/llama-3.1-70b-instruct
     type: chat
     max_input_tokens: 131072
-    input_price: 0.4
-    output_price: 0.4
-    max_output_tokens: 16384
+    input_price: 0.72
+    output_price: 0.72
+    max_output_tokens: 8192
     supports_function_calling: true
   - name: meta-llama/llama-3.1-8b-instruct
     type: chat
@@ -7247,7 +7253,7 @@
     supports_vision: true
   - name: mistralai/mistral-small-3.2-24b-instruct
     type: chat
-    max_input_tokens: 131072
+    max_input_tokens: 256000
     input_price: 0.075
     output_price: 0.2
     max_output_tokens: 16384
@@ -7315,8 +7321,8 @@
   - name: moonshotai/kimi-k3
     type: chat
     max_input_tokens: 1048576
-    input_price: 2.34
-    output_price: 11.7
+    input_price: 1.5352
+    output_price: 7.7001
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -8483,9 +8489,9 @@
   - name: qwen/qwen3-235b-a22b-2507
     type: chat
     max_input_tokens: 262144
-    input_price: 0.22
-    output_price: 0.88
-    max_output_tokens: 16384
+    input_price: 0.0875
+    output_price: 0.35
+    max_output_tokens: 235929
     supports_function_calling: true
   - name: qwen/qwen3-235b-a22b-thinking-2507
     type: chat
@@ -8799,8 +8805,8 @@
   - name: qwen/qwen3.8-27b
     type: chat
     max_input_tokens: 1000000
-    input_price: 0.42
-    output_price: 3.0
+    input_price: 0.214
+    output_price: 2.55
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
@@ -9196,9 +9202,9 @@
   - name: z-ai/glm-5.2
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.966
-    output_price: 3.036
-    max_output_tokens: 131072
+    input_price: 0.6
+    output_price: 2.0
+    max_output_tokens: 182476
     supports_function_calling: true
   - name: z-ai/glm-5.2:batch
     type: chat
@@ -9303,16 +9309,24 @@
   - name: ~moonshotai/kimi-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 2.34
-    output_price: 11.7
+    input_price: 1.5352
+    output_price: 7.7001
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
-  - name: ~openai/gpt-latest
+  - name: ~openai/gpt-astra-latest
     type: chat
     max_input_tokens: 1050000
-    input_price: 2.0
-    output_price: 10.0
+    input_price: 10.0
+    output_price: 50.0
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+  - name: ~openai/gpt-luna-latest
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 0.2
+    output_price: 1.2
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -9321,6 +9335,22 @@
     max_input_tokens: 400000
     input_price: 0.75
     output_price: 4.5
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+  - name: ~openai/gpt-sol-latest
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 2.0
+    output_price: 10.0
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+  - name: ~openai/gpt-terra-latest
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 2.0
+    output_price: 12.0
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -9343,8 +9373,8 @@
   - name: ~z-ai/glm-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.97
-    output_price: 3.3077
+    input_price: 0.8727
+    output_price: 3.36
     max_output_tokens: 943718
     supports_function_calling: true
 - provider: github
