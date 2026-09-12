@@ -176,6 +176,8 @@ impl GraphValidator {
         self.validate_rag_nodes(graph, &mut result);
         self.validate_llm_nodes(graph, &mut result);
         self.validate_llm_skills(graph, &mut result);
+        self.validate_max_attempts(graph, &mut result);
+        self.validate_fallback_capture(graph, &mut result);
         self.validate_max_concurrency(graph, &mut result);
         self.validate_max_concurrency_template(graph, &mut result);
         self.validate_orchestration_limits(graph, &mut result);
@@ -371,6 +373,54 @@ impl GraphValidator {
                     ));
                 }
             }
+        }
+    }
+
+    fn validate_max_attempts(&self, graph: &Graph, result: &mut ValidationResult) {
+        for (node_id, node) in &graph.nodes {
+            let kind = match &node.node_type {
+                NodeType::Llm(l) if l.max_attempts == 0 => "llm",
+                NodeType::Agent(a) if a.max_attempts == 0 => "agent",
+                _ => continue,
+            };
+            result.error(ValidationError::with_node(
+                node_id,
+                format!(
+                    "{kind} node's `max_attempts` must be >= 1 (got 0); the node \
+                     would exhaust retries without ever attempting a run"
+                ),
+            ));
+        }
+    }
+
+    fn validate_fallback_capture(&self, graph: &Graph, result: &mut ValidationResult) {
+        for (node_id, node) in &graph.nodes {
+            let kind = match &node.node_type {
+                NodeType::Llm(l)
+                    if l.fallback.is_some()
+                        && l.output_schema.is_some()
+                        && l.state_updates.is_none() =>
+                {
+                    "llm"
+                }
+                NodeType::Agent(a)
+                    if a.fallback.is_some()
+                        && a.output_schema.is_some()
+                        && a.state_updates.is_none() =>
+                {
+                    "agent"
+                }
+                _ => continue,
+            };
+            result.warning(ValidationError::with_node(
+                node_id,
+                format!(
+                    "{kind} node declares `fallback` with `output_schema` but no \
+                     `state_updates`; on failure the \"…failed: <chain>\" string is \
+                     only written through `state_updates`, so the fallback node \
+                     cannot see why it was reached"
+                ),
+            ));
         }
     }
 
@@ -4417,5 +4467,176 @@ mod tests {
         let graph = graph_with(vec![("a", a)], "a");
 
         assert_eq!(ids(&branch_subgraph(&graph, "a")), vec!["a"]);
+    }
+
+    #[test]
+    fn llm_max_attempts_zero_is_an_error() {
+        let mut node = llm_node("l", None, Some("end"));
+        if let NodeType::Llm(ref mut n) = node.node_type {
+            n.max_attempts = 0;
+        }
+        let graph = graph_with(vec![("l", node), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.node_id.as_deref() == Some("l")
+                    && e.message.contains("`max_attempts` must be >= 1")),
+            "expected max_attempts error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn agent_max_attempts_zero_is_an_error() {
+        let mut node = agent_node("a", "helper", Some("end"));
+        if let NodeType::Agent(ref mut n) = node.node_type {
+            n.max_attempts = 0;
+        }
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.node_id.as_deref() == Some("a")
+                    && e.message.contains("`max_attempts` must be >= 1")),
+            "expected max_attempts error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn max_attempts_of_one_is_not_flagged() {
+        let graph = graph_with(
+            vec![
+                ("l", llm_node("l", None, Some("end"))),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("`max_attempts`")),
+            "unexpected max_attempts error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn llm_fallback_with_output_schema_and_no_state_updates_warns() {
+        let mut node = llm_with_output_schema("l", &["summary"], Some("end"));
+        if let NodeType::Llm(ref mut n) = node.node_type {
+            n.fallback = Some("fb".into());
+        }
+        let graph = graph_with(
+            vec![
+                ("l", node),
+                ("fb", end_node("fb")),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|e| e.node_id.as_deref() == Some("l")
+                    && e.message
+                        .contains("declares `fallback` with `output_schema`")),
+            "expected fallback capture warning: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn agent_fallback_with_output_schema_and_no_state_updates_warns() {
+        let mut node = agent_node("a", "helper", Some("end"));
+        if let NodeType::Agent(ref mut n) = node.node_type {
+            n.fallback = Some("fb".into());
+            n.output_schema = Some(serde_json::json!({ "type": "object" }));
+        }
+        let graph = graph_with(
+            vec![
+                ("a", node),
+                ("fb", end_node("fb")),
+                ("end", end_node("end")),
+            ],
+            "a",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|e| e.node_id.as_deref() == Some("a")
+                    && e.message
+                        .contains("declares `fallback` with `output_schema`")),
+            "expected fallback capture warning: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn fallback_with_output_schema_and_state_updates_is_not_flagged() {
+        let mut node = llm_with_output_schema("l", &["summary"], Some("end"));
+        if let NodeType::Llm(ref mut n) = node.node_type {
+            n.fallback = Some("fb".into());
+            n.state_updates = Some(HashMap::from([("summary".into(), "{{output}}".into())]));
+        }
+        let graph = graph_with(
+            vec![
+                ("l", node),
+                ("fb", end_node("fb")),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result.warnings.iter().any(|e| e
+                .message
+                .contains("declares `fallback` with `output_schema`")),
+            "unexpected fallback capture warning: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn output_schema_without_fallback_is_not_flagged() {
+        let graph = graph_with(
+            vec![
+                ("l", llm_with_output_schema("l", &["summary"], Some("end"))),
+                ("end", end_node("end")),
+            ],
+            "l",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result.warnings.iter().any(|e| e
+                .message
+                .contains("declares `fallback` with `output_schema`")),
+            "unexpected fallback capture warning: {:?}",
+            result.warnings
+        );
     }
 }

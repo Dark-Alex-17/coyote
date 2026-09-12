@@ -918,42 +918,8 @@ mod tests {
     use super::*;
     use crate::config::mcp_tool_policy::LayerSource;
     use crate::function::ToolCall;
-    use log::{Level, LevelFilter, Log, Metadata, Record};
+    use crate::testing::{install_warn_collector, warn_messages};
     use std::sync::atomic::Ordering;
-    use std::sync::{Mutex, Once, OnceLock};
-
-    struct WarnCollector;
-
-    static WARN_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-
-    fn warn_messages() -> &'static Mutex<Vec<String>> {
-        WARN_MESSAGES.get_or_init(Mutex::default)
-    }
-
-    impl Log for WarnCollector {
-        fn enabled(&self, metadata: &Metadata) -> bool {
-            metadata.level() <= Level::Warn
-        }
-
-        fn log(&self, record: &Record) {
-            if self.enabled(record.metadata()) {
-                warn_messages()
-                    .lock()
-                    .unwrap()
-                    .push(record.args().to_string());
-            }
-        }
-
-        fn flush(&self) {}
-    }
-
-    fn install_warn_collector() {
-        static INSTALL: Once = Once::new();
-        INSTALL.call_once(|| {
-            log::set_logger(&WarnCollector).expect("no other logger should be installed");
-            log::set_max_level(LevelFilter::Warn);
-        });
-    }
 
     #[test]
     fn mcp_runtime_new_is_empty() {
