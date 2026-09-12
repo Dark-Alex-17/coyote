@@ -73,14 +73,21 @@ def append_criterion_complaints(lines, verdicts, extra, start):
 def render_exec_results(exec_results):
     """Lines for the "Verification runs:" report section.
 
-    exec_results is a list of {cmd, exit, duration_s, tail} records from
-    run_checks.py, or a string marker ("none declared —…" / "ENVIRONMENT: …"),
-    or empty when the run never reached the verification stage.
+    exec_results is a list of {cmd, exit, duration_s, tail} records (or
+    {cmd, skipped} for commands the runner's total deadline left no budget
+    for) from run_checks.py, or a string marker ("none declared —…" /
+    "ENVIRONMENT: …"), or empty when the run never reached the stage.
     """
     if isinstance(exec_results, list):
         out = []
         for r in exec_results:
             if not isinstance(r, dict):
+                continue
+            if r.get("skipped"):
+                out.append(
+                    f"- [SKIPPED] `{r.get('cmd', '?')}` — never ran: the runner's "
+                    "total deadline expired first; covered criteria are unproven"
+                )
                 continue
             status = "PASS" if r.get("exit") == 0 else "FAIL"
             out.append(

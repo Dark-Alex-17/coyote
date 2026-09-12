@@ -8360,12 +8360,23 @@ mod tests {
     }
 
     fn run_adversary_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+        run_adversary_script_env(script, state, &[])
+    }
+
+    fn run_adversary_script_env(
+        script: &str,
+        state: &serde_json::Value,
+        envs: &[(&str, &str)],
+    ) -> serde_json::Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/adversary/scripts")
             .join(script);
-        let out = std::process::Command::new("python3")
-            .arg(&path)
-            .env("GRAPH_STATE", state.to_string())
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg(&path).env("GRAPH_STATE", state.to_string());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let out = cmd
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
         assert!(
@@ -8506,7 +8517,11 @@ mod tests {
         let state = json!({"verification_commands": ["echo ok", "false"]});
         let out = run_adversary_script("run_checks.py", &state);
         let results = out["exec_results"].as_array().unwrap();
-        assert_eq!(results.len(), 2, "one record per declared command: {results:?}");
+        assert_eq!(
+            results.len(),
+            2,
+            "one record per declared command: {results:?}"
+        );
         assert_eq!(results[0]["cmd"], "echo ok");
         assert_eq!(results[0]["exit"], 0, "green command must record exit 0");
         assert!(
@@ -8517,6 +8532,180 @@ mod tests {
         assert_ne!(
             results[1]["exit"], 0,
             "failing command must record its nonzero exit: {results:?}"
+        );
+    }
+
+    #[test]
+    fn adversary_run_checks_runner_error_degrades_to_environment_marker() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A dead project_dir makes every spawn raise — the outer except must
+        // still exit 0 (asserted inside the helper) and degrade the whole run
+        // to the ENVIRONMENT marker instead of failing the node.
+        let state = json!({
+            "verification_commands": ["echo hi"],
+            "project_dir": "/nonexistent/xyz"
+        });
+        let out = run_adversary_script("run_checks.py", &state);
+        let marker = out["exec_results"].as_str().unwrap();
+        assert!(
+            marker.starts_with("ENVIRONMENT"),
+            "a runner error must degrade to an ENVIRONMENT marker: {marker}"
+        );
+    }
+
+    #[test]
+    fn adversary_run_checks_deadline_skips_remaining_commands() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Deadline seam: a 1s total budget. The hung first command must be cut
+        // off at min(per-command, remaining)≈1s and recorded as a timeout; the
+        // second must be recorded as skipped — the in-script handling stays
+        // authoritative instead of the NODE timeout killing the script from
+        // outside (which would bypass the ENVIRONMENT degradation entirely).
+        let state = json!({"verification_commands": ["sleep 5", "echo never"]});
+        let out = run_adversary_script_env(
+            "run_checks.py",
+            &state,
+            &[("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "1")],
+        );
+        let results = out["exec_results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "every declared command gets a record: {results:?}"
+        );
+        assert_eq!(
+            results[0]["exit"], -1,
+            "a command outliving its budget must record a timeout: {results:?}"
+        );
+        assert!(
+            results[0]["tail"].as_str().unwrap().contains("TIMEOUT"),
+            "the timeout must be named in the tail: {results:?}"
+        );
+        assert_eq!(
+            results[1]["skipped"], "deadline",
+            "commands past the deadline must be recorded as skipped: {results:?}"
+        );
+    }
+
+    #[test]
+    fn adversary_pipeline_fault_parse_stage_attribution() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({"parse_failure": "LLM node 'parse' failed: provider exploded"}),
+        );
+        let faults = out["pipeline_faults"].as_array().unwrap();
+        let fault = faults[0].as_str().unwrap();
+        assert!(
+            fault.contains("PIPELINE-FAULT: parse failed — cannot review"),
+            "an llm-node failure string must attribute to the parse stage: {fault}"
+        );
+        assert!(
+            fault.contains("provider exploded"),
+            "the failure detail must be carried into the fault: {fault}"
+        );
+    }
+
+    #[test]
+    fn adversary_pipeline_fault_facts_and_run_checks_stage_attribution() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A script node's fallback writes NOTHING into state (executor.rs
+        // script arm), so attribution keys off which stage outputs are
+        // present. facts stage: parse succeeded (schema JSON in
+        // parse_failure) but diff_text is still the initial '' — diff
+        // resolution itself died.
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({"parse_failure": "{\"criteria\": []}", "diff_text": ""}),
+        );
+        let faults = out["pipeline_faults"].as_array().unwrap();
+        assert!(
+            faults[0]
+                .as_str()
+                .unwrap()
+                .contains("PIPELINE-FAULT: diff resolution failed"),
+            "empty diff_text must attribute to the facts stage: {faults:?}"
+        );
+
+        // run_checks stage: facts completed (diff_facts.py unconditionally
+        // writes a nonempty diff_text) but the runner died at the node level
+        // before recording exec_results.
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({
+                "parse_failure": "{\"criteria\": []}",
+                "diff_text": "diff --git a/x b/x",
+                "exec_results": ""
+            }),
+        );
+        let faults = out["pipeline_faults"].as_array().unwrap();
+        assert!(
+            faults[0]
+                .as_str()
+                .unwrap()
+                .contains("PIPELINE-FAULT: verification runner killed"),
+            "nonempty diff_text must attribute to the run_checks stage: {faults:?}"
+        );
+    }
+
+    #[test]
+    fn adversary_check_criterion_prompt_cites_exec_results() {
+        use crate::graph::{GraphParser, NodeType};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/adversary");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .expect("adversary graph.yaml must parse");
+        let node = graph
+            .nodes
+            .get("check_criterion")
+            .expect("adversary graph must have a check_criterion node");
+        let NodeType::Llm(llm) = &node.node_type else {
+            panic!("check_criterion must be an llm node");
+        };
+        assert!(
+            llm.prompt.contains("{{exec_results}}"),
+            "check_criterion's prompt must cite the recorded verification runs: {}",
+            llm.prompt
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_renders_skipped_runs() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test --all", "skipped": "deadline"}]
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.contains("- [SKIPPED] `cargo test --all`"),
+            "a skipped record must render as SKIPPED: {report}"
+        );
+        assert!(
+            !report.contains("[FAIL] `cargo test --all`"),
+            "a skipped record must not render as FAIL: {report}"
         );
     }
 
@@ -8548,7 +8737,10 @@ mod tests {
                 "crit_verdict": "not json at all"
             }),
         );
-        assert_eq!(out["_next"], "check_criterion", "first failure must retry: {out}");
+        assert_eq!(
+            out["_next"], "check_criterion",
+            "first failure must retry: {out}"
+        );
         assert_eq!(out["gate_attempts"], 1);
 
         // Malformed output with the retry exhausted → recorded PARTIAL (unproven).
