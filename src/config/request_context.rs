@@ -8951,6 +8951,59 @@ mod tests {
     }
 
     #[test]
+    fn gauntlet_parse_fault_records_fault_in_signals_error() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script(
+            "parse_fault.py",
+            &json!({"parse_failure": "LLM node 'parse' failed: provider exploded"}),
+        );
+        let fault = out["signals_error"].as_str().unwrap();
+        assert!(
+            fault.contains("PIPELINE-FAULT: parse failed"),
+            "a dead parse stage must surface as a PIPELINE-FAULT: {fault}"
+        );
+        assert!(
+            fault.contains("provider exploded"),
+            "the failure detail must be carried into the fault: {fault}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_parse_fault_blocks_verdict_gate() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // End-to-end over the fallback route: parse_fault's emitted
+        // signals_error must make the gate BLOCK even with every lane empty.
+        let fault = run_gauntlet_script(
+            "parse_fault.py",
+            &json!({"parse_failure": "LLM node 'parse' failed: provider exploded"}),
+        );
+        let state = json!({
+            "code_review_results": [],
+            "adversary_results": [],
+            "security_results": [],
+            "probe_results": [],
+            "signals_error": fault["signals_error"]
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("## Blockers\n- pipeline: PIPELINE-FAULT: parse failed"),
+            "the parse fault must appear in the Blockers section: {report}"
+        );
+        assert!(
+            report.contains("provider exploded"),
+            "the failure detail must survive into the report: {report}"
+        );
+    }
+
+    #[test]
     fn gauntlet_default_lanes_is_deterministic() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
