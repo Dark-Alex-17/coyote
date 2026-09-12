@@ -464,6 +464,7 @@ mod tests {
             state_updates: None,
             output_schema: None,
             timeout: None,
+            max_attempts: 1,
             inputs: None,
             teammates,
         })
