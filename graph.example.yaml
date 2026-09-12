@@ -98,10 +98,12 @@ conversation_starters:             # Suggested prompts surfaced in the UI
 # ---------------------------------------------------------------------------
 # Agent variables (optional)
 # Declared the same way as a normal agent's config.yaml `variables:` block.
-# Each variable becomes available to:
-#   - LLM nodes via the template form `{{name}}` once seeded into state
-#     (see initial_state below).
-#   - Script nodes via the env var `LLM_AGENT_VAR_<UPPER_NAME>`.
+# At run start each declared variable is automatically seeded into graph
+# state under its name, resolved as: runtime override, else declared default.
+# An explicit `initial_state` entry or dispatcher input with the same key
+# takes precedence over the seeded value. Nodes can then reference the
+# variable via the template form `{{name}}`; script nodes additionally
+# receive the env var `LLM_AGENT_VAR_<UPPER_NAME>`.
 # Values may be overridden at runtime with
 #   `coyote -a <agent> --agent-variable <name> <value> "..."`.
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ use super::types::{EndNode, Graph, Node, NodeType};
 use super::user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 use super::validator::{AgentValidationContext, GraphValidator};
 use super::wall_clock;
-use crate::config::{RenderMode, RequestContext};
+use crate::config::{AgentVariable, AgentVariables, RenderMode, RequestContext};
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
 use crate::utils::{AbortSignal, wait_abort_signal, wait_user_interrupt};
 use anyhow::{Context, Result, anyhow, bail};
@@ -100,7 +100,13 @@ impl GraphExecutor {
             result.into_result()?;
         }
 
-        let mut state = StateManager::new(graph.initial_state.clone());
+        let mut initial_state = graph.initial_state.clone();
+        seed_variables(
+            &mut initial_state,
+            &graph.variables,
+            ctx.agent.as_ref().map(|a| a.variables()),
+        );
+        let mut state = StateManager::new(initial_state);
         let agent_envs = ctx
             .agent
             .as_ref()
@@ -444,6 +450,24 @@ fn sorted_frontier(frontier: &HashSet<String>) -> Vec<String> {
     v
 }
 
+fn seed_variables(
+    initial_state: &mut HashMap<String, Value>,
+    variables: &[AgentVariable],
+    agent_vars: Option<&AgentVariables>,
+) {
+    for var in variables {
+        let resolved = agent_vars
+            .and_then(|vars| vars.get(&var.name))
+            .cloned()
+            .or_else(|| var.default.clone());
+        if let Some(value) = resolved {
+            initial_state
+                .entry(var.name.clone())
+                .or_insert(Value::String(value));
+        }
+    }
+}
+
 fn teammate_flagged_nodes(graph: &Graph, frontier: &HashSet<String>) -> Vec<(String, String)> {
     frontier
         .iter()
@@ -735,6 +759,62 @@ mod tests {
         apply_simple_state_updates(Some(&updates), &mut state);
 
         assert_eq!(state.state().get("k"), Some(&json!("new-old")));
+    }
+
+    fn variable(name: &str, default: Option<&str>) -> AgentVariable {
+        AgentVariable {
+            name: name.into(),
+            default: default.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn seed_variables_fills_declared_default_when_key_absent() {
+        let mut state = HashMap::new();
+
+        seed_variables(&mut state, &[variable("foo", Some("bar"))], None);
+
+        assert_eq!(state.get("foo"), Some(&json!("bar")));
+    }
+
+    #[test]
+    fn seed_variables_agent_value_wins_over_declared_default() {
+        let mut state = HashMap::new();
+        let agent_vars: AgentVariables =
+            IndexMap::from([("foo".to_string(), "override".to_string())]);
+
+        seed_variables(
+            &mut state,
+            &[variable("foo", Some("bar"))],
+            Some(&agent_vars),
+        );
+
+        assert_eq!(state.get("foo"), Some(&json!("override")));
+    }
+
+    #[test]
+    fn seed_variables_never_overwrites_existing_key() {
+        let mut state = HashMap::from([("foo".to_string(), json!("explicit"))]);
+        let agent_vars: AgentVariables =
+            IndexMap::from([("foo".to_string(), "override".to_string())]);
+
+        seed_variables(
+            &mut state,
+            &[variable("foo", Some("bar"))],
+            Some(&agent_vars),
+        );
+
+        assert_eq!(state.get("foo"), Some(&json!("explicit")));
+    }
+
+    #[test]
+    fn seed_variables_skips_variable_with_no_value_anywhere() {
+        let mut state = HashMap::new();
+
+        seed_variables(&mut state, &[variable("foo", None)], None);
+
+        assert!(!state.contains_key("foo"));
     }
 
     fn agent_node(id: &str, teammates: bool) -> Node {
@@ -1064,6 +1144,61 @@ nodes:
             .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
 
         assert_eq!(result, "held|held");
+    }
+
+    /// Declared variables are seeded into state at run start, so the agent
+    /// node's strict prompt interpolation of `{{foo}}` succeeds instead of
+    /// bailing with "not found in state". `ctx.agent` is None here, so each
+    /// variable resolves to its declared default — except `kept`, whose
+    /// explicit `initial_state` entry wins over seeding.
+    #[tokio::test]
+    #[serial]
+    async fn declared_variables_are_seeded_into_state() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new();
+        materialize_probe_agent(0.0);
+        let ws = TestWorkspace::new();
+
+        let yaml = format!(
+            r#"
+name: variable_seeding_test
+settings:
+  validate_before_run: false
+start: worker
+variables:
+  - name: foo
+    description: seeded from its default
+    default: bar
+  - name: kept
+    description: shadowed by initial_state
+    default: from-default
+initial_state:
+  kept: explicit
+nodes:
+  worker:
+    type: agent
+    agent: {PROBE_AGENT}
+    prompt: "value is {{{{foo}}}}"
+    state_updates:
+      note: "{{{{foo}}}}-{{{{kept}}}}"
+    next: done
+  done:
+    type: end
+    output: "{{{{note}}}}"
+"#
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(result, "bar-explicit");
     }
 
     #[tokio::test]
