@@ -329,6 +329,7 @@ impl Agent {
         agent_variables: &[AgentVariable],
         pre_set_variables: Option<&AgentVariables>,
         no_interaction: bool,
+        interactive: bool,
     ) -> Result<AgentVariables> {
         let mut output = IndexMap::new();
         if agent_variables.is_empty() {
@@ -349,7 +350,7 @@ impl Agent {
             if no_interaction {
                 continue;
             }
-            if *IS_STDOUT_TERMINAL {
+            if interactive && *IS_STDOUT_TERMINAL {
                 if !printed {
                     println!("⚙ Init agent variables...");
                     printed = true;

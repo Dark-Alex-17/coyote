@@ -504,7 +504,7 @@ mod tests {
         let mut sup = Supervisor::new(4, 3);
         let id = sup
             .task_queue_mut()
-            .create("task".into(), "desc".into(), None, None);
+            .create("task".into(), "desc".into(), None, None, None);
         assert!(!id.is_empty());
         assert_eq!(sup.task_queue().list().len(), 1);
     }

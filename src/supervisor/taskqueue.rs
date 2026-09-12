@@ -1,3 +1,4 @@
+use crate::config::AgentVariables;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -22,6 +23,7 @@ pub struct TaskNode {
     pub blocks: HashSet<String>,
     pub dispatch_agent: Option<String>,
     pub prompt: Option<String>,
+    pub variables: Option<AgentVariables>,
 }
 
 impl TaskNode {
@@ -31,6 +33,7 @@ impl TaskNode {
         description: String,
         dispatch_agent: Option<String>,
         prompt: Option<String>,
+        variables: Option<AgentVariables>,
     ) -> Self {
         Self {
             id,
@@ -42,6 +45,7 @@ impl TaskNode {
             blocks: HashSet::new(),
             dispatch_agent,
             prompt,
+            variables,
         }
     }
 
@@ -70,10 +74,18 @@ impl TaskQueue {
         description: String,
         dispatch_agent: Option<String>,
         prompt: Option<String>,
+        variables: Option<AgentVariables>,
     ) -> String {
         let id = self.next_id.to_string();
         self.next_id += 1;
-        let task = TaskNode::new(id.clone(), subject, description, dispatch_agent, prompt);
+        let task = TaskNode::new(
+            id.clone(),
+            subject,
+            description,
+            dispatch_agent,
+            prompt,
+            variables,
+        );
         self.tasks.insert(id.clone(), task);
         id
     }
@@ -193,8 +205,15 @@ mod tests {
             "Research auth patterns".into(),
             None,
             None,
+            None,
         );
-        let id2 = queue.create("Implement".into(), "Write the code".into(), None, None);
+        let id2 = queue.create(
+            "Implement".into(),
+            "Write the code".into(),
+            None,
+            None,
+            None,
+        );
 
         assert_eq!(id1, "1");
         assert_eq!(id2, "2");
@@ -204,8 +223,8 @@ mod tests {
     #[test]
     fn test_dependency_and_completion() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("Step 1".into(), "".into(), None, None);
-        let id2 = queue.create("Step 2".into(), "".into(), None, None);
+        let id1 = queue.create("Step 1".into(), "".into(), None, None, None);
+        let id2 = queue.create("Step 2".into(), "".into(), None, None, None);
 
         queue.add_dependency(&id2, &id1).unwrap();
 
@@ -221,9 +240,9 @@ mod tests {
     #[test]
     fn test_fan_in_dependency() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("A".into(), "".into(), None, None);
-        let id2 = queue.create("B".into(), "".into(), None, None);
-        let id3 = queue.create("C (needs A and B)".into(), "".into(), None, None);
+        let id1 = queue.create("A".into(), "".into(), None, None, None);
+        let id2 = queue.create("B".into(), "".into(), None, None, None);
+        let id3 = queue.create("C (needs A and B)".into(), "".into(), None, None, None);
 
         queue.add_dependency(&id3, &id1).unwrap();
         queue.add_dependency(&id3, &id2).unwrap();
@@ -242,8 +261,8 @@ mod tests {
     #[test]
     fn test_cycle_detection() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("A".into(), "".into(), None, None);
-        let id2 = queue.create("B".into(), "".into(), None, None);
+        let id1 = queue.create("A".into(), "".into(), None, None, None);
+        let id2 = queue.create("B".into(), "".into(), None, None, None);
 
         queue.add_dependency(&id2, &id1).unwrap();
         let result = queue.add_dependency(&id1, &id2);
@@ -254,7 +273,7 @@ mod tests {
     #[test]
     fn test_self_dependency_rejected() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("A".into(), "".into(), None, None);
+        let id1 = queue.create("A".into(), "".into(), None, None, None);
         let result = queue.add_dependency(&id1, &id1);
         assert!(result.is_err());
     }
@@ -262,7 +281,7 @@ mod tests {
     #[test]
     fn test_claim() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("Task".into(), "".into(), None, None);
+        let id1 = queue.create("Task".into(), "".into(), None, None, None);
 
         assert!(queue.claim(&id1, "worker-1"));
         assert!(!queue.claim(&id1, "worker-2"));
@@ -272,7 +291,7 @@ mod tests {
     #[test]
     fn test_fail_sets_status() {
         let mut queue = TaskQueue::new();
-        let id = queue.create("Task".into(), "".into(), None, None);
+        let id = queue.create("Task".into(), "".into(), None, None, None);
         queue.fail(&id);
         assert_eq!(queue.get(&id).unwrap().status, TaskStatus::Failed);
     }
@@ -291,6 +310,7 @@ mod tests {
             "desc".into(),
             Some("coder".into()),
             Some("implement feature".into()),
+            None,
         );
         let task = queue.get(&id).unwrap();
         assert_eq!(task.dispatch_agent.as_deref(), Some("coder"));
@@ -298,10 +318,33 @@ mod tests {
     }
 
     #[test]
+    fn test_variables_stored() {
+        let mut queue = TaskQueue::new();
+        let id = queue.create(
+            "Auto task".into(),
+            "desc".into(),
+            Some("coder".into()),
+            Some("implement feature".into()),
+            Some(AgentVariables::from([(
+                "pr".to_string(),
+                "1234".to_string(),
+            )])),
+        );
+        let task = queue.get(&id).unwrap();
+        assert_eq!(
+            task.variables
+                .as_ref()
+                .and_then(|v| v.get("pr"))
+                .map(String::as_str),
+            Some("1234")
+        );
+    }
+
+    #[test]
     fn test_claim_blocked_task_fails() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("A".into(), "".into(), None, None);
-        let id2 = queue.create("B".into(), "".into(), None, None);
+        let id1 = queue.create("A".into(), "".into(), None, None, None);
+        let id2 = queue.create("B".into(), "".into(), None, None, None);
         queue.add_dependency(&id2, &id1).unwrap();
         assert!(!queue.claim(&id2, "worker"));
     }
@@ -309,9 +352,9 @@ mod tests {
     #[test]
     fn test_list_sorted_by_id() {
         let mut queue = TaskQueue::new();
-        queue.create("Third".into(), "".into(), None, None);
-        queue.create("First".into(), "".into(), None, None);
-        queue.create("Second".into(), "".into(), None, None);
+        queue.create("Third".into(), "".into(), None, None, None);
+        queue.create("First".into(), "".into(), None, None, None);
+        queue.create("Second".into(), "".into(), None, None, None);
         let tasks = queue.list();
         let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["1", "2", "3"]);
@@ -326,7 +369,7 @@ mod tests {
     #[test]
     fn test_dependency_on_nonexistent_task_errors() {
         let mut queue = TaskQueue::new();
-        let id1 = queue.create("A".into(), "".into(), None, None);
+        let id1 = queue.create("A".into(), "".into(), None, None, None);
         let result = queue.add_dependency(&id1, "nonexistent");
         assert!(result.is_err());
     }
@@ -340,13 +383,13 @@ mod tests {
 
     #[test]
     fn test_task_node_is_runnable() {
-        let node = TaskNode::new("1".into(), "t".into(), "d".into(), None, None);
+        let node = TaskNode::new("1".into(), "t".into(), "d".into(), None, None, None);
         assert!(node.is_runnable());
     }
 
     #[test]
     fn test_task_node_not_runnable_when_blocked() {
-        let mut node = TaskNode::new("1".into(), "t".into(), "d".into(), None, None);
+        let mut node = TaskNode::new("1".into(), "t".into(), "d".into(), None, None, None);
         node.blocked_by.insert("2".into());
         node.status = TaskStatus::Blocked;
         assert!(!node.is_runnable());

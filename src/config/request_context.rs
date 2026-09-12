@@ -1191,6 +1191,7 @@ impl RequestContext {
                 agent.defined_variables(),
                 self.agent_variables.as_ref(),
                 self.info_flag,
+                self.self_agent_id.is_none(),
             )?;
             agent.set_shared_variables(new_variables);
         }
@@ -1213,6 +1214,7 @@ impl RequestContext {
                         agent.defined_variables(),
                         self.agent_variables.as_ref(),
                         self.info_flag,
+                        self.self_agent_id.is_none(),
                     )?;
                     agent.set_shared_variables(new_variables.clone());
                     new_variables
