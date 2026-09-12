@@ -3567,13 +3567,6 @@
     - medium
     - high
     - max
-  - name: mistral.devstral-2-123b
-    type: chat
-    max_input_tokens: 256000
-    input_price: 0.4
-    output_price: 2.0
-    max_output_tokens: 8192
-    supports_function_calling: true
   - name: us.anthropic.claude-sonnet-4-6
     type: chat
     max_input_tokens: 1000000
@@ -3751,6 +3744,13 @@
     output_price: 0.24
     max_output_tokens: 8192
     supports_function_calling: true
+  - name: mistral.devstral-2-123b
+    type: chat
+    max_input_tokens: 256000
+    input_price: 0.4
+    output_price: 2.0
+    max_output_tokens: 8192
+    supports_function_calling: true
   - name: amazon.nova-2-lite-v1:0
     type: chat
     max_input_tokens: 1000000
@@ -3799,12 +3799,12 @@
     - low
     - medium
     - high
-  - name: mistral.magistral-small-2509
+  - name: mistral.ministral-3-14b-instruct
     type: chat
     max_input_tokens: 128000
-    input_price: 0.5
-    output_price: 1.5
-    max_output_tokens: 40000
+    input_price: 0.2
+    output_price: 0.2
+    max_output_tokens: 4096
     supports_vision: true
     supports_function_calling: true
   - name: mistral.ministral-3-3b-instruct
@@ -3813,6 +3813,14 @@
     input_price: 0.1
     output_price: 0.1
     max_output_tokens: 8192
+    supports_vision: true
+    supports_function_calling: true
+  - name: mistral.ministral-3-8b-instruct
+    type: chat
+    max_input_tokens: 128000
+    input_price: 0.15
+    output_price: 0.15
+    max_output_tokens: 4096
     supports_vision: true
     supports_function_calling: true
   - name: mistral.mistral-large-3-675b-instruct
@@ -4095,6 +4103,14 @@
     max_output_tokens: 262000
     supports_vision: true
     supports_function_calling: true
+  - name: mistral.magistral-small-2509
+    type: chat
+    max_input_tokens: 128000
+    input_price: 0.5
+    output_price: 1.5
+    max_output_tokens: 40000
+    supports_vision: true
+    supports_function_calling: true
   - name: qwen.qwen3-next-80b-a3b
     type: chat
     max_input_tokens: 262144
@@ -4220,11 +4236,18 @@
     output_price: 0.88
     max_output_tokens: 131072
     supports_function_calling: true
+  - name: mistral.voxtral-mini-3b-2507
+    type: chat
+    max_input_tokens: 32768
+    input_price: 0.04
+    output_price: 0.04
+    max_output_tokens: 4096
+    supports_function_calling: true
   - name: mistral.voxtral-small-24b-2507
     type: chat
-    max_input_tokens: 32000
-    input_price: 0.15
-    output_price: 0.35
+    max_input_tokens: 32768
+    input_price: 0.1
+    output_price: 0.3
     max_output_tokens: 8192
     supports_function_calling: true
   - name: us.amazon.nova-premier-v1:0
@@ -4235,25 +4258,11 @@
     max_output_tokens: 5120
     supports_vision: true
     supports_function_calling: true
-  - name: us.writer.palmyra-x4-v1:0
-    type: chat
-    max_input_tokens: 122880
-    input_price: 2.5
-    output_price: 10.0
-    max_output_tokens: 8192
-    supports_function_calling: true
   - name: us.writer.palmyra-x5-v1:0
     type: chat
     max_input_tokens: 1040000
     input_price: 0.6
     output_price: 6.0
-    max_output_tokens: 8192
-    supports_function_calling: true
-  - name: writer.palmyra-x4-v1:0
-    type: chat
-    max_input_tokens: 122880
-    input_price: 2.5
-    output_price: 10.0
     max_output_tokens: 8192
     supports_function_calling: true
   - name: writer.palmyra-x5-v1:0
@@ -4292,15 +4301,15 @@
     max_input_tokens: 1000000
     input_price: 0.24
     output_price: 0.97
-    max_output_tokens: 16384
+    max_output_tokens: 8192
     supports_vision: true
     supports_function_calling: true
   - name: meta.llama4-scout-17b-instruct-v1:0
     type: chat
-    max_input_tokens: 3500000
+    max_input_tokens: 10000000
     input_price: 0.17
     output_price: 0.66
-    max_output_tokens: 16384
+    max_output_tokens: 8192
     supports_vision: true
     supports_function_calling: true
   - name: us.meta.llama4-maverick-17b-instruct-v1:0
@@ -4308,16 +4317,16 @@
     max_input_tokens: 1000000
     input_price: 0.24
     output_price: 0.97
-    max_output_tokens: 16384
+    max_output_tokens: 8192
     require_max_tokens: true
     supports_vision: true
     supports_function_calling: true
   - name: us.meta.llama4-scout-17b-instruct-v1:0
     type: chat
-    max_input_tokens: 3500000
+    max_input_tokens: 10000000
     input_price: 0.17
     output_price: 0.66
-    max_output_tokens: 16384
+    max_output_tokens: 8192
     require_max_tokens: true
     supports_vision: true
     supports_function_calling: true
@@ -4476,26 +4485,19 @@
     max_output_tokens: 5120
     supports_vision: true
     supports_function_calling: true
-  - name: mistral.ministral-3-14b-instruct
+  - name: us.writer.palmyra-x4-v1:0
     type: chat
-    max_input_tokens: 128000
-    input_price: 0.2
-    output_price: 0.2
-    max_output_tokens: 4096
+    max_input_tokens: 122880
+    input_price: 2.5
+    output_price: 10.0
+    max_output_tokens: 8192
     supports_function_calling: true
-  - name: mistral.ministral-3-8b-instruct
+  - name: writer.palmyra-x4-v1:0
     type: chat
-    max_input_tokens: 128000
-    input_price: 0.15
-    output_price: 0.15
-    max_output_tokens: 4096
-    supports_function_calling: true
-  - name: mistral.voxtral-mini-3b-2507
-    type: chat
-    max_input_tokens: 128000
-    input_price: 0.04
-    output_price: 0.04
-    max_output_tokens: 4096
+    max_input_tokens: 122880
+    input_price: 2.5
+    output_price: 10.0
+    max_output_tokens: 8192
     supports_function_calling: true
   - name: meta.llama3-1-70b-instruct-v1:0
     type: chat
@@ -6348,15 +6350,15 @@
   - name: deepseek/deepseek-v4-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0676
-    output_price: 0.1352
+    input_price: 0.0668
+    output_price: 0.1336
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.065
-    output_price: 0.18
+    input_price: 0.04
+    output_price: 0.08
     max_output_tokens: 943718
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731:batch
@@ -6385,8 +6387,8 @@
   - name: deepseek/deepseek-v4-pro
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.8397
-    output_price: 1.6794
+    input_price: 0.7788
+    output_price: 1.5576
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813
@@ -6863,6 +6865,18 @@
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
+  - name: inference-net/schematron-v2-small
+    type: chat
+    max_input_tokens: 128000
+    input_price: 0.05
+    output_price: 0.23
+    max_output_tokens: 4096
+  - name: inference-net/schematron-v2-turbo
+    type: chat
+    max_input_tokens: 128000
+    input_price: 0.03
+    output_price: 0.15
+    max_output_tokens: 8192
   - name: kwaipilot/kat-coder-pro-v2
     type: chat
     max_input_tokens: 262144
@@ -7058,9 +7072,9 @@
   - name: minimax/minimax-m2.5
     type: chat
     max_input_tokens: 204800
-    input_price: 0.3
-    output_price: 1.2
-    max_output_tokens: 131072
+    input_price: 0.27
+    output_price: 1.08
+    max_output_tokens: 128000
     supports_function_calling: true
   - name: minimax/minimax-m2.7
     type: chat
@@ -7292,7 +7306,7 @@
     max_input_tokens: 262144
     input_price: 0.6
     output_price: 2.5
-    max_output_tokens: 100352
+    max_output_tokens: 235929
     supports_function_calling: true
   - name: moonshotai/kimi-k2.5
     type: chat
@@ -7321,8 +7335,8 @@
   - name: moonshotai/kimi-k3
     type: chat
     max_input_tokens: 1048576
-    input_price: 1.5352
-    output_price: 7.7001
+    input_price: 2.3027
+    output_price: 11.5502
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -8988,7 +9002,7 @@
     max_input_tokens: 1048576
     input_price: 1.0
     output_price: 4.05
-    max_output_tokens: 32768
+    max_output_tokens: 471859
     supports_vision: true
     supports_function_calling: true
   - name: thinkingmachines/inkling-small
@@ -9223,8 +9237,8 @@
   - name: z-ai/glm-5.3-flash
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.15
-    output_price: 0.5
+    input_price: 0.075
+    output_price: 0.25
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
@@ -9286,8 +9300,8 @@
   - name: ~deepseek/deepseek-v4-flash-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.05
-    output_price: 0.16
+    input_price: 0.03
+    output_price: 0.07
     max_output_tokens: 393216
     supports_function_calling: true
   - name: ~google/gemini-flash-latest
@@ -9309,8 +9323,8 @@
   - name: ~moonshotai/kimi-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 1.5352
-    output_price: 7.7001
+    input_price: 2.125
+    output_price: 11.9
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
