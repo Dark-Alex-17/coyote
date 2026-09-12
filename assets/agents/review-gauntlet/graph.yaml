@@ -276,6 +276,7 @@ nodes:
       {{extra_context}}
 
       Close your report with your Review Verdict line.
+    max_attempts: 2
     state_updates:
       lane_out: '{{output}}'
 
@@ -296,6 +297,7 @@ nodes:
       {{extra_context}}
 
       Return your ADVERSARIAL_REVIEW verdict.
+    max_attempts: 2
     state_updates:
       lane_out: '{{output}}'
 
@@ -313,6 +315,7 @@ nodes:
       {{extra_context}}
 
       Return your SECURITY_REVIEW verdict.
+    max_attempts: 2
     state_updates:
       lane_out: '{{output}}'
 
@@ -335,6 +338,7 @@ nodes:
       Derive expected behaviors from the plan/contract BEFORE reading
       implementation code, run existing suites first, then author spec-first
       tests for the uncovered delta. Return your USAGE_PROBE verdict.
+    max_attempts: 2
     state_updates:
       lane_out: '{{output}}'
 
