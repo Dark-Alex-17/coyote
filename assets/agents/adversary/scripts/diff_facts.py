@@ -22,7 +22,9 @@ def load_state():
 
 
 state = load_state()
-proj = state.get("project_dir") or "."
+proj = os.path.expanduser(
+    (state.get("project_dir_in") or "").strip() or state.get("project_dir") or "."
+)
 spec = (state.get("diff_spec") or "auto").strip()
 
 
@@ -33,7 +35,7 @@ def git(*args):
     return r.stdout
 
 
-out = {"diff_note": ""}
+out = {"diff_note": "", "project_dir": proj}
 try:
     if spec in ("auto", ""):
         text = git("diff", "--cached")
