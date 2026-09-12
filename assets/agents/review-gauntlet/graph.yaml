@@ -235,7 +235,7 @@ nodes:
   default_lanes:
     id: default_lanes
     type: script
-    description: Deterministic lane-selection fallback (reached only via select_lanes' fallback) — forces code-review + adversary, plus probe when consumer_surface, when the additive LLM judgment dies. Selection degrades WIDER, never narrower; the degradation note flows into lanes_summary via build_items.
+    description: Deterministic lane-selection fallback (reached only via select_lanes' fallback) — when the additive LLM judgment dies, forces code-review + adversary, plus probe when consumer_surface, plus security on attack-surface signals (auth/deps/exec) or hardened posture, unioned with any caller-forced lanes. Selection degrades WIDER, never narrower; the degradation note flows into lanes_summary via build_items.
     script: scripts/default_lanes.py
     timeout: 30
     next: build_items

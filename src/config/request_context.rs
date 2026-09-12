@@ -8870,6 +8870,132 @@ mod tests {
     }
 
     #[test]
+    fn gauntlet_verdict_gate_reds_block_despite_merge_ready() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "code_review_results": ["🔴 [correctness] broken invariant\n\n**Verdict: MERGE-READY**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("code-review: 1 🔴 CRITICAL finding(s)"),
+            "🔴 findings must block regardless of the verdict line: {report}"
+        );
+        assert!(
+            report.contains("| code-review | BLOCKED | 1 🔴 finding(s) |"),
+            "the lane table must carry the 🔴 count: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_needs_human_without_reds_passes_with_attention() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "code_review_results": ["🟡 [convention] minor nit\n\n**Verdict: NEEDS-HUMAN**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(
+            out["gauntlet_verdict"], "PASS",
+            "NEEDS-HUMAN without 🔴 must pass: {out}"
+        );
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("## Human attention required"),
+            "the attention section must be surfaced: {report}"
+        );
+        assert!(
+            report.contains("| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴 |"),
+            "the lane table must record the attention status: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_probe_inconclusive_blocks_with_environment_note() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "code_review_results": ["**Verdict: MERGE-READY**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": ["USAGE_PROBE: INCONCLUSIVE — could not boot the stack"]
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("the ENVIRONMENT could not be established"),
+            "INCONCLUSIVE must carry the environment note: {report}"
+        );
+        assert!(
+            report.contains("| probe | BLOCKED | INCONCLUSIVE (environment) |"),
+            "the lane table must record the environment block: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A truthy non-list lane result makes lane_report index into an int,
+        // raising inside main; the top-level guard must emit BLOCKED (exit 0
+        // is asserted in the helper) — never a crash into a silent pass.
+        let out = run_gauntlet_script("verdict_gate.py", &json!({"code_review_results": 42}));
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("verdict gate error"),
+            "the internal error must be named in the report: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_quoted_fault_marker_not_misrouted() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A real review that merely QUOTES the marker mid-text (e.g. a code
+        // review of the gauntlet itself) must flow to the normal verdict
+        // rules: the 🔴 count blocks it, NOT the lane-fault rule.
+        let state = json!({
+            "code_review_results": ["🔴 [correctness] gate mishandles reports quoting 'PIPELINE-FAULT:' mid-text\n\n**Verdict: MERGE-READY**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| code-review | BLOCKED | 1 🔴 finding(s) |"),
+            "the quoting report must be routed to the 🔴 rule: {report}"
+        );
+        assert!(
+            !report.contains("code-review: PIPELINE-FAULT — the lane failed"),
+            "a quoting report must NOT be treated as a lane fault: {report}"
+        );
+    }
+
+    #[test]
     fn gauntlet_build_items_crash_fails_closed() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
@@ -9028,6 +9154,64 @@ mod tests {
 
         let again = run_gauntlet_script("default_lanes.py", &json!({}));
         assert_eq!(out, again, "same input must produce identical output");
+    }
+
+    #[test]
+    fn gauntlet_default_lanes_preserves_caller_forced_lanes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A caller who forced a lane must not lose it when selection
+        // degrades — the fallback unions, never overwrites — and forced
+        // names canonicalize via the same aliases build_items uses.
+        let out = run_gauntlet_script(
+            "default_lanes.py",
+            &json!({"forced_lanes": ["security-reviewer"]}),
+        );
+        assert_eq!(
+            out["forced_lanes"],
+            json!(["code-review", "adversary", "security"]),
+            "a caller-forced lane must survive the fallback: {out}"
+        );
+
+        // Unknown forced names are ignored, not crashed on.
+        let bogus = run_gauntlet_script("default_lanes.py", &json!({"forced_lanes": ["bogus"]}));
+        assert_eq!(
+            bogus["forced_lanes"],
+            json!(["code-review", "adversary"]),
+            "unknown forced names must be ignored: {bogus}"
+        );
+
+        let again = run_gauntlet_script(
+            "default_lanes.py",
+            &json!({"forced_lanes": ["security-reviewer"]}),
+        );
+        assert_eq!(out, again, "same input must produce identical output");
+    }
+
+    #[test]
+    fn gauntlet_default_lanes_security_signals_force_security_lane() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // The deterministic security signals are already in state when the
+        // fallback runs; degradation must never drop the security lane
+        // build_items' hard rules would have selected.
+        for state in [
+            json!({"touches_auth": true}),
+            json!({"touches_deps": true}),
+            json!({"touches_exec": true}),
+            json!({"security_posture": "hardened"}),
+        ] {
+            let out = run_gauntlet_script("default_lanes.py", &state);
+            assert_eq!(
+                out["forced_lanes"],
+                json!(["code-review", "adversary", "security"]),
+                "security signal {state} must force the security lane: {out}"
+            );
+        }
     }
 
     #[test]
