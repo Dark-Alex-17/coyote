@@ -5,9 +5,11 @@ Parses each configured lane's verdict SENTINEL with a regex — no LLM
 re-reads, no judgment. The gate's hard rules:
 
   - a missing sentinel is a LANE FAILURE and blocks — never a pass;
-  - a PIPELINE-FAULT lane result (the lane's agent died after retries) or a
-    PIPELINE-FAULT in signals_error (builder/parse fault) blocks — a
-    degraded pipeline is never a pass;
+  - a PIPELINE-FAULT lane result (the lane's agent died after retries;
+    detected only when the report IS the lane_fault.py marker, i.e. it
+    STARTS with it — a real review merely quoting the marker flows to the
+    normal rules) or a PIPELINE-FAULT in signals_error (builder/parse
+    fault) blocks — a degraded pipeline is never a pass;
   - any 🔴 finding in the code-review report blocks regardless of the
     lane's own verdict line;
   - NEEDS-HUMAN without 🔴 passes but is surfaced as attention required;
@@ -49,6 +51,13 @@ def main():
         )
         return line.strip()[:200]
 
+    def is_lane_fault(report):
+        # A genuine lane fault is the ENTIRE report emitted by lane_fault.py,
+        # which always begins with the marker. Matching the marker anywhere
+        # would let a real review that merely QUOTES "PIPELINE-FAULT:" bypass
+        # 🔴 counting and sentinel parsing.
+        return report.strip().startswith("PIPELINE-FAULT:")
+
     def lane_fault_blocker(lane, report):
         blockers.append(
             f"{lane}: PIPELINE-FAULT — the lane failed after retries and produced "
@@ -60,7 +69,7 @@ def main():
     cr = lane_report("code_review_results")
     if cr is None:
         record("code-review", "SKIPPED", "not selected")
-    elif "PIPELINE-FAULT:" in cr:
+    elif is_lane_fault(cr):
         lane_fault_blocker("code-review", cr)
         reports.append(("code-review", cr))
     else:
@@ -91,7 +100,7 @@ def main():
     adv = lane_report("adversary_results")
     if adv is None:
         record("adversary", "SKIPPED", "not selected")
-    elif "PIPELINE-FAULT:" in adv:
+    elif is_lane_fault(adv):
         lane_fault_blocker("adversary", adv)
         reports.append(("adversary", adv))
     else:
@@ -114,7 +123,7 @@ def main():
     sec = lane_report("security_results")
     if sec is None:
         record("security", "SKIPPED", "not selected")
-    elif "PIPELINE-FAULT:" in sec:
+    elif is_lane_fault(sec):
         lane_fault_blocker("security", sec)
         reports.append(("security", sec))
     else:
@@ -135,7 +144,7 @@ def main():
     pb = lane_report("probe_results")
     if pb is None:
         record("probe", "SKIPPED", "not selected")
-    elif "PIPELINE-FAULT:" in pb:
+    elif is_lane_fault(pb):
         lane_fault_blocker("probe", pb)
         reports.append(("probe", pb))
     else:
