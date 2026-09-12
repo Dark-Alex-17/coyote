@@ -1,4 +1,4 @@
-use super::agent::AgentNodeExecutor;
+use super::agent::{AgentExecutionOutcome, AgentNodeExecutor};
 use super::llm::{LlmExecutionOutcome, LlmNodeExecutor};
 use super::logging::{GraphLogger, narrate_node_complete, narrate_node_failed};
 use super::map::MapNodeExecutor;
@@ -574,8 +574,15 @@ pub(super) async fn step(
 ) -> Result<StepResult> {
     match &node.node_type {
         NodeType::Agent(agent_node) => {
-            AgentNodeExecutor::execute(agent_node, state, ctx, !step_ctx.branch_mode).await?;
-            let targets = static_next_targets(node, current, "agent", step_ctx.branch_mode)?;
+            let outcome =
+                AgentNodeExecutor::execute(current, agent_node, state, ctx, !step_ctx.branch_mode)
+                    .await?;
+            let targets = match outcome {
+                AgentExecutionOutcome::Continue(_) => {
+                    static_next_targets(node, current, "agent", step_ctx.branch_mode)?
+                }
+                AgentExecutionOutcome::FellBack(target) => vec![target],
+            };
             Ok(StepResult::Continue(targets))
         }
         NodeType::Script(script_node) => {
@@ -827,6 +834,8 @@ mod tests {
                 state_updates: None,
                 output_schema: None,
                 timeout: None,
+                max_attempts: 1,
+                fallback: None,
                 inputs: None,
                 teammates,
             }),

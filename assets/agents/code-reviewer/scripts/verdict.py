@@ -8,6 +8,9 @@ The model that wrote the findings never grades its own homework:
   markers, exactly per the published rules;
 - MERGE-READY/NEEDS-HUMAN is computed from counts + always-human triggers
   (deterministic signals ∪ the synthesis's ADDITIVE-only flags).
+Fail-closed: any PIPELINE-FAULT recorded upstream (dead domain lane, dead
+verifier, dead synthesis, missing domain reports) forces NEEDS-HUMAN — a
+degraded run can never read MERGE-READY.
 The gate never crashes into a silent verdict: any internal error emits
 NEEDS-HUMAN naming the error.
 """
@@ -15,6 +18,9 @@ NEEDS-HUMAN naming the error.
 import json
 import os
 import re
+
+MAX_DETAIL_CHARS = 500
+
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
@@ -117,16 +123,48 @@ def main():
     seen = set()
     attention = [a for a in attention if not (a.lower() in seen or seen.add(a.lower()))]
 
-    if (state.get("changed_files") or []) and not (state.get("domain_reports") or []):
-        attention.append(
-            "PIPELINE FAULT: the diff is non-empty but no domain reports were produced — "
+    # --- pipeline-fault accounting (fail closed) -----------------------------
+    # PREFIX-anchored: a report that merely QUOTES a marker mid-text must not
+    # trip it. Any fault forces NEEDS-HUMAN.
+    faults = []
+    changed = state.get("changed_files") or []
+    reports = state.get("domain_reports") or []
+    faulted = sum(
+        1 for r in reports if isinstance(r, str) and r.lstrip().startswith("> ⚠️ PIPELINE-FAULT:")
+    )
+    if faulted:
+        faults.append(
+            f"PIPELINE-FAULT: {faulted} of {len(reports)} domain review lane(s) "
+            "failed after retries — their slices were not reviewed"
+        )
+    verifier_raw = state.get("verifier_output")
+    if isinstance(verifier_raw, str) and verifier_raw.lstrip().startswith("Agent node failed:"):
+        faults.append(
+            "PIPELINE-FAULT: finding verification failed — findings render as unverified"
+        )
+    # Keyed off synth_failure + a non-empty diff, NEVER off findings == [] —
+    # a clean review legitimately has zero findings and stays MERGE-READY.
+    synth_failure = state.get("synth_failure")
+    if isinstance(synth_failure, str) and synth_failure.startswith("LLM node") and changed:
+        detail = synth_failure.strip().replace("\n", " ")
+        if len(detail) > MAX_DETAIL_CHARS:
+            detail = detail[: MAX_DETAIL_CHARS - 1] + "…"
+        faults.append(f"PIPELINE-FAULT: synthesis failed — findings unavailable; {detail}")
+    if changed and not reports:
+        faults.append(
+            "PIPELINE-FAULT: the diff is non-empty but no domain reports were produced — "
             "the review did not actually run; do not trust this verdict."
         )
+    # faults go FIRST so the attention cap can never hide one
+    attention = faults + attention
+
     reasons = []
     if counts["🔴"]:
         reasons.append(f"{counts['🔴']} 🔴 CRITICAL finding(s)")
     if yellow_correctness:
         reasons.append(f"{yellow_correctness} 🟡 [correctness] finding(s) outside the deferred section")
+    if faults:
+        reasons.append("pipeline fault(s) recorded — degraded run")
     if attention:
         reasons.append("always-human trigger(s) fired")
     verdict = "NEEDS-HUMAN" if reasons else "MERGE-READY"

@@ -2,7 +2,7 @@ use super::state::StateManager;
 use super::state_updates;
 use super::structured;
 use super::types::LlmNode;
-use super::wall_clock;
+use super::{is_transient_error, wall_clock};
 use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use crate::config::{
@@ -250,7 +250,7 @@ async fn run_with_retries(
     for attempt in 1..=node.max_attempts {
         match run_chat_loop(node, prompt, ctx, abort).await {
             Ok(out) => return Ok(out),
-            Err(e) if is_transient(&e) && attempt < node.max_attempts => {
+            Err(e) if is_transient_error(&e) && attempt < node.max_attempts => {
                 warn!("llm node attempt {attempt} failed (transient): {e}; retrying");
                 last_err = Some(e);
             }
@@ -447,16 +447,6 @@ fn validate_tools_subset(
     }
 
     Ok(())
-}
-
-fn is_transient(err: &Error) -> bool {
-    let s = format!("{err:#}");
-    s.contains("timed out")
-        || s.contains("rate limit")
-        || s.contains("429")
-        || s.contains("Connection reset")
-        || s.contains("Connection refused")
-        || s.contains("produced no output")
 }
 
 fn apply_state_updates_with_output(
@@ -722,26 +712,6 @@ mod tests {
 
         assert!(regular.is_empty());
         assert!(mcp.is_empty());
-    }
-
-    #[test]
-    fn is_transient_matches_expected_signatures() {
-        assert!(is_transient(&anyhow!("request timed out after 30s")));
-        assert!(is_transient(&anyhow!("rate limit reached")));
-        assert!(is_transient(&anyhow!("429 too many requests")));
-        assert!(is_transient(&anyhow!("Connection reset by peer")));
-        assert!(is_transient(&anyhow!("Connection refused")));
-        assert!(is_transient(&anyhow!("llm produced no output")));
-    }
-
-    #[test]
-    fn is_transient_rejects_non_transient_errors() {
-        assert!(!is_transient(&anyhow!("Unknown model 'foo'")));
-        assert!(!is_transient(&anyhow!(
-            "llm node references unknown tool 'bad'"
-        )));
-        assert!(!is_transient(&anyhow!("hit max_iterations")));
-        assert!(!is_transient(&anyhow!("authentication failed")));
     }
 
     #[test]

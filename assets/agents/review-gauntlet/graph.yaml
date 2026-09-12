@@ -39,6 +39,7 @@ initial_state:
   security_posture: standard
   probe_context: ''
   extra_context: ''
+  verification_commands: []
   forced_lanes: []
   changed_files: []
   file_count: 0
@@ -56,6 +57,9 @@ initial_state:
   add_security: false
   add_probe: false
   lane_reasons: ''
+  parse_failure: ''
+  select_lanes_failure: ''
+  lanes_degraded: ''
   code_review_items: []
   adversary_items: []
   security_items: []
@@ -100,6 +104,10 @@ nodes:
         names). Empty array = automatic selection.
       - `extra_context`: any remaining caller context reviewers should see,
         condensed.
+      - `verification_commands`: the exact build/test/lint shell commands the
+        caller explicitly declares for verification (verbatim strings, in the
+        order given). Empty array when the caller declares none — NEVER invent,
+        guess, or auto-detect commands; undeclared stays undeclared.
     prompt: |
       Extract the review-request facts from this request:
 
@@ -126,10 +134,25 @@ nodes:
           type: string
         project_dir_in:
           type: string
-      required: [diff_spec, plan_context, rigor, security_posture, probe_context, forced_lanes, extra_context, project_dir_in]
+        verification_commands:
+          type: array
+          items:
+            type: string
+      required: [diff_spec, plan_context, rigor, security_posture, probe_context, forced_lanes, extra_context, project_dir_in, verification_commands]
     max_iterations: 3
     max_attempts: 2
+    state_updates:
+      parse_failure: '{{output}}'
+    fallback: parse_fault
     next: signals
+
+  parse_fault:
+    id: parse_fault
+    type: script
+    description: Fail-closed marker for a dead parse stage (reached only via parse's fallback) — records a PIPELINE-FAULT in signals_error and jumps straight to the verdict gate, which blocks on it. Lane item lists stay their initial [] so every lane records SKIPPED.
+    script: scripts/parse_fault.py
+    timeout: 30
+    next: verdict_gate
 
   signals:
     id: signals
@@ -204,6 +227,17 @@ nodes:
       required: [add_code_review, add_adversary, add_security, add_probe, lane_reasons]
     max_iterations: 3
     max_attempts: 2
+    state_updates:
+      select_lanes_failure: '{{output}}'
+    fallback: default_lanes
+    next: build_items
+
+  default_lanes:
+    id: default_lanes
+    type: script
+    description: Deterministic lane-selection fallback (reached only via select_lanes' fallback) — when the additive LLM judgment dies, forces code-review + adversary, plus probe when consumer_surface, plus security on attack-surface signals (auth/deps/exec) or hardened posture, unioned with any caller-forced lanes. Selection degrades WIDER, never narrower; the degradation note flows into lanes_summary via build_items.
+    script: scripts/default_lanes.py
+    timeout: 30
     next: build_items
 
   build_items:
@@ -276,8 +310,10 @@ nodes:
       {{extra_context}}
 
       Close your report with your Review Verdict line.
+    max_attempts: 2
     state_updates:
       lane_out: '{{output}}'
+    fallback: lane_fault
 
   run_adversary:
     id: run_adversary
@@ -293,11 +329,15 @@ nodes:
       The spec / plan / acceptance criteria it must satisfy:
       {{plan_context}}
 
+      Verification commands (declared by the caller; empty = none declared): {{verification_commands}}
+
       {{extra_context}}
 
       Return your ADVERSARIAL_REVIEW verdict.
+    max_attempts: 2
     state_updates:
       lane_out: '{{output}}'
+    fallback: lane_fault
 
   run_security:
     id: run_security
@@ -313,8 +353,10 @@ nodes:
       {{extra_context}}
 
       Return your SECURITY_REVIEW verdict.
+    max_attempts: 2
     state_updates:
       lane_out: '{{output}}'
+    fallback: lane_fault
 
   run_probe:
     id: run_probe
@@ -332,11 +374,23 @@ nodes:
       Plan / acceptance-criteria context:
       {{plan_context}}
 
+      The workspace may contain test files from an aborted earlier attempt of
+      this lane; reconcile rather than duplicate.
+
       Derive expected behaviors from the plan/contract BEFORE reading
       implementation code, run existing suites first, then author spec-first
       tests for the uncovered delta. Return your USAGE_PROBE verdict.
+    max_attempts: 2
     state_updates:
       lane_out: '{{output}}'
+    fallback: lane_fault
+
+  lane_fault:
+    id: lane_fault
+    type: script
+    description: Fail-closed lane fault marker (reached only via the run_* lanes' fallback routes; shared across the four map branches). Normalizes the engine's "Agent node failed" text in lane_out into a PIPELINE-FAULT lane result the map collects; verdict_gate turns it into BLOCKED — a degraded lane is never a pass.
+    script: scripts/lane_fault.py
+    timeout: 30
 
   verdict_gate:
     id: verdict_gate

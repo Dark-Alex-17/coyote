@@ -8200,6 +8200,20 @@ mod tests {
                 .collect()
         }
 
+        fn fallback_capture(node_ids: &[&str]) -> Vec<String> {
+            node_ids
+                .iter()
+                .map(|id| {
+                    format!(
+                        "{id}: llm node declares `fallback` with `output_schema` but no \
+                         `state_updates`; on failure the \"…failed: <chain>\" string is \
+                         only written through `state_updates`, so the fallback node \
+                         cannot see why it was reached"
+                    )
+                })
+                .collect()
+        }
+
         let _guard = TestConfigDirGuard::new();
 
         Agent::install_builtin_agents(false).unwrap();
@@ -8238,7 +8252,9 @@ mod tests {
         // nodes, plus variable-shadowing on `coder` and `step-runner` (they
         // declare variables whose names are also `initial_state` keys). A new
         // rule that fires on a shipped asset (or a new bundled graph) must be
-        // recorded here deliberately.
+        // recorded here deliberately. The fallback-capture warnings on
+        // `step-runner` are true positives, recorded until those nodes gain
+        // `state_updates` that capture the failure string.
         let expected_warnings = BTreeMap::from([
             ("adversary".to_string(), Vec::new()),
             ("code-reviewer".to_string(), Vec::new()),
@@ -8266,9 +8282,8 @@ mod tests {
             ("finding-verifier".to_string(), Vec::new()),
             ("librarian".to_string(), Vec::new()),
             ("review-gauntlet".to_string(), Vec::new()),
-            (
-                "step-runner".to_string(),
-                [
+            ("step-runner".to_string(), {
+                let mut lines = [
                     shadowed(&["plans_dir", "project_dir"]),
                     unreachable(&[
                         "check_handoff",
@@ -8290,9 +8305,12 @@ mod tests {
                         "verify_tests",
                         "write_handoff",
                     ]),
+                    fallback_capture(&["edge_case_sweep", "orient", "write_handoff"]),
                 ]
-                .concat(),
-            ),
+                .concat();
+                lines.sort();
+                lines
+            }),
         ]);
         assert_eq!(
             warnings_by_agent, expected_warnings,
@@ -8327,6 +8345,1333 @@ mod tests {
                 "subjects_map",
             ]),
             "graph.example.yaml validator warnings drifted from the recorded baseline"
+        );
+    }
+
+    // ---- adversary suite-script regression tests (R5) ----
+    //
+    // Fault paths of the adversary's verdict/gate scripts, exercised by
+    // invoking `python3 <script>` with a synthetic GRAPH_STATE env — the same
+    // contract the graph's script executor uses. Guarded on python3 being
+    // available, mirroring src/graph/script.rs's local helper.
+
+    fn cmd_available(name: &str) -> bool {
+        which::which(name).is_ok()
+    }
+
+    fn run_adversary_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+        run_adversary_script_env(script, state, &[])
+    }
+
+    fn run_adversary_script_env(
+        script: &str,
+        state: &serde_json::Value,
+        envs: &[(&str, &str)],
+    ) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/adversary/scripts")
+            .join(script);
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg(&path).env("GRAPH_STATE", state.to_string());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let out = cmd
+            .output()
+            .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
+        assert!(
+            out.status.success(),
+            "{script} exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{script} stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    #[test]
+    fn adversary_verdict_pipeline_fault_forces_diverges() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": ["PIPELINE-FAULT: parse failed — cannot review: LLM node failed: boom"],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""},
+                {"id": "c2", "text": "does Y", "status": "UNMET",
+                 "evidence": "", "complaint": "nothing in the diff does Y"}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": ""
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "a pipeline fault must force DIVERGES: {report}"
+        );
+        assert!(
+            report.contains("1. PIPELINE-FAULT: parse failed — cannot review"),
+            "the fault must be complaint #1: {report}"
+        );
+        assert!(
+            report.contains("2. Acceptance criterion \"does Y\""),
+            "per-criterion results must still be reported after the fault: {report}"
+        );
+        assert!(
+            report.contains("Verification runs:"),
+            "the report must carry the Verification runs section: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_holistic_failure_is_a_pipeline_fault() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "holistic_failure": "LLM node failed: provider exploded",
+            "exec_results": ""
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "a holistic-pass failure must force DIVERGES: {report}"
+        );
+        assert!(
+            report.contains(
+                "PIPELINE-FAULT: holistic pass failed — criterion verdicts stand \
+                 but cross-cutting hunt did not run"
+            ),
+            "the holistic failure must become a PIPELINE-FAULT complaint: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_conforms_is_unaffected_without_faults() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // holistic_failure carries the rendered SUCCESS output here — it must
+        // not be mistaken for a failure, and a recorded green run must render
+        // as [PASS] in the Verification runs section.
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "holistic_failure": "{\"extra_complaints\": [], \"observations\": \"\"}",
+            "exec_results": [{"cmd": "cargo test --all", "exit": 0, "duration_s": 42.0, "tail": "ok"}]
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: CONFORMS\nCriteria: 1/1 met"),
+            "non-degraded all-MET semantics must be unchanged: {report}"
+        );
+        assert!(
+            report.contains("Verification runs:") && report.contains("- [PASS] `cargo test --all`"),
+            "a recorded green run must render as PASS evidence: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_run_checks_none_declared_marker() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_adversary_script("run_checks.py", &json!({}));
+        let marker = out["exec_results"].as_str().unwrap();
+        assert!(
+            marker.contains("none declared"),
+            "no verification_commands must degrade to a 'none declared' marker: {marker}"
+        );
+    }
+
+    #[test]
+    fn adversary_run_checks_records_green_and_failing_runs() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({"verification_commands": ["echo ok", "false"]});
+        let out = run_adversary_script("run_checks.py", &state);
+        let results = out["exec_results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "one record per declared command: {results:?}"
+        );
+        assert_eq!(results[0]["cmd"], "echo ok");
+        assert_eq!(results[0]["exit"], 0, "green command must record exit 0");
+        assert!(
+            results[0]["tail"].as_str().unwrap().contains("ok"),
+            "the output tail must be recorded: {results:?}"
+        );
+        assert!(results[0]["duration_s"].is_number());
+        assert_ne!(
+            results[1]["exit"], 0,
+            "failing command must record its nonzero exit: {results:?}"
+        );
+    }
+
+    #[test]
+    fn adversary_run_checks_runner_error_degrades_to_environment_marker() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A dead project_dir makes every spawn raise — the outer except must
+        // still exit 0 (asserted inside the helper) and degrade the whole run
+        // to the ENVIRONMENT marker instead of failing the node.
+        let state = json!({
+            "verification_commands": ["echo hi"],
+            "project_dir": "/nonexistent/xyz"
+        });
+        let out = run_adversary_script("run_checks.py", &state);
+        let marker = out["exec_results"].as_str().unwrap();
+        assert!(
+            marker.starts_with("ENVIRONMENT"),
+            "a runner error must degrade to an ENVIRONMENT marker: {marker}"
+        );
+    }
+
+    #[test]
+    fn adversary_run_checks_deadline_skips_remaining_commands() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Deadline seam: a 1s total budget. The hung first command must be cut
+        // off at min(per-command, remaining)≈1s and recorded as a timeout; the
+        // second must be recorded as skipped — the in-script handling stays
+        // authoritative instead of the NODE timeout killing the script from
+        // outside (which would bypass the ENVIRONMENT degradation entirely).
+        let state = json!({"verification_commands": ["sleep 5", "echo never"]});
+        let out = run_adversary_script_env(
+            "run_checks.py",
+            &state,
+            &[("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "1")],
+        );
+        let results = out["exec_results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "every declared command gets a record: {results:?}"
+        );
+        assert_eq!(
+            results[0]["exit"], -1,
+            "a command outliving its budget must record a timeout: {results:?}"
+        );
+        assert!(
+            results[0]["tail"].as_str().unwrap().contains("TIMEOUT"),
+            "the timeout must be named in the tail: {results:?}"
+        );
+        assert_eq!(
+            results[1]["skipped"], "deadline",
+            "commands past the deadline must be recorded as skipped: {results:?}"
+        );
+    }
+
+    #[test]
+    fn adversary_pipeline_fault_parse_stage_attribution() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({"parse_failure": "LLM node 'parse' failed: provider exploded"}),
+        );
+        let faults = out["pipeline_faults"].as_array().unwrap();
+        let fault = faults[0].as_str().unwrap();
+        assert!(
+            fault.contains("PIPELINE-FAULT: parse failed — cannot review"),
+            "an llm-node failure string must attribute to the parse stage: {fault}"
+        );
+        assert!(
+            fault.contains("provider exploded"),
+            "the failure detail must be carried into the fault: {fault}"
+        );
+    }
+
+    #[test]
+    fn adversary_pipeline_fault_facts_and_run_checks_stage_attribution() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A script node's fallback writes NOTHING into state (executor.rs
+        // script arm), so attribution keys off which stage outputs are
+        // present. facts stage: parse succeeded (schema JSON in
+        // parse_failure) but diff_text is still the initial '' — diff
+        // resolution itself died.
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({"parse_failure": "{\"criteria\": []}", "diff_text": ""}),
+        );
+        let faults = out["pipeline_faults"].as_array().unwrap();
+        assert!(
+            faults[0]
+                .as_str()
+                .unwrap()
+                .contains("PIPELINE-FAULT: diff resolution failed"),
+            "empty diff_text must attribute to the facts stage: {faults:?}"
+        );
+
+        // run_checks stage: facts completed (diff_facts.py unconditionally
+        // writes a nonempty diff_text) but the runner died at the node level
+        // before recording exec_results.
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({
+                "parse_failure": "{\"criteria\": []}",
+                "diff_text": "diff --git a/x b/x",
+                "exec_results": ""
+            }),
+        );
+        let faults = out["pipeline_faults"].as_array().unwrap();
+        assert!(
+            faults[0]
+                .as_str()
+                .unwrap()
+                .contains("PIPELINE-FAULT: verification runner killed"),
+            "nonempty diff_text must attribute to the run_checks stage: {faults:?}"
+        );
+    }
+
+    #[test]
+    fn adversary_check_criterion_prompt_cites_exec_results() {
+        use crate::graph::{GraphParser, NodeType};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/adversary");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .expect("adversary graph.yaml must parse");
+        let node = graph
+            .nodes
+            .get("check_criterion")
+            .expect("adversary graph must have a check_criterion node");
+        let NodeType::Llm(llm) = &node.node_type else {
+            panic!("check_criterion must be an llm node");
+        };
+        assert!(
+            llm.prompt.contains("{{exec_results}}"),
+            "check_criterion's prompt must cite the recorded verification runs: {}",
+            llm.prompt
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_renders_skipped_runs() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test --all", "skipped": "deadline"}]
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.contains("- [SKIPPED] `cargo test --all`"),
+            "a skipped record must render as SKIPPED: {report}"
+        );
+        assert!(
+            !report.contains("[FAIL] `cargo test --all`"),
+            "a skipped record must not render as FAIL: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_crit_gate_contract_regression() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Valid MET verdict passes through with the id stamped from the criterion.
+        let out = run_adversary_script(
+            "crit_gate.py",
+            &json!({
+                "criterion": {"id": "c7", "text": "the spec"},
+                "gate_attempts": 0,
+                "crit_verdict": "{\"id\": \"wrong\", \"status\": \"MET\", \
+                 \"evidence\": \"src/a.rs:1 + test tests/a.rs:5\", \"complaint\": \"\"}"
+            }),
+        );
+        assert_eq!(out["crit_verdict"]["id"], "c7", "id must be stamped: {out}");
+        assert_eq!(out["crit_verdict"]["status"], "MET");
+
+        // Malformed output with retry budget left → reject back to check_criterion.
+        let out = run_adversary_script(
+            "crit_gate.py",
+            &json!({
+                "criterion": {"id": "c7", "text": "the spec"},
+                "gate_attempts": 0,
+                "crit_verdict": "not json at all"
+            }),
+        );
+        assert_eq!(
+            out["_next"], "check_criterion",
+            "first failure must retry: {out}"
+        );
+        assert_eq!(out["gate_attempts"], 1);
+
+        // Malformed output with the retry exhausted → recorded PARTIAL (unproven).
+        let out = run_adversary_script(
+            "crit_gate.py",
+            &json!({
+                "criterion": {"id": "c7", "text": "the spec"},
+                "gate_attempts": 1,
+                "crit_verdict": "still not json"
+            }),
+        );
+        assert_eq!(out["crit_verdict"]["status"], "PARTIAL");
+        assert!(
+            out["crit_verdict"]["complaint"]
+                .as_str()
+                .unwrap()
+                .contains("failed machine validation"),
+            "exhausted retries must record the unproven complaint: {out}"
+        );
+    }
+
+    // ---- review-gauntlet suite-script regression tests (R5) ----
+    //
+    // Degradation paths of the gauntlet's lane/builder/gate scripts,
+    // exercised the same way as the adversary suite above: `python3 <script>`
+    // with a synthetic GRAPH_STATE env.
+
+    fn run_gauntlet_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/review-gauntlet/scripts")
+            .join(script);
+        let out = std::process::Command::new("python3")
+            .arg(&path)
+            .env("GRAPH_STATE", state.to_string())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
+        assert!(
+            out.status.success(),
+            "{script} exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{script} stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_blocks_lane_fault_distinctly() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // One run exercising all three failure classes at once — a faulted
+        // lane, an unselected lane, and a lane that returned no sentinel —
+        // each must be reported distinctly.
+        let state = json!({
+            "code_review_results": ["...**Verdict: MERGE-READY**..."],
+            "adversary_results": ["PIPELINE-FAULT: adversary lane failed after retries — Agent node failed: boom"],
+            "security_results": [],
+            "probe_results": ["some text with no sentinel"]
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("adversary: PIPELINE-FAULT — the lane failed after retries"),
+            "the faulted lane must be named as a blocker: {report}"
+        );
+        assert!(
+            report.contains("| adversary | BLOCKED | PIPELINE-FAULT (lane failed) |"),
+            "the lane table must carry the fault detail: {report}"
+        );
+        assert!(
+            report.contains("| security | SKIPPED | not selected |"),
+            "an unselected lane must stay SKIPPED: {report}"
+        );
+        assert!(
+            report.contains("| probe | BLOCKED | missing verdict sentinel |"),
+            "a sentinel-less lane must stay a missing-sentinel failure: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_signals_error_fault_blocks() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "code_review_results": [],
+            "adversary_results": [],
+            "security_results": [],
+            "probe_results": [],
+            "signals_error": "PIPELINE-FAULT: lane builder crashed — boom; no lanes were run"
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains(
+                "## Blockers\n- pipeline: PIPELINE-FAULT: lane builder crashed — boom; no lanes were run"
+            ),
+            "the pipeline fault must appear in the Blockers section: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_happy_path_regression() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "code_review_results": ["**Verdict: MERGE-READY**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(
+            out["gauntlet_verdict"], "PASS",
+            "non-degraded semantics must be unchanged: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_reds_block_despite_merge_ready() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "code_review_results": ["🔴 [correctness] broken invariant\n\n**Verdict: MERGE-READY**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("code-review: 1 🔴 CRITICAL finding(s)"),
+            "🔴 findings must block regardless of the verdict line: {report}"
+        );
+        assert!(
+            report.contains("| code-review | BLOCKED | 1 🔴 finding(s) |"),
+            "the lane table must carry the 🔴 count: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_needs_human_without_reds_passes_with_attention() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "code_review_results": ["🟡 [convention] minor nit\n\n**Verdict: NEEDS-HUMAN**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(
+            out["gauntlet_verdict"], "PASS",
+            "NEEDS-HUMAN without 🔴 must pass: {out}"
+        );
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("## Human attention required"),
+            "the attention section must be surfaced: {report}"
+        );
+        assert!(
+            report.contains("| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴 |"),
+            "the lane table must record the attention status: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_probe_inconclusive_blocks_with_environment_note() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "code_review_results": ["**Verdict: MERGE-READY**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": ["USAGE_PROBE: INCONCLUSIVE — could not boot the stack"]
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("the ENVIRONMENT could not be established"),
+            "INCONCLUSIVE must carry the environment note: {report}"
+        );
+        assert!(
+            report.contains("| probe | BLOCKED | INCONCLUSIVE (environment) |"),
+            "the lane table must record the environment block: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A truthy non-list lane result makes lane_report index into an int,
+        // raising inside main; the top-level guard must emit BLOCKED (exit 0
+        // is asserted in the helper) — never a crash into a silent pass.
+        let out = run_gauntlet_script("verdict_gate.py", &json!({"code_review_results": 42}));
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("verdict gate error"),
+            "the internal error must be named in the report: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_quoted_fault_marker_not_misrouted() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A real review that merely QUOTES the marker mid-text (e.g. a code
+        // review of the gauntlet itself) must flow to the normal verdict
+        // rules: the 🔴 count blocks it, NOT the lane-fault rule.
+        let state = json!({
+            "code_review_results": ["🔴 [correctness] gate mishandles reports quoting 'PIPELINE-FAULT:' mid-text\n\n**Verdict: MERGE-READY**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| code-review | BLOCKED | 1 🔴 finding(s) |"),
+            "the quoting report must be routed to the 🔴 rule: {report}"
+        );
+        assert!(
+            !report.contains("code-review: PIPELINE-FAULT — the lane failed"),
+            "a quoting report must NOT be treated as a lane fault: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_build_items_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A truthy non-iterable forced_lanes raises inside main; the guard
+        // must exit 0 (asserted in the helper) with empty lanes and a
+        // PIPELINE-FAULT for the gate.
+        let out = run_gauntlet_script("build_items.py", &json!({"forced_lanes": 42}));
+        for key in [
+            "code_review_items",
+            "adversary_items",
+            "security_items",
+            "probe_items",
+        ] {
+            assert_eq!(
+                out[key],
+                json!([]),
+                "{key} must be empty on a builder crash: {out}"
+            );
+        }
+        assert!(
+            out["signals_error"]
+                .as_str()
+                .unwrap()
+                .contains("PIPELINE-FAULT: lane builder crashed"),
+            "the crash must surface as a PIPELINE-FAULT: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_build_items_folds_degradation_note_into_summary() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "forced_lanes": ["code-review", "adversary"],
+            "lanes_degraded": "lane selection degraded to deterministic defaults"
+        });
+        let out = run_gauntlet_script("build_items.py", &state);
+        let summary = out["lanes_summary"].as_str().unwrap();
+        assert!(
+            summary.contains("lane selection degraded to deterministic defaults"),
+            "the degradation note must survive into lanes_summary: {summary}"
+        );
+        assert!(
+            summary.contains("forced lanes honored exactly"),
+            "the forced-lanes reason must still be recorded: {summary}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_lane_fault_normalizes_engine_failure_text() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script(
+            "lane_fault.py",
+            &json!({"lane_ctx": {"lane": "security"}, "lane_out": "Agent node failed: kaboom"}),
+        );
+        assert_eq!(
+            out["lane_out"],
+            "PIPELINE-FAULT: security lane failed after retries — Agent node failed: kaboom"
+        );
+
+        let out = run_gauntlet_script(
+            "lane_fault.py",
+            &json!({"lane_out": "Agent node failed: kaboom"}),
+        );
+        assert!(
+            out["lane_out"]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: unknown lane failed after retries"),
+            "a missing lane_ctx must degrade to the unknown lane: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_parse_fault_records_fault_in_signals_error() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script(
+            "parse_fault.py",
+            &json!({"parse_failure": "LLM node 'parse' failed: provider exploded"}),
+        );
+        let fault = out["signals_error"].as_str().unwrap();
+        assert!(
+            fault.contains("PIPELINE-FAULT: parse failed"),
+            "a dead parse stage must surface as a PIPELINE-FAULT: {fault}"
+        );
+        assert!(
+            fault.contains("provider exploded"),
+            "the failure detail must be carried into the fault: {fault}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_parse_fault_blocks_verdict_gate() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // End-to-end over the fallback route: parse_fault's emitted
+        // signals_error must make the gate BLOCK even with every lane empty.
+        let fault = run_gauntlet_script(
+            "parse_fault.py",
+            &json!({"parse_failure": "LLM node 'parse' failed: provider exploded"}),
+        );
+        let state = json!({
+            "code_review_results": [],
+            "adversary_results": [],
+            "security_results": [],
+            "probe_results": [],
+            "signals_error": fault["signals_error"]
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("## Blockers\n- pipeline: PIPELINE-FAULT: parse failed"),
+            "the parse fault must appear in the Blockers section: {report}"
+        );
+        assert!(
+            report.contains("provider exploded"),
+            "the failure detail must survive into the report: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_default_lanes_is_deterministic() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script("default_lanes.py", &json!({}));
+        assert_eq!(out["forced_lanes"], json!(["code-review", "adversary"]));
+        assert!(
+            out["lanes_degraded"]
+                .as_str()
+                .unwrap()
+                .contains("deterministic defaults"),
+            "the degradation note must name the deterministic defaults: {out}"
+        );
+
+        let probe = run_gauntlet_script("default_lanes.py", &json!({"consumer_surface": true}));
+        assert_eq!(
+            probe["forced_lanes"],
+            json!(["code-review", "adversary", "probe"]),
+            "a consumer surface must widen selection to include probe: {probe}"
+        );
+
+        let again = run_gauntlet_script("default_lanes.py", &json!({}));
+        assert_eq!(out, again, "same input must produce identical output");
+    }
+
+    #[test]
+    fn gauntlet_default_lanes_preserves_caller_forced_lanes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A caller who forced a lane must not lose it when selection
+        // degrades — the fallback unions, never overwrites — and forced
+        // names canonicalize via the same aliases build_items uses.
+        let out = run_gauntlet_script(
+            "default_lanes.py",
+            &json!({"forced_lanes": ["security-reviewer"]}),
+        );
+        assert_eq!(
+            out["forced_lanes"],
+            json!(["code-review", "adversary", "security"]),
+            "a caller-forced lane must survive the fallback: {out}"
+        );
+
+        // Unknown forced names are ignored, not crashed on.
+        let bogus = run_gauntlet_script("default_lanes.py", &json!({"forced_lanes": ["bogus"]}));
+        assert_eq!(
+            bogus["forced_lanes"],
+            json!(["code-review", "adversary"]),
+            "unknown forced names must be ignored: {bogus}"
+        );
+
+        let again = run_gauntlet_script(
+            "default_lanes.py",
+            &json!({"forced_lanes": ["security-reviewer"]}),
+        );
+        assert_eq!(out, again, "same input must produce identical output");
+    }
+
+    #[test]
+    fn gauntlet_default_lanes_security_signals_force_security_lane() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // The deterministic security signals are already in state when the
+        // fallback runs; degradation must never drop the security lane
+        // build_items' hard rules would have selected.
+        for state in [
+            json!({"touches_auth": true}),
+            json!({"touches_deps": true}),
+            json!({"touches_exec": true}),
+            json!({"security_posture": "hardened"}),
+        ] {
+            let out = run_gauntlet_script("default_lanes.py", &state);
+            assert_eq!(
+                out["forced_lanes"],
+                json!(["code-review", "adversary", "security"]),
+                "security signal {state} must force the security lane: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn gauntlet_lane_prompts_carry_passthroughs() {
+        use crate::graph::{GraphParser, NodeType};
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/review-gauntlet");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .expect("review-gauntlet graph.yaml must parse");
+        let node = graph
+            .nodes
+            .get("run_adversary")
+            .expect("review-gauntlet graph must have a run_adversary node");
+        let NodeType::Agent(adv) = &node.node_type else {
+            panic!("run_adversary must be an agent node");
+        };
+        assert!(
+            adv.prompt.contains("{{verification_commands}}"),
+            "run_adversary's prompt must pass the declared verification commands through: {}",
+            adv.prompt
+        );
+        let node = graph
+            .nodes
+            .get("run_probe")
+            .expect("review-gauntlet graph must have a run_probe node");
+        let NodeType::Agent(probe) = &node.node_type else {
+            panic!("run_probe must be an agent node");
+        };
+        assert!(
+            probe.prompt.contains("reconcile rather than duplicate"),
+            "run_probe's prompt must carry the reconcile line: {}",
+            probe.prompt
+        );
+    }
+
+    // ---- code-reviewer suite-script regression tests (R5) ----
+    //
+    // Fail-closed fault paths of the code-reviewer's verdict/fault/render
+    // scripts, exercised the same way as the suites above: `python3 <script>`
+    // with a synthetic GRAPH_STATE env.
+
+    fn run_code_reviewer_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+        run_code_reviewer_script_raw(script, &state.to_string())
+    }
+
+    fn run_code_reviewer_script_raw(script: &str, raw_state: &str) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/code-reviewer/scripts")
+            .join(script);
+        let out = std::process::Command::new("python3")
+            .arg(&path)
+            .env("GRAPH_STATE", raw_state)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
+        assert!(
+            out.status.success(),
+            "{script} exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{script} stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    #[test]
+    fn code_reviewer_verdict_domain_fault_forces_needs_human() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "domain_reports": ["> ⚠️ PIPELINE-FAULT: domain review lane failed after retries — domain 'engine' (files: a.rs): Agent node failed: dead"],
+            "findings": []
+        });
+        let out = run_code_reviewer_script("verdict.py", &state);
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "NEEDS-HUMAN",
+            "a faulted domain lane must force NEEDS-HUMAN: {out}"
+        );
+        let first = v["attention"][0].as_str().unwrap();
+        assert!(
+            first.starts_with("PIPELINE-FAULT:"),
+            "the fault must lead the attention list: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_verdict_synthesis_fault_blocks() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Keyed off synth_failure, never off findings == [] — the empty
+        // findings list here is exactly what a dead synthesis leaves behind.
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "domain_reports": ["clean report. DOMAIN_REVIEW_COMPLETE"],
+            "findings": [],
+            "synth_failure": "LLM node failed: boom"
+        });
+        let out = run_code_reviewer_script("verdict.py", &state);
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "NEEDS-HUMAN",
+            "a dead synthesis must block: {out}"
+        );
+        assert!(
+            v["attention"].as_array().unwrap().iter().any(|a| a
+                .as_str()
+                .unwrap_or("")
+                .contains("PIPELINE-FAULT: synthesis failed")),
+            "the synthesis fault must be in attention: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_verdict_verifier_fault_attention() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "domain_reports": ["clean report. DOMAIN_REVIEW_COMPLETE"],
+            "findings": [{
+                "id": "f1", "severity": "🟡 WARNING", "marker": "",
+                "file": "a.rs", "lines": "10", "title": "possible issue",
+                "block": "#### possible issue"
+            }],
+            "verifier_output": "Agent node failed: dead"
+        });
+        let out = run_code_reviewer_script("verdict.py", &state);
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "NEEDS-HUMAN",
+            "a dead verifier must block: {out}"
+        );
+        assert!(
+            v["attention"].as_array().unwrap().iter().any(|a| a
+                .as_str()
+                .unwrap_or("")
+                .contains("PIPELINE-FAULT: finding verification failed")),
+            "the verifier fault must be in attention: {out}"
+        );
+        let block = v["findings_final"][0]["block"].as_str().unwrap();
+        assert!(
+            block.contains("(unverified: no verifier verdict returned"),
+            "the kept finding must render as unverified: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_verdict_quoted_marker_precedence() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // PREFIX-anchored fault detection: a clean report that merely QUOTES
+        // the banner mid-text must not read as a faulted lane.
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "domain_reports": ["The gate prepends '> ⚠️ PIPELINE-FAULT:' when a lane dies; this slice reviewed that logic and it is correct. DOMAIN_REVIEW_COMPLETE"],
+            "findings": []
+        });
+        let out = run_code_reviewer_script("verdict.py", &state);
+        assert_eq!(
+            out["verdict_out"]["verdict"], "MERGE-READY",
+            "a quoted marker mid-text must not trip the fault check: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_verdict_happy_path_regression() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "domain_reports": ["clean report. DOMAIN_REVIEW_COMPLETE"],
+            "findings": [],
+            "verifier_output": "",
+            "parse_failure": "",
+            "refine_failure": "",
+            "aux_failure": "",
+            "synth_failure": ""
+        });
+        let out = run_code_reviewer_script("verdict.py", &state);
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "MERGE-READY",
+            "a clean run must stay MERGE-READY: {out}"
+        );
+        assert_eq!(
+            v["reason"], "no blocking findings and no always-human triggers",
+            "the happy-path reason must be byte-compatible: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_domain_fault_normalizes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "domain_group": {"domain": "engine", "files": ["a.rs"]},
+            "domain_report": "Agent node failed: spawn dead\nline2"
+        });
+        let out = run_code_reviewer_script("domain_fault.py", &state);
+        let report = out["domain_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("> ⚠️ PIPELINE-FAULT: domain review lane failed after retries — "),
+            "the banner prefix verdict.py anchors on must be exact: {report}"
+        );
+        assert!(
+            report.contains("domain 'engine' (files: a.rs)"),
+            "the fault must name the slice: {report}"
+        );
+        assert!(
+            !report.contains('\n'),
+            "the failure detail must be newline-normalized: {report}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_parse_fault_emits_needs_human() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_code_reviewer_script(
+            "parse_fault.py",
+            &json!({"parse_failure": "LLM node failed: x"}),
+        );
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "NEEDS-HUMAN",
+            "a dead parse must block: {out}"
+        );
+        assert!(
+            v["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: parse failed"),
+            "the reason must carry the fault marker: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_parse_fault_renders_well_formed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A parse fault dies before facts, so changed_files is empty — the
+        // fault verdict must still render as a full report, not the
+        // "No changes to review." stub.
+        let fault = run_code_reviewer_script(
+            "parse_fault.py",
+            &json!({"parse_failure": "LLM node failed: x"}),
+        );
+        let state = json!({
+            "changed_files": [],
+            "verdict_out": fault["verdict_out"].clone()
+        });
+        let out = run_code_reviewer_script("render.py", &state);
+        let report = out["final_report"].as_str().unwrap();
+        assert!(
+            report.contains("**Verdict: NEEDS-HUMAN**"),
+            "the fault verdict must render: {report}"
+        );
+        assert!(
+            report.contains("PIPELINE-FAULT: parse failed"),
+            "the fault reason must render: {report}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_render_no_changes_regression() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "changed_files": [],
+            "verdict_out": {
+                "verdict": "MERGE-READY",
+                "reason": "no blocking findings and no always-human triggers"
+            }
+        });
+        let out = run_code_reviewer_script("render.py", &state);
+        assert!(
+            out["final_report"]
+                .as_str()
+                .unwrap()
+                .contains("No changes to review."),
+            "an empty non-fault diff must keep the stub report: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_aux_fault_normalizes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_code_reviewer_script(
+            "aux_fault.py",
+            &json!({"aux_failure": "LLM node failed: y"}),
+        );
+        assert!(
+            out["aux_note"]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: aux context lanes failed after retries —"),
+            "the aux fault must land in aux_note: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_cover_gate_notes_refine_failure() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // refine_groups' fallback lands in cover_gate with `groups` never set;
+        // the deterministic proposal must win and the degradation must be
+        // noted for the synthesis prompt.
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "proposed_groups": [{"domain": "engine", "files": ["a.rs"]}],
+            "refine_failure": "LLM node failed: z"
+        });
+        let out = run_code_reviewer_script("cover_gate.py", &state);
+        assert_eq!(
+            out["group_items"],
+            json!([{"domain": "engine", "files": ["a.rs"]}]),
+            "the deterministic proposal must be used: {out}"
+        );
+        assert!(
+            out["groups_note"]
+                .as_str()
+                .unwrap()
+                .contains("fell back to the deterministic grouping"),
+            "the refine failure must be noted: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_render_verifier_fault_empty_diff_renders_fault() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // The verifier fault check is deliberately not gated on a non-empty
+        // diff, and verdict.py carries the marker in attention rather than
+        // the reason — render.py must not swallow that verdict into the
+        // "No changes to review." stub.
+        let fault = run_code_reviewer_script(
+            "verdict.py",
+            &json!({
+                "changed_files": [],
+                "domain_reports": [],
+                "findings": [],
+                "verifier_output": "Agent node failed: dead"
+            }),
+        );
+        let state = json!({
+            "changed_files": [],
+            "verdict_out": fault["verdict_out"].clone()
+        });
+        let out = run_code_reviewer_script("render.py", &state);
+        let report = out["final_report"].as_str().unwrap();
+        assert!(
+            report.contains("**Verdict: NEEDS-HUMAN**"),
+            "the fault verdict must render: {report}"
+        );
+        assert!(
+            report.contains("PIPELINE-FAULT: finding verification failed"),
+            "the verifier fault must render: {report}"
+        );
+        assert!(
+            !report.contains("No changes to review."),
+            "a fault-degraded verdict must not collapse into the stub: {report}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_verdict_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A truthy non-iterable attention_flags raises TypeError inside main;
+        // the guard must still emit a fail-closed verdict.
+        let state = json!({"changed_files": ["a.rs"], "attention_flags": 42});
+        let out = run_code_reviewer_script("verdict.py", &state);
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "NEEDS-HUMAN",
+            "a crashed verdict gate must fail closed: {out}"
+        );
+        assert!(
+            v["reason"]
+                .as_str()
+                .unwrap()
+                .contains("verdict computation error"),
+            "the reason must name the error: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_cover_gate_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A domain-less proposed group raises KeyError while building the
+        // fallback grouping; the guard must emit one catch-all group, never
+        // an empty review.
+        let state = json!({"changed_files": ["a.rs"], "proposed_groups": [{}]});
+        let out = run_code_reviewer_script("cover_gate.py", &state);
+        assert_eq!(
+            out["group_items"],
+            json!([{"domain": "all-changes", "files": ["a.rs"]}]),
+            "a crashed gate must fall back to a catch-all group: {out}"
+        );
+        assert!(
+            out["groups_note"]
+                .as_str()
+                .unwrap()
+                .contains("cover gate error"),
+            "the crash must be noted: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_domain_fault_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Unparseable state makes load_state raise before main runs; the
+        // fault marker itself must still emit the banner-prefixed report.
+        let out = run_code_reviewer_script_raw("domain_fault.py", "not json");
+        let report = out["domain_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("> ⚠️ PIPELINE-FAULT: domain review lane failed after retries — "),
+            "the banner prefix verdict.py anchors on must survive a crash: {report}"
+        );
+        assert!(
+            report.contains("fault-marker script error"),
+            "the crash must be named: {report}"
         );
     }
 

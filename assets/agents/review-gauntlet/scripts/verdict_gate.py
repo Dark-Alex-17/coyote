@@ -5,6 +5,11 @@ Parses each configured lane's verdict SENTINEL with a regex — no LLM
 re-reads, no judgment. The gate's hard rules:
 
   - a missing sentinel is a LANE FAILURE and blocks — never a pass;
+  - a PIPELINE-FAULT lane result (the lane's agent died after retries;
+    detected only when the report IS the lane_fault.py marker, i.e. it
+    STARTS with it — a real review merely quoting the marker flows to the
+    normal rules) or a PIPELINE-FAULT in signals_error (builder/parse
+    fault) blocks — a degraded pipeline is never a pass;
   - any 🔴 finding in the code-review report blocks regardless of the
     lane's own verdict line;
   - NEEDS-HUMAN without 🔴 passes but is surfaced as attention required;
@@ -40,10 +45,33 @@ def main():
     def record(lane, status, detail=""):
         lane_lines.append(f"| {lane} | {status} | {detail} |")
 
+    def fault_excerpt(report):
+        line = next(
+            (ln for ln in report.splitlines() if "PIPELINE-FAULT:" in ln), report
+        )
+        return line.strip()[:200]
+
+    def is_lane_fault(report):
+        # A genuine lane fault is the ENTIRE report emitted by lane_fault.py,
+        # which always begins with the marker. Matching the marker anywhere
+        # would let a real review that merely QUOTES "PIPELINE-FAULT:" bypass
+        # 🔴 counting and sentinel parsing.
+        return report.strip().startswith("PIPELINE-FAULT:")
+
+    def lane_fault_blocker(lane, report):
+        blockers.append(
+            f"{lane}: PIPELINE-FAULT — the lane failed after retries and produced "
+            f"no verdict; a degraded lane is never a pass ({fault_excerpt(report)})"
+        )
+        record(lane, "BLOCKED", "PIPELINE-FAULT (lane failed)")
+
     # --- code-review ------------------------------------------------------
     cr = lane_report("code_review_results")
     if cr is None:
         record("code-review", "SKIPPED", "not selected")
+    elif is_lane_fault(cr):
+        lane_fault_blocker("code-review", cr)
+        reports.append(("code-review", cr))
     else:
         reports.append(("code-review", cr))
         m = re.search(r"Verdict:\**\s*\**\s*(MERGE-READY|NEEDS-HUMAN)", cr)
@@ -72,6 +100,9 @@ def main():
     adv = lane_report("adversary_results")
     if adv is None:
         record("adversary", "SKIPPED", "not selected")
+    elif is_lane_fault(adv):
+        lane_fault_blocker("adversary", adv)
+        reports.append(("adversary", adv))
     else:
         reports.append(("adversary", adv))
         m = re.search(r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)", adv)
@@ -92,6 +123,9 @@ def main():
     sec = lane_report("security_results")
     if sec is None:
         record("security", "SKIPPED", "not selected")
+    elif is_lane_fault(sec):
+        lane_fault_blocker("security", sec)
+        reports.append(("security", sec))
     else:
         reports.append(("security", sec))
         m = re.search(r"SECURITY_REVIEW:\s*(PASS|FAIL)", sec)
@@ -110,6 +144,9 @@ def main():
     pb = lane_report("probe_results")
     if pb is None:
         record("probe", "SKIPPED", "not selected")
+    elif is_lane_fault(pb):
+        lane_fault_blocker("probe", pb)
+        reports.append(("probe", pb))
     else:
         reports.append(("probe", pb))
         m = re.search(r"USAGE_PROBE:\s*(PASS|FAIL|INCONCLUSIVE)", pb)
@@ -130,6 +167,12 @@ def main():
                 "probe: no USAGE_PROBE sentinel found — lane failed; never a pass"
             )
             record("probe", "BLOCKED", "missing verdict sentinel")
+
+    # A gauntlet-level fault (build_items crash, dead parse stage) means the
+    # lanes above were never built — SKIPPED rows alone must not read as PASS.
+    signals_error = state.get("signals_error")
+    if isinstance(signals_error, str) and "PIPELINE-FAULT:" in signals_error:
+        blockers.append(f"pipeline: {signals_error}")
 
     verdict = "BLOCKED" if blockers else "PASS"
 

@@ -12,7 +12,12 @@ description: |
   tests — ADDITIVE-only: it can add complaints, never flip a criterion verdict.
   The final CONFORMS/DIVERGES sentinel is computed by a script: CONFORMS
   requires every criterion MET and zero holistic complaints. Missing plan =
-  DIVERGES (fail-closed) naming the missing spec.
+  DIVERGES (fail-closed) naming the missing spec. Caller-declared verification
+  commands are executed ONCE by a deterministic stage and recorded — criterion
+  branches cite the record and never run anything themselves. Any pipeline
+  fault (parse, diff resolution, verification runner, or holistic failure)
+  lands a PIPELINE-FAULT marker and fails closed into DIVERGES: degraded is
+  never passing.
 
 version: '1.0'
 
@@ -42,12 +47,17 @@ initial_state:
   changed_files: []
   diff_text: ''
   diff_note: ''
+  verification_commands: []
+  exec_results: ''
   crit_verdicts: []
   extra_complaints: []
   observations: ''
   adv_report: ''
   gate_feedback: ''
   gate_attempts: 0
+  parse_failure: ''
+  holistic_failure: ''
+  pipeline_faults: []
 
 start: parse
 
@@ -75,6 +85,10 @@ nodes:
         verbatim — the holistic pass checks the diff didn't silently override them.
       - `scope_notes`: what the plan says NOT to touch / explicit boundaries.
       - `extra_context`: anything else conformance-relevant, condensed.
+      - `verification_commands`: the exact build/test/lint shell commands the
+        caller explicitly declares for verification (verbatim strings, in the
+        order given). Empty array when the caller declares none — NEVER invent,
+        guess, or auto-detect commands; undeclared stays undeclared.
     prompt: |
       Extract the conformance-review facts from this request:
 
@@ -103,9 +117,16 @@ nodes:
           type: string
         project_dir_in:
           type: string
-      required: [criteria, diff_spec, plan_notes, scope_notes, extra_context, project_dir_in]
+        verification_commands:
+          type: array
+          items:
+            type: string
+      required: [criteria, diff_spec, plan_notes, scope_notes, extra_context, project_dir_in, verification_commands]
     max_iterations: 3
     max_attempts: 2
+    state_updates:
+      parse_failure: '{{output}}'
+    fallback: pipeline_fault
     next: facts
 
   facts:
@@ -114,6 +135,16 @@ nodes:
     description: Deterministic diff resolution — changed files and the (bounded) diff text every criterion branch verifies against.
     script: scripts/diff_facts.py
     timeout: 120
+    fallback: pipeline_fault
+    next: run_checks
+
+  run_checks:
+    id: run_checks
+    type: script
+    description: Deterministic execution evidence — runs ONLY the caller-declared verification commands in the project dir and records exec_results; criterion branches cite the record and never execute anything. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker; a 3300s total deadline keeps the script under the node timeout (commands past it are recorded as skipped), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
+    script: scripts/run_checks.py
+    timeout: 3600
+    fallback: pipeline_fault
     next: map_criteria
 
   map_criteria:
@@ -158,6 +189,21 @@ nodes:
       values shaped to the criterion's example, TODO/stub presented as done —
       those are PARTIAL or DIVERGED with the gaming named in the complaint.
 
+      Execution criteria ("tests pass", "lint clean", "build succeeds") are
+      judged ONLY against the recorded verification runs in your prompt — you
+      have no execution tools BY DESIGN and must never claim to have run
+      anything yourself:
+      - a recorded green run (exit 0) of a command covering the criterion is
+        the proving evidence — MET, citing that run (the command + exit 0).
+      - a recorded failing run covering the criterion ⇒ UNMET, citing the
+        recorded exit code and output tail.
+      - "none declared" or an ENVIRONMENT marker ⇒ at best PARTIAL, with an
+        ENVIRONMENT note in the complaint naming the exact command the caller
+        should declare via verification_commands (e.g. "cargo test --all").
+      - a SKIPPED record (the runner's total deadline expired before that
+        command ran) ⇒ at best PARTIAL for the criteria it covers, same
+        treatment as an ENVIRONMENT marker: unproven, never failed.
+
       Output format — respond with ONLY this JSON object, no prose around it:
       {"id": "<the criterion's id, echoed>",
        "status": "MET" | "PARTIAL" | "UNMET" | "DIVERGED",
@@ -181,6 +227,9 @@ nodes:
 
       The diff{{diff_note}}:
       {{diff_text}}
+
+      Verification runs (recorded by the deterministic run_checks stage):
+      {{exec_results}}
       {{gate_feedback}}
     tools:
       - fs_read
@@ -273,12 +322,23 @@ nodes:
       required: [extra_complaints, observations]
     max_iterations: 10
     max_attempts: 2
+    state_updates:
+      holistic_failure: '{{output}}'
+    fallback: verdict
+    next: verdict
+
+  pipeline_fault:
+    id: pipeline_fault
+    type: script
+    description: Fail-closed fault marker (reached only via fallback routes from parse/facts/run_checks) — records a PIPELINE-FAULT in state and continues to verdict, which turns any fault into DIVERGES. The graph never dies without its sentinel.
+    script: scripts/pipeline_fault.py
+    timeout: 30
     next: verdict
 
   verdict:
     id: verdict
     type: script
-    description: Deterministic verdict — CONFORMS requires every criterion MET and zero holistic complaints; no criteria at all fails closed. Assembles the exact sentinel format.
+    description: Deterministic verdict — CONFORMS requires every criterion MET, zero holistic complaints, and zero pipeline faults; no criteria at all fails closed and any recorded PIPELINE-FAULT forces DIVERGES (degraded is never passing). Assembles the exact sentinel format.
     script: scripts/verdict.py
     timeout: 30
     next: done
