@@ -405,6 +405,7 @@ nodes:
       Review the changed files against the step plan's acceptance criteria.
       Preserve severity tags in your findings.
     timeout: 1200
+    max_attempts: 2
     state_updates:
       review_report: '{{output}}'
     next: route_review

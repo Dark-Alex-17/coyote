@@ -242,6 +242,7 @@ nodes:
 
       Produce the final report following your instructions.
     timeout: 300
+    max_attempts: 2
     state_updates:
       report: '{{output}}'
     next: verify_sources

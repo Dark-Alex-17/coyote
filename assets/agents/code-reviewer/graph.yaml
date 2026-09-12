@@ -272,6 +272,7 @@ nodes:
       Linter output (extract the lines for your files):
       {{linter_notes}}
       {{extra_context}}
+    max_attempts: 2
     state_updates:
       domain_report: '{{output}}'
     next: completeness_gate
@@ -472,6 +473,7 @@ nodes:
       Findings (JSON; verify every 🔴 and 🟡 entry — id, severity, path, lines, claim
       are the fields; `title` + `block` together are the claim):
       {{findings}}
+    max_attempts: 2
     state_updates:
       verifier_output: '{{output}}'
     next: verdict
