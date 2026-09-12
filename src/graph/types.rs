@@ -240,6 +240,9 @@ pub struct AgentNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<HashMap<String, String>>,
 
@@ -321,7 +324,7 @@ pub struct LlmNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
 
-    #[serde(default = "default_llm_max_attempts")]
+    #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
 
     #[serde(default = "default_llm_max_iterations")]
@@ -349,7 +352,7 @@ pub struct LlmNode {
     pub skill_instructions: Option<String>,
 }
 
-fn default_llm_max_attempts() -> u32 {
+fn default_max_attempts() -> u32 {
     1
 }
 
@@ -636,6 +639,41 @@ nodes:
         }
         match &graph.get_node("b").unwrap().node_type {
             NodeType::Agent(n) => assert!(!n.teammates),
+            _ => panic!("expected Agent variant"),
+        }
+    }
+
+    #[test]
+    fn agent_node_max_attempts_parses_and_defaults_to_one() {
+        let yaml = r#"
+name: g
+start: a
+nodes:
+  a:
+    id: a
+    type: agent
+    agent: helper
+    prompt: hi
+    max_attempts: 2
+    next: b
+  b:
+    id: b
+    type: agent
+    agent: helper
+    prompt: hi
+    next: e
+  e:
+    id: e
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        match &graph.get_node("a").unwrap().node_type {
+            NodeType::Agent(n) => assert_eq!(n.max_attempts, 2),
+            _ => panic!("expected Agent variant"),
+        }
+        match &graph.get_node("b").unwrap().node_type {
+            NodeType::Agent(n) => assert_eq!(n.max_attempts, 1),
             _ => panic!("expected Agent variant"),
         }
     }

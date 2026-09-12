@@ -1,3 +1,4 @@
+use super::is_transient_error;
 use super::state::StateManager;
 use super::state_updates;
 use super::structured;
@@ -5,10 +6,14 @@ use super::types::AgentNode;
 use super::wall_clock;
 use crate::config::RequestContext;
 use crate::function::agents::run_agent_for_graph;
-use anyhow::{Context, Result};
-use log::debug;
+use crate::supervisor::mailbox::{Inbox, PeerRegistry};
+use anyhow::{Context, Error, Result, anyhow};
+use log::{debug, warn};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use tokio::time::timeout;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
@@ -34,31 +39,26 @@ impl AgentNodeExecutor {
         }
 
         let secs = node.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
-        let bound = wall_clock(secs);
+        let agent_name = node.agent.clone();
 
-        // run_agent_for_graph takes the identity off the ctx; keep a handle so
-        // a frontier peer is retired the moment the agent stops, not after
-        // extraction. Chains re-arm the same identity for later steps and
-        // leave retirement to the chain runner.
-        let peer = parent_ctx.peer_registry.clone().zip(
-            parent_ctx
-                .peer_assignment
-                .as_ref()
-                .map(|(id, _)| id.clone()),
-        );
+        let mut run_attempt = attempt_runner(move |ctx| {
+            let agent_name = agent_name.clone();
+            let prompt = prompt.clone();
+            let graph_inputs = graph_inputs.clone();
+            boxed_attempt(async move {
+                bounded_attempt(
+                    &agent_name,
+                    secs,
+                    run_agent_for_graph(ctx, &agent_name, &prompt, graph_inputs),
+                )
+                .await
+            })
+        });
+        let raw =
+            run_with_retries(node, parent_ctx, retire_peer_on_return, &mut run_attempt).await?;
 
-        let fut = run_agent_for_graph(parent_ctx, &node.agent, &prompt, graph_inputs);
-        let raw_result = match bound {
-            Some(d) => timeout(d, fut).await,
-            None => Ok(fut.await),
-        };
-        if retire_peer_on_return && let Some((registry, id)) = &peer {
-            registry.mark_finished(id);
-        }
-        let raw = raw_result
-            .with_context(|| format!("Agent '{}' timed out after {}s", node.agent, secs))?
-            .with_context(|| format!("Agent '{}' failed", node.agent))?;
-
+        // Extraction stays outside the retry loop: by this point the agent
+        // itself succeeded, so an extraction failure is never retried.
         let output_value = match &node.output_schema {
             Some(schema) => structured::extract(&raw, schema, parent_ctx)
                 .await
@@ -75,6 +75,106 @@ impl AgentNodeExecutor {
 
         Ok(raw)
     }
+}
+
+/// One boxed attempt against the ctx. Boxed (rather than an opaque
+/// `AsyncFnMut` future) because agent nodes run inside `tokio::spawn`ed map
+/// branches, where higher-ranked opaque futures trip the `Send` auto-trait
+/// solver ("implementation of `Send` is not general enough").
+type AttemptFuture<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+
+/// The per-attempt runner the retry loop drives. The attempt future may only
+/// borrow the ctx it is handed, so runners move owned clones of everything
+/// else into the future.
+type AttemptRunner<'f> = dyn for<'a> FnMut(&'a mut RequestContext) -> AttemptFuture<'a> + Send + 'f;
+
+/// Identity funnel that pins a closure to the runner's higher-ranked
+/// signature, so inline closures at call sites infer the right lifetimes.
+fn attempt_runner<F>(f: F) -> F
+where
+    F: for<'a> FnMut(&'a mut RequestContext) -> AttemptFuture<'a> + Send,
+{
+    f
+}
+
+fn boxed_attempt<'a>(fut: impl Future<Output = Result<String>> + Send + 'a) -> AttemptFuture<'a> {
+    Box::pin(fut)
+}
+
+/// Runs the node's agent up to `node.max_attempts` times, retrying only
+/// failures that `is_transient_error` recognizes.
+///
+/// `run_agent_for_graph` takes the peer identity off the ctx and never
+/// restores it, so BOTH halves — the (id, inbox) assignment and the registry
+/// — are captured up front and re-armed before every retry; re-arming only
+/// the assignment would give a retried attempt its identity back but no
+/// roster and a broken `agent__send_message`. A frontier peer is retired
+/// exactly once, after the final attempt, the moment the agent stops — not
+/// after extraction. Chains re-arm the same identity for later steps and
+/// leave retirement to the chain runner.
+async fn run_with_retries(
+    node: &AgentNode,
+    parent_ctx: &mut RequestContext,
+    retire_peer_on_return: bool,
+    run_attempt: &mut AttemptRunner<'_>,
+) -> Result<String> {
+    let assignment = parent_ctx.peer_assignment.clone();
+    let registry = parent_ctx.peer_registry.clone();
+
+    let result = retry_transient(node, parent_ctx, &assignment, &registry, run_attempt).await;
+
+    if retire_peer_on_return && let (Some(registry), Some((id, _))) = (&registry, &assignment) {
+        registry.mark_finished(id);
+    }
+
+    result
+}
+
+async fn retry_transient(
+    node: &AgentNode,
+    parent_ctx: &mut RequestContext,
+    assignment: &Option<(String, Arc<Inbox>)>,
+    registry: &Option<Arc<PeerRegistry>>,
+    run_attempt: &mut AttemptRunner<'_>,
+) -> Result<String> {
+    let mut last_err: Option<Error> = None;
+    for attempt in 1..=node.max_attempts {
+        if attempt > 1 {
+            if let Some(assignment) = assignment {
+                parent_ctx.peer_assignment = Some(assignment.clone());
+            }
+            if let Some(registry) = registry {
+                parent_ctx.peer_registry = Some(Arc::clone(registry));
+            }
+        }
+        match run_attempt(parent_ctx).await {
+            Ok(out) => return Ok(out),
+            Err(e) if is_transient_error(&e) && attempt < node.max_attempts => {
+                warn!("agent node attempt {attempt} failed (transient): {e:#}; retrying");
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("agent node exhausted retries")))
+}
+
+/// Applies the wall-clock bound and the human-readable failure contexts to a
+/// single attempt. The contexts land here — before the caller inspects the
+/// error — because `tokio::time::error::Elapsed` renders as "deadline has
+/// elapsed", which the transient matcher would not recognize as a timeout.
+async fn bounded_attempt(
+    agent_name: &str,
+    secs: u64,
+    fut: impl Future<Output = Result<String>>,
+) -> Result<String> {
+    let raw_result = match wall_clock(secs) {
+        Some(d) => timeout(d, fut).await,
+        None => Ok(fut.await),
+    };
+    raw_result
+        .with_context(|| format!("Agent '{agent_name}' timed out after {secs}s"))?
+        .with_context(|| format!("Agent '{agent_name}' failed"))
 }
 
 /// Resolves each `inputs` template against the parent state. A lone
@@ -135,6 +235,7 @@ mod tests {
             state_updates: updates,
             output_schema: None,
             timeout: None,
+            max_attempts: 1,
             inputs: None,
             teammates: false,
         }
@@ -182,6 +283,254 @@ mod tests {
         execute_past_max_depth(&mut ctx, false).await;
 
         assert!(!registry.is_finished(&id));
+    }
+
+    fn plain_ctx() -> RequestContext {
+        RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
+    }
+
+    fn retryable_node(max_attempts: u32) -> AgentNode {
+        let mut node = node_with("hi", None);
+        node.max_attempts = max_attempts;
+        node
+    }
+
+    #[tokio::test]
+    async fn run_with_retries_retries_transient_failure_and_succeeds() {
+        let mut ctx = plain_ctx();
+        let node = retryable_node(2);
+        let mut attempts = 0u32;
+
+        let out = run_with_retries(
+            &node,
+            &mut ctx,
+            false,
+            &mut attempt_runner(|_ctx| {
+                attempts += 1;
+                let result = if attempts == 1 {
+                    Err(anyhow!("error sending request for url"))
+                } else {
+                    Ok("recovered".to_string())
+                };
+                boxed_attempt(async move { result })
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "recovered");
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn run_with_retries_does_not_retry_non_transient_failures() {
+        let mut ctx = plain_ctx();
+        let node = retryable_node(3);
+        let mut attempts = 0u32;
+
+        let err = run_with_retries(
+            &node,
+            &mut ctx,
+            false,
+            &mut attempt_runner(|_ctx| {
+                attempts += 1;
+                boxed_attempt(async move { Err::<String, _>(anyhow!("Unknown model 'foo'")) })
+            }),
+        )
+        .await
+        .expect_err("non-transient failure must propagate immediately");
+
+        assert_eq!(attempts, 1);
+        assert!(format!("{err:#}").contains("Unknown model 'foo'"));
+    }
+
+    #[tokio::test]
+    async fn run_with_retries_stops_at_max_attempts_and_keeps_failure_context() {
+        let mut ctx = plain_ctx();
+        let node = retryable_node(2);
+        let mut attempts = 0u32;
+
+        let err = run_with_retries(
+            &node,
+            &mut ctx,
+            false,
+            &mut attempt_runner(|_ctx| {
+                attempts += 1;
+                boxed_attempt(bounded_attempt("test_agent", 0, async {
+                    Err(anyhow!("connection error: unexpected end of stream"))
+                }))
+            }),
+        )
+        .await
+        .expect_err("exhausted retries must propagate the last error");
+
+        assert_eq!(attempts, 2);
+        let chain = format!("{err:#}");
+        assert!(chain.contains("Agent 'test_agent' failed"), "{chain}");
+        assert!(chain.contains("connection error"), "{chain}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_with_retries_retries_a_timeout_and_succeeds() {
+        let mut ctx = plain_ctx();
+        let node = retryable_node(2);
+        let mut attempts = 0u32;
+
+        let out = run_with_retries(
+            &node,
+            &mut ctx,
+            false,
+            &mut attempt_runner(|_ctx| {
+                attempts += 1;
+                if attempts == 1 {
+                    boxed_attempt(bounded_attempt(
+                        "test_agent",
+                        1,
+                        std::future::pending::<Result<String>>(),
+                    ))
+                } else {
+                    boxed_attempt(async move { Ok("recovered".to_string()) })
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "recovered");
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_attempt_timeout_context_is_transient() {
+        let err = bounded_attempt("test_agent", 1, std::future::pending::<Result<String>>())
+            .await
+            .expect_err("pending future must hit the wall clock");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("Agent 'test_agent' timed out after 1s"),
+            "{chain}"
+        );
+        assert!(is_transient_error(&err));
+    }
+
+    #[tokio::test]
+    async fn run_with_retries_rearms_the_same_peer_identity_for_each_retry() {
+        let (mut ctx, registry, id) = ctx_at_max_depth_with_peer();
+        let expected_inbox = Arc::clone(&ctx.peer_assignment.as_ref().unwrap().1);
+        let node = retryable_node(2);
+        let mut attempts = 0u32;
+        let mut observations: Vec<(String, bool, bool)> = Vec::new();
+
+        let out = run_with_retries(
+            &node,
+            &mut ctx,
+            true,
+            &mut attempt_runner(|ctx| {
+                attempts += 1;
+                // Mirror run_agent_for_graph: consume both identity halves.
+                let (peer_id, inbox) = ctx.peer_assignment.take().expect("assignment armed");
+                let reg = ctx.peer_registry.take().expect("registry armed");
+                observations.push((
+                    peer_id,
+                    Arc::ptr_eq(&inbox, &expected_inbox),
+                    Arc::ptr_eq(&reg, &registry),
+                ));
+                assert!(
+                    !registry.is_finished(&id),
+                    "peer must not be retired between attempts"
+                );
+                let result = if attempts == 1 {
+                    Err(anyhow!("stream closed because of a broken pipe"))
+                } else {
+                    Ok("done".to_string())
+                };
+                boxed_attempt(async move { result })
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "done");
+        assert_eq!(observations.len(), 2);
+        for (peer_id, same_inbox, same_registry) in &observations {
+            assert_eq!(peer_id, &id);
+            assert!(same_inbox, "retry must reuse the same inbox Arc");
+            assert!(same_registry, "retry must reuse the same registry Arc");
+        }
+        assert!(registry.is_finished(&id));
+    }
+
+    #[tokio::test]
+    async fn run_with_retries_retires_frontier_peer_after_the_final_failed_attempt() {
+        let (mut ctx, registry, id) = ctx_at_max_depth_with_peer();
+        let node = retryable_node(2);
+        let mut attempts = 0u32;
+
+        let err = run_with_retries(
+            &node,
+            &mut ctx,
+            true,
+            &mut attempt_runner(|ctx| {
+                attempts += 1;
+                ctx.peer_assignment.take();
+                ctx.peer_registry.take();
+                assert!(
+                    !registry.is_finished(&id),
+                    "peer must not be retired between attempts"
+                );
+                boxed_attempt(async move { Err::<String, _>(anyhow!("Connection reset by peer")) })
+            }),
+        )
+        .await
+        .expect_err("both attempts fail");
+
+        assert_eq!(attempts, 2);
+        assert!(registry.is_finished(&id));
+        assert!(format!("{err:#}").contains("Connection reset"));
+    }
+
+    #[tokio::test]
+    async fn run_with_retries_leaves_peer_live_when_not_retiring() {
+        let (mut ctx, registry, id) = ctx_at_max_depth_with_peer();
+        let node = retryable_node(1);
+
+        run_with_retries(
+            &node,
+            &mut ctx,
+            false,
+            &mut attempt_runner(|ctx| {
+                ctx.peer_assignment.take();
+                ctx.peer_registry.take();
+                boxed_attempt(async move { Ok("done".to_string()) })
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(!registry.is_finished(&id));
+    }
+
+    #[tokio::test]
+    async fn run_with_retries_zero_attempts_reports_exhausted_retries() {
+        let mut ctx = plain_ctx();
+        let node = retryable_node(0);
+        let mut attempts = 0u32;
+
+        let err = run_with_retries(
+            &node,
+            &mut ctx,
+            false,
+            &mut attempt_runner(|_ctx| {
+                attempts += 1;
+                boxed_attempt(async move { Ok("never".to_string()) })
+            }),
+        )
+        .await
+        .expect_err("zero attempts cannot succeed");
+
+        assert_eq!(attempts, 0);
+        assert!(format!("{err:#}").contains("agent node exhausted retries"));
     }
 
     fn node_with_inputs(pairs: &[(&str, &str)]) -> AgentNode {
