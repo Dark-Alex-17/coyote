@@ -77,6 +77,7 @@ fn validate_spawn_variables(
             "Agent '{agent_name}' declares no variables; remove the 'variables' argument."
         ));
     }
+
     let declared_list = declared
         .iter()
         .map(|v| format!("{} ({})", v.name, v.description))
@@ -91,6 +92,7 @@ fn merge_spawn_variables(inherited: &mut Option<AgentVariables>, provided: Agent
     if provided.is_empty() {
         return;
     }
+
     inherited
         .get_or_insert_with(AgentVariables::new)
         .extend(provided);
@@ -101,9 +103,11 @@ fn dispatch_spawn_args(agent: &str, prompt: &str, variables: Option<&AgentVariab
         "agent": agent,
         "prompt": prompt,
     });
+
     if let Some(variables) = variables {
         spawn_args["variables"] = json!(variables);
     }
+
     spawn_args
 }
 
@@ -3147,8 +3151,10 @@ mod tests {
     #[test]
     fn handle_task_create_rejects_non_object_variables() {
         let mut ctx = ctx_with_supervisor(4, 3);
+
         let result =
             handle_task_create(&mut ctx, &json!({"subject": "Bad", "variables": ["pr"]})).unwrap();
+
         assert_eq!(result["status"], "error");
         assert!(result["message"].as_str().unwrap().contains("JSON object"));
     }
@@ -3856,11 +3862,13 @@ mod tests {
     #[test]
     fn handle_spawn_non_object_variables_errors() {
         let mut ctx = ctx_with_supervisor(4, 3);
+
         let result = run_async(handle_spawn(
             &mut ctx,
             &json!({"agent": "x", "prompt": "p", "variables": "pr=1234"}),
         ))
         .unwrap();
+
         assert_eq!(result["status"], "error");
         assert!(result["message"].as_str().unwrap().contains("JSON object"));
     }
@@ -3868,11 +3876,13 @@ mod tests {
     #[test]
     fn handle_spawn_non_string_variable_value_errors() {
         let mut ctx = ctx_with_supervisor(4, 3);
+
         let result = run_async(handle_spawn(
             &mut ctx,
             &json!({"agent": "x", "prompt": "p", "variables": {"pr": 1234}}),
         ))
         .unwrap();
+
         assert_eq!(result["status"], "error");
         assert!(
             result["message"]
@@ -3892,6 +3902,7 @@ mod tests {
         let parsed = parse_variables_arg(&json!({"variables": {"pr": "1234", "repo": "coyote"}}))
             .unwrap()
             .unwrap();
+
         assert_eq!(parsed.get("pr").map(String::as_str), Some("1234"));
         assert_eq!(parsed.get("repo").map(String::as_str), Some("coyote"));
     }
@@ -3903,7 +3914,9 @@ mod tests {
             description: "PR number".into(),
             ..Default::default()
         }];
+
         let provided = AgentVariables::from([("typo".to_string(), "x".to_string())]);
+
         let err = validate_spawn_variables("coder", &declared, &provided).unwrap_err();
         assert!(err.contains("typo"));
         assert!(err.contains("pr (PR number)"));
@@ -3912,7 +3925,9 @@ mod tests {
     #[test]
     fn validate_spawn_variables_none_declared_errors() {
         let provided = AgentVariables::from([("pr".to_string(), "1".to_string())]);
+
         let err = validate_spawn_variables("coder", &[], &provided).unwrap_err();
+
         assert!(err.contains("declares no variables"));
     }
 
@@ -3923,7 +3938,9 @@ mod tests {
             description: "PR number".into(),
             ..Default::default()
         }];
+
         let provided = AgentVariables::from([("pr".to_string(), "1".to_string())]);
+
         assert!(validate_spawn_variables("coder", &declared, &provided).is_ok());
     }
 
@@ -3933,10 +3950,12 @@ mod tests {
             ("pr".to_string(), "1".to_string()),
             ("repo".to_string(), "coyote".to_string()),
         ]));
+
         merge_spawn_variables(
             &mut inherited,
             AgentVariables::from([("pr".to_string(), "2".to_string())]),
         );
+
         let merged = inherited.unwrap();
         assert_eq!(merged.get("pr").map(String::as_str), Some("2"));
         assert_eq!(merged.get("repo").map(String::as_str), Some("coyote"));
@@ -3945,17 +3964,21 @@ mod tests {
     #[test]
     fn merge_spawn_variables_seeds_when_nothing_inherited() {
         let mut inherited = None;
+
         merge_spawn_variables(
             &mut inherited,
             AgentVariables::from([("pr".to_string(), "2".to_string())]),
         );
+
         assert_eq!(inherited.unwrap().get("pr").map(String::as_str), Some("2"));
     }
 
     #[test]
     fn dispatch_spawn_args_includes_variables() {
         let variables = AgentVariables::from([("pr".to_string(), "1234".to_string())]);
+
         let args = dispatch_spawn_args("coder", "do it", Some(&variables));
+
         assert_eq!(args["agent"], "coder");
         assert_eq!(args["prompt"], "do it");
         assert_eq!(args["variables"]["pr"], "1234");
@@ -3964,6 +3987,7 @@ mod tests {
     #[test]
     fn dispatch_spawn_args_omits_absent_variables() {
         let args = dispatch_spawn_args("coder", "do it", None);
+
         assert!(args.get("variables").is_none());
     }
 
