@@ -8200,20 +8200,6 @@ mod tests {
                 .collect()
         }
 
-        fn fallback_capture(node_ids: &[&str]) -> Vec<String> {
-            node_ids
-                .iter()
-                .map(|id| {
-                    format!(
-                        "{id}: llm node declares `fallback` with `output_schema` but no \
-                         `state_updates`; on failure the \"…failed: <chain>\" string is \
-                         only written through `state_updates`, so the fallback node \
-                         cannot see why it was reached"
-                    )
-                })
-                .collect()
-        }
-
         let _guard = TestConfigDirGuard::new();
 
         Agent::install_builtin_agents(false).unwrap();
@@ -8252,9 +8238,7 @@ mod tests {
         // nodes, plus variable-shadowing on `coder` and `step-runner` (they
         // declare variables whose names are also `initial_state` keys). A new
         // rule that fires on a shipped asset (or a new bundled graph) must be
-        // recorded here deliberately. The fallback-capture warnings on
-        // `step-runner` are true positives, recorded until those nodes gain
-        // `state_updates` that capture the failure string.
+        // recorded here deliberately.
         let expected_warnings = BTreeMap::from([
             ("adversary".to_string(), Vec::new()),
             ("code-reviewer".to_string(), Vec::new()),
@@ -8282,8 +8266,9 @@ mod tests {
             ("finding-verifier".to_string(), Vec::new()),
             ("librarian".to_string(), Vec::new()),
             ("review-gauntlet".to_string(), Vec::new()),
-            ("step-runner".to_string(), {
-                let mut lines = [
+            (
+                "step-runner".to_string(),
+                [
                     shadowed(&["plans_dir", "project_dir"]),
                     unreachable(&[
                         "check_handoff",
@@ -8305,12 +8290,9 @@ mod tests {
                         "verify_tests",
                         "write_handoff",
                     ]),
-                    fallback_capture(&["edge_case_sweep", "orient", "write_handoff"]),
                 ]
-                .concat();
-                lines.sort();
-                lines
-            }),
+                .concat(),
+            ),
         ]);
         assert_eq!(
             warnings_by_agent, expected_warnings,
@@ -9801,6 +9783,409 @@ mod tests {
             report.contains("fault-marker script error"),
             "the crash must be named: {report}"
         );
+    }
+
+    // ---- finding-verifier suite-script regression tests (R5) ----
+    //
+    // Fail-closed fault paths of the finding-verifier's marker scripts,
+    // exercised the same way as the suites above: `python3 <script>` with a
+    // synthetic GRAPH_STATE env.
+
+    fn run_fv_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+        run_fv_script_raw(script, &state.to_string())
+    }
+
+    fn run_fv_script_raw(script: &str, raw_state: &str) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/finding-verifier/scripts")
+            .join(script);
+        let out = std::process::Command::new("python3")
+            .arg(&path)
+            .env("GRAPH_STATE", raw_state)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
+        assert!(
+            out.status.success(),
+            "{script} exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{script} stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    #[test]
+    fn finding_verifier_parse_fault_emits_unverifiable_entry() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_fv_script(
+            "parse_fault.py",
+            &json!({"parse_failure": "LLM node failed: model exploded\nline2"}),
+        );
+        let verdicts = out["verdicts"].as_array().unwrap();
+        assert_eq!(verdicts.len(), 1, "exactly one fault entry: {out}");
+        let v = &verdicts[0];
+        assert_eq!(v["id"], "pipeline-fault", "{out}");
+        assert_eq!(v["verdict"], "UNVERIFIABLE", "{out}");
+        assert_eq!(v["evidence"], "", "{out}");
+        let note = v["note"].as_str().unwrap();
+        assert!(
+            note.starts_with("PIPELINE-FAULT: parse failed"),
+            "the note must carry the fault prefix: {note}"
+        );
+        assert!(
+            note.contains("model exploded") && !note.contains('\n'),
+            "the failure detail must be carried, newline-normalized: {note}"
+        );
+    }
+
+    #[test]
+    fn finding_verifier_parse_fault_without_detail_degrades() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // parse_failure not holding an engine failure string (unset here)
+        // must degrade to a generic detail, never echo unrelated state.
+        let out = run_fv_script("parse_fault.py", &json!({}));
+        let note = out["verdicts"][0]["note"].as_str().unwrap();
+        assert!(
+            note.starts_with("PIPELINE-FAULT: parse failed"),
+            "the fault prefix must not depend on the detail: {note}"
+        );
+        assert!(
+            note.contains("died without recording a failure detail"),
+            "a missing detail must be named as such: {note}"
+        );
+    }
+
+    #[test]
+    fn finding_verifier_parse_fault_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Unparseable state makes load_state raise before main runs; the
+        // fault marker itself must still emit a schema-conformant verdict.
+        let out = run_fv_script_raw("parse_fault.py", "not json");
+        let v = &out["verdicts"][0];
+        assert_eq!(
+            v["verdict"], "UNVERIFIABLE",
+            "a crashed parse-fault marker must fail closed: {out}"
+        );
+        let note = v["note"].as_str().unwrap();
+        assert!(
+            note.starts_with("PIPELINE-FAULT: parse failed"),
+            "the fault prefix must survive a crash: {note}"
+        );
+        assert!(
+            note.contains("fault-marker script error"),
+            "the crash must be named: {note}"
+        );
+    }
+
+    #[test]
+    fn finding_verifier_verify_fault_normalizes_failure_text() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // The engine wrote the failure text into `verdict` via verify_one's
+        // state_updates before routing here; the marker normalizes it into a
+        // schema-conformant UNVERIFIABLE verdict with the authoritative id.
+        let state = json!({
+            "finding": {"id": "f3", "severity": "🔴 CRITICAL", "path": "a.rs", "lines": "10", "claim": "x"},
+            "verdict": "LLM node failed: boom\nline2"
+        });
+        let out = run_fv_script("verify_fault.py", &state);
+        let v = &out["verdict"];
+        assert_eq!(v["id"], "f3", "the finding's id must be stamped: {out}");
+        assert_eq!(v["verdict"], "UNVERIFIABLE", "{out}");
+        assert_eq!(v["evidence"], "", "{out}");
+        let note = v["note"].as_str().unwrap();
+        assert!(
+            note.starts_with("PIPELINE-FAULT: verifier lane failed after retries — "),
+            "the note must carry the fault prefix: {note}"
+        );
+        assert!(
+            note.contains("boom") && !note.contains('\n'),
+            "the failure detail must be carried, newline-normalized: {note}"
+        );
+    }
+
+    #[test]
+    fn finding_verifier_verify_fault_without_detail_degrades() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A `verdict` value that is not the engine's failure string (stale
+        // model output here) must degrade to a generic detail — never leak
+        // non-fault text into the fault note.
+        let state = json!({
+            "finding": {"id": "f3"},
+            "verdict": "some stale model output"
+        });
+        let out = run_fv_script("verify_fault.py", &state);
+        let v = &out["verdict"];
+        assert_eq!(v["id"], "f3", "{out}");
+        assert_eq!(v["verdict"], "UNVERIFIABLE", "{out}");
+        let note = v["note"].as_str().unwrap();
+        assert!(
+            note.contains("died without recording a failure detail"),
+            "a non-engine detail must be named as missing: {note}"
+        );
+    }
+
+    #[test]
+    fn finding_verifier_verify_fault_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Unparseable state makes load_state raise before main runs; the
+        // fault marker itself must still emit a schema-conformant verdict.
+        let out = run_fv_script_raw("verify_fault.py", "not json");
+        let v = &out["verdict"];
+        assert_eq!(v["id"], "unknown", "{out}");
+        assert_eq!(
+            v["verdict"], "UNVERIFIABLE",
+            "a crashed verify-fault marker must fail closed: {out}"
+        );
+        let note = v["note"].as_str().unwrap();
+        assert!(
+            note.starts_with("PIPELINE-FAULT: verifier lane failed after retries — "),
+            "the fault prefix must survive a crash: {note}"
+        );
+        assert!(
+            note.contains("fault-marker script error"),
+            "the crash must be named: {note}"
+        );
+    }
+
+    #[test]
+    fn finding_verifier_fault_wiring_preserves_sentinel() {
+        use crate::graph::{GraphParser, NodeType};
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/finding-verifier");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .unwrap();
+
+        let NodeType::Llm(parse) = &graph.get_node("parse").unwrap().node_type else {
+            panic!("parse must be an llm node")
+        };
+        assert_eq!(parse.max_attempts, 2, "parse is retried once");
+        assert_eq!(parse.fallback.as_deref(), Some("parse_fault"));
+        assert!(
+            parse
+                .state_updates
+                .as_ref()
+                .is_some_and(|u| u.contains_key("parse_failure")),
+            "parse must capture its failure text for the fault marker"
+        );
+        assert_eq!(
+            graph.get_node("parse_fault").unwrap().next_target(),
+            Some("done"),
+            "the parse fault marker must continue to the sentinel-emitting end"
+        );
+
+        let NodeType::Llm(verify) = &graph.get_node("verify_one").unwrap().node_type else {
+            panic!("verify_one must be an llm node")
+        };
+        assert_eq!(verify.fallback.as_deref(), Some("verify_fault"));
+        assert!(
+            graph.get_node("verify_fault").unwrap().next.is_none(),
+            "verify_fault must end the branch chain so the map collects the verdict"
+        );
+
+        let NodeType::End(done) = &graph.get_node("done").unwrap().node_type else {
+            panic!("done must be an end node")
+        };
+        assert!(
+            done.output.starts_with("FINDING_VERIFIER_RESULTS"),
+            "the sentinel must lead the output: {}",
+            done.output
+        );
+        assert!(
+            done.output.contains("{{verdicts}}"),
+            "the output must interpolate the collected verdicts: {}",
+            done.output
+        );
+    }
+
+    // ---- step-runner fault-wiring regression tests (R5) ----
+    //
+    // route_review.sh is a bash script node; the graph's script executor runs
+    // `.sh` scripts through bash with the same GRAPH_STATE env contract, so
+    // it is exercised the same way as the python suites above (guarded on
+    // bash + jq, which the script requires).
+
+    fn run_step_runner_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/step-runner/scripts")
+            .join(script);
+        let out = std::process::Command::new("bash")
+            .arg(&path)
+            .env("GRAPH_STATE", state.to_string())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to invoke bash {script}: {e}"));
+        assert!(
+            out.status.success(),
+            "{script} exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{script} stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    #[test]
+    fn step_runner_route_review_fault_text_skips_fix_loop() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        // The engine's failure text must never be mistaken for review
+        // findings — even a 🔴 embedded in the error chain must not spend a
+        // fix-loop attempt (the guard sits BEFORE the 🔴 grep).
+        let state = json!({
+            "review_report": "Agent node failed: reviewer died mid-report: 🔴 CRITICAL",
+            "review_attempts": 0,
+            "max_review_attempts": 1
+        });
+        let out = run_step_runner_script("route_review.sh", &state);
+        assert_eq!(
+            out,
+            json!({"_next": "write_handoff"}),
+            "a fault report must route straight to the handoff"
+        );
+    }
+
+    #[test]
+    fn step_runner_route_review_critical_finding_still_loops() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        // Non-fault routing regression: a real 🔴 report still enters the
+        // bounded fix loop exactly as before.
+        let state = json!({
+            "review_report": "🔴 CRITICAL: bug in a.rs",
+            "review_attempts": 0,
+            "max_review_attempts": 1
+        });
+        let out = run_step_runner_script("route_review.sh", &state);
+        assert_eq!(out["_next"], "implement", "{out}");
+        assert_eq!(out["review_attempts"], 1, "{out}");
+        assert_eq!(out["needs_independent_review"], false, "{out}");
+        assert!(
+            out["fix_instructions"]
+                .as_str()
+                .unwrap()
+                .contains("🔴 CRITICAL: bug in a.rs"),
+            "the findings must reach the implementer verbatim: {out}"
+        );
+    }
+
+    #[test]
+    fn step_runner_route_review_clean_report_proceeds() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        let out =
+            run_step_runner_script("route_review.sh", &json!({"review_report": "all clean 🟢"}));
+        assert_eq!(
+            out,
+            json!({"_next": "write_handoff"}),
+            "a clean report must proceed to the handoff unchanged"
+        );
+    }
+
+    #[test]
+    fn step_runner_fault_wiring_preserves_sentinels() {
+        use crate::graph::{GraphParser, NodeType};
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/step-runner");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .unwrap();
+
+        let NodeType::Agent(implement) = &graph.get_node("implement").unwrap().node_type else {
+            panic!("implement must be an agent node")
+        };
+        assert_eq!(implement.fallback.as_deref(), Some("end_failure"));
+        assert_eq!(
+            implement.max_attempts, 1,
+            "rerunning a coder that died mid-edit against a mutated tree is unsafe — never retried"
+        );
+
+        let NodeType::Agent(review) = &graph.get_node("independent_review").unwrap().node_type
+        else {
+            panic!("independent_review must be an agent node")
+        };
+        assert_eq!(review.fallback.as_deref(), Some("write_handoff"));
+
+        // The llm nodes with fallbacks capture their failure text so the
+        // fallback path can see why it was reached (the TASK-016 warning —
+        // this is what shrank the step-runner warning baseline to zero).
+        for (node_id, key) in [
+            ("orient", "orient_failure"),
+            ("edge_case_sweep", "sweep_failure"),
+            ("write_handoff", "handoff_failure"),
+        ] {
+            let NodeType::Llm(llm) = &graph.get_node(node_id).unwrap().node_type else {
+                panic!("{node_id} must be an llm node")
+            };
+            assert!(
+                llm.state_updates
+                    .as_ref()
+                    .is_some_and(|u| u.contains_key(key)),
+                "{node_id} must capture its failure text into {key}"
+            );
+        }
+
+        // write_handoff must teach the review-fault flag: a review_report
+        // holding the engine's failure text is "review DID NOT RUN", flagged
+        // prominently — never presented as findings.
+        let NodeType::Llm(handoff) = &graph.get_node("write_handoff").unwrap().node_type else {
+            panic!("write_handoff must be an llm node")
+        };
+        assert!(
+            handoff
+                .instructions
+                .as_ref()
+                .is_some_and(|i| i.contains("Agent node failed:")),
+            "write_handoff instructions must handle the review-fault text"
+        );
+
+        // end_failure renders sensibly when reached via implement's fallback:
+        // STEP_FAILED leads, and every interpolated key has an initial_state
+        // default (coder_result carries the failure text via state_updates).
+        let NodeType::End(end) = &graph.get_node("end_failure").unwrap().node_type else {
+            panic!("end_failure must be an end node")
+        };
+        assert!(
+            end.output.starts_with("STEP_FAILED"),
+            "the sentinel must lead the output: {}",
+            end.output
+        );
+        for chunk in end.output.split("{{").skip(1) {
+            let key = chunk.split("}}").next().unwrap().trim();
+            assert!(
+                graph.initial_state.contains_key(key),
+                "end_failure interpolates '{key}' which has no initial_state default"
+            );
+        }
     }
 
     #[test]

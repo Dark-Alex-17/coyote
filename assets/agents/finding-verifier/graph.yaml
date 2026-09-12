@@ -32,6 +32,7 @@ initial_state:
   verdicts: []
   gate_feedback: ''
   gate_attempts: 0
+  parse_failure: ''
 
 start: parse
 
@@ -92,7 +93,19 @@ nodes:
           type: string
           description: Repository directory named in the request (echo the prompt default when none).
       required: [findings_list, project_dir]
+    max_attempts: 2
+    state_updates:
+      parse_failure: '{{output}}'
+    fallback: parse_fault
     next: verify_each
+
+  parse_fault:
+    id: parse_fault
+    type: script
+    description: Fail-closed marker for a dead parse stage (reached only via parse's fallback) — rewrites `verdicts` to a single UNVERIFIABLE PIPELINE-FAULT entry and jumps straight to done, so the FINDING_VERIFIER_RESULTS sentinel still renders and the caller's verify lane degrades instead of dying.
+    script: scripts/parse_fault.py
+    timeout: 30
+    next: done
 
   verify_each:
     id: verify_each
@@ -165,6 +178,7 @@ nodes:
     max_attempts: 2
     state_updates:
       verdict: '{{output}}'
+    fallback: verify_fault
     next: verdict_gate
 
   verdict_gate:
@@ -172,6 +186,13 @@ nodes:
     type: script
     description: Deterministic contract gate for each verdict — validates shape, verdict enum, and evidence/note rules; rejects back to verify_one exactly once with the reason, then records UNVERIFIABLE. No LLM judgment.
     script: scripts/verdict_gate.py
+    timeout: 30
+
+  verify_fault:
+    id: verify_fault
+    type: script
+    description: Fail-closed marker for a dead verify branch (reached only via verify_one's fallback; branch-local). Normalizes the engine's failure text in `verdict` into a schema-conformant UNVERIFIABLE verdict the map collects — a dead verifier lane never sinks the whole map or masquerades as verified.
+    script: scripts/verify_fault.py
     timeout: 30
 
   done:

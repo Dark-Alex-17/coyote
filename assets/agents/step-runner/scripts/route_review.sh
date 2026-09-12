@@ -13,6 +13,16 @@ review_report=$(echo "$state" | jq -r '.review_report // ""')
 review_attempts=$(echo "$state" | jq -r '.review_attempts // 0')
 max_review_attempts=$(echo "$state" | jq -r '.max_review_attempts // 1')
 
+# Fail-visible guard: a review_report holding the engine's "Agent node
+# failed:" text means the independent review DID NOT RUN (its fallback
+# normally routes straight to write_handoff, bypassing this script). Never
+# treat that text as findings or spend a fix-loop attempt on it -
+# write_handoff flags the fault prominently in the handoff instead.
+if [[ "$review_report" == "Agent node failed:"* ]]; then
+  jq -nc '{"_next": "write_handoff"}'
+  exit 0
+fi
+
 if ! grep -qF "🔴" <<< "$review_report"; then
   jq -nc '{"_next": "write_handoff"}'
   exit 0

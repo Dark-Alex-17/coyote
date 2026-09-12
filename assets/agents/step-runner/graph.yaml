@@ -64,6 +64,7 @@ initial_state:
   plan_summary: ''
   implementation_brief: ''
   staleness_report: ''
+  orient_failure: ''
   has_major_deviation: false
   deviation_summary: ''
   user_feedback: ''
@@ -80,12 +81,14 @@ initial_state:
   tests_output: ''
   edge_case_report: ''
   downstream_updates: ''
+  sweep_failure: ''
   needs_independent_review: false
   review_report: ''
   review_attempts: 0
   max_review_attempts: 1
   handoff_attempts: 0
   handoff_fix: ''
+  handoff_failure: ''
   step_summary: ''
 
 start: resolve_step
@@ -191,6 +194,8 @@ nodes:
           has_major_deviation,
           deviation_summary,
         ]
+    state_updates:
+      orient_failure: '{{output}}'
     fallback: end_failure
     next: route_staleness
 
@@ -270,6 +275,12 @@ nodes:
     timeout: 3600
     state_updates:
       coder_result: '{{output}}'
+    # No max_attempts: rerunning a coder that died mid-edit against an
+    # already-mutated tree is unsafe. On failure the "Agent node failed:"
+    # text lands in coder_result (via state_updates above) and end_failure
+    # renders it; end_failure's other keys all have initial_state defaults,
+    # so the STEP_FAILED output degrades to empty build/tests sections.
+    fallback: end_failure
     next: route_coder_result
 
   route_coder_result:
@@ -376,6 +387,8 @@ nodes:
         needs_independent_review:
           type: boolean
       required: [edge_case_report, downstream_updates, needs_independent_review]
+    state_updates:
+      sweep_failure: '{{output}}'
     fallback: write_handoff
     next: route_sweep
 
@@ -408,6 +421,7 @@ nodes:
     max_attempts: 2
     state_updates:
       review_report: '{{output}}'
+    fallback: write_handoff
     next: route_review
 
   route_review:
@@ -451,6 +465,15 @@ nodes:
 
       If "Gate feedback" below is non-empty, a previous handoff attempt
       failed validation - fix exactly what it lists.
+
+      PIPELINE-FAULT VISIBILITY: an "Independent review report" below that
+      starts with "Agent node failed:" means the independent review DID NOT
+      RUN - the graph routed here through the reviewer's failure fallback.
+      Never present that text as review findings. Flag it prominently
+      instead: add a Deviations entry "PIPELINE-FAULT: independent review
+      did not run - <failure text>", repeat it under Notes for next step,
+      and carry it into `step_summary` so the user sees it at the approval
+      gate.
     prompt: |
       ## Step
       {{step_number}} ({{step_title}}) - plan at {{step_plan_path}}
@@ -502,6 +525,8 @@ nodes:
           type: string
           description: 3-6 sentence summary of the step for the user's approval decision - what was done, deviations, anything needing their attention
       required: [step_summary]
+    state_updates:
+      handoff_failure: '{{output}}'
     fallback: end_failure
     next: check_handoff
 
