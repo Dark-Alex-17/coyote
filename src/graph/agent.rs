@@ -832,6 +832,11 @@ mod tests {
             "warn must carry the error chain: {}",
             warns[0]
         );
+        assert!(
+            warns[0].contains("no JSON object found in output"),
+            "fallback warn must carry the full error chain: {}",
+            warns[0]
+        );
     }
 
     #[test]
