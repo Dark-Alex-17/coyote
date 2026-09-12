@@ -367,9 +367,11 @@ mod tests {
         file_name: &str,
         parent: &Path,
     ) -> Result<Vec<FunctionDeclaration>> {
+        let pid = std::process::id();
         let unique = PARSE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("coyote_python_parser_{file_name}_{unique}.py"));
+        let path = std::env::temp_dir().join(format!(
+            "coyote_python_parser_{file_name}_{pid}_{unique}.py"
+        ));
         fs::write(&path, source).expect("failed to write temp python source");
         let file = File::open(&path).expect("failed to open temp python source");
         let result = generate_python_declarations(file, file_name, Some(parent));
