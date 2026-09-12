@@ -719,6 +719,7 @@ impl GraphValidator {
                 .filter_map(|(_, n)| match &n.node_type {
                     NodeType::Script(s) => s.fallback.as_deref(),
                     NodeType::Llm(l) => l.fallback.as_deref(),
+                    NodeType::Agent(a) => a.fallback.as_deref(),
                     _ => None,
                 })
                 .collect();
@@ -982,12 +983,17 @@ fn declared_targets(node: &Node) -> Vec<(String, &'static str)> {
                 out.push((t.clone(), "llm 'fallback'"));
             }
         }
+        NodeType::Agent(a) => {
+            if let Some(t) = &a.fallback {
+                out.push((t.clone(), "agent 'fallback'"));
+            }
+        }
         NodeType::Map(m) => {
             out.push((m.branch.clone(), "map 'branch'"));
         }
-        // `agent`/`input`/`rag` route only via `next` (already collected
-        // above); `end` is terminal. No type-specific routing edges to add.
-        NodeType::Agent(_) | NodeType::Input(_) | NodeType::Rag(_) | NodeType::End(_) => {}
+        // `input`/`rag` route only via `next` (already collected above);
+        // `end` is terminal. No type-specific routing edges to add.
+        NodeType::Input(_) | NodeType::Rag(_) | NodeType::End(_) => {}
     }
     out
 }
@@ -1056,8 +1062,8 @@ fn main_flow_reachable(graph: &Graph) -> HashSet<String> {
 }
 
 /// Nodes reachable from `entry` over the edges a chain can follow at run
-/// time: `next` targets and script/llm `fallback`s. Approval routes and a
-/// nested map's `branch` are not followed. Neither may appear inside a
+/// time: `next` targets and script/llm/agent `fallback`s. Approval routes
+/// and a nested map's `branch` are not followed. Neither may appear inside a
 /// branch, and the validator reports them separately.
 pub(super) fn branch_subgraph(graph: &Graph, entry: &str) -> HashSet<String> {
     let mut reachable: HashSet<String> = HashSet::new();
@@ -1082,6 +1088,7 @@ pub(super) fn branch_subgraph(graph: &Graph, entry: &str) -> HashSet<String> {
         match &node.node_type {
             NodeType::Script(s) => edges.extend(s.fallback.as_ref()),
             NodeType::Llm(l) => edges.extend(l.fallback.as_ref()),
+            NodeType::Agent(a) => edges.extend(a.fallback.as_ref()),
             _ => {}
         }
         for next in edges {
@@ -1925,6 +1932,7 @@ mod tests {
                 output_schema: None,
                 timeout: None,
                 max_attempts: 1,
+                fallback: None,
                 inputs: None,
                 teammates: false,
             }),
@@ -2015,6 +2023,51 @@ mod tests {
                 .errors
                 .iter()
                 .any(|e| e.message.contains("non-existent node 'nowhere'"))
+        );
+    }
+
+    #[test]
+    fn flags_missing_agent_fallback_target() {
+        let mut a = agent_node("a", "helper", Some("end"));
+        if let NodeType::Agent(ref mut an) = a.node_type {
+            an.fallback = Some("ghost".into());
+        }
+        let graph = graph_with(vec![("a", a), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("non-existent node 'ghost'")
+                    && e.message.contains("agent 'fallback'"))
+        );
+    }
+
+    #[test]
+    fn agent_fallback_target_is_not_flagged_unreachable() {
+        let mut a = agent_node("a", "helper", Some("end"));
+        if let NodeType::Agent(ref mut an) = a.node_type {
+            an.fallback = Some("recover".into());
+        }
+        let recover = agent_node("recover", "helper", Some("end"));
+        let graph = graph_with(
+            vec![("a", a), ("recover", recover), ("end", end_node("end"))],
+            "a",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.node_id.as_deref() == Some("recover")
+                    && w.message.contains("unreachable")),
+            "fallback target 'recover' incorrectly marked unreachable: {:?}",
+            result.warnings
         );
     }
 
@@ -2853,6 +2906,62 @@ mod tests {
                 && e.message.contains("never honored")
                 && e.node_id.as_deref() == Some("m")),
             "expected end-node error with the fallback hint: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_branch_agent_fallback_escaping_the_branch_gets_hint() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let mut branch = agent_node("br", "helper", None);
+        if let NodeType::Agent(ref mut an) = branch.node_type {
+            an.fallback = Some("end".into());
+        }
+        let graph = graph_with(
+            vec![("m", map), ("br", branch), ("end", end_node("end"))],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("'end'")
+                && e.message.contains("end node")
+                && e.message.contains("never honored")
+                && e.node_id.as_deref() == Some("m")),
+            "expected end-node error with the fallback hint: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn map_branch_agent_fallback_to_branch_local_node_passes() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let mut branch = agent_node("br", "helper", None);
+        if let NodeType::Agent(ref mut an) = branch.node_type {
+            an.fallback = Some("recover".into());
+        }
+        let recover = agent_node("recover", "helper", None);
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("recover", recover),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        // Agent-existence errors on 'br'/'recover' are expected (no agent
+        // dirs in the test cwd); branch-locality errors land on the map.
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.node_id.as_deref() == Some("m")),
+            "a branch-local agent fallback is allowed: {:?}",
             result.errors
         );
     }

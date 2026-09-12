@@ -244,6 +244,9 @@ pub struct AgentNode {
     pub max_attempts: u32,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<HashMap<String, String>>,
 
     #[serde(default)]
@@ -674,6 +677,41 @@ nodes:
         }
         match &graph.get_node("b").unwrap().node_type {
             NodeType::Agent(n) => assert_eq!(n.max_attempts, 1),
+            _ => panic!("expected Agent variant"),
+        }
+    }
+
+    #[test]
+    fn agent_node_fallback_parses_and_defaults_to_none() {
+        let yaml = r#"
+name: g
+start: a
+nodes:
+  a:
+    id: a
+    type: agent
+    agent: helper
+    prompt: hi
+    fallback: b
+    next: b
+  b:
+    id: b
+    type: agent
+    agent: helper
+    prompt: hi
+    next: e
+  e:
+    id: e
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        match &graph.get_node("a").unwrap().node_type {
+            NodeType::Agent(n) => assert_eq!(n.fallback.as_deref(), Some("b")),
+            _ => panic!("expected Agent variant"),
+        }
+        match &graph.get_node("b").unwrap().node_type {
+            NodeType::Agent(n) => assert!(n.fallback.is_none()),
             _ => panic!("expected Agent variant"),
         }
     }
