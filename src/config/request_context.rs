@@ -9625,8 +9625,136 @@ mod tests {
             v["reason"]
                 .as_str()
                 .unwrap()
-                .contains("verdict computation error"),
-            "the reason must name the error: {out}"
+                .starts_with("PIPELINE-FAULT: verdict computation error"),
+            "the reason must carry the fault prefix render.py anchors on: {out}"
+        );
+        assert!(
+            v["attention"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: verdict script error"),
+            "the attention entry must carry the fault prefix: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_verdict_crash_empty_diff_renders_fault() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A crashed verdict gate on an EMPTY diff: render.py's stub bypass is
+        // anchored on the "PIPELINE-FAULT:" prefix, so the crash-guard verdict
+        // must carry it — otherwise the fail-closed NEEDS-HUMAN collapses into
+        // the "No changes to review." stub and never reaches the final report.
+        let fault = run_code_reviewer_script(
+            "verdict.py",
+            &json!({"changed_files": [], "attention_flags": 42}),
+        );
+        let state = json!({
+            "changed_files": [],
+            "verdict_out": fault["verdict_out"].clone()
+        });
+        let out = run_code_reviewer_script("render.py", &state);
+        let report = out["final_report"].as_str().unwrap();
+        assert!(
+            report.contains("**Verdict: NEEDS-HUMAN**"),
+            "the crash verdict must render: {report}"
+        );
+        assert!(
+            report.contains("PIPELINE-FAULT: verdict computation error"),
+            "the crash reason must render: {report}"
+        );
+        assert!(
+            !report.contains("No changes to review."),
+            "a crashed gate on an empty diff must not collapse into the stub: {report}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_verdict_fault_survives_attention_cap() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Faults are prepended to attention exactly so the [:5] cap can never
+        // hide one — pack 6 user flags alongside a verifier fault and assert
+        // the fault still leads the capped list.
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "domain_reports": ["clean report. DOMAIN_REVIEW_COMPLETE"],
+            "findings": [],
+            "verifier_output": "Agent node failed: dead",
+            "attention_flags": ["f1", "f2", "f3", "f4", "f5", "f6"]
+        });
+        let out = run_code_reviewer_script("verdict.py", &state);
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "NEEDS-HUMAN",
+            "a dead verifier must block: {out}"
+        );
+        let attention = v["attention"].as_array().unwrap();
+        assert_eq!(
+            attention.len(),
+            5,
+            "attention must be capped at 5 entries: {out}"
+        );
+        assert!(
+            attention[0]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: finding verification failed"),
+            "the fault must survive the attention cap by leading the list: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_parse_fault_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Unparseable state makes load_state raise before main runs; the
+        // fault marker itself must still emit a prefix-anchored fault verdict.
+        let out = run_code_reviewer_script_raw("parse_fault.py", "not json");
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "NEEDS-HUMAN",
+            "a crashed parse-fault marker must fail closed: {out}"
+        );
+        assert!(
+            v["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: parse failed"),
+            "the fault prefix must survive a crash: {out}"
+        );
+        assert!(
+            v["reason"]
+                .as_str()
+                .unwrap()
+                .contains("fault-marker script error"),
+            "the crash must be named: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_aux_fault_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Unparseable state makes load_state raise before main runs; the
+        // fault marker itself must still emit the prefixed aux_note.
+        let out = run_code_reviewer_script_raw("aux_fault.py", "not json");
+        let note = out["aux_note"].as_str().unwrap();
+        assert!(
+            note.starts_with("PIPELINE-FAULT: aux context lanes failed after retries —"),
+            "the aux fault prefix must survive a crash: {note}"
+        );
+        assert!(
+            note.contains("fault-marker script error"),
+            "the crash must be named: {note}"
         );
     }
 

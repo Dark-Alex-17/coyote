@@ -196,9 +196,13 @@ except Exception as e:  # noqa: BLE001 — never crash into a silent verdict
             {
                 "verdict_out": {
                     "verdict": "NEEDS-HUMAN",
-                    "reason": f"verdict computation error: {e} — treat as needing human review",
+                    # PIPELINE-FAULT prefix is load-bearing: render.py's
+                    # empty-diff stub bypass anchors on it — without it a
+                    # crashed gate on an empty diff collapses into the
+                    # "No changes to review." stub.
+                    "reason": f"PIPELINE-FAULT: verdict computation error: {e} — human review required",
                     "counts": {}, "deferred_count": 0, "dropped_count": 0,
-                    "dropped_titles": [], "attention": [f"verdict script error: {e}"],
+                    "dropped_titles": [], "attention": [f"PIPELINE-FAULT: verdict script error: {e}"],
                     "findings_final": [],
                 }
             }
