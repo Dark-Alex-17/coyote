@@ -24,7 +24,14 @@ def main():
     changed = state.get("changed_files") or []
     rigor = state.get("resolved_rigor") or "production"
 
-    if not changed:
+    # A fault can leave changed_files empty (a parse fault dies before the
+    # diff is resolved; a verifier fault fires even on an empty diff) — a
+    # fault-degraded verdict must still render as a full report. parse_fault
+    # puts the marker in the reason; verdict.py prepends it to attention.
+    faulted = str(v.get("reason") or "").startswith("PIPELINE-FAULT:") or any(
+        isinstance(a, str) and a.startswith("PIPELINE-FAULT:") for a in v.get("attention") or []
+    )
+    if not changed and not faulted:
         print(json.dumps({"final_report": "# Code Review Summary\n\nNo changes to review."}))
         return
 

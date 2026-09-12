@@ -91,6 +91,10 @@ initial_state:
   final_report: ''
   gate_feedback: ''
   gate_attempts: 0
+  parse_failure: ''
+  refine_failure: ''
+  aux_failure: ''
+  synth_failure: ''
 
 start: parse
 
@@ -139,7 +143,18 @@ nodes:
       required: [diff_spec, intent, rigor_in, surfaces_in, project_dir_in, extra_context]
     max_iterations: 3
     max_attempts: 2
+    state_updates:
+      parse_failure: '{{output}}'
+    fallback: parse_fault
     next: facts
+
+  parse_fault:
+    id: parse_fault
+    type: script
+    description: Fail-closed marker for a dead parse stage (reached only via parse's fallback) — emits a complete PIPELINE-FAULT verdict_out and jumps straight to render; a review that could not parse its request never reads as MERGE-READY.
+    script: scripts/parse_fault.py
+    timeout: 30
+    next: render
 
   facts:
     id: facts
@@ -209,6 +224,9 @@ nodes:
       required: [groups]
     max_iterations: 3
     max_attempts: 2
+    state_updates:
+      refine_failure: '{{output}}'
+    fallback: cover_gate
     next: cover_gate
 
   cover_gate:
@@ -275,6 +293,7 @@ nodes:
     max_attempts: 2
     state_updates:
       domain_report: '{{output}}'
+    fallback: domain_fault
     next: completeness_gate
 
   completeness_gate:
@@ -282,6 +301,13 @@ nodes:
     type: script
     description: Deterministic report-contract gate — required sections present (even when clean) and the completion sentinel. Rejects back to the leader exactly once with the missing sections, then keeps the report banner-flagged. Never sinks the map.
     script: scripts/completeness_gate.py
+    timeout: 30
+
+  domain_fault:
+    id: domain_fault
+    type: script
+    description: Fail-closed domain lane fault marker (reached only via review_domain's fallback route inside the map branch). Normalizes the engine's "Agent node failed" text in domain_report into a > ⚠️ PIPELINE-FAULT banner the map collects; verdict.py counts any faulted lane and forces NEEDS-HUMAN — a dead domain lane never reads as a clean slice.
+    script: scripts/domain_fault.py
     timeout: 30
 
   aux_lanes:
@@ -339,6 +365,17 @@ nodes:
     max_iterations: 10
     max_attempts: 2
     timeout: 3600
+    state_updates:
+      aux_failure: '{{output}}'
+    fallback: aux_fault
+    next: synthesize
+
+  aux_fault:
+    id: aux_fault
+    type: script
+    description: Fail-closed marker for dead aux context lanes (reached only via aux_lanes' fallback) — records the failure as a PIPELINE-FAULT in aux_note, which synthesize surfaces as a lane skip. Aux lanes are enrichment; the degradation is visible but never blocks.
+    script: scripts/aux_fault.py
+    timeout: 30
     next: synthesize
 
   downstream_sweep:
@@ -457,6 +494,9 @@ nodes:
       required: [walkthrough, changes_rows, findings, cross_file, operational_history, org_context_section, attention_flags, placement_notes]
     max_iterations: 6
     max_attempts: 2
+    state_updates:
+      synth_failure: '{{output}}'
+    fallback: verdict
     next: verify
 
   verify:
@@ -476,6 +516,7 @@ nodes:
     max_attempts: 2
     state_updates:
       verifier_output: '{{output}}'
+    fallback: verdict
     next: verdict
 
   verdict:
