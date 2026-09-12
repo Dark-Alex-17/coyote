@@ -54,6 +54,11 @@ def main():
             else:
                 chosen = [{"domain": g["domain"], "files": g["files"]} for g in refined]
     if chosen is None:
+        # refine_groups' fallback lands here with `groups` never set; make the
+        # degradation visible in the synthesis prompt via groups_note.
+        refine_failure = state.get("refine_failure")
+        if not refined and isinstance(refine_failure, str) and refine_failure.startswith("LLM node"):
+            note = "refinement lane failed after retries — fell back to the deterministic grouping"
         chosen = [{"domain": g["domain"], "files": g["files"]} for g in proposed if isinstance(g, dict)]
 
     print(json.dumps({"group_items": chosen, "groups_note": note}))

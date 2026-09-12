@@ -9248,6 +9248,433 @@ mod tests {
         );
     }
 
+    // ---- code-reviewer suite-script regression tests (R5) ----
+    //
+    // Fail-closed fault paths of the code-reviewer's verdict/fault/render
+    // scripts, exercised the same way as the suites above: `python3 <script>`
+    // with a synthetic GRAPH_STATE env.
+
+    fn run_code_reviewer_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+        run_code_reviewer_script_raw(script, &state.to_string())
+    }
+
+    fn run_code_reviewer_script_raw(script: &str, raw_state: &str) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/code-reviewer/scripts")
+            .join(script);
+        let out = std::process::Command::new("python3")
+            .arg(&path)
+            .env("GRAPH_STATE", raw_state)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
+        assert!(
+            out.status.success(),
+            "{script} exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{script} stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    #[test]
+    fn code_reviewer_verdict_domain_fault_forces_needs_human() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "domain_reports": ["> ⚠️ PIPELINE-FAULT: domain review lane failed after retries — domain 'engine' (files: a.rs): Agent node failed: dead"],
+            "findings": []
+        });
+        let out = run_code_reviewer_script("verdict.py", &state);
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "NEEDS-HUMAN",
+            "a faulted domain lane must force NEEDS-HUMAN: {out}"
+        );
+        let first = v["attention"][0].as_str().unwrap();
+        assert!(
+            first.starts_with("PIPELINE-FAULT:"),
+            "the fault must lead the attention list: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_verdict_synthesis_fault_blocks() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Keyed off synth_failure, never off findings == [] — the empty
+        // findings list here is exactly what a dead synthesis leaves behind.
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "domain_reports": ["clean report. DOMAIN_REVIEW_COMPLETE"],
+            "findings": [],
+            "synth_failure": "LLM node failed: boom"
+        });
+        let out = run_code_reviewer_script("verdict.py", &state);
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "NEEDS-HUMAN",
+            "a dead synthesis must block: {out}"
+        );
+        assert!(
+            v["attention"].as_array().unwrap().iter().any(|a| a
+                .as_str()
+                .unwrap_or("")
+                .contains("PIPELINE-FAULT: synthesis failed")),
+            "the synthesis fault must be in attention: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_verdict_verifier_fault_attention() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "domain_reports": ["clean report. DOMAIN_REVIEW_COMPLETE"],
+            "findings": [{
+                "id": "f1", "severity": "🟡 WARNING", "marker": "",
+                "file": "a.rs", "lines": "10", "title": "possible issue",
+                "block": "#### possible issue"
+            }],
+            "verifier_output": "Agent node failed: dead"
+        });
+        let out = run_code_reviewer_script("verdict.py", &state);
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "NEEDS-HUMAN",
+            "a dead verifier must block: {out}"
+        );
+        assert!(
+            v["attention"].as_array().unwrap().iter().any(|a| a
+                .as_str()
+                .unwrap_or("")
+                .contains("PIPELINE-FAULT: finding verification failed")),
+            "the verifier fault must be in attention: {out}"
+        );
+        let block = v["findings_final"][0]["block"].as_str().unwrap();
+        assert!(
+            block.contains("(unverified: no verifier verdict returned"),
+            "the kept finding must render as unverified: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_verdict_quoted_marker_precedence() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // PREFIX-anchored fault detection: a clean report that merely QUOTES
+        // the banner mid-text must not read as a faulted lane.
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "domain_reports": ["The gate prepends '> ⚠️ PIPELINE-FAULT:' when a lane dies; this slice reviewed that logic and it is correct. DOMAIN_REVIEW_COMPLETE"],
+            "findings": []
+        });
+        let out = run_code_reviewer_script("verdict.py", &state);
+        assert_eq!(
+            out["verdict_out"]["verdict"], "MERGE-READY",
+            "a quoted marker mid-text must not trip the fault check: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_verdict_happy_path_regression() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "domain_reports": ["clean report. DOMAIN_REVIEW_COMPLETE"],
+            "findings": [],
+            "verifier_output": "",
+            "parse_failure": "",
+            "refine_failure": "",
+            "aux_failure": "",
+            "synth_failure": ""
+        });
+        let out = run_code_reviewer_script("verdict.py", &state);
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "MERGE-READY",
+            "a clean run must stay MERGE-READY: {out}"
+        );
+        assert_eq!(
+            v["reason"], "no blocking findings and no always-human triggers",
+            "the happy-path reason must be byte-compatible: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_domain_fault_normalizes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "domain_group": {"domain": "engine", "files": ["a.rs"]},
+            "domain_report": "Agent node failed: spawn dead\nline2"
+        });
+        let out = run_code_reviewer_script("domain_fault.py", &state);
+        let report = out["domain_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("> ⚠️ PIPELINE-FAULT: domain review lane failed after retries — "),
+            "the banner prefix verdict.py anchors on must be exact: {report}"
+        );
+        assert!(
+            report.contains("domain 'engine' (files: a.rs)"),
+            "the fault must name the slice: {report}"
+        );
+        assert!(
+            !report.contains('\n'),
+            "the failure detail must be newline-normalized: {report}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_parse_fault_emits_needs_human() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_code_reviewer_script(
+            "parse_fault.py",
+            &json!({"parse_failure": "LLM node failed: x"}),
+        );
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "NEEDS-HUMAN",
+            "a dead parse must block: {out}"
+        );
+        assert!(
+            v["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: parse failed"),
+            "the reason must carry the fault marker: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_parse_fault_renders_well_formed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A parse fault dies before facts, so changed_files is empty — the
+        // fault verdict must still render as a full report, not the
+        // "No changes to review." stub.
+        let fault = run_code_reviewer_script(
+            "parse_fault.py",
+            &json!({"parse_failure": "LLM node failed: x"}),
+        );
+        let state = json!({
+            "changed_files": [],
+            "verdict_out": fault["verdict_out"].clone()
+        });
+        let out = run_code_reviewer_script("render.py", &state);
+        let report = out["final_report"].as_str().unwrap();
+        assert!(
+            report.contains("**Verdict: NEEDS-HUMAN**"),
+            "the fault verdict must render: {report}"
+        );
+        assert!(
+            report.contains("PIPELINE-FAULT: parse failed"),
+            "the fault reason must render: {report}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_render_no_changes_regression() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "changed_files": [],
+            "verdict_out": {
+                "verdict": "MERGE-READY",
+                "reason": "no blocking findings and no always-human triggers"
+            }
+        });
+        let out = run_code_reviewer_script("render.py", &state);
+        assert!(
+            out["final_report"]
+                .as_str()
+                .unwrap()
+                .contains("No changes to review."),
+            "an empty non-fault diff must keep the stub report: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_aux_fault_normalizes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_code_reviewer_script(
+            "aux_fault.py",
+            &json!({"aux_failure": "LLM node failed: y"}),
+        );
+        assert!(
+            out["aux_note"]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: aux context lanes failed after retries —"),
+            "the aux fault must land in aux_note: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_cover_gate_notes_refine_failure() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // refine_groups' fallback lands in cover_gate with `groups` never set;
+        // the deterministic proposal must win and the degradation must be
+        // noted for the synthesis prompt.
+        let state = json!({
+            "changed_files": ["a.rs"],
+            "proposed_groups": [{"domain": "engine", "files": ["a.rs"]}],
+            "refine_failure": "LLM node failed: z"
+        });
+        let out = run_code_reviewer_script("cover_gate.py", &state);
+        assert_eq!(
+            out["group_items"],
+            json!([{"domain": "engine", "files": ["a.rs"]}]),
+            "the deterministic proposal must be used: {out}"
+        );
+        assert!(
+            out["groups_note"]
+                .as_str()
+                .unwrap()
+                .contains("fell back to the deterministic grouping"),
+            "the refine failure must be noted: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_render_verifier_fault_empty_diff_renders_fault() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // The verifier fault check is deliberately not gated on a non-empty
+        // diff, and verdict.py carries the marker in attention rather than
+        // the reason — render.py must not swallow that verdict into the
+        // "No changes to review." stub.
+        let fault = run_code_reviewer_script(
+            "verdict.py",
+            &json!({
+                "changed_files": [],
+                "domain_reports": [],
+                "findings": [],
+                "verifier_output": "Agent node failed: dead"
+            }),
+        );
+        let state = json!({
+            "changed_files": [],
+            "verdict_out": fault["verdict_out"].clone()
+        });
+        let out = run_code_reviewer_script("render.py", &state);
+        let report = out["final_report"].as_str().unwrap();
+        assert!(
+            report.contains("**Verdict: NEEDS-HUMAN**"),
+            "the fault verdict must render: {report}"
+        );
+        assert!(
+            report.contains("PIPELINE-FAULT: finding verification failed"),
+            "the verifier fault must render: {report}"
+        );
+        assert!(
+            !report.contains("No changes to review."),
+            "a fault-degraded verdict must not collapse into the stub: {report}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_verdict_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A truthy non-iterable attention_flags raises TypeError inside main;
+        // the guard must still emit a fail-closed verdict.
+        let state = json!({"changed_files": ["a.rs"], "attention_flags": 42});
+        let out = run_code_reviewer_script("verdict.py", &state);
+        let v = &out["verdict_out"];
+        assert_eq!(
+            v["verdict"], "NEEDS-HUMAN",
+            "a crashed verdict gate must fail closed: {out}"
+        );
+        assert!(
+            v["reason"]
+                .as_str()
+                .unwrap()
+                .contains("verdict computation error"),
+            "the reason must name the error: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_cover_gate_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A domain-less proposed group raises KeyError while building the
+        // fallback grouping; the guard must emit one catch-all group, never
+        // an empty review.
+        let state = json!({"changed_files": ["a.rs"], "proposed_groups": [{}]});
+        let out = run_code_reviewer_script("cover_gate.py", &state);
+        assert_eq!(
+            out["group_items"],
+            json!([{"domain": "all-changes", "files": ["a.rs"]}]),
+            "a crashed gate must fall back to a catch-all group: {out}"
+        );
+        assert!(
+            out["groups_note"]
+                .as_str()
+                .unwrap()
+                .contains("cover gate error"),
+            "the crash must be noted: {out}"
+        );
+    }
+
+    #[test]
+    fn code_reviewer_domain_fault_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Unparseable state makes load_state raise before main runs; the
+        // fault marker itself must still emit the banner-prefixed report.
+        let out = run_code_reviewer_script_raw("domain_fault.py", "not json");
+        let report = out["domain_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("> ⚠️ PIPELINE-FAULT: domain review lane failed after retries — "),
+            "the banner prefix verdict.py anchors on must survive a crash: {report}"
+        );
+        assert!(
+            report.contains("fault-marker script error"),
+            "the crash must be named: {report}"
+        );
+    }
+
     #[test]
     #[serial]
     fn install_functions_force_preserves_user_mcp_json() {
