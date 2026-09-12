@@ -2095,21 +2095,27 @@ nodes:
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 abort.set_ctrlc();
+                Instant::now()
             })
         };
-        let started = Instant::now();
         let result = GraphExecutor::new(graph, &ws.dir)
             .with_frontier_observer(observer)
             .execute(&mut ctx, abort)
             .await;
-        trigger.await.unwrap();
+        let run_ended = Instant::now();
+        let abort_at = trigger.await.unwrap();
 
         let err = format!("{:#}", result.expect_err("the abort ends the run"));
         assert!(err.contains("aborted"), "{err}");
+        // Measured from when the abort lands, not from execute() start:
+        // dispatcher bash spawn latency on a loaded runner (notably Windows
+        // CI) can eat several seconds before the marker even exists, and
+        // that time is not this test's to budget. Joining the in-flight
+        // hold instead of unwinding would still show >= ~4.5s here.
+        let unwind = run_ended.saturating_duration_since(abort_at);
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "the run must not wait for the 5s probe hold: {:?}",
-            started.elapsed()
+            unwind < Duration::from_secs(3),
+            "the run must not wait for the 5s probe hold after the abort lands: {unwind:?}"
         );
 
         // Aborted tasks unwind on the runtime's next pass, not inside execute().
