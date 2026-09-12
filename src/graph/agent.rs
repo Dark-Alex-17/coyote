@@ -797,6 +797,44 @@ mod tests {
     }
 
     #[test]
+    fn outcome_from_fallback_warn_names_the_node_and_the_fallback_target() {
+        install_warn_collector();
+        let mut node = node_with("hi", None);
+        node.fallback = Some("recover".into());
+        let mut state = manager_with(&[]);
+
+        let outcome = outcome_from(
+            "fallback_warn_capture",
+            &node,
+            &mut state,
+            Err(extraction_error()),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, AgentExecutionOutcome::FellBack("recover".into()));
+        let warns: Vec<String> = warn_messages()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.contains("'fallback_warn_capture'"))
+            .cloned()
+            .collect();
+        assert_eq!(warns.len(), 1, "exactly one fallback warn: {warns:?}");
+        assert!(
+            warns[0].contains(
+                "agent node 'fallback_warn_capture' failed, routing to fallback 'recover'"
+            ),
+            "{}",
+            warns[0]
+        );
+        assert!(
+            warns[0].contains("Agent 'test_agent' output failed structured-output extraction"),
+            "warn must carry the error chain: {}",
+            warns[0]
+        );
+    }
+
+    #[test]
     fn outcome_from_failure_without_fallback_propagates_the_error_unchanged() {
         let node = node_with("hi", Some(failure_capture_updates()));
         let mut state = manager_with(&[]);
