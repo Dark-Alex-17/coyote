@@ -8762,6 +8762,255 @@ mod tests {
         );
     }
 
+    // ---- review-gauntlet suite-script regression tests (R5) ----
+    //
+    // Degradation paths of the gauntlet's lane/builder/gate scripts,
+    // exercised the same way as the adversary suite above: `python3 <script>`
+    // with a synthetic GRAPH_STATE env.
+
+    fn run_gauntlet_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/review-gauntlet/scripts")
+            .join(script);
+        let out = std::process::Command::new("python3")
+            .arg(&path)
+            .env("GRAPH_STATE", state.to_string())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
+        assert!(
+            out.status.success(),
+            "{script} exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{script} stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_blocks_lane_fault_distinctly() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // One run exercising all three failure classes at once — a faulted
+        // lane, an unselected lane, and a lane that returned no sentinel —
+        // each must be reported distinctly.
+        let state = json!({
+            "code_review_results": ["...**Verdict: MERGE-READY**..."],
+            "adversary_results": ["PIPELINE-FAULT: adversary lane failed after retries — Agent node failed: boom"],
+            "security_results": [],
+            "probe_results": ["some text with no sentinel"]
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("adversary: PIPELINE-FAULT — the lane failed after retries"),
+            "the faulted lane must be named as a blocker: {report}"
+        );
+        assert!(
+            report.contains("| adversary | BLOCKED | PIPELINE-FAULT (lane failed) |"),
+            "the lane table must carry the fault detail: {report}"
+        );
+        assert!(
+            report.contains("| security | SKIPPED | not selected |"),
+            "an unselected lane must stay SKIPPED: {report}"
+        );
+        assert!(
+            report.contains("| probe | BLOCKED | missing verdict sentinel |"),
+            "a sentinel-less lane must stay a missing-sentinel failure: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_signals_error_fault_blocks() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "code_review_results": [],
+            "adversary_results": [],
+            "security_results": [],
+            "probe_results": [],
+            "signals_error": "PIPELINE-FAULT: lane builder crashed — boom; no lanes were run"
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains(
+                "## Blockers\n- pipeline: PIPELINE-FAULT: lane builder crashed — boom; no lanes were run"
+            ),
+            "the pipeline fault must appear in the Blockers section: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_happy_path_regression() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "code_review_results": ["**Verdict: MERGE-READY**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(
+            out["gauntlet_verdict"], "PASS",
+            "non-degraded semantics must be unchanged: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_build_items_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A truthy non-iterable forced_lanes raises inside main; the guard
+        // must exit 0 (asserted in the helper) with empty lanes and a
+        // PIPELINE-FAULT for the gate.
+        let out = run_gauntlet_script("build_items.py", &json!({"forced_lanes": 42}));
+        for key in [
+            "code_review_items",
+            "adversary_items",
+            "security_items",
+            "probe_items",
+        ] {
+            assert_eq!(
+                out[key],
+                json!([]),
+                "{key} must be empty on a builder crash: {out}"
+            );
+        }
+        assert!(
+            out["signals_error"]
+                .as_str()
+                .unwrap()
+                .contains("PIPELINE-FAULT: lane builder crashed"),
+            "the crash must surface as a PIPELINE-FAULT: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_build_items_folds_degradation_note_into_summary() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "forced_lanes": ["code-review", "adversary"],
+            "lanes_degraded": "lane selection degraded to deterministic defaults"
+        });
+        let out = run_gauntlet_script("build_items.py", &state);
+        let summary = out["lanes_summary"].as_str().unwrap();
+        assert!(
+            summary.contains("lane selection degraded to deterministic defaults"),
+            "the degradation note must survive into lanes_summary: {summary}"
+        );
+        assert!(
+            summary.contains("forced lanes honored exactly"),
+            "the forced-lanes reason must still be recorded: {summary}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_lane_fault_normalizes_engine_failure_text() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script(
+            "lane_fault.py",
+            &json!({"lane_ctx": {"lane": "security"}, "lane_out": "Agent node failed: kaboom"}),
+        );
+        assert_eq!(
+            out["lane_out"],
+            "PIPELINE-FAULT: security lane failed after retries — Agent node failed: kaboom"
+        );
+
+        let out = run_gauntlet_script(
+            "lane_fault.py",
+            &json!({"lane_out": "Agent node failed: kaboom"}),
+        );
+        assert!(
+            out["lane_out"]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: unknown lane failed after retries"),
+            "a missing lane_ctx must degrade to the unknown lane: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_default_lanes_is_deterministic() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script("default_lanes.py", &json!({}));
+        assert_eq!(out["forced_lanes"], json!(["code-review", "adversary"]));
+        assert!(
+            out["lanes_degraded"]
+                .as_str()
+                .unwrap()
+                .contains("deterministic defaults"),
+            "the degradation note must name the deterministic defaults: {out}"
+        );
+
+        let probe = run_gauntlet_script("default_lanes.py", &json!({"consumer_surface": true}));
+        assert_eq!(
+            probe["forced_lanes"],
+            json!(["code-review", "adversary", "probe"]),
+            "a consumer surface must widen selection to include probe: {probe}"
+        );
+
+        let again = run_gauntlet_script("default_lanes.py", &json!({}));
+        assert_eq!(out, again, "same input must produce identical output");
+    }
+
+    #[test]
+    fn gauntlet_lane_prompts_carry_passthroughs() {
+        use crate::graph::{GraphParser, NodeType};
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/review-gauntlet");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .expect("review-gauntlet graph.yaml must parse");
+        let node = graph
+            .nodes
+            .get("run_adversary")
+            .expect("review-gauntlet graph must have a run_adversary node");
+        let NodeType::Agent(adv) = &node.node_type else {
+            panic!("run_adversary must be an agent node");
+        };
+        assert!(
+            adv.prompt.contains("{{verification_commands}}"),
+            "run_adversary's prompt must pass the declared verification commands through: {}",
+            adv.prompt
+        );
+        let node = graph
+            .nodes
+            .get("run_probe")
+            .expect("review-gauntlet graph must have a run_probe node");
+        let NodeType::Agent(probe) = &node.node_type else {
+            panic!("run_probe must be an agent node");
+        };
+        assert!(
+            probe.prompt.contains("reconcile rather than duplicate"),
+            "run_probe's prompt must carry the reconcile line: {}",
+            probe.prompt
+        );
+    }
+
     #[test]
     #[serial]
     fn install_functions_force_preserves_user_mcp_json() {
