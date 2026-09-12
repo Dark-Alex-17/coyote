@@ -465,6 +465,7 @@ mod tests {
             output_schema: None,
             timeout: None,
             max_attempts: 1,
+            fallback: None,
             inputs: None,
             teammates,
         })
@@ -1607,6 +1608,55 @@ nodes:
             .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
 
         assert_eq!(collected(&result), vec![json!("fb")]);
+    }
+
+    #[tokio::test]
+    async fn map_chain_agent_failure_routes_to_fallback() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_py(
+            "recover.py",
+            r#"print(json.dumps({"output": "recovered"}))"#,
+        );
+
+        let yaml = r#"
+name: chain
+start: fan_out
+settings:
+  validate_before_run: false
+initial_state:
+  items: [1, 2]
+nodes:
+  fan_out:
+    type: map
+    over: "{{items}}"
+    as: item
+    branch: worker
+    collect_into: results
+    next: done
+  worker:
+    type: agent
+    agent: no-such-agent
+    prompt: "hi"
+    fallback: recover
+  recover:
+    type: script
+    script: recover.py
+  done:
+    type: end
+    output: "{{results}}"
+"#;
+        let result = run_graph(yaml, &ws)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(
+            collected(&result),
+            vec![json!("recovered"), json!("recovered")]
+        );
     }
 
     struct Harness {

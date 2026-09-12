@@ -18,63 +18,109 @@ use tokio::time::timeout;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum AgentExecutionOutcome {
+    Continue(String),
+    FellBack(String),
+}
+
 pub struct AgentNodeExecutor;
 
 impl AgentNodeExecutor {
-    pub async fn execute(
+    pub(super) async fn execute(
         node: &AgentNode,
         state_manager: &mut StateManager,
         parent_ctx: &mut RequestContext,
         retire_peer_on_return: bool,
-    ) -> Result<String> {
-        let prompt = state_manager
-            .interpolate(&node.prompt)
-            .with_context(|| format!("Failed to interpolate prompt for agent '{}'", node.agent))?;
-
-        let graph_inputs = resolve_inputs(node, state_manager)?;
-        if let Some(inputs) = &graph_inputs {
-            let mut keys: Vec<&String> = inputs.keys().collect();
-            keys.sort_unstable();
-            debug!("Agent '{}' graph inputs: {keys:?}", node.agent);
-        }
-
-        let secs = node.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
-        let agent_name = node.agent.clone();
-
-        let mut run_attempt = attempt_runner(move |ctx| {
-            let agent_name = agent_name.clone();
-            let prompt = prompt.clone();
-            let graph_inputs = graph_inputs.clone();
-            boxed_attempt(async move {
-                bounded_attempt(
-                    &agent_name,
-                    secs,
-                    run_agent_for_graph(ctx, &agent_name, &prompt, graph_inputs),
-                )
-                .await
-            })
-        });
-        let raw =
-            run_with_retries(node, parent_ctx, retire_peer_on_return, &mut run_attempt).await?;
-
-        // Extraction stays outside the retry loop: by this point the agent
-        // itself succeeded, so an extraction failure is never retried.
-        let output_value = match &node.output_schema {
-            Some(schema) => structured::extract(&raw, schema, parent_ctx)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Agent '{}' output failed structured-output extraction",
-                        node.agent
-                    )
-                })?,
-            None => Value::String(raw.clone()),
-        };
-
-        apply_state_updates(node, state_manager, &output_value);
-
-        Ok(raw)
+    ) -> Result<AgentExecutionOutcome> {
+        let result = run(node, state_manager, parent_ctx, retire_peer_on_return).await;
+        outcome_from(node, state_manager, result)
     }
+}
+
+/// Turns the node run's final result into a routing outcome. With a
+/// `fallback` declared, any failure — retries exhausted, hard error, or
+/// extraction failure — is written into state as
+/// `"Agent node failed: <chain>"` (through the node's own state_updates /
+/// output-schema path, so the fallback node can interpolate it) and routes
+/// to the fallback. Without one the error propagates unchanged; unlike llm
+/// nodes there is no teaching bail, because agent nodes always failed loudly
+/// and callers assert on the existing "Agent 'X' failed" chains.
+fn outcome_from(
+    node: &AgentNode,
+    state_manager: &mut StateManager,
+    result: Result<String>,
+) -> Result<AgentExecutionOutcome> {
+    match result {
+        Ok(raw) => Ok(AgentExecutionOutcome::Continue(raw)),
+        Err(e) => match &node.fallback {
+            Some(fb) => {
+                warn!("agent node failed, routing to fallback '{fb}': {e:#}");
+                state_updates::apply(
+                    state_manager,
+                    &Value::String(format!("Agent node failed: {e:#}")),
+                    node.output_schema.is_some(),
+                    node.state_updates.as_ref(),
+                );
+                Ok(AgentExecutionOutcome::FellBack(fb.clone()))
+            }
+            None => Err(e),
+        },
+    }
+}
+
+async fn run(
+    node: &AgentNode,
+    state_manager: &mut StateManager,
+    parent_ctx: &mut RequestContext,
+    retire_peer_on_return: bool,
+) -> Result<String> {
+    let prompt = state_manager
+        .interpolate(&node.prompt)
+        .with_context(|| format!("Failed to interpolate prompt for agent '{}'", node.agent))?;
+
+    let graph_inputs = resolve_inputs(node, state_manager)?;
+    if let Some(inputs) = &graph_inputs {
+        let mut keys: Vec<&String> = inputs.keys().collect();
+        keys.sort_unstable();
+        debug!("Agent '{}' graph inputs: {keys:?}", node.agent);
+    }
+
+    let secs = node.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let agent_name = node.agent.clone();
+
+    let mut run_attempt = attempt_runner(move |ctx| {
+        let agent_name = agent_name.clone();
+        let prompt = prompt.clone();
+        let graph_inputs = graph_inputs.clone();
+        boxed_attempt(async move {
+            bounded_attempt(
+                &agent_name,
+                secs,
+                run_agent_for_graph(ctx, &agent_name, &prompt, graph_inputs),
+            )
+            .await
+        })
+    });
+    let raw = run_with_retries(node, parent_ctx, retire_peer_on_return, &mut run_attempt).await?;
+
+    // Extraction stays outside the retry loop: by this point the agent
+    // itself succeeded, so an extraction failure is never retried.
+    let output_value = match &node.output_schema {
+        Some(schema) => structured::extract(&raw, schema, parent_ctx)
+            .await
+            .with_context(|| {
+                format!(
+                    "Agent '{}' output failed structured-output extraction",
+                    node.agent
+                )
+            })?,
+        None => Value::String(raw.clone()),
+    };
+
+    apply_state_updates(node, state_manager, &output_value);
+
+    Ok(raw)
 }
 
 /// One boxed attempt against the ctx. Boxed (rather than an opaque
@@ -236,6 +282,7 @@ mod tests {
             output_schema: None,
             timeout: None,
             max_attempts: 1,
+            fallback: None,
             inputs: None,
             teammates: false,
         }
@@ -531,6 +578,114 @@ mod tests {
 
         assert_eq!(attempts, 0);
         assert!(format!("{err:#}").contains("agent node exhausted retries"));
+    }
+
+    fn failure_capture_updates() -> HashMap<String, String> {
+        let mut u = HashMap::new();
+        u.insert("failure".into(), "{{output}}".into());
+        u
+    }
+
+    #[tokio::test]
+    async fn execute_failure_with_fallback_routes_and_records_the_failure() {
+        let mut ctx = plain_ctx();
+        ctx.current_depth = default_max_agent_depth();
+        let mut node = node_with("hi", Some(failure_capture_updates()));
+        node.fallback = Some("recover".into());
+        let mut state = manager_with(&[]);
+
+        let outcome = AgentNodeExecutor::execute(&node, &mut state, &mut ctx, false)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, AgentExecutionOutcome::FellBack("recover".into()));
+        let failure = state
+            .state()
+            .get("failure")
+            .and_then(Value::as_str)
+            .expect("failure text must land in state for the fallback node")
+            .to_string();
+        assert!(failure.starts_with("Agent node failed: "), "{failure}");
+        assert!(failure.contains("Agent 'test_agent' failed"), "{failure}");
+        assert!(failure.contains("Max agent depth exceeded"), "{failure}");
+    }
+
+    fn extraction_error() -> Error {
+        anyhow!("no JSON object found in output")
+            .context("Agent 'test_agent' output failed structured-output extraction")
+    }
+
+    #[test]
+    fn outcome_from_success_is_continue() {
+        let node = node_with("hi", None);
+        let mut state = manager_with(&[]);
+
+        let outcome = outcome_from(&node, &mut state, Ok("raw".into())).unwrap();
+
+        assert_eq!(outcome, AgentExecutionOutcome::Continue("raw".into()));
+    }
+
+    #[test]
+    fn outcome_from_extraction_failure_with_fallback_falls_back() {
+        let mut node = node_with("hi", Some(failure_capture_updates()));
+        node.fallback = Some("recover".into());
+        let mut state = manager_with(&[]);
+
+        let outcome = outcome_from(&node, &mut state, Err(extraction_error())).unwrap();
+
+        assert_eq!(outcome, AgentExecutionOutcome::FellBack("recover".into()));
+        let failure = state
+            .state()
+            .get("failure")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            failure.contains("structured-output extraction"),
+            "{failure}"
+        );
+        assert!(failure.contains("no JSON object found"), "{failure}");
+    }
+
+    #[test]
+    fn outcome_from_failure_without_fallback_propagates_the_error_unchanged() {
+        let node = node_with("hi", Some(failure_capture_updates()));
+        let mut state = manager_with(&[]);
+
+        let err = outcome_from(&node, &mut state, Err(extraction_error()))
+            .expect_err("no fallback must propagate");
+
+        assert_eq!(
+            format!("{err:#}"),
+            "Agent 'test_agent' output failed structured-output extraction: \
+             no JSON object found in output"
+        );
+        assert!(state.state().get("failure").is_none());
+    }
+
+    #[tokio::test]
+    async fn fallback_engages_only_after_transient_retries_exhaust() {
+        let mut ctx = plain_ctx();
+        let mut node = retryable_node(2);
+        node.fallback = Some("recover".into());
+        let mut attempts = 0u32;
+
+        let result = run_with_retries(
+            &node,
+            &mut ctx,
+            false,
+            &mut attempt_runner(|_ctx| {
+                attempts += 1;
+                boxed_attempt(async move {
+                    Err::<String, _>(anyhow!("connection error: reset by peer"))
+                })
+            }),
+        )
+        .await;
+        let mut state = manager_with(&[]);
+        let outcome = outcome_from(&node, &mut state, result).unwrap();
+
+        assert_eq!(attempts, 2, "fallback must not preempt the retry budget");
+        assert_eq!(outcome, AgentExecutionOutcome::FellBack("recover".into()));
     }
 
     fn node_with_inputs(pairs: &[(&str, &str)]) -> AgentNode {
