@@ -8157,6 +8157,75 @@ mod tests {
         assert!(paths::skill_file("frontend-ui-ux").exists());
     }
 
+    /// TASK-021 pinned prose: the task-queue guidance added to the shipped
+    /// artifacts must not silently erode. Each anchor quotes the shipped text
+    /// verbatim (chosen to avoid line-wrap boundaries in the YAML sources).
+    #[test]
+    #[serial]
+    fn bundled_assets_pin_task_queue_guidance() {
+        let _guard = TestConfigDirGuard::new();
+        Agent::install_builtin_agents(false).unwrap();
+
+        // 1. Architect config: the parallel-mode "Task-queue mirroring"
+        //    section with all five HARD RULES.
+        let architect = read_to_string(
+            paths::agents_data_dir()
+                .join("architect")
+                .join("config.yaml"),
+        )
+        .unwrap();
+        for anchor in [
+            "Task-queue mirroring (optional).",
+            "it is NEVER the source of truth",
+            "Root tasks (no blockers) are NOT auto-dispatched on create — spawn them yourself.",
+            "Call `agent__task_complete` ONLY after this task's verification gate",
+            "Collect every auto-dispatched agent via `agent__collect`",
+            "strands the queue task InProgress with no reset — recreate",
+        ] {
+            assert!(
+                architect.contains(anchor),
+                "architect config lost TASK-021 anchor: {anchor:?}"
+            );
+        }
+
+        // 2. Sisyphus config: the task-queue chain note in the
+        //    parallel-research section.
+        let sisyphus = read_to_string(
+            paths::agents_data_dir()
+                .join("sisyphus")
+                .join("config.yaml"),
+        )
+        .unwrap();
+        for anchor in [
+            "`agent__task_create` chains MAY encode the",
+            "Todos remain the tracking source of truth.",
+        ] {
+            assert!(
+                sisyphus.contains(anchor),
+                "sisyphus config lost TASK-021 anchor: {anchor:?}"
+            );
+        }
+
+        // 3. Spawn instructions: dispatch/collect/failure semantics plus the
+        //    corrected numeric-string task IDs (no `task_1`-style remnants).
+        let spawn = crate::config::prompts::DEFAULT_SPAWN_INSTRUCTIONS;
+        for anchor in [
+            "is NEVER auto-dispatched",
+            "agent__collect",
+            "recreate the chain rather than retrying",
+            "--blocked_by [\"1\"]",
+        ] {
+            assert!(
+                spawn.contains(anchor),
+                "DEFAULT_SPAWN_INSTRUCTIONS lost TASK-021 anchor: {anchor:?}"
+            );
+        }
+        assert!(
+            !spawn.contains("task_1"),
+            "DEFAULT_SPAWN_INSTRUCTIONS must not reference task_1-style IDs"
+        );
+    }
+
     #[test]
     #[serial]
     fn bundled_graph_agents_parse_and_validate() {
