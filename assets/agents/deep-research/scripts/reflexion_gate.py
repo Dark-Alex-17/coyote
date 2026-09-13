@@ -15,6 +15,12 @@ Routing (`_next`):
 Reflexion is a best-effort quality booster, not a hard gate: once the
 budget is spent the workflow proceeds anyway, and the human approval
 step is the final backstop.
+
+Fail-safe (R3): a crash here fails FORWARD to `synthesize` — the same
+direction as the existing malformed-critique PASS default — with a
+PIPELINE-FAULT entry recorded (best-effort preserving existing faults),
+so a broken gate costs the run its automated critique routing, never the
+run itself.
 """
 import json
 import os
@@ -31,6 +37,14 @@ def load_state():
         with open(path) as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
+
+
+def safe_faults():
+    try:
+        state = load_state()
+        return [f for f in (state.get("pipeline_faults") or []) if isinstance(f, str)]
+    except Exception:  # noqa: BLE001 — best-effort preservation only
+        return []
 
 
 def as_int(value, default=0):
@@ -72,5 +86,12 @@ def main():
     print(json.dumps(output))
 
 
-if __name__ == "__main__":
+try:
     main()
+except Exception as e:  # noqa: BLE001 — a crashed gate fails forward, never dies
+    faults = safe_faults()
+    faults.append(
+        f"PIPELINE-FAULT: reflexion gate crashed — {e}; proceeded to synthesis "
+        "without automated critique routing"
+    )
+    print(json.dumps({"_next": "synthesize", "pipeline_faults": faults}))

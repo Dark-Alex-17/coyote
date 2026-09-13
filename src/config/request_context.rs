@@ -10378,6 +10378,597 @@ mod tests {
         }
     }
 
+    // ---- deep-research suite-script regression tests (R5) ----
+    //
+    // The deep-research graph's R3 guards and fault markers, exercised by
+    // invoking `python3 <script>` with a synthetic GRAPH_STATE env. The raw
+    // runner feeds deliberately malformed JSON to prove every guarded script
+    // emits a sane degraded output instead of crashing the node.
+
+    fn run_deep_research_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+        run_deep_research_script_raw(script, &state.to_string())
+    }
+
+    fn run_deep_research_script_raw(script: &str, raw_state: &str) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/deep-research/scripts")
+            .join(script);
+        let out = std::process::Command::new("python3")
+            .arg(&path)
+            .env("GRAPH_STATE", raw_state)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
+        assert!(
+            out.status.success(),
+            "{script} exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{script} stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    #[test]
+    fn deep_research_scripts_survive_malformed_state() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // R3: every guarded script and fault marker must exit 0 with JSON
+        // stdout even when GRAPH_STATE is not JSON at all (the runner
+        // asserts both); per-script degraded shapes are pinned below.
+        for script in [
+            "parse_request.py",
+            "bootstrap_research.py",
+            "combine_findings.py",
+            "reflexion_gate.py",
+            "incorporate_feedback.py",
+            "verify_sources.py",
+            "plan_fault.py",
+            "question_fault.py",
+            "vet_fault.py",
+            "critique_fault.py",
+            "synth_fault.py",
+        ] {
+            let _ = run_deep_research_script_raw(script, "not json {");
+        }
+    }
+
+    #[test]
+    fn deep_research_parse_request_crash_asks_user() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // An unreadable state means the caller's prompt is lost — the sane
+        // degraded route is asking the user for the topic directly.
+        let out = run_deep_research_script_raw("parse_request.py", "not json {");
+        assert_eq!(out["_next"], "ask_topic", "{out}");
+        assert!(
+            out["pipeline_faults"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: request parsing crashed"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn deep_research_parse_request_happy_path_unchanged() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out =
+            run_deep_research_script("parse_request.py", &json!({"initial_prompt": " quantum "}));
+        assert_eq!(out, json!({"topic": "quantum"}));
+        let out = run_deep_research_script("parse_request.py", &json!({"initial_prompt": ""}));
+        assert_eq!(out, json!({"_next": "ask_topic"}));
+    }
+
+    #[test]
+    fn deep_research_bootstrap_survives_malformed_state() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // The fan-out source's happy-path output IS its degraded output.
+        assert_eq!(
+            run_deep_research_script_raw("bootstrap_research.py", "not json {"),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn deep_research_combine_findings_crash_degrades() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_deep_research_script_raw("combine_findings.py", "not json {");
+        let findings = out["findings"].as_str().unwrap();
+        assert!(
+            findings.starts_with("PIPELINE-FAULT: combining findings crashed"),
+            "{out}"
+        );
+        assert_eq!(out["pipeline_faults"], json!([findings]), "{out}");
+    }
+
+    #[test]
+    fn deep_research_combine_findings_happy_path_unchanged() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "questions": ["Q1", "Q2"],
+            "question_findings": ["finding one", "finding two"],
+            "pipeline_faults": []
+        });
+        let out = run_deep_research_script("combine_findings.py", &state);
+        assert_eq!(
+            out,
+            json!({
+                "findings": "## Q1\n\nfinding one\n\n## Q2\n\nfinding two",
+                "pipeline_faults": []
+            })
+        );
+    }
+
+    #[test]
+    fn deep_research_combine_findings_lifts_question_faults() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A dead research lane's PIPELINE-FAULT finding (written branch-local
+        // by question_fault, where pipeline_faults is out of reach) must be
+        // lifted into pipeline_faults so it reaches the Pipeline notes.
+        let fault = "PIPELINE-FAULT: question research failed — finding unavailable — LLM node failed: boom";
+        let out = run_deep_research_script(
+            "combine_findings.py",
+            &json!({
+                "questions": ["Q1", "Q2"],
+                "question_findings": ["finding one", fault],
+                "pipeline_faults": []
+            }),
+        );
+        assert_eq!(out["pipeline_faults"], json!([fault]), "{out}");
+        assert!(out["findings"].as_str().unwrap().contains(fault), "{out}");
+        // Reflexion/feedback loops re-run the map: the lift must deduplicate.
+        let out = run_deep_research_script(
+            "combine_findings.py",
+            &json!({
+                "questions": ["Q1"],
+                "question_findings": [fault],
+                "pipeline_faults": [fault]
+            }),
+        );
+        assert_eq!(out["pipeline_faults"], json!([fault]), "{out}");
+    }
+
+    #[test]
+    fn deep_research_reflexion_gate_crash_fails_forward() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Same direction as the documented malformed-critique PASS default:
+        // a broken gate costs the automated critique routing, never the run.
+        let out = run_deep_research_script_raw("reflexion_gate.py", "not json {");
+        assert_eq!(out["_next"], "synthesize", "{out}");
+        assert!(
+            out["pipeline_faults"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: reflexion gate crashed"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn deep_research_reflexion_gate_happy_paths_unchanged() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_deep_research_script(
+            "reflexion_gate.py",
+            &json!({"critique": "VERDICT: REVISE\nFEEDBACK: missing X", "research_attempts": 0}),
+        );
+        assert_eq!(out["_next"], "research_each_question", "{out}");
+        assert_eq!(out["research_attempts"], 1, "{out}");
+        let out = run_deep_research_script(
+            "reflexion_gate.py",
+            &json!({"critique": "VERDICT: PASS\nFEEDBACK: none", "research_attempts": 0}),
+        );
+        assert_eq!(out, json!({"_next": "synthesize"}));
+    }
+
+    #[test]
+    fn deep_research_incorporate_feedback_crash_still_loops() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // The user's intent (another pass) is unambiguous even when their
+        // feedback text is lost — the degraded route still loops.
+        let out = run_deep_research_script_raw("incorporate_feedback.py", "not json {");
+        assert_eq!(out["_next"], "research_each_question", "{out}");
+        assert_eq!(out["research_attempts"], 0, "{out}");
+        assert!(
+            out["research_feedback"]
+                .as_str()
+                .unwrap()
+                .contains("could not be recovered"),
+            "{out}"
+        );
+        assert!(
+            out["pipeline_faults"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: feedback incorporation crashed"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn deep_research_incorporate_feedback_happy_path_unchanged() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out =
+            run_deep_research_script("incorporate_feedback.py", &json!({"decision": "add X"}));
+        assert_eq!(out["_next"], "research_each_question", "{out}");
+        assert_eq!(out["research_attempts"], 0, "{out}");
+        assert!(
+            out["research_feedback"].as_str().unwrap().contains("add X"),
+            "{out}"
+        );
+        assert!(out.get("pipeline_faults").is_none(), "{out}");
+    }
+
+    #[test]
+    fn deep_research_verify_sources_crash_degrades() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_deep_research_script_raw("verify_sources.py", "not json {");
+        assert!(
+            out["source_check"]
+                .as_str()
+                .unwrap()
+                .contains("NOT checked"),
+            "{out}"
+        );
+        assert!(
+            out["pipeline_notes"]
+                .as_str()
+                .unwrap()
+                .contains("## Pipeline notes"),
+            "the crash fault must still render in the notes: {out}"
+        );
+        assert!(
+            out["pipeline_faults"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: source verification crashed"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn deep_research_verify_sources_folds_pipeline_notes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // No URLs in the report → no network probes; the notes fold is what
+        // this pins. Non-empty faults render the "## Pipeline notes" section…
+        let out = run_deep_research_script(
+            "verify_sources.py",
+            &json!({
+                "report": "plain text, no links",
+                "pipeline_faults": ["PIPELINE-FAULT: critique failed — LLM node failed: x"]
+            }),
+        );
+        assert_eq!(
+            out["source_check"],
+            "No web sources were cited in the report."
+        );
+        assert_eq!(
+            out["pipeline_notes"],
+            "\n\n## Pipeline notes\n\n- PIPELINE-FAULT: critique failed — LLM node failed: x"
+        );
+        // …and a fault-free run folds to "" so the accepted-path output
+        // ({{report}}{{pipeline_notes}}) stays byte-identical.
+        let out = run_deep_research_script(
+            "verify_sources.py",
+            &json!({"report": "plain text, no links", "pipeline_faults": []}),
+        );
+        assert_eq!(out["pipeline_notes"], "");
+    }
+
+    #[test]
+    fn deep_research_plan_fault_normalizes_capture() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_deep_research_script(
+            "plan_fault.py",
+            &json!({"plan_failure": "LLM node failed: boom", "pipeline_faults": []}),
+        );
+        assert_eq!(
+            out["fault_text"],
+            "planning failed — nothing to research: LLM node failed: boom"
+        );
+        assert_eq!(
+            out["pipeline_faults"],
+            json!(["PIPELINE-FAULT: planning failed — nothing to research: LLM node failed: boom"])
+        );
+        // On success plan_failure holds the node's structured JSON output —
+        // the prefix anchor must never mistake it for a failure detail.
+        let out = run_deep_research_script(
+            "plan_fault.py",
+            &json!({"plan_failure": "{\"research_plan\":\"ok\"}"}),
+        );
+        assert!(
+            out["fault_text"]
+                .as_str()
+                .unwrap()
+                .contains("died without recording"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn deep_research_question_fault_normalizes_finding() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_deep_research_script(
+            "question_fault.py",
+            &json!({"finding": "LLM node failed: boom"}),
+        );
+        assert_eq!(
+            out,
+            json!({
+                "finding":
+                    "PIPELINE-FAULT: question research failed — finding unavailable — LLM node failed: boom"
+            })
+        );
+        // state_updates run on success too — a real finding (no "LLM node"
+        // prefix) must not leak into the fault detail.
+        let out = run_deep_research_script(
+            "question_fault.py",
+            &json!({"finding": "real research findings"}),
+        );
+        let finding = out["finding"].as_str().unwrap();
+        assert!(
+            finding.starts_with("PIPELINE-FAULT: question research failed — finding unavailable —"),
+            "{out}"
+        );
+        assert!(finding.contains("died without recording"), "{out}");
+    }
+
+    #[test]
+    fn deep_research_vet_fault_degrades_and_preserves() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_deep_research_script(
+            "vet_fault.py",
+            &json!({
+                "source_assessment": "LLM node failed: kaboom",
+                "pipeline_faults": ["PIPELINE-FAULT: earlier"]
+            }),
+        );
+        assert_eq!(
+            out["pipeline_faults"],
+            json!([
+                "PIPELINE-FAULT: earlier",
+                "PIPELINE-FAULT: source vetting failed — LLM node failed: kaboom"
+            ]),
+            "existing faults must be preserved"
+        );
+        let assessment = out["source_assessment"].as_str().unwrap();
+        assert!(
+            !assessment.starts_with("LLM node"),
+            "raw engine error text must not flow into downstream prompts: {out}"
+        );
+        assert!(assessment.contains("unvetted"), "{out}");
+    }
+
+    #[test]
+    fn deep_research_critique_fault_rides_the_pass_default() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_deep_research_script(
+            "critique_fault.py",
+            &json!({"critique": "LLM node failed: dead", "pipeline_faults": []}),
+        );
+        assert_eq!(
+            out["pipeline_faults"],
+            json!(["PIPELINE-FAULT: critique failed — LLM node failed: dead"])
+        );
+        let note = out["critique"].as_str().unwrap();
+        assert!(
+            !note.contains("VERDICT:"),
+            "the note must not synthesize a verdict line: {note}"
+        );
+        // Integration: the rewritten critique rides reflexion_gate's
+        // malformed-critique PASS default straight to synthesis.
+        let gate = run_deep_research_script(
+            "reflexion_gate.py",
+            &json!({"critique": note, "research_attempts": 0}),
+        );
+        assert_eq!(gate, json!({"_next": "synthesize"}));
+    }
+
+    #[test]
+    fn deep_research_synth_fault_normalizes_report() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_deep_research_script(
+            "synth_fault.py",
+            &json!({"report": "Agent node failed: writer died", "pipeline_faults": []}),
+        );
+        assert_eq!(
+            out["fault_text"],
+            "report synthesis failed — no report was produced: Agent node failed: writer died"
+        );
+        assert_eq!(
+            out["pipeline_faults"],
+            json!([
+                "PIPELINE-FAULT: report synthesis failed — no report was produced: Agent node failed: writer died"
+            ])
+        );
+        // A real report never starts with the engine's failure prefix.
+        let out = run_deep_research_script("synth_fault.py", &json!({"report": "# A real report"}));
+        assert!(
+            out["fault_text"]
+                .as_str()
+                .unwrap()
+                .contains("died without recording"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn deep_research_fault_wiring_preserves_sentinel() {
+        use crate::graph::{GraphParser, NodeType};
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/deep-research");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .unwrap();
+
+        // plan: fail-closed. Its output_schema + fallback combination requires
+        // a state_updates capture (the TASK-016 warning) so plan_fault can see
+        // why it was reached.
+        let NodeType::Llm(plan) = &graph.get_node("plan").unwrap().node_type else {
+            panic!("plan must be an llm node")
+        };
+        assert!(plan.output_schema.is_some());
+        assert_eq!(plan.fallback.as_deref(), Some("plan_fault"));
+        assert!(
+            plan.state_updates
+                .as_ref()
+                .is_some_and(|u| u.contains_key("plan_failure")),
+            "plan must capture its failure text for the fault marker"
+        );
+        let plan_fault = graph.get_node("plan_fault").unwrap();
+        assert_eq!(plan_fault.next_target(), Some("end_fault"));
+        let NodeType::Script(pf) = &plan_fault.node_type else {
+            panic!("plan_fault must be a script node")
+        };
+        assert_eq!(pf.fallback.as_deref(), Some("end_fault"));
+
+        // research_one_question: branch-local marker; no `next` so the map
+        // collects the fault as the lane's finding.
+        let NodeType::Llm(question) = &graph.get_node("research_one_question").unwrap().node_type
+        else {
+            panic!("research_one_question must be an llm node")
+        };
+        assert_eq!(question.fallback.as_deref(), Some("question_fault"));
+        assert!(
+            question
+                .state_updates
+                .as_ref()
+                .is_some_and(|u| u.contains_key("finding")),
+            "the failure text must land in the key question_fault normalizes"
+        );
+        assert!(
+            graph.get_node("question_fault").unwrap().next.is_none(),
+            "question_fault must end the branch chain so the map collects the finding"
+        );
+        let NodeType::Map(map) = &graph.get_node("research_each_question").unwrap().node_type
+        else {
+            panic!("research_each_question must be a map node")
+        };
+        assert_eq!(map.over, "{{questions}}");
+        assert_eq!(map.output_key, "finding");
+
+        // vet_sources / critique: degrade-visibly markers that continue to the
+        // stage each node's own `next` pointed to.
+        let NodeType::Llm(vet) = &graph.get_node("vet_sources").unwrap().node_type else {
+            panic!("vet_sources must be an llm node")
+        };
+        assert_eq!(vet.fallback.as_deref(), Some("vet_fault"));
+        assert_eq!(
+            graph.get_node("vet_fault").unwrap().next_target(),
+            Some("critique")
+        );
+        let NodeType::Llm(critique) = &graph.get_node("critique").unwrap().node_type else {
+            panic!("critique must be an llm node")
+        };
+        assert_eq!(critique.fallback.as_deref(), Some("critique_fault"));
+        assert_eq!(
+            graph.get_node("critique_fault").unwrap().next_target(),
+            Some("reflexion_gate")
+        );
+
+        // synthesize: fail-closed via synth_fault → end_fault; the failure
+        // text lands in `report` via state_updates.
+        let NodeType::Agent(synthesize) = &graph.get_node("synthesize").unwrap().node_type else {
+            panic!("synthesize must be an agent node")
+        };
+        assert_eq!(synthesize.fallback.as_deref(), Some("synth_fault"));
+        assert_eq!(synthesize.max_attempts, 2);
+        assert!(
+            synthesize
+                .state_updates
+                .as_ref()
+                .is_some_and(|u| u.contains_key("report"))
+        );
+        assert_eq!(
+            graph.get_node("synth_fault").unwrap().next_target(),
+            Some("end_fault")
+        );
+
+        // end_fault renders the naming-pinned sentinel.
+        let NodeType::End(end) = &graph.get_node("end_fault").unwrap().node_type else {
+            panic!("end_fault must be an end node")
+        };
+        assert_eq!(
+            end.output,
+            "DEEP_RESEARCH FAILED — PIPELINE-FAULT: {{fault_text}}"
+        );
+
+        // Accepted-path visibility: pipeline_notes ("" on a fault-free run,
+        // keeping the happy-path output byte-identical) is appended to the
+        // report and shown at the approval gate.
+        let NodeType::End(accepted) = &graph.get_node("end_accepted").unwrap().node_type else {
+            panic!("end_accepted must be an end node")
+        };
+        assert_eq!(accepted.output, "{{report}}{{pipeline_notes}}");
+        let NodeType::Approval(approve) = &graph.get_node("approve").unwrap().node_type else {
+            panic!("approve must be an approval node")
+        };
+        assert!(approve.question.contains("{{pipeline_notes}}"));
+
+        // Every fault-path state key has an initial_state default; questions'
+        // [] also keeps the sibling knowledge_lookup lane alive for the one
+        // super-step where a dead plan races end_fault (the map resolves
+        // {{questions}} to zero items instead of erroring).
+        assert_eq!(graph.initial_state.get("pipeline_faults"), Some(&json!([])));
+        assert_eq!(graph.initial_state.get("pipeline_notes"), Some(&json!("")));
+        assert_eq!(graph.initial_state.get("fault_text"), Some(&json!("")));
+        assert_eq!(graph.initial_state.get("questions"), Some(&json!([])));
+    }
+
     #[test]
     #[serial]
     fn install_functions_force_preserves_user_mcp_json() {
