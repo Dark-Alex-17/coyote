@@ -473,8 +473,11 @@ mod tests {
         assert!(chain.contains("connection error"), "{chain}");
     }
 
+    /// Attempt 2 is bounded by the same 1s wall clock as attempt 1 and
+    /// sleeps for most of it; it can only succeed if the retry owns a fresh
+    /// budget rather than the deadline attempt 1 already exhausted.
     #[tokio::test(start_paused = true)]
-    async fn run_with_retries_retries_a_timeout_and_succeeds() {
+    async fn run_with_retries_gives_each_attempt_a_fresh_timeout_budget() {
         let mut ctx = plain_ctx();
         let node = retryable_node(2);
         let mut attempts = 0u32;
@@ -493,7 +496,10 @@ mod tests {
                         std::future::pending::<Result<String>>(),
                     ))
                 } else {
-                    boxed_attempt(async move { Ok("recovered".to_string()) })
+                    boxed_attempt(bounded_attempt("test_agent", 1, async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                        Ok("recovered".to_string())
+                    }))
                 }
             }),
         )

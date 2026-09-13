@@ -36,32 +36,43 @@ impl LlmNodeExecutor {
         abort: &AbortSignal,
     ) -> Result<LlmExecutionOutcome> {
         let result = run(node_id, node, state_manager, parent_ctx, abort).await;
-        let (output, failure_reason) = match result {
-            Ok(raw) => match &node.output_schema {
-                Some(schema) => match structured::extract(&raw, schema, parent_ctx).await {
-                    Ok(value) => (value, None),
-                    Err(e) => {
-                        warn!("llm node structured extraction failed: {e:#}");
-                        (
-                            Value::String(format!("LLM node structured-extraction failed: {e:#}")),
-                            Some(format!("structured-extraction failed: {e:#}")),
-                        )
-                    }
-                },
-                None => (Value::String(raw), None),
-            },
-            Err(e) => {
-                warn!("llm node failed: {e:#}");
-                (
-                    Value::String(format!("LLM node failed: {e:#}")),
-                    Some(format!("LLM call failed: {e:#}")),
-                )
-            }
-        };
-
-        apply_state_updates_with_output(node, state_manager, &output);
-        outcome_from(failure_reason.as_deref(), node.fallback.as_deref())
+        finish(node, state_manager, parent_ctx, result).await
     }
+}
+
+/// Extraction, state_updates, and the outcome for an already-finished run.
+/// Split from `execute` so tests can feed a raw run result without a model.
+async fn finish(
+    node: &LlmNode,
+    state_manager: &mut StateManager,
+    parent_ctx: &mut RequestContext,
+    result: Result<String>,
+) -> Result<LlmExecutionOutcome> {
+    let (output, failure_reason) = match result {
+        Ok(raw) => match &node.output_schema {
+            Some(schema) => match structured::extract(&raw, schema, parent_ctx).await {
+                Ok(value) => (value, None),
+                Err(e) => {
+                    warn!("llm node structured extraction failed: {e:#}");
+                    (
+                        Value::String(format!("LLM node structured-extraction failed: {e:#}")),
+                        Some(format!("structured-extraction failed: {e:#}")),
+                    )
+                }
+            },
+            None => (Value::String(raw), None),
+        },
+        Err(e) => {
+            warn!("llm node failed: {e:#}");
+            (
+                Value::String(format!("LLM node failed: {e:#}")),
+                Some(format!("LLM call failed: {e:#}")),
+            )
+        }
+    };
+
+    apply_state_updates_with_output(node, state_manager, &output);
+    outcome_from(failure_reason.as_deref(), node.fallback.as_deref())
 }
 
 fn outcome_from(
@@ -851,5 +862,75 @@ mod tests {
             .expect("state_updates still run before the bail")
             .to_string();
         assert!(captured.starts_with("LLM node failed: "), "{captured}");
+    }
+
+    /// A run that succeeds but yields unparseable output must fault through
+    /// the structured-extraction branch with the extractor's full chain, so
+    /// fallback scripts can tell "model spoke prose" from "model call failed".
+    #[tokio::test]
+    async fn structured_extraction_failure_text_carries_full_error_chain() {
+        let mut u = HashMap::new();
+        u.insert("captured".into(), "{{output}}".into());
+        let mut node = node_with_schema(Some(u), json!({"type": "object"}));
+        node.fallback = Some("fb".into());
+        let mut state = manager_with(&[]);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+
+        let outcome = finish(&node, &mut state, &mut ctx, Ok("not json".to_string()))
+            .await
+            .expect("a declared fallback turns the failure into a route");
+
+        assert_eq!(outcome, LlmExecutionOutcome::FellBack("fb".into()));
+        let captured = state
+            .state()
+            .get("captured")
+            .and_then(Value::as_str)
+            .expect("captured failure text is a string")
+            .to_string();
+        assert!(
+            captured.starts_with("LLM node structured-extraction failed: "),
+            "{captured}"
+        );
+        assert!(
+            captured.contains("Structured-output extractor LLM call failed: "),
+            "{captured}"
+        );
+        assert!(captured.contains("Invalid model"), "{captured}");
+    }
+
+    /// Without a fallback the extraction fault bails, wrapping the same
+    /// extractor chain the state_updates text carries.
+    #[tokio::test]
+    async fn structured_extraction_failure_without_fallback_bails_with_full_chain() {
+        let mut u = HashMap::new();
+        u.insert("captured".into(), "{{output}}".into());
+        let mut node = node_with_schema(Some(u), json!({"type": "object"}));
+        node.fallback = None;
+        let mut state = manager_with(&[]);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+
+        let err = finish(&node, &mut state, &mut ctx, Ok("not json".to_string()))
+            .await
+            .expect_err("no fallback means the failure bails");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(
+                "LLM node failed and no fallback declared: structured-extraction failed: Structured-output extractor LLM call failed"
+            ),
+            "{chain}"
+        );
+        let captured = state
+            .state()
+            .get("captured")
+            .and_then(Value::as_str)
+            .expect("state_updates still run before the bail")
+            .to_string();
+        assert!(
+            captured.starts_with("LLM node structured-extraction failed: "),
+            "{captured}"
+        );
     }
 }
