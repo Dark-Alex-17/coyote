@@ -7,6 +7,7 @@ use super::wall_clock;
 use crate::config::RequestContext;
 use crate::function::agents::run_agent_for_graph;
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
+use crate::utils::create_abort_signal;
 use anyhow::{Context, Error, Result, anyhow};
 use log::{debug, warn};
 use serde_json::Value;
@@ -145,8 +146,14 @@ async fn attempt_and_extract(
     )
     .await?;
 
+    // Agent nodes carry no graph abort; the session signal is the interrupt
+    // the executor bridges onto the graph abort anyway.
+    let abort = parent_ctx
+        .session_abort
+        .clone()
+        .unwrap_or_else(create_abort_signal);
     let output_value = match &node.output_schema {
-        Some(schema) => structured::extract(&raw, schema, parent_ctx)
+        Some(schema) => structured::extract(&raw, schema, parent_ctx, &abort)
             .await
             .with_context(|| {
                 format!(
@@ -731,6 +738,38 @@ mod tests {
             chain.contains("output failed structured-output extraction"),
             "{chain}"
         );
+    }
+
+    /// Agent-node extraction runs on the session abort: a fired signal
+    /// stops the extractor before it issues a request.
+    #[tokio::test]
+    async fn extraction_honours_a_fired_session_abort() {
+        let mut ctx = plain_ctx();
+        let session = create_abort_signal();
+        session.set_ctrlc();
+        ctx.session_abort = Some(session);
+        let mut node = retryable_node(1);
+        node.output_schema = Some(json!({"type": "object"}));
+        let mut state = manager_with(&[]);
+
+        let err = attempt_and_extract(
+            "test_node",
+            &node,
+            &mut state,
+            &mut ctx,
+            false,
+            &mut attempt_runner(|_ctx| boxed_attempt(async move { Ok("not json".to_string()) })),
+        )
+        .await
+        .expect_err("an aborted session must stop the extractor");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("output failed structured-output extraction"),
+            "{chain}"
+        );
+        assert!(chain.contains("Aborted."), "{chain}");
+        assert!(!chain.contains("Invalid model"), "{chain}");
     }
 
     fn failure_capture_updates() -> HashMap<String, String> {
