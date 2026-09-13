@@ -9398,6 +9398,17 @@ mod tests {
                 .is_some_and(|s| s.contains("Never begin `evidence`")),
             "check_criterion must be told the PIPELINE-FAULT evidence prefix is reserved"
         );
+        assert_eq!(
+            llm.tools.as_deref(),
+            Some(&["fs_read", "fs_cat", "fs_grep", "ast_grep"].map(String::from)[..]),
+            "check_criterion must have read-only tools only: no execute_command, so it can never run checks itself"
+        );
+        assert!(
+            llm.instructions
+                .as_deref()
+                .is_some_and(|s| s.contains("judged ONLY against the recorded verification runs")),
+            "check_criterion must be told execution criteria are judged from the recorded runs, never by running anything"
+        );
 
         let fault = graph
             .nodes
@@ -9425,6 +9436,141 @@ mod tests {
             panic!("holistic must be an llm node");
         };
         assert_eq!(holistic.max_iterations, 20);
+    }
+
+    const BUNDLED_GRAPHS: [&str; 6] = [
+        "adversary",
+        "review-gauntlet",
+        "code-reviewer",
+        "finding-verifier",
+        "deep-research",
+        "step-runner",
+    ];
+
+    fn load_bundled_graph(name: &str) -> crate::graph::Graph {
+        use crate::graph::GraphParser;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents")
+            .join(name);
+        GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .unwrap_or_else(|e| panic!("{name} graph.yaml must parse: {e}"))
+    }
+
+    fn node_fallback(node_type: &crate::graph::NodeType) -> Option<&str> {
+        use crate::graph::NodeType;
+        match node_type {
+            NodeType::Llm(l) => l.fallback.as_deref(),
+            NodeType::Agent(a) => a.fallback.as_deref(),
+            NodeType::Script(s) => s.fallback.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// `default_max_attempts()` is 1, so a `max_attempts:` line silently
+    /// dropped from a graph.yaml would turn a retried agent lane into a
+    /// one-shot without any validator complaint. Every bundled agent node
+    /// retries exactly once, except step-runner's coder: rerunning a coder
+    /// that died mid-edit against the mutated tree is unsafe.
+    #[test]
+    fn bundled_graph_agent_nodes_retry_exactly_once_except_step_runner_implement() {
+        use crate::graph::NodeType;
+
+        let mut seen = Vec::new();
+        for name in BUNDLED_GRAPHS {
+            let graph = load_bundled_graph(name);
+            for (id, node) in &graph.nodes {
+                let NodeType::Agent(agent) = &node.node_type else {
+                    continue;
+                };
+                let label = format!("{name}/{id}");
+                let expected = if label == "step-runner/implement" {
+                    1
+                } else {
+                    2
+                };
+                assert_eq!(
+                    agent.max_attempts, expected,
+                    "{label} must have max_attempts {expected}"
+                );
+                seen.push(label);
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                "code-reviewer/review_domain",
+                "code-reviewer/verify",
+                "deep-research/synthesize",
+                "review-gauntlet/run_adversary",
+                "review-gauntlet/run_code_review",
+                "review-gauntlet/run_probe",
+                "review-gauntlet/run_security",
+                "step-runner/implement",
+                "step-runner/independent_review",
+            ],
+            "the sweep must cover every bundled agent node; update this list when one is added or removed"
+        );
+    }
+
+    /// An llm/agent node without a fallback sinks its whole map or graph
+    /// when the model dies after retries. Every such node in the bundled
+    /// graphs currently declares one; any future exemption must be listed
+    /// here by `<graph>/<node_id>` with the reason it is safe to sink.
+    #[test]
+    fn bundled_graph_llm_and_agent_nodes_all_declare_fallbacks() {
+        use crate::graph::NodeType;
+
+        let mut graphs = std::collections::BTreeMap::new();
+        for name in BUNDLED_GRAPHS {
+            let graph = load_bundled_graph(name);
+            for (id, node) in &graph.nodes {
+                if !matches!(node.node_type, NodeType::Llm(_) | NodeType::Agent(_)) {
+                    continue;
+                }
+                let target = node_fallback(&node.node_type)
+                    .unwrap_or_else(|| panic!("{name}/{id} must declare a fallback"));
+                assert!(
+                    graph.nodes.contains_key(target),
+                    "{name}/{id} fallback target {target} does not exist"
+                );
+            }
+            graphs.insert(name, graph);
+        }
+
+        let wiring = [
+            ("review-gauntlet", "parse", "parse_fault"),
+            ("review-gauntlet", "select_lanes", "default_lanes"),
+            ("review-gauntlet", "run_code_review", "lane_fault"),
+            ("review-gauntlet", "run_adversary", "lane_fault"),
+            ("review-gauntlet", "run_security", "lane_fault"),
+            ("review-gauntlet", "run_probe", "lane_fault"),
+            ("code-reviewer", "parse", "parse_fault"),
+            ("code-reviewer", "refine_groups", "cover_gate"),
+            ("code-reviewer", "review_domain", "domain_fault"),
+            ("code-reviewer", "aux_lanes", "aux_fault"),
+            ("adversary", "parse", "pipeline_fault"),
+            ("adversary", "facts", "pipeline_fault"),
+            ("adversary", "run_checks", "pipeline_fault"),
+            ("adversary", "holistic", "verdict"),
+        ];
+        for (name, id, target) in wiring {
+            let graph = &graphs[name];
+            let node = graph
+                .nodes
+                .get(id)
+                .unwrap_or_else(|| panic!("{name} graph must have a {id} node"));
+            assert_eq!(
+                node_fallback(&node.node_type),
+                Some(target),
+                "{name}/{id} must fall back to {target}"
+            );
+            assert!(
+                graph.nodes.contains_key(target),
+                "{name}/{id} fallback target {target} does not exist"
+            );
+        }
     }
 
     // ---- review-gauntlet suite-script regression tests ----
