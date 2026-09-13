@@ -41,19 +41,19 @@ impl LlmNodeExecutor {
                 Some(schema) => match structured::extract(&raw, schema, parent_ctx).await {
                     Ok(value) => (value, None),
                     Err(e) => {
-                        warn!("llm node structured extraction failed: {e}");
+                        warn!("llm node structured extraction failed: {e:#}");
                         (
-                            Value::String(format!("LLM node structured-extraction failed: {e}")),
-                            Some(format!("structured-extraction failed: {e}")),
+                            Value::String(format!("LLM node structured-extraction failed: {e:#}")),
+                            Some(format!("structured-extraction failed: {e:#}")),
                         )
                     }
                 },
                 None => (Value::String(raw), None),
             },
             Err(e) => {
-                warn!("llm node failed: {e}");
+                warn!("llm node failed: {e:#}");
                 (
-                    Value::String(format!("LLM node failed: {e}")),
+                    Value::String(format!("LLM node failed: {e:#}")),
                     Some(format!("LLM call failed: {e:#}")),
                 )
             }
@@ -771,6 +771,51 @@ mod tests {
             state.state().get(OUTPUT_KEY),
             None,
             "no output is recorded for an aborted node without state_updates"
+        );
+    }
+
+    /// The fault text written through state_updates must carry the full
+    /// anyhow chain, not just the outermost context, so downstream fault
+    /// scripts can surface the root cause.
+    #[tokio::test]
+    async fn failure_text_in_state_updates_carries_full_error_chain() {
+        let mut u = HashMap::new();
+        u.insert("captured".into(), "{{output}}".into());
+        let mut node = node_with(Some(u));
+        node.prompt = "{{nope}}".into();
+        node.fallback = Some("fb".into());
+        let mut state = manager_with(&[]);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let abort = create_abort_signal();
+
+        let inner = state
+            .interpolate(&node.prompt)
+            .context("Failed to interpolate llm node prompt")
+            .expect_err("missing reference must fail interpolation");
+        assert_ne!(
+            format!("{inner:#}"),
+            format!("{inner}"),
+            "the chosen error must have more than one level of context"
+        );
+
+        let outcome = LlmNodeExecutor::execute("think", &node, &mut state, &mut ctx, &abort)
+            .await
+            .expect("a declared fallback turns the failure into a route");
+
+        assert_eq!(outcome, LlmExecutionOutcome::FellBack("fb".into()));
+        let captured = state
+            .state()
+            .get("captured")
+            .and_then(Value::as_str)
+            .expect("captured failure text is a string")
+            .to_string();
+        assert!(captured.starts_with("LLM node failed: "), "{captured}");
+        assert!(
+            captured.contains(
+                "Failed to interpolate llm node prompt: Template interpolation failed: 'nope' not found in state"
+            ),
+            "{captured}"
         );
     }
 }
