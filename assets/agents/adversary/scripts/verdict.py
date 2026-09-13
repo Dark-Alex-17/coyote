@@ -7,7 +7,7 @@ a missing plan or a degraded (faulted) pipeline — is DIVERGES (fail-closed).
 Any "PIPELINE-FAULT:" marker recorded in `pipeline_faults` (or a holistic
 llm-node failure captured in `holistic_failure`) becomes complaint #1;
 per-criterion results are still reported. A criterion whose check DIED
-(criterion_fault's UNMET verdict, evidence prefixed "PIPELINE-FAULT:") is
+(criterion_fault's UNMET verdict, evidence prefixed DIED_EVIDENCE_PREFIX) is
 rendered as died rather than judged and counted as unmet regardless of the
 status it carries. Assembles the exact sentinel format the callers route on.
 Never crashes into a silent verdict.
@@ -18,11 +18,12 @@ import os
 
 MAX_FAULT_DETAIL_CHARS = 300
 DIED_MARKER = "criterion check DIED (pipeline fault)"
+DIED_EVIDENCE_PREFIX = "PIPELINE-FAULT: criterion "
 
 
 def died(v):
     evidence = v.get("evidence")
-    return isinstance(evidence, str) and evidence.startswith("PIPELINE-FAULT:")
+    return isinstance(evidence, str) and evidence.startswith(DIED_EVIDENCE_PREFIX)
 
 
 def load_state():
@@ -69,7 +70,7 @@ def append_criterion_complaints(lines, verdicts, extra, start):
         complaint = (v.get("complaint") or "").strip()
         if died(v):
             if not complaint.startswith(DIED_MARKER):
-                complaint = f"{DIED_MARKER} — {complaint}"
+                complaint = f"{DIED_MARKER} — {complaint}" if complaint else DIED_MARKER
             lines.append(f'{i}. Acceptance criterion "{text}" — {complaint}')
         else:
             lines.append(
@@ -174,9 +175,14 @@ def main():
             lines.append(observations)
     else:
         lines.append("ADVERSARIAL_REVIEW: DIVERGES")
-        lines.append(
-            f"Criteria: {len(met)}/{n} met, {len(partial)} partial, {len(bad)} unmet/diverged."
-        )
+        header = f"Criteria: {len(met)}/{n} met, {len(partial)} partial, {len(bad)} unmet/diverged"
+        if died_count := sum(1 for v in verdicts if died(v)):
+            header += (
+                f" — degraded run: {died_count} criterion check(s) died (fail-closed)."
+            )
+        else:
+            header += "."
+        lines.append(header)
         lines.append("Complaints:")
         append_criterion_complaints(lines, verdicts, extra, 0)
         if observations:

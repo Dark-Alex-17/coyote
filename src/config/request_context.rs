@@ -8411,16 +8411,25 @@ mod tests {
         run_adversary_script_env(script, state, &[])
     }
 
+    // Scripts' load_state() prefers GRAPH_STATE_FILE over GRAPH_STATE, so an
+    // inherited live state file (adversary verifying this repo) must not win.
+    fn adversary_script_command(script: &str, state: &serde_json::Value) -> std::process::Command {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/adversary/scripts")
+            .join(script);
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg(&path)
+            .env("GRAPH_STATE", state.to_string())
+            .env_remove("GRAPH_STATE_FILE");
+        cmd
+    }
+
     fn run_adversary_script_env(
         script: &str,
         state: &serde_json::Value,
         envs: &[(&str, &str)],
     ) -> serde_json::Value {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("assets/agents/adversary/scripts")
-            .join(script);
-        let mut cmd = std::process::Command::new("python3");
-        cmd.arg(&path).env("GRAPH_STATE", state.to_string());
+        let mut cmd = adversary_script_command(script, state);
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -8941,6 +8950,24 @@ mod tests {
     }
 
     #[test]
+    fn adversary_script_helper_ignores_inherited_graph_state_file() {
+        let cmd = adversary_script_command("criterion_fault.py", &json!({}));
+        let removed = cmd
+            .get_envs()
+            .any(|(k, v)| k == "GRAPH_STATE_FILE" && v.is_none());
+        assert!(
+            removed,
+            "GRAPH_STATE_FILE must be explicitly removed so an inherited live state file cannot shadow GRAPH_STATE: {:?}",
+            cmd.get_envs().collect::<Vec<_>>()
+        );
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == "GRAPH_STATE" && v.is_some()),
+            "GRAPH_STATE must still carry the synthetic state"
+        );
+    }
+
+    #[test]
     fn adversary_verdict_renders_died_criterion_and_never_conforms() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
@@ -8966,8 +8993,8 @@ mod tests {
             "a died criterion must never conform: {report}"
         );
         assert!(
-            report.contains("Criteria: 1/2 met, 0 partial, 1 unmet/diverged."),
-            "the died criterion counts as unmet: {report}"
+            report.contains("Criteria: 1/2 met, 0 partial, 1 unmet/diverged — degraded run: 1 criterion check(s) died (fail-closed)."),
+            "the died criterion counts as unmet and the header flags the degraded run: {report}"
         );
         assert!(
             report.contains(
@@ -9014,12 +9041,20 @@ mod tests {
             "a fault-marked verdict must never conform, whatever status it carries: {report}"
         );
         assert!(
-            report.contains("Criteria: 1/2 met, 0 partial, 1 unmet/diverged."),
-            "the fault-marked verdict counts as unmet, not met: {report}"
+            report.contains("Criteria: 1/2 met, 0 partial, 1 unmet/diverged — degraded run: 1 criterion check(s) died (fail-closed)."),
+            "the fault-marked verdict counts as unmet, not met, and the header flags the degraded run: {report}"
+        );
+        let died_line = report
+            .lines()
+            .find(|l| l.contains("criterion check DIED (pipeline fault)"))
+            .unwrap_or_else(|| panic!("a fault-marked verdict must render as died: {report}"));
+        assert!(
+            !died_line.ends_with("— "),
+            "an empty complaint must not leave a dangling em-dash: {died_line:?}"
         );
         assert!(
-            report.contains("criterion check DIED (pipeline fault)"),
-            "a fault-marked verdict must render as died: {report}"
+            died_line.ends_with("criterion check DIED (pipeline fault)"),
+            "with no complaint the died marker stands alone: {died_line:?}"
         );
         let met_section = report
             .split("Met criteria (evidence):")
@@ -9028,6 +9063,87 @@ mod tests {
         assert!(
             !met_section.contains("does Y"),
             "the fault-marked verdict must not be listed as met: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_quoted_marker_in_met_evidence_is_not_died() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Free-text evidence that merely quotes the marker (not the exact
+        // prefix criterion_fault emits) is a genuine MET, not a died check.
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "renders the fault marker", "status": "MET",
+                 "evidence": "PIPELINE-FAULT: is emitted by criterion_fault.py per verdict.py:70",
+                 "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": []
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: CONFORMS"),
+            "evidence quoting the marker must not be reclassified as died: {report}"
+        );
+        assert!(
+            !report.contains("DIED"),
+            "no died rendering for a genuine MET: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_died_criterion_under_pipeline_fault_banner() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": ["PIPELINE-FAULT: parse failed — cannot review: LLM node failed: boom"],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""},
+                {"id": "c2", "text": "does Y", "status": "UNMET",
+                 "evidence": "PIPELINE-FAULT: criterion check failed — LLM node failed: boom",
+                 "complaint": "criterion check DIED (pipeline fault) — LLM node failed: boom; the criterion was NOT verified and is treated as unmet (fail-closed)"}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": []
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "a pipeline fault plus a died criterion must never conform: {report}"
+        );
+        assert!(
+            report.contains("Criteria: 1/2 met, 0 partial, 1 unmet/diverged — degraded run: pipeline fault recorded (fail-closed)."),
+            "the pipeline-fault banner takes precedence in the header: {report}"
+        );
+        assert!(
+            report
+                .contains("1. PIPELINE-FAULT: parse failed — cannot review: LLM node failed: boom"),
+            "the pipeline fault is complaint #1: {report}"
+        );
+        assert!(
+            report.contains(
+                "2. Acceptance criterion \"does Y\" — criterion check DIED (pipeline fault) — "
+            ),
+            "the died criterion is complaint #2: {report}"
+        );
+        let met_section = report
+            .split("Met criteria (evidence):")
+            .nth(1)
+            .expect("the genuine MET criterion produces an evidence appendix");
+        assert!(
+            !met_section.contains("does Y"),
+            "the died criterion must not be listed as met: {report}"
         );
     }
 
@@ -9132,6 +9248,12 @@ mod tests {
                 .as_deref()
                 .is_some_and(|s| s.contains("bounded tool budget")),
             "check_criterion must be told its tool budget is bounded"
+        );
+        assert!(
+            llm.instructions
+                .as_deref()
+                .is_some_and(|s| s.contains("Never begin `evidence`")),
+            "check_criterion must be told the PIPELINE-FAULT evidence prefix is reserved"
         );
 
         let fault = graph

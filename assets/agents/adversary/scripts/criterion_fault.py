@@ -7,7 +7,10 @@ state_updates. Converts that text into a schema-shaped UNMET verdict whose
 evidence carries a "PIPELINE-FAULT:" marker, so one criterion check that dies
 (max_iterations exhausted, API failure) is recorded as DIED rather than
 judged, the other criteria still get verdicts, and the run is DIVERGES. The
-map collects it like any other verdict — the branch never sinks the map.
+map collects it like any other verdict — the branch never sinks the map. The
+engine applies state_updates before routing to the fallback (src/graph/llm.rs:
+`apply_state_updates_with_output`, then `outcome_from`), so the "no failure
+text captured" branch is belt-and-braces rather than an expected path.
 """
 
 import json

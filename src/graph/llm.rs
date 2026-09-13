@@ -251,7 +251,7 @@ async fn run_with_retries(
         match run_chat_loop(node, prompt, ctx, abort).await {
             Ok(out) => return Ok(out),
             Err(e) if is_transient_error(&e) && attempt < node.max_attempts => {
-                warn!("llm node attempt {attempt} failed (transient): {e}; retrying");
+                warn!("llm node attempt {attempt} failed (transient): {e:#}; retrying");
                 last_err = Some(e);
             }
             Err(e) => return Err(e),

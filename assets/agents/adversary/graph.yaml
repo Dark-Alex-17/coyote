@@ -217,6 +217,8 @@ nodes:
       The id is stamped from the criterion itself — your echo is informative only.
       You have a bounded tool budget — prefer fs_grep and line-ranged fs_read over
       whole-file reads, and conclude as soon as the evidence is decisive.
+      Never begin `evidence` with the literal `PIPELINE-FAULT:` — that prefix is
+      reserved for the graph's own fault markers.
     prompt: |
       Repository: {{project_dir}}
       Changed files: {{changed_files}}
@@ -255,7 +257,7 @@ nodes:
   criterion_fault:
     id: criterion_fault
     type: script
-    description: Fail-closed per-criterion fault marker (reached only via check_criterion's fallback) — converts the captured "LLM node failed" text into a schema-shaped UNMET verdict carrying a PIPELINE-FAULT evidence marker, so one dead criterion check can never sink the map or read as met. Never sinks the map.
+    description: Fail-closed per-criterion fault marker (reached only via check_criterion's fallback) — converts the captured "LLM node failed" text into a schema-shaped UNMET verdict carrying a PIPELINE-FAULT evidence marker, so one dead criterion check can never sink the map or read as met.
     script: scripts/criterion_fault.py
     timeout: 30
 
