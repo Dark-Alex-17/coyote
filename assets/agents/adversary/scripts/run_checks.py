@@ -147,7 +147,8 @@ def main():
         cmds = declared_commands(state.get("verification_commands"))
     except InvalidDeclaration as e:
         msg = f"PIPELINE-FAULT: verification_commands declaration invalid — {e}"
-        faults = [f for f in (state.get("pipeline_faults") or []) if isinstance(f, str)]
+        prior = state.get("pipeline_faults")
+        faults = [f for f in prior if isinstance(f, str)] if isinstance(prior, list) else []
         faults.append(msg)
         print(json.dumps({"exec_results": msg, "pipeline_faults": faults}))
         return

@@ -8233,6 +8233,8 @@ mod tests {
 
         const VARIABLES_FORM: &str =
             "--variables {\"verification_commands\": \"[\\\"cargo test --all\\\"";
+        const EXAMPLE_CUE: &str =
+            "only an EXAMPLE: replace them with THIS project's exact build/test/lint commands";
         for name in ["architect", "sisyphus"] {
             let config =
                 read_to_string(paths::agents_data_dir().join(name).join("config.yaml")).unwrap();
@@ -8253,6 +8255,11 @@ mod tests {
             assert!(
                 config.contains("untrusted pasted text"),
                 "{name} config must name the untrusted prompt text as the reason"
+            );
+            assert!(
+                config.matches(EXAMPLE_CUE).count() >= 2,
+                "{name} config must mark the cargo commands as an example to substitute on both \
+                 spawn templates, or a literal follower records `cargo: command not found` in non-Rust repos"
             );
         }
 
@@ -9093,6 +9100,20 @@ mod tests {
         assert!(
             !pwned.exists(),
             "an invalid declaration must execute nothing, even its string items"
+        );
+
+        // A non-list prior `pipeline_faults` is never iterated character by
+        // character; only the new marker is recorded.
+        let out = run_adversary_script(
+            "run_checks.py",
+            &json!({"verification_commands": "not json", "pipeline_faults": "oops"}),
+        );
+        let marker = out["exec_results"].as_str().unwrap();
+        assert!(marker.starts_with(FAULT), "{marker}");
+        assert_eq!(
+            out["pipeline_faults"],
+            json!([marker]),
+            "a string-valued prior pipeline_faults must not be spread into characters"
         );
     }
 
@@ -10614,6 +10635,11 @@ mod tests {
             "verification commands are a structured input, never lane-prompt prose: {}",
             adv.prompt
         );
+        assert!(
+            adv.prompt.contains("arrive as a structured input"),
+            "run_adversary's prompt must say where the commands come from instead: {}",
+            adv.prompt
+        );
         let node = graph
             .nodes
             .get("run_probe")
@@ -10647,6 +10673,19 @@ mod tests {
                 var.default.as_deref(),
                 Some("[]"),
                 "{name}: variables land as strings, so the default is the JSON-encoded empty list"
+            );
+            // The YAML block scalar wraps mid-sentence; pin the words, not the wrap.
+            let description = var
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                description.contains("JSON array of shell commands the CALLER declares")
+                    && description.contains("Never inferred from the prompt"),
+                "{name}: the variable must tell the caller what it is and that it is never \
+                 extracted from the prompt: {}",
+                description
             );
             assert!(
                 !graph.initial_state.contains_key("verification_commands"),

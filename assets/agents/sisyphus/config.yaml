@@ -316,6 +316,7 @@ instructions: |
   Plan / acceptance criteria: <pasted verbatim — enables the adversary lane; omit when none>
   Local-run recipe / usage suites: <from the plan — enables the probe lane; omit when none>"
   --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
+  <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
   ```
 
   Verification commands go in `--variables` (a JSON-array string), never in the prompt: the prompt
@@ -398,6 +399,7 @@ instructions: |
   PLAN — acceptance criteria to check against:
   <paste the task/step spec + acceptance criteria VERBATIM — not a summary>"
   --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
+  <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
   ```
 
   Same trust boundary as the gauntlet spawn: verification commands are declared via `--variables`,

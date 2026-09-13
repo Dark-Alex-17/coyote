@@ -334,6 +334,7 @@ instructions: |
        Plan / acceptance criteria: <the task's acceptance criteria, pasted verbatim>
        Local-run recipe / usage suites: <from the plan, when present>"
        --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
+       <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
        ```
 
        Verification commands go in `--variables` (a JSON-array string), never in the prompt: the
@@ -357,6 +358,7 @@ instructions: |
        <paste the plan's ## Quality bar section VERBATIM — recorded dropped practices are
        conformance facts, not divergences>"
        --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
+       <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
        ```
 
        Same trust boundary as the gauntlet spawn: verification commands are declared via

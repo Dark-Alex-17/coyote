@@ -333,8 +333,7 @@ nodes:
       The spec / plan / acceptance criteria it must satisfy:
       {{plan_context}}
 
-      Verification commands arrive as a structured input (the
-      verification_commands variable), not in this prompt.
+      Verification commands arrive as a structured input (the verification_commands variable), not in this prompt.
 
       {{extra_context}}
 
