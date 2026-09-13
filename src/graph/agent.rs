@@ -20,8 +20,6 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum AgentExecutionOutcome {
-    /// Carries the raw agent output for tests; the executor's agent arm
-    /// ignores the payload.
     Continue(String),
     FellBack(String),
 }
@@ -49,8 +47,8 @@ impl AgentNodeExecutor {
 }
 
 /// Turns the node run's final result into a routing outcome. With a
-/// `fallback` declared, any failure — retries exhausted, hard error, or
-/// extraction failure — is written into state as
+/// `fallback` declared, any failure (e.g. retries exhausted, hard error, or
+/// extraction failure) is written into state as
 /// `"Agent node failed: <chain>"` and routes to the fallback. Only the
 /// node's `state_updates` can capture that string (bound as `{{output}}`
 /// during interpolation); the output-schema auto-merge never applies to it,
@@ -192,11 +190,11 @@ fn boxed_attempt<'a>(fut: impl Future<Output = Result<String>> + Send + 'a) -> A
 /// failures that `is_transient_error` recognizes.
 ///
 /// `run_agent_for_graph` takes the peer identity off the ctx and never
-/// restores it, so BOTH halves — the (id, inbox) assignment and the registry
-/// — are captured up front and re-armed before every retry; re-arming only
+/// restores it, so BOTH halves, the (id, inbox) assignment and the registry,
+/// are captured up front and re-armed before every retry; re-arming only
 /// the assignment would give a retried attempt its identity back but no
 /// roster and a broken `agent__send_message`. A frontier peer is retired
-/// exactly once, after the final attempt, the moment the agent stops — not
+/// exactly once, after the final attempt, the moment the agent stops, not
 /// after extraction. Chains re-arm the same identity for later steps and
 /// leave retirement to the chain runner.
 async fn run_with_retries(
@@ -259,8 +257,8 @@ async fn retry_transient(
 }
 
 /// Applies the wall-clock bound and the human-readable failure contexts to a
-/// single attempt. The contexts land here — before the caller inspects the
-/// error — because `tokio::time::error::Elapsed` renders as "deadline has
+/// single attempt. The contexts land here, before the caller inspects the
+/// error, because `tokio::time::error::Elapsed` renders as "deadline has
 /// elapsed", which the transient matcher would not recognize as a timeout.
 async fn bounded_attempt(
     agent_name: &str,

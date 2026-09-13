@@ -38,7 +38,7 @@ initial_state:
   research_attempts: 0
   local_context: ''
   local_sources: ''
-  # Fault-path defaults (TASK-023 hardening). `questions: []` also keeps the
+  # Fault-path defaults. `questions: []` also keeps the
   # knowledge_lookup lane alive for one super-step when `plan` dies inside the
   # static fan-out: research_each_question maps over zero items while the
   # plan_fault → end_fault route renders the failure sentinel.
@@ -100,7 +100,7 @@ nodes:
           description: 3-5 specific, self-contained sub-questions.
       required: [research_plan, questions]
     # On success plan_failure holds the node's structured JSON output; on
-    # failure the engine writes "LLM node …failed: <chain>" into it BEFORE
+    # failure the engine writes "LLM node ...failed: <chain>" into it BEFORE
     # routing to the fallback (schema properties are only merged on success).
     state_updates:
       plan_failure: '{{output}}'
@@ -175,7 +175,7 @@ nodes:
     max_attempts: 2
     state_updates:
       finding: '{{output}}'
-    # On failure the engine writes "LLM node …failed: <chain>" into `finding`
+    # On failure the engine writes "LLM node ...failed: <chain>" into `finding`
     # via the state_updates above BEFORE routing to the fallback. The marker
     # is branch-local: a map branch's fallback must stay inside the branch.
     fallback: question_fault

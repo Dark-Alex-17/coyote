@@ -294,8 +294,8 @@ async fn run_chain_step(
                     branch_nodes.sort_unstable();
                     bail!(
                         "routed to '{target}' which is outside the branch subgraph rooted at \
-                         '{}' (branch nodes: {}). Routing targets inside a map branch — script \
-                         `_next` or node fallback — must stay within the branch.",
+                         '{}' (branch nodes: {}). Routing targets inside a map branch (script \
+                         `_next` or node fallback) must stay within the branch.",
                         chain.entry,
                         branch_nodes.join(", ")
                     );
@@ -1282,7 +1282,7 @@ nodes:
         );
         assert!(
             chain.contains(
-                "Routing targets inside a map branch — script `_next` or node fallback — \
+                "Routing targets inside a map branch (script `_next` or node fallback) \
                  must stay within the branch."
             ),
             "{chain}"

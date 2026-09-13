@@ -23,6 +23,7 @@ pub use executor::GraphExecutor;
 pub use parser::{GraphParser, agent_has_graph};
 use serde_json::Value;
 use std::time::Duration;
+use anyhow::Error;
 pub use types::{Graph, NodeType};
 
 pub const GRAPH_SCHEMA_VERSION: &str = "1.0";
@@ -34,12 +35,7 @@ pub(crate) fn wall_clock(secs: u64) -> Option<Duration> {
     (secs != 0).then(|| Duration::from_secs(secs))
 }
 
-/// Whether an error looks like a transient transport/provider failure worth
-/// retrying. Typed transport errors anywhere in the chain (reqwest
-/// connect/timeout failures and tokio's `Elapsed`) are recognized first;
-/// providers that surface failures only as rendered text fall back to
-/// substring matching over the whole context chain.
-pub(crate) fn is_transient_error(err: &anyhow::Error) -> bool {
+pub(crate) fn is_transient_error(err: &Error) -> bool {
     if err.chain().any(|c| {
         c.downcast_ref::<reqwest::Error>()
             .is_some_and(|e| e.is_connect() || e.is_timeout())
@@ -136,7 +132,7 @@ mod tests {
         let elapsed = tokio::time::timeout(Duration::from_secs(1), std::future::pending::<()>())
             .await
             .expect_err("pending future must time out");
-        let err = anyhow::Error::new(elapsed).context("calling provider");
+        let err = Error::new(elapsed).context("calling provider");
 
         // "deadline has elapsed" contains no recognized substring, so only
         // the typed pre-check can classify this as transient.
@@ -157,6 +153,6 @@ mod tests {
             .expect_err("closed local port must refuse the connection");
 
         assert!(err.is_connect());
-        assert!(is_transient_error(&anyhow::Error::new(err)));
+        assert!(is_transient_error(&Error::new(err)));
     }
 }

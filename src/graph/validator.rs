@@ -416,7 +416,7 @@ impl GraphValidator {
                 node_id,
                 format!(
                     "{kind} node declares `fallback` with `output_schema` but no \
-                     `state_updates`; on failure the \"…failed: <chain>\" string is \
+                     `state_updates`; on failure the \"...failed: <chain>\" string is \
                      only written through `state_updates`, so the fallback node \
                      cannot see why it was reached"
                 ),

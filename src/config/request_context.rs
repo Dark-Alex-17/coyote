@@ -8157,9 +8157,6 @@ mod tests {
         assert!(paths::skill_file("frontend-ui-ux").exists());
     }
 
-    /// TASK-021 pinned prose: the task-queue guidance added to the shipped
-    /// artifacts must not silently erode. Each anchor quotes the shipped text
-    /// verbatim (chosen to avoid line-wrap boundaries in the YAML sources).
     #[test]
     #[serial]
     fn bundled_assets_pin_task_queue_guidance() {
