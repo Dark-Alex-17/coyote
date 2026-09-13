@@ -14,7 +14,7 @@ surface their collected output_key). This script lifts such findings into
 `pipeline_faults` (deduplicated, since a reflexion or feedback loop can
 re-run the map) so dead lanes surface in the report's Pipeline notes.
 
-Fail-safe (R3): on a crash (e.g. malformed GRAPH_STATE), `findings`
+Fail-safe: on a crash (e.g. malformed GRAPH_STATE), `findings`
 becomes the fault text itself and a PIPELINE-FAULT entry is recorded —
 the pipeline proceeds visibly degraded, and the human approval gate is
 the backstop. Existing faults are preserved best-effort.

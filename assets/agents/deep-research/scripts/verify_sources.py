@@ -15,7 +15,7 @@ rendered section when `pipeline_faults` is non-empty and the empty
 string otherwise, keeping the happy-path `{{report}}{{pipeline_notes}}`
 output byte-identical to the pre-hardening `{{report}}`.
 
-Fail-safe (R3): per-URL probes were already guarded; the top level now
+Fail-safe: per-URL probes were already guarded; the top level now
 is too. On a crash the summary says sources were NOT checked, a
 PIPELINE-FAULT is recorded (best-effort preserving existing faults), and
 pipeline_notes still renders — the approval gate remains the backstop.

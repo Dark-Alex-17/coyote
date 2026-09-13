@@ -263,7 +263,7 @@ pass — every fault is visible to the reviewer or the caller — and some
 end node always renders its sentinel, so the graph degrades instead of
 dying.
 
-All 11 scripts also carry a top-level crash guard (R3): a script that
+All 11 scripts also carry a top-level crash guard: a script that
 throws records a fault and fails forward where the flow allows it (a
 crashed `reflexion_gate` proceeds to `synthesize`; a crashed
 `verify_sources` reports that sources were NOT checked) instead of

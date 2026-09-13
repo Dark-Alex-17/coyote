@@ -16,7 +16,7 @@ Reflexion is a best-effort quality booster, not a hard gate: once the
 budget is spent the workflow proceeds anyway, and the human approval
 step is the final backstop.
 
-Fail-safe (R3): a crash here fails FORWARD to `synthesize` — the same
+Fail-safe: a crash here fails FORWARD to `synthesize` — the same
 direction as the existing malformed-critique PASS default — with a
 PIPELINE-FAULT entry recorded (best-effort preserving existing faults),
 so a broken gate costs the run its automated critique routing, never the

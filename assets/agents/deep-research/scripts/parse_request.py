@@ -10,7 +10,7 @@ Routing (`_next`):
   - prompt present -> (no _next; static next: plan)
   - prompt empty   -> ask_topic
 
-Fail-safe (R3): a crash here (e.g. malformed GRAPH_STATE) means the
+Fail-safe: a crash here (e.g. malformed GRAPH_STATE) means the
 caller's prompt cannot be read at all, so proceeding silently is
 meaningless — the degraded route is `ask_topic`, which asks the user for
 the topic directly, plus a PIPELINE-FAULT entry so the loss is visible in

@@ -7,7 +7,7 @@ the RAG knowledge lookup) as a single super-step. The validator requires
 declared parallel-branch script outputs, so we emit an empty JSON object
 explicitly here.
 
-Fail-safe (R3): the node reads no state and computes nothing, so its
+Fail-safe: the node reads no state and computes nothing, so its
 happy-path output IS the sane degraded output — the guard emits the same
 empty object on any crash. No PIPELINE-FAULT is recorded: appending one
 would require reading state (the very thing that crashed) or clobbering

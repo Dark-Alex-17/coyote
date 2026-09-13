@@ -11,7 +11,7 @@ budget.
 
 Routing (`_next`): always research_each_question.
 
-Fail-safe (R3): a crash here means the user's feedback text cannot be
+Fail-safe: a crash here means the user's feedback text cannot be
 recovered, but their INTENT — another research pass — is unambiguous
 (they chose neither accept nor reject). The degraded route therefore
 still loops to `research_each_question`, with a generic feedback note

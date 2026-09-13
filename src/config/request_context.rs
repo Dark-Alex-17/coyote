@@ -8181,7 +8181,7 @@ mod tests {
         ] {
             assert!(
                 architect.contains(anchor),
-                "architect config lost TASK-021 anchor: {anchor:?}"
+                "architect config lost task-queue mirroring anchor: {anchor:?}"
             );
         }
 
@@ -8199,7 +8199,7 @@ mod tests {
         ] {
             assert!(
                 sisyphus.contains(anchor),
-                "sisyphus config lost TASK-021 anchor: {anchor:?}"
+                "sisyphus config lost task-queue chain anchor: {anchor:?}"
             );
         }
 
@@ -8214,7 +8214,7 @@ mod tests {
         ] {
             assert!(
                 spawn.contains(anchor),
-                "DEFAULT_SPAWN_INSTRUCTIONS lost TASK-021 anchor: {anchor:?}"
+                "DEFAULT_SPAWN_INSTRUCTIONS lost task-queue semantics anchor: {anchor:?}"
             );
         }
         assert!(
@@ -8492,7 +8492,7 @@ mod tests {
         );
     }
 
-    // ---- adversary suite-script regression tests (R5) ----
+    // ---- adversary suite-script regression tests ----
     //
     // Fault paths of the adversary's verdict/gate scripts, exercised by
     // invoking `python3 <script>` with a synthetic GRAPH_STATE env — the same
@@ -9427,7 +9427,7 @@ mod tests {
         assert_eq!(holistic.max_iterations, 20);
     }
 
-    // ---- review-gauntlet suite-script regression tests (R5) ----
+    // ---- review-gauntlet suite-script regression tests ----
     //
     // Degradation paths of the gauntlet's lane/builder/gate scripts,
     // exercised the same way as the adversary suite above: `python3 <script>`
@@ -9914,7 +9914,7 @@ mod tests {
         );
     }
 
-    // ---- code-reviewer suite-script regression tests (R5) ----
+    // ---- code-reviewer suite-script regression tests ----
     //
     // Fail-closed fault paths of the code-reviewer's verdict/fault/render
     // scripts, exercised the same way as the suites above: `python3 <script>`
@@ -10503,7 +10503,7 @@ mod tests {
         );
     }
 
-    // ---- finding-verifier suite-script regression tests (R5) ----
+    // ---- finding-verifier suite-script regression tests ----
     //
     // Fail-closed fault paths of the finding-verifier's marker scripts,
     // exercised the same way as the suites above: `python3 <script>` with a
@@ -10738,7 +10738,7 @@ mod tests {
         );
     }
 
-    // ---- step-runner fault-wiring regression tests (R5) ----
+    // ---- step-runner fault-wiring regression tests ----
     //
     // route_review.sh is a bash script node; the graph's script executor runs
     // `.sh` scripts through bash with the same GRAPH_STATE env contract, so
@@ -10899,7 +10899,7 @@ mod tests {
         if skip_step_runner_bash_harness() {
             return;
         }
-        // R3: a fault-noting script must never itself kill the pipeline —
+        // A fault-noting script must never itself kill the pipeline —
         // the harness asserts exit 0 + JSON stdout even for a bare state.
         let out = run_step_runner_script("note_llm_fault.sh", &json!({}));
         assert_eq!(out, json!({"fault_note": ""}));
@@ -10949,8 +10949,9 @@ mod tests {
         assert_eq!(review.fallback.as_deref(), Some("write_handoff"));
 
         // The llm nodes with fallbacks capture their failure text so the
-        // fallback path can see why it was reached (the TASK-016 warning —
-        // this is what shrank the step-runner warning baseline to zero).
+        // fallback path can see why it was reached (the validator's
+        // fallback-capture warning — this is what shrank the step-runner
+        // warning baseline to zero).
         // orient and write_handoff route their fallbacks through
         // note_llm_fault, which distills the capture into fault_note;
         // edge_case_sweep still falls back to write_handoff, which renders
@@ -11037,9 +11038,9 @@ mod tests {
         }
     }
 
-    // ---- deep-research suite-script regression tests (R5) ----
+    // ---- deep-research suite-script regression tests ----
     //
-    // The deep-research graph's R3 guards and fault markers, exercised by
+    // The deep-research graph's crash guards and fault markers, exercised by
     // invoking `python3 <script>` with a synthetic GRAPH_STATE env. The raw
     // runner feeds deliberately malformed JSON to prove every guarded script
     // emits a sane degraded output instead of crashing the node.
@@ -11077,7 +11078,7 @@ mod tests {
             eprintln!("skipping: python3 not available");
             return;
         }
-        // R3: every guarded script and fault marker must exit 0 with JSON
+        // Fail-safe: every guarded script and fault marker must exit 0 with JSON
         // stdout even when GRAPH_STATE is not JSON at all (the runner
         // asserts both); per-script degraded shapes are pinned below.
         for script in [
@@ -11516,8 +11517,8 @@ mod tests {
             .unwrap();
 
         // plan: fail-closed. Its output_schema + fallback combination requires
-        // a state_updates capture (the TASK-016 warning) so plan_fault can see
-        // why it was reached.
+        // a state_updates capture (the validator's fallback-capture warning) so
+        // plan_fault can see why it was reached.
         let NodeType::Llm(plan) = &graph.get_node("plan").unwrap().node_type else {
             panic!("plan must be an llm node")
         };
