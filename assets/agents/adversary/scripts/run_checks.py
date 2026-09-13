@@ -25,6 +25,11 @@ its own session (start_new_session) and a timeout SIGKILLs the whole process
 group, so grandchildren of a hung command cannot linger. On non-POSIX
 platforms only the direct shell child is killed — grandchildren of a
 timed-out command may survive (documented limitation).
+
+Verification commands run with GRAPH_STATE* (GRAPH_STATE, GRAPH_STATE_FILE)
+scrubbed from their environment: the reviewed repo's own tests may exec these very
+scripts with their own GRAPH_STATE, and load_state() prefers
+GRAPH_STATE_FILE, so an inherited live state file would silently win.
 """
 
 import json
@@ -57,6 +62,7 @@ def run_one(cmd, proj, budget):
     """Run one command, hard-bounded by `budget` seconds; return its record."""
     start = time.monotonic()
     popen_kwargs = {"start_new_session": True} if os.name == "posix" else {}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPH_STATE")}
     p = subprocess.Popen(
         cmd,
         shell=True,
@@ -64,6 +70,7 @@ def run_one(cmd, proj, budget):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=env,
         **popen_kwargs,
     )
     try:

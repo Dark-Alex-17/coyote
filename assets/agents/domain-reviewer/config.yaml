@@ -23,7 +23,13 @@ enabled_skills:
 spawnable_agents:
   - file-reviewer
 max_concurrent_agents: 8
-max_agent_depth: 2
+# The limit is consulted by the SPAWNER against the child's absolute depth
+# (root = 0). Deepest documented chain: architect(0) → sisyphus(1) →
+# review-gauntlet | step-runner(2) → code-reviewer(3) → domain-reviewer(4) →
+# file-reviewer(5). This agent spawns depth-5 children; 6 = one level of headroom.
+# NOTE: can_spawn_agents is not yet set, so the file-reviewer hop is documented
+# but inert; 6 keeps the limit forward-compatible for when it is wired.
+max_agent_depth: 6
 
 variables:
   - name: project_dir

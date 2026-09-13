@@ -6,6 +6,12 @@ description: |
   review -> evidence-backed handoff -> user approval gate. Designed to be
   delegated to by sisyphus.
 version: '1.0'
+# The limit is consulted by the SPAWNER against the child's absolute depth
+# (root = 0). Deepest documented chain: architect(0) → sisyphus(1) →
+# step-runner(2) → code-reviewer(3) →
+# {domain-reviewer(4) → file-reviewer(5) | finding-verifier(4)}.
+# This agent spawns depth-3 children; 4 = one level of headroom (default 3 had none).
+max_agent_depth: 4
 global_tools:
   - ast_grep.sh
   - fs_cat.sh

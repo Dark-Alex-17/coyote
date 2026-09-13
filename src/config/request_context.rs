@@ -8223,6 +8223,102 @@ mod tests {
         );
     }
 
+    // The spawner's own `max_agent_depth` is checked against the child's
+    // absolute depth (root = 0), so every hop along a chain needs its own
+    // limit >= child depth; +1 leaves one level of headroom.
+    #[test]
+    #[serial]
+    fn bundled_review_suite_depth_limits_cover_documented_chain() {
+        use crate::graph::GraphParser;
+
+        fn bundled_agent_config(name: &str) -> AgentConfig {
+            let dir = paths::agents_data_dir().join(name);
+            let graph_path = dir.join("graph.yaml");
+            if graph_path.exists() {
+                let graph = GraphParser::new(&dir)
+                    .load_from_file(&graph_path)
+                    .unwrap_or_else(|e| panic!("graph.yaml for '{name}' failed to parse: {e}"));
+                return AgentConfig::from_graph(name, &graph);
+            }
+            AgentConfig::load(&dir.join("config.yaml"))
+                .unwrap_or_else(|e| panic!("config.yaml for '{name}' failed to load: {e}"))
+        }
+
+        let _guard = TestConfigDirGuard::new();
+        Agent::install_builtin_agents(false).unwrap();
+
+        for (name, expected) in [
+            ("architect", 10),
+            ("sisyphus", 5),
+            ("review-gauntlet", 4),
+            ("step-runner", 4),
+            ("code-reviewer", 5),
+            ("domain-reviewer", 6),
+            ("architecture-reviewer", 4),
+        ] {
+            assert_eq!(
+                bundled_agent_config(name).max_agent_depth,
+                expected,
+                "bundled '{name}' max_agent_depth drifted"
+            );
+        }
+
+        // User decision: domain-reviewer's file-reviewer fan-out stays unwired
+        // for now. Remove it from this list when `can_spawn_agents: true` is added.
+        const DOCUMENTED_BUT_UNWIRED: &[&str] = &["domain-reviewer"];
+
+        let chains: [&[&str]; 4] = [
+            &[
+                "architect",
+                "sisyphus",
+                "review-gauntlet",
+                "code-reviewer",
+                "domain-reviewer",
+                "file-reviewer",
+            ],
+            &[
+                "architect",
+                "sisyphus",
+                "step-runner",
+                "code-reviewer",
+                "domain-reviewer",
+                "file-reviewer",
+            ],
+            &[
+                "architect",
+                "sisyphus",
+                "review-gauntlet",
+                "code-reviewer",
+                "finding-verifier",
+            ],
+            &["architect", "sisyphus", "architecture-reviewer", "explore"],
+        ];
+        for chain in chains {
+            for (i, pair) in chain.windows(2).enumerate() {
+                let (spawner, child) = (pair[0], pair[1]);
+                let cfg = bundled_agent_config(spawner);
+                assert!(
+                    cfg.max_agent_depth >= i + 2,
+                    "{spawner} (depth {i}) needs max_agent_depth >= {} to spawn {child} at depth {} with one level of headroom",
+                    i + 2,
+                    i + 1
+                );
+                if !DOCUMENTED_BUT_UNWIRED.contains(&spawner) {
+                    assert!(
+                        cfg.can_spawn_agents,
+                        "{spawner} must have can_spawn_agents to reach {child}"
+                    );
+                }
+                if let Some(list) = &cfg.spawnable_agents {
+                    assert!(
+                        list.iter().any(|s| s == child),
+                        "{spawner} spawnable_agents must include {child}, got {list:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn bundled_graph_agents_parse_and_validate() {
@@ -8589,6 +8685,53 @@ mod tests {
         assert_ne!(
             results[1]["exit"], 0,
             "failing command must record its nonzero exit: {results:?}"
+        );
+    }
+
+    #[test]
+    fn adversary_run_checks_scrubs_graph_state_from_verification_commands() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_file =
+            env::temp_dir().join(format!("coyote-adversary-run-checks-state-{unique}.json"));
+        // python3 probe rather than `echo "${VAR:-UNSET}"`: run_checks.py uses
+        // shell=True, which is cmd.exe on the Windows CI leg.
+        let state = json!({
+            "verification_commands": [
+                "python3 -c \"import os; print('file=' + os.environ.get('GRAPH_STATE_FILE', 'UNSET') + ' inline=' + os.environ.get('GRAPH_STATE', 'UNSET'))\""
+            ]
+        });
+        write(&state_file, state.to_string()).unwrap();
+
+        // The script itself must load from GRAPH_STATE_FILE (the envs are
+        // applied after the helper's env_remove), so an inline dummy state
+        // proves the file-preferred path is the one exercised.
+        let out = run_adversary_script_env(
+            "run_checks.py",
+            &json!({}),
+            &[("GRAPH_STATE_FILE", state_file.to_str().unwrap())],
+        );
+        let _ = std::fs::remove_file(&state_file);
+
+        let results = out["exec_results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "state must come from the file: {results:?}"
+        );
+        assert_eq!(results[0]["exit"], 0, "{results:?}");
+        assert!(
+            results[0]["tail"]
+                .as_str()
+                .unwrap()
+                .contains("file=UNSET inline=UNSET"),
+            "verification command must not inherit GRAPH_STATE*: {results:?}"
         );
     }
 
@@ -9297,6 +9440,7 @@ mod tests {
         let out = std::process::Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", state.to_string())
+            .env_remove("GRAPH_STATE_FILE")
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
         assert!(
@@ -9787,6 +9931,7 @@ mod tests {
         let out = std::process::Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", raw_state)
+            .env_remove("GRAPH_STATE_FILE")
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
         assert!(
@@ -10375,6 +10520,7 @@ mod tests {
         let out = std::process::Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", raw_state)
+            .env_remove("GRAPH_STATE_FILE")
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
         assert!(
@@ -10606,6 +10752,7 @@ mod tests {
         let out = std::process::Command::new("bash")
             .arg(&path)
             .env("GRAPH_STATE", state.to_string())
+            .env_remove("GRAPH_STATE_FILE")
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke bash {script}: {e}"));
         assert!(
@@ -10908,6 +11055,7 @@ mod tests {
         let out = std::process::Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", raw_state)
+            .env_remove("GRAPH_STATE_FILE")
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
         assert!(
