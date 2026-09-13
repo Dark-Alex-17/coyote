@@ -8989,6 +8989,83 @@ mod tests {
     }
 
     #[test]
+    fn adversary_verdict_met_with_fault_evidence_never_conforms() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""},
+                {"id": "c2", "text": "does Y", "status": "MET",
+                 "evidence": "PIPELINE-FAULT: criterion check failed — LLM node failed: boom",
+                 "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": []
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "a fault-marked verdict must never conform, whatever status it carries: {report}"
+        );
+        assert!(
+            report.contains("Criteria: 1/2 met, 0 partial, 1 unmet/diverged."),
+            "the fault-marked verdict counts as unmet, not met: {report}"
+        );
+        assert!(
+            report.contains("criterion check DIED (pipeline fault)"),
+            "a fault-marked verdict must render as died: {report}"
+        );
+        let met_section = report
+            .split("Met criteria (evidence):")
+            .nth(1)
+            .expect("the genuine MET criterion produces an evidence appendix");
+        assert!(
+            !met_section.contains("does Y"),
+            "the fault-marked verdict must not be listed as met: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_prepends_died_marker_once_when_complaint_lacks_it() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does Y", "status": "UNMET",
+                 "evidence": "PIPELINE-FAULT: criterion check failed — LLM node failed: boom",
+                 "complaint": "LLM node failed: boom"}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": []
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.contains(
+                "1. Acceptance criterion \"does Y\" — criterion check DIED (pipeline fault) — LLM node failed: boom"
+            ),
+            "the died marker is prepended to a bare complaint: {report}"
+        );
+        assert_eq!(
+            report
+                .matches("criterion check DIED (pipeline fault)")
+                .count(),
+            1,
+            "the died marker must appear exactly once: {report}"
+        );
+    }
+
+    #[test]
     fn adversary_crit_gate_passes_fault_shaped_verdict_through() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
@@ -8996,7 +9073,7 @@ mod tests {
         }
         let evidence = "PIPELINE-FAULT: criterion check failed — LLM node failed: boom";
         let fault = json!({
-            "id": "c1", "status": "UNMET", "evidence": evidence,
+            "id": "c1", "text": "x", "status": "UNMET", "evidence": evidence,
             "complaint": "criterion check DIED (pipeline fault) — LLM node failed: boom"
         });
         let out = run_adversary_script(
@@ -9011,8 +9088,14 @@ mod tests {
             out.get("_next").is_none(),
             "a fault-shaped verdict must not retry: {out}"
         );
+        assert_eq!(out["crit_verdict"]["id"], "c1", "{out}");
+        assert_eq!(out["crit_verdict"]["text"], "x", "{out}");
         assert_eq!(out["crit_verdict"]["status"], "UNMET");
         assert_eq!(out["crit_verdict"]["evidence"], evidence, "{out}");
+        assert_eq!(
+            out["crit_verdict"]["complaint"], fault["complaint"],
+            "{out}"
+        );
     }
 
     #[test]

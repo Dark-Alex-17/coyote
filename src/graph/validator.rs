@@ -3017,6 +3017,34 @@ mod tests {
     }
 
     #[test]
+    fn map_branch_llm_fallback_to_branch_local_script_passes() {
+        let map = map_node_basic("m", "br", Some("end"));
+        let branch = llm_node("br", Some("recover"), None);
+        let recover = script_node("recover", "Cargo.toml", None);
+        let graph = graph_with(
+            vec![
+                ("m", map),
+                ("br", branch),
+                ("recover", recover),
+                ("end", end_node("end")),
+            ],
+            "m",
+        );
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.node_id.as_deref() == Some("m")),
+            "a branch-local script fallback raises nothing on the map: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
     fn map_branch_deep_approval_node_errors_on_the_map() {
         let map = map_node_basic("m", "br", Some("end"));
         let branch = llm_node("br", None, Some("gate"));

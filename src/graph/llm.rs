@@ -818,4 +818,38 @@ mod tests {
             "{captured}"
         );
     }
+
+    /// Without a fallback the node bails, and that bail must wrap the same
+    /// full chain the state_updates text carries.
+    #[tokio::test]
+    async fn bail_without_fallback_carries_full_error_chain() {
+        let mut u = HashMap::new();
+        u.insert("captured".into(), "{{output}}".into());
+        let mut node = node_with(Some(u));
+        node.prompt = "{{nope}}".into();
+        node.fallback = None;
+        let mut state = manager_with(&[]);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let abort = create_abort_signal();
+
+        let err = LlmNodeExecutor::execute("think", &node, &mut state, &mut ctx, &abort)
+            .await
+            .expect_err("no fallback means the failure bails");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(
+                "LLM node failed and no fallback declared: LLM call failed: Failed to interpolate llm node prompt: Template interpolation failed: 'nope' not found in state"
+            ),
+            "{chain}"
+        );
+        let captured = state
+            .state()
+            .get("captured")
+            .and_then(Value::as_str)
+            .expect("state_updates still run before the bail")
+            .to_string();
+        assert!(captured.starts_with("LLM node failed: "), "{captured}");
+    }
 }

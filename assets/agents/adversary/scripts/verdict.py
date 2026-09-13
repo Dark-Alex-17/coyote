@@ -8,8 +8,9 @@ Any "PIPELINE-FAULT:" marker recorded in `pipeline_faults` (or a holistic
 llm-node failure captured in `holistic_failure`) becomes complaint #1;
 per-criterion results are still reported. A criterion whose check DIED
 (criterion_fault's UNMET verdict, evidence prefixed "PIPELINE-FAULT:") is
-rendered as died rather than judged. Assembles the exact sentinel format the
-callers route on. Never crashes into a silent verdict.
+rendered as died rather than judged and counted as unmet regardless of the
+status it carries. Assembles the exact sentinel format the callers route on.
+Never crashes into a silent verdict.
 """
 
 import json
@@ -17,6 +18,11 @@ import os
 
 MAX_FAULT_DETAIL_CHARS = 300
 DIED_MARKER = "criterion check DIED (pipeline fault)"
+
+
+def died(v):
+    evidence = v.get("evidence")
+    return isinstance(evidence, str) and evidence.startswith("PIPELINE-FAULT:")
 
 
 def load_state():
@@ -54,15 +60,14 @@ def append_criterion_complaints(lines, verdicts, extra, start):
     """Numbered complaints for non-MET verdicts and holistic extras."""
     i = start
     for v in verdicts:
-        if v.get("status") == "MET":
+        if v.get("status") == "MET" and not died(v):
             continue
         i += 1
         text = (v.get("text") or "").strip().replace("\n", " ")
         if len(text) > 140:
             text = text[:137] + "…"
         complaint = (v.get("complaint") or "").strip()
-        evidence = v.get("evidence")
-        if isinstance(evidence, str) and evidence.startswith("PIPELINE-FAULT:"):
+        if died(v):
             if not complaint.startswith(DIED_MARKER):
                 complaint = f"{DIED_MARKER} — {complaint}"
             lines.append(f'{i}. Acceptance criterion "{text}" — {complaint}')
@@ -121,9 +126,11 @@ def main():
     faults = collect_pipeline_faults(state)
     n = len(verdicts)
 
-    met = [v for v in verdicts if v.get("status") == "MET"]
-    partial = [v for v in verdicts if v.get("status") == "PARTIAL"]
-    bad = [v for v in verdicts if v.get("status") in ("UNMET", "DIVERGED")]
+    met = [v for v in verdicts if v.get("status") == "MET" and not died(v)]
+    partial = [v for v in verdicts if v.get("status") == "PARTIAL" and not died(v)]
+    bad = [
+        v for v in verdicts if died(v) or v.get("status") in ("UNMET", "DIVERGED")
+    ]
 
     lines = []
     if faults:
