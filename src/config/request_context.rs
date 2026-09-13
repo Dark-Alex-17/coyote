@@ -8267,6 +8267,12 @@ mod tests {
             adversary.contains("--agent-variable verification_commands '[\"cargo test --all\"]'"),
             "adversary README must show the CLI form"
         );
+        assert!(
+            adversary.contains(
+                "merges only the keys declared under `parse`'s `output_schema.properties`"
+            ) && !adversary.contains("Known residual"),
+            "adversary README must state the schema-declared merge closes the extra-key channel"
+        );
         let gauntlet = read_to_string(readmes.join("review-gauntlet/README.md")).unwrap();
         assert!(
             !gauntlet.contains("Verification commands:"),
@@ -8286,6 +8292,10 @@ mod tests {
         assert!(
             runner.contains("Trust boundary:") && runner.contains("never a field an LLM"),
             "run_checks.py docstring must state the declared-variable trust boundary"
+        );
+        assert!(
+            !runner.contains("Known residual") && !gauntlet.contains("residual:"),
+            "run_checks.py and the review-gauntlet README must not disclose the closed residual"
         );
     }
 
@@ -8556,6 +8566,207 @@ mod tests {
             ]),
             "graph.example.yaml validator warnings drifted from the recorded baseline"
         );
+    }
+
+    // `state_updates::apply` merges only the keys an llm/agent node's
+    // `output_schema.properties` declares, so a bundled graph that relied on
+    // an undeclared model-emitted key reaching state would now break at
+    // runtime. Every key a graph consumes must have a declared writer, and a
+    // schema node's field list must not name a state key its schema omits.
+    #[test]
+    #[serial]
+    fn bundled_graph_output_schemas_declare_every_key_relied_on() {
+        use crate::graph::types::{ConcurrencyCap, Node};
+        use crate::graph::{GraphParser, NodeType};
+        use fancy_regex::Regex;
+        use std::collections::BTreeMap;
+
+        fn idents(re: &Regex, text: &str) -> BTreeSet<String> {
+            re.captures_iter(text)
+                .flatten()
+                .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+                .collect()
+        }
+
+        fn state_updates_of(node: &Node) -> Option<&HashMap<String, String>> {
+            match &node.node_type {
+                NodeType::Llm(n) => n.state_updates.as_ref(),
+                NodeType::Agent(n) => n.state_updates.as_ref(),
+                NodeType::Rag(n) => n.state_updates.as_ref(),
+                NodeType::Approval(n) => n.state_updates.as_ref(),
+                NodeType::Input(n) => n.state_updates.as_ref(),
+                NodeType::Script(n) => n.state_updates.as_ref(),
+                NodeType::End(n) => n.state_updates.as_ref(),
+                NodeType::Map(_) => None,
+            }
+        }
+
+        fn templated_fields(node: &Node) -> Vec<&str> {
+            let mut fields: Vec<&str> = match &node.node_type {
+                NodeType::Llm(n) => {
+                    let mut v = vec![n.prompt.as_str()];
+                    v.extend(n.instructions.as_deref());
+                    v
+                }
+                NodeType::Agent(n) => {
+                    let mut v = vec![n.prompt.as_str()];
+                    v.extend(n.inputs.iter().flat_map(|m| m.values().map(String::as_str)));
+                    v
+                }
+                NodeType::Rag(n) => {
+                    let mut v: Vec<&str> = n.documents.iter().map(String::as_str).collect();
+                    v.extend(n.query.as_deref());
+                    v.extend(n.extractor_prompt.as_deref());
+                    v
+                }
+                NodeType::Approval(n) => vec![n.question.as_str()],
+                NodeType::Input(n) => {
+                    let mut v = vec![n.question.as_str()];
+                    v.extend(n.default.as_deref());
+                    v
+                }
+                NodeType::End(n) => vec![n.output.as_str()],
+                NodeType::Map(n) => {
+                    let mut v = vec![n.over.as_str()];
+                    if let Some(ConcurrencyCap::Template(t)) = &n.max_concurrency {
+                        v.push(t);
+                    }
+                    v
+                }
+                NodeType::Script(_) => Vec::new(),
+            };
+            fields.extend(
+                state_updates_of(node)
+                    .into_iter()
+                    .flat_map(|m| m.values().map(String::as_str)),
+            );
+            fields
+        }
+
+        fn schema_node_text(node: &Node) -> Option<(Option<&serde_json::Value>, String)> {
+            match &node.node_type {
+                NodeType::Llm(n) => Some((
+                    n.output_schema.as_ref(),
+                    format!("{}\n{}", n.instructions.as_deref().unwrap_or(""), n.prompt),
+                )),
+                NodeType::Agent(n) => Some((n.output_schema.as_ref(), n.prompt.clone())),
+                _ => None,
+            }
+        }
+
+        let template_root = Regex::new(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+        let script_read =
+            Regex::new(r#"state(?:\.get\(|\[)\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"#).unwrap();
+        let script_dict_key = Regex::new(r#"["']([A-Za-z_][A-Za-z0-9_]*)["']\s*:"#).unwrap();
+        let script_subscript_assign =
+            Regex::new(r#"\[["']([A-Za-z_][A-Za-z0-9_]*)["']\]\s*=[^=]"#).unwrap();
+        let backticked_field = Regex::new(r"(?m)^\s*-\s*`([a-z][a-z0-9_]*)`").unwrap();
+
+        // Seeded by the engine rather than any graph author: `initial_prompt`
+        // (dispatch) and the per-node scoped `output`/`choice`/`input` bindings.
+        let engine_seeded = ["initial_prompt", "output", "choice", "input"];
+
+        let _guard = TestConfigDirGuard::new();
+        Agent::install_builtin_agents(false).unwrap();
+
+        let mut checked = Vec::new();
+        for entry in std::fs::read_dir(paths::agents_data_dir()).unwrap() {
+            let dir = entry.unwrap().path();
+            let graph_path = dir.join("graph.yaml");
+            if !graph_path.exists() {
+                continue;
+            }
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            let graph = GraphParser::new(&dir)
+                .load_from_file(&graph_path)
+                .unwrap_or_else(|e| panic!("graph.yaml for '{name}' failed to parse: {e}"));
+
+            let mut scripts = String::new();
+            if let Ok(entries) = std::fs::read_dir(dir.join("scripts")) {
+                for script in entries.map(|e| e.unwrap().path()) {
+                    if script.extension().is_some_and(|ext| ext == "py") {
+                        scripts.push_str(&read_to_string(&script).unwrap());
+                        scripts.push('\n');
+                    }
+                }
+            }
+
+            let mut writers: BTreeSet<String> =
+                engine_seeded.iter().map(|k| k.to_string()).collect();
+            writers.extend(graph.initial_state.keys().cloned());
+            writers.extend(graph.variables.iter().map(|v| v.name.clone()));
+            writers.extend(idents(&script_dict_key, &scripts));
+            writers.extend(idents(&script_subscript_assign, &scripts));
+
+            let mut consumed = idents(&script_read, &scripts);
+            let mut declared: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+            for (id, node) in &graph.nodes {
+                for field in templated_fields(node) {
+                    consumed.extend(idents(&template_root, field));
+                }
+                writers.extend(
+                    state_updates_of(node)
+                        .into_iter()
+                        .flat_map(|m| m.keys().cloned()),
+                );
+                if let NodeType::Map(m) = &node.node_type {
+                    writers.extend([
+                        m.as_name.clone(),
+                        m.output_key.clone(),
+                        m.collect_into.clone(),
+                    ]);
+                }
+                if let Some((Some(schema), _)) = schema_node_text(node) {
+                    let properties = schema
+                        .get("properties")
+                        .and_then(serde_json::Value::as_object)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{name}/{id}: output_schema has no object `properties`, so the \
+                                 engine would merge nothing from its output: {schema}"
+                            )
+                        });
+                    declared.insert(id, properties.keys().cloned().collect());
+                }
+            }
+            let schema_keys: BTreeSet<&String> = declared.values().flatten().collect();
+
+            let unwritten: Vec<&String> = consumed
+                .iter()
+                .filter(|k| !writers.contains(*k) && !schema_keys.contains(k))
+                .collect();
+            assert!(
+                unwritten.is_empty(),
+                "{name}: state keys consumed with no declared writer (initial_state, variable, \
+                 state_updates target, map key, script-emitted key, or output_schema property): \
+                 {unwritten:?}"
+            );
+
+            for (id, properties) in &declared {
+                let (_, text) = schema_node_text(&graph.nodes[*id]).unwrap();
+                let omitted: Vec<String> = idents(&backticked_field, &text)
+                    .into_iter()
+                    .filter(|k| {
+                        (consumed.contains(k) || schema_keys.contains(&k))
+                            && !properties.contains(k)
+                            && !writers.contains(k)
+                    })
+                    .collect();
+                assert!(
+                    omitted.is_empty(),
+                    "{name}/{id}: the node's field list names state keys its output_schema does \
+                     not declare, so the engine would drop them when the model emits them: \
+                     {omitted:?}"
+                );
+            }
+            checked.push(name);
+        }
+        for expected in ["adversary", "review-gauntlet"] {
+            assert!(
+                checked.iter().any(|n| n == expected),
+                "expected bundled graph agent '{expected}' to be checked; found {checked:?}"
+            );
+        }
     }
 
     // ---- adversary suite-script regression tests ----
@@ -10452,8 +10663,14 @@ mod tests {
                 .output_schema
                 .as_ref()
                 .unwrap_or_else(|| panic!("{name}: parse must have an output_schema"));
+            let properties = schema["properties"].as_object().unwrap_or_else(|| {
+                panic!(
+                    "{name}: parse output_schema must declare `properties`; the engine merges \
+                     only declared keys into state: {schema}"
+                )
+            });
             assert!(
-                schema["properties"].get("verification_commands").is_none(),
+                !properties.contains_key("verification_commands"),
                 "{name}: parse must not extract verification_commands: {schema}"
             );
             assert!(

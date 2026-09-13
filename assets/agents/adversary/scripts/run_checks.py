@@ -18,10 +18,10 @@ shell=True. Variables land in state as strings, so a JSON-encoded list is
 accepted alongside a real list. A declaration that is not a JSON array of
 strings is a caller contract violation, not a runner hiccup: it executes
 NOTHING and records a PIPELINE-FAULT (fail-closed into DIVERGES) instead of
-degrading to the soft ENVIRONMENT marker. Known residual: the engine merges
-every top-level key of an llm node's JSON output into state, so a parse LLM
-coaxed into emitting an extra `verification_commands` key could still
-overwrite the declared value before this script runs.
+degrading to the soft ENVIRONMENT marker. The engine merges only the keys an
+llm node's `output_schema.properties` declares, so a parse LLM coaxed into
+emitting an extra `verification_commands` key cannot overwrite the declared
+value: the undeclared key is dropped before it reaches state.
 
 Budget: commands run sequentially, so TOTAL runtime is bounded by a deadline
 (TOTAL_DEADLINE_SECS = 3300s, the run_checks node's 3600s timeout minus

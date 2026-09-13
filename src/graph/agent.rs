@@ -71,7 +71,7 @@ fn outcome_from(
                 state_updates::apply(
                     state_manager,
                     &Value::String(format!("Agent node failed: {e:#}")),
-                    node.output_schema.is_some(),
+                    node.output_schema.as_ref(),
                     node.state_updates.as_ref(),
                 );
                 Ok(AgentExecutionOutcome::FellBack(fb.clone()))
@@ -309,7 +309,7 @@ fn apply_state_updates(node: &AgentNode, state_manager: &mut StateManager, outpu
     state_updates::apply(
         state_manager,
         output,
-        node.output_schema.is_some(),
+        node.output_schema.as_ref(),
         node.state_updates.as_ref(),
     );
 }
@@ -1090,7 +1090,11 @@ mod tests {
 
     #[test]
     fn output_schema_auto_merges_top_level_keys() {
-        let node = node_with_schema("hi", None, json!({"type": "object"}));
+        let node = node_with_schema(
+            "hi",
+            None,
+            json!({"type": "object", "properties": {"goal": {}, "summary": {}}}),
+        );
         let mut state = manager_with(&[]);
         let output = json!({"goal": "do X", "summary": "details"});
 
@@ -1102,7 +1106,11 @@ mod tests {
 
     #[test]
     fn output_schema_preserves_nested_value_types() {
-        let node = node_with_schema("hi", None, json!({"type": "object"}));
+        let node = node_with_schema(
+            "hi",
+            None,
+            json!({"type": "object", "properties": {"tags": {}, "config": {}, "count": {}}}),
+        );
         let mut state = manager_with(&[]);
         let output = json!({
             "tags": ["a", "b"],
@@ -1121,7 +1129,11 @@ mod tests {
     fn output_schema_explicit_state_updates_override_auto_merge() {
         let mut u = HashMap::new();
         u.insert("goal".into(), "renamed-{{output.goal}}".into());
-        let node = node_with_schema("hi", Some(u), json!({"type": "object"}));
+        let node = node_with_schema(
+            "hi",
+            Some(u),
+            json!({"type": "object", "properties": {"goal": {}}}),
+        );
         let mut state = manager_with(&[]);
         let output = json!({"goal": "do X"});
 

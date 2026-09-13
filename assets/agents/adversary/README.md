@@ -139,10 +139,9 @@ as a structured `inputs:` passthrough, not as prompt text.
   an invalid declaration: `run_checks` executes **nothing** and records a
   `PIPELINE-FAULT: verification_commands declaration invalid — …` marker, which forces DIVERGES —
   fail-closed, not degraded to the soft ENVIRONMENT marker.
-- Known residual: the engine merges every top-level key of `parse`'s JSON output into state, not
-  only the keys in its `output_schema`, so an injected instruction that makes the parse LLM emit an
-  extra `verification_commands` key is not yet blocked at the engine level. Closing that requires
-  restricting the llm-node auto-merge to `output_schema.properties` (tracked as a follow-up).
+- The engine merges only the keys declared under `parse`'s `output_schema.properties` into state,
+  so an injected instruction that makes the parse LLM emit an extra `verification_commands` key
+  cannot reach state: the undeclared key is dropped and the declared variable stands.
 
 ### Tools
 

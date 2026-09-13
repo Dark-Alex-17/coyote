@@ -133,9 +133,10 @@ final report verbatim.
   and never extracted by `parse`. The adversary's `run_checks` stage executes
   those commands with a shell, which makes the declaration a trust boundary:
   the prompt also carries plan text pasted from the repo under review, so
-  commands must never be inferred from it (residual: the engine still merges
-  every top-level key of `parse`'s output into state, so an extra
-  `verification_commands` key emitted by the LLM is not yet blocked).
+  commands must never be inferred from it, and the engine merges only the keys
+  `parse`'s `output_schema.properties` declares, so an extra
+  `verification_commands` key emitted by the LLM is dropped before it reaches
+  state.
   Undeclared stays undeclared
   (`'[]'` ⇒ "none declared"); a declaration that is not a JSON array of
   strings executes nothing and records a `PIPELINE-FAULT`, which the

@@ -213,8 +213,10 @@ nodes:
                                       # agent/graph/global default when omitted.
     skill_instructions: null          # Per-node skill-hint text override; uses the built-in default when omitted.
     output_schema:             # Optional JSON Schema. The output is parsed to JSON
-      type: object             # and its top-level object keys auto-merge into state
-      properties:              # (so `topic` / `needs_deep_dive` become {{topic}} etc).
+      type: object             # and only the keys declared under `properties` auto-merge
+      properties:              # into state (so `topic` / `needs_deep_dive` become {{topic}}
+                               # etc). Undeclared keys the model emits are dropped; lift
+                               # one explicitly via state_updates: `{{output.<key>}}`.
         topic: { type: string }
         needs_deep_dive: { type: boolean }
       required: [topic, needs_deep_dive]
@@ -284,8 +286,9 @@ nodes:
           type: array
           items: { type: string }
       required: [context, sources]
-    # When `output_schema` is set, top-level keys auto-merge into state, so
-    # `context` and `sources` are produced without needing `state_updates`.
+    # When `output_schema` is set, the keys declared under `properties`
+    # auto-merge into state, so `context` and `sources` are produced without
+    # needing `state_updates`. Keys the schema does not declare are dropped.
     next: synthesize           # Joins with retrieve at `synthesize`.
 
   # --- script node (the diamond's join; also dispatches) -----------------
@@ -369,7 +372,8 @@ nodes:
                                # and is retired when the chain ends. A message delivered
                                # after the chain's last flagged agent step is accepted
                                # but never read.
-    output_schema:             # Optional. Same extraction as llm nodes
+    output_schema:             # Optional. Same extraction as llm nodes: only the keys
+                               # declared under `properties` auto-merge into state.
       type: object
       properties:
         summary: { type: string }
