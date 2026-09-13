@@ -8794,6 +8794,119 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn adversary_run_checks_timeout_kills_the_whole_process_group() {
+        if !cmd_available("python3") || !cmd_available("sh") {
+            eprintln!("skipping: python3 or sh not available");
+            return;
+        }
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = env::temp_dir().join(format!(
+            "coyote-adversary-run-checks-pgroup-{}-{unique}",
+            std::process::id()
+        ));
+        create_dir_all(&tmp).unwrap();
+        let pid_file = tmp.join("grandchild.pid");
+
+        // run_one() starts each command in its own session and SIGKILLs the
+        // process group on timeout. A plain p.kill() would only take the
+        // shell, leaving a backgrounded `sleep 30` holding the stdout pipe —
+        // and, in the real graph, a leaked cargo/pytest tree.
+        let cmd = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let state = json!({"verification_commands": [cmd]});
+        let out = run_adversary_script_env(
+            "run_checks.py",
+            &state,
+            &[("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "1")],
+        );
+        let results = out["exec_results"].as_array().unwrap();
+        assert_eq!(
+            results[0]["exit"], -1,
+            "the hung shell must record a timeout: {results:?}"
+        );
+        assert!(
+            results[0]["tail"].as_str().unwrap().contains("TIMEOUT"),
+            "the timeout must be named in the tail: {results:?}"
+        );
+
+        let mut pid = String::new();
+        for _ in 0..20 {
+            pid = read_to_string(&pid_file)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !pid.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = remove_dir_all(&tmp);
+        assert!(
+            !pid.is_empty(),
+            "the shell must have recorded its grandchild pid at {}",
+            pid_file.display()
+        );
+
+        let alive = |pid: &str| {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let mut polls = 0;
+        let mut still_alive = alive(&pid);
+        while still_alive && polls < 40 {
+            std::thread::sleep(Duration::from_millis(50));
+            polls += 1;
+            still_alive = alive(&pid);
+        }
+        assert!(
+            !still_alive,
+            "grandchild {pid} must die with the process group, still alive after {polls} polls: {results:?}"
+        );
+    }
+
+    /// TOTAL_DEADLINE_SECS in run_checks.py and the run_checks node's
+    /// `timeout:` in graph.yaml live in different files; if the script's
+    /// deadline ever creeps past the node timeout, the executor kills the
+    /// script from outside and the in-script skipped/ENVIRONMENT degradation
+    /// never gets to run.
+    #[test]
+    fn adversary_run_checks_deadline_stays_inside_the_node_timeout() {
+        use crate::graph::NodeType;
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/adversary/scripts/run_checks.py");
+        let source = read_to_string(&script).unwrap();
+        let line = source
+            .lines()
+            .find(|l| l.starts_with("TOTAL_DEADLINE_SECS = "))
+            .expect("run_checks.py must define TOTAL_DEADLINE_SECS");
+        let deadline: u64 = line
+            .rsplit_once(" or ")
+            .and_then(|(_, rest)| rest.strip_suffix(')'))
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or_else(|| panic!("TOTAL_DEADLINE_SECS default no longer parses: {line}"));
+
+        let graph = load_bundled_graph("adversary");
+        let node = graph
+            .get_node("run_checks")
+            .expect("adversary graph must have a run_checks node");
+        let NodeType::Script(s) = &node.node_type else {
+            panic!("run_checks must be a script node");
+        };
+        assert!(
+            deadline < s.timeout,
+            "run_checks.py TOTAL_DEADLINE_SECS ({deadline}) must stay below the run_checks node timeout ({}) in assets/agents/adversary/graph.yaml",
+            s.timeout
+        );
+    }
+
+    #[test]
     fn adversary_pipeline_fault_parse_stage_attribution() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
