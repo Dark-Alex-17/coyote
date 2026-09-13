@@ -9598,6 +9598,39 @@ mod tests {
     }
 
     #[test]
+    fn code_reviewer_synthesize_retries_and_fails_closed() {
+        use crate::graph::{GraphParser, NodeType};
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/code-reviewer");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .expect("code-reviewer graph.yaml must parse");
+
+        // synthesize: retries once, then falls back to verdict with the
+        // failure text captured in synth_failure for the fault rendering.
+        let synthesize = graph.get_node("synthesize").unwrap();
+        let NodeType::Llm(llm) = &synthesize.node_type else {
+            panic!("synthesize must be an llm node")
+        };
+        assert_eq!(llm.max_attempts, 2, "synthesize must retry once");
+        assert_eq!(llm.fallback.as_deref(), Some("verdict"));
+        assert!(
+            llm.state_updates
+                .as_ref()
+                .is_some_and(|u| u.contains_key("synth_failure")),
+            "synthesize must capture its failure text for the verdict"
+        );
+        assert_eq!(synthesize.next_target(), Some("verify"));
+
+        // verify: same retry-then-fail-closed shape.
+        let NodeType::Agent(verify) = &graph.get_node("verify").unwrap().node_type else {
+            panic!("verify must be an agent node")
+        };
+        assert_eq!(verify.max_attempts, 2, "verify must retry once");
+        assert_eq!(verify.fallback.as_deref(), Some("verdict"));
+    }
+
+    #[test]
     fn code_reviewer_verdict_domain_fault_forces_needs_human() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
