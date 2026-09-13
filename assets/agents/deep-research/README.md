@@ -22,11 +22,13 @@ agent, this is the file to read alongside the
 
 ## Workflow
 
-17 nodes. Solid arrows are static `next` / `routes` edges declared in
+23 nodes. Solid arrows are static `next` / `routes` edges declared in
 `graph.yaml`; script nodes can also route dynamically via `_next` (shown as
 labeled branches out of the diamond). Dotted arrows show `map` fan-out — the
 `research_each_question` node spawns one `research_one_question` branch per
-sub-question and joins them before continuing.
+sub-question and joins them before continuing — and `fallback` edges
+(labeled "fallback"), taken when a node fails outright (see *Fault paths*
+below).
 
 ```mermaid
 flowchart TD
@@ -38,18 +40,27 @@ flowchart TD
     bootstrap_research --> plan
     bootstrap_research --> knowledge_lookup
     plan["plan<br/>llm + output_schema"] --> research_each_question
+    plan -. "fallback" .-> plan_fault{"plan_fault<br/>script"}
+    plan_fault --> end_fault
     knowledge_lookup[("knowledge_lookup<br/>rag")] --> research_each_question
     research_each_question[\research_each_question<br/>map/]
     research_each_question -. "spawns × N" .-> research_one_question["research_one_question<br/>llm + web tools"]
+    research_one_question -. "fallback" .-> question_fault{"question_fault<br/>script"}
     research_each_question --> combine_findings
     combine_findings{"combine_findings<br/>script"} --> vet_sources
     vet_sources["vet_sources<br/>llm + classify_source"] --> critique
+    vet_sources -. "fallback" .-> vet_fault{"vet_fault<br/>script"}
+    vet_fault --> critique
     critique["critique<br/>llm"] --> reflexion_gate
+    critique -. "fallback" .-> critique_fault{"critique_fault<br/>script"}
+    critique_fault --> reflexion_gate
     reflexion_gate{"reflexion_gate<br/>script"}
     reflexion_gate -->|"PASS"| synthesize
     reflexion_gate -->|"REVISE (budget left)"| research_each_question
     reflexion_gate -->|"REVISE (budget spent)"| synthesize
     synthesize[["synthesize<br/>agent → report-writer"]] --> verify_sources
+    synthesize -. "fallback" .-> synth_fault{"synth_fault<br/>script"}
+    synth_fault --> end_fault
     verify_sources{"verify_sources<br/>script"} --> approve
     approve{{"approve<br/>approval"}}
     approve -->|"accept"| end_accepted
@@ -59,13 +70,14 @@ flowchart TD
 
     end_accepted(["end_accepted<br/>report"])
     end_rejected(["end_rejected"])
+    end_fault(["end_fault<br/>DEEP_RESEARCH FAILED"])
 ```
 
 ### Node-type breakdown
 
 | Type                        | Nodes                                                                                                                 |
 |-----------------------------|-----------------------------------------------------------------------------------------------------------------------|
-| `script` (Python)           | `parse_request`, `bootstrap_research`, `combine_findings`, `reflexion_gate`, `verify_sources`, `incorporate_feedback` |
+| `script` (Python)           | `parse_request`, `bootstrap_research`, `combine_findings`, `reflexion_gate`, `verify_sources`, `incorporate_feedback`, plus the fault markers `plan_fault`, `question_fault`, `vet_fault`, `critique_fault`, `synth_fault` |
 | `llm` (tools: `[]`)         | `plan`, `critique`                                                                                                    |
 | `llm` (with tool whitelist) | `research_one_question`, `vet_sources`                                                                                |
 | `rag`                       | `knowledge_lookup` — local corpus retrieval                                                                           |
@@ -73,7 +85,7 @@ flowchart TD
 | `agent`                     | `synthesize` — spawns the `report-writer` sub-agent                                                                   |
 | `input`                     | `ask_topic`                                                                                                           |
 | `approval`                  | `approve`                                                                                                             |
-| `end`                       | `end_accepted`, `end_rejected`                                                                                        |
+| `end`                       | `end_accepted`, `end_rejected`, `end_fault`                                                                           |
 
 ## Parallel execution
 
@@ -217,6 +229,46 @@ folds that text into `research_feedback` and loops back to
 `settings.max_loop_iterations` (40) is the engine's infinite-loop
 backstop: it caps the total visits to any single node.
 
+## Fault paths
+
+Every stage that can die outright has a `fallback:` edge to a small
+fault-marker script — the dashed edges in the diagram. A fallback fires
+after a node's retries are exhausted (`research_one_question` and
+`synthesize` each get two attempts via `max_attempts: 2`); the engine
+writes its failure text into the node's state key before routing, and
+the marker normalizes that text into a `PIPELINE-FAULT: ...` entry in
+`pipeline_faults`. The five routes:
+
+- `plan -> plan_fault -> end_fault` — fail-closed: no plan means
+  nothing to research.
+- `research_one_question -> question_fault` — branch-local, inside the
+  map branch: one dead research lane becomes a fault finding instead of
+  sinking the whole map.
+- `vet_sources -> vet_fault -> critique` — degrade-visibly: vetting is
+  a quality lane, not the product; `source_assessment` becomes a
+  neutral "unvetted" note.
+- `critique -> critique_fault -> reflexion_gate` — degrade-visibly: the
+  rewritten critique deliberately has no `VERDICT:` line, so the gate's
+  malformed-critique PASS default proceeds to synthesis.
+- `synthesize -> synth_fault -> end_fault` — fail-closed: no report
+  means no product.
+
+On the fail-closed routes, `end_fault` renders the
+`DEEP_RESEARCH FAILED — PIPELINE-FAULT: ...` sentinel. On the
+degrade-visibly routes, `verify_sources` folds the accumulated faults
+into a `## Pipeline notes` section shown at the approval step and
+appended to the accepted report (`{{report}}{{pipeline_notes}}`;
+empty when there were no faults). Degraded output is never a silent
+pass — every fault is visible to the reviewer or the caller — and some
+end node always renders its sentinel, so the graph degrades instead of
+dying.
+
+All 11 scripts also carry a top-level crash guard (R3): a script that
+throws records a fault and fails forward where the flow allows it (a
+crashed `reflexion_gate` proceeds to `synthesize`; a crashed
+`verify_sources` reports that sources were NOT checked) instead of
+killing the run.
+
 ## Running
 
 ```sh
@@ -241,6 +293,9 @@ coyote -a deep-research                # no prompt -> triggers ask_topic
 - `verify_sources` probes every cited URL / DOI with an HTTP HEAD
   request and reports which are unreachable, so the human reviewer
   sees broken citations before approving.
+- Fault paths degrade visibly, never silently: a `PIPELINE-FAULT`
+  can only ever surface as a failure sentinel or a `## Pipeline
+  notes` section, never as a clean report.
 
 ## Customizing
 
@@ -270,7 +325,7 @@ coyote -a deep-research                # no prompt -> triggers ask_topic
 
 ```
 assets/agents/deep-research/
-  graph.yaml                    - agent config + 17-node workflow
+  graph.yaml                    - agent config + 23-node workflow
   tools.sh                      - classify_source custom tool
   README.md                     - this file
   knowledge/
@@ -279,9 +334,15 @@ assets/agents/deep-research/
   scripts/
     parse_request.py            - _next: bootstrap_research, or ask_topic if no topic
     bootstrap_research.py       - fan-out source: next [plan, knowledge_lookup]
+    plan_fault.py               - fail-closed fault marker: dead plan -> end_fault
+    question_fault.py           - branch-local fault marker for a dead research lane
     combine_findings.py         - joins map output (question_findings) into findings
+    vet_fault.py                - degrade-visibly fault marker: unvetted sources
+    critique_fault.py           - degrade-visibly fault marker: skipped critique
     reflexion_gate.py           - _next: research_each_question (revise) or synthesize
-    verify_sources.py           - HTTP HEAD on cited URLs / DOIs
+    synth_fault.py              - fail-closed fault marker: no report -> end_fault
+    verify_sources.py           - HTTP HEAD on cited URLs / DOIs; folds pipeline_faults
+                                  into the report's "## Pipeline notes" section
     incorporate_feedback.py     - _next: research_each_question, with user feedback
 ```
 

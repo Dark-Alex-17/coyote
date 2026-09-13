@@ -11,13 +11,21 @@ gets the chance to rationalize past it.
 ```mermaid
 flowchart TD
     parse["parse<br/>(llm: extract request facts)"] --> signals["signals<br/>(script: deterministic diff facts)"]
+    parse -. "fallback" .-> pfault["parse_fault<br/>(script: PIPELINE-FAULT marker)"]
+    pfault --> gate
     signals --> select["select_lanes<br/>(llm: ADDITIVE-only judgment)"]
     select --> build["build_items<br/>(script: rules floor ∪ additions;<br/>forced lanes override exactly)"]
+    select -. "fallback" .-> dlanes["default_lanes<br/>(script: deterministic degraded<br/>selection — wider, never narrower)"]
+    dlanes --> build
     build --> mcr["map: code-review"] & madv["map: adversary"] & msec["map: security"] & mpb["map: probe"]
-    mcr -->|"over: 0-or-1 items"| rcr[["code-reviewer"]]
-    madv --> radv[["adversary"]]
-    msec --> rsec[["security-reviewer"]]
-    mpb --> rpb[["probe"]]
+    mcr -->|"over: 0-or-1 items"| rcr[["code-reviewer<br/>(max_attempts: 2)"]]
+    madv --> radv[["adversary<br/>(max_attempts: 2)"]]
+    msec --> rsec[["security-reviewer<br/>(max_attempts: 2)"]]
+    mpb --> rpb[["probe<br/>(max_attempts: 2)"]]
+    rcr -. "fallback" .-> lfault["lane_fault<br/>(script: PIPELINE-FAULT lane result,<br/>collected by the map)"]
+    radv -. "fallback" .-> lfault
+    rsec -. "fallback" .-> lfault
+    rpb -. "fallback" .-> lfault
     mcr & madv & msec & mpb --> gate["verdict_gate<br/>(script: sentinel regex — deterministic)"]
     gate --> done(["GAUNTLET: PASS | BLOCKED"])
 ```
@@ -49,6 +57,21 @@ those rules are *structure*:
   with an environment note — it is never treated as PASS or FAIL.
 - **Verdict independence is structural**: lanes run as isolated sub-agents
   with no `teammates:` flag — no cross-lane messaging, by construction.
+- **Failure fails closed, structurally** (`fallback:` routes + `PIPELINE-FAULT`
+  markers): every LLM node and lane retries once (`max_attempts: 2`), then a
+  fallback fires instead of killing the graph — and every fallback degrades
+  toward BLOCKED, never toward a pass. A dead lane becomes a `PIPELINE-FAULT:`
+  lane result (`lane_fault.py`) that the gate reports as BLOCKED *naming the
+  lane* — distinct from SKIPPED (not selected). A dead `parse` records a fault
+  and jumps straight to the gate (`parse_fault.py`). A dead `select_lanes`
+  degrades to a deterministic selection (`default_lanes.py`): code-review +
+  adversary, plus probe on consumer surface, plus security on auth/deps/exec
+  signals or hardened posture, unioned with caller-forced lanes — wider, never
+  narrower. A crashed `build_items` records a fault so an all-SKIPPED gate
+  still blocks. Fault detection is prefix-anchored — a real review that merely
+  *quotes* "PIPELINE-FAULT:" flows to the normal sentinel rules. And the
+  `GAUNTLET:` sentinel is always emitted: even a crashed gate prints
+  `GAUNTLET: BLOCKED`, never silence.
 
 ## Sentinels parsed
 
@@ -74,6 +97,9 @@ Plan / acceptance criteria:
 Local-run recipe / usage suites:
 <how to boot the service locally + where existing suites live — enables the probe lane>
 
+Verification commands: (optional — exact build/test/lint commands, passed
+verbatim to the adversary lane; omitted = none declared, never invented)
+
 Forced lanes: (optional — e.g. 'adversary, probe' to run exactly those)"
 ```
 
@@ -89,9 +115,13 @@ final report verbatim.
 - The caller decides *whether* review is warranted at all (the gauntlet is for
   non-trivial work — that's why code-review is unconditionally on); the
   gauntlet decides *which* of the other lanes apply and what the verdicts mean.
-- Lane sub-agents get generous finite timeouts (2h each; 3h whole-gauntlet).
-  A lane that dies or times out produces no sentinel — which is a BLOCKED,
-  never a silent pass.
+- Lane sub-agents get generous finite timeouts (2h each; 3h whole-gauntlet)
+  and one retry (`max_attempts: 2`). A lane that still dies or times out falls
+  back to the `lane_fault` marker — BLOCKED naming the lane, never a silent
+  pass.
+- Caller-declared verification commands are extracted verbatim by `parse` and
+  passed through to the adversary lane's prompt — never invented or
+  auto-detected; undeclared stays undeclared.
 - Signals failures degrade gracefully: if git can't compute the diff, lane
   selection falls back to caller context + forced lanes, and the report notes
   it. The auth-path regex deliberately over-fires (`auth(?!or)` matches

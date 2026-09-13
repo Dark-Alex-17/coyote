@@ -27,6 +27,7 @@ flowchart TD
     gate_blocked -->|"yes"| orient
     gate_blocked -->|"no"| end_blocked
     orient["orient<br/>llm, read-only"] --> route_staleness
+    orient -. "LLM fault" .-> note_llm_fault
     route_staleness{"route_staleness<br/>script"}
     route_staleness -->|"major deviation"| gate_deviation
     route_staleness -->|"else"| implement
@@ -35,6 +36,7 @@ flowchart TD
     gate_deviation -->|"abort"| end_rejected
     gate_deviation -->|"other (user guidance)"| implement
     implement[["implement<br/>agent → coder"]] --> route_coder_result
+    implement -. "coder crashed<br/>(no retries)" .-> end_failure
     route_coder_result{"route_coder_result<br/>script"}
     route_coder_result -->|"CODER_COMPLETE"| verify_format_lint
     route_coder_result -->|"REJECTED / FAILED"| end_failure
@@ -51,14 +53,18 @@ flowchart TD
     fix_loop_gate -->|"budget left"| implement
     fix_loop_gate -->|"budget spent"| end_failure
     edge_case_sweep["edge_case_sweep<br/>llm"] --> route_sweep
+    edge_case_sweep -. "LLM fault" .-> write_handoff
     route_sweep{"route_sweep<br/>script"}
     route_sweep -->|"5+ files or boundary"| independent_review
     route_sweep -->|"else"| write_handoff
     independent_review[["independent_review<br/>agent → code-reviewer"]] --> route_review
+    independent_review -. "2 attempts failed" .-> write_handoff
     route_review{"route_review<br/>script"}
     route_review -->|"🔴 critical findings"| implement
     route_review -->|"else"| write_handoff
     write_handoff["write_handoff<br/>llm"] --> check_handoff
+    write_handoff -. "LLM fault" .-> note_llm_fault
+    note_llm_fault{"note_llm_fault<br/>script"} --> end_failure
     check_handoff{"check_handoff<br/>script"}
     check_handoff -->|"schema valid"| gate_user_review
     check_handoff -->|"one retry"| write_handoff
@@ -81,8 +87,32 @@ End nodes emit sentinel outcomes for the caller:
 - `STEP_BLOCKED` — `depends_on` unsatisfied and the user declined to proceed.
 - `STEP_REJECTED` — user aborted at the deviation gate, or the coder's plan
   was rejected at its approval gate.
-- `STEP_FAILED` — coder failed, the step-level fix budget was exhausted, or
-  the handoff failed validation twice.
+- `STEP_FAILED` — the coder failed or crashed, the step-level fix budget was
+  exhausted, the handoff failed validation twice, or an orient/handoff LLM
+  fault was recorded (rendered as `Pipeline fault:` in the output).
+
+## Fault handling
+
+Node crashes degrade the run visibly instead of masquerading as success:
+
+- `implement` has **no retries** — rerunning a coder that died mid-edit
+  against an already-mutated tree is unsafe. Its failure text lands in
+  `coder_result` and the run falls straight to `end_failure`.
+- `independent_review` retries once (`max_attempts: 2`); if both attempts
+  fail it falls back to `write_handoff`, which flags "PIPELINE-FAULT:
+  independent review did not run" in the handoff rather than presenting the
+  failure text as findings. `route_review` carries the same guard before its
+  🔴 grep, so a reviewer fault never spends a fix-loop attempt.
+- `edge_case_sweep` faults likewise fall through to `write_handoff` and are
+  flagged as "PIPELINE-FAULT: edge-case sweep did not run".
+- `orient` and `write_handoff` faults route through `note_llm_fault`, which
+  distills the engine's failure text into a `fault_note` rendered in the
+  `STEP_FAILED` output — never an empty shell.
+
+Degraded is never passing (a skipped review or sweep is recorded as NOT RUN,
+never paraphrased as covered), and the sentinel is always emitted — every
+path terminates at one of the four end nodes, so the caller always gets a
+parseable outcome.
 
 ## Usage
 

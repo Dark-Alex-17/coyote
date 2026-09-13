@@ -49,6 +49,12 @@ Complaints:
 2. ...
 ```
 
+Every verdict — CONFORMS or DIVERGES — ends with a `Verification runs:` section: the recorded
+PASS/FAIL results (command, exit code, duration, failure tail) of the caller-declared verification
+commands, or an explicit marker when none were declared or the run never reached that stage. The
+one exception is the verdict script's own crash guard, which emits a bare DIVERGES with a
+"verdict computation error" line — and no section — when verdict computation itself dies.
+
 A `DIVERGES` verdict **blocks** completion. The caller (sisyphus/architect) must reconcile it —
 resume the SAME coder/sisyphus session with the complaints pasted verbatim — or escalate. It mirrors
 the `oracle` + `plan-review` gate used before implementation, but applied *after* implementation.
@@ -60,21 +66,29 @@ violation) and cites `file:line`. Vague complaints are not emitted.
 
 ```mermaid
 flowchart TD
-    A["parse (llm): extract acceptance criteria"] --> B["diff_facts (script): resolve + bound the diff"]
-    B --> C["map over criteria: one fresh-context branch each (parallel)"]
+    A["parse (llm): extract acceptance criteria + declared verification commands"] --> B["diff_facts (script): resolve + bound the diff"]
+    B --> R["run_checks (script): run the declared verification commands ONCE, record results"]
+    R --> C["map over criteria: one fresh-context branch each (parallel)"]
     C --> D["check_criterion (llm + fs/ast tools)"]
     D --> E["crit_gate (script): MET needs change+test evidence"]
     E -. "reject-retry once; exhausted = PARTIAL" .-> D
     E --> F["holistic (llm): ADDITIVE-only hunt - absence, scope drift, substitution, gamed tests"]
-    F --> G["verdict (script): CONFORMS iff ALL MET + zero extras; no criteria = DIVERGES"]
+    F --> G["verdict (script): CONFORMS iff ALL MET + zero extras + zero faults; no criteria = DIVERGES"]
     G --> H(["ADVERSARIAL_REVIEW: CONFORMS | DIVERGES"])
+    A -. "fallback" .-> P["pipeline_fault (script): record PIPELINE-FAULT marker"]
+    B -. "fallback" .-> P
+    R -. "fallback" .-> P
+    F -. "fallback" .-> G
+    P --> G
 ```
 
 The conformance doctrine is baked into the graph's own nodes:
 
 1. **Every** acceptance criterion gets its own fresh-context verification branch — MET / PARTIAL / UNMET / DIVERGED, machine-gated (MET requires the satisfying change AND the proving test, cited). No test ⇒ at best PARTIAL. Partial coverage of the criteria list is structurally impossible.
 2. Ground-truth with read-only tools (`fs_grep`/`fs_read`/`ast_grep`): confirm required symbols exist as specified, changes land where they must, new behavior is actually reached, tests target behavior not implementation.
-3. Hunt adversarially for the **absent**: skipped criteria, scope creep, interface/approach substitution, out-of-scope touches, downstream contract breakage.
+3. Execution evidence is recorded **once, deterministically**: `run_checks` runs ONLY the caller-declared verification commands (never invented or auto-detected), sequentially under a 3300s total deadline — commands the deadline leaves no budget for are recorded as SKIPPED. Criterion branches have no execution tools by design: "tests pass"-style criteria are judged against the record — a recorded green run is MET citing it; no declared command ⇒ at best PARTIAL.
+4. Hunt adversarially for the **absent**: skipped criteria, scope creep, interface/approach substitution, out-of-scope touches, downstream contract breakage.
+5. **Fail closed on pipeline faults**: if parse, diff resolution, or the verification runner dies, its fallback routes to `pipeline_fault`, which records a `PIPELINE-FAULT:` marker and continues to the verdict (a failed holistic pass falls back straight to the verdict, which synthesizes the same marker). Any recorded fault forces DIVERGES with the fault as complaint #1 — degraded is never passing, and the sentinel is always emitted: the graph never dies without one.
 
 It is **read-only** — it produces a verdict, never a fix.
 
@@ -93,6 +107,9 @@ Run get_diff (or --base main), or: <paste diff>
 
 ## PLAN — acceptance criteria to check against
 <paste the task index.md body + the relevant PLAN-*.md section, verbatim>
+
+## VERIFICATION (optional)
+<exact build/test/lint commands to run, one per line — undeclared commands are never guessed>
 "
 ```
 
@@ -106,6 +123,7 @@ coyote -a adversary --agent-variable project_dir /path/to/repo \
 ### Tools
 
 - The graph's `diff_facts` script resolves the diff itself (staged → unstaged → `HEAD~1`, or an explicit ref/range named in the prompt) — there is no `get_diff` tool anymore.
+- The `run_checks` script executes the caller-declared verification commands and records the results — criterion branches cite the record and never run anything themselves.
 - Criterion branches carry read-only `fs_read`/`fs_cat`/`fs_grep`/`ast_grep` for ground-truth checks.
 
 ## Related

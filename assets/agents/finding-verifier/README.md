@@ -7,13 +7,23 @@ or confirmation-bias the check. A graph can't: the structure IS the discipline.
 
 ## How it works
 
-```
-parse (llm) ──▶ verify_each (map, max_concurrency 4) ──▶ done (end)
-                     └─▶ verify_one (llm + fs tools) ──▶ verdict_gate (script), one CHAIN per finding
+```mermaid
+flowchart TD
+    A["parse (llm, max_attempts 2)"] --> B["verify_each (map, max_concurrency 4): one branch per finding"]
+    A -. "fallback" .-> PF["parse_fault (script): verdicts = one UNVERIFIABLE PIPELINE-FAULT entry"]
+    PF --> D
+    B -. "spawns × N" .-> C["verify_one (llm + fs tools, max_attempts 2)"]
+    C --> G["verdict_gate (script): machine-validates the JSON contract"]
+    G -. "reject-retry once" .-> C
+    C -. "fallback" .-> VF["verify_fault (script): branch-local UNVERIFIABLE marker"]
+    B --> D(["done (end): FINDING_VERIFIER_RESULTS"])
 ```
 
 1. **parse** — extracts every 🔴/🟡 finding from the spawn prompt into a structured list
    (id, severity verbatim, path, lines, self-contained claim). Extraction only — no judging.
+   Gets two attempts (`max_attempts: 2`); if both fail, its `fallback` routes to
+   `parse_fault`, which rewrites `verdicts` to a single UNVERIFIABLE entry naming the fault
+   and jumps straight to `done`.
 2. **verify_each** — a `map` node fans out one `verify_one` branch per finding. Skipping a
    finding is structurally impossible; results collect in input order.
 3. **verify_one** — reads the cited code (greps for moved code before concluding anything)
@@ -28,11 +38,18 @@ parse (llm) ──▶ verify_each (map, max_concurrency 4) ──▶ done (end)
    contract (verdict enum; evidence required for VERIFIED/FALSE; note for UNVERIFIABLE),
    stamps the authoritative id FROM the finding item (the model's echo is never trusted),
    rejects back to `verify_one` exactly once with the reason, and on a second failure records
-   UNVERIFIABLE — a malformed branch never sinks the map.
-     Kept, marked unverified.
+   UNVERIFIABLE — a malformed branch never sinks the map. If `verify_one` itself dies (both
+   `max_attempts: 2` attempts fail), its `fallback` routes to `verify_fault`, which
+   normalizes the engine's failure text into a branch-local UNVERIFIABLE verdict the map
+   still collects.
 4. **done** — a deterministic `end` node emits the raw verdict list plus the caller
    contract (VERIFIED = keep + paste evidence; FALSE = drop + tally; UNVERIFIABLE = keep,
    marked). No final LLM step that could editorialize.
+
+The dashed edges are fault paths. Both fault markers surface as `PIPELINE-FAULT:` text in
+a verdict's `note`, and a fault can only ever produce UNVERIFIABLE — degraded output is
+never a passing verdict. Every path ends at `done`, so the `FINDING_VERIFIER_RESULTS`
+sentinel is always emitted and the caller's verify lane degrades instead of dying.
 
 ## What it is NOT
 
@@ -50,3 +67,6 @@ installed, code-reviewer runs the same contract inline as a fallback.
 
 - `graph.yaml` — the agent (no tools.sh; the graph grants `fs_read`/`fs_cat`/`fs_grep`
   per node).
+- `scripts/verdict_gate.py` — the deterministic contract gate.
+- `scripts/parse_fault.py`, `scripts/verify_fault.py` — the fault markers behind the
+  dashed fallback edges.

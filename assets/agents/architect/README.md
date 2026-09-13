@@ -160,6 +160,9 @@ By default (`parallel_tasks: 0`) tasks run **sequentially** on the single run br
 - Architect integrates: completed task branches merge into the run branch **one at a time**, with a
   full build + test run after every merge. Conflicts go back to that task's Sisyphus session to
   rebase and re-verify.
+- Optionally, the `agent__task_*` queue may mirror the on-disk `blocked_by` graph so completing a
+  task auto-dispatches its unblocked dependents. The queue is in-memory convenience only — disk task
+  files remain the durable source of truth.
 - Worktrees and task branches are cleaned up after each clean merge. Phase F (single draft PR +
   CI-check watch) is unchanged in both modes.
 

@@ -14,21 +14,44 @@
 ```mermaid
 flowchart TD
     A["parse (llm)"] --> B["facts (script): diff, quality bar, ledger, history, trigger signals"]
+    A -. "fallback" .-> PF["parse_fault (script): PIPELINE-FAULT verdict"]
+    PF --> L
     B --> C["linters (script): tflint / hadolint / actionlint / buf breaking"]
-    C --> D["group_domains (script) --> refine_groups (llm) --> cover_gate (script: exact cover)"]
-    D --> E["map over domain slices (parallel): domain-reviewer leaders, teammates on"]
-    D --> F["aux_lanes (llm): org-context + prior-art spawns"]
-    D --> G["downstream_sweep (script)"]
+    C --> D1["group_propose (script): deterministic domain proposal"]
+    D1 --> D2["refine_groups (llm)"]
+    D2 --> D3["cover_gate (script: exact cover)"]
+    D2 -. "fallback" .-> D3
+    D3 --> E["map over domain slices (parallel): domain-reviewer leaders, teammates on, max_attempts: 2"]
+    D3 --> F["aux_lanes (llm): org-context + prior-art spawns"]
+    D3 --> G["downstream_sweep (script)"]
     E --> H["completeness_gate (script): required sections even when clean"]
+    E -. "fallback" .-> DF["domain_fault (script): ⚠️ PIPELINE-FAULT slice banner"]
     H -. "reject-retry once" .-> E
     H --> I["synthesize (llm: dedup + prose, NO verdict authority)"]
     F --> I
+    F -. "fallback" .-> AF["aux_fault (script): PIPELINE-FAULT lane-skip note"]
+    AF --> I
     G --> I
-    I --> J["verify: finding-verifier (agent node, unskippable)"]
-    J --> K["verdict (script): FALSE-drops, rigor folding, MERGE-READY / NEEDS-HUMAN arithmetic"]
+    I --> J["verify: finding-verifier (agent node, unskippable, max_attempts: 2)"]
+    I -. "fallback" .-> K
+    J --> K["verdict (script): FALSE-drops, rigor folding, fault accounting, MERGE-READY / NEEDS-HUMAN arithmetic"]
+    J -. "fallback" .-> K
     K --> L["render (script): the standard report"]
 ```
 
+**Failure fails closed.** Every LLM/agent node retries once (`max_attempts: 2` — the
+domain-reviewer lanes and the verifier included), then routes to a `fallback:` instead of killing
+the graph, and every fallback that loses review coverage leaves a `PIPELINE-FAULT` marker: a dead
+`parse` emits a complete fault verdict and jumps straight to render; a dead domain lane becomes a
+`> ⚠️ PIPELINE-FAULT` banner where its slice report would be; a dead `refine_groups` falls
+through to the cover gate, which keeps the deterministic proposal; a dead synthesis or verifier
+falls through to the verdict script. The verdict script counts every fault and forces
+`NEEDS-HUMAN` — a degraded run never reads `MERGE-READY`. The aux context lanes are the one
+exception: they are enrichment, so their fault (`aux_fault`) is surfaced as a lane-skip note but
+never blocks. Fault detection is prefix-anchored (a report that merely *quotes* a marker doesn't
+trip it), and the report is always emitted: the verdict script's own crash guard emits a
+`PIPELINE-FAULT` NEEDS-HUMAN, and render bypasses its "No changes to review." stub for fault
+verdicts — a fault renders as a full report, never silence.
 
 A CodeRabbit-style code review orchestrator that coordinates per-file reviews and synthesizes findings into a unified 
 report.
