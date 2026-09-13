@@ -89,6 +89,7 @@ initial_state:
   handoff_attempts: 0
   handoff_fix: ''
   handoff_failure: ''
+  fault_note: ''
   step_summary: ''
 
 start: resolve_step
@@ -196,7 +197,7 @@ nodes:
         ]
     state_updates:
       orient_failure: '{{output}}'
-    fallback: end_failure
+    fallback: note_llm_fault
     next: route_staleness
 
   route_staleness:
@@ -474,6 +475,16 @@ nodes:
       did not run - <failure text>", repeat it under Notes for next step,
       and carry it into `step_summary` so the user sees it at the approval
       gate.
+
+      The same rule covers the "Edge-case sweep result" below: text starting
+      with "LLM node" means the edge-case sweep DID NOT RUN - the graph
+      routed here through the sweep's failure fallback. Never present it as
+      sweep findings. Add a Deviations entry "PIPELINE-FAULT: edge-case
+      sweep did not run - <failure text>" and carry it into `step_summary`
+      so the user sees it at the approval gate. If it holds successful
+      structured output or is empty, ignore it - the sweep's real results
+      already flow through the "Edge cases discovered" / "Downstream plan
+      updates" sections above.
     prompt: |
       ## Step
       {{step_number}} ({{step_title}}) - plan at {{step_plan_path}}
@@ -496,6 +507,9 @@ nodes:
 
       ## Downstream plan updates
       {{downstream_updates}}
+
+      ## Edge-case sweep result (fault detection)
+      {{sweep_failure}}
 
       ## Independent review report (if any)
       {{review_report}}
@@ -527,8 +541,21 @@ nodes:
       required: [step_summary]
     state_updates:
       handoff_failure: '{{output}}'
-    fallback: end_failure
+    fallback: note_llm_fault
     next: check_handoff
+
+  note_llm_fault:
+    id: note_llm_fault
+    type: script
+    description: |
+      Make LLM-node fallback captures visible: when orient or write_handoff
+      failed (their capture keys hold the engine's "LLM node..." failure
+      text), distill it into fault_note so end_failure can render WHY the
+      step died instead of an empty STEP_FAILED shell.
+    script: scripts/note_llm_fault.sh
+    timeout: 5
+    fallback: end_failure
+    next: end_failure
 
   check_handoff:
     id: check_handoff
@@ -627,6 +654,7 @@ nodes:
       Step: {{step_number}} ({{step_title}})
       Fix attempts: {{fix_attempts}}/{{max_fix_attempts}}
       Blocking reason (if resolution failed): {{blocking_reason}}
+      Pipeline fault (if any): {{fault_note}}
 
       Coder result:
       {{coder_result}}

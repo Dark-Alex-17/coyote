@@ -10112,6 +10112,91 @@ mod tests {
     }
 
     #[test]
+    fn step_runner_note_llm_fault_orient_failure() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        let state = json!({
+            "orient_failure": "LLM node failed: boom",
+            "handoff_failure": ""
+        });
+        let out = run_step_runner_script("note_llm_fault.sh", &state);
+        assert_eq!(
+            out,
+            json!({"fault_note": "PIPELINE-FAULT: orient stage failed — LLM node failed: boom"})
+        );
+    }
+
+    #[test]
+    fn step_runner_note_llm_fault_handoff_failure() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        // On success orient_failure holds the node's structured JSON output,
+        // which never starts with the engine's "LLM node" prefix — only the
+        // handoff fault must be reported.
+        let state = json!({
+            "orient_failure": "{\"plan_summary\":\"ok\"}",
+            "handoff_failure": "LLM node structured-extraction failed: bad schema"
+        });
+        let out = run_step_runner_script("note_llm_fault.sh", &state);
+        assert!(
+            out["fault_note"].as_str().unwrap().starts_with(
+                "PIPELINE-FAULT: handoff stage failed — LLM node structured-extraction failed:"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn step_runner_note_llm_fault_clean_path() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        let state = json!({
+            "orient_failure": "{\"plan_summary\":\"ok\"}",
+            "handoff_failure": ""
+        });
+        let out = run_step_runner_script("note_llm_fault.sh", &state);
+        assert_eq!(out, json!({"fault_note": ""}));
+    }
+
+    #[test]
+    fn step_runner_note_llm_fault_survives_empty_state() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        // R3: a fault-noting script must never itself kill the pipeline —
+        // the harness asserts exit 0 + JSON stdout even for a bare state.
+        let out = run_step_runner_script("note_llm_fault.sh", &json!({}));
+        assert_eq!(out, json!({"fault_note": ""}));
+    }
+
+    #[test]
+    fn step_runner_note_llm_fault_truncates_long_failure() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        let failure = format!("LLM node failed: {}", "x".repeat(400));
+        let out = run_step_runner_script("note_llm_fault.sh", &json!({"orient_failure": failure}));
+        let note = out["fault_note"].as_str().unwrap();
+        assert!(
+            note.starts_with("PIPELINE-FAULT: orient stage failed — LLM node failed:"),
+            "{out}"
+        );
+        assert!(
+            note.chars().count() <= 340,
+            "fault_note must be bounded to the prefix + 300 chars, got {}: {note}",
+            note.chars().count()
+        );
+    }
+
+    #[test]
     fn step_runner_fault_wiring_preserves_sentinels() {
         use crate::graph::{GraphParser, NodeType};
         let dir =
@@ -10138,10 +10223,14 @@ mod tests {
         // The llm nodes with fallbacks capture their failure text so the
         // fallback path can see why it was reached (the TASK-016 warning —
         // this is what shrank the step-runner warning baseline to zero).
-        for (node_id, key) in [
-            ("orient", "orient_failure"),
-            ("edge_case_sweep", "sweep_failure"),
-            ("write_handoff", "handoff_failure"),
+        // orient and write_handoff route their fallbacks through
+        // note_llm_fault, which distills the capture into fault_note;
+        // edge_case_sweep still falls back to write_handoff, which renders
+        // sweep_failure in its prompt.
+        for (node_id, key, fallback) in [
+            ("orient", "orient_failure", "note_llm_fault"),
+            ("edge_case_sweep", "sweep_failure", "write_handoff"),
+            ("write_handoff", "handoff_failure", "note_llm_fault"),
         ] {
             let NodeType::Llm(llm) = &graph.get_node(node_id).unwrap().node_type else {
                 panic!("{node_id} must be an llm node")
@@ -10152,7 +10241,21 @@ mod tests {
                     .is_some_and(|u| u.contains_key(key)),
                 "{node_id} must capture its failure text into {key}"
             );
+            assert_eq!(
+                llm.fallback.as_deref(),
+                Some(fallback),
+                "{node_id} must fall back to {fallback}"
+            );
         }
+
+        // note_llm_fault sits on the failure path; its own fallback also
+        // lands on end_failure so a broken script can never strand the step.
+        let note_node = graph.get_node("note_llm_fault").unwrap();
+        let NodeType::Script(note) = &note_node.node_type else {
+            panic!("note_llm_fault must be a script node")
+        };
+        assert_eq!(note_node.next_target(), Some("end_failure"));
+        assert_eq!(note.fallback.as_deref(), Some("end_failure"));
 
         // write_handoff must teach the review-fault flag: a review_report
         // holding the engine's failure text is "review DID NOT RUN", flagged
@@ -10167,6 +10270,19 @@ mod tests {
                 .is_some_and(|i| i.contains("Agent node failed:")),
             "write_handoff instructions must handle the review-fault text"
         );
+        // Same treatment for the sweep fault: sweep_failure is interpolated
+        // in the prompt and the instructions teach the "LLM node" anchor.
+        assert!(
+            handoff.prompt.contains("{{sweep_failure}}"),
+            "write_handoff prompt must surface the sweep capture"
+        );
+        assert!(
+            handoff
+                .instructions
+                .as_ref()
+                .is_some_and(|i| i.contains("LLM node")),
+            "write_handoff instructions must handle the sweep-fault text"
+        );
 
         // end_failure renders sensibly when reached via implement's fallback:
         // STEP_FAILED leads, and every interpolated key has an initial_state
@@ -10177,6 +10293,11 @@ mod tests {
         assert!(
             end.output.starts_with("STEP_FAILED"),
             "the sentinel must lead the output: {}",
+            end.output
+        );
+        assert!(
+            end.output.contains("{{fault_note}}"),
+            "end_failure must render the distilled fault note: {}",
             end.output
         );
         for chunk in end.output.split("{{").skip(1) {
