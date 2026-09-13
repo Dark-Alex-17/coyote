@@ -8937,8 +8937,8 @@ mod tests {
             v["evidence"]
                 .as_str()
                 .unwrap()
-                .starts_with("PIPELINE-FAULT:"),
-            "the fault prefix must survive a crash: {out}"
+                .starts_with("PIPELINE-FAULT: criterion "),
+            "the crash path must emit the exact prefix verdict.py's died() keys on: {out}"
         );
         assert!(
             v["complaint"]
