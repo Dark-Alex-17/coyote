@@ -10117,10 +10117,25 @@ mod tests {
         })
     }
 
-    #[test]
-    fn step_runner_route_review_fault_text_skips_fix_loop() {
+    /// Gate for the bash-harness tests below. The step-runner `.sh` scripts
+    /// are POSIX-oriented: git-bash on Windows satisfies `cmd_available` but
+    /// the POSIX invocation (path/quoting/env semantics) fails there, so
+    /// Windows always skips; the scripts are exercised on unix runners.
+    fn skip_step_runner_bash_harness() -> bool {
+        if cfg!(windows) {
+            eprintln!("skipping: POSIX bash script harness");
+            return true;
+        }
         if !cmd_available("bash") || !cmd_available("jq") {
             eprintln!("skipping: bash/jq not available");
+            return true;
+        }
+        false
+    }
+
+    #[test]
+    fn step_runner_route_review_fault_text_skips_fix_loop() {
+        if skip_step_runner_bash_harness() {
             return;
         }
         // The engine's failure text must never be mistaken for review
@@ -10141,8 +10156,7 @@ mod tests {
 
     #[test]
     fn step_runner_route_review_critical_finding_still_loops() {
-        if !cmd_available("bash") || !cmd_available("jq") {
-            eprintln!("skipping: bash/jq not available");
+        if skip_step_runner_bash_harness() {
             return;
         }
         // Non-fault routing regression: a real 🔴 report still enters the
@@ -10167,8 +10181,7 @@ mod tests {
 
     #[test]
     fn step_runner_route_review_clean_report_proceeds() {
-        if !cmd_available("bash") || !cmd_available("jq") {
-            eprintln!("skipping: bash/jq not available");
+        if skip_step_runner_bash_harness() {
             return;
         }
         let out =
@@ -10182,8 +10195,7 @@ mod tests {
 
     #[test]
     fn step_runner_note_llm_fault_orient_failure() {
-        if !cmd_available("bash") || !cmd_available("jq") {
-            eprintln!("skipping: bash/jq not available");
+        if skip_step_runner_bash_harness() {
             return;
         }
         let state = json!({
@@ -10199,8 +10211,7 @@ mod tests {
 
     #[test]
     fn step_runner_note_llm_fault_handoff_failure() {
-        if !cmd_available("bash") || !cmd_available("jq") {
-            eprintln!("skipping: bash/jq not available");
+        if skip_step_runner_bash_harness() {
             return;
         }
         // On success orient_failure holds the node's structured JSON output,
@@ -10221,8 +10232,7 @@ mod tests {
 
     #[test]
     fn step_runner_note_llm_fault_clean_path() {
-        if !cmd_available("bash") || !cmd_available("jq") {
-            eprintln!("skipping: bash/jq not available");
+        if skip_step_runner_bash_harness() {
             return;
         }
         let state = json!({
@@ -10235,8 +10245,7 @@ mod tests {
 
     #[test]
     fn step_runner_note_llm_fault_survives_empty_state() {
-        if !cmd_available("bash") || !cmd_available("jq") {
-            eprintln!("skipping: bash/jq not available");
+        if skip_step_runner_bash_harness() {
             return;
         }
         // R3: a fault-noting script must never itself kill the pipeline —
@@ -10247,8 +10256,7 @@ mod tests {
 
     #[test]
     fn step_runner_note_llm_fault_truncates_long_failure() {
-        if !cmd_available("bash") || !cmd_available("jq") {
-            eprintln!("skipping: bash/jq not available");
+        if skip_step_runner_bash_harness() {
             return;
         }
         let failure = format!("LLM node failed: {}", "x".repeat(400));
