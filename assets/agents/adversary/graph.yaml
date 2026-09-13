@@ -215,6 +215,8 @@ nodes:
       Your response is machine-validated: a malformed response is rejected back
       to you exactly once with the reason, then recorded as PARTIAL (unproven).
       The id is stamped from the criterion itself — your echo is informative only.
+      You have a bounded tool budget — prefer fs_grep and line-ranged fs_read over
+      whole-file reads, and conclude as soon as the evidence is decisive.
     prompt: |
       Repository: {{project_dir}}
       Changed files: {{changed_files}}
@@ -236,10 +238,11 @@ nodes:
       - fs_cat
       - fs_grep
       - ast_grep
-    max_iterations: 10
+    max_iterations: 30
     max_attempts: 2
     state_updates:
       crit_verdict: '{{output}}'
+    fallback: criterion_fault
     next: crit_gate
 
   crit_gate:
@@ -247,6 +250,13 @@ nodes:
     type: script
     description: Deterministic contract gate per criterion verdict — status enum, MET requires evidence, non-MET requires a complaint; reject-and-retry once, then record PARTIAL (unproven). Never sinks the map.
     script: scripts/crit_gate.py
+    timeout: 30
+
+  criterion_fault:
+    id: criterion_fault
+    type: script
+    description: Fail-closed per-criterion fault marker (reached only via check_criterion's fallback) — converts the captured "LLM node failed" text into a schema-shaped UNMET verdict carrying a PIPELINE-FAULT evidence marker, so one dead criterion check can never sink the map or read as met. Never sinks the map.
+    script: scripts/criterion_fault.py
     timeout: 30
 
   holistic:
@@ -320,7 +330,7 @@ nodes:
         observations:
           type: string
       required: [extra_complaints, observations]
-    max_iterations: 10
+    max_iterations: 20
     max_attempts: 2
     state_updates:
       holistic_failure: '{{output}}'

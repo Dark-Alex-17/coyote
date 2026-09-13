@@ -6,14 +6,17 @@ holistic complaints, and zero pipeline faults. Everything else — including
 a missing plan or a degraded (faulted) pipeline — is DIVERGES (fail-closed).
 Any "PIPELINE-FAULT:" marker recorded in `pipeline_faults` (or a holistic
 llm-node failure captured in `holistic_failure`) becomes complaint #1;
-per-criterion results are still reported. Assembles the exact sentinel
-format the callers route on. Never crashes into a silent verdict.
+per-criterion results are still reported. A criterion whose check DIED
+(criterion_fault's UNMET verdict, evidence prefixed "PIPELINE-FAULT:") is
+rendered as died rather than judged. Assembles the exact sentinel format the
+callers route on. Never crashes into a silent verdict.
 """
 
 import json
 import os
 
 MAX_FAULT_DETAIL_CHARS = 300
+DIED_MARKER = "criterion check DIED (pipeline fault)"
 
 
 def load_state():
@@ -57,10 +60,17 @@ def append_criterion_complaints(lines, verdicts, extra, start):
         text = (v.get("text") or "").strip().replace("\n", " ")
         if len(text) > 140:
             text = text[:137] + "…"
-        lines.append(
-            f'{i}. Acceptance criterion "{text}" — {v.get("status", "?").title()} — '
-            f'{(v.get("complaint") or "").strip()}'
-        )
+        complaint = (v.get("complaint") or "").strip()
+        evidence = v.get("evidence")
+        if isinstance(evidence, str) and evidence.startswith("PIPELINE-FAULT:"):
+            if not complaint.startswith(DIED_MARKER):
+                complaint = f"{DIED_MARKER} — {complaint}"
+            lines.append(f'{i}. Acceptance criterion "{text}" — {complaint}')
+        else:
+            lines.append(
+                f'{i}. Acceptance criterion "{text}" — {v.get("status", "?").title()} — '
+                f"{complaint}"
+            )
     for c in extra:
         i += 1
         lines.append(

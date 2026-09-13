@@ -8810,6 +8810,275 @@ mod tests {
         );
     }
 
+    #[test]
+    fn adversary_criterion_fault_happy_path() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "criterion": {"id": "c7", "text": "the spec"},
+            "crit_verdict": "LLM node failed: LLM call failed: llm node hit max_iterations (10) before LLM concluded"
+        });
+        let out = run_adversary_script("criterion_fault.py", &state);
+        let v = &out["crit_verdict"];
+        assert_eq!(v["status"], "UNMET", "a dead check must fail closed: {out}");
+        assert_eq!(
+            v["id"], "c7",
+            "id must be stamped from the criterion: {out}"
+        );
+        assert_eq!(v["text"], "the spec");
+        assert!(
+            v["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: criterion check failed — LLM node failed:"),
+            "evidence must carry the fault marker and the captured chain: {out}"
+        );
+        assert!(
+            v["complaint"].as_str().unwrap().contains("DIED"),
+            "the complaint must say the check died rather than judged: {out}"
+        );
+    }
+
+    #[test]
+    fn adversary_criterion_fault_degraded_inputs() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // No captured failure text at all.
+        let out = run_adversary_script(
+            "criterion_fault.py",
+            &json!({"criterion": {"id": "c1", "text": "x"}}),
+        );
+        assert_eq!(out["crit_verdict"]["status"], "UNMET");
+        assert!(
+            out["crit_verdict"]["evidence"]
+                .as_str()
+                .unwrap()
+                .ends_with("no failure text captured"),
+            "{out}"
+        );
+
+        // crit_verdict present but not an engine failure string.
+        let out = run_adversary_script(
+            "criterion_fault.py",
+            &json!({"criterion": {"id": "c1", "text": "x"}, "crit_verdict": "{\"status\": \"MET\"}"}),
+        );
+        assert_eq!(out["crit_verdict"]["status"], "UNMET");
+        assert!(
+            out["crit_verdict"]["evidence"]
+                .as_str()
+                .unwrap()
+                .ends_with("no failure text captured"),
+            "non-failure text must not be echoed as a failure: {out}"
+        );
+
+        // Criterion missing → id falls back to "unknown".
+        let out = run_adversary_script(
+            "criterion_fault.py",
+            &json!({"crit_verdict": "LLM node failed: boom"}),
+        );
+        assert_eq!(out["crit_verdict"]["id"], "unknown", "{out}");
+        assert_eq!(out["crit_verdict"]["status"], "UNMET");
+
+        // Overlong, multi-line failure text is flattened and truncated.
+        let long = format!("LLM node failed: {}\nline two", "x".repeat(600));
+        let out = run_adversary_script(
+            "criterion_fault.py",
+            &json!({"criterion": {"id": "c1", "text": "x"}, "crit_verdict": long}),
+        );
+        let evidence = out["crit_verdict"]["evidence"].as_str().unwrap();
+        assert!(
+            evidence.ends_with('…'),
+            "must truncate with an ellipsis: {evidence}"
+        );
+        assert!(
+            !evidence.contains('\n'),
+            "must flatten newlines: {evidence}"
+        );
+        assert!(
+            evidence.chars().count() < 600,
+            "{}",
+            evidence.chars().count()
+        );
+    }
+
+    #[test]
+    fn adversary_criterion_fault_crash_fails_closed() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Unparseable state makes load_state raise before main runs; the
+        // fault marker itself must still emit a schema-shaped UNMET verdict.
+        let out = run_adversary_script_env(
+            "criterion_fault.py",
+            &json!({}),
+            &[("GRAPH_STATE", "not json")],
+        );
+        let v = &out["crit_verdict"];
+        assert_eq!(
+            v["status"], "UNMET",
+            "a crashed fault marker must fail closed: {out}"
+        );
+        assert_eq!(v["id"], "unknown");
+        assert!(
+            v["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT:"),
+            "the fault prefix must survive a crash: {out}"
+        );
+        assert!(
+            v["complaint"]
+                .as_str()
+                .unwrap()
+                .contains("fault-marker script error"),
+            "the crash must be named: {out}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_renders_died_criterion_and_never_conforms() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""},
+                {"id": "c2", "text": "does Y", "status": "UNMET",
+                 "evidence": "PIPELINE-FAULT: criterion check failed — LLM node failed: boom",
+                 "complaint": "criterion check DIED (pipeline fault) — LLM node failed: boom; the criterion was NOT verified and is treated as unmet (fail-closed)"}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": []
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "a died criterion must never conform: {report}"
+        );
+        assert!(
+            report.contains("Criteria: 1/2 met, 0 partial, 1 unmet/diverged."),
+            "the died criterion counts as unmet: {report}"
+        );
+        assert!(
+            report.contains(
+                "Acceptance criterion \"does Y\" — criterion check DIED (pipeline fault) — "
+            ),
+            "a died criterion must render as died rather than judged: {report}"
+        );
+        assert!(
+            !report.contains("— Unmet —"),
+            "a died criterion must not render as a judged Unmet: {report}"
+        );
+        assert_eq!(
+            report
+                .matches("criterion check DIED (pipeline fault)")
+                .count(),
+            1,
+            "the died marker must not be doubled: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_crit_gate_passes_fault_shaped_verdict_through() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let evidence = "PIPELINE-FAULT: criterion check failed — LLM node failed: boom";
+        let fault = json!({
+            "id": "c1", "status": "UNMET", "evidence": evidence,
+            "complaint": "criterion check DIED (pipeline fault) — LLM node failed: boom"
+        });
+        let out = run_adversary_script(
+            "crit_gate.py",
+            &json!({
+                "criterion": {"id": "c1", "text": "x"},
+                "gate_attempts": 0,
+                "crit_verdict": fault.to_string()
+            }),
+        );
+        assert!(
+            out.get("_next").is_none(),
+            "a fault-shaped verdict must not retry: {out}"
+        );
+        assert_eq!(out["crit_verdict"]["status"], "UNMET");
+        assert_eq!(out["crit_verdict"]["evidence"], evidence, "{out}");
+    }
+
+    #[test]
+    fn adversary_check_criterion_fails_closed_per_criterion() {
+        use crate::graph::{GraphParser, NodeType};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/adversary");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .expect("adversary graph.yaml must parse");
+
+        let node = graph
+            .nodes
+            .get("check_criterion")
+            .expect("adversary graph must have a check_criterion node");
+        let NodeType::Llm(llm) = &node.node_type else {
+            panic!("check_criterion must be an llm node");
+        };
+        assert_eq!(
+            llm.fallback.as_deref(),
+            Some("criterion_fault"),
+            "a dead criterion check must fall back instead of sinking the map"
+        );
+        assert_eq!(llm.max_iterations, 30);
+        assert_eq!(llm.max_attempts, 2);
+        assert!(
+            llm.state_updates
+                .as_ref()
+                .is_some_and(|u| u.contains_key("crit_verdict")),
+            "the failure text must land in crit_verdict for criterion_fault to read"
+        );
+        assert_eq!(node.next_target(), Some("crit_gate"));
+        assert!(
+            llm.instructions
+                .as_deref()
+                .is_some_and(|s| s.contains("bounded tool budget")),
+            "check_criterion must be told its tool budget is bounded"
+        );
+
+        let fault = graph
+            .nodes
+            .get("criterion_fault")
+            .expect("adversary graph must have a criterion_fault node");
+        let NodeType::Script(script) = &fault.node_type else {
+            panic!("criterion_fault must be a script node");
+        };
+        assert!(
+            script.script.ends_with("criterion_fault.py"),
+            "{}",
+            script.script
+        );
+        assert_eq!(
+            fault.next_target(),
+            None,
+            "criterion_fault must terminate the branch so the map collects it"
+        );
+
+        let holistic = graph
+            .nodes
+            .get("holistic")
+            .expect("adversary graph must have a holistic node");
+        let NodeType::Llm(holistic) = &holistic.node_type else {
+            panic!("holistic must be an llm node");
+        };
+        assert_eq!(holistic.max_iterations, 20);
+    }
+
     // ---- review-gauntlet suite-script regression tests (R5) ----
     //
     // Degradation paths of the gauntlet's lane/builder/gate scripts,
