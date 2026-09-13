@@ -66,7 +66,7 @@ violation) and cites `file:line`. Vague complaints are not emitted.
 
 ```mermaid
 flowchart TD
-    A["parse (llm): extract acceptance criteria + declared verification commands"] --> B["diff_facts (script): resolve + bound the diff"]
+    A["parse (llm): extract acceptance criteria + declared verification commands"] --> B["facts (diff_facts.py): resolve + bound the diff"]
     B --> R["run_checks (script): run the declared verification commands ONCE, record results"]
     R --> C["map over criteria: one fresh-context branch each (parallel)"]
     C --> D["check_criterion (llm + fs/ast tools)"]
@@ -79,7 +79,7 @@ flowchart TD
     B -. "fallback" .-> P
     R -. "fallback" .-> P
     D -. "fallback" .-> CF["criterion_fault (script): UNMET + PIPELINE-FAULT evidence for that ONE criterion"]
-    CF --> F
+    CF -. "map join" .-> F
     F -. "fallback" .-> G
     P --> G
 ```
