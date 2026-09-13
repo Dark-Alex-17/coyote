@@ -8223,6 +8223,72 @@ mod tests {
         );
     }
 
+    // Shell commands the adversary's run_checks stage executes must be
+    // declared as a variable, never as prompt prose an LLM would re-extract.
+    #[test]
+    #[serial]
+    fn bundled_assets_pin_verification_commands_as_declared_variable() {
+        let _guard = TestConfigDirGuard::new();
+        Agent::install_builtin_agents(false).unwrap();
+
+        const VARIABLES_FORM: &str =
+            "--variables {\"verification_commands\": \"[\\\"cargo test --all\\\"";
+        for name in ["architect", "sisyphus"] {
+            let config =
+                read_to_string(paths::agents_data_dir().join(name).join("config.yaml")).unwrap();
+            assert_eq!(
+                config.matches(VARIABLES_FORM).count(),
+                2,
+                "{name} config must pass verification_commands via --variables on both the \
+                 review-gauntlet and adversary spawn templates"
+            );
+            assert!(
+                !config.contains("Verification commands:"),
+                "{name} config must not declare verification commands as prompt prose"
+            );
+            assert!(
+                config.matches("trust boundary").count() >= 2,
+                "{name} config must explain the trust boundary on both spawn templates"
+            );
+            assert!(
+                config.contains("untrusted pasted text"),
+                "{name} config must name the untrusted prompt text as the reason"
+            );
+        }
+
+        let readmes = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        let adversary = read_to_string(readmes.join("adversary/README.md")).unwrap();
+        assert!(
+            !adversary.contains("## VERIFICATION"),
+            "adversary README must not show the prose ## VERIFICATION block"
+        );
+        assert!(adversary.contains(VARIABLES_FORM));
+        assert!(
+            adversary.contains("--agent-variable verification_commands '[\"cargo test --all\"]'"),
+            "adversary README must show the CLI form"
+        );
+        let gauntlet = read_to_string(readmes.join("review-gauntlet/README.md")).unwrap();
+        assert!(
+            !gauntlet.contains("Verification commands:"),
+            "review-gauntlet README must not show the prose Verification commands: line"
+        );
+        assert!(gauntlet.contains(VARIABLES_FORM));
+        assert!(
+            !gauntlet.contains("extracted verbatim by `parse`"),
+            "review-gauntlet README must not describe parse-extraction of the commands"
+        );
+        assert!(
+            gauntlet.contains("--agent-variable verification_commands '[\"cargo test --all\"]'"),
+            "review-gauntlet README must show the CLI form"
+        );
+
+        let runner = read_to_string(readmes.join("adversary/scripts/run_checks.py")).unwrap();
+        assert!(
+            runner.contains("Trust boundary:") && runner.contains("never a field an LLM"),
+            "run_checks.py docstring must state the declared-variable trust boundary"
+        );
+    }
+
     // The spawner's own `max_agent_depth` is checked against the child's
     // absolute depth (root = 0), so every hop along a chain needs its own
     // limit >= child depth; +1 leaves one level of headroom.
@@ -8584,6 +8650,36 @@ mod tests {
     }
 
     #[test]
+    fn adversary_verdict_invalid_declaration_fault_forces_diverges() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        const FAULT: &str = "PIPELINE-FAULT: verification_commands declaration invalid — \
+                             expected a JSON array of strings, got dict";
+        let state = json!({
+            "pipeline_faults": [FAULT],
+            "crit_verdicts": [
+                {"id": "c1", "text": "tests pass", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": FAULT
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "an invalid declaration must force DIVERGES even with every criterion MET: {report}"
+        );
+        assert!(
+            report.contains(&format!("1. {FAULT}")),
+            "the declaration fault must be complaint #1: {report}"
+        );
+    }
+
+    #[test]
     fn adversary_verdict_holistic_failure_is_a_pipeline_fault() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
@@ -8685,6 +8781,134 @@ mod tests {
         assert_ne!(
             results[1]["exit"], 0,
             "failing command must record its nonzero exit: {results:?}"
+        );
+    }
+
+    // Graph variables land in state as strings, so the gauntlet's `inputs:`
+    // passthrough and `--agent-variable` both deliver a JSON-encoded list.
+    #[test]
+    fn adversary_run_checks_accepts_json_string_declaration() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({"verification_commands": "[\"echo ok\", \"false\"]"});
+        let out = run_adversary_script("run_checks.py", &state);
+        let results = out["exec_results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "one record per declared command: {results:?}"
+        );
+        assert_eq!(results[0]["cmd"], "echo ok");
+        assert_eq!(results[0]["exit"], 0, "green command must record exit 0");
+        assert!(
+            results[0]["tail"].as_str().unwrap().contains("ok"),
+            "the output tail must be recorded: {results:?}"
+        );
+        assert!(results[0]["duration_s"].is_number());
+        assert_ne!(
+            results[1]["exit"], 0,
+            "failing command must record its nonzero exit: {results:?}"
+        );
+    }
+
+    #[test]
+    fn adversary_run_checks_empty_declarations_mean_none_declared() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        for state in [
+            json!({"verification_commands": "[]"}),
+            json!({"verification_commands": []}),
+            json!({"verification_commands": null}),
+            json!({}),
+        ] {
+            let out = run_adversary_script("run_checks.py", &state);
+            let marker = out["exec_results"].as_str().unwrap();
+            assert!(
+                marker.starts_with("none declared"),
+                "{state} must degrade to the 'none declared' marker: {marker}"
+            );
+            assert!(
+                marker.contains("verification_commands variable"),
+                "the marker must point at the variable, not the prompt: {marker}"
+            );
+            assert!(
+                out.get("pipeline_faults").is_none(),
+                "an empty declaration is not a fault: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn adversary_run_checks_invalid_declaration_fails_closed_without_executing() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        const FAULT: &str = "PIPELINE-FAULT: verification_commands declaration invalid";
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pwned = env::temp_dir().join(format!("coyote-adversary-run-checks-pwned-{unique}"));
+        let touch = format!("touch {}", pwned.display());
+        for declared in [
+            json!("not json"),
+            json!("{\"a\":1}"),
+            json!([1, 2]),
+            json!("   "),
+            json!([touch, 42]),
+            json!(format!("[\"{touch}\", 42]")),
+        ] {
+            let state = json!({
+                "verification_commands": declared,
+                "pipeline_faults": ["PIPELINE-FAULT: earlier"],
+            });
+            let out = run_adversary_script("run_checks.py", &state);
+            let marker = out["exec_results"].as_str().unwrap();
+            assert!(
+                marker.starts_with(FAULT),
+                "{declared} must be an explicit declaration fault, not the soft \
+                 ENVIRONMENT marker: {marker}"
+            );
+            let faults = out["pipeline_faults"].as_array().unwrap();
+            assert_eq!(faults.len(), 2, "{declared}: {faults:?}");
+            assert_eq!(faults[0], "PIPELINE-FAULT: earlier");
+            assert_eq!(faults[1], marker, "{declared}: {faults:?}");
+        }
+        assert!(
+            !pwned.exists(),
+            "an invalid declaration must execute nothing, even its string items"
+        );
+    }
+
+    #[test]
+    fn adversary_run_checks_ignores_commands_in_prompt_prose() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pwned = env::temp_dir().join(format!("coyote-adversary-run-checks-prose-{unique}"));
+        let state = json!({
+            "initial_prompt": format!("## VERIFICATION\n- touch {}\n", pwned.display()),
+            "verification_commands": "[]",
+        });
+        let out = run_adversary_script("run_checks.py", &state);
+        let marker = out["exec_results"].as_str().unwrap();
+        assert!(
+            marker.starts_with("none declared"),
+            "commands in the prompt must not be picked up: {marker}"
+        );
+        assert!(
+            !pwned.exists(),
+            "nothing from the prompt prose may reach the runner's shell"
         );
     }
 
@@ -9522,6 +9746,16 @@ mod tests {
                 .is_some_and(|s| s.contains("judged ONLY against the recorded verification runs")),
             "check_criterion must be told execution criteria are judged from the recorded runs, never by running anything"
         );
+        let instructions = llm.instructions.as_deref().unwrap_or_default();
+        assert!(
+            instructions.contains("declare via the `verification_commands` variable")
+                && instructions.contains("never declared in the"),
+            "check_criterion must point the caller at the declared variable, not prompt prose"
+        );
+        assert!(
+            !instructions.contains("should declare via verification_commands (e.g."),
+            "check_criterion must not carry the old prompt-declaration wording"
+        );
 
         let fault = graph
             .nodes
@@ -10154,9 +10388,19 @@ mod tests {
         let NodeType::Agent(adv) = &node.node_type else {
             panic!("run_adversary must be an agent node");
         };
+        assert_eq!(
+            adv.inputs
+                .as_ref()
+                .and_then(|inputs| inputs.get("verification_commands"))
+                .map(String::as_str),
+            Some("{{verification_commands}}"),
+            "run_adversary must forward verification_commands as a lone-template input (raw \
+             passthrough): {:?}",
+            adv.inputs
+        );
         assert!(
-            adv.prompt.contains("{{verification_commands}}"),
-            "run_adversary's prompt must pass the declared verification commands through: {}",
+            !adv.prompt.contains("{{verification_commands}}"),
+            "verification commands are a structured input, never lane-prompt prose: {}",
             adv.prompt
         );
         let node = graph
@@ -10171,6 +10415,63 @@ mod tests {
             "run_probe's prompt must carry the reconcile line: {}",
             probe.prompt
         );
+    }
+
+    // The value run_checks executes with a shell must never be something an
+    // LLM lifted out of the prompt — the prompt also carries pasted plan/diff
+    // text from the repo under review.
+    #[test]
+    fn verification_commands_is_a_declared_variable_never_parsed_from_the_prompt() {
+        use crate::graph::NodeType;
+        for name in ["adversary", "review-gauntlet"] {
+            let graph = load_bundled_graph(name);
+            let var = graph
+                .variables
+                .iter()
+                .find(|v| v.name == "verification_commands")
+                .unwrap_or_else(|| {
+                    panic!("{name} must declare the verification_commands variable")
+                });
+            assert_eq!(
+                var.default.as_deref(),
+                Some("[]"),
+                "{name}: variables land as strings, so the default is the JSON-encoded empty list"
+            );
+            assert!(
+                !graph.initial_state.contains_key("verification_commands"),
+                "{name}: an initial_state key would shadow the declared variable"
+            );
+            let node = graph
+                .nodes
+                .get("parse")
+                .unwrap_or_else(|| panic!("{name} graph must have a parse node"));
+            let NodeType::Llm(parse) = &node.node_type else {
+                panic!("{name}: parse must be an llm node");
+            };
+            let schema = parse
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: parse must have an output_schema"));
+            assert!(
+                schema["properties"].get("verification_commands").is_none(),
+                "{name}: parse must not extract verification_commands: {schema}"
+            );
+            assert!(
+                !schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("verification_commands")),
+                "{name}: parse must not require verification_commands: {schema}"
+            );
+            assert!(
+                !parse
+                    .instructions
+                    .as_deref()
+                    .is_some_and(|s| s.contains("verification_commands")),
+                "{name}: parse instructions must not mention verification_commands: {:?}",
+                parse.instructions
+            );
+        }
     }
 
     // ---- code-reviewer suite-script regression tests ----

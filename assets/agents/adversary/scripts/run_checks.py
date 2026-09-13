@@ -10,6 +10,19 @@ NO auto-detection: undeclared commands mean a "none declared" marker
 (fail-visible, not fail-guessed). Any runner error degrades into an
 ENVIRONMENT marker — this script never fails the node.
 
+Trust boundary: `verification_commands` is a DECLARED graph variable (or the
+review-gauntlet's structured `inputs:` passthrough), never a field an LLM
+extracts from the spawn prompt — that prose also carries plan/diff text pasted
+from the repo under review, and whatever is declared here runs with
+shell=True. Variables land in state as strings, so a JSON-encoded list is
+accepted alongside a real list. A declaration that is not a JSON array of
+strings is a caller contract violation, not a runner hiccup: it executes
+NOTHING and records a PIPELINE-FAULT (fail-closed into DIVERGES) instead of
+degrading to the soft ENVIRONMENT marker. Known residual: the engine merges
+every top-level key of an llm node's JSON output into state, so a parse LLM
+coaxed into emitting an extra `verification_commands` key could still
+overwrite the declared value before this script runs.
+
 Budget: commands run sequentially, so TOTAL runtime is bounded by a deadline
 (TOTAL_DEADLINE_SECS = 3300s, the run_checks node's 3600s timeout minus
 margin). Without it, a handful of hanging commands (4 x 900s) would blow the
@@ -49,6 +62,35 @@ def load_state():
         with open(path) as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
+
+
+class InvalidDeclaration(ValueError):
+    pass
+
+
+def declared_commands(declared):
+    """Normalize the verification_commands declaration to a list of commands.
+
+    Accepts a JSON list or a JSON-encoded string of one; missing/None means
+    none declared. Anything else raises InvalidDeclaration.
+    """
+    if declared is None:
+        return []
+    if isinstance(declared, str):
+        if not declared.strip():
+            raise InvalidDeclaration("empty string (declare '[]' for none)")
+        try:
+            declared = json.loads(declared)
+        except json.JSONDecodeError as e:
+            raise InvalidDeclaration(f"not valid JSON: {e}") from e
+    if not isinstance(declared, list):
+        raise InvalidDeclaration(
+            f"expected a JSON array of strings, got {type(declared).__name__}"
+        )
+    bad = [c for c in declared if not isinstance(c, str)]
+    if bad:
+        raise InvalidDeclaration(f"non-string item(s): {json.dumps(bad)}")
+    return [c.strip() for c in declared if c.strip()]
 
 
 def tail_of(text):
@@ -101,12 +143,14 @@ def run_one(cmd, proj, budget):
 
 def main():
     state = load_state()
-    declared = state.get("verification_commands")
-    cmds = (
-        [c.strip() for c in declared if isinstance(c, str) and c.strip()]
-        if isinstance(declared, list)
-        else []
-    )
+    try:
+        cmds = declared_commands(state.get("verification_commands"))
+    except InvalidDeclaration as e:
+        msg = f"PIPELINE-FAULT: verification_commands declaration invalid — {e}"
+        faults = [f for f in (state.get("pipeline_faults") or []) if isinstance(f, str)]
+        faults.append(msg)
+        print(json.dumps({"exec_results": msg, "pipeline_faults": faults}))
+        return
     if not cmds:
         print(
             json.dumps(
@@ -114,8 +158,8 @@ def main():
                     "exec_results": (
                         "none declared — the caller supplied no verification_commands; "
                         "execution criteria (build/test/lint) cannot be independently "
-                        "confirmed. Declare the exact commands in the spawn prompt to "
-                        "get recorded runs."
+                        "confirmed. Declare the exact commands via the "
+                        "verification_commands variable to get recorded runs."
                     )
                 }
             )

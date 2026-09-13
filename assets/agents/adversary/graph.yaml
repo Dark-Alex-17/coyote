@@ -31,6 +31,12 @@ variables:
   - name: project_dir
     description: Project directory containing the changes under review
     default: '.'
+  - name: verification_commands
+    description: |
+      JSON array of shell commands the CALLER declares for the deterministic
+      run_checks stage — e.g. '["cargo test --all"]'. Never inferred from the
+      prompt; empty array = none declared.
+    default: '[]'
 
 settings:
   max_loop_iterations: 10
@@ -47,7 +53,6 @@ initial_state:
   changed_files: []
   diff_text: ''
   diff_note: ''
-  verification_commands: []
   exec_results: ''
   crit_verdicts: []
   extra_complaints: []
@@ -85,10 +90,6 @@ nodes:
         verbatim — the holistic pass checks the diff didn't silently override them.
       - `scope_notes`: what the plan says NOT to touch / explicit boundaries.
       - `extra_context`: anything else conformance-relevant, condensed.
-      - `verification_commands`: the exact build/test/lint shell commands the
-        caller explicitly declares for verification (verbatim strings, in the
-        order given). Empty array when the caller declares none — NEVER invent,
-        guess, or auto-detect commands; undeclared stays undeclared.
     prompt: |
       Extract the conformance-review facts from this request:
 
@@ -117,11 +118,7 @@ nodes:
           type: string
         project_dir_in:
           type: string
-        verification_commands:
-          type: array
-          items:
-            type: string
-      required: [criteria, diff_spec, plan_notes, scope_notes, extra_context, project_dir_in, verification_commands]
+      required: [criteria, diff_spec, plan_notes, scope_notes, extra_context, project_dir_in]
     max_iterations: 3
     max_attempts: 2
     state_updates:
@@ -141,7 +138,7 @@ nodes:
   run_checks:
     id: run_checks
     type: script
-    description: Deterministic execution evidence — runs ONLY the caller-declared verification commands in the project dir and records exec_results; criterion branches cite the record and never execute anything. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker; a 3300s total deadline keeps the script under the node timeout (commands past it are recorded as skipped), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
+    description: Deterministic execution evidence — runs ONLY the commands declared via the verification_commands variable in the project dir and records exec_results; criterion branches cite the record and never execute anything. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker; a declaration that is not a JSON array of strings executes nothing and records a PIPELINE-FAULT (fail-closed); a 3300s total deadline keeps the script under the node timeout (commands past it are recorded as skipped), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
     script: scripts/run_checks.py
     timeout: 3600
     fallback: pipeline_fault
@@ -199,7 +196,9 @@ nodes:
         recorded exit code and output tail.
       - "none declared" or an ENVIRONMENT marker ⇒ at best PARTIAL, with an
         ENVIRONMENT note in the complaint naming the exact command the caller
-        should declare via verification_commands (e.g. "cargo test --all").
+        should declare via the `verification_commands` variable (structured
+        input, e.g. "cargo test --all") — commands are never declared in the
+        prompt.
       - a SKIPPED record (the runner's total deadline expired before that
         command ran) ⇒ at best PARTIAL for the criteria it covers, same
         treatment as an ENVIRONMENT marker: unproven, never failed.

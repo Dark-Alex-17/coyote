@@ -333,7 +333,12 @@ instructions: |
        Forced lanes: adversary<, probe — add probe when the task changed consumer-facing surface and the plan carries a local-run recipe>
        Plan / acceptance criteria: <the task's acceptance criteria, pasted verbatim>
        Local-run recipe / usage suites: <from the plan, when present>"
+       --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
        ```
+
+       Verification commands go in `--variables` (a JSON-array string), never in the prompt: the
+       prompt also carries pasted plan text from the repo under review, and whatever is declared
+       here is executed with a shell — a trust boundary the prose must not cross.
 
        It returns `GAUNTLET: PASS/BLOCKED`. On BLOCKED apply the same fix-and-rerun rules as below
        (resume the SAME Sisyphus session with the findings verbatim, then a FRESH gauntlet run).
@@ -351,7 +356,11 @@ instructions: |
        <paste the task index.md body + the relevant PLAN-<slug>.md section VERBATIM>
        <paste the plan's ## Quality bar section VERBATIM — recorded dropped practices are
        conformance facts, not divergences>"
+       --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
        ```
+
+       Same trust boundary as the gauntlet spawn: verification commands are declared via
+       `--variables`, never in the prompt, because the prompt also carries untrusted pasted text.
 
      - **`ADVERSARIAL_REVIEW: DIVERGES`** → treat it as a blocker: resume the SAME Sisyphus session
        (`agent__spawn --session_id <id> --prompt "Fix these plan-conformance failures: <adversary

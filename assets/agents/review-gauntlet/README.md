@@ -97,10 +97,18 @@ Plan / acceptance criteria:
 Local-run recipe / usage suites:
 <how to boot the service locally + where existing suites live — enables the probe lane>
 
-Verification commands: (optional — exact build/test/lint commands, passed
-verbatim to the adversary lane; omitted = none declared, never invented)
+Forced lanes: (optional — e.g. 'adversary, probe' to run exactly those)" \
+  --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
+```
 
-Forced lanes: (optional — e.g. 'adversary, probe' to run exactly those)"
+Verification commands are NOT part of the prompt. They are the declared
+`verification_commands` graph variable (default `'[]'`; a JSON array of shell
+commands as a string, since agent variables arrive as strings), also settable
+from the CLI:
+
+```sh
+coyote -a review-gauntlet --agent-variable project_dir /abs/path/to/repo \
+  --agent-variable verification_commands '["cargo test --all"]' "<prompt>"
 ```
 
 The reply ends with `GAUNTLET: PASS` or `GAUNTLET: BLOCKED`, a lane status
@@ -119,9 +127,19 @@ final report verbatim.
   and one retry (`max_attempts: 2`). A lane that still dies or times out falls
   back to the `lane_fault` marker — BLOCKED naming the lane, never a silent
   pass.
-- Caller-declared verification commands are extracted verbatim by `parse` and
-  passed through to the adversary lane's prompt — never invented or
-  auto-detected; undeclared stays undeclared.
+- The `verification_commands` variable is forwarded to the adversary lane as a
+  structured `inputs:` passthrough on `run_adversary` (a lone `{{…}}` template
+  lands the raw value in the child's state) — never through the lane prompt
+  and never extracted by `parse`. The adversary's `run_checks` stage executes
+  those commands with a shell, which makes the declaration a trust boundary:
+  the prompt also carries plan text pasted from the repo under review, so
+  commands must never be inferred from it (residual: the engine still merges
+  every top-level key of `parse`'s output into state, so an extra
+  `verification_commands` key emitted by the LLM is not yet blocked).
+  Undeclared stays undeclared
+  (`'[]'` ⇒ "none declared"); a declaration that is not a JSON array of
+  strings executes nothing and records a `PIPELINE-FAULT`, which the
+  adversary lane reports as DIVERGES and the gate as BLOCKED.
 - Signals failures degrade gracefully: if git can't compute the diff, lane
   selection falls back to caller context + forced lanes, and the report notes
   it. The auth-path regex deliberately over-fires (`auth(?!or)` matches

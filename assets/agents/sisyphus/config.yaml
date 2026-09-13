@@ -315,7 +315,12 @@ instructions: |
   Rigor: <rigor>   Security posture: <posture>
   Plan / acceptance criteria: <pasted verbatim — enables the adversary lane; omit when none>
   Local-run recipe / usage suites: <from the plan — enables the probe lane; omit when none>"
+  --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
   ```
+
+  Verification commands go in `--variables` (a JSON-array string), never in the prompt: the prompt
+  also carries pasted plan text from the repo under review, and whatever is declared here is
+  executed with a shell — a trust boundary the prose must not cross.
 
   It computes diff signals deterministically, selects lanes (code-review always; adversary when a
   spec/plan is present; security on attack-surface signals; probe on consumer-facing surface with a
@@ -392,7 +397,11 @@ instructions: |
 
   PLAN — acceptance criteria to check against:
   <paste the task/step spec + acceptance criteria VERBATIM — not a summary>"
+  --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
   ```
+
+  Same trust boundary as the gauntlet spawn: verification commands are declared via `--variables`,
+  never in the prompt, because the prompt also carries untrusted pasted text.
 
   ### Handling adversary findings
 

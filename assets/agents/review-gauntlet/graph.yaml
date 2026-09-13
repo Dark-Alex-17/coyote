@@ -31,6 +31,12 @@ variables:
   - name: project_dir
     description: Repository the change lives in; signals and every review lane run against it.
     default: '.'
+  - name: verification_commands
+    description: |
+      JSON array of shell commands the CALLER declares for the deterministic
+      run_checks stage — e.g. '["cargo test --all"]'. Never inferred from the
+      prompt; empty array = none declared.
+    default: '[]'
 
 settings:
   max_loop_iterations: 10
@@ -44,7 +50,6 @@ initial_state:
   security_posture: standard
   probe_context: ''
   extra_context: ''
-  verification_commands: []
   forced_lanes: []
   changed_files: []
   file_count: 0
@@ -109,10 +114,6 @@ nodes:
         names). Empty array = automatic selection.
       - `extra_context`: any remaining caller context reviewers should see,
         condensed.
-      - `verification_commands`: the exact build/test/lint shell commands the
-        caller explicitly declares for verification (verbatim strings, in the
-        order given). Empty array when the caller declares none — NEVER invent,
-        guess, or auto-detect commands; undeclared stays undeclared.
     prompt: |
       Extract the review-request facts from this request:
 
@@ -139,11 +140,7 @@ nodes:
           type: string
         project_dir_in:
           type: string
-        verification_commands:
-          type: array
-          items:
-            type: string
-      required: [diff_spec, plan_context, rigor, security_posture, probe_context, forced_lanes, extra_context, project_dir_in, verification_commands]
+      required: [diff_spec, plan_context, rigor, security_posture, probe_context, forced_lanes, extra_context, project_dir_in]
     max_iterations: 3
     max_attempts: 2
     state_updates:
@@ -326,6 +323,8 @@ nodes:
     description: Plan-conformance review lane.
     agent: adversary
     timeout: 7200
+    inputs:
+      verification_commands: '{{verification_commands}}'
     prompt: |
       Adversarial plan-conformance review in {{project_dir}}.
 
@@ -334,7 +333,8 @@ nodes:
       The spec / plan / acceptance criteria it must satisfy:
       {{plan_context}}
 
-      Verification commands (declared by the caller; empty = none declared): {{verification_commands}}
+      Verification commands arrive as a structured input (the
+      verification_commands variable), not in this prompt.
 
       {{extra_context}}
 

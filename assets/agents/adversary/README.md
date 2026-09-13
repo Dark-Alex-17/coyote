@@ -66,7 +66,8 @@ violation) and cites `file:line`. Vague complaints are not emitted.
 
 ```mermaid
 flowchart TD
-    A["parse (llm): extract acceptance criteria + declared verification commands"] --> B["facts (diff_facts.py): resolve + bound the diff"]
+    A["parse (llm): extract acceptance criteria"] --> B["facts (diff_facts.py): resolve + bound the diff"]
+    V["verification_commands (declared graph variable — never parsed from the prompt)"] --> R
     B --> R["run_checks (script): run the declared verification commands ONCE, record results"]
     R --> C["map over criteria: one fresh-context branch each (parallel)"]
     C --> D["check_criterion (llm + fs/ast tools)"]
@@ -88,7 +89,7 @@ The conformance doctrine is baked into the graph's own nodes:
 
 1. **Every** acceptance criterion gets its own fresh-context verification branch — MET / PARTIAL / UNMET / DIVERGED, machine-gated (MET requires the satisfying change AND the proving test, cited). No test ⇒ at best PARTIAL. Partial coverage of the criteria list is structurally impossible.
 2. Ground-truth with read-only tools (`fs_grep`/`fs_read`/`ast_grep`): confirm required symbols exist as specified, changes land where they must, new behavior is actually reached, tests target behavior not implementation.
-3. Execution evidence is recorded **once, deterministically**: `run_checks` runs ONLY the caller-declared verification commands (never invented or auto-detected), sequentially under a 3300s total deadline — commands the deadline leaves no budget for are recorded as SKIPPED. Criterion branches have no execution tools by design: "tests pass"-style criteria are judged against the record — a recorded green run is MET citing it; no declared command ⇒ at best PARTIAL.
+3. Execution evidence is recorded **once, deterministically**: `run_checks` runs ONLY the caller-declared verification commands (never invented or auto-detected), sequentially under a 3300s total deadline — commands the deadline leaves no budget for are recorded as SKIPPED. Criterion branches have no execution tools by design: "tests pass"-style criteria are judged against the record — a recorded green run is MET citing it; no declared command ⇒ at best PARTIAL. The commands arrive through the declared `verification_commands` graph variable (see [Declaring verification commands](#declaring-verification-commands)) — `parse` never extracts them from the prompt, so the prompt is no longer an extraction source for the commands.
 4. Hunt adversarially for the **absent**: skipped criteria, scope creep, interface/approach substitution, out-of-scope touches, downstream contract breakage.
 5. **Fail closed on pipeline faults**: if parse, diff resolution, or the verification runner dies, its fallback routes to `pipeline_fault`, which records a `PIPELINE-FAULT:` marker and continues to the verdict (a failed holistic pass falls back straight to the verdict, which synthesizes the same marker). Any recorded fault forces DIVERGES with the fault as complaint #1 — degraded is never passing, and the sentinel is always emitted: the graph never dies without one.
 6. **Fail closed per criterion**: a criterion check that dies (max_iterations exhausted, API failure) falls back to `criterion_fault`, which records a schema-shaped UNMET verdict carrying a `PIPELINE-FAULT: criterion ` evidence marker for that one criterion. The other criteria still get verdicts, the report says the check DIED rather than judged, and the run is DIVERGES. That exact marker prefix (the one `criterion_fault` emits) forces the criterion into unmet regardless of the status it carries, so a verdict that echoes it with `MET` can never count toward CONFORMS; `check_criterion` is told never to begin its own evidence with `PIPELINE-FAULT:`.
@@ -98,7 +99,8 @@ It is **read-only** — it produces a verdict, never a fix.
 ## Usage
 
 Typically spawned by `sisyphus` (or `architect`) alongside `code-reviewer`. The spawn prompt IS its
-entire context, so it must include the diff (or a base ref to fetch) **and** the acceptance criteria:
+entire context, so it must include the diff (or a base ref to fetch) **and** the acceptance criteria.
+Verification commands travel separately, as a declared variable:
 
 ```sh
 agent__spawn --agent adversary --prompt "
@@ -110,23 +112,42 @@ Run get_diff (or --base main), or: <paste diff>
 
 ## PLAN — acceptance criteria to check against
 <paste the task index.md body + the relevant PLAN-*.md section, verbatim>
-
-## VERIFICATION (optional)
-<exact build/test/lint commands to run, one per line — undeclared commands are never guessed>
-"
+" --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
 ```
 
 Direct invocation for ad-hoc use:
 
 ```sh
 coyote -a adversary --agent-variable project_dir /path/to/repo \
+  --agent-variable verification_commands '["cargo test --all"]' \
   "Review staged changes against these criteria: <paste criteria>"
 ```
+
+### Declaring verification commands
+
+`verification_commands` is a declared graph variable (default `'[]'`): a JSON array of shell
+commands, passed as a string because agent variables always arrive as strings. `run_checks` runs
+exactly those commands with a shell — so the declaration is a **trust boundary**. The prompt is the
+wrong side of it: it also carries plan and diff text pasted from the repo under review, and an LLM
+`parse` node extracting commands from that prose would let anything in the repo's text run under
+the reviewer's shell. Hence the commands are never in the prompt and never in `parse`'s output
+schema; `review-gauntlet` forwards its own `verification_commands` variable to the adversary lane
+as a structured `inputs:` passthrough, not as prompt text.
+
+- `'[]'` (or omitted) ⇒ the "none declared" marker; execution criteria are at best PARTIAL.
+- Anything that is not a JSON array of strings (unparsable JSON, an object, non-string items) is
+  an invalid declaration: `run_checks` executes **nothing** and records a
+  `PIPELINE-FAULT: verification_commands declaration invalid — …` marker, which forces DIVERGES —
+  fail-closed, not degraded to the soft ENVIRONMENT marker.
+- Known residual: the engine merges every top-level key of `parse`'s JSON output into state, not
+  only the keys in its `output_schema`, so an injected instruction that makes the parse LLM emit an
+  extra `verification_commands` key is not yet blocked at the engine level. Closing that requires
+  restricting the llm-node auto-merge to `output_schema.properties` (tracked as a follow-up).
 
 ### Tools
 
 - The graph's `diff_facts` script resolves the diff itself (staged → unstaged → `HEAD~1`, or an explicit ref/range named in the prompt) — there is no `get_diff` tool anymore.
-- The `run_checks` script executes the caller-declared verification commands and records the results — criterion branches cite the record and never run anything themselves.
+- The `run_checks` script executes the commands declared via the `verification_commands` variable and records the results — criterion branches cite the record and never run anything themselves.
 - Criterion branches carry read-only `fs_read`/`fs_cat`/`fs_grep`/`ast_grep` for ground-truth checks.
 
 ## Related
