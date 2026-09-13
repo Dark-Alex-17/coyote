@@ -6350,8 +6350,8 @@
   - name: deepseek/deepseek-v4-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0657
-    output_price: 0.1313
+    input_price: 0.0493
+    output_price: 0.0986
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731
@@ -7292,21 +7292,21 @@
     max_input_tokens: 131072
     input_price: 0.57
     output_price: 2.3
-    max_output_tokens: 100352
+    max_output_tokens: 98304
     supports_function_calling: true
   - name: moonshotai/kimi-k2-0905
     type: chat
     max_input_tokens: 262144
     input_price: 0.6
     output_price: 2.5
-    max_output_tokens: 100352
+    max_output_tokens: 98304
     supports_function_calling: true
   - name: moonshotai/kimi-k2-thinking
     type: chat
     max_input_tokens: 262144
     input_price: 0.6
     output_price: 2.5
-    max_output_tokens: 100352
+    max_output_tokens: 98304
     supports_function_calling: true
   - name: moonshotai/kimi-k2.5
     type: chat
@@ -8524,9 +8524,9 @@
   - name: qwen/qwen3-30b-a3b-instruct-2507
     type: chat
     max_input_tokens: 262144
-    input_price: 0.09
-    output_price: 0.3
-    max_output_tokens: 235929
+    input_price: 0.0482
+    output_price: 0.1931
+    max_output_tokens: 32000
     supports_function_calling: true
   - name: qwen/qwen3-30b-a3b-thinking-2507
     type: chat
@@ -9300,9 +9300,9 @@
   - name: ~deepseek/deepseek-v4-flash-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.03
-    output_price: 0.07
-    max_output_tokens: 393216
+    input_price: 0.0352
+    output_price: 0.1056
+    max_output_tokens: 131072
     supports_function_calling: true
   - name: ~google/gemini-flash-latest
     type: chat
@@ -9323,8 +9323,8 @@
   - name: ~moonshotai/kimi-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 2.375
-    output_price: 13.3
+    input_price: 2.1
+    output_price: 10.95
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -9387,9 +9387,9 @@
   - name: ~z-ai/glm-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.8727
-    output_price: 3.36
-    max_output_tokens: 943718
+    input_price: 0.936
+    output_price: 3.168
+    max_output_tokens: 235929
     supports_function_calling: true
 - provider: github
   models:
