@@ -16,6 +16,7 @@ pub mod types;
 pub mod user_interaction;
 pub mod validator;
 
+use anyhow::Error;
 pub use dispatch::{
     active_agent_graph_name, run_active_agent_graph, run_active_agent_graph_with_inputs,
 };
@@ -23,7 +24,6 @@ pub use executor::GraphExecutor;
 pub use parser::{GraphParser, agent_has_graph};
 use serde_json::Value;
 use std::time::Duration;
-use anyhow::Error;
 pub use types::{Graph, NodeType};
 
 pub const GRAPH_SCHEMA_VERSION: &str = "1.0";
