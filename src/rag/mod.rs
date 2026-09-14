@@ -2281,6 +2281,7 @@ where
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDir {
@@ -2293,12 +2294,12 @@ mod tests {
             // (coarse clocks hand the same tick to concurrent callers, so two
             // tests would share a directory and overwrite each other's files);
             // a process-wide counter makes every name distinct.
-            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static SEQ: AtomicU64 = AtomicU64::new(0);
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
             let unique = format!("{nanos}-{seq}");
             let path = env::temp_dir().join(format!("coyote-rag-{tag}-{unique}"));
             fs::create_dir_all(&path).unwrap();

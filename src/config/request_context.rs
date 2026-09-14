@@ -5268,6 +5268,7 @@ mod tests {
     use serial_test::serial;
     use std::fs::{create_dir_all, remove_dir_all, write};
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use std::{env, mem};
 
@@ -8505,7 +8506,7 @@ mod tests {
 
     #[test]
     fn review_gauntlet_readme_states_retry_and_incomplete_contract() {
-        let readmes = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        let readmes = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
         // Windows checkouts carry CRLF; the paragraph assertion below spans line breaks.
         let gauntlet = read_to_string(readmes.join("review-gauntlet/README.md"))
             .unwrap()
@@ -9050,11 +9051,11 @@ mod tests {
 
     // Scripts' load_state() prefers GRAPH_STATE_FILE over GRAPH_STATE, so an
     // inherited live state file (adversary verifying this repo) must not win.
-    fn adversary_script_command(script: &str, state: &serde_json::Value) -> std::process::Command {
+    fn adversary_script_command(script: &str, state: &serde_json::Value) -> Command {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/adversary/scripts")
             .join(script);
-        let mut cmd = std::process::Command::new("python3");
+        let mut cmd = Command::new("python3");
         cmd.arg(&path)
             .env("GRAPH_STATE", state.to_string())
             .env_remove("GRAPH_STATE_FILE");
@@ -9591,7 +9592,7 @@ mod tests {
         );
 
         let alive = |pid: &str| {
-            std::process::Command::new("kill")
+            Command::new("kill")
                 .args(["-0", pid])
                 .output()
                 .unwrap()
@@ -10950,7 +10951,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/review-gauntlet/scripts")
             .join(script);
-        let out = std::process::Command::new("python3")
+        let out = Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", state.to_string())
             .env_remove("GRAPH_STATE_FILE")
@@ -13246,7 +13247,7 @@ mod tests {
             );
         }
         let adversary_verdict = read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("assets/agents/adversary/scripts/verdict.py"),
         )
         .unwrap();
@@ -13403,11 +13404,11 @@ mod tests {
             eprintln!("skipping: python3 not available");
             return;
         }
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/review-gauntlet/scripts/build_items.py");
         let state =
             json!({"forced_lanes": ["code-review", "adversary"], "gauntlet_started_at": 5.0});
-        let out = std::process::Command::new("python3")
+        let out = Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", state.to_string())
             .env_remove("GRAPH_STATE_FILE")
@@ -13459,7 +13460,7 @@ mod tests {
             eprintln!("skipping: python3 not available");
             return;
         }
-        let dir = utils::temp_file("-gauntlet-signals-", "");
+        let dir = temp_file("-gauntlet-signals-", "");
         create_dir_all(&dir).unwrap();
         let project_dir = dir.to_string_lossy().to_string();
         let out = run_gauntlet_script(
@@ -13585,7 +13586,7 @@ mod tests {
     fn gauntlet_retry_budget_fits_inside_graph_timeout() {
         use crate::graph::NodeType;
         const OTHER_STAGES_MARGIN_SECS: u64 = 1200;
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/review-gauntlet/scripts/retry_gate.py");
         let source = read_to_string(&script).unwrap();
         let line = source
@@ -13707,7 +13708,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/code-reviewer/scripts")
             .join(script);
-        let out = std::process::Command::new("python3")
+        let out = Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", raw_state)
             .env_remove("GRAPH_STATE_FILE")
@@ -14517,7 +14518,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/finding-verifier/scripts")
             .join(script);
-        let out = std::process::Command::new("python3")
+        let out = Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", raw_state)
             .env_remove("GRAPH_STATE_FILE")
@@ -14819,7 +14820,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/step-runner/scripts")
             .join(script);
-        let out = std::process::Command::new("bash")
+        let out = Command::new("bash")
             .arg(&path)
             .env("GRAPH_STATE", state.to_string())
             .env_remove("GRAPH_STATE_FILE")
@@ -15123,7 +15124,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/deep-research/scripts")
             .join(script);
-        let out = std::process::Command::new("python3")
+        let out = Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", raw_state)
             .env_remove("GRAPH_STATE_FILE")

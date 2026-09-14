@@ -346,6 +346,8 @@ fn parse_options(args: &Value) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn headless_select_returns_structured_json() {
@@ -431,9 +433,9 @@ mod tests {
             concat!("escalation_timeout:", " 300"),
             concat!("default:", " 5 minutes"),
         ];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let example = root.join("config.agent.example.yaml");
-        let example_text = std::fs::read_to_string(&example).unwrap();
+        let example_text = fs::read_to_string(&example).unwrap();
         for needle in ["escalation_timeout: 0", "0 = wait indefinitely"] {
             assert!(
                 example_text.contains(needle),
@@ -454,7 +456,7 @@ mod tests {
 
         let mut hits = Vec::new();
         for path in &files {
-            let text = String::from_utf8_lossy(&std::fs::read(path).unwrap()).into_owned();
+            let text = String::from_utf8_lossy(&fs::read(path).unwrap()).into_owned();
             for needle in needles {
                 if text.contains(needle) {
                     hits.push(format!("{}: {needle:?}", path.display()));
@@ -468,8 +470,8 @@ mod tests {
         );
     }
 
-    fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+    fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
             let path = entry.path();
             if path.is_dir() {
                 collect_files(&path, out);
