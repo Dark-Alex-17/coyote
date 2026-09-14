@@ -35,6 +35,8 @@ pub(crate) fn wall_clock(secs: u64) -> Option<Duration> {
     (secs != 0).then(|| Duration::from_secs(secs))
 }
 
+/// An HTTP status in the chain is authoritative — message text never
+/// overrides it. String anchors are only consulted for untyped errors.
 pub(crate) fn is_transient_error(err: &Error) -> bool {
     if err.chain().any(|c| {
         c.downcast_ref::<reqwest::Error>()
@@ -43,18 +45,32 @@ pub(crate) fn is_transient_error(err: &Error) -> bool {
     }) {
         return true;
     }
-    let s = format!("{err:#}");
+    if let Some(api) = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::client::ApiStatusError>())
+    {
+        return is_transient_status(api.status);
+    }
+    let s = format!("{err:#}").to_lowercase();
     s.contains("timed out")
         || s.contains("rate limit")
-        || s.contains("HTTP 429")
+        || s.contains("http 429")
         || s.contains("status 429")
-        || s.contains("429 Too Many")
-        || s.contains("Connection reset")
-        || s.contains("Connection refused")
+        || s.contains("429 too many")
+        || s.contains("connection reset")
+        || s.contains("connection refused")
         || s.contains("produced no output")
         || s.contains("broken pipe")
         || s.contains("connection error")
         || s.contains("error sending request")
+}
+
+/// Transient HTTP statuses worth a from-scratch retry: 429 (rate limit),
+/// 500/502/503/504 (upstream hiccups), 529 (Anthropic overloaded).
+/// Deterministic statuses — 4xx other than 429 (including 408) and
+/// 501/505-class capability errors — are excluded.
+fn is_transient_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504 | 529)
 }
 
 pub const MAX_STATE_SIZE_BYTES: usize = 32 * 1024;
@@ -125,6 +141,71 @@ mod tests {
         assert!(!is_transient_error(&anyhow!(
             "script exited 1: see line 429 in a comment"
         )));
+    }
+
+    #[test]
+    fn is_transient_error_sees_typed_api_status_429_through_context_chain() {
+        let data = serde_json::json!({
+            "error": {
+                "type": "rate_limit_error",
+                "message": "Too many requests, please slow down"
+            }
+        });
+        let err = crate::client::catch_error(&data, 429)
+            .unwrap_err()
+            .context("Failed to call chat-completions api")
+            .context("Agent 'domain-reviewer' failed");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            !is_transient_error(&anyhow!("{rendered}")),
+            "the rendered text alone must not be transient — proves the typed arm is what catches it"
+        );
+        assert!(is_transient_error(&err));
+    }
+
+    #[test]
+    fn is_transient_error_typed_status_overrides_message_text() {
+        let err = crate::client::catch_error(
+            &serde_json::json!({ "message": "rate limit reached — connection reset" }),
+            400,
+        )
+        .unwrap_err();
+        assert!(
+            !is_transient_error(&err),
+            "typed 400 must not be retried even when the body matches string anchors"
+        );
+
+        let err = crate::client::catch_error(&serde_json::json!({ "message": "x" }), 503)
+            .unwrap_err()
+            .context("Agent 'x' failed");
+        assert!(is_transient_error(&err));
+    }
+
+    #[test]
+    fn is_transient_error_typed_status_table() {
+        let data = serde_json::json!({ "message": "x" });
+        for status in [429, 500, 502, 503, 504, 529] {
+            let err = crate::client::catch_error(&data, status).unwrap_err();
+            assert!(
+                is_transient_error(&err),
+                "status {status} should be transient"
+            );
+        }
+        for status in [400, 401, 403, 404, 408, 422, 501, 505] {
+            let err = crate::client::catch_error(&data, status).unwrap_err();
+            assert!(
+                !is_transient_error(&err),
+                "status {status} should not be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn is_transient_error_string_anchors_are_case_insensitive() {
+        assert!(is_transient_error(&anyhow!("Rate Limit reached")));
+        assert!(is_transient_error(&anyhow!("Request Timed Out")));
+        assert!(is_transient_error(&anyhow!("connection reset by peer")));
     }
 
     #[tokio::test(start_paused = true)]
