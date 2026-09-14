@@ -432,10 +432,25 @@ mod tests {
             concat!("default:", " 5 minutes"),
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = vec![root.join("config.agent.example.yaml")];
+        let example = root.join("config.agent.example.yaml");
+        let example_text = std::fs::read_to_string(&example).unwrap();
+        for needle in ["escalation_timeout: 0", "0 = wait indefinitely"] {
+            assert!(
+                example_text.contains(needle),
+                "{} lost the shipped wording {needle:?}",
+                example.display()
+            );
+        }
+
+        let mut files = vec![example];
         collect_files(&root.join("src"), &mut files);
         collect_files(&root.join("assets"), &mut files);
-        assert!(files.len() > 3, "walked only {} files", files.len());
+        let this_file = root.join(file!());
+        assert!(
+            files.contains(&this_file),
+            "walk did not reach {}",
+            this_file.display()
+        );
 
         let mut hits = Vec::new();
         for path in &files {

@@ -1711,7 +1711,7 @@ fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Val
         }
         None => Ok(json!({
             "status": "error",
-            "message": format!("No pending escalation found with id '{escalation_id}'. It may have already been replied to, or the child is no longer waiting (aborted, or its configured `escalation_timeout` expired)."),
+            "message": format!("No pending escalation found with id '{escalation_id}'. It may have already been replied to."),
         })),
     }
 }
@@ -3093,6 +3093,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["status"], "error");
+        assert_eq!(
+            result["message"],
+            "No pending escalation found with id 'missing'. It may have already been replied to."
+        );
     }
 
     #[test]
