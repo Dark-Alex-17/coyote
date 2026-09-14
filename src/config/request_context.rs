@@ -8454,7 +8454,10 @@ mod tests {
                 && adversary.contains("never degrades to an ENVIRONMENT marker"),
             "adversary README must describe a malformed declaration as fail-closed, not a soft marker"
         );
-        let gauntlet = read_to_string(readmes.join("review-gauntlet/README.md")).unwrap();
+        // Windows checkouts carry CRLF; the paragraph assertions below span line breaks.
+        let gauntlet = read_to_string(readmes.join("review-gauntlet/README.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
         assert!(
             !gauntlet.contains("Verification commands:"),
             "review-gauntlet README must not show the prose Verification commands: line"
@@ -13204,8 +13207,13 @@ mod tests {
     fn gauntlet_retry_gate_sentinels_match_verdict_gate() {
         let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/review-gauntlet/scripts");
-        let retry = read_to_string(scripts.join("retry_gate.py")).unwrap();
-        let verdict = read_to_string(scripts.join("verdict_gate.py")).unwrap();
+        // Windows checkouts carry CRLF; `slice_between` anchors on "\n)\n".
+        let retry = read_to_string(scripts.join("retry_gate.py"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let verdict = read_to_string(scripts.join("verdict_gate.py"))
+            .unwrap()
+            .replace("\r\n", "\n");
         for sentinel in [
             r"Verdict:\**\s*\**\s*(MERGE-READY|NEEDS-HUMAN)",
             r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)",
