@@ -8,10 +8,11 @@ re-reads, no judgment. The gate's hard rules:
   - a non-string lane result (the map collected an object instead of the
     lane's rendered text) blocks — it cannot carry a sentinel;
   - a PIPELINE-FAULT lane result (the lane's agent died after retries;
-    detected only when the report IS the lane_fault.py marker, i.e. it
-    STARTS with it — a real review merely quoting the marker flows to the
-    normal rules) or a PIPELINE-FAULT in signals_error (builder/parse
-    fault) blocks — a degraded pipeline is never a pass;
+    detected only when the report IS the lane_fault.py marker or
+    retry_gate.py's no-report marker, i.e. it STARTS with it — a real
+    review merely quoting the marker flows to the normal rules) or a
+    PIPELINE-FAULT in signals_error (builder/parse fault) blocks — a
+    degraded pipeline is never a pass;
   - a code-review lane whose OWN verdict line records a pipeline fault
     (code-reviewer's verdict.py / render.py degraded-run wording) blocks —
     the nested graph completed, but with a dead domain lane, verifier, or
@@ -24,8 +25,16 @@ re-reads, no judgment. The gate's hard rules:
   - probe INCONCLUSIVE blocks with an ENVIRONMENT note — it is never
     treated as PASS or FAIL (fix the environment per the plan's local-run
     recipe, then re-run);
+  - a PIPELINE-FAULT lane row carries its attempt count (` ×N`) when retry_gate
+    re-ran it, so the reader can tell a first-pass death from an exhausted
+    retry budget;
+  - an incomplete review — lanes retry_gate gave up on (review_incomplete)
+    or a pipeline-level fault (reported under the `pipeline` pseudo-lane) —
+    emits the GAUNTLET_REVIEW_INCOMPLETE: machine line and a "Review
+    incomplete" section: that is a fault to re-run, never a code finding;
   - the gate itself must never crash into a silent pass: any internal
-    error emits GAUNTLET: BLOCKED naming the error.
+    error emits GAUNTLET: BLOCKED naming the error, with the pipeline
+    marked incomplete.
 """
 
 import json
@@ -43,6 +52,7 @@ def main():
     state = load_state()
     blockers, attention, lane_lines, reports = [], [], [], []
     malformed = set()
+    lane_attempts = state.get("lane_attempts") or {}
 
     def lane_report(key):
         arr = state.get(key) or []
@@ -57,6 +67,10 @@ def main():
     def record(lane, status, detail=""):
         lane_lines.append(f"| {lane} | {status} | {detail} |")
 
+    def attempts_suffix(lane):
+        n = int(lane_attempts.get(lane) or 0)
+        return f" ×{n}" if n > 1 else ""
+
     def fault_excerpt(report):
         line = next(
             (ln for ln in report.splitlines() if "PIPELINE-FAULT:" in ln), report
@@ -64,10 +78,11 @@ def main():
         return line.strip()[:200]
 
     def is_lane_fault(report):
-        # A genuine lane fault is the ENTIRE report emitted by lane_fault.py,
-        # which always begins with the marker. Matching the marker anywhere
-        # would let a real review that merely QUOTES "PIPELINE-FAULT:" bypass
-        # 🔴 counting and sentinel parsing.
+        # A genuine lane fault is the ENTIRE report — the lane_fault.py marker
+        # or retry_gate.py's no-report marker — which always begins with
+        # "PIPELINE-FAULT:". Matching the marker anywhere would let a real
+        # review that merely QUOTES it bypass 🔴 counting and sentinel
+        # parsing.
         return report.strip().startswith("PIPELINE-FAULT:")
 
     def lane_fault_blocker(lane, report):
@@ -75,7 +90,7 @@ def main():
             f"{lane}: PIPELINE-FAULT — the lane failed after retries and produced "
             f"no verdict; a degraded lane is never a pass ({fault_excerpt(report)})"
         )
-        record(lane, "BLOCKED", "PIPELINE-FAULT (lane failed)")
+        record(lane, "BLOCKED", f"PIPELINE-FAULT (lane failed{attempts_suffix(lane)})")
 
     def malformed_blocker(lane, report):
         blockers.append(f"{lane}: malformed lane result (non-string item) — never a pass")
@@ -129,10 +144,11 @@ def main():
             blockers.append(
                 f"code-review: {reds} 🔴 CRITICAL finding(s) — fix before claiming done"
             )
+        suffix = attempts_suffix("code-review")
         if m_fault and reds:
-            record("code-review", "BLOCKED", f"PIPELINE-FAULT (degraded lane); {reds} 🔴")
+            record("code-review", "BLOCKED", f"PIPELINE-FAULT (degraded lane{suffix}); {reds} 🔴")
         elif m_fault:
-            record("code-review", "BLOCKED", "PIPELINE-FAULT (degraded lane)")
+            record("code-review", "BLOCKED", f"PIPELINE-FAULT (degraded lane{suffix})")
         elif reds:
             record("code-review", "BLOCKED", f"{reds} 🔴 finding(s)")
         elif m and m.group(1) == "MERGE-READY":
@@ -231,10 +247,26 @@ def main():
     # A gauntlet-level fault (build_items crash, dead parse stage) means the
     # lanes above were never built — SKIPPED rows alone must not read as PASS.
     signals_error = state.get("signals_error")
+    incomplete = set(state.get("review_incomplete") or [])
     if isinstance(signals_error, str) and "PIPELINE-FAULT:" in signals_error:
         blockers.append(f"pipeline: {signals_error}")
+        incomplete.add("pipeline")
 
     verdict = "BLOCKED" if blockers else "PASS"
+
+    incomplete_lines = []
+    for name in sorted(incomplete):
+        if name == "pipeline":
+            incomplete_lines.append(f"- pipeline: {signals_error}")
+        elif n := int(lane_attempts.get(name) or 0):
+            incomplete_lines.append(f"- {name}: no completed review after {n} attempt(s)")
+        else:
+            incomplete_lines.append(f"- {name}: no completed review")
+    incomplete_line = (
+        "\nGAUNTLET_REVIEW_INCOMPLETE: " + ", ".join(sorted(incomplete))
+        if incomplete
+        else ""
+    )
 
     md = "\n".join(
         ["| lane | status | detail |", "|------|--------|--------|"] + lane_lines
@@ -246,11 +278,21 @@ def main():
         md += "\n\n## Human attention required\n" + "\n".join(f"- {a}" for a in attention)
     if state.get("signals_error"):
         md += f"\n\n> {state['signals_error']}"
+    if incomplete_lines:
+        md += "\n\n## Review incomplete\n" + "\n".join(incomplete_lines)
     md += "\n\n## Full lane reports\n"
     for lane, rep in reports:
         md += f"\n<details><summary>{lane}</summary>\n\n{rep}\n\n</details>\n"
 
-    print(json.dumps({"gauntlet_verdict": verdict, "gauntlet_report": md}))
+    print(
+        json.dumps(
+            {
+                "gauntlet_verdict": verdict,
+                "gauntlet_report": md,
+                "gauntlet_incomplete_line": incomplete_line,
+            }
+        )
+    )
 
 
 try:
@@ -261,6 +303,7 @@ except Exception as e:  # noqa: BLE001 — the gate must never crash into a sile
             {
                 "gauntlet_verdict": "BLOCKED",
                 "gauntlet_report": f"verdict gate error: {e} — treat as a failed gate, not a pass.",
+                "gauntlet_incomplete_line": "\nGAUNTLET_REVIEW_INCOMPLETE: pipeline",
             }
         )
     )

@@ -93,6 +93,7 @@ initial_state:
   lanes_summary: ''
   gauntlet_verdict: ''
   gauntlet_report: ''
+  gauntlet_incomplete_line: ''
 
 start: parse
 
@@ -429,7 +430,7 @@ nodes:
   verdict_gate:
     id: verdict_gate
     type: script
-    description: Deterministic sentinel parser and gate. A missing sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks with an environment note; the code-review critical count is read from render.py's summary line (raw 🔴 count if absent) and blocks regardless of the lane's own verdict line; a code-review verdict line that records the nested graph's own pipeline fault blocks as a degraded lane.
+    description: Deterministic sentinel parser and gate. A missing sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks with an environment note; the code-review critical count is read from render.py's summary line (raw 🔴 count if absent) and blocks regardless of the lane's own verdict line; a code-review verdict line that records the nested graph's own pipeline fault blocks as a degraded lane. Lanes retry_gate gave up on, and any pipeline-level fault, are named on a GAUNTLET_REVIEW_INCOMPLETE machine line so a caller can tell an incomplete review from a failed one.
     script: scripts/verdict_gate.py
     timeout: 60
     next: done
@@ -438,6 +439,6 @@ nodes:
     id: done
     type: end
     output: |
-      GAUNTLET: {{gauntlet_verdict}}
+      GAUNTLET: {{gauntlet_verdict}}{{gauntlet_incomplete_line}}
 
       {{gauntlet_report}}

@@ -26,8 +26,10 @@ flowchart TD
     radv -. "fallback" .-> lfault
     rsec -. "fallback" .-> lfault
     rpb -. "fallback" .-> lfault
-    mcr & madv & msec & mpb --> gate["verdict_gate<br/>(script: sentinel regex — deterministic)"]
-    gate --> done(["GAUNTLET: PASS | BLOCKED"])
+    mcr & madv & msec & mpb --> rgate["retry_gate<br/>(script: fault-only re-run gate;<br/>stash + restore, ≤3 attempts,<br/>wall-clock budget)"]
+    rgate -. "_next: retry faulted lanes" .-> build
+    rgate --> gate["verdict_gate<br/>(script: sentinel regex — deterministic)"]
+    gate --> done(["GAUNTLET: PASS | BLOCKED<br/>(+ GAUNTLET_REVIEW_INCOMPLETE: … when any lane or the pipeline was incomplete)"])
 ```
 
 ## Why a graph
@@ -49,7 +51,8 @@ those rules are *structure*:
 - **Conditional lanes without dynamic routing**: each lane is a `map` node
   over a 0-or-1-item list — an empty list means the map runs zero branches
   (map-over-nothing), which *is* the skip mechanism. All four maps join at
-  the verdict gate on equal-length paths.
+  the retry gate on equal-length paths; it falls through to the verdict
+  gate, or routes back to `build_items` for faulted lanes only.
 - **The verdict is a regex, not an opinion** (`verdict_gate.py`): a missing
   sentinel is a lane FAILURE, never a pass; the critical count from the
   code-review report's summary line (raw 🔴 count if absent) blocks
@@ -76,6 +79,45 @@ those rules are *structure*:
   *quotes* "PIPELINE-FAULT:" flows to the normal sentinel rules. And the
   `GAUNTLET:` sentinel is always emitted: even a crashed gate prints
   `GAUNTLET: BLOCKED`, never silence.
+
+## Fault-only re-runs
+
+`retry_gate.py` sits between the lane maps and the verdict gate and re-runs
+only lanes that **faulted** — a missing report (stood in for by a synthetic
+`PIPELINE-FAULT: <lane> lane produced no report` marker so it never renders as
+SKIPPED), a non-string report, the `lane_fault` marker, a sentinel-less
+report, or a nested graph's own degraded-run wording. A real verdict
+(DIVERGES, FAIL, INCONCLUSIVE, NEEDS-HUMAN, …) is never re-run: the review's
+judgment stands. Each lane gets up to 3 attempts, all inside a wall-clock
+budget (`MAX_RETRY_ELAPSED_SECS`) sized to fit the graph timeout.
+
+- **Stash + restore**: every lane report that ran this pass is stashed in
+  `kept_results`; a re-run pass overwrites the untouched lanes' collected
+  results with `[]`, so their stashed reports are restored before the gate.
+  The verdict gate always sees each lane's *last* report.
+- **Retry never narrows selection**: lane selection is not re-run. A re-run
+  pass rebuilds items only for the retried lanes, and the stashed results
+  stand in for the rest.
+- **Exhaustion is recorded, not hidden**: a lane still faulted after its
+  attempts or the budget lands in `review_incomplete`, and its fault flows to
+  the verdict gate as-is.
+- **Crash guards append**: the `build_items.py` and `retry_gate.py` crash
+  guards append to an existing `signals_error` rather than overwrite it, and
+  `build_items.py` preserves the prior `lanes_summary`.
+
+Whenever at least one lane (or the pipeline) could not complete, the first
+line reads `GAUNTLET: BLOCKED` followed immediately by
+`GAUNTLET_REVIEW_INCOMPLETE: <lane>[, <lane>]`. The names are the exhausted
+lanes from `review_incomplete`, plus the `pipeline` pseudo-lane whenever a
+pipeline-level `PIPELINE-FAULT:` fired — parse death, or a crash in the
+builder, the retry gate, the default-lanes fallback, or the verdict gate
+itself (the default-lanes fallback's crash still runs the widened lanes, so
+`pipeline` appears alongside real lane rows). The report gains a
+`## Review incomplete` section naming each exhausted lane with its
+attempt count; `PIPELINE-FAULT` lane rows carry ` ×N` when the lane was
+re-run (N > 1). The *named* entries are faults to re-run, never code
+findings; the line can accompany real findings from the other lanes, which
+still appear under `## Blockers` and must be fixed as usual.
 
 ## Sentinels parsed
 
@@ -115,22 +157,29 @@ coyote -a review-gauntlet --agent-variable project_dir /abs/path/to/repo \
   --agent-variable verification_commands '["cargo test --all"]' "<prompt>"
 ```
 
-The reply ends with `GAUNTLET: PASS` or `GAUNTLET: BLOCKED`, a lane status
+The reply opens with `GAUNTLET: PASS` or `GAUNTLET: BLOCKED` (plus the
+`GAUNTLET_REVIEW_INCOMPLETE:` line when applicable), followed by a lane status
 table, the lane-selection reasons, blockers, attention items, and each lane's
-full report in a collapsible section. On BLOCKED: fix the findings per your
-own findings-handling rules, then spawn a **fresh** gauntlet run. On PASS with
-*Human attention required*: complete the work but carry those items into your
-final report verbatim.
+full report in a collapsible section. On BLOCKED with a
+`GAUNTLET_REVIEW_INCOMPLETE:` line: the named lanes never completed — fix any
+non-fault blockers listed under `## Blockers`, then spawn a **fresh** gauntlet
+run (a fault is never a code finding). On BLOCKED without it: fix the findings
+per your own findings-handling rules, then spawn a **fresh** gauntlet run. On
+PASS with *Human attention required*: complete the work but carry those items
+into your final report verbatim.
 
 ## Notes
 
 - The caller decides *whether* review is warranted at all (the gauntlet is for
   non-trivial work — that's why code-review is unconditionally on); the
   gauntlet decides *which* of the other lanes apply and what the verdicts mean.
-- Lane sub-agents get generous finite timeouts (2h each; 3h whole-gauntlet)
-  and one retry (`max_attempts: 2`). A lane that still dies or times out falls
-  back to the `lane_fault` marker — BLOCKED naming the lane, never a silent
-  pass.
+- Lane sub-agents get generous finite per-attempt timeouts (see the
+  `timeout:` on each `run_*` node) and one retry (`max_attempts: 2`) inside
+  the lane, then up to 3 attempts of the whole lane from `retry_gate.py` while
+  the wall-clock budget (`MAX_RETRY_ELAPSED_SECS`) allows; `settings.timeout`
+  is derived from that envelope in graph.yaml's comment. A lane that still
+  dies or times out falls back to the `lane_fault` marker — BLOCKED naming the
+  lane and `GAUNTLET_REVIEW_INCOMPLETE`, never a silent pass.
 - The `verification_commands` variable is forwarded to the adversary lane as a
   structured `inputs:` passthrough on `run_adversary` (a lone `{{…}}` template
   lands the raw value in the child's state) — never through the lane prompt

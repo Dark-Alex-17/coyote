@@ -10,7 +10,9 @@ hard rules:
     and faulted alike, and a lane whose map ran nothing this pass gets
     its stashed report restored — the verdict gate always sees each
     lane's LAST report;
-  - a lane is FAULTED only when its report is missing, non-string, the
+  - a lane is FAULTED only when its report is missing (the map ran but
+    collected nothing — replaced by a synthetic PIPELINE-FAULT marker so
+    the verdict gate never reads it as SKIPPED), non-string, the
     lane_fault.py marker, sentinel-less, or carries the nested graph's own
     degraded-run wording; a real verdict (DIVERGES, FAIL, INCONCLUSIVE,
     NEEDS-HUMAN, …) is never re-run — the review's judgment stands;
@@ -27,7 +29,9 @@ import os
 import re
 import time
 
-MAX_RETRY_ELAPSED_SECS = 45600
+# 69600 (graph timeout) − 2 × 11400 (largest lane envelope) − 1200 (script stages)
+# = 45600; 600 s of slack below that.
+MAX_RETRY_ELAPSED_SECS = 45000
 MAX_ATTEMPTS = 3
 
 # lane name -> (items key, results key)
@@ -114,8 +118,10 @@ def main():
                 out[results_key] = [kept[lane]]
             continue
         report = results[0] if results else None
-        if report is not None:
-            kept[lane] = report
+        if report is None:
+            report = f"PIPELINE-FAULT: {lane} lane produced no report"
+            out[results_key] = [report]
+        kept[lane] = report
         if is_faulted(lane, report):
             faulted.append(lane)
         attempts[lane] = int(attempts.get(lane) or 0) + 1
