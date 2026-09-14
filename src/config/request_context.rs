@@ -8251,8 +8251,25 @@ mod tests {
         ];
 
         // The pin must never leak run-local provenance into the shipped
-        // assets: task IDs, plan branch names, or plan-repo paths.
-        const PROVENANCE_LEAKS: [&str; 3] = ["TASK-030", "PLAN-review-retry", "plans/tasks/"];
+        // assets: concrete task ids (`TASK-` followed by digits) or plan-repo
+        // paths. `TASK-NNN` / `PLAN-<slug>` template vocabulary is legitimate
+        // orchestrator prose, so only concrete ids are rejected — except the
+        // ids the configs use as illustrative anti-pattern examples (the
+        // "never cite TASK numbers in code comments" rule quotes `// TASK-002`).
+        const ILLUSTRATIVE_IDS: [&str; 1] = ["TASK-002"];
+        fn provenance_leak(text: &str) -> Option<String> {
+            if text.contains("plans/tasks/") {
+                return Some("plans/tasks/".to_string());
+            }
+            text.match_indices("TASK-").find_map(|(start, _)| {
+                let digits = text[start + "TASK-".len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .count();
+                let id = text[start..start + "TASK-".len() + digits].to_string();
+                (digits >= 3 && !ILLUSTRATIVE_IDS.contains(&id.as_str())).then_some(id)
+            })
+        }
 
         let mut configs = std::collections::HashMap::new();
         for name in ["architect", "sisyphus"] {
@@ -8271,12 +8288,11 @@ mod tests {
                 config.contains("user__select"),
                 "{name} config must escalate review-incomplete via user__select"
             );
-            for leak in PROVENANCE_LEAKS {
-                assert!(
-                    !config.contains(leak),
-                    "{name} config must not carry run-local provenance: {leak:?}"
-                );
-            }
+            assert!(
+                provenance_leak(&config).is_none(),
+                "{name} config must not carry run-local provenance: {:?}",
+                provenance_leak(&config)
+            );
             configs.insert(name, config);
         }
 
@@ -8317,15 +8333,18 @@ mod tests {
         let verify = find("4. **Verify against the plan");
         let preferred = find("**Preferred: run the conformance checks through `review-gauntlet`**");
         let incomplete = find("GAUNTLET_REVIEW_INCOMPLETE:");
+        let fallback = find("an adversary/probe result that is ONLY a `PIPELINE-FAULT`");
         let adversary = find("- **Spawn `adversary`**");
         assert!(
             phase_e < verify
                 && verify < preferred
                 && preferred < incomplete
-                && incomplete < adversary,
+                && incomplete < fallback
+                && fallback < adversary,
             "architect config must place the REVIEW_INCOMPLETE contract inside Phase E's verify \
-             step, under the preferred gauntlet path and before the adversary fallback \
-             (got {phase_e} / {verify} / {preferred} / {incomplete} / {adversary})"
+             step, under the preferred gauntlet path, followed by the fallback-path note, all \
+             before the adversary fallback bullet \
+             (got {phase_e} / {verify} / {preferred} / {incomplete} / {fallback} / {adversary})"
         );
 
         // The architect also owns the no-gauntlet fallback path: a
@@ -8361,12 +8380,11 @@ mod tests {
                     "{name} README lost review-incomplete contract anchor: {anchor:?}"
                 );
             }
-            for leak in PROVENANCE_LEAKS {
-                assert!(
-                    !readme.contains(leak),
-                    "{name} README must not carry run-local provenance: {leak:?}"
-                );
-            }
+            assert!(
+                provenance_leak(&readme).is_none(),
+                "{name} README must not carry run-local provenance: {:?}",
+                provenance_leak(&readme)
+            );
         }
     }
 
