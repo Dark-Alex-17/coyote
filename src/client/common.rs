@@ -597,7 +597,7 @@ pub async fn call_chat_completions_streaming(
 }
 
 /// Streaming transport for graph `llm` nodes: accumulates the reply and the
-/// transport itself renders nothing — no spinner, delta, or reasoning
+/// transport itself renders nothing; no spinner, delta, or reasoning
 /// (tool-call rendering inside `eval_tool_calls` is unchanged from the
 /// non-streaming path). Because chunks arrive as they are generated, the
 /// reqwest `read_timeout` bounds only stalls between chunks; the caller's
@@ -605,7 +605,7 @@ pub async fn call_chat_completions_streaming(
 /// transport is kept deliberately: the handler's call-loop detection is off
 /// (that path never had it), and a model the catalog marks `no_stream`
 /// takes the non-streaming request, raced against the abort. An abort
-/// observed after the provider call fails outright — partial output is
+/// observed after the provider call fails outright. Partial output is
 /// never returned as success.
 pub async fn call_chat_completions_streaming_quiet(
     input: &Input,
@@ -900,8 +900,10 @@ mod tests {
     use super::*;
 
     use super::super::access_token::{is_rejected, set_access_token};
+    use crate::config::{AppState, WorkingMode};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::Instant;
 
     fn catch_error_message(data: &Value, status: u16) -> String {
         catch_error(data, status).unwrap_err().to_string()
@@ -1189,10 +1191,7 @@ mod tests {
     }
 
     fn quiet_ctx() -> RequestContext {
-        RequestContext::new(
-            Arc::new(crate::config::AppState::test_default()),
-            crate::config::WorkingMode::Cmd,
-        )
+        RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
     }
 
     /// 600s of virtual generation completes and yields the same shape the
@@ -1207,7 +1206,7 @@ mod tests {
         let mut ctx = quiet_ctx();
         let input = Input::from_str(&ctx, "hi", None).unwrap();
         let client = paced_client(false);
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
 
         let (text, results) =
             call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
@@ -1236,7 +1235,7 @@ mod tests {
             tokio::time::sleep(PACED_GAP * PACED_DELTAS as u32 + Duration::from_secs(30)).await;
             trigger.set_ctrlc();
         });
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
 
         let err = call_chat_completions_streaming_quiet(&input, &client, &mut ctx, abort)
             .await
@@ -1312,7 +1311,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(5)).await;
             trigger.set_ctrlc();
         });
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
 
         let err = call_chat_completions_streaming_quiet(&input, &client, &mut ctx, abort)
             .await
@@ -1326,14 +1325,14 @@ mod tests {
     /// transport still streams with it off.
     #[tokio::test(start_paused = true)]
     async fn quiet_transport_ignores_the_user_stream_toggle() {
-        let app = crate::config::AppState {
+        let app = AppState {
             config: Arc::new(AppConfig {
                 stream: false,
                 ..AppConfig::default()
             }),
-            ..crate::config::AppState::test_default()
+            ..AppState::test_default()
         };
-        let mut ctx = RequestContext::new(Arc::new(app), crate::config::WorkingMode::Cmd);
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
         let input = Input::from_str(&ctx, "hi", None).unwrap();
         assert!(!input.stream(), "fixture must have streaming disabled");
         let client = paced_client(false);

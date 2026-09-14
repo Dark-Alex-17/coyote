@@ -16,6 +16,7 @@ pub mod types;
 pub mod user_interaction;
 pub mod validator;
 
+use crate::client::ApiStatusError;
 use anyhow::Error;
 pub use dispatch::{
     active_agent_graph_name, run_active_agent_graph, run_active_agent_graph_with_inputs,
@@ -45,10 +46,7 @@ pub(crate) fn is_transient_error(err: &Error) -> bool {
     }) {
         return true;
     }
-    if let Some(api) = err
-        .chain()
-        .find_map(|c| c.downcast_ref::<crate::client::ApiStatusError>())
-    {
+    if let Some(api) = err.chain().find_map(|c| c.downcast_ref::<ApiStatusError>()) {
         return is_transient_status(api.status);
     }
     let s = format!("{err:#}").to_lowercase();
@@ -67,8 +65,8 @@ pub(crate) fn is_transient_error(err: &Error) -> bool {
 
 /// Transient HTTP statuses worth a from-scratch retry: 429 (rate limit),
 /// 500/502/503/504 (upstream hiccups), 529 (Anthropic overloaded).
-/// Deterministic statuses — 4xx other than 429 (including 408) and
-/// 501/505-class capability errors — are excluded.
+/// Deterministic statuses (4xx other than 429 (including 408) and
+/// 501/505-class capability errors) are excluded.
 fn is_transient_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504 | 529)
 }
@@ -89,6 +87,7 @@ pub(in crate::graph) fn type_name(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client;
     use anyhow::anyhow;
 
     #[test]
@@ -151,7 +150,7 @@ mod tests {
                 "message": "Too many requests, please slow down"
             }
         });
-        let err = crate::client::catch_error(&data, 429)
+        let err = client::catch_error(&data, 429)
             .unwrap_err()
             .context("Failed to call chat-completions api")
             .context("Agent 'domain-reviewer' failed");
@@ -166,7 +165,7 @@ mod tests {
 
     #[test]
     fn is_transient_error_typed_status_overrides_message_text() {
-        let err = crate::client::catch_error(
+        let err = client::catch_error(
             &serde_json::json!({ "message": "rate limit reached — connection reset" }),
             400,
         )
@@ -176,7 +175,7 @@ mod tests {
             "typed 400 must not be retried even when the body matches string anchors"
         );
 
-        let err = crate::client::catch_error(&serde_json::json!({ "message": "x" }), 503)
+        let err = client::catch_error(&serde_json::json!({ "message": "x" }), 503)
             .unwrap_err()
             .context("Agent 'x' failed");
         assert!(is_transient_error(&err));
@@ -186,14 +185,14 @@ mod tests {
     fn is_transient_error_typed_status_table() {
         let data = serde_json::json!({ "message": "x" });
         for status in [429, 500, 502, 503, 504, 529] {
-            let err = crate::client::catch_error(&data, status).unwrap_err();
+            let err = client::catch_error(&data, status).unwrap_err();
             assert!(
                 is_transient_error(&err),
                 "status {status} should be transient"
             );
         }
         for status in [400, 401, 403, 404, 408, 422, 501, 505] {
-            let err = crate::client::catch_error(&data, status).unwrap_err();
+            let err = client::catch_error(&data, status).unwrap_err();
             assert!(
                 !is_transient_error(&err),
                 "status {status} should not be transient"
@@ -261,7 +260,7 @@ mod tests {
             .read_timeout(Duration::from_millis(50))
             .build()
             .unwrap();
-        let err = crate::client::sse_stream(client.get(format!("http://{addr}/")), |_| Ok(false))
+        let err = client::sse_stream(client.get(format!("http://{addr}/")), |_| Ok(false))
             .await
             .expect_err("a body that never arrives must trip the read timeout");
         server.abort();
@@ -308,7 +307,7 @@ mod tests {
             .build()
             .unwrap();
         let mut received = 0usize;
-        crate::client::sse_stream(client.get(format!("http://{addr}/")), |message| {
+        client::sse_stream(client.get(format!("http://{addr}/")), |message| {
             if message.data == "[DONE]" {
                 return Ok(true);
             }

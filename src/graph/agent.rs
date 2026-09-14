@@ -127,7 +127,7 @@ async fn run(
 }
 
 /// Drives the retry loop, then extraction, then state updates. Extraction
-/// stays outside the retry loop: by the time it runs the agent itself
+/// stays outside the retry loop: by the time it runs, the agent itself
 /// succeeded, so an extraction failure is never retried.
 async fn attempt_and_extract(
     node_id: &str,
@@ -249,6 +249,7 @@ async fn retry_transient(
                 parent_ctx.peer_registry = Some(Arc::clone(registry));
             }
         }
+
         match run_attempt(parent_ctx).await {
             Ok(out) => return Ok(out),
             Err(e) if is_transient_error(&e) && attempt < node.max_attempts => {
@@ -260,6 +261,7 @@ async fn retry_transient(
             Err(e) => return Err(e),
         }
     }
+
     Err(last_err.unwrap_or_else(|| anyhow!("agent node exhausted retries")))
 }
 

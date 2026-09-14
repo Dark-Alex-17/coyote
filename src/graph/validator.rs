@@ -5,7 +5,7 @@ use crate::config;
 use crate::config::{Agent, AppConfig, paths};
 use crate::rag::{GraphRagConfig, RagData};
 use anyhow::{Result, bail};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -451,7 +451,7 @@ impl GraphValidator {
                 format!(
                     "{kind} node's `output_schema` declares no (non-empty) object `properties`; \
                      the engine auto-merges ONLY keys declared under `properties` (a bare \
-                     object schema merges nothing) — declare the keys under \
+                     object schema merges nothing). Declare the keys under \
                      `properties` or lift them via `state_updates`"
                 ),
             ));
@@ -1297,7 +1297,7 @@ fn primary_templated_fields(node: &Node) -> Vec<String> {
     }
 }
 
-fn node_state_updates_map(node: &Node) -> Option<&std::collections::HashMap<String, String>> {
+fn node_state_updates_map(node: &Node) -> Option<&HashMap<String, String>> {
     match &node.node_type {
         NodeType::Llm(n) => n.state_updates.as_ref(),
         NodeType::Agent(n) => n.state_updates.as_ref(),
@@ -1310,7 +1310,7 @@ fn node_state_updates_map(node: &Node) -> Option<&std::collections::HashMap<Stri
     }
 }
 
-fn lifts_via_state_updates(updates: &Option<std::collections::HashMap<String, String>>) -> bool {
+fn lifts_via_state_updates(updates: &Option<HashMap<String, String>>) -> bool {
     updates.as_ref().is_some_and(|m| !m.is_empty())
 }
 
