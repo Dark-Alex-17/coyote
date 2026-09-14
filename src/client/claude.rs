@@ -381,10 +381,15 @@ pub fn claude_build_chat_completions_body(
                                 "content": tool_result.output.to_string(),
                             }));
                         }
-                        vec![
-                            json!({ "role": "assistant", "content": assistant_parts }),
-                            json!({ "role": "user", "content": user_parts }),
-                        ]
+                        // Empty tool_results (reachable via deserialized sessions) must not emit an empty pair.
+                        if assistant_parts.is_empty() {
+                            vec![]
+                        } else {
+                            vec![
+                                json!({ "role": "assistant", "content": assistant_parts }),
+                                json!({ "role": "user", "content": user_parts }),
+                            ]
+                        }
                     } else {
                         // One pair per round: Claude can reuse tool_use IDs across API calls.
                         // A round boundary is detected by the presence of round text, but
@@ -638,7 +643,12 @@ mod tests {
         }
     }
 
-    fn build_body(tool_results: Vec<ToolResult>, prompt_cache: bool) -> Value {
+    fn build_body_with(
+        tool_results: Vec<ToolResult>,
+        text: &str,
+        sequence: bool,
+        prompt_cache: bool,
+    ) -> Value {
         let data = ChatCompletionsData {
             messages: vec![
                 Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
@@ -646,8 +656,8 @@ mod tests {
                     MessageRole::Assistant,
                     MessageContent::ToolCalls(MessageContentToolCalls {
                         tool_results,
-                        text: String::new(),
-                        sequence: true,
+                        text: text.to_string(),
+                        sequence,
                     }),
                 ),
             ],
@@ -659,6 +669,10 @@ mod tests {
         };
         claude_build_chat_completions_body(data, &Model::new("claude", "claude-test"), prompt_cache)
             .unwrap()
+    }
+
+    fn build_body(tool_results: Vec<ToolResult>, prompt_cache: bool) -> Value {
+        build_body_with(tool_results, "", true, prompt_cache)
     }
 
     fn multi_turn_data(functions: Option<Vec<FunctionDeclaration>>) -> ChatCompletionsData {
@@ -764,6 +778,42 @@ mod tests {
 
         assert_eq!(messages.len(), 3, "body: {body}");
         assert_unique_tool_use_ids_per_message(&body);
+    }
+
+    #[test]
+    fn non_sequence_emits_assistant_user_pair() {
+        let body = build_body_with(
+            vec![tool_result("toolu_A", None), tool_result("toolu_B", None)],
+            "",
+            false,
+            false,
+        );
+
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 3, "body: {body}");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn non_sequence_empty_tool_results_emits_no_messages() {
+        let body = build_body_with(vec![], "leftover text", false, false);
+
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1, "body: {body}");
+    }
+
+    #[test]
+    fn sequence_empty_tool_results_emits_no_messages() {
+        let body = build_body_with(vec![], "leftover text", true, false);
+
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1, "body: {body}");
     }
 
     #[test]

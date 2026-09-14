@@ -373,7 +373,10 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                     text,
                     sequence,
                 }) => {
-                    if !sequence {
+                    // Empty tool_results (reachable via deserialized sessions) must not emit empty tool_calls.
+                    if tool_results.is_empty() {
+                        vec![]
+                    } else if !sequence {
                         let tool_calls: Vec<_> = tool_results
                             .iter()
                             .map(|tool_result| {
@@ -744,4 +747,49 @@ pub async fn openai_responses_streaming(
     };
 
     sse_stream(builder, handle).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_body(sequence: bool) -> Value {
+        let data = ChatCompletionsData {
+            messages: vec![
+                Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::ToolCalls(MessageContentToolCalls {
+                        tool_results: vec![],
+                        text: "leftover text".to_string(),
+                        sequence,
+                    }),
+                ),
+            ],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream: false,
+        };
+        openai_build_chat_completions_body(data, &Model::new("openai", "gpt-test"))
+    }
+
+    #[test]
+    fn non_sequence_empty_tool_results_emits_no_messages() {
+        let body = build_body(false);
+
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1, "body: {body}");
+    }
+
+    #[test]
+    fn sequence_empty_tool_results_emits_no_messages() {
+        let body = build_body(true);
+
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1, "body: {body}");
+    }
 }

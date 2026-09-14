@@ -412,10 +412,15 @@ pub fn gemini_build_chat_completions_body(
                                 }
                             })
                         }).collect();
-                        vec![
-                            json!({ "role": "model", "parts": model_parts }),
-                            json!({ "role": "function", "parts": function_parts }),
-                        ]
+                        // Empty tool_results (reachable via deserialized sessions) must not emit an empty pair.
+                        if function_parts.is_empty() {
+                            vec![]
+                        } else {
+                            vec![
+                                json!({ "role": "model", "parts": model_parts }),
+                                json!({ "role": "function", "parts": function_parts }),
+                            ]
+                        }
                     }
                 }
         })
@@ -577,5 +582,39 @@ fn strip_model_version(name: &str) -> &str {
     match name.split_once('@') {
         Some((v, _)) => v,
         None => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemini_empty_tool_results_emits_no_messages() {
+        let data = ChatCompletionsData {
+            messages: vec![
+                Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::ToolCalls(MessageContentToolCalls {
+                        tool_results: vec![],
+                        text: "leftover text".to_string(),
+                        sequence: false,
+                    }),
+                ),
+            ],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream: false,
+        };
+
+        let body = gemini_build_chat_completions_body(data, &Model::new("vertexai", "gemini-test"))
+            .unwrap();
+
+        let contents = body["contents"].as_array().unwrap();
+
+        assert_eq!(contents.len(), 1, "body: {body}");
     }
 }
