@@ -46,9 +46,10 @@ flowchart TD
    contract (VERIFIED = keep + paste evidence; FALSE = drop + tally; UNVERIFIABLE = keep,
    marked). No final LLM step that could editorialize.
 
-The dashed edges are fault paths. Both fault markers surface as `PIPELINE-FAULT:` text in
-a verdict's `note`, and a fault can only ever produce UNVERIFIABLE — degraded output is
-never a passing verdict. Every path ends at `done`, so the `FINDING_VERIFIER_RESULTS`
+The dashed edges are fault paths. All three fault emitters (`parse_fault`, `verify_fault`,
+and `verdict_gate`'s own crash guard) surface as `PIPELINE-FAULT:` text in a verdict's
+`note`, and a fault can only ever produce UNVERIFIABLE — degraded output is never a
+passing verdict. Every path ends at `done`, so the `FINDING_VERIFIER_RESULTS`
 sentinel is always emitted and the caller's verify lane degrades instead of dying.
 
 ## What it is NOT

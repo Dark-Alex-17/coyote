@@ -33,6 +33,14 @@ def load_state():
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 
 
+def safe_faults():
+    try:
+        state = load_state()
+        return [f for f in (state.get("pipeline_faults") or []) if isinstance(f, str)]
+    except Exception:  # noqa: BLE001 — best-effort preservation only
+        return []
+
+
 def main():
     state = load_state()
     faults = [f for f in (state.get("pipeline_faults") or []) if isinstance(f, str)]
@@ -42,19 +50,21 @@ def main():
         detail = "the critique stage died without recording a failure detail"
     if len(detail) > MAX_DETAIL_CHARS:
         detail = detail[: MAX_DETAIL_CHARS - 1] + "…"
-    faults.append(f"PIPELINE-FAULT: critique failed — {detail}")
+    fault = f"PIPELINE-FAULT: critique failed — {detail}"
+    if fault not in faults:
+        faults.append(fault)
     print(json.dumps({"pipeline_faults": faults, "critique": CRITIQUE_NOTE}))
 
 
 try:
     main()
 except Exception as e:  # noqa: BLE001 — the fault marker itself must never crash
+    faults = safe_faults()
+    faults.append(f"PIPELINE-FAULT: critique failed — fault-marker script error: {e}")
     print(
         json.dumps(
             {
-                "pipeline_faults": [
-                    f"PIPELINE-FAULT: critique failed — fault-marker script error: {e}"
-                ],
+                "pipeline_faults": faults,
                 "critique": CRITIQUE_NOTE,
             }
         )

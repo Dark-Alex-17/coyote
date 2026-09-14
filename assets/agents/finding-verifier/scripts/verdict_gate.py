@@ -104,6 +104,7 @@ def main():
         )
         return
 
+    # Deliberately not PIPELINE-FAULT-prefixed: model misbehavior, not infrastructure.
     print(
         json.dumps(
             {
@@ -128,7 +129,7 @@ except Exception as e:  # noqa: BLE001 — the gate must never crash the chain
                     "id": "unknown",
                     "verdict": "UNVERIFIABLE",
                     "evidence": "",
-                    "note": f"verdict gate error: {e}",
+                    "note": f"PIPELINE-FAULT: verdict gate error: {e}",
                 }
             }
         )
