@@ -8280,6 +8280,15 @@ mod tests {
             ) && !adversary.contains("Known residual"),
             "adversary README must state the schema-declared merge closes the extra-key channel"
         );
+        assert!(
+            adversary.contains("zero red verification runs"),
+            "adversary README must state the fail-closed CONFORMS doctrine"
+        );
+        assert!(
+            !adversary.contains("soft ENVIRONMENT")
+                && adversary.contains("never degrades to an ENVIRONMENT marker"),
+            "adversary README must describe a malformed declaration as fail-closed, not a soft marker"
+        );
         let gauntlet = read_to_string(readmes.join("review-gauntlet/README.md")).unwrap();
         assert!(
             !gauntlet.contains("Verification commands:"),
@@ -8294,11 +8303,27 @@ mod tests {
             gauntlet.contains("--agent-variable verification_commands '[\"cargo test --all\"]'"),
             "review-gauntlet README must show the CLI form"
         );
+        assert!(gauntlet.contains("plus probe on consumer surface *with a local-run recipe*"));
+        assert!(gauntlet.contains("critical count from the report's summary line"));
+        assert!(gauntlet.contains("raw 🔴 count if absent"));
+        assert!(
+            gauntlet
+                .contains("records a pipeline fault blocks (a degraded review is never a pass)")
+        );
+        assert!(
+            !gauntlet.contains("any 🔴 in the code-review report"),
+            "review-gauntlet README must not describe the retired raw-🔴 gate"
+        );
 
         let runner = read_to_string(readmes.join("adversary/scripts/run_checks.py")).unwrap();
         assert!(
             runner.contains("Trust boundary:") && runner.contains("never a field an LLM"),
             "run_checks.py docstring must state the declared-variable trust boundary"
+        );
+        assert!(
+            !runner.contains("soft ENVIRONMENT")
+                && runner.contains("never\ndegrades to an ENVIRONMENT marker"),
+            "run_checks.py docstring must describe a malformed declaration as fail-closed, not a soft marker"
         );
         assert!(
             !runner.contains("Known residual") && !gauntlet.contains("residual:"),
@@ -9223,7 +9248,10 @@ mod tests {
         // second must be recorded as skipped — the in-script handling stays
         // authoritative instead of the NODE timeout killing the script from
         // outside (which would bypass the ENVIRONMENT degradation entirely).
-        let state = json!({"verification_commands": ["sleep 5", "echo never"]});
+        let state = json!({"verification_commands": [
+            r#"python3 -c "import time; time.sleep(5)""#,
+            "echo never"
+        ]});
         let out = run_adversary_script_env(
             "run_checks.py",
             &state,
@@ -9246,6 +9274,30 @@ mod tests {
         assert_eq!(
             results[1]["skipped"], "deadline",
             "commands past the deadline must be recorded as skipped: {results:?}"
+        );
+    }
+
+    #[test]
+    fn adversary_run_checks_tolerates_non_utf8_output() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({"verification_commands": [
+            r#"python3 -c "import sys; sys.stdout.buffer.write(b'ok \xff\xfe bytes\n')""#
+        ]});
+        let out = run_adversary_script("run_checks.py", &state);
+        let results = out["exec_results"].as_array().unwrap_or_else(|| {
+            panic!("invalid UTF-8 output must not collapse the record to a marker: {out}")
+        });
+        assert_eq!(
+            results[0]["exit"], 0,
+            "the command itself succeeded: {results:?}"
+        );
+        let tail = results[0]["tail"].as_str().unwrap();
+        assert!(
+            tail.contains("ok") && tail.contains("bytes"),
+            "decodable parts of the output must survive with replacement: {results:?}"
         );
     }
 
@@ -9327,6 +9379,39 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn adversary_run_checks_timeout_drain_is_bounded_by_session_escaped_grandchild() {
+        if !cmd_available("python3") || !cmd_available("sh") {
+            eprintln!("skipping: python3 or sh not available");
+            return;
+        }
+        // The grandchild starts its own session, so the SIGKILL of the
+        // command's process group misses it — but it inherited the stdout
+        // pipe, so an unbounded post-kill drain would block until it exits
+        // (~40s). DRAIN_TIMEOUT_SECS (10) must cap that. The orphaned `sleep
+        // 40` exits on its own.
+        let cmd = "python3 -c \"import subprocess,time; \
+                   subprocess.Popen(['sleep','40'], start_new_session=True); time.sleep(60)\"";
+        let state = json!({"verification_commands": [cmd]});
+        let started = Instant::now();
+        let out = run_adversary_script_env(
+            "run_checks.py",
+            &state,
+            &[("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "1")],
+        );
+        let elapsed = started.elapsed();
+        let results = out["exec_results"].as_array().unwrap();
+        assert_eq!(
+            results[0]["exit"], -1,
+            "the hung command must record a timeout: {results:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the post-kill drain must be bounded by DRAIN_TIMEOUT_SECS, took {elapsed:?}: {results:?}"
+        );
+    }
+
     /// TOTAL_DEADLINE_SECS in run_checks.py and the run_checks node's
     /// `timeout:` in graph.yaml live in different files; if the script's
     /// deadline ever creeps past the node timeout, the executor kills the
@@ -9359,6 +9444,103 @@ mod tests {
             deadline < s.timeout,
             "run_checks.py TOTAL_DEADLINE_SECS ({deadline}) must stay below the run_checks node timeout ({}) in assets/agents/adversary/graph.yaml",
             s.timeout
+        );
+    }
+
+    /// The adversary's graph-level timeout must leave room for run_checks to
+    /// burn its whole node timeout AND for the rest of the pipeline to still
+    /// finish — a graph timeout kills from outside, so no fallback fires and
+    /// the DIVERGES sentinel is lost.
+    #[test]
+    fn adversary_graph_timeout_covers_run_checks_budget() {
+        use crate::graph::NodeType;
+        const OTHER_STAGES_ENVELOPE_SECS: u64 = 5400;
+        let graph = load_bundled_graph("adversary");
+        let node = graph
+            .get_node("run_checks")
+            .expect("adversary graph must have a run_checks node");
+        let NodeType::Script(s) = &node.node_type else {
+            panic!("run_checks must be a script node");
+        };
+        let graph_timeout = graph
+            .settings
+            .timeout
+            .expect("adversary graph must set settings.timeout");
+        assert!(
+            graph_timeout >= s.timeout + OTHER_STAGES_ENVELOPE_SECS,
+            "assets/agents/adversary/graph.yaml settings.timeout ({graph_timeout}) must cover the run_checks node timeout ({}) plus the {OTHER_STAGES_ENVELOPE_SECS}s envelope for the other stages",
+            s.timeout
+        );
+    }
+
+    /// Every gauntlet lane that runs a graph-backed agent must outlive that
+    /// graph's own timeout so the child's own graph timeout, not the lane
+    /// timeout, is the binding bound; the child's internal retry envelope is
+    /// deliberately not derived here (follow-up). And because agent-node
+    /// retries each get a fresh per-attempt budget (src/graph/agent.rs
+    /// retry_transient/bounded_attempt), the gauntlet itself must outlive
+    /// `max_attempts × timeout` for every lane, with headroom for the
+    /// surrounding stages.
+    #[test]
+    fn gauntlet_lane_timeouts_cover_child_graphs_and_retries() {
+        use crate::graph::NodeType;
+        const OTHER_STAGES_MARGIN_SECS: u64 = 1200;
+        let gauntlet = load_bundled_graph("review-gauntlet");
+        let gauntlet_timeout = gauntlet
+            .settings
+            .timeout
+            .expect("review-gauntlet must set settings.timeout");
+        let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        let gauntlet_yaml = read_to_string(assets.join("review-gauntlet/graph.yaml")).unwrap();
+        assert!(
+            gauntlet_yaml.contains("internal retry envelope")
+                && gauntlet_yaml.contains("not derived here"),
+            "review-gauntlet graph.yaml must keep the NOTE that the child's internal retry envelope is not derived from the lane timeout"
+        );
+        assert!(
+            !gauntlet_yaml.contains("is what arrives"),
+            "review-gauntlet graph.yaml must not claim the lane timeout guarantees the child's verdict arrives"
+        );
+        assert!(
+            gauntlet_yaml.contains("AND a probe_context (local-run recipe) is present"),
+            "review-gauntlet graph.yaml default_lanes description must state the probe_context guard"
+        );
+        let mut seen = 0;
+        let mut graph_backed = 0;
+        for (id, node) in &gauntlet.nodes {
+            let NodeType::Agent(a) = &node.node_type else {
+                continue;
+            };
+            seen += 1;
+            let lane_timeout = a
+                .timeout
+                .unwrap_or_else(|| panic!("review-gauntlet lane {id} must set a timeout"));
+            if assets.join(&a.agent).join("graph.yaml").exists() {
+                graph_backed += 1;
+                let child_timeout = load_bundled_graph(&a.agent)
+                    .settings
+                    .timeout
+                    .unwrap_or_else(|| panic!("{} graph must set settings.timeout", a.agent));
+                assert!(
+                    lane_timeout > child_timeout,
+                    "assets/agents/review-gauntlet/graph.yaml lane {id} timeout ({lane_timeout}) must exceed assets/agents/{}/graph.yaml settings.timeout ({child_timeout})",
+                    a.agent
+                );
+            }
+            let worst_case = u64::from(a.max_attempts) * lane_timeout;
+            assert!(
+                gauntlet_timeout >= worst_case + OTHER_STAGES_MARGIN_SECS,
+                "review-gauntlet settings.timeout ({gauntlet_timeout}) must cover lane {id}'s max_attempts × timeout ({} × {lane_timeout} = {worst_case}) plus a {OTHER_STAGES_MARGIN_SECS}s margin for the other stages",
+                a.max_attempts
+            );
+        }
+        assert!(
+            seen >= 4,
+            "review-gauntlet must have at least 4 agent lanes, saw {seen}"
+        );
+        assert!(
+            graph_backed >= 2,
+            "at least the adversary and code-reviewer lanes must be graph-backed so the child-graph timeout check runs, saw {graph_backed}"
         );
     }
 
@@ -9475,6 +9657,380 @@ mod tests {
         assert!(
             !report.contains("[FAIL] `cargo test --all`"),
             "a skipped record must not render as FAIL: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_green_runs_keep_conforms() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test", "exit": 0, "duration_s": 1.0, "tail": "ok"}]
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: CONFORMS"),
+            "an all-green run record must not block CONFORMS: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_red_run_forces_diverges() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A criterion judged MET cannot outrank a recorded failing run of a
+        // declared command — the verdict is fail-closed on exec_results.
+        let mut state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test", "exit": 101, "duration_s": 1.0, "tail": "FAILED"}]
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "a recorded red run must force DIVERGES: {report}"
+        );
+        assert!(
+            report.contains("1. Verification run `cargo test` — exit 101"),
+            "the red run must be a numbered complaint naming the command: {report}"
+        );
+        assert!(
+            report.contains("Criteria: 1/1 met, 0 partial, 0 unmet/diverged — 1 red verification run(s) (fail-closed)."),
+            "a reds-only DIVERGES header must count the red runs: {report}"
+        );
+
+        state["exec_results"] = json!([{"cmd": "cargo clippy", "skipped": "deadline"}]);
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "a skipped (unproven) run must force DIVERGES: {report}"
+        );
+        assert!(
+            report.contains("1. Verification run `cargo clippy` — never ran"),
+            "the skipped run must be a numbered complaint naming the command: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_none_declared_marker_is_not_red() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": "none declared — the caller supplied no verification_commands; criteria relying on tests are unproven"
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: CONFORMS"),
+            "the none-declared marker must not block CONFORMS: {report}"
+        );
+        assert!(
+            !report.contains("Verification run `"),
+            "the none-declared marker must not yield a run complaint: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_environment_marker_with_declared_commands_blocks() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Commands were declared and the runner died before running them:
+        // the criteria are unproven, and an all-MET set of criterion
+        // judgments must not turn that into CONFORMS.
+        let state = json!({
+            "pipeline_faults": [],
+            "verification_commands": ["cargo test"],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": "ENVIRONMENT: verification runner error: x — the declared commands could not be executed"
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "an ENVIRONMENT marker with declared commands must block CONFORMS: {report}"
+        );
+        assert!(
+            report.contains("1. Verification runner error"),
+            "the runner error must be a numbered complaint: {report}"
+        );
+        assert!(
+            report.contains("0 unmet/diverged — 1 red verification run(s) (fail-closed)."),
+            "the header must count the runner error as a red run: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_environment_marker_without_declaration_is_not_red() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "verification_commands": "[]",
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": "ENVIRONMENT: verification runner error: x — the declared commands could not be executed"
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: CONFORMS"),
+            "with nothing declared the ENVIRONMENT marker is doctrine-PARTIAL, not a red run: {report}"
+        );
+        assert!(
+            !report.contains("Verification runner error"),
+            "the ENVIRONMENT marker must not yield a run complaint: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_timeout_run_named_as_timeout() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test", "exit": -1, "duration_s": 900.0, "tail": "TIMEOUT after 900s"}]
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "a timed-out run must force DIVERGES: {report}"
+        );
+        assert!(
+            report.contains("1. Verification run `cargo test` — TIMEOUT (exit -1)"),
+            "the -1 sentinel must be named as a TIMEOUT, not a bare exit code: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_red_runs_number_after_faults_and_criteria() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": ["PIPELINE-FAULT: x"],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "UNMET",
+                 "evidence": "", "complaint": "no impl found"}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test", "exit": 101, "duration_s": 1.0, "tail": "FAILED"}]
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        let fault = report
+            .find("1. PIPELINE-FAULT")
+            .expect("the pipeline fault must be complaint 1");
+        let criterion = report
+            .find("2. Acceptance criterion")
+            .expect("the unmet criterion must be complaint 2");
+        let red = report
+            .find("3. Verification run")
+            .expect("the red run must be complaint 3");
+        assert!(
+            fault < criterion && criterion < red,
+            "complaints must be ordered fault, criterion, red run: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_no_criteria_still_lists_red_runs() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test", "exit": 101, "duration_s": 1.0, "tail": "FAILED"}]
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "no criteria must fail closed: {report}"
+        );
+        assert!(
+            report.contains("Criteria: none provided."),
+            "the no-criteria header must be kept: {report}"
+        );
+        assert!(
+            report.contains("2. Verification run `cargo test`"),
+            "the red run must be numbered after the no-criteria complaint: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_environment_marker_with_string_declaration_blocks() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Production path: graph variables land in state as strings, so the
+        // declaration is a JSON-encoded list, not a list.
+        let mut state = json!({
+            "pipeline_faults": [],
+            "verification_commands": "[\"cargo test\"]",
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": "ENVIRONMENT: verification runner error: x — the declared commands could not be executed"
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "a JSON-string declaration must count as declared: {report}"
+        );
+        assert!(
+            report.contains("1. Verification runner error"),
+            "the runner error must be a numbered complaint: {report}"
+        );
+
+        state["verification_commands"] = json!("[\"  \"]");
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: CONFORMS"),
+            "blank items are not a declaration, so the ENVIRONMENT marker is not a red run: {report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_died_and_red_header_has_single_period() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "UNMET",
+                 "evidence": "PIPELINE-FAULT: criterion x", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test", "exit": 101, "duration_s": 1.0, "tail": "FAILED"}]
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.contains("died (fail-closed) — 1 red verification run(s) (fail-closed)."),
+            "both header notes must be joined with a single em dash: {report}"
+        );
+        assert!(
+            !report.contains(".."),
+            "the header must end with exactly one period: {report}"
+        );
+    }
+
+    /// The fail-closed CONFORMS block on unrun declared commands is described
+    /// in three places that must keep agreeing: the runner's ENVIRONMENT
+    /// marker, the node descriptions, and check_criterion's instructions.
+    #[test]
+    fn adversary_fail_closed_wording_pins() {
+        use crate::graph::NodeType;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/adversary");
+        let runner = read_to_string(dir.join("scripts/run_checks.py")).unwrap();
+        assert!(
+            runner.contains("the verdict blocks CONFORMS when"),
+            "run_checks.py's ENVIRONMENT marker must point at the verdict's fail-closed block"
+        );
+        let graph = load_bundled_graph("adversary");
+        let run_checks = graph
+            .get_node("run_checks")
+            .expect("adversary graph must have a run_checks node");
+        assert!(
+            run_checks.description.contains("blocks CONFORMS"),
+            "run_checks description must state the verdict blocks CONFORMS: {}",
+            run_checks.description
+        );
+        let verdict = graph
+            .get_node("verdict")
+            .expect("adversary graph must have a verdict node");
+        assert!(
+            verdict
+                .description
+                .contains("zero recorded red verification runs"),
+            "verdict description must list red runs among the CONFORMS requirements: {}",
+            verdict.description
+        );
+        let check = graph
+            .get_node("check_criterion")
+            .expect("adversary graph must have a check_criterion node");
+        assert!(
+            check.description.contains(
+                "the deterministic verdict blocks CONFORMS when declared commands did not run"
+            ),
+            "check_criterion description must hand the fail-closed block to the verdict: {}",
+            check.description
+        );
+        let NodeType::Llm(llm) = &check.node_type else {
+            panic!("check_criterion must be an llm node");
+        };
+        let instructions = llm
+            .instructions
+            .as_deref()
+            .expect("check_criterion must have instructions");
+        assert!(
+            instructions.contains("deterministic verdict additionally blocks CONFORMS"),
+            "check_criterion instructions must hand the fail-closed block to the verdict"
         );
     }
 

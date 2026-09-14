@@ -17,8 +17,8 @@ from the repo under review, and whatever is declared here runs with
 shell=True. Variables land in state as strings, so a JSON-encoded list is
 accepted alongside a real list. A declaration that is not a JSON array of
 strings is a caller contract violation, not a runner hiccup: it executes
-NOTHING and records a PIPELINE-FAULT (fail-closed into DIVERGES) instead of
-degrading to the soft ENVIRONMENT marker. The engine merges only the keys an
+NOTHING and fails closed as a PIPELINE-FAULT (complaint #1) — it never
+degrades to an ENVIRONMENT marker. The engine merges only the keys an
 llm node's `output_schema.properties` declares, so a parse LLM coaxed into
 emitting an extra `verification_commands` key cannot overwrite the declared
 value: the undeclared key is dropped before it reaches state.
@@ -35,9 +35,12 @@ ADVERSARY_RUN_CHECKS_DEADLINE_SECS overrides the deadline (test seam).
 
 Process hygiene: commands run through the shell. On POSIX each command gets
 its own session (start_new_session) and a timeout SIGKILLs the whole process
-group, so grandchildren of a hung command cannot linger. On non-POSIX
-platforms only the direct shell child is killed — grandchildren of a
-timed-out command may survive (documented limitation).
+group, so grandchildren of a hung command cannot linger. The post-kill
+reap/drain is itself bounded by DRAIN_TIMEOUT_SECS: a grandchild that escaped
+the session (its own start_new_session) but still holds the stdout pipe
+would otherwise block the drain until it exits. On non-POSIX platforms only
+the direct shell child is killed — grandchildren of a timed-out command may
+survive (documented limitation).
 
 Verification commands run with GRAPH_STATE* (GRAPH_STATE, GRAPH_STATE_FILE)
 scrubbed from their environment: the reviewed repo's own tests may exec these very
@@ -53,6 +56,7 @@ import time
 
 PER_COMMAND_TIMEOUT_SECS = 900
 TOTAL_DEADLINE_SECS = float(os.environ.get("ADVERSARY_RUN_CHECKS_DEADLINE_SECS") or 3300)
+DRAIN_TIMEOUT_SECS = 10
 TAIL_LINES = 50
 MAX_TAIL_CHARS = 8000
 
@@ -112,6 +116,8 @@ def run_one(cmd, proj, budget):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         **popen_kwargs,
     )
@@ -125,7 +131,10 @@ def run_one(cmd, proj, budget):
                 pass
         else:
             p.kill()
-        p.communicate()  # reap the child and drain the pipes
+        try:
+            p.communicate(timeout=DRAIN_TIMEOUT_SECS)
+        except subprocess.TimeoutExpired:
+            pass
         return {
             "cmd": cmd,
             "exit": -1,
@@ -189,8 +198,9 @@ except Exception as e:  # noqa: BLE001 — never fail the node; degrade visibly
             {
                 "exec_results": (
                     f"ENVIRONMENT: verification runner error: {e} — the declared "
-                    "commands could not be executed; treat execution criteria as "
-                    "PARTIAL (unproven), not as failed"
+                    "commands could not be executed; execution criteria are unproven "
+                    "(PARTIAL at the criterion level; the verdict blocks CONFORMS when "
+                    "commands were declared)"
                 )
             }
         )

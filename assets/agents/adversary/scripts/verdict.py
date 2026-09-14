@@ -2,8 +2,11 @@
 """Deterministic conformance verdict for the adversary graph.
 
 CONFORMS requires: at least one criterion, every criterion MET, zero
-holistic complaints, and zero pipeline faults. Everything else — including
-a missing plan or a degraded (faulted) pipeline — is DIVERGES (fail-closed).
+holistic complaints, zero pipeline faults, and zero recorded red
+verification runs (exit≠0/timeout/skipped, or an ENVIRONMENT runner-error
+marker when commands were declared — the declared commands never ran, so the
+run is unproven). Everything else — including a missing plan or a degraded
+(faulted) pipeline — is DIVERGES (fail-closed).
 Any "PIPELINE-FAULT:" marker recorded in `pipeline_faults` (or a holistic
 llm-node failure captured in `holistic_failure`) becomes complaint #1;
 per-criterion results are still reported. A criterion whose check DIED
@@ -17,6 +20,7 @@ import json
 import os
 
 MAX_FAULT_DETAIL_CHARS = 300
+MAX_MARKER_CHARS = 200
 DIED_MARKER = "criterion check DIED (pipeline fault)"
 DIED_EVIDENCE_PREFIX = "PIPELINE-FAULT: criterion "
 
@@ -86,6 +90,63 @@ def append_criterion_complaints(lines, verdicts, extra, start):
     return i
 
 
+def declared_nonempty(declared):
+    """True when verification_commands names at least one command.
+
+    Accepts a list or a JSON-encoded string of one. None, unparseable, or
+    empty declarations count as not declared — run_checks already records
+    a PIPELINE-FAULT for the invalid ones.
+    """
+    if isinstance(declared, str):
+        try:
+            declared = json.loads(declared)
+        except json.JSONDecodeError:
+            return False
+    if not isinstance(declared, list):
+        return False
+    return any(isinstance(c, str) and c.strip() for c in declared)
+
+
+def exec_run_complaints(exec_results, declared):
+    """One complaint per red verification run recorded by run_checks.py.
+
+    A red run is a record that was skipped (deadline) or exited nonzero
+    (including the -1 TIMEOUT sentinel). An "ENVIRONMENT: …" runner-error
+    marker with a non-empty declaration is one complaint: the declared
+    commands never ran. Other string markers ("none declared",
+    "PIPELINE-FAULT…") are not runs and yield nothing.
+    """
+    if isinstance(exec_results, str):
+        marker = exec_results.strip().replace("\n", " ")
+        if not marker.startswith("ENVIRONMENT:") or not declared_nonempty(declared):
+            return []
+        if len(marker) > MAX_MARKER_CHARS:
+            marker = marker[: MAX_MARKER_CHARS - 1] + "…"
+        return [
+            f"Verification runner error — the declared command(s) never ran ({marker}); "
+            "unproven runs block CONFORMS"
+        ]
+    if not isinstance(exec_results, list):
+        return []
+    out = []
+    for r in exec_results:
+        if not isinstance(r, dict):
+            continue
+        cmd = r.get("cmd", "?")
+        if r.get("skipped"):
+            out.append(f"Verification run `{cmd}` — never ran: deadline expired (unproven)")
+            continue
+        code = r.get("exit")
+        if code == 0:
+            continue
+        outcome = "TIMEOUT (exit -1)" if code == -1 else f"exit {code}"
+        out.append(
+            f"Verification run `{cmd}` — {outcome} (recorded FAIL; a red declared "
+            "command blocks CONFORMS regardless of criterion judgments)"
+        )
+    return out
+
+
 def render_exec_results(exec_results):
     """Lines for the "Verification runs:" report section.
 
@@ -125,6 +186,9 @@ def main():
     extra = [c for c in (state.get("extra_complaints") or []) if isinstance(c, dict)]
     observations = (state.get("observations") or "").strip()
     faults = collect_pipeline_faults(state)
+    reds = exec_run_complaints(
+        state.get("exec_results"), state.get("verification_commands")
+    )
     n = len(verdicts)
 
     met = [v for v in verdicts if v.get("status") == "MET" and not died(v)]
@@ -152,7 +216,10 @@ def main():
         for f in faults:
             i += 1
             lines.append(f"{i}. {f}")
-        append_criterion_complaints(lines, verdicts, extra, i)
+        i = append_criterion_complaints(lines, verdicts, extra, i)
+        for c in reds:
+            i += 1
+            lines.append(f"{i}. {c}")
         if observations:
             lines.append("")
             lines.append("Non-blocking observations:")
@@ -166,7 +233,9 @@ def main():
             "be judged without a spec (fail-closed). Supply the plan's Objective/Tasks/"
             "Acceptance criteria and re-run."
         )
-    elif not partial and not bad and not extra:
+        for i, c in enumerate(reds, start=2):
+            lines.append(f"{i}. {c}")
+    elif not partial and not bad and not extra and not reds:
         lines.append("ADVERSARIAL_REVIEW: CONFORMS")
         lines.append(f"Criteria: {n}/{n} met (all with tests).")
         if observations:
@@ -176,15 +245,17 @@ def main():
     else:
         lines.append("ADVERSARIAL_REVIEW: DIVERGES")
         header = f"Criteria: {len(met)}/{n} met, {len(partial)} partial, {len(bad)} unmet/diverged"
+        notes = []
         if died_count := sum(1 for v in verdicts if died(v)):
-            header += (
-                f" — degraded run: {died_count} criterion check(s) died (fail-closed)."
-            )
-        else:
-            header += "."
-        lines.append(header)
+            notes.append(f"degraded run: {died_count} criterion check(s) died (fail-closed)")
+        if reds:
+            notes.append(f"{len(reds)} red verification run(s) (fail-closed)")
+        lines.append(header + "".join(f" — {note}" for note in notes) + ".")
         lines.append("Complaints:")
-        append_criterion_complaints(lines, verdicts, extra, 0)
+        i = append_criterion_complaints(lines, verdicts, extra, 0)
+        for c in reds:
+            i += 1
+            lines.append(f"{i}. {c}")
         if observations:
             lines.append("")
             lines.append("Non-blocking observations:")

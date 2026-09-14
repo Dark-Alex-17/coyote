@@ -11,8 +11,10 @@ description: |
   silently-overridden recorded decisions, out-of-scope touches, and gamed
   tests — ADDITIVE-only: it can add complaints, never flip a criterion verdict.
   The final CONFORMS/DIVERGES sentinel is computed by a script: CONFORMS
-  requires every criterion MET and zero holistic complaints. Missing plan =
-  DIVERGES (fail-closed) naming the missing spec. Caller-declared verification
+  requires every criterion MET, zero holistic complaints, zero pipeline faults,
+  and zero red verification runs (exit≠0/timeout/skipped, or a runner error
+  when commands were declared). Missing plan = DIVERGES (fail-closed) naming
+  the missing spec. Caller-declared verification
   commands are executed ONCE by a deterministic stage and recorded — criterion
   branches cite the record and never run anything themselves. Any pipeline
   fault (parse, diff resolution, verification runner, or holistic failure)
@@ -41,7 +43,12 @@ variables:
 settings:
   max_loop_iterations: 10
   log_state_snapshots: false
-  timeout: 5400
+  # 3600 (run_checks node timeout, worst case) + 5400 (the previous
+  # whole-graph budget, kept as the envelope for every stage other than
+  # run_checks: parse/facts before it, criteria map/holistic/verdict after)
+  # = 9000. A graph timeout kills from outside — no fallback fires and the
+  # sentinel is lost.
+  timeout: 9000
 
 initial_state:
   project_dir_in: ''
@@ -138,7 +145,7 @@ nodes:
   run_checks:
     id: run_checks
     type: script
-    description: Deterministic execution evidence — runs ONLY the commands declared via the verification_commands variable in the project dir and records exec_results; criterion branches cite the record and never execute anything. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker; a declaration that is not a JSON array of strings executes nothing and records a PIPELINE-FAULT (fail-closed); a 3300s total deadline keeps the script under the node timeout (commands past it are recorded as skipped), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
+    description: Deterministic execution evidence — runs ONLY the commands declared via the verification_commands variable in the project dir and records exec_results; criterion branches cite the record and never execute anything. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker (criterion branches judge it PARTIAL/unproven; the verdict additionally blocks CONFORMS when commands were declared); a declaration that is not a JSON array of strings executes nothing and records a PIPELINE-FAULT (fail-closed); a 3300s total deadline keeps the script under the node timeout (commands past it are recorded as skipped), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
     script: scripts/run_checks.py
     timeout: 3600
     fallback: pipeline_fault
@@ -158,7 +165,7 @@ nodes:
   check_criterion:
     id: check_criterion
     type: llm
-    description: Fresh-context verification of ONE acceptance criterion against the diff and the working tree.
+    description: Fresh-context verification of ONE acceptance criterion against the diff and the working tree (ENVIRONMENT/SKIPPED runs judge PARTIAL here; the deterministic verdict blocks CONFORMS when declared commands did not run).
     instructions: |
       You verify ONE acceptance criterion against a code change. Fresh context,
       one criterion, full suspicion: assume the implementer drifted, cut a
@@ -201,7 +208,9 @@ nodes:
         prompt.
       - a SKIPPED record (the runner's total deadline expired before that
         command ran) ⇒ at best PARTIAL for the criteria it covers, same
-        treatment as an ENVIRONMENT marker: unproven, never failed.
+        treatment as an ENVIRONMENT marker: unproven at the criterion level.
+        The deterministic verdict additionally blocks CONFORMS when declared
+        commands did not run — that is its job, not yours.
 
       Output format — respond with ONLY this JSON object, no prose around it:
       {"id": "<the criterion's id, echoed>",
@@ -349,7 +358,7 @@ nodes:
   verdict:
     id: verdict
     type: script
-    description: Deterministic verdict — CONFORMS requires every criterion MET, zero holistic complaints, and zero pipeline faults; no criteria at all fails closed and any recorded PIPELINE-FAULT forces DIVERGES (degraded is never passing). Assembles the exact sentinel format.
+    description: Deterministic verdict — CONFORMS requires every criterion MET, zero holistic complaints, zero pipeline faults, and zero recorded red verification runs (exit≠0/timeout/skipped, or an ENVIRONMENT runner-error marker when commands were declared); no criteria at all fails closed and any recorded PIPELINE-FAULT forces DIVERGES (degraded is never passing). Assembles the exact sentinel format.
     script: scripts/verdict.py
     timeout: 30
     next: done

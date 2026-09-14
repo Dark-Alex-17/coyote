@@ -6,8 +6,9 @@
 > is structurally impossible. Each verdict passes a deterministic contract gate (MET requires
 > evidence including a proving test; no test = at best PARTIAL), a holistic ADDITIVE-only pass hunts
 > absence/scope-drift/substitution/gamed-tests, and the CONFORMS/DIVERGES sentinel is computed by a
-> script (missing plan = DIVERGES, fail-closed). The conformance doctrine below is unchanged — now
-> structurally enforced.
+> script (missing plan = DIVERGES, fail-closed). The conformance doctrine below is structurally
+> enforced: CONFORMS requires ALL MET + zero holistic complaints + zero pipeline faults +
+> zero red verification runs (exit≠0/timeout/skipped, or a runner error when commands were declared).
 
 
 An **adversarial plan-conformance reviewer**. Where [`code-reviewer`](../code-reviewer/README.md)
@@ -40,6 +41,9 @@ The agent ends every review with one sentinel:
 ADVERSARIAL_REVIEW: CONFORMS
 Criteria: N/N met (all with tests).
 ```
+
+CONFORMS is deterministic: ALL MET + zero holistic complaints + zero pipeline faults +
+zero red verification runs (exit≠0/timeout/skipped, or a runner error when commands were declared).
 
 ```
 ADVERSARIAL_REVIEW: DIVERGES
@@ -74,7 +78,7 @@ flowchart TD
     D --> E["crit_gate (script): MET needs change+test evidence"]
     E -. "reject-retry once; exhausted = PARTIAL" .-> D
     E --> F["holistic (llm): ADDITIVE-only hunt - absence, scope drift, substitution, gamed tests"]
-    F --> G["verdict (script): CONFORMS iff ALL MET + zero extras + zero faults; no criteria = DIVERGES"]
+    F --> G["verdict (script): CONFORMS iff ALL MET + zero extras + zero faults + zero red runs; no criteria = DIVERGES"]
     G --> H(["ADVERSARIAL_REVIEW: CONFORMS | DIVERGES"])
     A -. "fallback" .-> P["pipeline_fault (script): record PIPELINE-FAULT marker"]
     B -. "fallback" .-> P
@@ -89,7 +93,7 @@ The conformance doctrine is baked into the graph's own nodes:
 
 1. **Every** acceptance criterion gets its own fresh-context verification branch — MET / PARTIAL / UNMET / DIVERGED, machine-gated (MET requires the satisfying change AND the proving test, cited). No test ⇒ at best PARTIAL. Partial coverage of the criteria list is structurally impossible.
 2. Ground-truth with read-only tools (`fs_grep`/`fs_read`/`ast_grep`): confirm required symbols exist as specified, changes land where they must, new behavior is actually reached, tests target behavior not implementation.
-3. Execution evidence is recorded **once, deterministically**: `run_checks` runs ONLY the caller-declared verification commands (never invented or auto-detected), sequentially under a 3300s total deadline — commands the deadline leaves no budget for are recorded as SKIPPED. Criterion branches have no execution tools by design: "tests pass"-style criteria are judged against the record — a recorded green run is MET citing it; no declared command ⇒ at best PARTIAL. The commands arrive through the declared `verification_commands` graph variable (see [Declaring verification commands](#declaring-verification-commands)) — `parse` never extracts them from the prompt, so the prompt is no longer an extraction source for the commands.
+3. Execution evidence is recorded **once, deterministically**: `run_checks` runs ONLY the caller-declared verification commands (never invented or auto-detected), sequentially under a 3300s total deadline — commands the deadline leaves no budget for are recorded as SKIPPED. Criterion branches have no execution tools by design: "tests pass"-style criteria are judged against the record — a recorded green run is MET citing it; no declared command ⇒ at best PARTIAL. Independently of the criterion judgments, the verdict script blocks CONFORMS on any red run (exit≠0/timeout/skipped) and on an ENVIRONMENT runner-error marker when commands were declared — the declared commands never ran, so the run is unproven. The commands arrive through the declared `verification_commands` graph variable (see [Declaring verification commands](#declaring-verification-commands)) — `parse` never extracts them from the prompt, so the prompt is no longer an extraction source for the commands.
 4. Hunt adversarially for the **absent**: skipped criteria, scope creep, interface/approach substitution, out-of-scope touches, downstream contract breakage.
 5. **Fail closed on pipeline faults**: if parse, diff resolution, or the verification runner dies, its fallback routes to `pipeline_fault`, which records a `PIPELINE-FAULT:` marker and continues to the verdict (a failed holistic pass falls back straight to the verdict, which synthesizes the same marker). Any recorded fault forces DIVERGES with the fault as complaint #1 — degraded is never passing, and the sentinel is always emitted: the graph never dies without one.
 6. **Fail closed per criterion**: a criterion check that dies (max_iterations exhausted, API failure) falls back to `criterion_fault`, which records a schema-shaped UNMET verdict carrying a `PIPELINE-FAULT: criterion ` evidence marker for that one criterion. The other criteria still get verdicts, the report says the check DIED rather than judged, and the run is DIVERGES. That exact marker prefix (the one `criterion_fault` emits) forces the criterion into unmet regardless of the status it carries, so a verdict that echoes it with `MET` can never count toward CONFORMS; `check_criterion` is told never to begin its own evidence with `PIPELINE-FAULT:`.
@@ -137,8 +141,8 @@ as a structured `inputs:` passthrough, not as prompt text.
 - `'[]'` (or omitted) ⇒ the "none declared" marker; execution criteria are at best PARTIAL.
 - Anything that is not a JSON array of strings (unparsable JSON, an object, non-string items) is
   an invalid declaration: `run_checks` executes **nothing** and records a
-  `PIPELINE-FAULT: verification_commands declaration invalid — …` marker, which forces DIVERGES —
-  fail-closed, not degraded to the soft ENVIRONMENT marker.
+  `PIPELINE-FAULT: verification_commands declaration invalid — …` marker, which forces DIVERGES:
+  it fails closed as a PIPELINE-FAULT (complaint #1) — it never degrades to an ENVIRONMENT marker.
 - The engine merges only the keys declared under `parse`'s `output_schema.properties` into state,
   so an injected instruction that makes the parse LLM emit an extra `verification_commands` key
   cannot reach state: the undeclared key is dropped and the declared variable stands.
