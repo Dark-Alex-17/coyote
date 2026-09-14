@@ -6350,15 +6350,15 @@
   - name: deepseek/deepseek-v4-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0493
-    output_price: 0.0986
+    input_price: 0.0899
+    output_price: 0.1797
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.04
-    output_price: 0.08
+    input_price: 0.065
+    output_price: 0.18
     max_output_tokens: 943718
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731:batch
@@ -6394,9 +6394,9 @@
   - name: deepseek/deepseek-v4-pro-0813
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.5782
-    output_price: 1.7345
-    max_output_tokens: 393216
+    input_price: 1.0547
+    output_price: 3.164
+    max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813:batch
     type: chat
@@ -7426,9 +7426,9 @@
   - name: nvidia/nemotron-3-ultra-550b-a55b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.625
-    output_price: 3.125
-    max_output_tokens: 32768
+    input_price: 0.6
+    output_price: 2.4
+    max_output_tokens: 182520
     supports_function_calling: true
   - name: nvidia/nemotron-3-ultra-550b-a55b:free
     type: chat
@@ -8489,9 +8489,9 @@
   - name: qwen/qwen3-14b
     type: chat
     max_input_tokens: 131072
-    input_price: 0.2275
-    output_price: 0.91
-    max_output_tokens: 8192
+    input_price: 0.12
+    output_price: 0.24
+    max_output_tokens: 16384
     supports_function_calling: true
   - name: qwen/qwen3-235b-a22b
     type: chat
@@ -9216,9 +9216,9 @@
   - name: z-ai/glm-5.2
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.6
-    output_price: 2.0
-    max_output_tokens: 182476
+    input_price: 0.6832
+    output_price: 2.1472
+    max_output_tokens: 131072
     supports_function_calling: true
   - name: z-ai/glm-5.2:batch
     type: chat
@@ -9230,9 +9230,9 @@
   - name: z-ai/glm-5.3
     type: chat
     max_input_tokens: 1310720
-    input_price: 1.092
-    output_price: 3.432
-    max_output_tokens: 131072
+    input_price: 1.4
+    output_price: 4.4
+    max_output_tokens: 943717
     supports_function_calling: true
   - name: z-ai/glm-5.3-flash
     type: chat
