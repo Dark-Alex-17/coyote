@@ -24,6 +24,7 @@ pub struct ClaudeConfig {
     pub auth: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
+    pub prompt_cache: Option<bool>,
     pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }
@@ -75,7 +76,11 @@ async fn prepare_chat_completions(
         .unwrap_or_else(|_| API_BASE.to_string());
 
     let url = format!("{}/messages", api_base.trim_end_matches('/'));
-    let body = claude_build_chat_completions_body(data, &self_.model)?;
+    let body = claude_build_chat_completions_body(
+        data,
+        &self_.model,
+        self_.config.prompt_cache.unwrap_or(true),
+    )?;
 
     let mut request_data = RequestData::new(url, body);
 
@@ -250,6 +255,18 @@ pub async fn claude_chat_completions_streaming(
                         function_arguments.clear();
                     }
                 }
+                "message_start" => {
+                    if let Some(usage) = claude_parse_usage(&data["message"]["usage"]) {
+                        debug!("token-usage: {usage:?}");
+                        handler.usage(usage);
+                    }
+                }
+                "message_delta" => {
+                    if let Some(usage) = claude_parse_usage(&data["usage"]) {
+                        debug!("token-usage: {usage:?}");
+                        handler.usage(usage);
+                    }
+                }
                 _ => {}
             }
         }
@@ -262,6 +279,7 @@ pub async fn claude_chat_completions_streaming(
 pub fn claude_build_chat_completions_body(
     data: ChatCompletionsData,
     model: &Model,
+    prompt_cache: bool,
 ) -> Result<Value> {
     let ChatCompletionsData {
         mut messages,
@@ -487,7 +505,63 @@ pub fn claude_build_chat_completions_body(
 						})
 					.collect();
     }
+    if prompt_cache {
+        apply_prompt_cache_breakpoints(&mut body);
+    }
     Ok(body)
+}
+
+/// Anthropic allows at most 4 cache_control breakpoints; all four are spent
+/// here: the last tool, the system prompt, and the last two user messages.
+/// Two moving breakpoints guarantee a cache read every turn: turn N+1's
+/// second-to-last breakpoint sits exactly where turn N's last one was.
+fn apply_prompt_cache_breakpoints(body: &mut Value) {
+    if let Some(text) = body["system"].as_str().map(str::to_string) {
+        body["system"] = json!([{
+            "type": "text",
+            "text": text,
+            "cache_control": { "type": "ephemeral" },
+        }]);
+    }
+    if let Some(tool) = body
+        .get_mut("tools")
+        .and_then(|v| v.as_array_mut())
+        .and_then(|v| v.last_mut())
+    {
+        tool["cache_control"] = json!({ "type": "ephemeral" });
+    }
+    let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let mut remaining = 2;
+    for message in messages.iter_mut().rev() {
+        if remaining == 0 {
+            break;
+        }
+        if message["role"] != "user" {
+            continue;
+        }
+        if let Some(text) = message["content"].as_str().map(str::to_string) {
+            message["content"] = json!([{ "type": "text", "text": text }]);
+        }
+        if let Some(block) = message["content"].as_array_mut().and_then(|v| v.last_mut()) {
+            block["cache_control"] = json!({ "type": "ephemeral" });
+            remaining -= 1;
+        }
+    }
+}
+
+fn claude_parse_usage(usage: &Value) -> Option<TokenUsage> {
+    if !usage.is_object() {
+        return None;
+    }
+
+    Some(TokenUsage {
+        input_tokens: usage["input_tokens"].as_u64(),
+        output_tokens: usage["output_tokens"].as_u64(),
+        cache_creation_input_tokens: usage["cache_creation_input_tokens"].as_u64(),
+        cache_read_input_tokens: usage["cache_read_input_tokens"].as_u64(),
+    })
 }
 
 pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
@@ -545,6 +619,7 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         text: text.to_string(),
         tool_calls,
         thinking,
+        usage: claude_parse_usage(&data["usage"]),
     };
     Ok(output)
 }
@@ -552,7 +627,7 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::function::{ToolCall, ToolResult};
+    use crate::function::{FunctionDeclaration, ToolCall, ToolResult};
 
     fn tool_result(id: &str, text: Option<&str>) -> ToolResult {
         ToolResult {
@@ -563,7 +638,7 @@ mod tests {
         }
     }
 
-    fn build_body(tool_results: Vec<ToolResult>) -> Value {
+    fn build_body(tool_results: Vec<ToolResult>, prompt_cache: bool) -> Value {
         let data = ChatCompletionsData {
             messages: vec![
                 Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
@@ -582,7 +657,44 @@ mod tests {
             functions: None,
             stream: false,
         };
-        claude_build_chat_completions_body(data, &Model::new("claude", "claude-test")).unwrap()
+        claude_build_chat_completions_body(data, &Model::new("claude", "claude-test"), prompt_cache)
+            .unwrap()
+    }
+
+    fn multi_turn_data(functions: Option<Vec<FunctionDeclaration>>) -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages: vec![
+                Message::new(MessageRole::System, MessageContent::Text("sys".to_string())),
+                Message::new(MessageRole::User, MessageContent::Text("first".to_string())),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::Text("reply".to_string()),
+                ),
+                Message::new(
+                    MessageRole::User,
+                    MessageContent::Text("second".to_string()),
+                ),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::Text("reply2".to_string()),
+                ),
+                Message::new(MessageRole::User, MessageContent::Text("third".to_string())),
+            ],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions,
+            stream: false,
+        }
+    }
+
+    fn function_declaration(name: &str) -> FunctionDeclaration {
+        FunctionDeclaration {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            parameters: Default::default(),
+            agent: false,
+        }
     }
 
     fn assert_unique_tool_use_ids_per_message(body: &Value) {
@@ -605,11 +717,14 @@ mod tests {
 
     #[test]
     fn sequence_splits_on_round_text() {
-        let body = build_body(vec![
-            tool_result("toolu_A", None),
-            tool_result("toolu_B", None),
-            tool_result("toolu_C", Some("running another tool")),
-        ]);
+        let body = build_body(
+            vec![
+                tool_result("toolu_A", None),
+                tool_result("toolu_B", None),
+                tool_result("toolu_C", Some("running another tool")),
+            ],
+            false,
+        );
 
         let messages = body["messages"].as_array().unwrap();
 
@@ -619,11 +734,14 @@ mod tests {
 
     #[test]
     fn sequence_splits_on_reused_id_in_textless_round() {
-        let body = build_body(vec![
-            tool_result("toolu_A", None),
-            tool_result("toolu_B", None),
-            tool_result("toolu_A", None),
-        ]);
+        let body = build_body(
+            vec![
+                tool_result("toolu_A", None),
+                tool_result("toolu_B", None),
+                tool_result("toolu_A", None),
+            ],
+            false,
+        );
 
         let messages = body["messages"].as_array().unwrap();
 
@@ -633,15 +751,108 @@ mod tests {
 
     #[test]
     fn sequence_keeps_textless_rounds_merged_when_ids_are_unique() {
-        let body = build_body(vec![
-            tool_result("toolu_A", None),
-            tool_result("toolu_B", None),
-            tool_result("toolu_C", None),
-        ]);
+        let body = build_body(
+            vec![
+                tool_result("toolu_A", None),
+                tool_result("toolu_B", None),
+                tool_result("toolu_C", None),
+            ],
+            false,
+        );
 
         let messages = body["messages"].as_array().unwrap();
 
         assert_eq!(messages.len(), 3, "body: {body}");
         assert_unique_tool_use_ids_per_message(&body);
+    }
+
+    #[test]
+    fn prompt_cache_places_breakpoints() {
+        let functions = vec![function_declaration("a"), function_declaration("b")];
+        let body = claude_build_chat_completions_body(
+            multi_turn_data(Some(functions)),
+            &Model::new("claude", "claude-test"),
+            true,
+        )
+        .unwrap();
+
+        let cache_control = json!({ "type": "ephemeral" });
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none(), "body: {body}");
+        assert_eq!(tools[1]["cache_control"], cache_control);
+
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(system.last().unwrap()["text"], "sys");
+        assert_eq!(system.last().unwrap()["cache_control"], cache_control);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert!(
+            messages[0]["content"].is_string(),
+            "older user messages stay untouched: {body}"
+        );
+        for idx in [2, 4] {
+            let blocks = messages[idx]["content"].as_array().unwrap();
+            let last = blocks.last().unwrap();
+            assert_eq!(last["type"], "text", "body: {body}");
+            assert_eq!(last["cache_control"], cache_control, "body: {body}");
+        }
+    }
+
+    #[test]
+    fn prompt_cache_marks_last_tool_result_block() {
+        let body = build_body(
+            vec![tool_result("toolu_A", None), tool_result("toolu_B", None)],
+            true,
+        );
+
+        assert!(body.get("system").is_none(), "body: {body}");
+        assert!(body.get("tools").is_none(), "body: {body}");
+
+        let cache_control = json!({ "type": "ephemeral" });
+        let messages = body["messages"].as_array().unwrap();
+        let last_blocks = messages.last().unwrap()["content"].as_array().unwrap();
+        let last_block = last_blocks.last().unwrap();
+        assert_eq!(last_block["type"], "tool_result", "body: {body}");
+        assert_eq!(last_block["cache_control"], cache_control);
+        assert!(last_blocks[0].get("cache_control").is_none());
+
+        let first_blocks = messages[0]["content"].as_array().unwrap();
+        assert_eq!(first_blocks.last().unwrap()["type"], "text");
+        assert_eq!(first_blocks.last().unwrap()["cache_control"], cache_control);
+    }
+
+    #[test]
+    fn prompt_cache_disabled_leaves_body_unchanged() {
+        let functions = vec![function_declaration("a")];
+        let body = claude_build_chat_completions_body(
+            multi_turn_data(Some(functions)),
+            &Model::new("claude", "claude-test"),
+            false,
+        )
+        .unwrap();
+
+        assert!(body["system"].is_string(), "body: {body}");
+        assert!(!body.to_string().contains("cache_control"), "body: {body}");
+    }
+
+    #[test]
+    fn extract_populates_usage() {
+        let data = json!({
+            "content": [{ "type": "text", "text": "hi" }],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 200,
+            }
+        });
+
+        let output = claude_extract_chat_completions(&data).unwrap();
+
+        let usage = output.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(usage.cache_creation_input_tokens, Some(100));
+        assert_eq!(usage.cache_read_input_tokens, Some(200));
     }
 }

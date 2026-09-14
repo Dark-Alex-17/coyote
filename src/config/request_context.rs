@@ -16,7 +16,7 @@ use super::{
     list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
-use crate::client::{Model, ModelType, list_models};
+use crate::client::{Model, ModelType, TokenUsage, list_models};
 use crate::function::{
     FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
     agents::AGENT_FUNCTION_PREFIX,
@@ -308,6 +308,10 @@ pub struct RequestContext {
 
     pub last_message: Option<LastMessage>,
 
+    /// Usage reported by the most recent API call; reset on every completion
+    /// so providers that report nothing never show stale numbers.
+    pub last_token_usage: Option<TokenUsage>,
+
     pub tool_scope: ToolScope,
 
     pub declared_function_names: HashSet<String>,
@@ -367,6 +371,7 @@ impl RequestContext {
             rag_key: None,
             agent: None,
             last_message: None,
+            last_token_usage: None,
             tool_scope: ToolScope::default(),
             declared_function_names: Default::default(),
             node_job_scope: None,
@@ -431,6 +436,7 @@ impl RequestContext {
             rag_key: None,
             agent: None,
             last_message: None,
+            last_token_usage: None,
             tool_scope: ToolScope {
                 functions,
                 mcp_runtime,
@@ -492,6 +498,7 @@ impl RequestContext {
             rag_key: self.rag_key.clone(),
             agent: self.agent.clone(),
             last_message: self.last_message.clone(),
+            last_token_usage: self.last_token_usage.clone(),
             tool_scope: self.tool_scope.clone(),
             declared_function_names: self.declared_function_names.clone(),
             node_job_scope: None,
@@ -541,6 +548,7 @@ impl RequestContext {
             rag_key: None,
             agent: None,
             last_message: None,
+            last_token_usage: None,
             tool_scope: ToolScope {
                 functions: Functions::default(),
                 mcp_runtime: McpRuntime::default(),
@@ -2206,6 +2214,16 @@ impl RequestContext {
         }
     }
 
+    pub fn record_token_usage(&mut self, usage: Option<TokenUsage>) {
+        if let Some(usage) = &usage {
+            debug!("token-usage: {usage:?}");
+            if let Some(session) = self.session.as_mut() {
+                session.accumulate_token_usage(usage);
+            }
+        }
+        self.last_token_usage = usage;
+    }
+
     pub fn generate_prompt_context(&self, app: &AppConfig) -> HashMap<&str, String> {
         let mut output = HashMap::new();
         let role = self.extract_role_impl(app, false).unwrap_or_else(|err| {
@@ -2258,6 +2276,20 @@ impl RequestContext {
         if !role.is_derived() {
             output.insert("role", role.name().to_string());
         }
+        if let Some(usage) = &self.last_token_usage {
+            if let Some(value) = usage.input_tokens {
+                output.insert("last_input_tokens", value.to_string());
+            }
+            if let Some(value) = usage.output_tokens {
+                output.insert("last_output_tokens", value.to_string());
+            }
+            if let Some(value) = usage.cache_read_input_tokens {
+                output.insert("last_cache_read_tokens", value.to_string());
+            }
+            if let Some(value) = usage.cache_creation_input_tokens {
+                output.insert("last_cache_creation_tokens", value.to_string());
+            }
+        }
         if let Some(session) = &self.session {
             output.insert("session", session.name().to_string());
             if let Some(autoname) = session.autoname() {
@@ -2268,6 +2300,19 @@ impl RequestContext {
             output.insert("consume_tokens", tokens.to_string());
             output.insert("consume_percent", percent.to_string());
             output.insert("user_messages_len", session.user_messages_len().to_string());
+            let usage = session.token_usage();
+            if let Some(value) = usage.input_tokens {
+                output.insert("total_input_tokens", value.to_string());
+            }
+            if let Some(value) = usage.output_tokens {
+                output.insert("total_output_tokens", value.to_string());
+            }
+            if let Some(value) = usage.cache_read_input_tokens {
+                output.insert("total_cache_read_tokens", value.to_string());
+            }
+            if let Some(value) = usage.cache_creation_input_tokens {
+                output.insert("total_cache_creation_tokens", value.to_string());
+            }
         }
         if let Some(rag) = &self.rag {
             output.insert("rag", rag.name().to_string());
@@ -5364,6 +5409,72 @@ mod tests {
 
     fn create_test_ctx() -> RequestContext {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
+    }
+
+    #[test]
+    fn generate_prompt_context_emits_token_usage_vars() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        ctx.record_token_usage(Some(TokenUsage {
+            input_tokens: Some(120),
+            output_tokens: Some(8),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(100),
+        }));
+        ctx.record_token_usage(Some(TokenUsage {
+            input_tokens: Some(30),
+            output_tokens: Some(2),
+            cache_creation_input_tokens: Some(40),
+            cache_read_input_tokens: None,
+        }));
+
+        let app = ctx.app.config.clone();
+        let vars = ctx.generate_prompt_context(&app);
+
+        assert_eq!(
+            vars.get("last_input_tokens").map(String::as_str),
+            Some("30")
+        );
+        assert_eq!(
+            vars.get("last_output_tokens").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            vars.get("last_cache_creation_tokens").map(String::as_str),
+            Some("40")
+        );
+        assert!(!vars.contains_key("last_cache_read_tokens"));
+        assert_eq!(
+            vars.get("total_input_tokens").map(String::as_str),
+            Some("150")
+        );
+        assert_eq!(
+            vars.get("total_output_tokens").map(String::as_str),
+            Some("10")
+        );
+        assert_eq!(
+            vars.get("total_cache_read_tokens").map(String::as_str),
+            Some("100")
+        );
+        assert_eq!(
+            vars.get("total_cache_creation_tokens").map(String::as_str),
+            Some("40")
+        );
+    }
+
+    #[test]
+    fn generate_prompt_context_omits_token_usage_vars_when_provider_reports_none() {
+        let mut ctx = create_test_ctx();
+        ctx.record_token_usage(Some(TokenUsage {
+            input_tokens: Some(1),
+            ..Default::default()
+        }));
+        ctx.record_token_usage(None);
+
+        let app = ctx.app.config.clone();
+        let vars = ctx.generate_prompt_context(&app);
+        assert!(!vars.contains_key("last_input_tokens"));
+        assert!(!vars.contains_key("total_input_tokens"));
     }
 
     fn test_decl(name: &str) -> FunctionDeclaration {

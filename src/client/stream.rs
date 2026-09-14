@@ -1,4 +1,4 @@
-use super::{ApiStatusError, ThinkingBlock, ToolCall, catch_error};
+use super::{ApiStatusError, ThinkingBlock, TokenUsage, ToolCall, catch_error};
 use crate::utils::AbortSignal;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,6 +14,7 @@ pub struct SseHandler {
     buffer: String,
     tool_calls: Vec<ToolCall>,
     thinking: Vec<ThinkingBlock>,
+    usage: Option<TokenUsage>,
     last_tool_calls: Vec<ToolCall>,
     max_call_repeats: usize,
     call_repeat_chain_len: usize,
@@ -29,6 +30,7 @@ impl SseHandler {
             buffer: String::new(),
             tool_calls: Vec::new(),
             thinking: Vec::new(),
+            usage: None,
             last_tool_calls: Vec::new(),
             max_call_repeats: 2,
             call_repeat_chain_len: 3,
@@ -185,6 +187,26 @@ impl SseHandler {
         self.thinking.push(block);
     }
 
+    /// Merges a usage update into the accumulator; later non-None fields win.
+    /// Claude's `message_start` carries input/cache counts while
+    /// `message_delta` carries the output count, so a single event never has
+    /// the full picture.
+    pub fn usage(&mut self, update: TokenUsage) {
+        let usage = self.usage.get_or_insert_with(TokenUsage::default);
+        if update.input_tokens.is_some() {
+            usage.input_tokens = update.input_tokens;
+        }
+        if update.output_tokens.is_some() {
+            usage.output_tokens = update.output_tokens;
+        }
+        if update.cache_creation_input_tokens.is_some() {
+            usage.cache_creation_input_tokens = update.cache_creation_input_tokens;
+        }
+        if update.cache_read_input_tokens.is_some() {
+            usage.cache_read_input_tokens = update.cache_read_input_tokens;
+        }
+    }
+
     /// Whether any output (text, tool calls, or thinking blocks) has been
     /// accumulated. `Client::chat_completions_streaming` gates its 401 retry
     /// on this: content already streamed to the user would be rendered a
@@ -202,14 +224,22 @@ impl SseHandler {
         &self.last_tool_calls
     }
 
-    pub fn take(self) -> (String, Vec<ToolCall>, Vec<ThinkingBlock>) {
+    pub fn take(
+        self,
+    ) -> (
+        String,
+        Vec<ToolCall>,
+        Vec<ThinkingBlock>,
+        Option<TokenUsage>,
+    ) {
         let Self {
             buffer,
             tool_calls,
             thinking,
+            usage,
             ..
         } = self;
-        (buffer, tool_calls, thinking)
+        (buffer, tool_calls, thinking, usage)
     }
 }
 
@@ -455,7 +485,7 @@ mod tests {
             handler.tool_call(call.clone()).unwrap();
         }
 
-        let (_, calls, _) = handler.take();
+        let (_, calls, _, _) = handler.take();
         assert_eq!(calls.len(), 5);
     }
 
@@ -514,6 +544,32 @@ mod tests {
         assert!(handler.has_received_content());
     }
 
+    /// Claude splits usage across events: `message_start` carries the input
+    /// and cache counts with a provisional output count, `message_delta`
+    /// carries only the final output count. Later non-None fields must win.
+    #[test]
+    fn test_usage_merges_later_non_none_fields() {
+        let (mut handler, _rx) = new_handler();
+
+        handler.usage(TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(1),
+            cache_creation_input_tokens: Some(200),
+            cache_read_input_tokens: Some(300),
+        });
+        handler.usage(TokenUsage {
+            output_tokens: Some(42),
+            ..Default::default()
+        });
+
+        let (_, _, _, usage) = handler.take();
+        let usage = usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(42));
+        assert_eq!(usage.cache_creation_input_tokens, Some(200));
+        assert_eq!(usage.cache_read_input_tokens, Some(300));
+    }
+
     /// A silent handler is the quiet transport's whole output gate: text,
     /// tool calls, and thinking still accumulate for `take()`, but the
     /// receiver sees no `Text` events, only the trailing `Done`.
@@ -540,7 +596,7 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(SseEvent::Done)));
         assert!(rx.try_recv().is_err(), "no events beyond Done");
 
-        let (text, calls, thinking) = handler.take();
+        let (text, calls, thinking, _) = handler.take();
         assert_eq!(text, "hello");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "lookup");

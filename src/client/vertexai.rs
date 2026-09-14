@@ -18,6 +18,7 @@ pub struct VertexAIConfig {
     pub adc_file: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
+    pub prompt_cache: Option<bool>,
     pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }
@@ -137,7 +138,11 @@ fn prepare_chat_completions(
     let body = match model_category {
         ModelCategory::Gemini => gemini_build_chat_completions_body(data, &self_.model)?,
         ModelCategory::Claude => {
-            let mut body = claude_build_chat_completions_body(data, &self_.model)?;
+            let mut body = claude_build_chat_completions_body(
+                data,
+                &self_.model,
+                self_.config.prompt_cache.unwrap_or(true),
+            )?;
             if let Some(body_obj) = body.as_object_mut() {
                 body_obj.remove("model");
             }

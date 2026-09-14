@@ -1,7 +1,8 @@
 use super::input::*;
+use super::todo::TodoList;
 use super::*;
 
-use crate::client::{Message, MessageContent, MessageRole};
+use crate::client::{Message, MessageContent, MessageRole, TokenUsage};
 use crate::render::MarkdownRender;
 
 use anyhow::{Context, Result, bail};
@@ -94,6 +95,8 @@ pub struct Session {
     messages: Vec<Message>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     data_urls: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "TokenUsage::is_empty")]
+    token_usage: TokenUsage,
 
     #[serde(skip)]
     model: Model,
@@ -233,6 +236,18 @@ impl Session {
         self.tokens = self.model().total_tokens(&self.messages);
     }
 
+    pub fn token_usage(&self) -> &TokenUsage {
+        &self.token_usage
+    }
+
+    /// Accumulates usage reported by one API call. Each tool-loop iteration
+    /// is a separately billed request, so totals grow per call; compression
+    /// rewrites messages but never resets these counters.
+    pub fn accumulate_token_usage(&mut self, usage: &TokenUsage) {
+        self.token_usage.accumulate(usage);
+        self.dirty = true;
+    }
+
     pub fn has_user_messages(&self) -> bool {
         self.messages.iter().any(|v| v.role.is_user())
     }
@@ -301,6 +316,18 @@ impl Session {
         }
         if percent != 0.0 {
             data["total/max"] = format!("{percent}%").into();
+        }
+        if let Some(value) = self.token_usage.input_tokens {
+            data["real_input_tokens"] = value.into();
+        }
+        if let Some(value) = self.token_usage.output_tokens {
+            data["real_output_tokens"] = value.into();
+        }
+        if let Some(value) = self.token_usage.cache_read_input_tokens {
+            data["cache_read_tokens"] = value.into();
+        }
+        if let Some(value) = self.token_usage.cache_creation_input_tokens {
+            data["cache_creation_tokens"] = value.into();
         }
         data["messages"] = json!(self.messages);
 
@@ -398,6 +425,19 @@ impl Session {
 
         if let Some(max_input_tokens) = self.model().max_input_tokens() {
             items.push(("max_input_tokens", max_input_tokens.to_string()));
+        }
+
+        if let Some(value) = self.token_usage.input_tokens {
+            items.push(("real_input_tokens", value.to_string()));
+        }
+        if let Some(value) = self.token_usage.output_tokens {
+            items.push(("real_output_tokens", value.to_string()));
+        }
+        if let Some(value) = self.token_usage.cache_read_input_tokens {
+            items.push(("cache_read_tokens", value.to_string()));
+        }
+        if let Some(value) = self.token_usage.cache_creation_input_tokens {
+            items.push(("cache_creation_tokens", value.to_string()));
         }
 
         let mut lines: Vec<String> = items
@@ -1005,7 +1045,9 @@ impl AutoName {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{Message, MessageContent, MessageContentToolCalls, MessageRole, Model};
+    use crate::client::{
+        Message, MessageContent, MessageContentToolCalls, MessageRole, Model, TokenUsage,
+    };
     use crate::config::{AppConfig, AppState, RequestContext, WorkingMode};
     use crate::function::{Functions, ToolCall, ToolResult};
     use std::sync::Arc;
@@ -1107,6 +1149,60 @@ mod tests {
     }
 
     #[test]
+    fn session_token_usage_accumulates_and_survives_yaml_round_trip() {
+        let mut session = Session::default();
+        assert!(session.token_usage().is_empty());
+
+        session.accumulate_token_usage(&TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cache_creation_input_tokens: Some(50),
+            cache_read_input_tokens: None,
+        });
+        session.accumulate_token_usage(&TokenUsage {
+            input_tokens: Some(1),
+            output_tokens: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(90),
+        });
+        assert!(session.dirty());
+        assert_eq!(session.token_usage().input_tokens, Some(101));
+        assert_eq!(session.token_usage().output_tokens, Some(10));
+        assert_eq!(session.token_usage().cache_creation_input_tokens, Some(50));
+        assert_eq!(session.token_usage().cache_read_input_tokens, Some(90));
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(reloaded.token_usage().input_tokens, Some(101));
+        assert_eq!(reloaded.token_usage().cache_read_input_tokens, Some(90));
+    }
+
+    #[test]
+    fn session_empty_token_usage_is_not_serialized() {
+        let session = Session::default();
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        assert!(!yaml.contains("token_usage"));
+    }
+
+    #[test]
+    fn session_export_includes_real_usage_only_when_reported() {
+        let empty = Session::default().export().unwrap();
+        assert!(!empty.contains("real_input_tokens"));
+
+        let mut session = Session::default();
+        session.accumulate_token_usage(&TokenUsage {
+            input_tokens: Some(5),
+            output_tokens: Some(7),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(3),
+        });
+        let exported = session.export().unwrap();
+        assert!(exported.contains("real_input_tokens: 5"));
+        assert!(exported.contains("real_output_tokens: 7"));
+        assert!(exported.contains("cache_read_tokens: 3"));
+        assert!(!exported.contains("cache_creation_tokens"));
+    }
+
     fn session_mcp_tools_survives_yaml_round_trip() {
         let mut session = Session::default();
         let mut mcp_tools = IndexMap::new();

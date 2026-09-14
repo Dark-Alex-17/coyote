@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::mem;
 
 use super::*;
@@ -24,6 +25,7 @@ pub struct BedrockConfig {
     pub session_token: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
+    pub prompt_cache: Option<bool>,
     pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }
@@ -59,7 +61,11 @@ impl BedrockClient {
             format!("/model/{model_name}/converse")
         };
 
-        let body = build_chat_completions_body(data, &self.model)?;
+        let body = build_chat_completions_body(
+            data,
+            &self.model,
+            self.config.prompt_cache.unwrap_or(true),
+        )?;
 
         let mut request_data = RequestData::new("", body);
         self.patch_request_data(&mut request_data);
@@ -284,6 +290,12 @@ async fn chat_completions_streaming(
                                 function_arguments.clear();
                             }
                         }
+                        "metadata" => {
+                            if let Some(usage) = bedrock_parse_usage(&data["usage"]) {
+                                debug!("token-usage: {usage:?}");
+                                handler.usage(usage);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -323,7 +335,11 @@ struct EmbeddingsResBody {
     embeddings: Vec<Vec<f32>>,
 }
 
-fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Result<Value> {
+fn build_chat_completions_body(
+    data: ChatCompletionsData,
+    model: &Model,
+    prompt_cache: bool,
+) -> Result<Value> {
     let ChatCompletionsData {
         mut messages,
         temperature,
@@ -390,45 +406,112 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                     })]
                 }
                 MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results, text, ..
+                    tool_results,
+                    text,
+                    sequence,
                 }) => {
-                    let mut assistant_parts = vec![];
-                    let mut user_parts = vec![];
-                    if !text.is_empty() {
-                        assistant_parts.push(json!({
-                            "text": text,
-                        }))
-                    }
-                    for tool_result in tool_results {
-                        if let Some(round_text) = &tool_result.text {
+                    // Unlike claude.rs, tool_result.thinking blocks are dropped:
+                    // Converse reasoningContent replay is not implemented.
+                    if !sequence {
+                        let mut assistant_parts = vec![];
+                        let mut user_parts = vec![];
+                        for (index, tool_result) in tool_results.iter().enumerate() {
+                            let round_text = if index == 0 && !text.is_empty() {
+                                Some(text.as_str())
+                            } else {
+                                tool_result.text.as_deref()
+                            };
+                            if let Some(round_text) = round_text {
+                                let round_text = strip_think_tag(round_text);
+                                let round_text = round_text.trim();
+                                if !round_text.is_empty() {
+                                    assistant_parts.push(json!({
+                                        "text": round_text,
+                                    }))
+                                }
+                            }
                             assistant_parts.push(json!({
-                                "text": round_text,
-                            }))
+                                "toolUse": {
+                                    "toolUseId": tool_result.call.id,
+                                    "name": tool_result.call.name,
+                                    "input": tool_result.call.arguments,
+                                }
+                            }));
+                            user_parts.push(json!({
+                                "toolResult": {
+                                    "toolUseId": tool_result.call.id,
+                                    "content": [bedrock_tool_result_content(&tool_result.output)]
+                                }
+                            }));
                         }
-                        assistant_parts.push(json!({
-                            "toolUse": {
-                                "toolUseId": tool_result.call.id,
-                                "name": tool_result.call.name,
-                                "input": tool_result.call.arguments,
+                        vec![
+                            json!({ "role": "assistant", "content": assistant_parts }),
+                            json!({ "role": "user", "content": user_parts }),
+                        ]
+                    } else {
+                        // One pair per round: Claude can reuse tool_use IDs across API calls.
+                        // A round boundary is detected by the presence of round text, but
+                        // rounds where the model emitted only tool calls (no narration)
+                        // carry no text marker. As a backstop, also split whenever a
+                        // toolUseId would repeat within the current assistant message.
+                        // Converse rejects duplicate toolUseIds in a single message.
+                        let mut messages = vec![];
+                        let mut assistant_parts: Vec<Value> = vec![];
+                        let mut user_parts: Vec<Value> = vec![];
+                        let mut chunk_ids: HashSet<&str> = HashSet::new();
+                        for (index, tool_result) in tool_results.iter().enumerate() {
+                            let id_collision = tool_result
+                                .call
+                                .id
+                                .as_deref()
+                                .is_some_and(|id| chunk_ids.contains(id));
+                            if index > 0 && (tool_result.text.is_some() || id_collision) {
+                                messages.push(
+                                    json!({ "role": "assistant", "content": assistant_parts }),
+                                );
+                                messages.push(json!({ "role": "user", "content": user_parts }));
+                                assistant_parts = vec![];
+                                user_parts = vec![];
+                                chunk_ids.clear();
                             }
-                        }));
-                        user_parts.push(json!({
-                            "toolResult": {
-                                "toolUseId": tool_result.call.id,
-                                "content": [bedrock_tool_result_content(&tool_result.output)]
+                            if let Some(id) = tool_result.call.id.as_deref() {
+                                chunk_ids.insert(id);
                             }
-                        }));
+                            let round_text = if index == 0 && !text.is_empty() {
+                                Some(text.as_str())
+                            } else {
+                                tool_result.text.as_deref()
+                            };
+                            if let Some(round_text) = round_text {
+                                let round_text = strip_think_tag(round_text);
+                                let round_text = round_text.trim();
+                                if !round_text.is_empty() {
+                                    assistant_parts.push(json!({
+                                        "text": round_text,
+                                    }))
+                                }
+                            }
+                            assistant_parts.push(json!({
+                                "toolUse": {
+                                    "toolUseId": tool_result.call.id,
+                                    "name": tool_result.call.name,
+                                    "input": tool_result.call.arguments,
+                                }
+                            }));
+                            user_parts.push(json!({
+                                "toolResult": {
+                                    "toolUseId": tool_result.call.id,
+                                    "content": [bedrock_tool_result_content(&tool_result.output)]
+                                }
+                            }));
+                        }
+                        if !assistant_parts.is_empty() {
+                            messages
+                                .push(json!({ "role": "assistant", "content": assistant_parts }));
+                            messages.push(json!({ "role": "user", "content": user_parts }));
+                        }
+                        messages
                     }
-                    vec![
-                        json!({
-                            "role": "assistant",
-                            "content": assistant_parts,
-                        }),
-                        json!({
-                            "role": "user",
-                            "content": user_parts,
-                        }),
-                    ]
                 }
             }
         })
@@ -484,7 +567,68 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
             "tools": tools,
         })
     }
+    if prompt_cache && is_anthropic_model(model) {
+        apply_prompt_cache_points(&mut body);
+    }
     Ok(body)
+}
+
+/// Converse rejects cachePoint blocks for models that don't support them
+/// (e.g. openai.gpt-*), so caching is only applied to Anthropic models.
+fn is_anthropic_model(model: &Model) -> bool {
+    let name = model.real_name();
+    name.contains("anthropic.") || name.contains("claude")
+}
+
+/// Converse counterpart of the claude client's cache_control breakpoints:
+/// a cachePoint after the tools, the system prompt, and the last two user
+/// messages. See `apply_prompt_cache_breakpoints` in claude.rs for why the
+/// last two.
+fn apply_prompt_cache_points(body: &mut Value) {
+    let cache_point = || json!({ "cachePoint": { "type": "default" } });
+    if let Some(system) = body.get_mut("system").and_then(|v| v.as_array_mut()) {
+        system.push(cache_point());
+    }
+    if let Some(tools) = body
+        .get_mut("toolConfig")
+        .and_then(|v| v.get_mut("tools"))
+        .and_then(|v| v.as_array_mut())
+    {
+        tools.push(cache_point());
+    }
+    let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let mut remaining = 2;
+    for message in messages.iter_mut().rev() {
+        if remaining == 0 {
+            break;
+        }
+        if message["role"] != "user" {
+            continue;
+        }
+        // Converse rejects a cachePoint with no preceding block, so an empty
+        // content array (a tool-call pair with no results) passes the
+        // breakpoint to an earlier user message.
+        if let Some(content) = message["content"].as_array_mut()
+            && !content.is_empty()
+        {
+            content.push(cache_point());
+            remaining -= 1;
+        }
+    }
+}
+
+fn bedrock_parse_usage(usage: &Value) -> Option<TokenUsage> {
+    if !usage.is_object() {
+        return None;
+    }
+    Some(TokenUsage {
+        input_tokens: usage["inputTokens"].as_u64(),
+        output_tokens: usage["outputTokens"].as_u64(),
+        cache_creation_input_tokens: usage["cacheWriteInputTokens"].as_u64(),
+        cache_read_input_tokens: usage["cacheReadInputTokens"].as_u64(),
+    })
 }
 
 fn bedrock_tool_result_content(output: &Value) -> Value {
@@ -539,6 +683,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
+        usage: bedrock_parse_usage(&data["usage"]),
         ..Default::default()
     };
     Ok(output)
@@ -661,7 +806,7 @@ fn gen_signing_key(key: &str, date_stamp: &str, region: &str, service: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::function::{ToolCall, ToolResult};
+    use crate::function::{FunctionDeclaration, ToolCall, ToolResult};
 
     fn tool_result(output: Value) -> ToolResult {
         ToolResult {
@@ -676,14 +821,23 @@ mod tests {
         }
     }
 
-    fn tool_result_content_block(output: Value) -> Value {
+    fn sequence_tool_result(id: &str, text: Option<&str>) -> ToolResult {
+        ToolResult {
+            call: ToolCall::new("fs_read".into(), json!({"path": "x"}), Some(id.into())),
+            output: json!("ok"),
+            text: text.map(|t| t.to_string()),
+            thinking: vec![],
+        }
+    }
+
+    fn build_body(tool_results: Vec<ToolResult>) -> Value {
         let data = ChatCompletionsData {
             messages: vec![
                 Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
                 Message::new(
                     MessageRole::Assistant,
                     MessageContent::ToolCalls(MessageContentToolCalls {
-                        tool_results: vec![tool_result(output)],
+                        tool_results,
                         text: String::new(),
                         sequence: true,
                     }),
@@ -695,8 +849,176 @@ mod tests {
             functions: None,
             stream: false,
         };
-        let body = build_chat_completions_body(data, &Model::new("bedrock", "test")).unwrap();
+        build_chat_completions_body(data, &Model::new("bedrock", "test"), false).unwrap()
+    }
+
+    fn tool_result_content_block(output: Value) -> Value {
+        let body = build_body(vec![tool_result(output)]);
         body["messages"][2]["content"][0]["toolResult"]["content"][0].clone()
+    }
+
+    fn assert_unique_tool_use_ids_per_message(body: &Value) {
+        for message in body["messages"].as_array().unwrap() {
+            let Some(content) = message["content"].as_array() else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            for block in content {
+                if let Some(id) = block["toolUse"]["toolUseId"].as_str() {
+                    assert!(
+                        seen.insert(id.to_string()),
+                        "duplicate toolUseId `{id}` within a single assistant message: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn cache_fixture() -> ChatCompletionsData {
+        ChatCompletionsData {
+            messages: vec![
+                Message::new(MessageRole::System, MessageContent::Text("sys".to_string())),
+                Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::Text("hi".to_string()),
+                ),
+                Message::new(MessageRole::User, MessageContent::Text("again".to_string())),
+            ],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: Some(vec![FunctionDeclaration {
+                name: "fs_read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: Default::default(),
+                agent: false,
+            }]),
+            stream: false,
+        }
+    }
+
+    #[test]
+    fn test_bedrock_prompt_cache_inserts_cache_points_for_anthropic_models() {
+        let body = build_chat_completions_body(
+            cache_fixture(),
+            &Model::new("bedrock", "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            true,
+        )
+        .unwrap();
+
+        let cache_point = json!({ "cachePoint": { "type": "default" } });
+        assert_eq!(
+            body["system"].as_array().unwrap().last(),
+            Some(&cache_point),
+            "body: {body}"
+        );
+        assert_eq!(
+            body["toolConfig"]["tools"].as_array().unwrap().last(),
+            Some(&cache_point),
+            "body: {body}"
+        );
+        let messages = body["messages"].as_array().unwrap();
+        for idx in [0, 2] {
+            assert_eq!(
+                messages[idx]["content"].as_array().unwrap().last(),
+                Some(&cache_point),
+                "body: {body}"
+            );
+        }
+        assert!(
+            messages[1]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block.get("cachePoint").is_none()),
+            "assistant messages must not get cache points: {body}"
+        );
+    }
+
+    #[test]
+    fn test_bedrock_prompt_cache_skips_non_anthropic_models() {
+        let body = build_chat_completions_body(
+            cache_fixture(),
+            &Model::new("bedrock", "openai.gpt-oss-120b-1:0"),
+            true,
+        )
+        .unwrap();
+
+        assert!(!body.to_string().contains("cachePoint"), "body: {body}");
+    }
+
+    /// Converse rejects a cachePoint with no preceding block, so a user
+    /// message with an empty content array must be skipped and the
+    /// breakpoint placed on an earlier user message instead.
+    #[test]
+    fn test_bedrock_prompt_cache_skips_empty_user_content() {
+        let mut body = json!({
+            "messages": [
+                { "role": "user", "content": [ { "text": "hello" } ] },
+                { "role": "assistant", "content": [ { "text": "hi" } ] },
+                { "role": "user", "content": [ { "text": "again" } ] },
+                { "role": "assistant", "content": [ { "text": "calling" } ] },
+                { "role": "user", "content": [] },
+            ],
+        });
+        apply_prompt_cache_points(&mut body);
+
+        let cache_point = json!({ "cachePoint": { "type": "default" } });
+        let messages = body["messages"].as_array().unwrap();
+        assert!(
+            messages[4]["content"].as_array().unwrap().is_empty(),
+            "empty user content must not get a cachePoint: {body}"
+        );
+        for idx in [0, 2] {
+            assert_eq!(
+                messages[idx]["content"].as_array().unwrap().last(),
+                Some(&cache_point),
+                "body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequence_splits_on_round_text() {
+        let body = build_body(vec![
+            sequence_tool_result("toolu_A", None),
+            sequence_tool_result("toolu_B", None),
+            sequence_tool_result("toolu_C", Some("running another tool")),
+        ]);
+
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 5, "body: {body}");
+        assert_unique_tool_use_ids_per_message(&body);
+    }
+
+    #[test]
+    fn sequence_splits_on_reused_id_in_textless_round() {
+        let body = build_body(vec![
+            sequence_tool_result("toolu_A", None),
+            sequence_tool_result("toolu_B", None),
+            sequence_tool_result("toolu_A", None),
+        ]);
+
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 5, "body: {body}");
+        assert_unique_tool_use_ids_per_message(&body);
+    }
+
+    #[test]
+    fn sequence_keeps_textless_rounds_merged_when_ids_are_unique() {
+        let body = build_body(vec![
+            sequence_tool_result("toolu_A", None),
+            sequence_tool_result("toolu_B", None),
+            sequence_tool_result("toolu_C", None),
+        ]);
+
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 3, "body: {body}");
+        assert_unique_tool_use_ids_per_message(&body);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use inquire::{
     MultiSelect, Select, Text, list_option::ListOption, required, validator::Validation,
 };
 use reqwest::{Client as ReqwestClient, RequestBuilder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -357,6 +357,7 @@ pub struct ChatCompletionsOutput {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub thinking: Vec<ThinkingBlock>,
+    pub usage: Option<TokenUsage>,
 }
 
 impl ChatCompletionsOutput {
@@ -365,6 +366,41 @@ impl ChatCompletionsOutput {
             text: text.to_string(),
             ..Default::default()
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.cache_creation_input_tokens.is_none()
+            && self.cache_read_input_tokens.is_none()
+    }
+
+    pub fn accumulate(&mut self, other: &TokenUsage) {
+        fn add(acc: &mut Option<u64>, value: Option<u64>) {
+            if let Some(value) = value {
+                *acc = Some(acc.unwrap_or(0).saturating_add(value));
+            }
+        }
+        add(&mut self.input_tokens, other.input_tokens);
+        add(&mut self.output_tokens, other.output_tokens);
+        add(
+            &mut self.cache_creation_input_tokens,
+            other.cache_creation_input_tokens,
+        );
+        add(
+            &mut self.cache_read_input_tokens,
+            other.cache_read_input_tokens,
+        );
     }
 }
 
@@ -513,7 +549,7 @@ pub async fn call_chat_completions(
                 mut text,
                 tool_calls,
                 thinking,
-                ..
+                usage,
             } = ret;
             if !text.is_empty() {
                 if extract_code {
@@ -523,6 +559,7 @@ pub async fn call_chat_completions(
                     ctx.app.config.print_markdown(&text)?;
                 }
             }
+            ctx.record_token_usage(usage);
             finish_completion(ctx, text, tool_calls, thinking).await
         }
         Err(err) => Err(err),
@@ -550,13 +587,17 @@ pub async fn call_chat_completions_streaming(
     let aborted_ctrlc = handler.abort().aborted_ctrlc();
     let aborted_ctrld = handler.abort().aborted_ctrld();
 
+    // Record usage before any early return: the provider bills an interrupted
+    // call's input tokens (reported in message_start), so abort and error
+    // paths must still count toward the session totals.
+    let (text, tool_calls, thinking, usage) = handler.take();
+    ctx.record_token_usage(usage);
+
     if aborted_ctrld {
         bail!("Aborted.");
     }
 
     render_ret?;
-
-    let (text, tool_calls, thinking) = handler.take();
 
     if aborted_ctrlc {
         if !ctx.working_mode.is_repl() || ctx.session.is_none() {
@@ -618,14 +659,16 @@ pub async fn call_chat_completions_streaming_quiet(
             ret = client.chat_completions(input.clone()) => ret?,
             _ = wait_abort_signal(&abort_signal) => bail!("Aborted."),
         };
-        if abort_signal.aborted() {
-            bail!("Aborted.");
-        }
         let ChatCompletionsOutput {
             text,
             tool_calls,
             thinking,
+            usage,
         } = output;
+        ctx.record_token_usage(usage);
+        if abort_signal.aborted() {
+            bail!("Aborted.");
+        }
         return finish_completion(ctx, text, tool_calls, thinking).await;
     }
 
@@ -637,15 +680,19 @@ pub async fn call_chat_completions_streaming_quiet(
 
     let send_ret = client.chat_completions_streaming(input, &mut handler).await;
 
+    let (text, tool_calls, thinking, usage) = handler.take();
+    ctx.record_token_usage(usage);
+
     if abort_signal.aborted() {
         bail!("Aborted.");
     }
     send_ret?;
 
-    let (text, tool_calls, thinking) = handler.take();
     finish_completion(ctx, text, tool_calls, thinking).await
 }
 
+/// Callers record token usage themselves before calling, so that abort and
+/// error paths that never reach here still count exactly once per API call.
 async fn finish_completion(
     ctx: &mut RequestContext,
     text: String,
@@ -910,6 +957,50 @@ mod tests {
     }
 
     #[test]
+    fn test_token_usage_is_empty_treats_some_zero_as_non_empty() {
+        assert!(TokenUsage::default().is_empty());
+        let usage = TokenUsage {
+            input_tokens: Some(0),
+            ..Default::default()
+        };
+        assert!(!usage.is_empty());
+    }
+
+    #[test]
+    fn test_token_usage_accumulate_merges_per_field() {
+        let mut total = TokenUsage::default();
+        total.accumulate(&TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: None,
+            cache_creation_input_tokens: Some(50),
+            cache_read_input_tokens: None,
+        });
+        total.accumulate(&TokenUsage {
+            input_tokens: Some(20),
+            output_tokens: Some(7),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(90),
+        });
+        assert_eq!(total.input_tokens, Some(120));
+        assert_eq!(total.output_tokens, Some(7));
+        assert_eq!(total.cache_creation_input_tokens, Some(50));
+        assert_eq!(total.cache_read_input_tokens, Some(90));
+    }
+
+    #[test]
+    fn test_token_usage_accumulate_saturates() {
+        let mut total = TokenUsage {
+            input_tokens: Some(u64::MAX),
+            ..Default::default()
+        };
+        total.accumulate(&TokenUsage {
+            input_tokens: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(total.input_tokens, Some(u64::MAX));
+    }
+
+    #[test]
     fn test_catch_error_display_json_with_type() {
         let data = json!({"error": {"type": "invalid_request_error", "message": "Bad request"}});
         assert_eq!(
@@ -1141,6 +1232,7 @@ mod tests {
                 text: paced_text(),
                 tool_calls: vec![paced_tool_call()],
                 thinking: vec![paced_thinking()],
+                usage: None,
             })
         }
 

@@ -36,10 +36,13 @@ sync_models_ttl_hours: 24        # Hours before the synced model catalog is cons
 
 # ---- REPL Prompt ----
 # Custom REPL left/right prompts; see the [REPL Prompt Documentation](https://github.com/Dark-Alex-17/coyote/wiki/REPL-Prompt) for more information
+# Token-usage variables (set only when the provider reports usage, so guard them with {?var ...}):
+#   last_input_tokens, last_output_tokens, last_cache_read_tokens, last_cache_creation_tokens (most recent API call)
+#   total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_creation_tokens (session cumulative)
 left_prompt:
   '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
 right_prompt:
-  '{color.cyan}{?reasoning_effort [{reasoning_effort}] }{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
+  '{color.cyan}{?reasoning_effort [{reasoning_effort}] }{color.purple}{?last_cache_read_tokens ⚡{last_cache_read_tokens} }{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
 
 # ---- Vault ----
 # See the [Vault documentation](https://github.com/Dark-Alex-17/coyote/wiki/Vault) for more information on the Coyote vault.
@@ -380,6 +383,7 @@ clients:
     api_key: '{{ANTHROPIC_API_KEY}}'                    # You can either hard-code or inject secrets from the Coyote vault
     auth: null                                          # When set to 'oauth', Coyote will use OAuth instead of an API key
                                                         # Authenticate with `coyote --authenticate` or `.authenticate` in the REPL
+    prompt_cache: true                                  # Optional - enable Anthropic prompt caching (default: true)
 
   # See https://docs.mistral.ai/
   - type: openai-compatible
@@ -461,6 +465,7 @@ clients:
     # Run `gcloud auth application-default login` to initialize the ADC file
     # see https://cloud.google.com/docs/authentication/external/set-up-adc for more information
     adc_file: <gcloud-config-dir>/application_default_credentials.json  # Optional
+    prompt_cache: true                                  # Optional - enable Anthropic prompt caching for Claude models (default: true)
     patch:
       chat_completions:
         'gemini-.*':
@@ -481,6 +486,7 @@ clients:
     secret_access_key: '{{AWS_SECRET_ACCESS_KEY}}'      # You can either hard-code or inject secrets from the Coyote vault
     region: xxx
     session_token: xxx                                  # Optional, only needed for temporary credentials
+    prompt_cache: true                                  # Optional - enable Anthropic prompt caching for Anthropic models (default: true)
 
   # See https://developers.cloudflare.com/workers-ai/
   - type: openai-compatible

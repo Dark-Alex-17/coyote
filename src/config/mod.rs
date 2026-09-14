@@ -217,7 +217,8 @@ Rules:
 const SUMMARY_CONTEXT_PROMPT: &str = "This is a summary of the chat history as a recap: ";
 
 const LEFT_PROMPT: &str = "{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} ";
-const RIGHT_PROMPT: &str = "{color.cyan}{?reasoning_effort [{reasoning_effort}] }{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}";
+// `{?var}` treats "0" as falsy, so a reported-but-zero cache read intentionally hides the ⚡ segment.
+const RIGHT_PROMPT: &str = "{color.cyan}{?reasoning_effort [{reasoning_effort}] }{color.purple}{?last_cache_read_tokens ⚡{last_cache_read_tokens} }{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}";
 
 static EDITOR: OnceLock<Option<String>> = OnceLock::new();
 
