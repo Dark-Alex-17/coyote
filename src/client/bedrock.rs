@@ -213,6 +213,8 @@ async fn chat_completions_streaming(
     let mut function_arguments = String::new();
     let mut function_id = String::new();
     let mut reasoning_state = 0;
+    let mut thinking_text = String::new();
+    let mut thinking_signature = String::new();
 
     let mut stream = res.bytes_stream();
     let mut buffer = BytesMut::new();
@@ -261,19 +263,29 @@ async fn chat_completions_streaming(
                             } else if let Some(text) =
                                 data["delta"]["reasoningContent"]["text"].as_str()
                             {
-                                if reasoning_state == 0 {
-                                    handler.text("<think>\n")?;
-                                    reasoning_state = 1;
-                                }
-                                handler.text(text)?;
+                                reasoning_state = 1;
+                                thinking_text.push_str(text);
+                            } else if let Some(signature) =
+                                data["delta"]["reasoningContent"]["signature"].as_str()
+                            {
+                                thinking_signature.push_str(signature);
+                            } else if let Some(redacted_data) =
+                                data["delta"]["reasoningContent"]["redactedContent"].as_str()
+                            {
+                                handler.thinking_block(ThinkingBlock::RedactedThinking {
+                                    data: redacted_data.to_string(),
+                                });
                             } else if let Some(input) = data["delta"]["toolUse"]["input"].as_str() {
                                 function_arguments.push_str(input);
                             }
                         }
                         "contentBlockStop" => {
                             if reasoning_state == 1 {
-                                handler.text("\n</think>\n\n")?;
                                 reasoning_state = 0;
+                                handler.thinking_block(ThinkingBlock::Thinking {
+                                    thinking: mem::take(&mut thinking_text),
+                                    signature: mem::take(&mut thinking_signature),
+                                });
                             }
                             if !function_name.is_empty() {
                                 if function_arguments.is_empty() {
@@ -410,12 +422,13 @@ fn build_chat_completions_body(
                     text,
                     sequence,
                 }) => {
-                    // Unlike claude.rs, tool_result.thinking blocks are dropped:
-                    // Converse reasoningContent replay is not implemented.
                     if !sequence {
                         let mut assistant_parts = vec![];
                         let mut user_parts = vec![];
                         for (index, tool_result) in tool_results.iter().enumerate() {
+                            for block in &tool_result.thinking {
+                                assistant_parts.push(converse_reasoning_block(block));
+                            }
                             let round_text = if index == 0 && !text.is_empty() {
                                 Some(text.as_str())
                             } else {
@@ -476,6 +489,9 @@ fn build_chat_completions_body(
                             }
                             if let Some(id) = tool_result.call.id.as_deref() {
                                 chunk_ids.insert(id);
+                            }
+                            for block in &tool_result.thinking {
+                                assistant_parts.push(converse_reasoning_block(block));
                             }
                             let round_text = if index == 0 && !text.is_empty() {
                                 Some(text.as_str())
@@ -639,10 +655,31 @@ fn bedrock_tool_result_content(output: &Value) -> Value {
     }
 }
 
+/// Maps a ThinkingBlock (Anthropic tagged shape) to the Converse
+/// reasoningContent union so signed blocks replay verbatim.
+fn converse_reasoning_block(block: &ThinkingBlock) -> Value {
+    match block {
+        ThinkingBlock::Thinking {
+            thinking,
+            signature,
+        } => json!({
+            "reasoningContent": {
+                "reasoningText": {
+                    "text": thinking,
+                    "signature": signature,
+                }
+            }
+        }),
+        ThinkingBlock::RedactedThinking { data } => json!({
+            "reasoningContent": { "redactedContent": data }
+        }),
+    }
+}
+
 fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     let mut text = String::new();
-    let mut reasoning = None;
     let mut tool_calls = vec![];
+    let mut thinking = vec![];
     if let Some(array) = data["output"]["message"]["content"].as_array() {
         for item in array {
             if let Some(v) = item["text"].as_str() {
@@ -653,9 +690,18 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
             } else if let Some(reasoning_text) =
                 item["reasoningContent"]["reasoningText"].as_object()
             {
-                if let Some(text) = json_str_from_map(reasoning_text, "text") {
-                    reasoning = Some(text.to_string());
+                if let Some(v) = json_str_from_map(reasoning_text, "text") {
+                    thinking.push(ThinkingBlock::Thinking {
+                        thinking: v.to_string(),
+                        signature: json_str_from_map(reasoning_text, "signature")
+                            .unwrap_or_default()
+                            .to_string(),
+                    });
                 }
+            } else if let Some(v) = item["reasoningContent"]["redactedContent"].as_str() {
+                thinking.push(ThinkingBlock::RedactedThinking {
+                    data: v.to_string(),
+                });
             } else if let Some(tool_use) = item["toolUse"].as_object()
                 && let (Some(id), Some(name), Some(input)) = (
                     json_str_from_map(tool_use, "toolUseId"),
@@ -672,10 +718,6 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         }
     }
 
-    if let Some(reasoning) = reasoning {
-        text = format!("<think>\n{reasoning}\n</think>\n\n{text}")
-    }
-
     if text.is_empty() && tool_calls.is_empty() {
         bail!("Invalid response data: {data}");
     }
@@ -683,8 +725,8 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
+        thinking,
         usage: bedrock_parse_usage(&data["usage"]),
-        ..Default::default()
     };
     Ok(output)
 }
@@ -1049,5 +1091,96 @@ mod tests {
             tool_result_content_block(json!(null)),
             json!({"text": "null"})
         );
+    }
+
+    fn thinking_tool_result() -> ToolResult {
+        ToolResult {
+            call: ToolCall::new(
+                "fs_read".into(),
+                json!({"path": "x"}),
+                Some("tool_A".into()),
+            ),
+            output: json!("ok"),
+            text: None,
+            thinking: vec![
+                ThinkingBlock::Thinking {
+                    thinking: "let me think".into(),
+                    signature: "sig123".into(),
+                },
+                ThinkingBlock::RedactedThinking {
+                    data: "b64data".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn replays_thinking_blocks_in_converse_shape() {
+        for sequence in [false, true] {
+            let body = build_body_with(vec![thinking_tool_result()], "", sequence);
+
+            let content = body["messages"][1]["content"].as_array().unwrap();
+            assert_eq!(
+                content[0],
+                json!({
+                    "reasoningContent": {
+                        "reasoningText": { "text": "let me think", "signature": "sig123" }
+                    }
+                }),
+                "body: {body}"
+            );
+            assert_eq!(
+                content[1],
+                json!({ "reasoningContent": { "redactedContent": "b64data" } }),
+                "body: {body}"
+            );
+            assert!(content[2].get("toolUse").is_some(), "body: {body}");
+        }
+    }
+
+    #[test]
+    fn extract_chat_completions_captures_reasoning_content() {
+        let data = json!({
+            "output": {
+                "message": {
+                    "content": [
+                        {
+                            "reasoningContent": {
+                                "reasoningText": { "text": "let me think", "signature": "sig123" }
+                            }
+                        },
+                        { "reasoningContent": { "redactedContent": "b64data" } },
+                        { "text": "answer" },
+                        {
+                            "toolUse": {
+                                "toolUseId": "tool_A",
+                                "name": "fs_read",
+                                "input": { "path": "x" }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let output = extract_chat_completions(&data).unwrap();
+
+        assert_eq!(output.text, "answer");
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.thinking.len(), 2);
+        match &output.thinking[0] {
+            ThinkingBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                assert_eq!(thinking, "let me think");
+                assert_eq!(signature, "sig123");
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+        assert!(matches!(
+            &output.thinking[1],
+            ThinkingBlock::RedactedThinking { data } if data == "b64data"
+        ));
     }
 }
