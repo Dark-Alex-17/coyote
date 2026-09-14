@@ -1384,6 +1384,12 @@ clients:
     }
 
     #[test]
+    fn config_template_does_not_carry_the_per_agent_escalation_timeout_key() {
+        // `escalation_timeout` is a per-agent setting; the global template must never grow it.
+        assert!(!CONFIG_TEMPLATE.contains("escalation_timeout"));
+    }
+
+    #[test]
     fn config_enabled_macros_empty_string_is_some_empty() {
         let cfg: Config = serde_yaml::from_str("enabled_macros: \"\"").unwrap();
 

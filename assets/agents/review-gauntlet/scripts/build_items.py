@@ -9,6 +9,10 @@ skip mechanism — no dynamic routing anywhere.
 The LLM's add_* flags can only ADD lanes. A flag that is false never
 removes a lane the hard rules selected.
 
+A re-run pass (retry_gate emitted `retry_lanes`) skips selection: only the
+named lanes get an item, stamped with their attempt number, and every other
+lane maps over nothing — retry_gate restores their earlier reports.
+
 Fail-closed: a builder crash emits all four lists empty plus a
 PIPELINE-FAULT in signals_error — verdict_gate blocks on it and the crash
 never kills the graph.
@@ -16,6 +20,7 @@ never kills the graph.
 
 import json
 import os
+import time
 
 # Keep in sync with default_lanes.ALIASES — a caller-forced lane must
 # canonicalize the same way on the degraded path as it does here.
@@ -35,6 +40,18 @@ ALIASES = {
     "usage-pattern-testing": "probe",
 }
 
+# Keep in sync with retry_gate.LANES
+LANE_KEYS = {
+    "code-review": "code_review_items",
+    "adversary": "adversary_items",
+    "security": "security_items",
+    "probe": "probe_items",
+}
+
+# Filled by main() so the crash guard can append to an upstream fault
+# instead of overwriting it, and keep the first pass's lanes_summary.
+crash_context = {"signals_error": "", "lanes_summary": ""}
+
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
@@ -45,10 +62,37 @@ def load_state():
 
 def main():
     state = load_state()
+    prior = state.get("signals_error")
+    crash_context["signals_error"] = prior if isinstance(prior, str) else ""
+    # retry_gate's wall-clock budget is measured from this stamp; signals.py
+    # is the normal stamper, this is the defensive fallback.
+    stamp = {} if state.get("gauntlet_started_at") else {"gauntlet_started_at": time.time()}
 
     def text(key):
         v = state.get(key)
         return v.strip() if isinstance(v, str) else ""
+
+    crash_context["lanes_summary"] = text("lanes_summary")
+    retry_lanes = [lane for lane in (state.get("retry_lanes") or []) if lane in LANE_KEYS]
+    if retry_lanes:
+        attempts = state.get("lane_attempts") or {}
+        retried = [(lane, int(attempts.get(lane) or 0) + 1) for lane in retry_lanes]
+        note = "- retried: [" + ", ".join(f"{lane} (attempt {n})" for lane, n in retried) + "]"
+        summary = text("lanes_summary")
+        print(
+            json.dumps(
+                {
+                    **{key: [] for key in LANE_KEYS.values()},
+                    **{
+                        LANE_KEYS[lane]: [{"lane": lane, "attempt": n}] for lane, n in retried
+                    },
+                    "lanes_summary": f"{summary}\n{note}" if summary else note,
+                    "retry_lanes": [],
+                    **stamp,
+                }
+            )
+        )
+        return
 
     forced_raw = state.get("forced_lanes") or []
     forced, unknown = [], []
@@ -126,6 +170,7 @@ def main():
                 "security_items": [{"lane": "security"}] if "security" in lanes else [],
                 "probe_items": [{"lane": "probe"}] if "probe" in lanes else [],
                 "lanes_summary": "\n".join(f"- {r}" for r in reasons),
+                **stamp,
             }
         )
     )
@@ -134,6 +179,9 @@ def main():
 try:
     main()
 except Exception as e:  # noqa: BLE001 — a builder crash must never kill the graph
+    fault = f"PIPELINE-FAULT: lane builder crashed — {e}; no lanes were run"
+    if crash_context["signals_error"]:
+        fault = f"{crash_context['signals_error']}; {fault}"
     print(
         json.dumps(
             {
@@ -141,8 +189,8 @@ except Exception as e:  # noqa: BLE001 — a builder crash must never kill the g
                 "adversary_items": [],
                 "security_items": [],
                 "probe_items": [],
-                "lanes_summary": "",
-                "signals_error": f"PIPELINE-FAULT: lane builder crashed — {e}; no lanes were run",
+                "lanes_summary": crash_context["lanes_summary"],
+                "signals_error": fault,
             }
         )
     )

@@ -200,7 +200,7 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     1. Read the child's question and options.
     2. If you can answer from context, call `agent__reply_escalation` with your answer.
     3. If you need the user's input, call the appropriate `user__*` tool yourself, then relay the answer via `agent__reply_escalation`.
-    4. **Respond promptly**; the child agent is blocked and waiting (5-minute timeout).
+    4. **Respond promptly**; the child blocks until answered — no timeout by default (`escalation_timeout` per agent).
 "};
 
 pub(in crate::config) const DEFAULT_JOB_INSTRUCTIONS: &str = indoc! {"

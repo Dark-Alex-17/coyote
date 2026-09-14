@@ -889,7 +889,7 @@ fn default_summarization_threshold() -> usize {
 }
 
 fn default_escalation_timeout() -> u64 {
-    300
+    0
 }
 
 impl AgentConfig {
@@ -1341,6 +1341,7 @@ variables:
         assert_eq!(config.max_concurrent_agents, 4);
         assert_eq!(config.max_agent_depth, 3);
         assert_eq!(config.max_auto_continues, 10);
+        assert_eq!(config.escalation_timeout, 0);
         assert!(config.mcp_servers.is_empty());
         assert!(config.global_tools.is_empty());
         assert!(config.conversation_starters.is_empty());

@@ -1325,6 +1325,117 @@ nodes:
         );
     }
 
+    /// A script `_next` back-edge into a node with a static fan-out must
+    /// re-fire every fan-out target on the next pass, and a map that
+    /// re-runs over zero items must overwrite its `collect_into` with `[]`
+    /// rather than leave the previous pass's results in place.
+    #[tokio::test]
+    async fn script_next_back_edge_refires_static_fan_out_and_empty_map_rerun_clears_collect_into()
+    {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script(
+            "build.py",
+            r#"#!/usr/bin/env python3
+import os, json
+state = json.loads(os.environ.get("GRAPH_STATE", "{}"))
+if state["pass"] == 0:
+    print(json.dumps({"a_items": [1], "b_items": [1]}))
+else:
+    print(json.dumps({"a_items": [], "b_items": [2]}))
+"#,
+        );
+        ws.write_script(
+            "worker.py",
+            r#"#!/usr/bin/env python3
+import os, json
+state = json.loads(os.environ.get("GRAPH_STATE", "{}"))
+print(json.dumps({"output": f"report-{state['item']}"}))
+"#,
+        );
+        ws.write_script(
+            "gate.py",
+            r#"#!/usr/bin/env python3
+import os, json
+state = json.loads(os.environ.get("GRAPH_STATE", "{}"))
+if state["pass"] == 0:
+    print(json.dumps({"pass": 1, "_next": "build"}))
+else:
+    print(json.dumps({}))
+"#,
+        );
+
+        let yaml = r#"
+name: fan_out_rerun_test
+start: build
+initial_state:
+  pass: 0
+  a_items: []
+  b_items: []
+  a_results: []
+  b_results: []
+nodes:
+  build:
+    type: script
+    script: build.py
+    next: [map_a, map_b]
+  map_a:
+    type: map
+    over: "{{a_items}}"
+    as: item
+    branch: worker
+    collect_into: a_results
+    next: gate
+  map_b:
+    type: map
+    over: "{{b_items}}"
+    as: item
+    branch: worker
+    collect_into: b_results
+    next: gate
+  worker:
+    type: script
+    script: worker.py
+    state_updates: {}
+    timeout: 60
+  gate:
+    type: script
+    script: gate.py
+    next: done
+  done:
+    type: end
+    output: "{{a_results}}|{{b_results}}"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        let (a, b) = result
+            .split_once('|')
+            .unwrap_or_else(|| panic!("expected `a|b`, got: {result}"));
+        let a: Value =
+            serde_json::from_str(a).unwrap_or_else(|_| panic!("a_results not JSON: {result}"));
+        let b: Value =
+            serde_json::from_str(b).unwrap_or_else(|_| panic!("b_results not JSON: {result}"));
+        assert_eq!(
+            b,
+            serde_json::json!(["report-2"]),
+            "the back-edge into build must re-fire both fan-out targets: {result}"
+        );
+        assert_eq!(
+            a,
+            serde_json::json!([]),
+            "map_a must re-fire on the back-edge pass and clear its collect_into over zero items: {result}"
+        );
+    }
+
     #[tokio::test]
     async fn parallel_branch_error_aborts_super_step() {
         if !cmd_available("bash") {

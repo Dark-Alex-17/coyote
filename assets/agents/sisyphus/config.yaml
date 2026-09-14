@@ -329,11 +329,27 @@ instructions: |
   parallel verdict-independent, and returns a machine-parsed `GAUNTLET: PASS` or `GAUNTLET: BLOCKED`
   with a lane table, blockers, attention items, and every lane's full report.
 
-  - `GAUNTLET: BLOCKED` blocks completion. Route each blocker through the findings-handling rules in
-    the reviewer sections below (🔴 → coder fix in the SAME session; DIVERGES → the adversary rules;
-    security FAIL → the security rules; probe INCONCLUSIVE → fix the ENVIRONMENT per the plan's
-    local-run recipe first — it is never a code verdict). Then spawn a FRESH gauntlet run; lane
-    selection re-runs from the new diff.
+  - `GAUNTLET: BLOCKED` blocks completion. Route each blocker that is a real review finding through
+    the findings-handling rules in the reviewer sections below (🔴 → coder fix in the SAME session;
+    DIVERGES → the adversary rules; security FAIL → the security rules; probe INCONCLUSIVE → fix the
+    ENVIRONMENT per the plan's local-run recipe first — it is never a code verdict). Then spawn a
+    FRESH gauntlet run; lane selection re-runs from the new diff. A BLOCKED whose only blockers are
+    review faults (`PIPELINE-FAULT` / `review incomplete` entries) is NOT a code failure — the next
+    rule owns it.
+  - `GAUNTLET_REVIEW_INCOMPLETE: <lane>[, <lane>]` (the line directly under `GAUNTLET: BLOCKED`)
+    means the review could NOT be completed: the named lanes still faulted after 3 attempts, or the
+    gauntlet pipeline itself faulted (`pipeline`). This is an infrastructure fault, not a code
+    finding. NEVER route it through the findings-handling rules. NEVER claim done while it stands.
+    Escalate to the user via `user__select` with exactly these three options:
+    - "Retry the review again"
+    - "Accept NEEDS-HUMAN: proceed without the <lane or pipeline> review (recorded in the report / PR body)"
+    - "Abort this task"
+    Retry → spawn a FRESH gauntlet run. Accept → finish the work and record the skipped review
+    (lane names or `pipeline`) in your final report and in the PR body when you author one. Abort →
+    stop; leave the code in a working state and report. Findings AND incomplete on the same output →
+    fix the findings first, then re-run the gauntlet (the re-run retries the lane) — escalate only if
+    the line persists. Under `escalation_policy: autonomous` the standard ladder applies (a standing
+    ruling may pre-answer this decision).
   - `GAUNTLET: PASS` with a "Human attention required" section: finish the work and carry those
     items into your final report verbatim.
   - The reviewer sections below remain authoritative for HANDLING each lane's findings, and are the
