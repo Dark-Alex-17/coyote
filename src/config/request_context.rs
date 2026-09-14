@@ -8315,7 +8315,11 @@ mod tests {
             "review-gauntlet README must not describe the retired raw-🔴 gate"
         );
 
-        let runner = read_to_string(readmes.join("adversary/scripts/run_checks.py")).unwrap();
+        // Normalize line endings: the assertion below spans a line break and
+        // Windows checkouts carry CRLF.
+        let runner = read_to_string(readmes.join("adversary/scripts/run_checks.py"))
+            .unwrap()
+            .replace("\r\n", "\n");
         assert!(
             runner.contains("Trust boundary:") && runner.contains("never a field an LLM"),
             "run_checks.py docstring must state the declared-variable trust boundary"
