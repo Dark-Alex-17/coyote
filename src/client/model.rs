@@ -327,6 +327,10 @@ pub struct ModelData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_price: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub patch: Option<Value>,
 
     // chat-only properties

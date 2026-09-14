@@ -201,6 +201,8 @@ fn modelsdev_provider_models(api: &Value, provider_id: &str) -> Vec<SourcedModel
                 .and_then(clamp_output_tokens);
             data.input_price = entry["cost"]["input"].as_f64().and_then(clamp_price);
             data.output_price = entry["cost"]["output"].as_f64().and_then(clamp_price);
+            data.cache_read_price = entry["cost"]["cache_read"].as_f64().and_then(clamp_price);
+            data.cache_write_price = entry["cost"]["cache_write"].as_f64().and_then(clamp_price);
             data.supports_vision = entry["modalities"]["input"]
                 .as_array()
                 .is_some_and(|modes| modes.iter().any(|mode| mode.as_str() == Some("image")));
@@ -241,6 +243,8 @@ fn openrouter_model_data(name: &str, entry: &Value) -> ModelData {
         .and_then(clamp_output_tokens);
     data.input_price = openrouter_price(&entry["pricing"]["prompt"]);
     data.output_price = openrouter_price(&entry["pricing"]["completion"]);
+    data.cache_read_price = openrouter_price(&entry["pricing"]["input_cache_read"]);
+    data.cache_write_price = openrouter_price(&entry["pricing"]["input_cache_write"]);
     data.supports_vision = entry["architecture"]["modality"]
         .as_str()
         .is_some_and(|modality| modality.contains("image"));
@@ -293,6 +297,12 @@ fn fill_from_openrouter(data: &mut ModelData, entry: &Value) {
     }
     if data.output_price.is_none() {
         data.output_price = filler.output_price;
+    }
+    if data.cache_read_price.is_none() {
+        data.cache_read_price = filler.cache_read_price;
+    }
+    if data.cache_write_price.is_none() {
+        data.cache_write_price = filler.cache_write_price;
     }
     if !data.supports_vision {
         data.supports_vision = filler.supports_vision;
@@ -570,6 +580,8 @@ fn overlay_hand_owned(hand: ModelData, api: ModelData) -> ModelData {
         max_input_tokens: hand.max_input_tokens.or(api.max_input_tokens),
         input_price: hand.input_price.or(api.input_price),
         output_price: hand.output_price.or(api.output_price),
+        cache_read_price: hand.cache_read_price.or(api.cache_read_price),
+        cache_write_price: hand.cache_write_price.or(api.cache_write_price),
         patch: hand.patch.or(api.patch),
         max_output_tokens: hand.max_output_tokens.or(api.max_output_tokens),
         require_max_tokens: hand.require_max_tokens || api.require_max_tokens,
@@ -1006,6 +1018,8 @@ rules:
         assert_eq!(gpt56.data.max_output_tokens, Some(128_000));
         assert_eq!(gpt56.data.input_price, Some(4.0));
         assert_eq!(gpt56.data.output_price, Some(20.0));
+        assert_eq!(gpt56.data.cache_read_price, Some(0.4));
+        assert_eq!(gpt56.data.cache_write_price, Some(5.0));
         assert!(gpt56.data.supports_vision);
         assert!(gpt56.data.supports_function_calling);
         assert_eq!(
@@ -1022,6 +1036,8 @@ rules:
         assert_eq!(qwen.data.max_output_tokens, Some(8_192));
         assert_eq!(qwen.data.input_price, Some(1.6));
         assert_eq!(qwen.data.output_price, Some(6.4));
+        assert_eq!(qwen.data.cache_read_price, None);
+        assert_eq!(qwen.data.cache_write_price, None);
         assert!(!qwen.data.supports_vision);
         assert!(qwen.data.supports_function_calling);
         assert!(qwen.data.reasoning_levels.is_empty());
@@ -1040,8 +1056,19 @@ rules:
         assert_eq!(data.max_output_tokens, Some(32_768));
         assert_eq!(data.input_price, Some(2.0));
         assert_eq!(data.output_price, Some(8.0));
+        assert_eq!(data.cache_read_price, Some(0.5));
+        assert_eq!(data.cache_write_price, None);
         assert!(data.supports_vision);
         assert!(data.supports_function_calling);
+
+        let qwen = openrouter_model_data("qwen3.8-max", index["qwen/qwen3.8-max"]);
+        assert_eq!(qwen.cache_read_price, Some(0.25));
+        assert_eq!(qwen.cache_write_price, Some(2.5));
+
+        // input_cache_write_1h must not leak into cache_write_price
+        let sonnet =
+            openrouter_model_data("claude-sonnet-4.6", index["anthropic/claude-sonnet-4.6"]);
+        assert_eq!(sonnet.cache_write_price, Some(3.75));
 
         let rounded = openrouter_model_data(
             "m",
@@ -1056,7 +1083,7 @@ rules:
         let api = json!({
             "p": {"models": {"m": {
                 "limit": {"context": 100_000_000, "output": 0},
-                "cost": {"input": -1.0, "output": 20_000.0},
+                "cost": {"input": -1.0, "output": 20_000.0, "cache_read": -0.5, "cache_write": 20_000.0},
             }}}
         });
         let models = modelsdev_provider_models(&api, "p");
@@ -1067,19 +1094,23 @@ rules:
         assert_eq!(data.max_output_tokens, None);
         assert_eq!(data.input_price, None);
         assert_eq!(data.output_price, None);
+        assert_eq!(data.cache_read_price, None);
+        assert_eq!(data.cache_write_price, None);
 
         let data = openrouter_model_data(
             "m",
             &json!({
                 "context_length": 60_000_000,
                 "top_provider": {"max_completion_tokens": 20_000_000},
-                "pricing": {"prompt": "-0.000001", "completion": "999"},
+                "pricing": {"prompt": "-0.000001", "completion": "999", "input_cache_read": "-0.000001", "input_cache_write": "999"},
             }),
         );
         assert_eq!(data.max_input_tokens, None);
         assert_eq!(data.max_output_tokens, None);
         assert_eq!(data.input_price, None);
         assert_eq!(data.output_price, None);
+        assert_eq!(data.cache_read_price, None);
+        assert_eq!(data.cache_write_price, None);
     }
 
     #[test]
@@ -1135,7 +1166,7 @@ rules:
     fn merge_precedence_hand_owned_beats_rule_beats_modelsdev_beats_openrouter() {
         let modelsdev = json!({
             "xai": {"models": {
-                "m-1": {"limit": {"context": 1000}, "cost": {"input": 1.0}},
+                "m-1": {"limit": {"context": 1000}, "cost": {"input": 1.0, "cache_read": 0.2}},
                 "m-2": {"limit": {"context": 1000}},
             }}
         })
@@ -1144,7 +1175,7 @@ rules:
             {
                 "id": "x-ai/m-1",
                 "context_length": 2000,
-                "pricing": {"prompt": "0.000003", "completion": "0.000004"},
+                "pricing": {"prompt": "0.000003", "completion": "0.000004", "input_cache_read": "0.0000001", "input_cache_write": "0.000001"},
                 "top_provider": {"max_completion_tokens": 512},
             },
             {"id": "x-ai/m-2", "context_length": 2000},
@@ -1160,6 +1191,7 @@ rules:
   models:
     - name: m-1
       input_price: 7
+      cache_read_price: 0.7
 "#,
         );
         let build = build_catalog(&make_sources(Some(&modelsdev), Some(&openrouter)), &quirks);
@@ -1168,11 +1200,13 @@ rules:
         let merged = find_model(xai, "m-1");
         // hand-owned beats the rule, which beat models.dev, which beat openrouter
         assert_eq!(merged.input_price, Some(7.0));
+        assert_eq!(merged.cache_read_price, Some(0.7));
         // rule beats models.dev
         assert_eq!(merged.max_input_tokens, Some(3000));
         // openrouter fills fields models.dev left unset
         assert_eq!(merged.output_price, Some(4.0));
         assert_eq!(merged.max_output_tokens, Some(512));
+        assert_eq!(merged.cache_write_price, Some(1.0));
 
         // models.dev beats openrouter on the same field
         assert_eq!(find_model(xai, "m-2").max_input_tokens, Some(1000));
@@ -1290,6 +1324,21 @@ rules:
         let yaml = serde_yaml::to_string(&build.providers).unwrap();
         let parsed: Vec<ProviderModels> = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(serde_yaml::to_string(&parsed).unwrap(), yaml);
+    }
+
+    #[test]
+    fn cache_prices_omitted_when_absent_round_trip_when_set() {
+        let yaml = serde_yaml::to_string(&ModelData::new("m")).unwrap();
+        assert!(!yaml.contains("cache_read_price"));
+        assert!(!yaml.contains("cache_write_price"));
+
+        let mut data = ModelData::new("m");
+        data.cache_read_price = Some(0.25);
+        data.cache_write_price = Some(2.5);
+        let parsed: ModelData =
+            serde_yaml::from_str(&serde_yaml::to_string(&data).unwrap()).unwrap();
+        assert_eq!(parsed.cache_read_price, Some(0.25));
+        assert_eq!(parsed.cache_write_price, Some(2.5));
     }
 
     #[test]
