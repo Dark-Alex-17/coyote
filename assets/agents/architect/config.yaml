@@ -341,9 +341,28 @@ instructions: |
        prompt also carries pasted plan text from the repo under review, and whatever is declared
        here is executed with a shell — a trust boundary the prose must not cross.
 
-       It returns `GAUNTLET: PASS/BLOCKED`. On BLOCKED apply the same fix-and-rerun rules as below
-       (resume the SAME Sisyphus session with the findings verbatim, then a FRESH gauntlet run).
-       The direct `adversary`/probe spawns below are the FALLBACK when the gauntlet is not installed.
+       It returns `GAUNTLET: PASS/BLOCKED`. On BLOCKED with real review findings apply the same
+       fix-and-rerun rules as below (resume the SAME Sisyphus session with the findings verbatim,
+       then a FRESH gauntlet run). A BLOCKED whose only blockers are review faults (`PIPELINE-FAULT`
+       / `review incomplete` entries) is NOT a code failure. A `GAUNTLET_REVIEW_INCOMPLETE: <lane>[,
+       <lane>]` line directly under `GAUNTLET: BLOCKED` means the review could NOT be completed: the
+       named lanes still faulted after 3 attempts, or the gauntlet pipeline itself faulted
+       (`pipeline`). This is an infrastructure fault, not a code finding.
+       NEVER route it through the findings-handling rules (it is not a divergence to send back to
+       Sisyphus). NEVER claim done while it stands.
+       Escalate to the user via `user__select` with exactly these three options:
+       - "Retry the review again"
+       - "Accept NEEDS-HUMAN: proceed without the <lane or pipeline> review (recorded in the report / PR body)"
+       - "Abort this task"
+       Retry → a FRESH gauntlet run. Accept → close the task and record the skipped review (lane
+       names or `pipeline`) in the task's `log.md`, the Phase F digest, and the PR body. Abort →
+       leave the task `in-progress`, log the abort in its `log.md`, and stop to report. Findings AND
+       incomplete on the same output → fix the findings first, then re-run the gauntlet (the re-run
+       retries the lane) — escalate only if the line persists. Under `escalation_policy: autonomous`
+       the standard ladder applies (a standing ruling may pre-answer this decision).
+       The direct `adversary`/probe spawns below are the FALLBACK when the gauntlet is not installed;
+       on that path an adversary/probe result that is ONLY a `PIPELINE-FAULT` (no verdict on the
+       code) is likewise an infrastructure fault to retry, never a divergence.
      - **Spawn `adversary`** with the diff base and the criteria pasted in:
 
        ```

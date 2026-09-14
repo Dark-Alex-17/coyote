@@ -177,7 +177,7 @@ By default (`parallel_tasks: 0`) tasks run **sequentially** on the single run br
 | [`explore`](../explore/README.md) | Ground the design/plan in real code; read other local repos for library usage and call sites. |
 | [`librarian`](../librarian/README.md) | External docs / OSS examples for unfamiliar libraries. |
 | [`whetstone`](../whetstone/README.md) | Continuous improvement — spawned once before the final report when the run addressed PR review feedback from outside its own lanes; converts review misses into user-approved suite edits / ledger entries. Never blocks the run. |
-| [`review-gauntlet`](../review-gauntlet/README.md) | Preferred per-task conformance gate — one spawn running adversary (+ probe for consumer-facing tasks) with a machine-parsed GAUNTLET: PASS/BLOCKED verdict; direct adversary/probe spawns remain the fallback. |
+| [`review-gauntlet`](../review-gauntlet/README.md) | Preferred per-task conformance gate — one spawn running adversary (+ probe for consumer-facing tasks) with a machine-parsed GAUNTLET: PASS/BLOCKED verdict; a `GAUNTLET_REVIEW_INCOMPLETE:` line is an infrastructure fault escalated to the user (retry / accept NEEDS-HUMAN / abort), never a divergence; direct adversary/probe spawns remain the fallback. |
 
 ## Related skills
 

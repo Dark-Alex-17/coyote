@@ -8223,6 +8223,54 @@ mod tests {
         );
     }
 
+    // A gauntlet output carrying the review-incomplete line is an infrastructure
+    // fault: both callers must escalate it with the exact same three options
+    // instead of routing it through their findings-handling rules.
+    #[test]
+    #[serial]
+    fn bundled_assets_pin_review_incomplete_escalation() {
+        let _guard = TestConfigDirGuard::new();
+        Agent::install_builtin_agents(false).unwrap();
+
+        const SHARED_ANCHORS: [&str; 7] = [
+            "GAUNTLET_REVIEW_INCOMPLETE:",
+            "\"Retry the review again\"",
+            "\"Accept NEEDS-HUMAN: proceed without the <lane or pipeline> review (recorded in the report / PR body)\"",
+            "\"Abort this task\"",
+            "NEVER route it through the findings-handling rules",
+            "NEVER claim done while it stands",
+            "is NOT a code failure",
+        ];
+
+        let mut configs = std::collections::HashMap::new();
+        for name in ["architect", "sisyphus"] {
+            let config =
+                read_to_string(paths::agents_data_dir().join(name).join("config.yaml")).unwrap();
+            for anchor in SHARED_ANCHORS {
+                assert!(
+                    config.contains(anchor),
+                    "{name} config lost review-incomplete escalation anchor: {anchor:?}"
+                );
+            }
+            assert!(
+                config.contains("user__select"),
+                "{name} config must escalate review-incomplete via user__select"
+            );
+            configs.insert(name, config);
+        }
+
+        // The architect also owns the no-gauntlet fallback path: a
+        // fault-only adversary/probe result is retried, never treated as
+        // a divergence.
+        let architect = &configs["architect"];
+        assert!(
+            architect.contains(
+                "an adversary/probe result that is ONLY a `PIPELINE-FAULT` (no verdict on the\n       code) is likewise an infrastructure fault to retry, never a divergence."
+            ),
+            "architect config lost the fallback adversary/probe pipeline-fault sentence"
+        );
+    }
+
     // Shell commands the adversary's run_checks stage executes must be
     // declared as a variable, never as prompt prose an LLM would re-extract.
     #[test]
