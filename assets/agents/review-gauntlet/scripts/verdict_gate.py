@@ -5,8 +5,21 @@ Parses each configured lane's verdict SENTINEL with a regex — no LLM
 re-reads, no judgment. The gate's hard rules:
 
   - a missing sentinel is a LANE FAILURE and blocks — never a pass;
-  - any 🔴 finding in the code-review report blocks regardless of the
-    lane's own verdict line;
+  - a non-string lane result (the map collected an object instead of the
+    lane's rendered text) blocks — it cannot carry a sentinel;
+  - a PIPELINE-FAULT lane result (the lane's agent died after retries;
+    detected only when the report IS the lane_fault.py marker, i.e. it
+    STARTS with it — a real review merely quoting the marker flows to the
+    normal rules) or a PIPELINE-FAULT in signals_error (builder/parse
+    fault) blocks — a degraded pipeline is never a pass;
+  - a code-review lane whose OWN verdict line records a pipeline fault
+    (code-reviewer's verdict.py / render.py degraded-run wording) blocks —
+    the nested graph completed, but with a dead domain lane, verifier, or
+    synthesis behind it, so its critical count is not trustworthy;
+  - a non-zero critical count in the code-review report blocks regardless
+    of the lane's own verdict line — derived from render.py's deterministic
+    summary line (`*Reviewed N files, found X critical, …*`); the raw 🔴
+    count is used only when that summary line is missing;
   - NEEDS-HUMAN without 🔴 passes but is surfaced as attention required;
   - probe INCONCLUSIVE blocks with an ENVIRONMENT note — it is never
     treated as PASS or FAIL (fix the environment per the plan's local-run
@@ -29,29 +42,98 @@ def load_state():
 def main():
     state = load_state()
     blockers, attention, lane_lines, reports = [], [], [], []
+    malformed = set()
 
     def lane_report(key):
         arr = state.get(key) or []
         if not arr:
             return None
         item = arr[0]
-        return item if isinstance(item, str) else json.dumps(item)
+        if isinstance(item, str):
+            return item
+        malformed.add(key)
+        return json.dumps(item)
 
     def record(lane, status, detail=""):
         lane_lines.append(f"| {lane} | {status} | {detail} |")
+
+    def fault_excerpt(report):
+        line = next(
+            (ln for ln in report.splitlines() if "PIPELINE-FAULT:" in ln), report
+        )
+        return line.strip()[:200]
+
+    def is_lane_fault(report):
+        # A genuine lane fault is the ENTIRE report emitted by lane_fault.py,
+        # which always begins with the marker. Matching the marker anywhere
+        # would let a real review that merely QUOTES "PIPELINE-FAULT:" bypass
+        # 🔴 counting and sentinel parsing.
+        return report.strip().startswith("PIPELINE-FAULT:")
+
+    def lane_fault_blocker(lane, report):
+        blockers.append(
+            f"{lane}: PIPELINE-FAULT — the lane failed after retries and produced "
+            f"no verdict; a degraded lane is never a pass ({fault_excerpt(report)})"
+        )
+        record(lane, "BLOCKED", "PIPELINE-FAULT (lane failed)")
+
+    def malformed_blocker(lane, report):
+        blockers.append(f"{lane}: malformed lane result (non-string item) — never a pass")
+        record(lane, "BLOCKED", "malformed lane result (non-string)")
+        reports.append((lane, report))
 
     # --- code-review ------------------------------------------------------
     cr = lane_report("code_review_results")
     if cr is None:
         record("code-review", "SKIPPED", "not selected")
+    elif "code_review_results" in malformed:
+        malformed_blocker("code-review", cr)
+    elif is_lane_fault(cr):
+        lane_fault_blocker("code-review", cr)
+        reports.append(("code-review", cr))
     else:
         reports.append(("code-review", cr))
         m = re.search(r"Verdict:\**\s*\**\s*(MERGE-READY|NEEDS-HUMAN)", cr)
-        reds = cr.count("🔴")
+        # code-reviewer's verdict.py forces NEEDS-HUMAN on its own internal
+        # faults; render.py emits that as `**Verdict: NEEDS-HUMAN** — <reason>`
+        # (CONTRACT comments at both emitters). Scoped to the FIRST rendered
+        # verdict line — render.py emits it before any finding body — so a
+        # finding that quotes the wording cannot trip it.
+        verdict_line = re.search(r"^\*\*Verdict: .*$", cr, re.MULTILINE)
+        m_fault = verdict_line and re.search(
+            r"^\*\*Verdict: NEEDS-HUMAN\*\* — .*"
+            r"(pipeline fault\(s\) recorded|PIPELINE-FAULT:|report rendering error)",
+            verdict_line.group(0),
+        )
+        # Same quoted-marker class as the PIPELINE-FAULT prefix anchoring: a
+        # 🔴 quoted inside finding text or a Changes-table row is not a
+        # finding. render.py's summary line is the authoritative count; the
+        # raw count is the fail-closed fallback when that line is absent. The
+        # LAST match wins: render.py emits the line after every finding body,
+        # so a quoted look-alike earlier in the report cannot shadow it. The
+        # pattern is the FULL shape of render.py's line (CONTRACT comment
+        # there) so a partial look-alike in LLM-authored text never matches.
+        sums = re.findall(
+            r"^\*Reviewed \d+ files, found (\d+) critical, \d+ warnings, \d+ suggestions, "
+            r"\d+ nitpicks \(\d+ deferred by quality bar\)\*$",
+            cr,
+            re.MULTILINE,
+        )
+        reds = int(sums[-1]) if sums else cr.count("🔴")
+        if m_fault:
+            blockers.append(
+                "code-review: the lane reported an internal PIPELINE-FAULT "
+                "(degraded review) — a degraded lane is never a pass"
+            )
         if reds:
             blockers.append(
                 f"code-review: {reds} 🔴 CRITICAL finding(s) — fix before claiming done"
             )
+        if m_fault and reds:
+            record("code-review", "BLOCKED", f"PIPELINE-FAULT (degraded lane); {reds} 🔴")
+        elif m_fault:
+            record("code-review", "BLOCKED", "PIPELINE-FAULT (degraded lane)")
+        elif reds:
             record("code-review", "BLOCKED", f"{reds} 🔴 finding(s)")
         elif m and m.group(1) == "MERGE-READY":
             record("code-review", "GREEN", "MERGE-READY")
@@ -72,6 +154,11 @@ def main():
     adv = lane_report("adversary_results")
     if adv is None:
         record("adversary", "SKIPPED", "not selected")
+    elif "adversary_results" in malformed:
+        malformed_blocker("adversary", adv)
+    elif is_lane_fault(adv):
+        lane_fault_blocker("adversary", adv)
+        reports.append(("adversary", adv))
     else:
         reports.append(("adversary", adv))
         m = re.search(r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)", adv)
@@ -92,6 +179,11 @@ def main():
     sec = lane_report("security_results")
     if sec is None:
         record("security", "SKIPPED", "not selected")
+    elif "security_results" in malformed:
+        malformed_blocker("security", sec)
+    elif is_lane_fault(sec):
+        lane_fault_blocker("security", sec)
+        reports.append(("security", sec))
     else:
         reports.append(("security", sec))
         m = re.search(r"SECURITY_REVIEW:\s*(PASS|FAIL)", sec)
@@ -110,6 +202,11 @@ def main():
     pb = lane_report("probe_results")
     if pb is None:
         record("probe", "SKIPPED", "not selected")
+    elif "probe_results" in malformed:
+        malformed_blocker("probe", pb)
+    elif is_lane_fault(pb):
+        lane_fault_blocker("probe", pb)
+        reports.append(("probe", pb))
     else:
         reports.append(("probe", pb))
         m = re.search(r"USAGE_PROBE:\s*(PASS|FAIL|INCONCLUSIVE)", pb)
@@ -130,6 +227,12 @@ def main():
                 "probe: no USAGE_PROBE sentinel found — lane failed; never a pass"
             )
             record("probe", "BLOCKED", "missing verdict sentinel")
+
+    # A gauntlet-level fault (build_items crash, dead parse stage) means the
+    # lanes above were never built — SKIPPED rows alone must not read as PASS.
+    signals_error = state.get("signals_error")
+    if isinstance(signals_error, str) and "PIPELINE-FAULT:" in signals_error:
+        blockers.append(f"pipeline: {signals_error}")
 
     verdict = "BLOCKED" if blockers else "PASS"
 

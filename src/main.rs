@@ -13,6 +13,8 @@ mod mcp;
 mod parsers;
 mod sandbox;
 mod supervisor;
+#[cfg(test)]
+mod testing;
 mod vault;
 
 #[macro_use]

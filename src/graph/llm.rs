@@ -2,12 +2,13 @@ use super::state::StateManager;
 use super::state_updates;
 use super::structured;
 use super::types::LlmNode;
-use super::wall_clock;
-use crate::client::{Model, ModelType, call_chat_completions};
+use super::{is_transient_error, wall_clock};
+use crate::client::{Model, ModelType, call_chat_completions_streaming_quiet};
 use crate::config::prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use crate::config::{
     Input, RequestContext, Role, RoleLike, SkillPolicy, should_inject_skill_instructions,
 };
+use crate::function::ToolResult;
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::function::jobs::reap_jobs;
 use crate::function::skill::skill_function_declarations;
@@ -16,6 +17,8 @@ use anyhow::{Context, Error, Result, anyhow, bail};
 use log::warn;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::time::timeout;
 
@@ -36,32 +39,44 @@ impl LlmNodeExecutor {
         abort: &AbortSignal,
     ) -> Result<LlmExecutionOutcome> {
         let result = run(node_id, node, state_manager, parent_ctx, abort).await;
-        let (output, failure_reason) = match result {
-            Ok(raw) => match &node.output_schema {
-                Some(schema) => match structured::extract(&raw, schema, parent_ctx).await {
-                    Ok(value) => (value, None),
-                    Err(e) => {
-                        warn!("llm node structured extraction failed: {e}");
-                        (
-                            Value::String(format!("LLM node structured-extraction failed: {e}")),
-                            Some(format!("structured-extraction failed: {e}")),
-                        )
-                    }
-                },
-                None => (Value::String(raw), None),
-            },
-            Err(e) => {
-                warn!("llm node failed: {e}");
-                (
-                    Value::String(format!("LLM node failed: {e}")),
-                    Some(format!("LLM call failed: {e:#}")),
-                )
-            }
-        };
-
-        apply_state_updates_with_output(node, state_manager, &output);
-        outcome_from(failure_reason.as_deref(), node.fallback.as_deref())
+        finish(node, state_manager, parent_ctx, result, abort).await
     }
+}
+
+/// Extraction, state_updates, and the outcome for an already-finished run.
+/// Split from `execute` so tests can feed a raw run result without a model.
+async fn finish(
+    node: &LlmNode,
+    state_manager: &mut StateManager,
+    parent_ctx: &mut RequestContext,
+    result: Result<String>,
+    abort: &AbortSignal,
+) -> Result<LlmExecutionOutcome> {
+    let (output, failure_reason) = match result {
+        Ok(raw) => match &node.output_schema {
+            Some(schema) => match structured::extract(&raw, schema, parent_ctx, abort).await {
+                Ok(value) => (value, None),
+                Err(e) => {
+                    warn!("llm node structured extraction failed: {e:#}");
+                    (
+                        Value::String(format!("LLM node structured-extraction failed: {e:#}")),
+                        Some(format!("structured-extraction failed: {e:#}")),
+                    )
+                }
+            },
+            None => (Value::String(raw), None),
+        },
+        Err(e) => {
+            warn!("llm node failed: {e:#}");
+            (
+                Value::String(format!("LLM node failed: {e:#}")),
+                Some(format!("LLM call failed: {e:#}")),
+            )
+        }
+    };
+
+    apply_state_updates_with_output(node, state_manager, &output);
+    outcome_from(failure_reason.as_deref(), node.fallback.as_deref())
 }
 
 fn outcome_from(
@@ -187,13 +202,14 @@ async fn run(
         node.mcp_tools.clone().map(|map| (node_id.to_string(), map)),
     );
     parent_ctx.refresh_mcp_tool_filters();
-    let result = match node.timeout.and_then(wall_clock) {
-        Some(d) => match timeout(d, run_with_retries(node, &prompt, parent_ctx, abort)).await {
-            Ok(r) => r,
-            Err(_) => Err(anyhow!("llm node timed out after {}s", d.as_secs())),
-        },
-        None => run_with_retries(node, &prompt, parent_ctx, abort).await,
-    };
+    let result = bounded_run(
+        node,
+        &prompt,
+        parent_ctx,
+        abort,
+        &mut default_completion_runner(),
+    )
+    .await;
     parent_ctx.role = saved_role;
     let node_jobs =
         std::mem::replace(&mut parent_ctx.node_job_scope, saved_job_scope).unwrap_or_default();
@@ -240,18 +256,63 @@ fn restore_agent_skill_policy(ctx: &mut RequestContext, saved: Option<SavedAgent
     agent.set_enabled_skills(saved.enabled_skills);
 }
 
+/// One boxed model call against the input and ctx. Boxed for the same
+/// reason as `AttemptFuture` in agent.rs: llm nodes run inside
+/// `tokio::spawn`ed map branches, where higher-ranked opaque futures trip
+/// the `Send` auto-trait solver.
+type CompletionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(String, Vec<ToolResult>)>> + Send + 'a>>;
+
+/// The per-call runner the chat loop drives; production uses the quiet
+/// streaming transport, tests substitute paced or aborting fakes. The runner
+/// owns client construction and the before-hook so a failed `create_client`
+/// never records a live `last_message`.
+type CompletionRunner<'f> = dyn for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a>
+    + Send
+    + 'f;
+
+fn default_completion_runner()
+-> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
+{
+    |input, ctx, abort| {
+        Box::pin(async move {
+            let client = input.create_client()?;
+            ctx.before_chat_completion(input)?;
+            call_chat_completions_streaming_quiet(input, client.as_ref(), ctx, abort).await
+        })
+    }
+}
+
+/// Applies the node's wall-clock bound around the whole retry loop.
+async fn bounded_run(
+    node: &LlmNode,
+    prompt: &str,
+    ctx: &mut RequestContext,
+    abort: &AbortSignal,
+    runner: &mut CompletionRunner<'_>,
+) -> Result<String> {
+    match node.timeout.and_then(wall_clock) {
+        Some(d) => match timeout(d, run_with_retries(node, prompt, ctx, abort, runner)).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow!("llm node timed out after {}s", d.as_secs())),
+        },
+        None => run_with_retries(node, prompt, ctx, abort, runner).await,
+    }
+}
+
 async fn run_with_retries(
     node: &LlmNode,
     prompt: &str,
     ctx: &mut RequestContext,
     abort: &AbortSignal,
+    runner: &mut CompletionRunner<'_>,
 ) -> Result<String> {
     let mut last_err: Option<Error> = None;
     for attempt in 1..=node.max_attempts {
-        match run_chat_loop(node, prompt, ctx, abort).await {
+        match run_chat_loop(node, prompt, ctx, abort, runner).await {
             Ok(out) => return Ok(out),
-            Err(e) if is_transient(&e) && attempt < node.max_attempts => {
-                warn!("llm node attempt {attempt} failed (transient): {e}; retrying");
+            Err(e) if is_transient_error(&e) && attempt < node.max_attempts => {
+                warn!("llm node attempt {attempt} failed (transient): {e:#}; retrying");
                 last_err = Some(e);
             }
             Err(e) => return Err(e),
@@ -270,6 +331,7 @@ async fn run_chat_loop(
     prompt: &str,
     ctx: &mut RequestContext,
     abort: &AbortSignal,
+    runner: &mut CompletionRunner<'_>,
 ) -> Result<String> {
     let abort = abort.clone();
     let app_cfg = Arc::clone(&ctx.app.config);
@@ -282,11 +344,12 @@ async fn run_chat_loop(
         if abort.aborted() {
             bail!("llm node aborted");
         }
-        let client = input.create_client()?;
-        ctx.before_chat_completion(&input)?;
-        let (output, tool_results) =
-            call_chat_completions(&input, false, false, client.as_ref(), ctx, abort.clone())
-                .await?;
+        let (output, tool_results) = runner(&input, ctx, abort.clone()).await?;
+        // Defence in depth: the transport bails on abort itself; this closes
+        // the window between its check and ours.
+        if abort.aborted() {
+            bail!("llm node aborted");
+        }
         ctx.after_chat_completion(app_cfg.as_ref(), &input, &output, &tool_results)?;
 
         if !output.is_empty() {
@@ -449,16 +512,6 @@ fn validate_tools_subset(
     Ok(())
 }
 
-fn is_transient(err: &Error) -> bool {
-    let s = format!("{err:#}");
-    s.contains("timed out")
-        || s.contains("rate limit")
-        || s.contains("429")
-        || s.contains("Connection reset")
-        || s.contains("Connection refused")
-        || s.contains("produced no output")
-}
-
 fn apply_state_updates_with_output(
     node: &LlmNode,
     state_manager: &mut StateManager,
@@ -467,7 +520,7 @@ fn apply_state_updates_with_output(
     state_updates::apply(
         state_manager,
         output,
-        node.output_schema.is_some(),
+        node.output_schema.as_ref(),
         node.state_updates.as_ref(),
     );
 }
@@ -618,7 +671,10 @@ mod tests {
 
     #[test]
     fn output_schema_auto_merges_top_level_keys() {
-        let node = node_with_schema(None, json!({"type": "object"}));
+        let node = node_with_schema(
+            None,
+            json!({"type": "object", "properties": {"goal": {}, "summary": {}}}),
+        );
         let mut state = manager_with(&[]);
         let output = json!({"goal": "do X", "summary": "details"});
 
@@ -630,7 +686,10 @@ mod tests {
 
     #[test]
     fn output_schema_preserves_nested_value_types() {
-        let node = node_with_schema(None, json!({"type": "object"}));
+        let node = node_with_schema(
+            None,
+            json!({"type": "object", "properties": {"tags": {}, "config": {}, "count": {}}}),
+        );
         let mut state = manager_with(&[]);
         let output = json!({
             "tags": ["a", "b"],
@@ -649,7 +708,10 @@ mod tests {
     fn output_schema_explicit_state_updates_override_auto_merge() {
         let mut u = HashMap::new();
         u.insert("goal".into(), "renamed-{{output.goal}}".into());
-        let node = node_with_schema(Some(u), json!({"type": "object"}));
+        let node = node_with_schema(
+            Some(u),
+            json!({"type": "object", "properties": {"goal": {}}}),
+        );
         let mut state = manager_with(&[]);
         let output = json!({"goal": "do X"});
 
@@ -725,26 +787,6 @@ mod tests {
     }
 
     #[test]
-    fn is_transient_matches_expected_signatures() {
-        assert!(is_transient(&anyhow!("request timed out after 30s")));
-        assert!(is_transient(&anyhow!("rate limit reached")));
-        assert!(is_transient(&anyhow!("429 too many requests")));
-        assert!(is_transient(&anyhow!("Connection reset by peer")));
-        assert!(is_transient(&anyhow!("Connection refused")));
-        assert!(is_transient(&anyhow!("llm produced no output")));
-    }
-
-    #[test]
-    fn is_transient_rejects_non_transient_errors() {
-        assert!(!is_transient(&anyhow!("Unknown model 'foo'")));
-        assert!(!is_transient(&anyhow!(
-            "llm node references unknown tool 'bad'"
-        )));
-        assert!(!is_transient(&anyhow!("hit max_iterations")));
-        assert!(!is_transient(&anyhow!("authentication failed")));
-    }
-
-    #[test]
     fn zero_timeout_resolves_to_no_bound() {
         assert!(Some(0u64).and_then(wall_clock).is_none());
         assert_eq!(
@@ -774,6 +816,165 @@ mod tests {
         assert!(!is_last_turn(u32::MAX, u32::MAX));
     }
 
+    fn plain_ctx() -> RequestContext {
+        RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
+    }
+
+    /// Identity funnel that pins a closure to the runner's higher-ranked
+    /// signature, so inline closures at call sites infer the right lifetimes.
+    fn completion_runner<F>(f: F) -> F
+    where
+        F: for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a>
+            + Send,
+    {
+        f
+    }
+
+    fn boxed_completion<'a>(
+        fut: impl Future<Output = Result<(String, Vec<ToolResult>)>> + Send + 'a,
+    ) -> CompletionFuture<'a> {
+        Box::pin(fut)
+    }
+
+    fn paced_reply(secs: u64) -> CompletionFuture<'static> {
+        boxed_completion(async move {
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            Ok(("done".to_string(), vec![]))
+        })
+    }
+
+    /// A 600s generation finishes under a 900s node timeout: the node's
+    /// own deadline is what bounds a reply. The runner is a fake, so this
+    /// does not exercise reqwest's `read_timeout`; the real-socket tests in
+    /// graph/mod.rs pin that it fires on a stall
+    /// (`sse_read_timeout_stall_is_transient`) and not on a slow but
+    /// continuous stream (`sse_slow_but_continuous_stream_outlives_read_timeout`).
+    #[tokio::test(start_paused = true)]
+    async fn node_timeout_above_generation_time_lets_the_reply_complete() {
+        let mut node = node_with(None);
+        node.timeout = Some(900);
+        let mut ctx = plain_ctx();
+        let abort = create_abort_signal();
+
+        let out = bounded_run(
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| paced_reply(600)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "done");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn node_timeout_below_generation_time_fails_transiently() {
+        let mut node = node_with(None);
+        node.timeout = Some(300);
+        let mut ctx = plain_ctx();
+        let abort = create_abort_signal();
+
+        let err = bounded_run(
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| paced_reply(600)),
+        )
+        .await
+        .expect_err("a 600s reply must not survive a 300s node timeout");
+
+        assert_eq!(err.to_string(), "llm node timed out after 300s");
+        assert!(is_transient_error(&err));
+    }
+
+    /// A typed stall (an `Elapsed` under the provider context, as the
+    /// transport surfaces it) is retried; the second attempt's reply wins.
+    #[tokio::test(start_paused = true)]
+    async fn run_with_retries_retries_a_typed_stall_once() {
+        let mut node = node_with(None);
+        node.max_attempts = 2;
+        let mut ctx = plain_ctx();
+        let abort = create_abort_signal();
+        let mut attempts = 0u32;
+
+        let out = run_with_retries(
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| {
+                attempts += 1;
+                if attempts == 1 {
+                    boxed_completion(async {
+                        let elapsed = tokio::time::timeout(
+                            Duration::from_secs(1),
+                            std::future::pending::<()>(),
+                        )
+                        .await
+                        .expect_err("pending future must time out");
+                        Err(Error::new(elapsed).context("Failed to call chat-completions api"))
+                    })
+                } else {
+                    boxed_completion(async { Ok(("recovered".to_string(), vec![])) })
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "recovered");
+        assert_eq!(attempts, 2);
+    }
+
+    /// The production runner builds the client before running the
+    /// before-hook, so a request that never leaves records no live
+    /// `last_message`.
+    #[tokio::test]
+    async fn default_completion_runner_leaves_no_last_message_when_create_client_fails() {
+        let mut ctx = plain_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut runner = default_completion_runner();
+
+        let err = runner(&input, &mut ctx, create_abort_signal())
+            .await
+            .expect_err("the test AppState has no model to build a client for");
+
+        assert!(
+            format!("{err:#}").contains("Invalid model"),
+            "expected create_client to fail, got: {err:#}"
+        );
+        assert!(ctx.last_message.is_none());
+    }
+
+    /// A call that observes the abort but still returns text must not be
+    /// treated as a completed turn; the loop discards it and fails.
+    #[tokio::test]
+    async fn run_chat_loop_discards_output_from_a_call_aborted_midway() {
+        let node = node_with(None);
+        let mut ctx = plain_ctx();
+        let abort = create_abort_signal();
+
+        let err = run_chat_loop(
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, abort| {
+                boxed_completion(async move {
+                    abort.set_ctrlc();
+                    Ok(("partial".to_string(), vec![]))
+                })
+            }),
+        )
+        .await
+        .expect_err("partial output from an aborted call is not a success");
+
+        assert_eq!(err.to_string(), "llm node aborted");
+    }
+
     /// The turn-top abort check runs before any client is created, so an
     /// already-aborted graph never issues a model call and the node fails
     /// with the abort reason rather than a connection error.
@@ -801,6 +1002,207 @@ mod tests {
             state.state().get(OUTPUT_KEY),
             None,
             "no output is recorded for an aborted node without state_updates"
+        );
+    }
+
+    /// The fault text written through state_updates must carry the full
+    /// anyhow chain, not just the outermost context, so downstream fault
+    /// scripts can surface the root cause.
+    #[tokio::test]
+    async fn failure_text_in_state_updates_carries_full_error_chain() {
+        let mut u = HashMap::new();
+        u.insert("captured".into(), "{{output}}".into());
+        let mut node = node_with(Some(u));
+        node.prompt = "{{nope}}".into();
+        node.fallback = Some("fb".into());
+        let mut state = manager_with(&[]);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let abort = create_abort_signal();
+
+        let inner = state
+            .interpolate(&node.prompt)
+            .context("Failed to interpolate llm node prompt")
+            .expect_err("missing reference must fail interpolation");
+        assert_ne!(
+            format!("{inner:#}"),
+            format!("{inner}"),
+            "the chosen error must have more than one level of context"
+        );
+
+        let outcome = LlmNodeExecutor::execute("think", &node, &mut state, &mut ctx, &abort)
+            .await
+            .expect("a declared fallback turns the failure into a route");
+
+        assert_eq!(outcome, LlmExecutionOutcome::FellBack("fb".into()));
+        let captured = state
+            .state()
+            .get("captured")
+            .and_then(Value::as_str)
+            .expect("captured failure text is a string")
+            .to_string();
+        assert!(captured.starts_with("LLM node failed: "), "{captured}");
+        assert!(
+            captured.contains(
+                "Failed to interpolate llm node prompt: Template interpolation failed: 'nope' not found in state"
+            ),
+            "{captured}"
+        );
+    }
+
+    /// Without a fallback the node bails, and that bail must wrap the same
+    /// full chain the state_updates text carries.
+    #[tokio::test]
+    async fn bail_without_fallback_carries_full_error_chain() {
+        let mut u = HashMap::new();
+        u.insert("captured".into(), "{{output}}".into());
+        let mut node = node_with(Some(u));
+        node.prompt = "{{nope}}".into();
+        node.fallback = None;
+        let mut state = manager_with(&[]);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let abort = create_abort_signal();
+
+        let err = LlmNodeExecutor::execute("think", &node, &mut state, &mut ctx, &abort)
+            .await
+            .expect_err("no fallback means the failure bails");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(
+                "LLM node failed and no fallback declared: LLM call failed: Failed to interpolate llm node prompt: Template interpolation failed: 'nope' not found in state"
+            ),
+            "{chain}"
+        );
+        let captured = state
+            .state()
+            .get("captured")
+            .and_then(Value::as_str)
+            .expect("state_updates still run before the bail")
+            .to_string();
+        assert!(captured.starts_with("LLM node failed: "), "{captured}");
+    }
+
+    /// A run that succeeds but yields unparseable output must fault through
+    /// the structured-extraction branch with the extractor's full chain, so
+    /// fallback scripts can tell "model spoke prose" from "model call failed".
+    #[tokio::test]
+    async fn structured_extraction_failure_text_carries_full_error_chain() {
+        let mut u = HashMap::new();
+        u.insert("captured".into(), "{{output}}".into());
+        let mut node = node_with_schema(Some(u), json!({"type": "object"}));
+        node.fallback = Some("fb".into());
+        let mut state = manager_with(&[]);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+
+        let outcome = finish(
+            &node,
+            &mut state,
+            &mut ctx,
+            Ok("not json".to_string()),
+            &create_abort_signal(),
+        )
+        .await
+        .expect("a declared fallback turns the failure into a route");
+
+        assert_eq!(outcome, LlmExecutionOutcome::FellBack("fb".into()));
+        let captured = state
+            .state()
+            .get("captured")
+            .and_then(Value::as_str)
+            .expect("captured failure text is a string")
+            .to_string();
+        assert!(
+            captured.starts_with("LLM node structured-extraction failed: "),
+            "{captured}"
+        );
+        assert!(
+            captured.contains("Structured-output extractor LLM call failed: "),
+            "{captured}"
+        );
+        assert!(captured.contains("Invalid model"), "{captured}");
+    }
+
+    /// The extractor runs on the graph abort: an already-aborted graph
+    /// never issues the extraction request, and the failure text still
+    /// carries the structured-extraction prefix the fallback scripts anchor on.
+    #[tokio::test]
+    async fn structured_extraction_observes_the_graph_abort() {
+        let mut u = HashMap::new();
+        u.insert("captured".into(), "{{output}}".into());
+        let mut node = node_with_schema(Some(u), json!({"type": "object"}));
+        node.fallback = Some("fb".into());
+        let mut state = manager_with(&[]);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let abort = create_abort_signal();
+        abort.set_ctrlc();
+
+        let outcome = finish(
+            &node,
+            &mut state,
+            &mut ctx,
+            Ok("not json".to_string()),
+            &abort,
+        )
+        .await
+        .expect("a declared fallback turns the failure into a route");
+
+        assert_eq!(outcome, LlmExecutionOutcome::FellBack("fb".into()));
+        let captured = state
+            .state()
+            .get("captured")
+            .and_then(Value::as_str)
+            .expect("captured failure text is a string")
+            .to_string();
+        assert!(
+            captured.starts_with("LLM node structured-extraction failed: "),
+            "{captured}"
+        );
+        assert!(captured.contains("Aborted."), "{captured}");
+        assert!(!captured.contains("Invalid model"), "{captured}");
+    }
+
+    /// Without a fallback the extraction fault bails, wrapping the same
+    /// extractor chain the state_updates text carries.
+    #[tokio::test]
+    async fn structured_extraction_failure_without_fallback_bails_with_full_chain() {
+        let mut u = HashMap::new();
+        u.insert("captured".into(), "{{output}}".into());
+        let mut node = node_with_schema(Some(u), json!({"type": "object"}));
+        node.fallback = None;
+        let mut state = manager_with(&[]);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+
+        let err = finish(
+            &node,
+            &mut state,
+            &mut ctx,
+            Ok("not json".to_string()),
+            &create_abort_signal(),
+        )
+        .await
+        .expect_err("no fallback means the failure bails");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(
+                "LLM node failed and no fallback declared: structured-extraction failed: Structured-output extractor LLM call failed"
+            ),
+            "{chain}"
+        );
+        let captured = state
+            .state()
+            .get("captured")
+            .and_then(Value::as_str)
+            .expect("state_updates still run before the bail")
+            .to_string();
+        assert!(
+            captured.starts_with("LLM node structured-extraction failed: "),
+            "{captured}"
         );
     }
 }

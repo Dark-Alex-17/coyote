@@ -57,6 +57,7 @@ Spawnable sub-agents (from `config.yaml`):
 - 💻 **CLI Coding**: Provides a natural language interface for writing and editing code.
 - 🔄 **Task Management**: Tracks progress and context across complex operations.
 - 🛠️ **Tool Integration**: Seamlessly uses system tools for building, testing, and file manipulation.
+- 🧵 **Task-queue bursts**: Dependency-shaped fan-outs (explore → code → verify) may be encoded as `agent__task_create` chains — dependents auto-dispatch when `agent__task_complete` unblocks them; todos remain the tracking source of truth.
 - 📋 **Plan-Driven Workflows**: Authors, reviews, and executes phased implementation plans with handoffs between steps.
 - 🚦 **Escalation policy**: `escalation_policy=autonomous` pre-delegates decision-making — standing rulings (`~/.config/coyote/share/standing-rulings.md`, recorded via `coyote --macro record-ruling`) and evidence-backed recommended options are taken without pausing and batched into a “Decisions taken autonomously” digest; secrets, money movement, and destructive actions always escalate.
 

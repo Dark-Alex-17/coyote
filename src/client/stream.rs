@@ -2,7 +2,7 @@ use super::{ApiStatusError, ThinkingBlock, ToolCall, catch_error};
 use crate::utils::AbortSignal;
 
 use anyhow::{Context, Result, anyhow, bail};
-use eventsource_stream::Eventsource;
+use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::{Stream, StreamExt};
 use reqwest::{RequestBuilder, header};
 use serde_json::Value;
@@ -18,6 +18,7 @@ pub struct SseHandler {
     max_call_repeats: usize,
     call_repeat_chain_len: usize,
     silent: bool,
+    call_loop_detection: bool,
 }
 
 impl SseHandler {
@@ -32,11 +33,19 @@ impl SseHandler {
             max_call_repeats: 2,
             call_repeat_chain_len: 3,
             silent: false,
+            call_loop_detection: true,
         }
     }
 
     pub fn set_silent(&mut self, silent: bool) {
         self.silent = silent;
+    }
+
+    /// Loop detection guards an interactive stream; the non-streaming
+    /// transport never had it, so callers that must match that transport's
+    /// tool-call handling turn it off.
+    pub fn set_call_loop_detection(&mut self, enabled: bool) {
+        self.call_loop_detection = enabled;
     }
 
     pub fn text(&mut self, text: &str) -> Result<()> {
@@ -73,7 +82,7 @@ impl SseHandler {
     }
 
     pub fn tool_call(&mut self, call: ToolCall) -> Result<()> {
-        if self.is_call_loop(&call) {
+        if self.call_loop_detection && self.is_call_loop(&call) {
             let loop_message = self.create_loop_detection_message(&call);
             return Err(anyhow!(loop_message));
         }
@@ -273,6 +282,11 @@ where
                     break;
                 }
             }
+            // Keep the typed reqwest error in the chain: a read_timeout stall
+            // is only recognised as transient via `reqwest::Error::is_timeout`.
+            Err(EventStreamError::Transport(err)) => {
+                return Err(err).context("Transport error");
+            }
             Err(err) => {
                 bail!("{err}");
             }
@@ -285,13 +299,12 @@ pub async fn json_stream<S, F, E>(mut stream: S, mut handle: F) -> Result<()>
 where
     S: Stream<Item = Result<bytes::Bytes, E>> + Unpin,
     F: FnMut(&str) -> Result<()>,
-    E: std::error::Error,
+    E: std::error::Error + Send + Sync + 'static,
 {
     let mut parser = JsonStreamParser::default();
     let mut unparsed_bytes = vec![];
     while let Some(chunk_bytes) = stream.next().await {
-        let chunk_bytes =
-            chunk_bytes.map_err(|err| anyhow!("Failed to read json stream, {err}"))?;
+        let chunk_bytes = chunk_bytes.context("Failed to read json stream")?;
         unparsed_bytes.extend(chunk_bytes);
         match std::str::from_utf8(&unparsed_bytes) {
             Ok(text) => {
@@ -430,6 +443,40 @@ mod tests {
         assert!(error_message.contains("test_function_loop"));
     }
 
+    /// With detection off, repeated identical calls all accumulate — the
+    /// non-streaming transport's behaviour, which the quiet transport mirrors.
+    #[test]
+    fn test_call_loop_detection_can_be_disabled() {
+        let (mut handler, _rx) = new_handler();
+        handler.set_call_loop_detection(false);
+        let call = ToolCall::new("test_function_loop".to_string(), json!({"param": 1}), None);
+
+        for _ in 0..5 {
+            handler.tool_call(call.clone()).unwrap();
+        }
+
+        let (_, calls, _) = handler.take();
+        assert_eq!(calls.len(), 5);
+    }
+
+    /// A transport failure keeps its typed error in the chain so callers can
+    /// classify it (a stall is only recognised as transient via the type).
+    #[tokio::test]
+    async fn json_stream_keeps_the_typed_transport_error() {
+        let stalled = std::io::Error::new(std::io::ErrorKind::TimedOut, "stall");
+        let mut source = stream::iter(vec![Err::<Bytes, std::io::Error>(stalled)]);
+
+        let err = json_stream(&mut source, |_| Ok(()))
+            .await
+            .expect_err("a failed read must fail the stream");
+
+        assert!(err.chain().any(|c| {
+            c.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+        }));
+        assert!(format!("{err:#}").starts_with("Failed to read json stream"));
+    }
+
     fn new_handler() -> (SseHandler, tokio::sync::mpsc::UnboundedReceiver<SseEvent>) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let abort_signal = crate::utils::create_abort_signal();
@@ -465,6 +512,43 @@ mod tests {
             signature: "sig".to_string(),
         });
         assert!(handler.has_received_content());
+    }
+
+    /// A silent handler is the quiet transport's whole output gate: text,
+    /// tool calls, and thinking still accumulate for `take()`, but the
+    /// receiver sees no `Text` events, only the trailing `Done`.
+    #[test]
+    fn test_silent_handler_accumulates_without_emitting_text() {
+        let (mut handler, mut rx) = new_handler();
+        handler.set_silent(true);
+
+        handler.text("hel").unwrap();
+        handler.text("lo").unwrap();
+        handler.thinking_block(ThinkingBlock::Thinking {
+            thinking: "hmm".to_string(),
+            signature: "sig".to_string(),
+        });
+        handler
+            .tool_call(ToolCall::new(
+                "lookup".to_string(),
+                json!({"q": 1}),
+                Some("call-1".to_string()),
+            ))
+            .unwrap();
+        handler.done();
+
+        assert!(matches!(rx.try_recv(), Ok(SseEvent::Done)));
+        assert!(rx.try_recv().is_err(), "no events beyond Done");
+
+        let (text, calls, thinking) = handler.take();
+        assert_eq!(text, "hello");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup");
+        assert_eq!(calls[0].id.as_deref(), Some("call-1"));
+        assert_eq!(thinking.len(), 1);
+        assert!(
+            matches!(&thinking[0], ThinkingBlock::Thinking { thinking, .. } if thinking == "hmm")
+        );
     }
 
     fn split_chunks(text: &str) -> Vec<Vec<u8>> {

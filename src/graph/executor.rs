@@ -1,4 +1,4 @@
-use super::agent::AgentNodeExecutor;
+use super::agent::{AgentExecutionOutcome, AgentNodeExecutor};
 use super::llm::{LlmExecutionOutcome, LlmNodeExecutor};
 use super::logging::{GraphLogger, narrate_node_complete, narrate_node_failed};
 use super::map::MapNodeExecutor;
@@ -574,8 +574,15 @@ pub(super) async fn step(
 ) -> Result<StepResult> {
     match &node.node_type {
         NodeType::Agent(agent_node) => {
-            AgentNodeExecutor::execute(agent_node, state, ctx, !step_ctx.branch_mode).await?;
-            let targets = static_next_targets(node, current, "agent", step_ctx.branch_mode)?;
+            let outcome =
+                AgentNodeExecutor::execute(current, agent_node, state, ctx, !step_ctx.branch_mode)
+                    .await?;
+            let targets = match outcome {
+                AgentExecutionOutcome::Continue(_) => {
+                    static_next_targets(node, current, "agent", step_ctx.branch_mode)?
+                }
+                AgentExecutionOutcome::FellBack(target) => vec![target],
+            };
             Ok(StepResult::Continue(targets))
         }
         NodeType::Script(script_node) => {
@@ -817,6 +824,59 @@ mod tests {
         assert!(!state.contains_key("foo"));
     }
 
+    // The dispatcher seeds a child's `inputs:` before the executor seeds
+    // variables, so a structured input outranks both a spawn-time override
+    // and the declared default — the contract the review-gauntlet →
+    // adversary `verification_commands` passthrough relies on.
+    fn seeded_after_dispatch(
+        inputs: Option<HashMap<String, Value>>,
+        agent_vars: Option<&AgentVariables>,
+    ) -> HashMap<String, Value> {
+        let mut state = HashMap::new();
+        crate::graph::dispatch::seed_initial_state(&mut state, "prompt", inputs);
+        seed_variables(&mut state, &[variable("foo", Some("default"))], agent_vars);
+        state
+    }
+
+    #[test]
+    fn dispatch_inputs_win_over_variable_override_and_default() {
+        let agent_vars: AgentVariables =
+            IndexMap::from([("foo".to_string(), "override".to_string())]);
+        let inputs = HashMap::from([("foo".to_string(), json!("from-inputs"))]);
+
+        let state = seeded_after_dispatch(Some(inputs), Some(&agent_vars));
+
+        assert_eq!(state.get("foo"), Some(&json!("from-inputs")));
+    }
+
+    #[test]
+    fn dispatch_without_inputs_lets_variable_override_beat_default() {
+        let agent_vars: AgentVariables =
+            IndexMap::from([("foo".to_string(), "override".to_string())]);
+
+        let state = seeded_after_dispatch(None, Some(&agent_vars));
+
+        assert_eq!(state.get("foo"), Some(&json!("override")));
+    }
+
+    #[test]
+    fn dispatch_without_inputs_or_override_lands_declared_default() {
+        let state = seeded_after_dispatch(None, None);
+
+        assert_eq!(state.get("foo"), Some(&json!("default")));
+    }
+
+    #[test]
+    fn dispatch_lone_array_input_survives_variable_seeding_as_array() {
+        let agent_vars: AgentVariables =
+            IndexMap::from([("foo".to_string(), "override".to_string())]);
+        let inputs = HashMap::from([("foo".to_string(), json!(["echo a", "echo b"]))]);
+
+        let state = seeded_after_dispatch(Some(inputs), Some(&agent_vars));
+
+        assert_eq!(state.get("foo"), Some(&json!(["echo a", "echo b"])));
+    }
+
     fn agent_node(id: &str, teammates: bool) -> Node {
         Node {
             id: id.into(),
@@ -827,6 +887,8 @@ mod tests {
                 state_updates: None,
                 output_schema: None,
                 timeout: None,
+                max_attempts: 1,
+                fallback: None,
                 inputs: None,
                 teammates,
             }),

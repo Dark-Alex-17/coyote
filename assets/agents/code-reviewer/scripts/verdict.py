@@ -8,6 +8,12 @@ The model that wrote the findings never grades its own homework:
   markers, exactly per the published rules;
 - MERGE-READY/NEEDS-HUMAN is computed from counts + always-human triggers
   (deterministic signals ∪ the synthesis's ADDITIVE-only flags).
+Fail-closed: any PIPELINE-FAULT recorded upstream (dead domain lane, dead
+verifier, verifier verdicts carrying a PIPELINE-FAULT note or the
+`pipeline-fault` sentinel id, dead synthesis, missing domain reports)
+forces NEEDS-HUMAN — a degraded run can never read MERGE-READY. Faults
+always lead the attention list; the display cap applies only to the
+non-fault entries so a degraded run can never hide a fault.
 The gate never crashes into a silent verdict: any internal error emits
 NEEDS-HUMAN naming the error.
 """
@@ -15,6 +21,9 @@ NEEDS-HUMAN naming the error.
 import json
 import os
 import re
+
+MAX_DETAIL_CHARS = 500
+
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
@@ -30,35 +39,43 @@ def sev_icon(severity):
     return "🟢"
 
 
-def parse_verifier(text):
-    """Extract {id: {verdict, evidence, note}} from finding-verifier output."""
-    verdicts = {}
+def parse_verifier_entries(text):
+    """Extract the raw list of {id, verdict, evidence, note} dicts from
+    finding-verifier output. Order and duplicates are preserved so fault
+    accounting can count every entry (crash-guard entries all carry the
+    same "unknown" id)."""
     if not isinstance(text, str) or not text.strip():
-        return verdicts
+        return []
     start, end = text.find("["), text.rfind("]")
     if start != -1 and end > start:
         try:
-            for v in json.loads(text[start : end + 1]):
-                if isinstance(v, dict) and v.get("id"):
-                    verdicts[str(v["id"])] = v
-            return verdicts
+            return [
+                v for v in json.loads(text[start : end + 1]) if isinstance(v, dict) and v.get("id")
+            ]
         except (ValueError, TypeError):
             pass
+    entries = []
     for m in re.finditer(r'\{[^{}]*"id"[^{}]*\}', text):
         try:
             v = json.loads(m.group(0))
             if v.get("id"):
-                verdicts[str(v["id"])] = v
+                entries.append(v)
         except (ValueError, TypeError):
             continue
-    return verdicts
+    return entries
+
+
+def parse_verifier(entries):
+    """Index verifier entries by finding id; the last entry per id wins."""
+    return {str(v["id"]): v for v in entries}
 
 
 def main():
     state = load_state()
     findings = [f for f in (state.get("findings") or []) if isinstance(f, dict)]
     rigor = (state.get("resolved_rigor") or "production").lower()
-    verdicts = parse_verifier(state.get("verifier_output"))
+    verifier_entries = parse_verifier_entries(state.get("verifier_output"))
+    verdicts = parse_verifier(verifier_entries)
 
     kept, dropped_titles = [], []
     for f in findings:
@@ -117,17 +134,73 @@ def main():
     seen = set()
     attention = [a for a in attention if not (a.lower() in seen or seen.add(a.lower()))]
 
-    if (state.get("changed_files") or []) and not (state.get("domain_reports") or []):
-        attention.append(
-            "PIPELINE FAULT: the diff is non-empty but no domain reports were produced — "
+    # --- pipeline-fault accounting (fail closed) -----------------------------
+    # PREFIX-anchored: a report that merely QUOTES a marker mid-text must not
+    # trip it. Any fault forces NEEDS-HUMAN.
+    faults = []
+    changed = state.get("changed_files") or []
+    reports = state.get("domain_reports") or []
+    faulted = sum(
+        1 for r in reports if isinstance(r, str) and r.lstrip().startswith("> ⚠️ PIPELINE-FAULT:")
+    )
+    if faulted:
+        faults.append(
+            f"PIPELINE-FAULT: {faulted} of {len(reports)} domain review lane(s) "
+            "failed after retries — their slices were not reviewed"
+        )
+    verifier_raw = state.get("verifier_output")
+    if isinstance(verifier_raw, str) and verifier_raw.lstrip().startswith("Agent node failed:"):
+        faults.append(
+            "PIPELINE-FAULT: finding verification failed — findings render as unverified"
+        )
+    # finding-verifier completes "successfully" with faults INSIDE the payload:
+    # parse_fault's `pipeline-fault` sentinel entry, or a per-finding
+    # PIPELINE-FAULT note from verify_fault or verdict_gate's crash guard.
+    # Anchored on the sentinel id / note prefix only. Counted over the raw
+    # entries, not the id-indexed dict, so N crash-guard entries sharing the
+    # "unknown" id count as N.
+    fv_faults = [
+        v
+        for v in verifier_entries
+        if v.get("id") == "pipeline-fault"
+        or (isinstance(v.get("note"), str) and v["note"].lstrip().startswith("PIPELINE-FAULT:"))
+    ]
+    if fv_faults:
+        first = fv_faults[0].get("note")
+        detail = first.strip().replace("\n", " ") if isinstance(first, str) else ""
+        if len(detail) > MAX_DETAIL_CHARS:
+            detail = detail[: MAX_DETAIL_CHARS - 1] + "…"
+        faults.append(
+            f"PIPELINE-FAULT: finding verification degraded — {len(fv_faults)} verifier "
+            f"verdict(s) carry a pipeline fault ({detail})"
+        )
+    # Keyed off synth_failure + a non-empty diff, NEVER off findings == [] —
+    # a clean review legitimately has zero findings and stays MERGE-READY.
+    synth_failure = state.get("synth_failure")
+    if isinstance(synth_failure, str) and synth_failure.startswith("LLM node") and changed:
+        detail = synth_failure.strip().replace("\n", " ")
+        if len(detail) > MAX_DETAIL_CHARS:
+            detail = detail[: MAX_DETAIL_CHARS - 1] + "…"
+        faults.append(f"PIPELINE-FAULT: synthesis failed — findings unavailable; {detail}")
+    if changed and not reports:
+        faults.append(
+            "PIPELINE-FAULT: the diff is non-empty but no domain reports were produced — "
             "the review did not actually run; do not trust this verdict."
         )
+    # faults go FIRST and uncapped so the display cap can never hide one;
+    # the trigger reason keys off the human-facing triggers alone
+    has_triggers = bool(attention)
+    attention = faults + attention[:5]
+
     reasons = []
     if counts["🔴"]:
         reasons.append(f"{counts['🔴']} 🔴 CRITICAL finding(s)")
     if yellow_correctness:
         reasons.append(f"{yellow_correctness} 🟡 [correctness] finding(s) outside the deferred section")
-    if attention:
+    if faults:
+        # CONTRACT: review-gauntlet/verdict_gate.py anchors on this wording
+        reasons.append("pipeline fault(s) recorded — degraded run")
+    if has_triggers:
         reasons.append("always-human trigger(s) fired")
     verdict = "NEEDS-HUMAN" if reasons else "MERGE-READY"
     reason_line = "; ".join(reasons) if reasons else "no blocking findings and no always-human triggers"
@@ -142,7 +215,7 @@ def main():
                     "deferred_count": len(deferred),
                     "dropped_count": len(dropped_titles),
                     "dropped_titles": dropped_titles,
-                    "attention": attention[:5],
+                    "attention": attention,
                     "findings_final": final,
                 }
             }
@@ -158,9 +231,13 @@ except Exception as e:  # noqa: BLE001 — never crash into a silent verdict
             {
                 "verdict_out": {
                     "verdict": "NEEDS-HUMAN",
-                    "reason": f"verdict computation error: {e} — treat as needing human review",
+                    # PIPELINE-FAULT prefix is load-bearing: render.py's
+                    # empty-diff stub bypass anchors on it — without it a
+                    # crashed gate on an empty diff collapses into the
+                    # "No changes to review." stub.
+                    "reason": f"PIPELINE-FAULT: verdict computation error: {e} — human review required",
                     "counts": {}, "deferred_count": 0, "dropped_count": 0,
-                    "dropped_titles": [], "attention": [f"verdict script error: {e}"],
+                    "dropped_titles": [], "attention": [f"PIPELINE-FAULT: verdict script error: {e}"],
                     "findings_final": [],
                 }
             }

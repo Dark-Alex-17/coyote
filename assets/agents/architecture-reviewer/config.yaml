@@ -12,7 +12,11 @@ spawnable_agents:
   - explore
   - oracle
 max_concurrent_agents: 4
-max_agent_depth: 2
+# The limit is consulted by the SPAWNER against the child's absolute depth
+# (root = 0). Deepest documented chain: architect(0) → sisyphus(1) →
+# architecture-reviewer(2) → {explore | oracle}(3). This agent spawns depth-3
+# children; 4 = one level of headroom.
+max_agent_depth: 4
 inject_spawn_instructions: true
 
 skills_enabled: true

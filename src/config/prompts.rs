@@ -167,16 +167,25 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     ```
     # Create tasks with dependencies (optional: auto-dispatch with --agent)
     agent__task_create --subject \"Explore existing patterns\"
-    agent__task_create --subject \"Implement feature\" --blocked_by [\"task_1\"] --agent coder --prompt \"Implement based on patterns found\"
-    agent__task_create --subject \"Write tests\" --blocked_by [\"task_2\"]
+    agent__task_create --subject \"Implement feature\" --blocked_by [\"1\"] --agent coder --prompt \"Implement based on patterns found\"
+    agent__task_create --subject \"Write tests\" --blocked_by [\"2\"]
 
     # Check what's runnable
     agent__task_list
 
     # After completing a task, mark it done to unblock dependents
     # If dependents have --agent set, they auto-dispatch
-    agent__task_complete --task_id task_1
+    agent__task_complete --task_id 1
     ```
+
+    Task-queue rules (NOT obvious — read carefully):
+    - Task IDs are numeric strings (\"1\", \"2\", ...) assigned in creation order.
+    - A task created with `agent` but NO blockers is NEVER auto-dispatched — spawn it yourself.
+    - Auto-dispatch happens only inside `agent__task_complete`: completing a task is what
+      dispatches its newly-unblocked dependents.
+    - Auto-dispatched agents must still be collected via `agent__collect`, and an agent finishing
+      does NOT complete its task — call `agent__task_complete` yourself to advance the chain.
+    - A failed task permanently blocks its dependents — recreate the chain rather than retrying.
 
     ### Escalation Handling
 

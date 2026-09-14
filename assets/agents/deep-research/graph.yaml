@@ -38,6 +38,14 @@ initial_state:
   research_attempts: 0
   local_context: ''
   local_sources: ''
+  # Fault-path defaults. `questions: []` also keeps the
+  # knowledge_lookup lane alive for one super-step when `plan` dies inside the
+  # static fan-out: research_each_question maps over zero items while the
+  # plan_fault → end_fault route renders the failure sentinel.
+  pipeline_faults: []
+  pipeline_notes: ''
+  fault_text: ''
+  questions: []
 
 start: parse_request
 
@@ -91,7 +99,21 @@ nodes:
           maxItems: 6
           description: 3-5 specific, self-contained sub-questions.
       required: [research_plan, questions]
+    # On success plan_failure holds the node's structured JSON output; on
+    # failure the engine writes "LLM node ...failed: <chain>" into it BEFORE
+    # routing to the fallback (schema properties are only merged on success).
+    state_updates:
+      plan_failure: '{{output}}'
+    fallback: plan_fault
     next: research_each_question
+
+  plan_fault:
+    id: plan_fault
+    type: script
+    description: Fail-closed marker for a dead planning stage (reached only via plan's fallback) — normalizes the failure text captured in plan_failure into a PIPELINE-FAULT and continues to end_fault; no plan means nothing to research, so the DEEP_RESEARCH FAILED sentinel always renders. The sibling knowledge_lookup lane survives one more super-step by mapping over the empty initial_state `questions` list.
+    script: scripts/plan_fault.py
+    fallback: end_fault
+    next: end_fault
 
   knowledge_lookup:
     id: knowledge_lookup
@@ -153,6 +175,16 @@ nodes:
     max_attempts: 2
     state_updates:
       finding: '{{output}}'
+    # On failure the engine writes "LLM node ...failed: <chain>" into `finding`
+    # via the state_updates above BEFORE routing to the fallback. The marker
+    # is branch-local: a map branch's fallback must stay inside the branch.
+    fallback: question_fault
+
+  question_fault:
+    id: question_fault
+    type: script
+    description: Fail-closed marker for a dead research lane (reached only via research_one_question's fallback route inside the map branch). Normalizes the engine's failure text in `finding` into a PIPELINE-FAULT finding the map collects — one dead lane never sinks the whole map. combine_findings later lifts PIPELINE-FAULT findings into pipeline_faults for the report's Pipeline notes.
+    script: scripts/question_fault.py
 
   combine_findings:
     id: combine_findings
@@ -179,6 +211,15 @@ nodes:
     max_iterations: 15
     state_updates:
       source_assessment: '{{output}}'
+    fallback: vet_fault
+    next: critique
+
+  vet_fault:
+    id: vet_fault
+    type: script
+    description: Degrade-visibly marker for a dead vetting stage (reached only via vet_sources' fallback) — vetting is a quality lane, not the product. Records a PIPELINE-FAULT, rewrites source_assessment to a neutral "unvetted" note, and continues to critique, the stage vet_sources' own next pointed to.
+    script: scripts/vet_fault.py
+    fallback: critique
     next: critique
 
   critique:
@@ -219,6 +260,15 @@ nodes:
     tools: []
     state_updates:
       critique: '{{output}}'
+    fallback: critique_fault
+    next: reflexion_gate
+
+  critique_fault:
+    id: critique_fault
+    type: script
+    description: Degrade-visibly marker for a dead critique stage (reached only via critique's fallback) — critique is a quality lane, not the product. Records a PIPELINE-FAULT and rewrites `critique` to a neutral note with deliberately NO "VERDICT:" line, so reflexion_gate's malformed-critique PASS default proceeds to synthesis; then continues to reflexion_gate, the stage critique's own next pointed to.
+    script: scripts/critique_fault.py
+    fallback: reflexion_gate
     next: reflexion_gate
 
   reflexion_gate:
@@ -242,9 +292,21 @@ nodes:
 
       Produce the final report following your instructions.
     timeout: 300
+    max_attempts: 2
     state_updates:
       report: '{{output}}'
+    # On failure the engine writes "Agent node failed: <chain>" into `report`
+    # via the state_updates above BEFORE routing to the fallback.
+    fallback: synth_fault
     next: verify_sources
+
+  synth_fault:
+    id: synth_fault
+    type: script
+    description: Fail-closed marker for a dead synthesis stage (reached only via synthesize's fallback) — no report means no product. Normalizes the "Agent node failed:" text captured in `report` into a PIPELINE-FAULT and continues to end_fault, which renders the DEEP_RESEARCH FAILED sentinel.
+    script: scripts/synth_fault.py
+    fallback: end_fault
+    next: end_fault
 
   verify_sources:
     id: verify_sources
@@ -261,7 +323,7 @@ nodes:
       {{report}}
 
       ----
-      {{source_check}}
+      {{source_check}}{{pipeline_notes}}
       ----
 
       Accept this report? Pick "accept" or "reject", or type specific
@@ -284,9 +346,14 @@ nodes:
   end_accepted:
     id: end_accepted
     type: end
-    output: '{{report}}'
+    output: '{{report}}{{pipeline_notes}}'
 
   end_rejected:
     id: end_rejected
     type: end
     output: "Research on '{{topic}}' was rejected and discarded."
+
+  end_fault:
+    id: end_fault
+    type: end
+    output: 'DEEP_RESEARCH FAILED — PIPELINE-FAULT: {{fault_text}}'

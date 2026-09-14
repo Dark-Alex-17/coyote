@@ -333,7 +333,13 @@ instructions: |
        Forced lanes: adversary<, probe — add probe when the task changed consumer-facing surface and the plan carries a local-run recipe>
        Plan / acceptance criteria: <the task's acceptance criteria, pasted verbatim>
        Local-run recipe / usage suites: <from the plan, when present>"
+       --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
+       <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
        ```
+
+       Verification commands go in `--variables` (a JSON-array string), never in the prompt: the
+       prompt also carries pasted plan text from the repo under review, and whatever is declared
+       here is executed with a shell — a trust boundary the prose must not cross.
 
        It returns `GAUNTLET: PASS/BLOCKED`. On BLOCKED apply the same fix-and-rerun rules as below
        (resume the SAME Sisyphus session with the findings verbatim, then a FRESH gauntlet run).
@@ -351,7 +357,12 @@ instructions: |
        <paste the task index.md body + the relevant PLAN-<slug>.md section VERBATIM>
        <paste the plan's ## Quality bar section VERBATIM — recorded dropped practices are
        conformance facts, not divergences>"
+       --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
+       <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
        ```
+
+       Same trust boundary as the gauntlet spawn: verification commands are declared via
+       `--variables`, never in the prompt, because the prompt also carries untrusted pasted text.
 
      - **`ADVERSARIAL_REVIEW: DIVERGES`** → treat it as a blocker: resume the SAME Sisyphus session
        (`agent__spawn --session_id <id> --prompt "Fix these plan-conformance failures: <adversary
@@ -455,6 +466,20 @@ instructions: |
   4. Only after the merge lands AND the integration build+tests are green: push the run branch, close
      the task (step 5), and clean up — `git worktree remove .worktrees/task-NNN` and delete the task
      branch (local + remote).
+
+  **Task-queue mirroring (optional).** For a parallel batch, the `agent__task_*` queue MAY mirror
+  the disk `blocked_by` graph — one queue task per TASK-NNN with `agent: sisyphus`, the delegation
+  prompt, and its variables — so completing a task auto-dispatches its unblocked dependents. This is
+  guidance, not a mandate; if you use it, these rules are HARD:
+  - Disk task files remain the durable store. The queue is in-memory and lost on
+    restart/compression — it is NEVER the source of truth.
+  - Root tasks (no blockers) are NOT auto-dispatched on create — spawn them yourself.
+  - Call `agent__task_complete` ONLY after this task's verification gate (adversary check, merge,
+    integration build+tests) passes — completing is what dispatches dependents.
+  - Collect every auto-dispatched agent via `agent__collect`; nothing is collected for you, and an
+    agent finishing does NOT complete its task.
+  - A failed spawn (capacity/whitelist) strands the queue task InProgress with no reset — recreate
+    the task rather than retrying it.
 
   Phase F is UNCHANGED (same single draft PR from the run branch). Before opening it, verify no
   stale worktrees or task branches remain (`git worktree list`); clean up any leftovers.

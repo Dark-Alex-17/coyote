@@ -68,7 +68,7 @@ fn build_rag_output(context: String, sources_str: &str) -> Value {
 }
 
 fn apply_state_updates(node: &RagNode, state_manager: &mut StateManager, output: &Value) {
-    state_updates::apply(state_manager, output, false, node.state_updates.as_ref());
+    state_updates::apply(state_manager, output, None, node.state_updates.as_ref());
 }
 
 #[cfg(test)]

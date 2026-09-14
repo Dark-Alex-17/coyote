@@ -1,6 +1,6 @@
-use crate::client::call_chat_completions;
+use crate::client::call_chat_completions_streaming_quiet;
 use crate::config::{Input, RequestContext, Role, RoleLike};
-use crate::utils::create_abort_signal;
+use crate::utils::AbortSignal;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::sync::Arc;
@@ -19,18 +19,24 @@ Rules:
 - If a field cannot be determined from the input, use `null` (when allowed) or your best inferred value.
 - Do NOT invent fields not present in the schema.";
 
-pub async fn extract(raw: &str, schema: &Value, parent_ctx: &mut RequestContext) -> Result<Value> {
+pub async fn extract(
+    raw: &str,
+    schema: &Value,
+    parent_ctx: &mut RequestContext,
+    abort: &AbortSignal,
+) -> Result<Value> {
     if let Some(parsed) = try_parse_json(raw) {
         return Ok(parsed);
     }
 
-    extract_via_extractor(raw, schema, parent_ctx, false).await
+    extract_via_extractor(raw, schema, parent_ctx, abort, false).await
 }
 
 async fn extract_via_extractor(
     raw: &str,
     schema: &Value,
     parent_ctx: &mut RequestContext,
+    abort: &AbortSignal,
     is_repair: bool,
 ) -> Result<Value> {
     let role = build_extractor_role(parent_ctx);
@@ -38,7 +44,7 @@ async fn extract_via_extractor(
 
     let saved_role = parent_ctx.role.clone();
     parent_ctx.role = Some(role);
-    let result = run_one_shot(&prompt, parent_ctx).await;
+    let result = run_one_shot(&prompt, parent_ctx, abort).await;
     parent_ctx.role = saved_role;
 
     let output = result.context("Structured-output extractor LLM call failed")?;
@@ -49,7 +55,12 @@ async fn extract_via_extractor(
             "Structured-output extractor failed to produce valid JSON after repair retry. \
              Last response:\n{output}"
         ),
-        None => Box::pin(extract_via_extractor(&output, schema, parent_ctx, true)).await,
+        None => {
+            Box::pin(extract_via_extractor(
+                &output, schema, parent_ctx, abort, true,
+            ))
+            .await
+        }
     }
 }
 
@@ -73,15 +84,21 @@ fn build_extractor_prompt(raw: &str, schema: &Value, is_repair: bool) -> String 
     }
 }
 
-async fn run_one_shot(prompt: &str, ctx: &mut RequestContext) -> Result<String> {
-    let abort = create_abort_signal();
+async fn run_one_shot(
+    prompt: &str,
+    ctx: &mut RequestContext,
+    abort: &AbortSignal,
+) -> Result<String> {
+    if abort.aborted() {
+        bail!("Aborted.");
+    }
     let app_cfg = Arc::clone(&ctx.app.config);
     let role_for_input = ctx.role.clone();
     let input = Input::from_str(ctx, prompt, role_for_input)?;
     let client = input.create_client()?;
     ctx.before_chat_completion(&input)?;
     let (output, tool_results) =
-        call_chat_completions(&input, false, false, client.as_ref(), ctx, abort).await?;
+        call_chat_completions_streaming_quiet(&input, client.as_ref(), ctx, abort.clone()).await?;
     ctx.after_chat_completion(app_cfg.as_ref(), &input, &output, &tool_results)?;
 
     Ok(output)

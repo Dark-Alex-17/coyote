@@ -16,15 +16,28 @@ def load_state():
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 
 
+# LLM-influenced values rendered after the summary line: a newline could
+# forge a second summary line that review-gauntlet/verdict_gate.py parses.
+def one_line(x):
+    return str(x).replace("\n", " ")
+
+
 def main():
     state = load_state()
     v = state.get("verdict_out") or {}
     findings = v.get("findings_final") or []
     counts = v.get("counts") or {}
     changed = state.get("changed_files") or []
-    rigor = state.get("resolved_rigor") or "production"
+    rigor = one_line(state.get("resolved_rigor") or "production")
 
-    if not changed:
+    # A fault can leave changed_files empty (a parse fault dies before the
+    # diff is resolved; a verifier fault fires even on an empty diff) — a
+    # fault-degraded verdict must still render as a full report. parse_fault
+    # puts the marker in the reason; verdict.py prepends it to attention.
+    faulted = str(v.get("reason") or "").startswith("PIPELINE-FAULT:") or any(
+        isinstance(a, str) and a.startswith("PIPELINE-FAULT:") for a in v.get("attention") or []
+    )
+    if not changed and not faulted:
         print(json.dumps({"final_report": "# Code Review Summary\n\nNo changes to review."}))
         return
 
@@ -32,7 +45,8 @@ def main():
     lines = [
         "# Code Review Summary",
         "",
-        f"**Verdict: {verdict}** — {v.get('reason', '')}",
+        # CONTRACT: review-gauntlet/verdict_gate.py anchors on this wording
+        f"**Verdict: {verdict}** — {one_line(v.get('reason', ''))}",
         "",
         "## Walkthrough",
         state.get("walkthrough") or "(no walkthrough provided)",
@@ -89,15 +103,17 @@ def main():
         m for x in findings for m in
         __import__("re").findall(r"MISS-\d+", (x.get("title") or "") + (x.get("block") or ""))
     })
+    dropped = ", ".join(one_line(t) for t in v.get("dropped_titles", [])[:5])
     lines += [
         "---",
+        # CONTRACT: review-gauntlet/verdict_gate.py parses this line — keep the format in sync
         f"*Reviewed {len(changed)} files, found {counts.get('🔴', 0)} critical, "
         f"{counts.get('🟡', 0)} warnings, {counts.get('🟢', 0)} suggestions, "
         f"{counts.get('💡', 0)} nitpicks ({v.get('deferred_count', 0)} deferred by quality bar)*",
-        f"*Quality bar: {rigor} — provenance: {state.get('bar_provenance', '?')}; "
-        f"surfaces: {state.get('resolved_surfaces') or 'none'}*",
+        f"*Quality bar: {rigor} — provenance: {one_line(state.get('bar_provenance', '?'))}; "
+        f"surfaces: {one_line(state.get('resolved_surfaces') or 'none')}*",
         f"*Verdict: {verdict}; verifier: dropped {v.get('dropped_count', 0)} provably-false"
-        + (f" ({', '.join(v.get('dropped_titles', [])[:5])})" if v.get("dropped_count") else "")
+        + (f" ({dropped})" if v.get("dropped_count") else "")
         + f"; review-miss patterns applied: {', '.join(miss_ids) if miss_ids else 'none relevant'}*",
     ]
     print(json.dumps({"final_report": "\n".join(lines)}))

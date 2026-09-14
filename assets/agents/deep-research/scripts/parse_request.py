@@ -9,6 +9,13 @@ supply one interactively.
 Routing (`_next`):
   - prompt present -> (no _next; static next: plan)
   - prompt empty   -> ask_topic
+
+Fail-safe: a crash here (e.g. malformed GRAPH_STATE) means the
+caller's prompt cannot be read at all, so proceeding silently is
+meaningless — the degraded route is `ask_topic`, which asks the user for
+the topic directly, plus a PIPELINE-FAULT entry so the loss is visible in
+the final report's Pipeline notes. Clobbering `pipeline_faults` is safe
+here: this is the start node, so the list can only hold its initial [].
 """
 import json
 import os
@@ -31,5 +38,17 @@ def main():
         print(json.dumps({"_next": "ask_topic"}))
 
 
-if __name__ == "__main__":
+try:
     main()
+except Exception as e:  # noqa: BLE001 — a crashed entry router must degrade, not die
+    print(
+        json.dumps(
+            {
+                "_next": "ask_topic",
+                "pipeline_faults": [
+                    f"PIPELINE-FAULT: request parsing crashed — {e}; asked the "
+                    "user for the research topic instead"
+                ],
+            }
+        )
+    )

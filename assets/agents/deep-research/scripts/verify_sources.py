@@ -6,6 +6,19 @@ request, and writes a `source_check` summary into state so the human
 reviewer sees broken citations at the approval step.
 
 Times out per request so a slow source cannot stall the graph.
+
+Pipeline-notes fold: end-node templates render unconditionally, so the
+conditional "## Pipeline notes" section of the accepted report is built
+HERE — the last stop before the approval gate on every accepted path,
+including reflexion and feedback re-loops. `pipeline_notes` is the
+rendered section when `pipeline_faults` is non-empty and the empty
+string otherwise, keeping the happy-path `{{report}}{{pipeline_notes}}`
+output byte-identical to the pre-hardening `{{report}}`.
+
+Fail-safe: per-URL probes were already guarded; the top level now
+is too. On a crash the summary says sources were NOT checked, a
+PIPELINE-FAULT is recorded (best-effort preserving existing faults), and
+pipeline_notes still renders — the approval gate remains the backstop.
 """
 import json
 import os
@@ -23,6 +36,21 @@ def load_state():
         with open(path) as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
+
+
+def safe_faults():
+    try:
+        state = load_state()
+        return [f for f in (state.get("pipeline_faults") or []) if isinstance(f, str)]
+    except Exception:  # noqa: BLE001 — best-effort preservation only
+        return []
+
+
+def render_notes(faults):
+    entries = [f for f in (faults or []) if isinstance(f, str) and f.strip()]
+    if not entries:
+        return ""
+    return "\n\n## Pipeline notes\n\n" + "\n".join(f"- {e}" for e in entries)
 
 
 def reachable(url, timeout=5.0):
@@ -62,8 +90,27 @@ def main():
             + "\n".join(results)
         )
 
-    print(json.dumps({"source_check": summary}))
+    notes = render_notes(state.get("pipeline_faults"))
+    print(json.dumps({"source_check": summary, "pipeline_notes": notes}))
 
 
-if __name__ == "__main__":
+try:
     main()
+except Exception as e:  # noqa: BLE001 — a crashed source check must degrade, not die
+    faults = safe_faults()
+    faults.append(
+        f"PIPELINE-FAULT: source verification crashed — {e}; cited sources "
+        "were not checked for reachability"
+    )
+    print(
+        json.dumps(
+            {
+                "source_check": (
+                    "Source verification crashed (pipeline fault) — cited "
+                    "sources were NOT checked for reachability."
+                ),
+                "pipeline_notes": render_notes(faults),
+                "pipeline_faults": faults,
+            }
+        )
+    )

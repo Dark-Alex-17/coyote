@@ -10,6 +10,13 @@ reflexion counter is reset so the user-driven pass gets a fresh revision
 budget.
 
 Routing (`_next`): always research_each_question.
+
+Fail-safe: a crash here means the user's feedback text cannot be
+recovered, but their INTENT — another research pass — is unambiguous
+(they chose neither accept nor reject). The degraded route therefore
+still loops to `research_each_question`, with a generic feedback note
+naming the loss and a PIPELINE-FAULT entry (best-effort preserving
+existing faults) that surfaces in the next approval's Pipeline notes.
 """
 import json
 import os
@@ -21,6 +28,14 @@ def load_state():
         with open(path) as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
+
+
+def safe_faults():
+    try:
+        state = load_state()
+        return [f for f in (state.get("pipeline_faults") or []) if isinstance(f, str)]
+    except Exception:  # noqa: BLE001 — best-effort preservation only
+        return []
 
 
 def main():
@@ -37,5 +52,26 @@ def main():
     print(json.dumps(output))
 
 
-if __name__ == "__main__":
+try:
     main()
+except Exception as e:  # noqa: BLE001 — a crashed feedback fold must degrade, not die
+    faults = safe_faults()
+    faults.append(
+        f"PIPELINE-FAULT: feedback incorporation crashed — {e}; the reviewer's "
+        "feedback text could not be recovered"
+    )
+    print(
+        json.dumps(
+            {
+                "_next": "research_each_question",
+                "research_attempts": 0,
+                "research_feedback": (
+                    "The user reviewed the report and asked for changes, but "
+                    "the feedback text could not be recovered (pipeline "
+                    "fault). Re-run the research pass with extra care and "
+                    "note this loss."
+                ),
+                "pipeline_faults": faults,
+            }
+        )
+    )

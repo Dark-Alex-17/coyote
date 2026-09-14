@@ -19,6 +19,11 @@ description: |
 
 version: '1.0'
 
+# The limit is consulted by the SPAWNER against the child's absolute depth
+# (root = 0). Deepest documented chain: architect(0) → sisyphus(1) →
+# review-gauntlet(2) → code-reviewer(3) →
+# {domain-reviewer(4) → file-reviewer(5) | finding-verifier(4)}.
+# This agent spawns depth-3 children; 4 = one level of headroom.
 max_agent_depth: 4
 max_concurrent_agents: 12
 
@@ -26,11 +31,23 @@ variables:
   - name: project_dir
     description: Repository the change lives in; signals and every review lane run against it.
     default: '.'
+  - name: verification_commands
+    description: |
+      JSON array of shell commands the CALLER declares for the deterministic
+      run_checks stage — e.g. '["cargo test --all"]'. Never inferred from the
+      prompt; empty array = none declared.
+    default: '[]'
 
 settings:
   max_loop_iterations: 10
   log_state_snapshots: true
-  timeout: 10800
+  # max over agent lanes of (max_attempts × lane timeout) = 2 × 11400 = 22800
+  # (agent-node retries each get a fresh per-attempt budget,
+  # src/graph/agent.rs retry_transient/bounded_attempt) + 1200 margin for
+  # the script stages (signals/select/build/gate) = 24000; the parse and
+  # select_lanes llm nodes carry no `timeout:` and are bounded by
+  # max_iterations.
+  timeout: 24000
 
 initial_state:
   diff_spec: worktree
@@ -56,6 +73,9 @@ initial_state:
   add_security: false
   add_probe: false
   lane_reasons: ''
+  parse_failure: ''
+  select_lanes_failure: ''
+  lanes_degraded: ''
   code_review_items: []
   adversary_items: []
   security_items: []
@@ -129,7 +149,18 @@ nodes:
       required: [diff_spec, plan_context, rigor, security_posture, probe_context, forced_lanes, extra_context, project_dir_in]
     max_iterations: 3
     max_attempts: 2
+    state_updates:
+      parse_failure: '{{output}}'
+    fallback: parse_fault
     next: signals
+
+  parse_fault:
+    id: parse_fault
+    type: script
+    description: Fail-closed marker for a dead parse stage (reached only via parse's fallback) — records a PIPELINE-FAULT in signals_error and jumps straight to the verdict gate, which blocks on it. Lane item lists stay their initial [] so every lane records SKIPPED.
+    script: scripts/parse_fault.py
+    timeout: 30
+    next: verdict_gate
 
   signals:
     id: signals
@@ -204,6 +235,17 @@ nodes:
       required: [add_code_review, add_adversary, add_security, add_probe, lane_reasons]
     max_iterations: 3
     max_attempts: 2
+    state_updates:
+      select_lanes_failure: '{{output}}'
+    fallback: default_lanes
+    next: build_items
+
+  default_lanes:
+    id: default_lanes
+    type: script
+    description: Deterministic lane-selection fallback (reached only via select_lanes' fallback) — when the additive LLM judgment dies, forces code-review + adversary, plus probe when consumer_surface AND a probe_context (local-run recipe) is present, plus security on attack-surface signals (auth/deps/exec) or hardened posture, unioned with any caller-forced lanes. Selection degrades WIDER, never narrower; the degradation note flows into lanes_summary via build_items.
+    script: scripts/default_lanes.py
+    timeout: 30
     next: build_items
 
   build_items:
@@ -263,7 +305,12 @@ nodes:
     type: agent
     description: Independent code-quality review lane.
     agent: code-reviewer
-    timeout: 7200
+    # Exceeds the code-reviewer graph's own settings.timeout (10800) by 600 so
+    # the child's graph timeout, not this lane timeout, is the binding bound.
+    # NOTE: the child's own internal retry envelope (its nodes' max_attempts ×
+    # timeouts) is not derived here — deliberately out of scope for this
+    # change; tracked as a follow-up.
+    timeout: 11400
     prompt: |
       Review the code changes in {{project_dir}} (diff: {{diff_spec}}) as an
       independent post-implementation review.
@@ -276,15 +323,24 @@ nodes:
       {{extra_context}}
 
       Close your report with your Review Verdict line.
+    max_attempts: 2
     state_updates:
       lane_out: '{{output}}'
+    fallback: lane_fault
 
   run_adversary:
     id: run_adversary
     type: agent
     description: Plan-conformance review lane.
     agent: adversary
-    timeout: 7200
+    # Exceeds the adversary graph's own settings.timeout (9000) by 600 so the
+    # child's graph timeout, not this lane timeout, is the binding bound.
+    # NOTE: the child's own internal retry envelope (its nodes' max_attempts ×
+    # timeouts) is not derived here — deliberately out of scope for this
+    # change; tracked as a follow-up.
+    timeout: 9600
+    inputs:
+      verification_commands: '{{verification_commands}}'
     prompt: |
       Adversarial plan-conformance review in {{project_dir}}.
 
@@ -293,11 +349,15 @@ nodes:
       The spec / plan / acceptance criteria it must satisfy:
       {{plan_context}}
 
+      Verification commands arrive as a structured input (the verification_commands variable), not in this prompt.
+
       {{extra_context}}
 
       Return your ADVERSARIAL_REVIEW verdict.
+    max_attempts: 2
     state_updates:
       lane_out: '{{output}}'
+    fallback: lane_fault
 
   run_security:
     id: run_security
@@ -313,8 +373,10 @@ nodes:
       {{extra_context}}
 
       Return your SECURITY_REVIEW verdict.
+    max_attempts: 2
     state_updates:
       lane_out: '{{output}}'
+    fallback: lane_fault
 
   run_probe:
     id: run_probe
@@ -332,16 +394,28 @@ nodes:
       Plan / acceptance-criteria context:
       {{plan_context}}
 
+      The workspace may contain test files from an aborted earlier attempt of
+      this lane; reconcile rather than duplicate.
+
       Derive expected behaviors from the plan/contract BEFORE reading
       implementation code, run existing suites first, then author spec-first
       tests for the uncovered delta. Return your USAGE_PROBE verdict.
+    max_attempts: 2
     state_updates:
       lane_out: '{{output}}'
+    fallback: lane_fault
+
+  lane_fault:
+    id: lane_fault
+    type: script
+    description: Fail-closed lane fault marker (reached only via the run_* lanes' fallback routes; shared across the four map branches). Normalizes the engine's "Agent node failed" text in lane_out into a PIPELINE-FAULT lane result the map collects; verdict_gate turns it into BLOCKED — a degraded lane is never a pass.
+    script: scripts/lane_fault.py
+    timeout: 30
 
   verdict_gate:
     id: verdict_gate
     type: script
-    description: Deterministic sentinel parser and gate. A missing sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks with an environment note; 🔴 findings block regardless of the lane's own verdict line.
+    description: Deterministic sentinel parser and gate. A missing sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks with an environment note; the code-review critical count is read from render.py's summary line (raw 🔴 count if absent) and blocks regardless of the lane's own verdict line; a code-review verdict line that records the nested graph's own pipeline fault blocks as a degraded lane.
     script: scripts/verdict_gate.py
     timeout: 60
     next: done

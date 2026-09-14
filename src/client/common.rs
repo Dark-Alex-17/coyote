@@ -523,14 +523,7 @@ pub async fn call_chat_completions(
                     ctx.app.config.print_markdown(&text)?;
                 }
             }
-            let mut tool_results = eval_tool_calls(ctx, tool_calls).await?;
-            if let Some(first) = tool_results.first_mut() {
-                first.thinking = thinking;
-            }
-            tool_results
-                .iter()
-                .for_each(|res| ctx.tool_scope.tool_tracker.record_call(res.call.clone()));
-            Ok((text, tool_results))
+            finish_completion(ctx, text, tool_calls, thinking).await
         }
         Err(err) => Err(err),
     }
@@ -592,14 +585,7 @@ pub async fn call_chat_completions_streaming(
             if !silent && !text.is_empty() && !text.ends_with('\n') {
                 println!();
             }
-            let mut tool_results = eval_tool_calls(ctx, tool_calls).await?;
-            if let Some(first) = tool_results.first_mut() {
-                first.thinking = thinking;
-            }
-            tool_results
-                .iter()
-                .for_each(|res| ctx.tool_scope.tool_tracker.record_call(res.call.clone()));
-            Ok((text, tool_results))
+            finish_completion(ctx, text, tool_calls, thinking).await
         }
         Err(err) => {
             if !silent && !text.is_empty() {
@@ -608,6 +594,72 @@ pub async fn call_chat_completions_streaming(
             Err(err)
         }
     }
+}
+
+/// Streaming transport for graph `llm` nodes: accumulates the reply and the
+/// transport itself renders nothing; no spinner, delta, or reasoning
+/// (tool-call rendering inside `eval_tool_calls` is unchanged from the
+/// non-streaming path). Because chunks arrive as they are generated, the
+/// reqwest `read_timeout` bounds only stalls between chunks; the caller's
+/// own deadline bounds the whole generation. Parity with the non-streaming
+/// transport is kept deliberately: the handler's call-loop detection is off
+/// (that path never had it), and a model the catalog marks `no_stream`
+/// takes the non-streaming request, raced against the abort. An abort
+/// observed after the provider call fails outright. Partial output is
+/// never returned as success.
+pub async fn call_chat_completions_streaming_quiet(
+    input: &Input,
+    client: &dyn Client,
+    ctx: &mut RequestContext,
+    abort_signal: AbortSignal,
+) -> Result<(String, Vec<ToolResult>)> {
+    if client.model().no_stream() {
+        let output = tokio::select! {
+            ret = client.chat_completions(input.clone()) => ret?,
+            _ = wait_abort_signal(&abort_signal) => bail!("Aborted."),
+        };
+        if abort_signal.aborted() {
+            bail!("Aborted.");
+        }
+        let ChatCompletionsOutput {
+            text,
+            tool_calls,
+            thinking,
+        } = output;
+        return finish_completion(ctx, text, tool_calls, thinking).await;
+    }
+
+    // `_rx` outlives the call so `handler.done()` still finds a receiver.
+    let (tx, _rx) = unbounded_channel();
+    let mut handler = SseHandler::new(tx, abort_signal.clone());
+    handler.set_silent(true);
+    handler.set_call_loop_detection(false);
+
+    let send_ret = client.chat_completions_streaming(input, &mut handler).await;
+
+    if abort_signal.aborted() {
+        bail!("Aborted.");
+    }
+    send_ret?;
+
+    let (text, tool_calls, thinking) = handler.take();
+    finish_completion(ctx, text, tool_calls, thinking).await
+}
+
+async fn finish_completion(
+    ctx: &mut RequestContext,
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    thinking: Vec<ThinkingBlock>,
+) -> Result<(String, Vec<ToolResult>)> {
+    let mut tool_results = eval_tool_calls(ctx, tool_calls).await?;
+    if let Some(first) = tool_results.first_mut() {
+        first.thinking = thinking;
+    }
+    tool_results
+        .iter()
+        .for_each(|res| ctx.tool_scope.tool_tracker.record_call(res.call.clone()));
+    Ok((text, tool_results))
 }
 
 pub fn noop_prepare_rerank<T>(_client: &T, _data: &RerankData) -> Result<RequestData> {
@@ -848,6 +900,10 @@ mod tests {
     use super::*;
 
     use super::super::access_token::{is_rejected, set_access_token};
+    use crate::config::{AppState, WorkingMode};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::Instant;
 
     fn catch_error_message(data: &Value, status: u16) -> String {
         catch_error(data, status).unwrap_err().to_string()
@@ -1009,5 +1065,284 @@ mod tests {
 
         assert!(!should_retry_auth(&api_status_error(401), client));
         assert!(!is_rejected(client, "at-1"));
+    }
+
+    /// Fake provider whose streaming path emits `PACED_DELTAS` text chunks
+    /// 60s apart, then one thinking block and one tool call, and whose
+    /// non-streaming path returns that same reply in one piece when
+    /// `nonstream_replies` is set (and bails otherwise). Exercises the real
+    /// trait defaults (build_client, prepare_completion_data, abort
+    /// `select!`) with no network.
+    struct PacedStreamClient {
+        config: AppConfig,
+        model: Model,
+        stall_forever: bool,
+        nonstream_replies: bool,
+        streaming_calls: AtomicUsize,
+    }
+
+    const PACED_DELTAS: usize = 10;
+    const PACED_GAP: Duration = Duration::from_secs(60);
+
+    fn paced_text() -> String {
+        (0..PACED_DELTAS).map(|i| format!("chunk{i} ")).collect()
+    }
+
+    fn paced_tool_call() -> ToolCall {
+        ToolCall::new(
+            "lookup".to_string(),
+            json!({"q": 1}),
+            Some("call-1".to_string()),
+        )
+    }
+
+    fn paced_thinking() -> ThinkingBlock {
+        ThinkingBlock::Thinking {
+            thinking: "hmm".to_string(),
+            signature: "sig".to_string(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Client for PacedStreamClient {
+        fn app_config(&self) -> &AppConfig {
+            &self.config
+        }
+
+        fn extra_config(&self) -> Option<&ExtraConfig> {
+            None
+        }
+
+        fn patch_config(&self) -> Option<&RequestPatch> {
+            None
+        }
+
+        fn name(&self) -> &str {
+            "paced-stream"
+        }
+
+        fn model(&self) -> &Model {
+            &self.model
+        }
+
+        async fn chat_completions_inner(
+            &self,
+            _client: &ReqwestClient,
+            data: ChatCompletionsData,
+        ) -> Result<ChatCompletionsOutput> {
+            assert!(!data.stream, "non-streaming path must not request a stream");
+            if !self.nonstream_replies {
+                bail!("the quiet transport must not take the non-streaming path");
+            }
+            if self.stall_forever {
+                std::future::pending::<()>().await;
+            }
+            Ok(ChatCompletionsOutput {
+                text: paced_text(),
+                tool_calls: vec![paced_tool_call()],
+                thinking: vec![paced_thinking()],
+            })
+        }
+
+        async fn chat_completions_streaming_inner(
+            &self,
+            _client: &ReqwestClient,
+            handler: &mut SseHandler,
+            data: ChatCompletionsData,
+        ) -> Result<()> {
+            self.streaming_calls.fetch_add(1, Ordering::SeqCst);
+            assert!(data.stream, "trait default must request a stream");
+            for i in 0..PACED_DELTAS {
+                tokio::time::sleep(PACED_GAP).await;
+                handler.text(&format!("chunk{i} "))?;
+            }
+            if self.stall_forever {
+                std::future::pending::<()>().await;
+            }
+            handler.thinking_block(paced_thinking());
+            handler.tool_call(paced_tool_call())
+        }
+    }
+
+    fn paced_client(stall_forever: bool) -> PacedStreamClient {
+        PacedStreamClient {
+            config: AppConfig::default(),
+            model: Model::default(),
+            stall_forever,
+            nonstream_replies: false,
+            streaming_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn no_stream_model() -> Model {
+        let mut data = ModelData::new("");
+        data.no_stream = true;
+        Model::from_config("", &[data]).remove(0)
+    }
+
+    fn assert_paced_reply(text: &str, results: &[ToolResult]) {
+        assert_eq!(text, paced_text());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].call.name, "lookup");
+        assert_eq!(results[0].call.id.as_deref(), Some("call-1"));
+        assert!(
+            matches!(&results[0].thinking[..], [ThinkingBlock::Thinking { thinking, .. }] if thinking == "hmm")
+        );
+    }
+
+    fn quiet_ctx() -> RequestContext {
+        RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
+    }
+
+    /// 600s of virtual generation completes and yields the same shape the
+    /// non-streaming transport would: full text, tool results with the
+    /// thinking stapled onto the first, and the tracker fed each call. The
+    /// fake ignores the reqwest client, so reqwest's `read_timeout` is not in
+    /// the loop here; the real-socket tests in graph/mod.rs pin that it
+    /// fires on a stall (`sse_read_timeout_stall_is_transient`) and not on a
+    /// slow but continuous stream (`sse_slow_but_continuous_stream_outlives_read_timeout`).
+    #[tokio::test(start_paused = true)]
+    async fn quiet_streaming_accumulates_across_a_long_generation() {
+        let mut ctx = quiet_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = paced_client(false);
+        let started = Instant::now();
+
+        let (text, results) =
+            call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+                .await
+                .unwrap();
+
+        assert!(started.elapsed() >= PACED_GAP * PACED_DELTAS as u32);
+        assert_paced_reply(&text, &results);
+        assert!(
+            results[0].output["tool_call_error"].is_string(),
+            "an undeclared tool evaluates to a tool_call_error, not a panic: {}",
+            results[0].output
+        );
+    }
+
+    /// An abort mid-stream cancels the provider call promptly and fails the
+    /// call outright; the ten chunks already buffered are never returned.
+    #[tokio::test(start_paused = true)]
+    async fn quiet_streaming_abort_discards_partial_output() {
+        let mut ctx = quiet_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = paced_client(true);
+        let abort = create_abort_signal();
+        let trigger = abort.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PACED_GAP * PACED_DELTAS as u32 + Duration::from_secs(30)).await;
+            trigger.set_ctrlc();
+        });
+        let started = Instant::now();
+
+        let err = call_chat_completions_streaming_quiet(&input, &client, &mut ctx, abort)
+            .await
+            .expect_err("an aborted stream must not succeed");
+
+        assert_eq!(err.to_string(), "Aborted.");
+        assert!(started.elapsed() < PACED_GAP * (PACED_DELTAS as u32 + 1));
+    }
+
+    /// The quiet transport and the non-streaming transport hand the node the
+    /// same `(text, tool_results)` for the same provider reply.
+    #[tokio::test(start_paused = true)]
+    async fn quiet_streaming_matches_the_non_streaming_reply() {
+        let mut ctx = quiet_ctx();
+        ctx.render_mode = RenderMode::Silent;
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = paced_client(false);
+        client.nonstream_replies = true;
+
+        let (streamed_text, streamed) =
+            call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+                .await
+                .unwrap();
+        let (plain_text, plain) = call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(streamed_text, plain_text);
+        assert_paced_reply(&streamed_text, &streamed);
+        assert_paced_reply(&plain_text, &plain);
+        assert_eq!(streamed[0].output, plain[0].output);
+    }
+
+    /// A model the catalog marks `no_stream` never sees a streaming request;
+    /// the quiet transport takes the non-streaming path and returns the same
+    /// shape.
+    #[tokio::test]
+    async fn quiet_transport_honours_no_stream_models() {
+        let mut ctx = quiet_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = paced_client(false);
+        client.model = no_stream_model();
+        client.nonstream_replies = true;
+
+        let (text, results) =
+            call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+                .await
+                .unwrap();
+
+        assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 0);
+        assert_paced_reply(&text, &results);
+    }
+
+    /// The `no_stream` fallback is raced against the abort like the
+    /// streaming path: a hung non-streaming request is cancelled promptly.
+    #[tokio::test(start_paused = true)]
+    async fn quiet_transport_no_stream_fallback_honours_abort() {
+        let mut ctx = quiet_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = paced_client(true);
+        client.model = no_stream_model();
+        client.nonstream_replies = true;
+        let abort = create_abort_signal();
+        let trigger = abort.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            trigger.set_ctrlc();
+        });
+        let started = Instant::now();
+
+        let err = call_chat_completions_streaming_quiet(&input, &client, &mut ctx, abort)
+            .await
+            .expect_err("an aborted non-streaming fallback must not succeed");
+
+        assert_eq!(err.to_string(), "Aborted.");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// The user-level `stream` toggle is a rendering preference; the quiet
+    /// transport still streams with it off.
+    #[tokio::test(start_paused = true)]
+    async fn quiet_transport_ignores_the_user_stream_toggle() {
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                stream: false,
+                ..AppConfig::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        assert!(!input.stream(), "fixture must have streaming disabled");
+        let client = paced_client(false);
+
+        let (text, results) =
+            call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+                .await
+                .unwrap();
+
+        assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 1);
+        assert_paced_reply(&text, &results);
     }
 }
