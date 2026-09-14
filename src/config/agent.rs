@@ -889,7 +889,7 @@ fn default_summarization_threshold() -> usize {
 }
 
 fn default_escalation_timeout() -> u64 {
-    300
+    0
 }
 
 impl AgentConfig {

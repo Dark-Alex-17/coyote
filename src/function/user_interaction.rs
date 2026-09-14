@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 
 pub const USER_FUNCTION_PREFIX: &str = "user__";
 
-const DEFAULT_ESCALATION_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_ESCALATION_TIMEOUT_SECS: u64 = 0;
 const CUSTOM_MULTI_CHOICE_ANSWER_OPTION: &str = "Other (custom)";
 
 pub fn user_interaction_function_declarations() -> Vec<FunctionDeclaration> {
@@ -289,17 +289,32 @@ async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> R
 
     root_queue.submit(request);
 
-    let timeout = Duration::from_secs(timeout_secs);
-    match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(reply)) => Ok(json!({ "answer": reply })),
-        Ok(Err(_)) => Ok(json!({
-            "error": "Escalation was cancelled. The parent agent dropped the request",
-            "fallback": "Make your best judgment and proceed",
-        })),
+    await_escalation_reply(rx, timeout_secs).await
+}
+
+/// Waits for the parent's reply. `timeout_secs == 0` waits indefinitely; a
+/// dropped sender (the parent cancelled the request) resolves either way.
+async fn await_escalation_reply(rx: oneshot::Receiver<String>, timeout_secs: u64) -> Result<Value> {
+    let reply = if timeout_secs == 0 {
+        rx.await
+    } else {
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+            Ok(reply) => reply,
+            Err(_) => {
+                return Ok(json!({
+                    "error": format!(
+                        "Escalation timed out after {timeout_secs} seconds waiting for user response"
+                    ),
+                    "fallback": "Make your best judgment and proceed",
+                }));
+            }
+        }
+    };
+
+    match reply {
+        Ok(reply) => Ok(json!({ "answer": reply })),
         Err(_) => Ok(json!({
-            "error": format!(
-                "Escalation timed out after {timeout_secs} seconds waiting for user response"
-            ),
+            "error": "Escalation was cancelled. The parent agent dropped the request",
             "fallback": "Make your best judgment and proceed",
         })),
     }
@@ -350,5 +365,97 @@ mod tests {
         assert_eq!(v["needs_human"], true);
         assert_eq!(v["action"], "confirm");
         assert_eq!(v["options"], json!([]));
+    }
+
+    #[test]
+    fn escalation_timeout_defaults_to_unlimited() {
+        assert_eq!(DEFAULT_ESCALATION_TIMEOUT_SECS, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_timeout_waits_indefinitely_for_the_reply() {
+        let (tx, rx) = oneshot::channel();
+        let wait = tokio::spawn(await_escalation_reply(rx, 0));
+
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(!wait.is_finished());
+
+        tx.send("approved".to_string()).unwrap();
+        let v = wait.await.unwrap().unwrap();
+        assert_eq!(v, json!({ "answer": "approved" }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nonzero_timeout_still_expires_with_the_existing_message() {
+        let (tx, rx) = oneshot::channel::<String>();
+        let wait = tokio::spawn(await_escalation_reply(rx, 5));
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let v = wait.await.unwrap().unwrap();
+        assert_eq!(
+            v["error"],
+            "Escalation timed out after 5 seconds waiting for user response"
+        );
+        assert_eq!(v["fallback"], "Make your best judgment and proceed");
+        assert!(tx.send("too late".to_string()).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_timeout_resolves_when_the_sender_is_dropped() {
+        let (tx, rx) = oneshot::channel::<String>();
+        drop(tx);
+
+        let v = tokio::time::timeout(Duration::from_secs(1), await_escalation_reply(rx, 0))
+            .await
+            .expect("the wait must complete once the sender is gone")
+            .unwrap();
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("Escalation was cancelled"),
+            "{v}"
+        );
+        assert_eq!(v["fallback"], "Make your best judgment and proceed");
+    }
+
+    #[test]
+    fn stale_timeout_wording_is_gone_from_shipped_text() {
+        let needles = [
+            concat!("(5-minute", " timeout)"),
+            concat!("escalation_timeout:", " 300"),
+            concat!("default:", " 5 minutes"),
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![root.join("config.agent.example.yaml")];
+        collect_files(&root.join("src"), &mut files);
+        collect_files(&root.join("assets"), &mut files);
+        assert!(files.len() > 3, "walked only {} files", files.len());
+
+        let mut hits = Vec::new();
+        for path in &files {
+            let text = String::from_utf8_lossy(&std::fs::read(path).unwrap()).into_owned();
+            for needle in needles {
+                if text.contains(needle) {
+                    hits.push(format!("{}: {needle:?}", path.display()));
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "stale timeout wording found:\n{}",
+            hits.join("\n")
+        );
+    }
+
+    fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files(&path, out);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
     }
 }
