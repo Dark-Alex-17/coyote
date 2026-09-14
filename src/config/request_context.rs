@@ -8361,16 +8361,25 @@ mod tests {
             "MAX_RETRY_ELAPSED_SECS",
             "preserves the prior `lanes_summary`",
             "append to an existing `signals_error`",
+            "structurally implies",
+            "not as a DIVERGES finding",
+            "never dropped",
+            "| adversary | `ADVERSARIAL_REVIEW: CONFORMS \\| DIVERGES` | DIVERGES; own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |",
         ] {
             assert!(
                 gauntlet.contains(claim),
                 "review-gauntlet README must state the retry/incomplete contract: {claim}"
             );
         }
+        assert!(
+            gauntlet.contains("never dropped.\n\nWhenever at least one lane"),
+            "review-gauntlet README must keep the incomplete-line contract in its own paragraph"
+        );
         for stale in [
             "on fault-only BLOCKED",
             "there is nothing to fix in the code yet",
             "3h whole-gauntlet",
+            "| DIVERGES; missing sentinel |",
         ] {
             assert!(
                 !gauntlet.contains(stale),
@@ -11417,6 +11426,352 @@ mod tests {
     }
 
     #[test]
+    fn gauntlet_verdict_gate_incomplete_lane_forces_blocked() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // retry_gate restores an exhausted lane's LAST report, which can be
+        // an earlier clean verdict; the incomplete lane must block anyway.
+        let state = json!({
+            "review_incomplete": ["adversary"],
+            "lane_attempts": {"adversary": 3},
+            "code_review_results": [GAUNTLET_MERGE_READY],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: adversary",
+            "{out}"
+        );
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| adversary | BLOCKED | review incomplete after 3 attempt(s) |"),
+            "an incomplete lane must render as BLOCKED with its attempt count: {report}"
+        );
+        assert!(
+            report.contains(
+                "adversary: review incomplete after 3 attempt(s) — the lane never produced a usable verdict"
+            ),
+            "an incomplete lane must be named as a blocker: {report}"
+        );
+        assert!(
+            !report.contains("| adversary | GREEN | CONFORMS |"),
+            "a restored clean verdict must not render as GREEN for an incomplete lane: {report}"
+        );
+        assert!(
+            !(out["gauntlet_verdict"] == "PASS" && out["gauntlet_incomplete_line"] != ""),
+            "PASS must never co-occur with an incomplete line: {out}"
+        );
+
+        let mut state = state;
+        state.as_object_mut().unwrap().remove("lane_attempts");
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| adversary | BLOCKED | review incomplete |"),
+            "no recorded attempts must render without a count: {report}"
+        );
+        assert!(
+            report.contains(
+                "adversary: review incomplete — the lane never produced a usable verdict"
+            ),
+            "{report}"
+        );
+        assert!(
+            !(out["gauntlet_verdict"] == "PASS" && out["gauntlet_incomplete_line"] != ""),
+            "PASS must never co-occur with an incomplete line: {out}"
+        );
+
+        state.as_object_mut().unwrap().remove("review_incomplete");
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "PASS", "{out}");
+        assert_eq!(out["gauntlet_incomplete_line"], "", "{out}");
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| adversary | GREEN | CONFORMS |"),
+            "a complete clean lane must still render GREEN: {out}"
+        );
+        assert!(
+            !(out["gauntlet_verdict"] == "PASS" && out["gauntlet_incomplete_line"] != ""),
+            "PASS must never co-occur with an incomplete line: {out}"
+        );
+
+        // A bare `pipeline` entry with no fault text must still block and
+        // must never render Python's None into the report.
+        let state = json!({
+            "review_incomplete": ["pipeline"],
+            "code_review_results": [GAUNTLET_MERGE_READY],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: pipeline",
+            "{out}"
+        );
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("pipeline: review incomplete"),
+            "a pipeline entry without fault text must still be named as a blocker: {report}"
+        );
+        assert!(
+            !report.contains("pipeline: None"),
+            "missing fault text must not render as None: {report}"
+        );
+
+        // An incomplete lane whose map collected nothing must not fall back
+        // to the SKIPPED row.
+        let state = json!({
+            "review_incomplete": ["security"],
+            "code_review_results": [GAUNTLET_MERGE_READY],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| security | BLOCKED | review incomplete |"),
+            "an incomplete lane with no report must render BLOCKED: {report}"
+        );
+        assert!(
+            !report.contains("| security | SKIPPED | not selected |"),
+            "an incomplete lane must never read as SKIPPED: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_adversary_degraded_header_is_fault_not_finding() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "lane_attempts": {"adversary": 2},
+            "code_review_results": [GAUNTLET_MERGE_READY],
+            "adversary_results": [GAUNTLET_ADVERSARY_DEGRADED],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| adversary | BLOCKED | PIPELINE-FAULT (degraded lane ×2) |"),
+            "the adversary's own degraded-run header is a pipeline fault with its attempt count: {report}"
+        );
+        assert!(
+            report.contains(
+                "adversary: PIPELINE-FAULT — degraded run, pipeline fault recorded inside the adversary"
+            ),
+            "{report}"
+        );
+        assert!(
+            !report.contains("adversary: DIVERGES — the implementation does not conform"),
+            "a degraded run must not be reported as a DIVERGES finding: {report}"
+        );
+
+        let mut state = state;
+        state.as_object_mut().unwrap().remove("lane_attempts");
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| adversary | BLOCKED | PIPELINE-FAULT (degraded lane) |"),
+            "a first-pass degraded run renders without a count: {out}"
+        );
+
+        // The predicate is anchored to the line under the sentinel: a clean
+        // report that quotes the wording later stays a real verdict.
+        state["adversary_results"] = json!([GAUNTLET_ADVERSARY_QUOTED_DEGRADED]);
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "PASS", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| adversary | GREEN | CONFORMS |"),
+            "a quoted degraded-run phrase must not trip the fault predicate: {report}"
+        );
+        assert!(!report.contains("adversary: PIPELINE-FAULT"), "{report}");
+
+        // Every degraded header the adversary's verdict.py can emit is a
+        // pipeline fault, not a DIVERGES finding.
+        for degraded in [
+            GAUNTLET_ADVERSARY_DEGRADED_COUNTED,
+            GAUNTLET_ADVERSARY_DEGRADED_DIED,
+            GAUNTLET_ADVERSARY_CRASH_STUB,
+        ] {
+            state["adversary_results"] = json!([degraded]);
+            let out = run_gauntlet_script("verdict_gate.py", &state);
+            assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{degraded:?}: {out}");
+            let report = out["gauntlet_report"].as_str().unwrap();
+            assert!(
+                report.contains("| adversary | BLOCKED | PIPELINE-FAULT (degraded lane) |"),
+                "{degraded:?} must render as a degraded lane: {report}"
+            );
+            assert!(
+                !report.contains("adversary: DIVERGES — the implementation does not conform"),
+                "{degraded:?} must not be reported as a DIVERGES finding: {report}"
+            );
+        }
+
+        // A plain DIVERGES header is a real finding.
+        state["adversary_results"] = json!([GAUNTLET_ADVERSARY_DIVERGES]);
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| adversary | BLOCKED | DIVERGES |"),
+            "a real DIVERGES must stay a finding: {report}"
+        );
+        assert!(!report.contains("adversary: PIPELINE-FAULT"), "{report}");
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_malformed_attempts_keeps_lane_rows() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Malformed bookkeeping must not crash the gate into the error stub
+        // that loses every lane row: a non-dict lane_attempts only affects
+        // counts, while a non-list review_incomplete is itself a pipeline
+        // fault — a bare string is never adopted as a lane name.
+        let state = json!({
+            "lane_attempts": 42,
+            "review_incomplete": "adversary",
+            "code_review_results": [GAUNTLET_MERGE_READY],
+            "adversary_results": [GAUNTLET_ADVERSARY_FAULT],
+            "security_results": [],
+            "probe_results": [],
+            "signals_error": "PIPELINE-FAULT: lane-selection fallback crashed — boom"
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            !report.contains("verdict gate error"),
+            "malformed bookkeeping must not reach the crash stub: {report}"
+        );
+        assert!(
+            report.contains("| code-review | GREEN | MERGE-READY |"),
+            "{report}"
+        );
+        assert!(
+            report.contains("| adversary | BLOCKED | PIPELINE-FAULT (lane failed) |"),
+            "unreadable attempts must render without a count: {report}"
+        );
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: pipeline",
+            "a string-valued review_incomplete is a pipeline fault, not a lane name; the pipeline is named: {out}"
+        );
+
+        // Without any upstream fault text, the malformed bookkeeping alone
+        // must block as a pipeline fault.
+        let state = json!({
+            "lane_attempts": 42,
+            "review_incomplete": "adversary",
+            "code_review_results": [GAUNTLET_MERGE_READY],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: pipeline",
+            "{out}"
+        );
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("pipeline: PIPELINE-FAULT — malformed review_incomplete bookkeeping"),
+            "malformed bookkeeping must be named as a pipeline fault: {report}"
+        );
+        assert!(
+            report.contains("| code-review | GREEN | MERGE-READY |"),
+            "{report}"
+        );
+        assert!(!report.contains("verdict gate error"), "{report}");
+
+        // A list with a non-str entry keeps its str lanes and still records
+        // the fault.
+        let state = json!({
+            "review_incomplete": ["adversary", 7],
+            "code_review_results": [GAUNTLET_MERGE_READY],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: adversary, pipeline",
+            "{out}"
+        );
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| adversary | BLOCKED | review incomplete |"),
+            "the str lane entries must still force their rows: {report}"
+        );
+        assert!(
+            report.contains("pipeline: PIPELINE-FAULT — malformed review_incomplete bookkeeping"),
+            "{report}"
+        );
+
+        // Per-lane values that are not ints count as zero: the row renders
+        // without a ×N suffix and the incomplete line without "after N".
+        let state = json!({
+            "lane_attempts": {"adversary": "three", "code-review": [1]},
+            "review_incomplete": ["adversary"],
+            "code_review_results": [GAUNTLET_MERGE_READY],
+            "adversary_results": [GAUNTLET_ADVERSARY_FAULT],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(!report.contains("verdict gate error"), "{report}");
+        assert!(
+            report.contains("| adversary | BLOCKED | PIPELINE-FAULT (lane failed) |"),
+            "a non-int per-lane count must render without a count: {report}"
+        );
+        assert!(!report.contains('×'), "{report}");
+        assert!(
+            report.contains("## Review incomplete\n- adversary: no completed review\n"),
+            "a non-int per-lane count must not render an attempt count: {report}"
+        );
+
+        let state = json!({
+            "lane_attempts": {"security": "x"},
+            "review_incomplete": ["security"],
+            "code_review_results": [GAUNTLET_MERGE_READY],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(!report.contains("verdict gate error"), "{report}");
+        assert!(
+            report.contains("| security | BLOCKED | review incomplete |"),
+            "{report}"
+        );
+        assert!(!report.contains("review incomplete after"), "{report}");
+    }
+
+    #[test]
     fn gauntlet_verdict_gate_non_string_lane_result_blocks() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
@@ -11998,6 +12353,12 @@ mod tests {
     const GAUNTLET_MERGE_READY: &str = "# Review\n\n**Verdict: MERGE-READY**\n";
     const GAUNTLET_ADVERSARY_FAULT: &str =
         "PIPELINE-FAULT: adversary lane failed after retries — Agent node failed: boom";
+    const GAUNTLET_ADVERSARY_DEGRADED: &str = "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: none verified — degraded run: pipeline fault recorded (fail-closed).\nComplaints:\n1. PIPELINE-FAULT: run_checks died";
+    const GAUNTLET_ADVERSARY_DEGRADED_COUNTED: &str = "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 2/3 met, 0 partial, 1 unmet/diverged — degraded run: pipeline fault recorded (fail-closed).\nComplaints:\n1. PIPELINE-FAULT: run_checks died";
+    const GAUNTLET_ADVERSARY_DEGRADED_DIED: &str = "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 2/3 met, 0 partial, 1 unmet/diverged — degraded run: 1 criterion check(s) died (fail-closed).\nComplaints:\n1. c3: check died — boom";
+    const GAUNTLET_ADVERSARY_CRASH_STUB: &str = "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: verdict computation error: boom — treat as failed, not as conforming.";
+    const GAUNTLET_ADVERSARY_DIVERGES: &str = "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 2/3 met, 0 partial, 1 unmet/diverged.\nComplaints:\n1. c3: nothing in the diff does Z";
+    const GAUNTLET_ADVERSARY_QUOTED_DEGRADED: &str = "ADVERSARIAL_REVIEW: CONFORMS\nCriteria: 3/3 met, 0 partial, 0 unmet/diverged.\nComplaints:\n- none\n\nObservations:\n- an earlier run printed 'Criteria: none verified — degraded run: pipeline fault recorded' but this one is clean";
 
     #[test]
     fn gauntlet_retry_gate_stashes_and_restores_reports() {
@@ -12149,6 +12510,311 @@ mod tests {
     }
 
     #[test]
+    fn gauntlet_retry_gate_adversary_degraded_predicate_is_anchored() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        for degraded in [
+            GAUNTLET_ADVERSARY_DEGRADED,
+            GAUNTLET_ADVERSARY_DEGRADED_COUNTED,
+            GAUNTLET_ADVERSARY_DEGRADED_DIED,
+            GAUNTLET_ADVERSARY_CRASH_STUB,
+        ] {
+            let out =
+                run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("adversary", degraded));
+            assert_eq!(
+                out["retry_lanes"],
+                json!(["adversary"]),
+                "the degraded-run header {degraded:?} under the sentinel is a fault: {out}"
+            );
+            assert_eq!(out["_next"], "build_items", "{out}");
+        }
+
+        // Anchored to the line under the sentinel: a clean report quoting
+        // the wording later is a completed review.
+        let out = run_gauntlet_script(
+            "retry_gate.py",
+            &gauntlet_lane_ran("adversary", GAUNTLET_ADVERSARY_QUOTED_DEGRADED),
+        );
+        assert_eq!(
+            out["retry_lanes"],
+            json!([]),
+            "a quoted degraded-run phrase must not trigger a re-run: {out}"
+        );
+        assert!(out.get("_next").is_none(), "{out}");
+        assert_eq!(out["review_incomplete"], json!([]), "{out}");
+
+        // A plain DIVERGES is a real finding, never re-run.
+        let out = run_gauntlet_script(
+            "retry_gate.py",
+            &gauntlet_lane_ran("adversary", GAUNTLET_ADVERSARY_DIVERGES),
+        );
+        assert_eq!(
+            out["retry_lanes"],
+            json!([]),
+            "a real DIVERGES must not trigger a re-run: {out}"
+        );
+        assert!(out.get("_next").is_none(), "{out}");
+    }
+
+    #[test]
+    fn gauntlet_retry_gate_malformed_bookkeeping_degrades() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Malformed bookkeeping must not crash the gate: attempts are still
+        // counted, the faulted lane is still retried, a stashed report is
+        // still restored, and the malformation is recorded as a pipeline
+        // fault rather than adopted as lane names.
+        let mut state = gauntlet_lane_ran("adversary", GAUNTLET_ADVERSARY_FAULT);
+        state["lane_attempts"] = json!(42);
+        state["review_incomplete"] = json!("probe");
+        state["kept_results"] = json!({"code-review": GAUNTLET_MERGE_READY});
+        state["code_review_items"] = json!([]);
+        state["code_review_results"] = json!([]);
+        let out = run_gauntlet_script("retry_gate.py", &state);
+        let fault = out["signals_error"].as_str().unwrap_or_default();
+        assert!(
+            !fault.starts_with("PIPELINE-FAULT: retry gate crashed"),
+            "malformed bookkeeping must not reach the crash stub: {out}"
+        );
+        assert_eq!(out["retry_lanes"], json!(["adversary"]), "{out}");
+        assert_eq!(out["lane_attempts"], json!({"adversary": 1}), "{out}");
+        assert_eq!(
+            out["review_incomplete"],
+            json!([]),
+            "a bare string is never split or adopted as a lane name: {out}"
+        );
+        assert_eq!(
+            out["code_review_results"],
+            json!([GAUNTLET_MERGE_READY]),
+            "the stashed report must still be restored: {out}"
+        );
+        assert!(
+            fault.contains("malformed review_incomplete bookkeeping"),
+            "the malformation must be recorded as a fault: {out}"
+        );
+        assert!(
+            fault.starts_with("PIPELINE-FAULT: malformed review_incomplete bookkeeping ("),
+            "{out}"
+        );
+
+        // Merged over the input state as the graph would, the verdict gate
+        // must block and name the pipeline.
+        let mut merged = state;
+        for (k, v) in out.as_object().unwrap() {
+            merged[k.as_str()] = v.clone();
+        }
+        let verdict = run_gauntlet_script("verdict_gate.py", &merged);
+        assert_eq!(verdict["gauntlet_verdict"], "BLOCKED", "{verdict}");
+        assert!(
+            verdict["gauntlet_incomplete_line"]
+                .as_str()
+                .unwrap()
+                .contains("pipeline"),
+            "{verdict}"
+        );
+
+        // Per-lane values that are not ints count as zero, so the lane that
+        // ran lands on its first attempt.
+        let mut state = gauntlet_lane_ran("adversary", GAUNTLET_ADVERSARY_FAULT);
+        state["lane_attempts"] = json!({"adversary": [1], "probe": "x"});
+        let out = run_gauntlet_script("retry_gate.py", &state);
+        assert!(
+            !out["signals_error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("retry gate crashed"),
+            "{out}"
+        );
+        assert_eq!(out["retry_lanes"], json!(["adversary"]), "{out}");
+        assert_eq!(out["lane_attempts"]["adversary"], json!(1), "{out}");
+
+        // A list with a non-str entry keeps its str lanes and records the
+        // fault; the retried lane is not declined.
+        let mut state = gauntlet_lane_ran("adversary", GAUNTLET_ADVERSARY_FAULT);
+        state["review_incomplete"] = json!(["probe", 7]);
+        let out = run_gauntlet_script("retry_gate.py", &state);
+        assert_eq!(out["retry_lanes"], json!(["adversary"]), "{out}");
+        assert_eq!(out["review_incomplete"], json!(["probe"]), "{out}");
+        assert!(
+            out["signals_error"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("PIPELINE-FAULT: malformed review_incomplete bookkeeping ("),
+            "{out}"
+        );
+
+        // The bookkeeping fault appends to a prior signals_error.
+        let mut state = gauntlet_lane_ran("adversary", GAUNTLET_ADVERSARY_FAULT);
+        state["review_incomplete"] = json!("probe");
+        state["signals_error"] = json!("PIPELINE-FAULT: earlier");
+        let out = run_gauntlet_script("retry_gate.py", &state);
+        assert!(
+            out["signals_error"].as_str().unwrap_or_default().starts_with(
+                "PIPELINE-FAULT: earlier; PIPELINE-FAULT: malformed review_incomplete bookkeeping ("
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_gates_block_real_adversary_degraded_verdict() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Pins the sentinel→header adjacency both gates rely on against the
+        // adversary's real verdict.py output.
+        let met = json!({"id": "c1", "text": "does X", "status": "MET",
+                         "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""});
+        let degraded = run_adversary_script(
+            "verdict.py",
+            &json!({
+                "pipeline_faults": ["PIPELINE-FAULT: run_checks died — boom"],
+                "crit_verdicts": [met],
+                "extra_complaints": [],
+                "observations": "",
+                "exec_results": ""
+            }),
+        );
+        let degraded = degraded["adv_report"].as_str().unwrap();
+        assert!(
+            degraded.contains("degraded run: pipeline fault recorded"),
+            "{degraded}"
+        );
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": [GAUNTLET_MERGE_READY],
+                "adversary_results": [degraded],
+                "security_results": [],
+                "probe_results": []
+            }),
+        );
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| adversary | BLOCKED | PIPELINE-FAULT (degraded lane) |"),
+            "the real degraded header must render as a pipeline fault: {report}"
+        );
+        assert!(
+            !report.contains("adversary: DIVERGES — the implementation does not conform"),
+            "{report}"
+        );
+        let out = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("adversary", degraded));
+        assert_eq!(
+            out["retry_lanes"],
+            json!(["adversary"]),
+            "the real degraded header must be re-run: {out}"
+        );
+
+        let diverges = run_adversary_script(
+            "verdict.py",
+            &json!({
+                "pipeline_faults": [],
+                "crit_verdicts": [{"id": "c1", "text": "does Y", "status": "UNMET",
+                                   "evidence": "", "complaint": "nothing in the diff does Y"}],
+                "extra_complaints": [],
+                "observations": "",
+                "exec_results": ""
+            }),
+        );
+        let diverges = diverges["adv_report"].as_str().unwrap();
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": [GAUNTLET_MERGE_READY],
+                "adversary_results": [diverges],
+                "security_results": [],
+                "probe_results": []
+            }),
+        );
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| adversary | BLOCKED | DIVERGES |"),
+            "a real DIVERGES must stay a finding: {out}"
+        );
+        let out = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("adversary", diverges));
+        assert_eq!(
+            out["retry_lanes"],
+            json!([]),
+            "a real DIVERGES must never be re-run: {out}"
+        );
+
+        // The other two degraded-header forms verdict.py emits: a criterion
+        // check that died, and the top-level crash stub.
+        let died = run_adversary_script(
+            "verdict.py",
+            &json!({
+                "pipeline_faults": [],
+                "crit_verdicts": [
+                    met,
+                    {"id": "c2", "text": "does Y", "status": "UNMET",
+                     "evidence": "PIPELINE-FAULT: criterion check died — boom",
+                     "complaint": "boom"}
+                ],
+                "extra_complaints": [],
+                "observations": "",
+                "exec_results": ""
+            }),
+        );
+        let died = died["adv_report"].as_str().unwrap();
+        assert!(
+            died.contains("degraded run: 1 criterion check(s) died"),
+            "{died}"
+        );
+        let crashed = run_adversary_script(
+            "verdict.py",
+            &json!({
+                "pipeline_faults": [],
+                "crit_verdicts": [{"status": "UNMET", "text": 123}],
+                "extra_complaints": [],
+                "observations": "",
+                "exec_results": ""
+            }),
+        );
+        let crashed = crashed["adv_report"].as_str().unwrap();
+        assert!(
+            crashed.contains("Criteria: verdict computation error:"),
+            "{crashed}"
+        );
+        for degraded in [died, crashed] {
+            let out = run_gauntlet_script(
+                "verdict_gate.py",
+                &json!({
+                    "code_review_results": [GAUNTLET_MERGE_READY],
+                    "adversary_results": [degraded],
+                    "security_results": [],
+                    "probe_results": []
+                }),
+            );
+            assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+            let report = out["gauntlet_report"].as_str().unwrap();
+            assert!(
+                report.contains("| adversary | BLOCKED | PIPELINE-FAULT (degraded lane) |"),
+                "the real degraded header must render as a pipeline fault: {report}"
+            );
+            assert!(
+                !report.contains("adversary: DIVERGES — the implementation does not conform"),
+                "{report}"
+            );
+            let out =
+                run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("adversary", degraded));
+            assert_eq!(
+                out["retry_lanes"],
+                json!(["adversary"]),
+                "the real degraded header must be re-run: {out}"
+            );
+        }
+    }
+
+    #[test]
     fn gauntlet_retry_gate_counts_attempts_per_lane_that_ran() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
@@ -12281,7 +12947,7 @@ mod tests {
         let out = run_gauntlet_script(
             "retry_gate.py",
             &json!({
-                "lane_attempts": 42,
+                "kept_results": 42,
                 "adversary_items": [{"lane": "adversary"}],
                 "adversary_results": ["x"],
                 "signals_error": "PIPELINE-FAULT: earlier fault",
@@ -12331,7 +12997,7 @@ mod tests {
         let out = run_gauntlet_script(
             "retry_gate.py",
             &json!({
-                "lane_attempts": 42,
+                "kept_results": 42,
                 "adversary_items": [{"lane": "adversary"}],
                 "adversary_results": ["x"],
                 "signals_error": "git diff unavailable",
@@ -12410,9 +13076,54 @@ mod tests {
             "retry_gate.py must match the adversary's degraded-run wording {degraded:?}"
         );
         assert!(
+            verdict.contains(degraded),
+            "verdict_gate.py must match the adversary's degraded-run wording {degraded:?}"
+        );
+        assert!(
             adversary_verdict.contains(degraded),
             "assets/agents/adversary/scripts/verdict.py must still emit {degraded:?}"
         );
+        for fragment in [
+            "degraded run: pipeline fault recorded",
+            r"criterion check\(s\) died",
+            "verdict computation error:",
+        ] {
+            assert!(
+                retry.contains(fragment),
+                "retry_gate.py must match the adversary degraded header fragment {fragment:?}"
+            );
+            assert!(
+                verdict.contains(fragment),
+                "verdict_gate.py must match the adversary degraded header fragment {fragment:?}"
+            );
+        }
+        for emitted in ["criterion check(s) died", "verdict computation error:"] {
+            assert!(
+                adversary_verdict.contains(emitted),
+                "assets/agents/adversary/scripts/verdict.py must still emit {emitted:?}"
+            );
+        }
+
+        fn slice_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+            let from = src
+                .find(start)
+                .unwrap_or_else(|| panic!("missing {start:?}"));
+            let rest = &src[from..];
+            let to = rest
+                .find(end)
+                .unwrap_or_else(|| panic!("missing {end:?} after {start:?}"));
+            &rest[..to + end.len()]
+        }
+        for (start, end) in [
+            ("ADVERSARY_DEGRADED_HEADER = re.compile(", "\n)\n"),
+            ("def adversary_degraded(report):", "    return False\n"),
+        ] {
+            assert_eq!(
+                slice_between(&retry, start, end),
+                slice_between(&verdict, start, end),
+                "the adversary degraded predicate must stay byte-identical in both gate scripts"
+            );
+        }
     }
 
     /// build_items.py's LANE_KEYS and retry_gate.py's LANES name the same

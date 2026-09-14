@@ -19,6 +19,9 @@ hard rules:
   - a faulted lane is re-run only while it has attempts left AND the
     gauntlet is inside its wall-clock budget; otherwise it is recorded in
     review_incomplete and its fault flows to the verdict gate as-is;
+  - malformed review_incomplete bookkeeping (not a list, or non-str
+    entries) keeps its str entries and records a PIPELINE-FAULT in
+    signals_error — never silently dropped, never split into lane names;
   - the gate itself must never retry by accident: any internal error
     records a PIPELINE-FAULT in signals_error and falls through to the
     verdict gate, which blocks on it.
@@ -57,12 +60,33 @@ SENTINELS = {
 # instead of overwriting it, and report the lanes it had already declined.
 crash_context = {"signals_error": "", "review_incomplete": []}
 
+# Duplicated verbatim in the sibling gate script — the two copies must stay identical.
+ADVERSARY_DEGRADED_HEADER = re.compile(
+    r"Criteria: .*("
+    r"degraded run: pipeline fault recorded"
+    r"|degraded run: \d+ criterion check\(s\) died"
+    r"|verdict computation error:"
+    r")"
+)
+
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
         with open(path) as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
+
+
+def adversary_degraded(report):
+    # The adversary's verdict.py emits its degraded-run header on the line
+    # directly under the FIRST sentinel; anchoring there keeps a report that
+    # merely quotes the wording later (observations, complaints) a real verdict.
+    lines = report.splitlines()
+    for i, ln in enumerate(lines):
+        if re.search(r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)", ln):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            return bool(ADVERSARY_DEGRADED_HEADER.match(nxt))
+    return False
 
 
 def nested_degraded(lane, report):
@@ -80,13 +104,7 @@ def nested_degraded(lane, report):
             )
         )
     if lane == "adversary":
-        return bool(
-            re.search(
-                r"^Criteria: .*degraded run: pipeline fault recorded",
-                report,
-                re.MULTILINE,
-            )
-        )
+        return adversary_degraded(report)
     return False
 
 
@@ -100,15 +118,38 @@ def is_faulted(lane, report):
     return nested_degraded(lane, report)
 
 
+def attempt_count(attempts, lane):
+    try:
+        return int(attempts.get(lane) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def main():
     state = load_state()
     prior = state.get("signals_error")
-    crash_context["signals_error"] = prior if isinstance(prior, str) else ""
-    incomplete = list(state.get("review_incomplete") or [])
-    crash_context["review_incomplete"] = incomplete
-    attempts = dict(state.get("lane_attempts") or {})
-    kept = dict(state.get("kept_results") or {})
+    signals_error = prior if isinstance(prior, str) else ""
+    crash_context["signals_error"] = signals_error
     out = {}
+    declared = state.get("review_incomplete")
+    if isinstance(declared, list):
+        incomplete = [name for name in declared if isinstance(name, str)]
+        malformed = len(incomplete) != len(declared)
+    else:
+        incomplete = []
+        malformed = declared is not None
+    if malformed:
+        fault = (
+            "PIPELINE-FAULT: malformed review_incomplete bookkeeping "
+            f"({repr(declared)[:80]})"
+        )
+        signals_error = f"{signals_error}; {fault}" if signals_error else fault
+        crash_context["signals_error"] = signals_error
+        out["signals_error"] = signals_error
+    crash_context["review_incomplete"] = incomplete
+    raw_attempts = state.get("lane_attempts")
+    attempts = dict(raw_attempts) if isinstance(raw_attempts, dict) else {}
+    kept = dict(state.get("kept_results") or {})
     faulted = []
 
     for lane, (items_key, results_key) in LANES.items():
@@ -124,7 +165,7 @@ def main():
         kept[lane] = report
         if is_faulted(lane, report):
             faulted.append(lane)
-        attempts[lane] = int(attempts.get(lane) or 0) + 1
+        attempts[lane] = attempt_count(attempts, lane) + 1
 
     # A missing/zero stamp reads as an ancient start and declines every
     # retry — the safe direction when the clock's origin is unknown.

@@ -57,7 +57,11 @@ those rules are *structure*:
   sentinel is a lane FAILURE, never a pass; the critical count from the
   code-review report's summary line (raw 🔴 count if absent) blocks
   regardless of its verdict line; a code-review lane whose own verdict line
-  records a pipeline fault blocks (a degraded review is never a pass);
+  records a pipeline fault blocks (a degraded review is never a pass); the
+  adversary's own degraded-run header (the `Criteria: …` line directly under
+  its sentinel recording a pipeline fault, died criterion checks, or its
+  verdict script's crash stub) blocks as a pipeline fault,
+  not as a DIVERGES finding;
   `NEEDS-HUMAN` without 🔴 passes but
   is surfaced under *Human attention required*; probe `INCONCLUSIVE` blocks
   with an environment note — it is never treated as PASS or FAIL.
@@ -86,7 +90,8 @@ those rules are *structure*:
 only lanes that **faulted** — a missing report (stood in for by a synthetic
 `PIPELINE-FAULT: <lane> lane produced no report` marker so it never renders as
 SKIPPED), a non-string report, the `lane_fault` marker, a sentinel-less
-report, or a nested graph's own degraded-run wording. A real verdict
+report, or a nested graph's own degraded-run wording (the code-review verdict
+line / the adversary's header line directly under its sentinel). A real verdict
 (DIVERGES, FAIL, INCONCLUSIVE, NEEDS-HUMAN, …) is never re-run: the review's
 judgment stands. Each lane gets up to 3 attempts, all inside a wall-clock
 budget (`MAX_RETRY_ELAPSED_SECS`) sized to fit the graph timeout.
@@ -104,6 +109,13 @@ budget (`MAX_RETRY_ELAPSED_SECS`) sized to fit the graph timeout.
 - **Crash guards append**: the `build_items.py` and `retry_gate.py` crash
   guards append to an existing `signals_error` rather than overwrite it, and
   `build_items.py` preserves the prior `lanes_summary`.
+
+A non-empty `GAUNTLET_REVIEW_INCOMPLETE:` line structurally implies
+`GAUNTLET: BLOCKED`: the verdict gate forces every lane named in
+`review_incomplete` to a BLOCKED row (`review incomplete after N attempt(s)`)
+and a matching blocker, so a restored earlier report can never turn an
+incomplete review into a pass — and malformed `review_incomplete` bookkeeping
+is itself recorded as a `pipeline` fault, never dropped.
 
 Whenever at least one lane (or the pipeline) could not complete, the first
 line reads `GAUNTLET: BLOCKED` followed immediately by
@@ -124,7 +136,7 @@ still appear under `## Blockers` and must be fixed as usual.
 | Lane | Sentinel | Blocks on |
 |------|----------|-----------|
 | code-reviewer | `**Verdict: MERGE-READY \| NEEDS-HUMAN**` | critical count from the report's summary line (raw 🔴 count if absent); missing sentinel; own verdict line records a pipeline fault |
-| adversary | `ADVERSARIAL_REVIEW: CONFORMS \| DIVERGES` | DIVERGES; missing sentinel |
+| adversary | `ADVERSARIAL_REVIEW: CONFORMS \| DIVERGES` | DIVERGES; own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |
 | security-reviewer | `SECURITY_REVIEW: PASS \| FAIL` | FAIL; missing sentinel |
 | probe | `USAGE_PROBE: PASS \| FAIL \| INCONCLUSIVE` | FAIL; INCONCLUSIVE (environment note); missing sentinel |
 

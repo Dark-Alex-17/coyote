@@ -17,6 +17,11 @@ re-reads, no judgment. The gate's hard rules:
     (code-reviewer's verdict.py / render.py degraded-run wording) blocks —
     the nested graph completed, but with a dead domain lane, verifier, or
     synthesis behind it, so its critical count is not trustworthy;
+  - an adversary lane whose OWN header line (the line directly under its
+    sentinel) records a degraded run — a pipeline fault, died criterion
+    checks, or its verdict script's crash stub — blocks as a PIPELINE-FAULT,
+    not as a DIVERGES finding: the nested graph completed with a dead stage
+    behind it, so its verdict is not a judgment on the code;
   - a non-zero critical count in the code-review report blocks regardless
     of the lane's own verdict line — derived from render.py's deterministic
     summary line (`*Reviewed N files, found X critical, …*`); the raw 🔴
@@ -31,7 +36,12 @@ re-reads, no judgment. The gate's hard rules:
   - an incomplete review — lanes retry_gate gave up on (review_incomplete)
     or a pipeline-level fault (reported under the `pipeline` pseudo-lane) —
     emits the GAUNTLET_REVIEW_INCOMPLETE: machine line and a "Review
-    incomplete" section: that is a fault to re-run, never a code finding;
+    incomplete" section: that is a fault to re-run, never a code finding.
+    Every lane named in review_incomplete is forced to a BLOCKED row, so a
+    restored earlier report can never turn an incomplete review into a
+    pass: a non-empty machine line structurally implies GAUNTLET: BLOCKED.
+    Malformed review_incomplete bookkeeping (not a list, or non-str
+    entries) is itself recorded as a `pipeline` fault, never dropped;
   - the gate itself must never crash into a silent pass: any internal
     error emits GAUNTLET: BLOCKED naming the error, with the pipeline
     marked incomplete.
@@ -41,6 +51,16 @@ import json
 import os
 import re
 
+# Duplicated verbatim in the sibling gate script — the two copies must stay identical.
+ADVERSARY_DEGRADED_HEADER = re.compile(
+    r"Criteria: .*("
+    r"degraded run: pipeline fault recorded"
+    r"|degraded run: \d+ criterion check\(s\) died"
+    r"|verdict computation error:"
+    r")"
+)
+
+
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
         with open(path) as f:
@@ -48,11 +68,26 @@ def load_state():
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 
 
+def adversary_degraded(report):
+    # The adversary's verdict.py emits its degraded-run header on the line
+    # directly under the FIRST sentinel; anchoring there keeps a report that
+    # merely quotes the wording later (observations, complaints) a real verdict.
+    lines = report.splitlines()
+    for i, ln in enumerate(lines):
+        if re.search(r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)", ln):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            return bool(ADVERSARY_DEGRADED_HEADER.match(nxt))
+    return False
+
+
 def main():
     state = load_state()
-    blockers, attention, lane_lines, reports = [], [], [], []
+    blockers, attention, reports = [], [], []
+    rows = {}
     malformed = set()
-    lane_attempts = state.get("lane_attempts") or {}
+    lane_attempts = state.get("lane_attempts")
+    if not isinstance(lane_attempts, dict):
+        lane_attempts = {}
 
     def lane_report(key):
         arr = state.get(key) or []
@@ -65,10 +100,16 @@ def main():
         return json.dumps(item)
 
     def record(lane, status, detail=""):
-        lane_lines.append(f"| {lane} | {status} | {detail} |")
+        rows[lane] = (status, detail)
+
+    def attempt_count(lane):
+        try:
+            return int(lane_attempts.get(lane) or 0)
+        except (TypeError, ValueError):
+            return 0
 
     def attempts_suffix(lane):
-        n = int(lane_attempts.get(lane) or 0)
+        n = attempt_count(lane)
         return f" ×{n}" if n > 1 else ""
 
     def fault_excerpt(report):
@@ -178,7 +219,17 @@ def main():
     else:
         reports.append(("adversary", adv))
         m = re.search(r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)", adv)
-        if m and m.group(1) == "CONFORMS":
+        if adversary_degraded(adv):
+            blockers.append(
+                "adversary: PIPELINE-FAULT — degraded run, pipeline fault recorded "
+                "inside the adversary; a degraded lane is never a pass"
+            )
+            record(
+                "adversary",
+                "BLOCKED",
+                f"PIPELINE-FAULT (degraded lane{attempts_suffix('adversary')})",
+            )
+        elif m and m.group(1) == "CONFORMS":
             record("adversary", "GREEN", "CONFORMS")
         elif m:
             blockers.append(
@@ -244,21 +295,57 @@ def main():
             )
             record("probe", "BLOCKED", "missing verdict sentinel")
 
+    # retry_gate restores an exhausted lane's LAST report, which may be an
+    # earlier clean verdict — an incomplete lane must block regardless of
+    # what its row parsed to.
+    declared = state.get("review_incomplete")
+    incomplete = set()
+    malformed_bookkeeping = None
+    if isinstance(declared, list):
+        incomplete = {name for name in declared if isinstance(name, str)}
+        if any(not isinstance(name, str) for name in declared):
+            malformed_bookkeeping = repr(declared)[:80]
+    elif declared is not None:
+        malformed_bookkeeping = repr(declared)[:80]
+    for lane in sorted(incomplete - {"pipeline"}):
+        if rows.get(lane, ("", ""))[0] == "BLOCKED":
+            continue
+        after = f" after {n} attempt(s)" if (n := attempt_count(lane)) else ""
+        blockers.append(
+            f"{lane}: review incomplete{after} — the lane never produced a usable verdict"
+        )
+        record(lane, "BLOCKED", f"review incomplete{after}")
+
     # A gauntlet-level fault (build_items crash, dead parse stage) means the
     # lanes above were never built — SKIPPED rows alone must not read as PASS.
     signals_error = state.get("signals_error")
-    incomplete = set(state.get("review_incomplete") or [])
-    if isinstance(signals_error, str) and "PIPELINE-FAULT:" in signals_error:
+    pipeline_fault = isinstance(signals_error, str) and "PIPELINE-FAULT:" in signals_error
+    if pipeline_fault:
         blockers.append(f"pipeline: {signals_error}")
         incomplete.add("pipeline")
+    if malformed_bookkeeping is not None:
+        blockers.append(
+            "pipeline: PIPELINE-FAULT — malformed review_incomplete bookkeeping "
+            f"({malformed_bookkeeping}); never a pass"
+        )
+        incomplete.add("pipeline")
+    if "pipeline" in incomplete and not any(b.startswith("pipeline:") for b in blockers):
+        blockers.append(
+            "pipeline: review incomplete — a pipeline stage never completed "
+            "(no fault text recorded)"
+        )
 
-    verdict = "BLOCKED" if blockers else "PASS"
+    verdict = "BLOCKED" if blockers or incomplete else "PASS"
 
     incomplete_lines = []
     for name in sorted(incomplete):
         if name == "pipeline":
-            incomplete_lines.append(f"- pipeline: {signals_error}")
-        elif n := int(lane_attempts.get(name) or 0):
+            incomplete_lines.append(
+                f"- pipeline: {signals_error}"
+                if pipeline_fault
+                else "- pipeline: review incomplete (no fault text recorded)"
+            )
+        elif n := attempt_count(name):
             incomplete_lines.append(f"- {name}: no completed review after {n} attempt(s)")
         else:
             incomplete_lines.append(f"- {name}: no completed review")
@@ -269,7 +356,8 @@ def main():
     )
 
     md = "\n".join(
-        ["| lane | status | detail |", "|------|--------|--------|"] + lane_lines
+        ["| lane | status | detail |", "|------|--------|--------|"]
+        + [f"| {lane} | {status} | {detail} |" for lane, (status, detail) in rows.items()]
     )
     md += "\n\n## Lane selection\n" + (state.get("lanes_summary") or "(none recorded)")
     if blockers:
