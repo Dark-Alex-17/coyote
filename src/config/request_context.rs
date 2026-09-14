@@ -8232,7 +8232,10 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         Agent::install_builtin_agents(false).unwrap();
 
-        const SHARED_ANCHORS: [&str; 7] = [
+        // Every anchor is a single-line prefix so YAML re-wrapping cannot
+        // break the pin; clauses that wrap differently per config are split
+        // at the wrap point.
+        const SHARED_ANCHORS: [&str; 10] = [
             "GAUNTLET_REVIEW_INCOMPLETE:",
             "\"Retry the review again\"",
             "\"Accept NEEDS-HUMAN: proceed without the <lane or pipeline> review (recorded in the report / PR body)\"",
@@ -8240,12 +8243,24 @@ mod tests {
             "NEVER route it through the findings-handling rules",
             "NEVER claim done while it stands",
             "is NOT a code failure",
+            // Findings AND incomplete on the same output: findings first.
+            "fix the findings first, then re-run the gauntlet (the re-run",
+            // The autonomous ladder still governs this escalation.
+            "Under `escalation_policy: autonomous`",
+            "the standard ladder applies (a standing",
         ];
+
+        // The pin must never leak run-local provenance into the shipped
+        // assets: task IDs, plan branch names, or plan-repo paths.
+        const PROVENANCE_LEAKS: [&str; 3] = ["TASK-030", "PLAN-review-retry", "plans/tasks/"];
 
         let mut configs = std::collections::HashMap::new();
         for name in ["architect", "sisyphus"] {
-            let config =
-                read_to_string(paths::agents_data_dir().join(name).join("config.yaml")).unwrap();
+            // Normalize line endings: the ordering slices below span line
+            // breaks and Windows checkouts carry CRLF.
+            let config = read_to_string(paths::agents_data_dir().join(name).join("config.yaml"))
+                .unwrap()
+                .replace("\r\n", "\n");
             for anchor in SHARED_ANCHORS {
                 assert!(
                     config.contains(anchor),
@@ -8256,19 +8271,103 @@ mod tests {
                 config.contains("user__select"),
                 "{name} config must escalate review-incomplete via user__select"
             );
+            for leak in PROVENANCE_LEAKS {
+                assert!(
+                    !config.contains(leak),
+                    "{name} config must not carry run-local provenance: {leak:?}"
+                );
+            }
             configs.insert(name, config);
         }
+
+        // Sisyphus PLACEMENT: the incomplete rule is its own bullet directly
+        // between the BLOCKED and PASS handling bullets, so a follower reading
+        // the BLOCKED rule meets "the next rule owns it" immediately.
+        let sisyphus = &configs["sisyphus"];
+        let find = |needle: &str| {
+            sisyphus
+                .find(needle)
+                .unwrap_or_else(|| panic!("sisyphus config lost placement anchor: {needle:?}"))
+        };
+        let blocked = find("- `GAUNTLET: BLOCKED` blocks completion");
+        let incomplete =
+            find("- `GAUNTLET_REVIEW_INCOMPLETE: <lane>[, <lane>]` (the line directly under");
+        let pass = find("- `GAUNTLET: PASS` with a");
+        assert!(
+            blocked < incomplete && incomplete < pass,
+            "sisyphus config must order the gauntlet rules BLOCKED < REVIEW_INCOMPLETE < PASS \
+             (got {blocked} / {incomplete} / {pass})"
+        );
+        assert!(
+            !sisyphus[blocked + 1..incomplete].contains("\n  - "),
+            "sisyphus config must keep the REVIEW_INCOMPLETE bullet directly after the BLOCKED \
+             bullet (no other same-level bullet in between)"
+        );
+
+        // Architect PLACEMENT: the incomplete contract lives inside Phase E's
+        // divergence check, under the preferred gauntlet path and before the
+        // fallback adversary spawn.
+        let architect = &configs["architect"];
+        let find = |needle: &str| {
+            architect
+                .find(needle)
+                .unwrap_or_else(|| panic!("architect config lost placement anchor: {needle:?}"))
+        };
+        let phase_e = find("### Phase E");
+        let verify = find("4. **Verify against the plan");
+        let preferred = find("**Preferred: run the conformance checks through `review-gauntlet`**");
+        let incomplete = find("GAUNTLET_REVIEW_INCOMPLETE:");
+        let adversary = find("- **Spawn `adversary`**");
+        assert!(
+            phase_e < verify
+                && verify < preferred
+                && preferred < incomplete
+                && incomplete < adversary,
+            "architect config must place the REVIEW_INCOMPLETE contract inside Phase E's verify \
+             step, under the preferred gauntlet path and before the adversary fallback \
+             (got {phase_e} / {verify} / {preferred} / {incomplete} / {adversary})"
+        );
 
         // The architect also owns the no-gauntlet fallback path: a
         // fault-only adversary/probe result is retried, never treated as
         // a divergence.
-        let architect = &configs["architect"];
-        assert!(
-            architect.contains(
-                "an adversary/probe result that is ONLY a `PIPELINE-FAULT` (no verdict on the\n       code) is likewise an infrastructure fault to retry, never a divergence."
-            ),
-            "architect config lost the fallback adversary/probe pipeline-fault sentence"
-        );
+        for anchor in [
+            "an adversary/probe result that is ONLY a `PIPELINE-FAULT`",
+            "is likewise an infrastructure fault to retry, never a divergence",
+        ] {
+            assert!(
+                architect.contains(anchor),
+                "architect config lost the fallback adversary/probe pipeline-fault sentence: {anchor:?}"
+            );
+        }
+
+        // The agent READMEs describe the same contract to humans: the line is
+        // an infrastructure fault escalated with the three caller options,
+        // never a finding (Sisyphus) / never a divergence (Architect).
+        let readmes = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        for (name, own_claim) in [
+            ("sisyphus", "never a finding to fix"),
+            ("architect", "never a divergence"),
+        ] {
+            let readme = read_to_string(readmes.join(name).join("README.md")).unwrap();
+            for anchor in [
+                "`GAUNTLET_REVIEW_INCOMPLETE:` line",
+                "infrastructure fault",
+                "retry / accept NEEDS-HUMAN / abort",
+                own_claim,
+            ] {
+                assert!(
+                    readme.contains(anchor),
+                    "{name} README lost review-incomplete contract anchor: {anchor:?}"
+                );
+            }
+            for leak in PROVENANCE_LEAKS {
+                assert!(
+                    !readme.contains(leak),
+                    "{name} README must not carry run-local provenance: {leak:?}"
+                );
+            }
+        }
     }
 
     // Shell commands the adversary's run_checks stage executes must be
@@ -8404,6 +8503,10 @@ mod tests {
             "GAUNTLET_REVIEW_INCOMPLETE: <lane>[, <lane>]",
             "`pipeline` pseudo-lane",
             "the named lanes never completed",
+            // Caller guidance mirrors the sisyphus/architect contract: the
+            // caller escalates; a fresh run is only the "retry" choice.
+            "escalate to the user with three options — retry the review again (a **fresh**",
+            "accept NEEDS-HUMAN and proceed without that lane",
             "never narrows selection",
             "up to 3 attempts",
             "MAX_RETRY_ELAPSED_SECS",

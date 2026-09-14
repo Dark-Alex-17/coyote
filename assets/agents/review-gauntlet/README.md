@@ -173,12 +173,16 @@ The reply opens with `GAUNTLET: PASS` or `GAUNTLET: BLOCKED` (plus the
 `GAUNTLET_REVIEW_INCOMPLETE:` line when applicable), followed by a lane status
 table, the lane-selection reasons, blockers, attention items, and each lane's
 full report in a collapsible section. On BLOCKED with a
-`GAUNTLET_REVIEW_INCOMPLETE:` line: the named lanes never completed — fix any
-non-fault blockers listed under `## Blockers`, then spawn a **fresh** gauntlet
-run (a fault is never a code finding). On BLOCKED without it: fix the findings
-per your own findings-handling rules, then spawn a **fresh** gauntlet run. On
-PASS with *Human attention required*: complete the work but carry those items
-into your final report verbatim.
+`GAUNTLET_REVIEW_INCOMPLETE:` line: the named lanes never completed — this is an
+infrastructure fault, never a code finding. Fix any non-fault blockers listed
+under `## Blockers` first (the re-run retries the lane); if the line persists,
+escalate to the user with three options — retry the review again (a **fresh**
+gauntlet run), accept NEEDS-HUMAN and proceed without that lane (recorded in the
+report / PR body), or abort — never route it through your findings-handling
+rules. On BLOCKED without it: fix the findings per your own findings-handling
+rules, then spawn a **fresh** gauntlet run. On PASS with *Human attention
+required*: complete the work but carry those items into your final report
+verbatim.
 
 ## Notes
 
