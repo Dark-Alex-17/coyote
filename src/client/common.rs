@@ -402,6 +402,27 @@ impl TokenUsage {
             other.cache_read_input_tokens,
         );
     }
+
+    /// USD cost of this usage at the given model's prices (USD per 1M
+    /// tokens). The four buckets are disjoint on both Anthropic direct and
+    /// Bedrock Converse (`input_tokens` excludes cache tokens), so the terms
+    /// sum without adjustment. Strict on missing prices: any nonzero
+    /// component without a price yields `None` rather than a silent
+    /// undercount. All-zero usage is also `None` — nothing billed, nothing
+    /// to show.
+    pub fn cost_usd(&self, model: &Model) -> Option<f64> {
+        fn term(tokens: Option<u64>, price: Option<f64>) -> Option<f64> {
+            match tokens.unwrap_or(0) {
+                0 => Some(0.0),
+                tokens => Some(tokens as f64 * price? / 1_000_000.0),
+            }
+        }
+        let total = term(self.input_tokens, model.input_price())?
+            + term(self.output_tokens, model.output_price())?
+            + term(self.cache_read_input_tokens, model.cache_read_price())?
+            + term(self.cache_creation_input_tokens, model.cache_write_price())?;
+        (total > 0.0).then_some(total)
+    }
 }
 
 #[derive(Debug)]
@@ -559,7 +580,7 @@ pub async fn call_chat_completions(
                     ctx.app.config.print_markdown(&text)?;
                 }
             }
-            ctx.record_token_usage(usage);
+            ctx.record_token_usage(usage, client.model());
             finish_completion(ctx, text, tool_calls, thinking).await
         }
         Err(err) => Err(err),
@@ -591,7 +612,7 @@ pub async fn call_chat_completions_streaming(
     // call's input tokens (reported in message_start), so abort and error
     // paths must still count toward the session totals.
     let (text, tool_calls, thinking, usage) = handler.take();
-    ctx.record_token_usage(usage);
+    ctx.record_token_usage(usage, client.model());
 
     if aborted_ctrld {
         bail!("Aborted.");
@@ -665,7 +686,7 @@ pub async fn call_chat_completions_streaming_quiet(
             thinking,
             usage,
         } = output;
-        ctx.record_token_usage(usage);
+        ctx.record_token_usage(usage, client.model());
         if abort_signal.aborted() {
             bail!("Aborted.");
         }
@@ -681,7 +702,7 @@ pub async fn call_chat_completions_streaming_quiet(
     let send_ret = client.chat_completions_streaming(input, &mut handler).await;
 
     let (text, tool_calls, thinking, usage) = handler.take();
-    ctx.record_token_usage(usage);
+    ctx.record_token_usage(usage, client.model());
 
     if abort_signal.aborted() {
         bail!("Aborted.");
@@ -998,6 +1019,72 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(total.input_tokens, Some(u64::MAX));
+    }
+
+    fn priced_model(
+        input_price: Option<f64>,
+        output_price: Option<f64>,
+        cache_read_price: Option<f64>,
+        cache_write_price: Option<f64>,
+    ) -> Model {
+        let mut data = ModelData::new("test");
+        data.input_price = input_price;
+        data.output_price = output_price;
+        data.cache_read_price = cache_read_price;
+        data.cache_write_price = cache_write_price;
+        Model::from_config("provider", &[data]).remove(0)
+    }
+
+    #[test]
+    fn test_token_usage_cost_usd_sums_all_four_components() {
+        let usage = TokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(500_000),
+            cache_creation_input_tokens: Some(200_000),
+            cache_read_input_tokens: Some(2_000_000),
+        };
+        let model = priced_model(Some(3.0), Some(15.0), Some(0.3), Some(3.75));
+        // 3.0 + 7.5 + 0.6 + 0.75
+        let cost = usage.cost_usd(&model).unwrap();
+        assert!((cost - 11.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_token_usage_cost_usd_is_none_when_a_billed_component_lacks_a_price() {
+        let usage = TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(50),
+        };
+        let model = priced_model(Some(3.0), Some(15.0), None, Some(3.75));
+        assert_eq!(usage.cost_usd(&model), None);
+    }
+
+    #[test]
+    fn test_token_usage_cost_usd_ignores_missing_prices_for_unbilled_components() {
+        let usage = TokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: None,
+        };
+        let model = priced_model(Some(3.0), Some(15.0), None, None);
+        let cost = usage.cost_usd(&model).unwrap();
+        assert!((cost - 18.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_token_usage_cost_usd_is_none_for_empty_or_all_zero_usage() {
+        let model = priced_model(Some(3.0), Some(15.0), Some(0.3), Some(3.75));
+        assert_eq!(TokenUsage::default().cost_usd(&model), None);
+        let zero = TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+        };
+        assert_eq!(zero.cost_usd(&model), None);
     }
 
     #[test]

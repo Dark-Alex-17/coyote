@@ -311,6 +311,7 @@ pub struct RequestContext {
     /// Usage reported by the most recent API call; reset on every completion
     /// so providers that report nothing never show stale numbers.
     pub last_token_usage: Option<TokenUsage>,
+    pub last_cost: Option<f64>,
 
     pub tool_scope: ToolScope,
 
@@ -372,6 +373,7 @@ impl RequestContext {
             agent: None,
             last_message: None,
             last_token_usage: None,
+            last_cost: None,
             tool_scope: ToolScope::default(),
             declared_function_names: Default::default(),
             node_job_scope: None,
@@ -437,6 +439,7 @@ impl RequestContext {
             agent: None,
             last_message: None,
             last_token_usage: None,
+            last_cost: None,
             tool_scope: ToolScope {
                 functions,
                 mcp_runtime,
@@ -499,6 +502,7 @@ impl RequestContext {
             agent: self.agent.clone(),
             last_message: self.last_message.clone(),
             last_token_usage: self.last_token_usage.clone(),
+            last_cost: self.last_cost,
             tool_scope: self.tool_scope.clone(),
             declared_function_names: self.declared_function_names.clone(),
             node_job_scope: None,
@@ -549,6 +553,7 @@ impl RequestContext {
             agent: None,
             last_message: None,
             last_token_usage: None,
+            last_cost: None,
             tool_scope: ToolScope {
                 functions: Functions::default(),
                 mcp_runtime: McpRuntime::default(),
@@ -2236,14 +2241,19 @@ impl RequestContext {
         }
     }
 
-    pub fn record_token_usage(&mut self, usage: Option<TokenUsage>) {
+    pub fn record_token_usage(&mut self, usage: Option<TokenUsage>, model: &Model) {
+        let cost = usage.as_ref().and_then(|u| u.cost_usd(model));
         if let Some(usage) = &usage {
             debug!("token-usage: {usage:?}");
             if let Some(session) = self.session.as_mut() {
                 session.accumulate_token_usage(usage);
+                if let Some(cost) = cost {
+                    session.accumulate_cost(cost);
+                }
             }
         }
         self.last_token_usage = usage;
+        self.last_cost = cost;
     }
 
     pub fn generate_prompt_context(&self, app: &AppConfig) -> HashMap<&str, String> {
@@ -2311,6 +2321,12 @@ impl RequestContext {
             if let Some(value) = usage.cache_creation_input_tokens {
                 output.insert("last_cache_creation_tokens", value.to_string());
             }
+            if let Some(value) = self.last_cost {
+                let rendered = format!("{value:.4}");
+                if rendered != "0.0000" {
+                    output.insert("last_cost", rendered);
+                }
+            }
         }
         if let Some(session) = &self.session {
             output.insert("session", session.name().to_string());
@@ -2334,6 +2350,10 @@ impl RequestContext {
             }
             if let Some(value) = usage.cache_creation_input_tokens {
                 output.insert("total_cache_creation_tokens", value.to_string());
+            }
+            let rendered = format!("{:.4}", session.cost());
+            if rendered != "0.0000" {
+                output.insert("total_cost", rendered);
             }
         }
         if let Some(rag) = &self.rag {
@@ -5343,6 +5363,7 @@ fn fork_base_name(name: &str) -> &str {
 mod tests {
     use super::super::mcp_factory::McpFactory;
     use super::*;
+    use crate::client::ModelData;
     use crate::config::AppState;
     use crate::config::agent::AgentConfig;
     use crate::config::bundles::BundleStore;
@@ -5460,22 +5481,37 @@ mod tests {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
     }
 
+    fn priced_model() -> Model {
+        let mut data = ModelData::new("test");
+        data.input_price = Some(10.0);
+        data.output_price = Some(100.0);
+        data.cache_read_price = Some(1.0);
+        data.cache_write_price = Some(20.0);
+        Model::from_config("provider", &[data]).remove(0)
+    }
+
     #[test]
     fn generate_prompt_context_emits_token_usage_vars() {
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
-        ctx.record_token_usage(Some(TokenUsage {
-            input_tokens: Some(120),
-            output_tokens: Some(8),
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: Some(100),
-        }));
-        ctx.record_token_usage(Some(TokenUsage {
-            input_tokens: Some(30),
-            output_tokens: Some(2),
-            cache_creation_input_tokens: Some(40),
-            cache_read_input_tokens: None,
-        }));
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(120),
+                output_tokens: Some(8),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(100),
+            }),
+            &priced_model(),
+        );
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(30),
+                output_tokens: Some(2),
+                cache_creation_input_tokens: Some(40),
+                cache_read_input_tokens: None,
+            }),
+            &priced_model(),
+        );
 
         let app = ctx.app.config.clone();
         let vars = ctx.generate_prompt_context(&app);
@@ -5509,21 +5545,49 @@ mod tests {
             vars.get("total_cache_creation_tokens").map(String::as_str),
             Some("40")
         );
+        // 30×10 + 2×100 + 40×20 per 1M = 0.0013; first call adds 0.0021.
+        assert_eq!(vars.get("last_cost").map(String::as_str), Some("0.0013"));
+        assert_eq!(vars.get("total_cost").map(String::as_str), Some("0.0034"));
     }
 
     #[test]
     fn generate_prompt_context_omits_token_usage_vars_when_provider_reports_none() {
         let mut ctx = create_test_ctx();
-        ctx.record_token_usage(Some(TokenUsage {
-            input_tokens: Some(1),
-            ..Default::default()
-        }));
-        ctx.record_token_usage(None);
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(1),
+                ..Default::default()
+            }),
+            &priced_model(),
+        );
+        ctx.record_token_usage(None, &priced_model());
 
         let app = ctx.app.config.clone();
         let vars = ctx.generate_prompt_context(&app);
         assert!(!vars.contains_key("last_input_tokens"));
         assert!(!vars.contains_key("total_input_tokens"));
+        assert!(!vars.contains_key("last_cost"));
+        assert!(!vars.contains_key("total_cost"));
+    }
+
+    #[test]
+    fn generate_prompt_context_omits_costs_that_render_as_zero() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        // 1 input token at $10/1M is 0.00001, which formats to "0.0000".
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(1),
+                ..Default::default()
+            }),
+            &priced_model(),
+        );
+
+        let app = ctx.app.config.clone();
+        let vars = ctx.generate_prompt_context(&app);
+        assert_eq!(vars.get("last_input_tokens").map(String::as_str), Some("1"));
+        assert!(!vars.contains_key("last_cost"));
+        assert!(!vars.contains_key("total_cost"));
     }
 
     fn test_decl(name: &str) -> FunctionDeclaration {

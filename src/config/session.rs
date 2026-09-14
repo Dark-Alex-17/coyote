@@ -24,6 +24,10 @@ pub const INTERRUPTED_RESPONSE_TEXT: &str = "[Response interrupted due to error]
 /// instead of thrashing every turn.
 const COMPRESSION_MIN_RECLAIM_DIVISOR: usize = 5;
 
+fn cost_is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Session {
     #[serde(rename(serialize = "model", deserialize = "model"))]
@@ -101,6 +105,8 @@ pub struct Session {
     auto_continue_paused: Option<String>,
     #[serde(default, skip_serializing_if = "TokenUsage::is_empty")]
     token_usage: TokenUsage,
+    #[serde(default, skip_serializing_if = "cost_is_zero")]
+    cost: f64,
 
     #[serde(skip)]
     model: Model,
@@ -276,6 +282,15 @@ impl Session {
         self.dirty = true;
     }
 
+    pub fn cost(&self) -> f64 {
+        self.cost
+    }
+
+    pub fn accumulate_cost(&mut self, cost: f64) {
+        self.cost += cost;
+        self.dirty = true;
+    }
+
     pub fn has_user_messages(&self) -> bool {
         self.messages.iter().any(|v| v.role.is_user())
     }
@@ -356,6 +371,9 @@ impl Session {
         }
         if let Some(value) = self.token_usage.cache_creation_input_tokens {
             data["cache_creation_tokens"] = value.into();
+        }
+        if self.cost != 0.0 {
+            data["total_cost"] = ((self.cost * 1e6).round() / 1e6).into();
         }
         data["messages"] = json!(self.messages);
 
@@ -466,6 +484,9 @@ impl Session {
         }
         if let Some(value) = self.token_usage.cache_creation_input_tokens {
             items.push(("cache_creation_tokens", value.to_string()));
+        }
+        if self.cost != 0.0 {
+            items.push(("total_cost", format!("${:.4}", self.cost)));
         }
 
         let mut lines: Vec<String> = items
@@ -1210,6 +1231,28 @@ mod tests {
         let session = Session::default();
         let yaml = serde_yaml::to_string(&session).unwrap();
         assert!(!yaml.contains("token_usage"));
+    }
+
+    #[test]
+    fn session_cost_accumulates_and_survives_yaml_round_trip() {
+        let mut session = Session::default();
+        assert_eq!(session.cost(), 0.0);
+
+        session.accumulate_cost(0.0025);
+        session.accumulate_cost(0.001);
+        assert!((session.cost() - 0.0035).abs() < 1e-12);
+        assert!(session.dirty());
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+        assert!((reloaded.cost() - 0.0035).abs() < 1e-12);
+    }
+
+    #[test]
+    fn session_zero_cost_is_not_serialized() {
+        let session = Session::default();
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        assert!(!yaml.contains("cost"));
     }
 
     #[test]

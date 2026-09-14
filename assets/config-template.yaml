@@ -240,10 +240,11 @@ theme: null                      # null = the built-in dark theme; set to `light
 left_prompt: null                # If null, uses the built-in default:
                                  #   '{color.red}{model}){color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
 right_prompt: null               # If null, uses the built-in default:
-                                 #   '{color.cyan}{?reasoning_effort [{reasoning_effort}] }{color.purple}{?last_cache_read_tokens ⚡{last_cache_read_tokens} }{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
+                                 #   '{color.cyan}{?reasoning_effort [{reasoning_effort}] }{color.purple}{?last_cache_read_tokens ⚡{last_cache_read_tokens} }{?total_cost ${total_cost} }{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
                                  # Token-usage variables (set only when the provider reports usage, so guard them with {?var ...}):
                                  #   last_input_tokens, last_output_tokens, last_cache_read_tokens, last_cache_creation_tokens (most recent API call)
                                  #   total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_creation_tokens (session cumulative)
+                                 #   last_cost, total_cost (USD, formatted like 0.0142; set only when nonzero and every billed token type has a price)
 
 # ---- Miscellaneous ----
 user_agent: null                 # Set User-Agent HTTP header, use `auto` for coyote/<current-version>

@@ -195,6 +195,22 @@ impl Model {
         self.data.max_output_tokens
     }
 
+    pub fn input_price(&self) -> Option<f64> {
+        self.data.input_price
+    }
+
+    pub fn output_price(&self) -> Option<f64> {
+        self.data.output_price
+    }
+
+    pub fn cache_read_price(&self) -> Option<f64> {
+        self.data.cache_read_price
+    }
+
+    pub fn cache_write_price(&self) -> Option<f64> {
+        self.data.cache_write_price
+    }
+
     pub fn supports_function_calling(&self) -> bool {
         self.data.supports_function_calling
     }
