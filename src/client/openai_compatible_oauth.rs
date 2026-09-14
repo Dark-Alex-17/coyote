@@ -51,6 +51,18 @@ impl OAuthProvider for OpenAICompatibleOAuthProvider {
             .collect()
     }
 
+    fn resource(&self) -> Option<&str> {
+        self.config.resource.as_deref()
+    }
+
+    fn extra_token_params(&self) -> Vec<(&str, &str)> {
+        self.config
+            .extra_token_params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
     fn token_request_format(&self) -> TokenRequestFormat {
         self.config
             .token_request_format

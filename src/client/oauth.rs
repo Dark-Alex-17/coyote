@@ -54,8 +54,11 @@ pub struct OAuthConfig {
     #[serde(default)]
     pub scopes: Vec<String>,
     pub token_request_format: Option<TokenRequestFormat>,
+    pub resource: Option<String>,
     #[serde(default)]
     pub extra_authorize_params: IndexMap<String, String>,
+    #[serde(default)]
+    pub extra_token_params: IndexMap<String, String>,
     #[serde(default)]
     pub extra_token_headers: IndexMap<String, String>,
     #[serde(default)]
@@ -98,9 +101,16 @@ impl OAuthConfig {
         if override_cfg.token_request_format.is_some() {
             self.token_request_format = override_cfg.token_request_format;
         }
+        if override_cfg.resource.is_some() {
+            self.resource = override_cfg.resource;
+        }
         if !override_cfg.extra_authorize_params.is_empty() {
             self.extra_authorize_params
                 .extend(override_cfg.extra_authorize_params);
+        }
+        if !override_cfg.extra_token_params.is_empty() {
+            self.extra_token_params
+                .extend(override_cfg.extra_token_params);
         }
         if !override_cfg.extra_token_headers.is_empty() {
             self.extra_token_headers
@@ -135,13 +145,25 @@ pub trait OAuthProvider: Send + Sync {
         vec![]
     }
 
+    /// RFC 8707 resource indicator identifying the protected resource the
+    /// token is for. Sent as the `resource` parameter on authorization
+    /// requests (PKCE authorize URL, device-authorization request) and on
+    /// every token request routed through `build_token_request`.
+    /// An `extra_authorize_params` or `extra_token_params` entry keyed
+    /// `resource` takes precedence over this value on its respective
+    /// surface.
+    fn resource(&self) -> Option<&str> {
+        None
+    }
+
     /// Extra form/body parameters appended to every token request routed
     /// through `build_token_request` (authorization-code exchange, refresh,
     /// client_credentials, and device-code polling). Used e.g. for the
     /// RFC 8707 `resource` indicator required by the MCP spec.
-    /// NOTE: these are merged AFTER the caller's params and will overwrite
-    /// a colliding key; do not return protocol parameter names
-    /// (grant_type, client_id, code, refresh_token, ...).
+    /// NOTE: these are merged AFTER the caller's params and the first-class
+    /// `resource()` value, and will overwrite a colliding key; do not
+    /// return protocol parameter names (grant_type, client_id, code,
+    /// refresh_token, ...).
     fn extra_token_params(&self) -> Vec<(&str, &str)> {
         vec![]
     }
@@ -219,6 +241,41 @@ pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> 
     }
 }
 
+fn build_authorize_url(
+    provider: &(impl OAuthProvider + ?Sized),
+    redirect_uri: &str,
+    code_challenge: &str,
+    state: &str,
+) -> String {
+    let scopes = provider.scopes();
+    let mut authorize_url = format!(
+        "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}",
+        provider.authorize_url(),
+        provider.client_id(),
+        urlencoding::encode(&scopes),
+        urlencoding::encode(redirect_uri),
+        code_challenge,
+        state
+    );
+
+    let extra_params = provider.extra_authorize_params();
+    for (key, value) in &extra_params {
+        authorize_url.push_str(&format!(
+            "&{}={}",
+            urlencoding::encode(key),
+            urlencoding::encode(value)
+        ));
+    }
+
+    if let Some(resource) = provider.resource()
+        && !extra_params.iter().any(|(key, _)| *key == "resource")
+    {
+        authorize_url.push_str(&format!("&resource={}", urlencoding::encode(resource)));
+    }
+
+    authorize_url
+}
+
 async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Result<()> {
     let random_bytes: [u8; 32] = rand::random::<[u8; 32]>();
     let code_verifier = URL_SAFE_NO_PAD.encode(random_bytes);
@@ -241,27 +298,7 @@ async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Resul
         (provider.redirect_uri().to_string(), false)
     };
 
-    let scopes = provider.scopes();
-    let encoded_scopes = urlencoding::encode(&scopes);
-    let encoded_redirect = urlencoding::encode(&redirect_uri);
-
-    let mut authorize_url = format!(
-        "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}",
-        provider.authorize_url(),
-        provider.client_id(),
-        encoded_scopes,
-        encoded_redirect,
-        code_challenge,
-        state
-    );
-
-    for (key, value) in provider.extra_authorize_params() {
-        authorize_url.push_str(&format!(
-            "&{}={}",
-            urlencoding::encode(key),
-            urlencoding::encode(value)
-        ));
-    }
+    let authorize_url = build_authorize_url(provider, &redirect_uri, &code_challenge, &state);
 
     println!(
         "\nOpen this URL to authenticate with {} (client '{}'):\n",
@@ -399,6 +436,28 @@ async fn run_client_credentials_flow(
     Ok(())
 }
 
+fn build_device_authorization_params<'a>(
+    provider: &'a (impl OAuthProvider + ?Sized),
+    scopes: &'a str,
+    pkce_challenge: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut device_params: Vec<(&str, &str)> = vec![("client_id", provider.client_id())];
+    if !scopes.is_empty() {
+        device_params.push(("scope", scopes));
+    }
+
+    if let Some(challenge) = pkce_challenge {
+        device_params.push(("code_challenge", challenge));
+        device_params.push(("code_challenge_method", "S256"));
+    }
+
+    if let Some(resource) = provider.resource() {
+        device_params.push(("resource", resource));
+    }
+
+    device_params
+}
+
 async fn run_device_code_flow(provider: &dyn OAuthProvider, client_name: &str) -> Result<()> {
     let device_auth_url = provider.device_authorization_url().ok_or_else(|| {
         anyhow!(
@@ -422,14 +481,11 @@ async fn run_device_code_flow(provider: &dyn OAuthProvider, client_name: &str) -
     };
 
     let scopes = provider.scopes();
-    let mut device_params: Vec<(&str, &str)> = vec![("client_id", provider.client_id())];
-    if !scopes.is_empty() {
-        device_params.push(("scope", scopes.as_str()));
-    }
-    if let Some((_, ref challenge)) = pkce {
-        device_params.push(("code_challenge", challenge.as_str()));
-        device_params.push(("code_challenge_method", "S256"));
-    }
+    let device_params = build_device_authorization_params(
+        provider,
+        &scopes,
+        pkce.as_ref().map(|(_, challenge)| challenge.as_str()),
+    );
     let form: HashMap<&str, &str> = device_params.iter().copied().collect();
 
     let mut device_request = client
@@ -803,6 +859,7 @@ fn build_token_request(
     let all_params: Vec<(&str, &str)> = params
         .iter()
         .copied()
+        .chain(provider.resource().map(|r| ("resource", r)))
         .chain(provider.extra_token_params())
         .collect();
     let mut request = match provider.token_request_format() {
@@ -1095,7 +1152,9 @@ mod tests {
             device_authorization_url: None,
             scopes: vec!["a".into(), "b".into()],
             token_request_format: Some(TokenRequestFormat::FormUrlEncoded),
+            resource: None,
             extra_authorize_params: IndexMap::from([("plan".into(), "base".into())]),
+            extra_token_params: IndexMap::new(),
             extra_token_headers: IndexMap::new(),
             extra_request_headers: IndexMap::new(),
             echo_pkce_in_token_exchange: false,
@@ -1116,7 +1175,9 @@ mod tests {
             device_authorization_url: None,
             scopes: vec![],
             token_request_format: None,
+            resource: None,
             extra_authorize_params: IndexMap::new(),
+            extra_token_params: IndexMap::new(),
             extra_token_headers: IndexMap::new(),
             extra_request_headers: IndexMap::new(),
             echo_pkce_in_token_exchange: false,
@@ -1430,6 +1491,54 @@ echo_pkce_in_token_exchange: true
     }
 
     #[test]
+    fn oauth_config_merge_user_resource_wins() {
+        let mut base = base_config();
+        base.resource = Some("https://base.example/".into());
+        let mut user = empty_user_override("user-id", "https://user.example/token");
+        user.resource = Some("https://user.example/".into());
+
+        let merged = base.merge(user);
+
+        assert_eq!(merged.resource.as_deref(), Some("https://user.example/"));
+    }
+
+    #[test]
+    fn oauth_config_merge_preserves_resource_when_user_omits() {
+        let mut base = base_config();
+        base.resource = Some("https://base.example/".into());
+        let user = empty_user_override("user-id", "https://user.example/token");
+
+        let merged = base.merge(user);
+
+        assert_eq!(merged.resource.as_deref(), Some("https://base.example/"));
+    }
+
+    #[test]
+    fn oauth_config_merge_extends_extra_token_params() {
+        let mut base = base_config();
+        base.extra_token_params = IndexMap::from([
+            ("audience".into(), "base".into()),
+            ("kept".into(), "yes".into()),
+        ]);
+        let mut user = empty_user_override("user-id", "https://user.example/token");
+        user.extra_token_params = IndexMap::from([("audience".into(), "user".into())]);
+
+        let merged = base.merge(user);
+
+        assert_eq!(
+            merged
+                .extra_token_params
+                .get("audience")
+                .map(String::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            merged.extra_token_params.get("kept").map(String::as_str),
+            Some("yes")
+        );
+    }
+
+    #[test]
     fn openai_compatible_provider_exposes_device_authorization_url() {
         let mut cfg = base_config();
         cfg.device_authorization_url = Some("https://example/device".into());
@@ -1476,6 +1585,21 @@ echo_pkce_in_token_exchange: true
         };
 
         assert!(provider.use_pkce_in_device_flow());
+    }
+
+    #[test]
+    fn openai_compatible_provider_exposes_resource_and_extra_token_params() {
+        let mut cfg = base_config();
+        cfg.resource = Some("https://rs.example/".into());
+        cfg.extra_token_params = IndexMap::from([("audience".into(), "gateway".into())]);
+
+        let provider = OpenAICompatibleOAuthProvider {
+            config: cfg,
+            client_name: "test".into(),
+        };
+
+        assert_eq!(provider.resource(), Some("https://rs.example/"));
+        assert_eq!(provider.extra_token_params(), vec![("audience", "gateway")]);
     }
 
     #[test]
@@ -1601,6 +1725,30 @@ scopes:
         assert_eq!(cfg.scopes, vec!["read", "write"]);
     }
 
+    #[test]
+    fn oauth_config_serde_parses_resource_and_extra_token_params() {
+        let yaml = r#"
+flow: device_code
+client_id: 1a2b3c4d-1a2b-1234-987a-1a2b3c4d5e6f
+device_authorization_url: https://some.site.com/oauth/device_authorization
+token_url: https://some.site.com/oauth/token
+scopes: [invoke]
+resource: https://some.site.com/
+extra_token_params:
+  audience: me
+"#;
+
+        let cfg: OAuthConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(matches!(cfg.flow, OAuthFlow::DeviceCode));
+        assert_eq!(cfg.resource.as_deref(), Some("https://some.site.com/"));
+        assert_eq!(
+            cfg.extra_token_params.get("audience").map(String::as_str),
+            Some("me")
+        );
+        assert_eq!(cfg.scopes, vec!["invoke"]);
+    }
+
     struct ResourceStubProvider;
 
     impl OAuthProvider for ResourceStubProvider {
@@ -1657,6 +1805,283 @@ scopes:
         assert!(
             body.contains("grant_type=authorization_code"),
             "body missing grant_type param: {body}"
+        );
+    }
+
+    #[test]
+    fn build_token_request_appends_first_class_resource_to_form_body() {
+        let mut cfg = base_config();
+        cfg.resource = Some("https://rs.example/".into());
+        let provider = OpenAICompatibleOAuthProvider {
+            config: cfg,
+            client_name: "test".into(),
+        };
+
+        let request = build_token_request(
+            &ReqwestClient::new(),
+            &provider,
+            &[("grant_type", "refresh_token")],
+        )
+        .build()
+        .unwrap();
+
+        let body = str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(
+            body.contains("resource=https%3A%2F%2Frs.example%2F"),
+            "body missing resource param: {body}"
+        );
+        assert!(
+            body.contains("grant_type=refresh_token"),
+            "body missing grant_type param: {body}"
+        );
+    }
+
+    struct CollidingResourceStubProvider;
+
+    impl OAuthProvider for CollidingResourceStubProvider {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn client_id(&self) -> &str {
+            "stub-client"
+        }
+
+        fn authorize_url(&self) -> &str {
+            "https://as.example/authorize"
+        }
+
+        fn token_url(&self) -> &str {
+            "https://as.example/token"
+        }
+
+        fn redirect_uri(&self) -> &str {
+            ""
+        }
+
+        fn scopes(&self) -> String {
+            String::new()
+        }
+
+        fn token_request_format(&self) -> TokenRequestFormat {
+            TokenRequestFormat::FormUrlEncoded
+        }
+
+        fn resource(&self) -> Option<&str> {
+            Some("first-class")
+        }
+
+        fn extra_token_params(&self) -> Vec<(&str, &str)> {
+            vec![("resource", "override")]
+        }
+    }
+
+    #[test]
+    fn build_token_request_extra_token_params_win_resource_collision() {
+        let provider = CollidingResourceStubProvider;
+
+        let request = build_token_request(
+            &ReqwestClient::new(),
+            &provider,
+            &[("grant_type", "authorization_code")],
+        )
+        .build()
+        .unwrap();
+
+        let body = str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(
+            body.contains("resource=override"),
+            "extra_token_params did not win collision: {body}"
+        );
+        assert!(
+            !body.contains("first-class"),
+            "first-class resource not overridden: {body}"
+        );
+    }
+
+    struct JsonCollidingResourceStubProvider;
+
+    impl OAuthProvider for JsonCollidingResourceStubProvider {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn client_id(&self) -> &str {
+            "stub-client"
+        }
+
+        fn authorize_url(&self) -> &str {
+            "https://as.example/authorize"
+        }
+
+        fn token_url(&self) -> &str {
+            "https://as.example/token"
+        }
+
+        fn redirect_uri(&self) -> &str {
+            ""
+        }
+
+        fn scopes(&self) -> String {
+            String::new()
+        }
+
+        fn token_request_format(&self) -> TokenRequestFormat {
+            TokenRequestFormat::Json
+        }
+
+        fn resource(&self) -> Option<&str> {
+            Some("first-class")
+        }
+
+        fn extra_token_params(&self) -> Vec<(&str, &str)> {
+            vec![("resource", "override")]
+        }
+    }
+
+    #[test]
+    fn build_token_request_extra_token_params_win_resource_collision_json() {
+        let provider = JsonCollidingResourceStubProvider;
+
+        let request = build_token_request(
+            &ReqwestClient::new(),
+            &provider,
+            &[("grant_type", "authorization_code")],
+        )
+        .build()
+        .unwrap();
+
+        let body = str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(
+            body.contains(r#""resource":"override""#),
+            "extra_token_params did not win collision: {body}"
+        );
+        assert!(
+            !body.contains("first-class"),
+            "first-class resource not overridden: {body}"
+        );
+    }
+
+    #[test]
+    fn build_token_request_omits_resource_when_unset() {
+        let provider = OpenAICompatibleOAuthProvider {
+            config: base_config(),
+            client_name: "test".into(),
+        };
+
+        let request = build_token_request(
+            &ReqwestClient::new(),
+            &provider,
+            &[("grant_type", "refresh_token")],
+        )
+        .build()
+        .unwrap();
+
+        let body = str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(
+            !body.contains("resource="),
+            "unexpected resource param: {body}"
+        );
+    }
+
+    #[test]
+    fn build_authorize_url_includes_resource_when_set() {
+        let mut cfg = base_config();
+        cfg.resource = Some("https://rs.example/".into());
+        let provider = OpenAICompatibleOAuthProvider {
+            config: cfg,
+            client_name: "test".into(),
+        };
+
+        let url = build_authorize_url(
+            &provider,
+            "http://127.0.0.1:1234/callback",
+            "challenge",
+            "state",
+        );
+        assert!(
+            url.contains("&resource=https%3A%2F%2Frs.example%2F"),
+            "authorize URL missing resource param: {url}"
+        );
+    }
+
+    #[test]
+    fn build_authorize_url_omits_resource_when_none() {
+        let provider = OpenAICompatibleOAuthProvider {
+            config: base_config(),
+            client_name: "test".into(),
+        };
+
+        let url = build_authorize_url(
+            &provider,
+            "http://127.0.0.1:1234/callback",
+            "challenge",
+            "state",
+        );
+        assert!(
+            !url.contains("resource="),
+            "unexpected resource param: {url}"
+        );
+    }
+
+    #[test]
+    fn build_authorize_url_extra_authorize_params_win_resource_collision() {
+        let mut cfg = base_config();
+        cfg.resource = Some("first-class".into());
+        cfg.extra_authorize_params = IndexMap::from([("resource".into(), "override".into())]);
+        let provider = OpenAICompatibleOAuthProvider {
+            config: cfg,
+            client_name: "test".into(),
+        };
+
+        let url = build_authorize_url(
+            &provider,
+            "http://127.0.0.1:1234/callback",
+            "challenge",
+            "state",
+        );
+        assert_eq!(
+            url.matches("resource=").count(),
+            1,
+            "resource param not deduped: {url}"
+        );
+        assert!(
+            url.contains("&resource=override"),
+            "extra_authorize_params did not win collision: {url}"
+        );
+        assert!(
+            !url.contains("first-class"),
+            "first-class resource not overridden: {url}"
+        );
+    }
+
+    #[test]
+    fn build_device_authorization_params_includes_resource_when_set() {
+        let mut cfg = base_config();
+        cfg.resource = Some("https://rs.example/".into());
+        let provider = OpenAICompatibleOAuthProvider {
+            config: cfg,
+            client_name: "test".into(),
+        };
+
+        let params = build_device_authorization_params(&provider, "a b", None);
+        assert!(
+            params.contains(&("resource", "https://rs.example/")),
+            "device params missing resource: {params:?}"
+        );
+    }
+
+    #[test]
+    fn build_device_authorization_params_omits_resource_when_none() {
+        let provider = OpenAICompatibleOAuthProvider {
+            config: base_config(),
+            client_name: "test".into(),
+        };
+
+        let params = build_device_authorization_params(&provider, "a b", Some("challenge"));
+        assert!(
+            !params.iter().any(|(key, _)| *key == "resource"),
+            "unexpected resource param: {params:?}"
         );
     }
 
