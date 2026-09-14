@@ -276,6 +276,7 @@ pub struct Config {
     pub save_session: Option<bool>,
     pub compression_threshold: usize,
     pub compression_keep_last: usize,
+    pub compression_model: Option<String>,
     pub summarization_prompt: Option<String>,
     pub summary_context_prompt: Option<String>,
     pub max_tool_result_chars: Option<usize>,
@@ -363,6 +364,7 @@ impl Default for Config {
             save_session: None,
             compression_threshold: 4000,
             compression_keep_last: 0,
+            compression_model: None,
             summarization_prompt: None,
             summary_context_prompt: None,
             max_tool_result_chars: None,
@@ -1300,6 +1302,7 @@ clients:
         assert!(cfg.function_calling_support);
         assert!(cfg.mcp_server_support);
         assert_eq!(cfg.compression_threshold, 4000);
+        assert!(cfg.compression_model.is_none());
         assert_eq!(cfg.rag_top_k, 5);
         assert!(cfg.save_shell_history);
         assert_eq!(cfg.keybindings, "emacs");

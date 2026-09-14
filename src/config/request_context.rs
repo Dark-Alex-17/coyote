@@ -1006,6 +1006,13 @@ impl RequestContext {
             .unwrap_or(self.app.config.compression_keep_last)
     }
 
+    pub fn compression_model(&self) -> Option<String> {
+        self.agent
+            .as_ref()
+            .and_then(|a| a.compression_model().map(|s| s.to_string()))
+            .or_else(|| self.app.config.compression_model.clone())
+    }
+
     pub fn role_like_mut(&mut self) -> Option<&mut dyn RoleLike> {
         if let Some(session) = self.session.as_mut() {
             Some(session)
@@ -5129,10 +5136,45 @@ impl RequestContext {
             .summarization_prompt
             .clone()
             .unwrap_or_else(|| SUMMARIZATION_PROMPT.into());
-        let input = Input::from_str(self, &prompt, None)?;
-        let summary = tokio::time::timeout(Duration::from_secs(120), input.fetch_chat_text())
-            .await
-            .map_err(|_| anyhow::anyhow!("Compression LLM call timed out after 120 s"))??;
+
+        async fn timed_fetch(input: &Input) -> Result<String> {
+            tokio::time::timeout(Duration::from_secs(120), input.fetch_chat_text())
+                .await
+                .map_err(|_| anyhow::anyhow!("Compression LLM call timed out after 120 s"))?
+        }
+
+        let mut input = Input::from_str(self, &prompt, None)?;
+        let compression_model_id = self
+            .compression_model()
+            .filter(|id| *id != self.current_model().id());
+        let summary = match compression_model_id {
+            Some(model_id) => {
+                match Model::retrieve_model(self.app.config.as_ref(), &model_id, ModelType::Chat) {
+                    Ok(model) => {
+                        input.set_role_model(model);
+                        match timed_fetch(&input).await {
+                            Ok(summary) => summary,
+                            Err(err) => {
+                                eprintln!(
+                                    "Warning: compression model '{model_id}' failed: {err}; falling back to the current model '{}' for session compression",
+                                    self.current_model().id()
+                                );
+                                let input = Input::from_str(self, &prompt, None)?;
+                                timed_fetch(&input).await?
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "Warning: compression model '{model_id}' could not be used ({err}); falling back to the current model '{}' for session compression",
+                            self.current_model().id()
+                        );
+                        timed_fetch(&input).await?
+                    }
+                }
+            }
+            None => timed_fetch(&input).await?,
+        };
         let summary_context_prompt = self
             .app
             .config
@@ -5798,6 +5840,49 @@ mod tests {
         let extracted = ctx.extract_role(&app).unwrap();
 
         assert_eq!(extracted.reasoning_effort(), Some("low".to_string()));
+    }
+
+    #[test]
+    fn compression_model_none_when_unset() {
+        let ctx = create_test_ctx();
+        assert_eq!(ctx.compression_model(), None);
+    }
+
+    #[test]
+    fn compression_model_uses_app_config_without_agent() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                compression_model: Some("openai:app-model".to_string()),
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        assert_eq!(
+            ctx.compression_model(),
+            Some("openai:app-model".to_string())
+        );
+    }
+
+    #[test]
+    fn compression_model_agent_overrides_app_config() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                compression_model: Some("openai:app-model".to_string()),
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "test-agent".to_string(),
+            compression_model: Some("openai:agent-model".to_string()),
+            ..AgentConfig::default()
+        }));
+        assert_eq!(
+            ctx.compression_model(),
+            Some("openai:agent-model".to_string())
+        );
     }
 
     #[test]

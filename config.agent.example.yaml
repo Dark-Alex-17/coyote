@@ -48,6 +48,7 @@ max_concurrent_jobs: 5           # Max background jobs (`job__*` tools) running 
 inject_spawn_instructions: true  # Inject the default agent spawning instructions into the agent's system prompt
 summarization_model: null        # Model to use for summarizing sub-agent output (e.g. 'openai:gpt-4o-mini'); defaults to current model
 summarization_threshold: 4000    # Character threshold above which sub-agent output is summarized before returning to parent
+compression_model: null          # Model to use for session compression for this agent (overrides the global setting); defaults to current model
 escalation_timeout: 0            # 0 = wait indefinitely for the reply (default); N = give up after N seconds
 mcp_servers:          # Optional list of MCP servers that the agent utilizes
   - github            # Corresponds to the name of an MCP server in the `<coyote-config-dir>/mcp.json` file

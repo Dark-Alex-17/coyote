@@ -317,6 +317,10 @@ impl Input {
         &self.role
     }
 
+    pub fn set_role_model(&mut self, model: Model) {
+        self.role.set_model(model);
+    }
+
     pub fn session<'a>(&self, session: &'a Option<Session>) -> Option<&'a Session> {
         if self.with_session {
             session.as_ref()
@@ -856,6 +860,17 @@ mod tests {
         let input = Input::from_str(&ctx, "test", None).unwrap();
         let session = Some(Session::default());
         assert!(input.session(&session).is_some());
+    }
+
+    #[test]
+    fn set_role_model_swaps_model_preserving_with_session() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let mut input = Input::from_str(&ctx, "test", None).unwrap();
+        assert!(input.with_session());
+        input.set_role_model(Model::new("provider", "compress-model"));
+        assert_eq!(input.role().model().id(), "provider:compress-model");
+        assert!(input.with_session());
     }
 
     #[test]

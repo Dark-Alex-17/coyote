@@ -635,6 +635,10 @@ impl Agent {
         self.config.compression_keep_last
     }
 
+    pub fn compression_model(&self) -> Option<&str> {
+        self.config.compression_model.as_deref()
+    }
+
     pub fn is_dynamic_instructions(&self) -> bool {
         self.config.dynamic_instructions
     }
@@ -832,6 +836,8 @@ pub struct AgentConfig {
     pub max_concurrent_jobs: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_keep_last: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_model: Option<String>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]

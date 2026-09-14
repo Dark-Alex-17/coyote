@@ -173,6 +173,7 @@ agent_session: null              # Set a session to use when starting an agent (
 save_session: null               # Controls the persistence of the session. If true, auto save; if false, don't auto-save; if null, ask the user what to do
 compression_threshold: 4000      # Compress the session when the token count reaches or exceeds this threshold
 compression_keep_last: 0         # Number of most-recent messages to keep visible after compression (0 = compress all messages)
+compression_model: null          # Model to use for session compression (e.g. 'openai:gpt-4o-mini'); defaults to the session's current model
 summarization_prompt: null       # The text prompt used for creating a concise summary of session messages. If null, uses built-in default
 summary_context_prompt: null     # The text prompt used for including the summary of the entire session as context to the model. If null, uses built-in default
 max_tool_result_chars: null      # Cap on tool result characters forwarded to the model per call (null = no cap)
