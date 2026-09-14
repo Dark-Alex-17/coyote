@@ -41,13 +41,14 @@ variables:
 settings:
   max_loop_iterations: 10
   log_state_snapshots: true
-  # max over agent lanes of (max_attempts × lane timeout) = 2 × 11400 = 22800
-  # (agent-node retries each get a fresh per-attempt budget,
-  # src/graph/agent.rs retry_transient/bounded_attempt) + 1200 margin for
-  # the script stages (signals/select/build/gate) = 24000; the parse and
-  # select_lanes llm nodes carry no `timeout:` and are bounded by
-  # max_iterations.
-  timeout: 24000
+  # A faulted lane can be re-run by retry_gate for up to 3 passes, and each
+  # pass's agent node retries up to max_attempts = 2 with a fresh per-attempt
+  # budget (src/graph/agent.rs retry_transient/bounded_attempt):
+  # 3 passes × 2 attempts × 11400 (max lane timeout) = 68400, + 1200 margin
+  # for the script stages (signals/select/build/retry gate/verdict gate)
+  # = 69600; the parse and select_lanes llm nodes carry no `timeout:` and
+  # are bounded by max_iterations.
+  timeout: 69600
 
 initial_state:
   diff_spec: worktree
@@ -84,6 +85,11 @@ initial_state:
   adversary_results: []
   security_results: []
   probe_results: []
+  lane_attempts: {}
+  kept_results: {}
+  retry_lanes: []
+  review_incomplete: []
+  gauntlet_started_at: 0
   lanes_summary: ''
   gauntlet_verdict: ''
   gauntlet_report: ''
@@ -251,7 +257,7 @@ nodes:
   build_items:
     id: build_items
     type: script
-    description: Deterministic lane builder — hard rules are the floor, LLM flags may only add, forced lanes override exactly. Emits one 0-or-1-item list per lane; an empty list skips that lane's map.
+    description: Deterministic lane builder — hard rules are the floor, LLM flags may only add, forced lanes override exactly. Emits one 0-or-1-item list per lane; an empty list skips that lane's map. On a re-run pass (retry_lanes non-empty) it skips selection and emits items only for those lanes, each carrying its attempt number.
     script: scripts/build_items.py
     timeout: 30
     next: [map_code_review, map_adversary, map_security, map_probe]
@@ -265,7 +271,7 @@ nodes:
     output_key: lane_out
     collect_into: code_review_results
     max_concurrency: 1
-    next: verdict_gate
+    next: retry_gate
 
   map_adversary:
     id: map_adversary
@@ -276,7 +282,7 @@ nodes:
     output_key: lane_out
     collect_into: adversary_results
     max_concurrency: 1
-    next: verdict_gate
+    next: retry_gate
 
   map_security:
     id: map_security
@@ -287,7 +293,7 @@ nodes:
     output_key: lane_out
     collect_into: security_results
     max_concurrency: 1
-    next: verdict_gate
+    next: retry_gate
 
   map_probe:
     id: map_probe
@@ -298,7 +304,7 @@ nodes:
     output_key: lane_out
     collect_into: probe_results
     max_concurrency: 1
-    next: verdict_gate
+    next: retry_gate
 
   run_code_review:
     id: run_code_review
@@ -411,6 +417,14 @@ nodes:
     description: Fail-closed lane fault marker (reached only via the run_* lanes' fallback routes; shared across the four map branches). Normalizes the engine's "Agent node failed" text in lane_out into a PIPELINE-FAULT lane result the map collects; verdict_gate turns it into BLOCKED — a degraded lane is never a pass.
     script: scripts/lane_fault.py
     timeout: 30
+
+  retry_gate:
+    id: retry_gate
+    type: script
+    description: Deterministic fault-only re-run gate. Stashes every lane report that ran this pass, restores reports a re-run pass overwrote with [] (a lane not being re-run maps over nothing), classifies each lane that ran as completed / faulted / skipped, counts attempts, and routes back into build_items for faulted lanes that still have attempts left inside the wall-clock budget; otherwise it records them in review_incomplete and falls through to verdict_gate. A real verdict is never re-run, and a gate crash never retries — it records a PIPELINE-FAULT and falls through.
+    script: scripts/retry_gate.py
+    timeout: 30
+    next: verdict_gate
 
   verdict_gate:
     id: verdict_gate

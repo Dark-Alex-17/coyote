@@ -12,6 +12,7 @@ import json
 import os
 import re
 import subprocess
+import time
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
@@ -37,6 +38,10 @@ def git(*args):
 
 
 out = {"project_dir": proj}
+# retry_gate measures its wall-clock budget from this stamp; it is set
+# before the git work so a failed diff still starts the clock.
+if not state.get("gauntlet_started_at"):
+    out["gauntlet_started_at"] = time.time()
 try:
     if spec in ("", "worktree"):
         names = git("diff", "--name-only", "HEAD")

@@ -11663,6 +11663,631 @@ mod tests {
         );
     }
 
+    fn now_secs() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    }
+
+    /// State for a single gauntlet lane whose map ran one item and collected
+    /// `report`, stamped with a fresh start so the retry budget is open.
+    fn gauntlet_lane_ran(lane: &str, report: &str) -> serde_json::Value {
+        let key = lane.replace('-', "_");
+        let mut state = json!({ "gauntlet_started_at": now_secs() });
+        state[format!("{key}_items").as_str()] = json!([{ "lane": lane }]);
+        state[format!("{key}_results").as_str()] = json!([report]);
+        state
+    }
+
+    const GAUNTLET_MERGE_READY: &str = "# Review\n\n**Verdict: MERGE-READY**\n";
+    const GAUNTLET_ADVERSARY_FAULT: &str =
+        "PIPELINE-FAULT: adversary lane failed after retries — Agent node failed: boom";
+
+    #[test]
+    fn gauntlet_retry_gate_stashes_and_restores_reports() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let first = run_gauntlet_script(
+            "retry_gate.py",
+            &json!({
+                "code_review_items": [{"lane": "code-review"}],
+                "code_review_results": [GAUNTLET_MERGE_READY],
+                "adversary_items": [{"lane": "adversary"}],
+                "adversary_results": [GAUNTLET_ADVERSARY_FAULT],
+                "gauntlet_started_at": now_secs(),
+            }),
+        );
+        assert_eq!(
+            first["kept_results"],
+            json!({"code-review": GAUNTLET_MERGE_READY, "adversary": GAUNTLET_ADVERSARY_FAULT}),
+            "completed and faulted lanes must both be stashed verbatim: {first}"
+        );
+        assert_eq!(first["retry_lanes"], json!(["adversary"]), "{first}");
+        assert_eq!(first["_next"], "build_items", "{first}");
+
+        // The re-run pass: code-review's map ran nothing and overwrote its
+        // collected results with []; adversary ran again and completed.
+        let second = run_gauntlet_script(
+            "retry_gate.py",
+            &json!({
+                "code_review_items": [],
+                "code_review_results": [],
+                "adversary_items": [{"lane": "adversary", "attempt": 2}],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS\nCriteria: all verified"],
+                "kept_results": first["kept_results"],
+                "lane_attempts": first["lane_attempts"],
+                "gauntlet_started_at": now_secs(),
+            }),
+        );
+        assert_eq!(
+            second["code_review_results"],
+            json!([GAUNTLET_MERGE_READY]),
+            "the overwritten code-review report must be restored from the stash: {second}"
+        );
+        assert_eq!(second["retry_lanes"], json!([]), "{second}");
+        assert!(
+            second.get("_next").is_none(),
+            "a pass with nothing to retry must fall through statically: {second}"
+        );
+        assert_eq!(
+            second["kept_results"]["adversary"],
+            "ADVERSARIAL_REVIEW: CONFORMS\nCriteria: all verified",
+            "the stash must carry the lane's latest report: {second}"
+        );
+        assert_eq!(second["lane_attempts"]["adversary"], 2, "{second}");
+
+        // A pass where nothing ran: both lanes come back from the stash,
+        // the faulted adversary report included — it is restored, not
+        // re-classified for another retry.
+        let restored = run_gauntlet_script(
+            "retry_gate.py",
+            &json!({
+                "code_review_items": [],
+                "code_review_results": [],
+                "adversary_items": [],
+                "adversary_results": [],
+                "security_items": [],
+                "security_results": [],
+                "probe_items": [],
+                "probe_results": [],
+                "kept_results": first["kept_results"],
+                "lane_attempts": first["lane_attempts"],
+                "gauntlet_started_at": now_secs(),
+            }),
+        );
+        assert_eq!(
+            restored["code_review_results"],
+            json!([GAUNTLET_MERGE_READY]),
+            "{restored}"
+        );
+        assert_eq!(
+            restored["adversary_results"],
+            json!([GAUNTLET_ADVERSARY_FAULT]),
+            "a faulted stash is restored as-is for the verdict gate: {restored}"
+        );
+        assert_eq!(restored["retry_lanes"], json!([]), "{restored}");
+        assert!(
+            restored.get("_next").is_none(),
+            "restoring a stash must never trigger a retry: {restored}"
+        );
+        assert_eq!(
+            restored["lane_attempts"], first["lane_attempts"],
+            "a lane that did not run must not be charged an attempt: {restored}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_retry_gate_classifies_lane_reports() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let completed = run_gauntlet_script(
+            "retry_gate.py",
+            &gauntlet_lane_ran("code-review", GAUNTLET_MERGE_READY),
+        );
+        assert_eq!(
+            completed["retry_lanes"],
+            json!([]),
+            "a report carrying its sentinel is completed, never re-run: {completed}"
+        );
+        assert!(completed.get("_next").is_none(), "{completed}");
+
+        let faulted = [
+            ("adversary", GAUNTLET_ADVERSARY_FAULT),
+            ("security", "some text"),
+            (
+                "code-review",
+                "# Review\n\n**Verdict: NEEDS-HUMAN** — 1 pipeline fault(s) recorded; see Human attention required\n\n## Findings\n",
+            ),
+            (
+                "adversary",
+                "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: none verified — degraded run: pipeline fault recorded (fail-closed).\nComplaints:\n- none",
+            ),
+        ];
+        for (lane, report) in faulted {
+            let out = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran(lane, report));
+            assert_eq!(
+                out["retry_lanes"],
+                json!([lane]),
+                "{lane} report {report:?} must classify as faulted: {out}"
+            );
+            assert_eq!(out["_next"], "build_items", "{lane}: {out}");
+        }
+
+        // A lane whose map ran nothing (items []) is skipped: no attempt, no
+        // retry, no incompleteness — and nothing to restore without a stash.
+        let mut state = gauntlet_lane_ran("adversary", GAUNTLET_ADVERSARY_FAULT);
+        state["probe_items"] = json!([]);
+        state["probe_results"] = json!([]);
+        let out = run_gauntlet_script("retry_gate.py", &state);
+        assert_eq!(out["retry_lanes"], json!(["adversary"]), "{out}");
+        assert_eq!(out["review_incomplete"], json!([]), "{out}");
+        assert!(
+            out["lane_attempts"].get("probe").is_none(),
+            "a skipped lane must not count an attempt: {out}"
+        );
+        assert!(out.get("probe_results").is_none(), "{out}");
+    }
+
+    #[test]
+    fn gauntlet_retry_gate_counts_attempts_per_lane_that_ran() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script(
+            "retry_gate.py",
+            &json!({
+                "code_review_items": [{"lane": "code-review"}],
+                "code_review_results": [GAUNTLET_MERGE_READY],
+                "adversary_items": [{"lane": "adversary"}],
+                "adversary_results": [GAUNTLET_ADVERSARY_FAULT],
+                "security_items": [],
+                "probe_items": [],
+                "gauntlet_started_at": now_secs(),
+            }),
+        );
+        assert_eq!(
+            out["lane_attempts"],
+            json!({"code-review": 1, "adversary": 1}),
+            "only lanes that ran count an attempt: {out}"
+        );
+
+        let mut state = gauntlet_lane_ran("adversary", GAUNTLET_ADVERSARY_FAULT);
+        state["lane_attempts"] = json!({"adversary": 1});
+        let out = run_gauntlet_script("retry_gate.py", &state);
+        assert_eq!(out["lane_attempts"]["adversary"], 2, "{out}");
+    }
+
+    #[test]
+    fn gauntlet_retry_gate_retries_until_attempts_are_exhausted() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        for prior in [0, 1] {
+            let mut state = gauntlet_lane_ran("adversary", GAUNTLET_ADVERSARY_FAULT);
+            state["lane_attempts"] = json!({"adversary": prior});
+            let out = run_gauntlet_script("retry_gate.py", &state);
+            assert_eq!(
+                out["_next"],
+                "build_items",
+                "attempt {} must route back into the builder: {out}",
+                prior + 1
+            );
+            assert_eq!(out["retry_lanes"], json!(["adversary"]), "{out}");
+            assert_eq!(
+                out["kept_results"]["adversary"], GAUNTLET_ADVERSARY_FAULT,
+                "{out}"
+            );
+            assert_eq!(out["review_incomplete"], json!([]), "{out}");
+        }
+
+        let mut state = gauntlet_lane_ran("adversary", GAUNTLET_ADVERSARY_FAULT);
+        state["lane_attempts"] = json!({"adversary": 2});
+        let out = run_gauntlet_script("retry_gate.py", &state);
+        assert!(
+            out.get("_next").is_none(),
+            "the third attempt must fall through to the verdict gate: {out}"
+        );
+        assert_eq!(out["lane_attempts"]["adversary"], 3, "{out}");
+        assert_eq!(out["retry_lanes"], json!([]), "{out}");
+        assert_eq!(out["review_incomplete"], json!(["adversary"]), "{out}");
+    }
+
+    #[test]
+    fn gauntlet_retry_gate_declines_outside_wall_clock_budget() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut state = gauntlet_lane_ran("adversary", GAUNTLET_ADVERSARY_FAULT);
+        state["gauntlet_started_at"] = json!(now_secs() - 100000.0);
+        let out = run_gauntlet_script("retry_gate.py", &state);
+        assert!(
+            out.get("_next").is_none(),
+            "a first-attempt fault past the budget must not retry: {out}"
+        );
+        assert_eq!(out["retry_lanes"], json!([]), "{out}");
+        assert_eq!(out["review_incomplete"], json!(["adversary"]), "{out}");
+    }
+
+    #[test]
+    fn gauntlet_retry_gate_crash_falls_through_without_retry() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // dict(42) raises inside main after the upstream fault was read.
+        let out = run_gauntlet_script(
+            "retry_gate.py",
+            &json!({
+                "lane_attempts": 42,
+                "adversary_items": [{"lane": "adversary"}],
+                "adversary_results": ["x"],
+                "signals_error": "PIPELINE-FAULT: earlier fault",
+            }),
+        );
+        assert!(
+            out["signals_error"]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: earlier fault; PIPELINE-FAULT: retry gate crashed"),
+            "the crash must append to the upstream fault, not overwrite it: {out}"
+        );
+        assert_eq!(out["retry_lanes"], json!([]), "{out}");
+        assert!(
+            out["review_incomplete"].is_array(),
+            "review_incomplete must stay a list on the crash path: {out}"
+        );
+        assert!(
+            out.get("_next").is_none(),
+            "a crashed gate must never retry: {out}"
+        );
+    }
+
+    /// retry_gate.py decides "completed" with the same sentinel regexes
+    /// verdict_gate.py parses; a drift would re-run lanes the verdict gate
+    /// accepts, or accept lanes it cannot read.
+    #[test]
+    fn gauntlet_retry_gate_sentinels_match_verdict_gate() {
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/review-gauntlet/scripts");
+        let retry = read_to_string(scripts.join("retry_gate.py")).unwrap();
+        let verdict = read_to_string(scripts.join("verdict_gate.py")).unwrap();
+        for sentinel in [
+            r"Verdict:\**\s*\**\s*(MERGE-READY|NEEDS-HUMAN)",
+            r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)",
+            r"SECURITY_REVIEW:\s*(PASS|FAIL)",
+            r"USAGE_PROBE:\s*(PASS|FAIL|INCONCLUSIVE)",
+        ] {
+            assert!(
+                retry.contains(sentinel),
+                "retry_gate.py must carry the sentinel regex {sentinel}"
+            );
+            assert!(
+                verdict.contains(sentinel),
+                "verdict_gate.py must carry the sentinel regex {sentinel}"
+            );
+        }
+        for fragment in [
+            r"^\*\*Verdict: NEEDS-HUMAN\*\* — .*",
+            r"(pipeline fault\(s\) recorded|PIPELINE-FAULT:|report rendering error)",
+        ] {
+            assert!(
+                retry.contains(fragment),
+                "retry_gate.py must carry the nested-degraded fragment {fragment}"
+            );
+            assert!(
+                verdict.contains(fragment),
+                "verdict_gate.py must carry the nested-degraded fragment {fragment}"
+            );
+        }
+        let adversary_verdict = read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/agents/adversary/scripts/verdict.py"),
+        )
+        .unwrap();
+        let degraded = "degraded run: pipeline fault recorded";
+        assert!(
+            retry.contains(degraded),
+            "retry_gate.py must match the adversary's degraded-run wording {degraded:?}"
+        );
+        assert!(
+            adversary_verdict.contains(degraded),
+            "assets/agents/adversary/scripts/verdict.py must still emit {degraded:?}"
+        );
+    }
+
+    /// build_items.py's LANE_KEYS and retry_gate.py's LANES name the same
+    /// four lanes and item keys; a lane present in one but not the other
+    /// would be built but never stashed, or stashed but never rebuilt.
+    #[test]
+    fn gauntlet_build_items_lane_keys_match_retry_gate_lanes() {
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/review-gauntlet/scripts");
+        let build = read_to_string(scripts.join("build_items.py")).unwrap();
+        let retry = read_to_string(scripts.join("retry_gate.py")).unwrap();
+        assert!(
+            build.contains("Keep in sync with retry_gate.LANES"),
+            "build_items.py LANE_KEYS must carry its sync note"
+        );
+        for lane in ["code-review", "adversary", "security", "probe"] {
+            let name = format!("\"{lane}\"");
+            let items = format!("{}_items", lane.replace('-', "_"));
+            for (file, source) in [("build_items.py", &build), ("retry_gate.py", &retry)] {
+                assert!(source.contains(&name), "{file} must name the lane {name}");
+                assert!(
+                    source.contains(&items),
+                    "{file} must carry the items key {items}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gauntlet_build_items_retry_pass_rebuilds_only_retried_lanes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script(
+            "build_items.py",
+            &json!({
+                "retry_lanes": ["adversary"],
+                "lane_attempts": {"adversary": 1, "code-review": 1},
+                "lanes_summary": "- code-review: always on",
+                "forced_lanes": ["code-review", "adversary"],
+                "gauntlet_started_at": 123.0,
+            }),
+        );
+        assert_eq!(
+            out["adversary_items"],
+            json!([{"lane": "adversary", "attempt": 2}]),
+            "{out}"
+        );
+        for key in ["code_review_items", "security_items", "probe_items"] {
+            assert_eq!(
+                out[key],
+                json!([]),
+                "{key} must map over nothing on a re-run pass, even when forced: {out}"
+            );
+        }
+        assert_eq!(out["retry_lanes"], json!([]), "{out}");
+        let summary = out["lanes_summary"].as_str().unwrap();
+        assert!(
+            summary.contains("retried: [adversary (attempt 2)]")
+                && summary.contains("code-review: always on"),
+            "the retry note must append to the first pass's summary: {summary}"
+        );
+        assert!(
+            out.get("gauntlet_started_at").is_none(),
+            "an existing start stamp must be left alone: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_build_items_stamps_start_time_once() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script("build_items.py", &json!({"forced_lanes": ["code-review"]}));
+        assert!(
+            out["gauntlet_started_at"].as_f64().is_some_and(|t| t > 0.0),
+            "a first pass without a stamp must start the clock: {out}"
+        );
+        let out = run_gauntlet_script(
+            "build_items.py",
+            &json!({"forced_lanes": ["code-review"], "gauntlet_started_at": 5.0}),
+        );
+        assert!(
+            out.get("gauntlet_started_at").is_none(),
+            "an existing start stamp must be left alone: {out}"
+        );
+    }
+
+    /// With the clock already stamped (the normal graph path — signals.py
+    /// runs first), a first pass must serialize exactly the five-key payload
+    /// it always has: same keys, same order, same values, nothing extra.
+    #[test]
+    fn gauntlet_build_items_first_pass_payload_is_unchanged_when_stamped() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/review-gauntlet/scripts/build_items.py");
+        let state =
+            json!({"forced_lanes": ["code-review", "adversary"], "gauntlet_started_at": 5.0});
+        let out = std::process::Command::new("python3")
+            .arg(&path)
+            .env("GRAPH_STATE", state.to_string())
+            .env_remove("GRAPH_STATE_FILE")
+            .output()
+            .expect("failed to invoke python3 build_items.py");
+        assert!(
+            out.status.success(),
+            "build_items.py exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout.trim_end(),
+            r#"{"code_review_items": [{"lane": "code-review"}], "adversary_items": [{"lane": "adversary"}], "security_items": [], "probe_items": [], "lanes_summary": "- forced lanes honored exactly: ['adversary', 'code-review']"}"#,
+            "the stamped first-pass payload must be byte-identical to the pre-loop form"
+        );
+    }
+
+    #[test]
+    fn gauntlet_build_items_crash_appends_to_prior_fault() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script(
+            "build_items.py",
+            &json!({
+                "forced_lanes": 42,
+                "signals_error": "PIPELINE-FAULT: earlier",
+                "lanes_summary": "- code-review: always on",
+            }),
+        );
+        assert!(
+            out["signals_error"]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: earlier; PIPELINE-FAULT: lane builder crashed"),
+            "the crash must append to the upstream fault, not overwrite it: {out}"
+        );
+        assert_eq!(
+            out["lanes_summary"], "- code-review: always on",
+            "a crash must not wipe the first pass's lanes_summary: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_signals_stamps_start_time_before_git_runs() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let dir = utils::temp_file("-gauntlet-signals-", "");
+        create_dir_all(&dir).unwrap();
+        let project_dir = dir.to_string_lossy().to_string();
+        let out = run_gauntlet_script(
+            "signals.py",
+            &json!({"project_dir": project_dir, "diff_spec": "worktree"}),
+        );
+        let stamped = run_gauntlet_script(
+            "signals.py",
+            &json!({"project_dir": project_dir, "diff_spec": "worktree", "gauntlet_started_at": 77.0}),
+        );
+        let _ = remove_dir_all(&dir);
+        assert!(
+            out["signals_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("diff signals could not be computed")),
+            "a non-repo project_dir must degrade the signals: {out}"
+        );
+        assert!(
+            out["gauntlet_started_at"].as_f64().is_some_and(|t| t > 0.0),
+            "the start stamp must be set even when git fails: {out}"
+        );
+        assert!(
+            stamped.get("gauntlet_started_at").is_none(),
+            "an existing start stamp must be left alone: {stamped}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_retry_loop_wiring() {
+        use crate::graph::NodeType;
+        let graph = load_bundled_graph("review-gauntlet");
+        let maps = [
+            "map_code_review",
+            "map_adversary",
+            "map_security",
+            "map_probe",
+        ];
+        for id in maps {
+            let node = graph
+                .get_node(id)
+                .unwrap_or_else(|| panic!("review-gauntlet must have a {id} node"));
+            assert_eq!(
+                node.next.as_ref().map(|n| n.as_slice()),
+                Some(&["retry_gate".to_string()][..]),
+                "{id} must route into retry_gate: {:?}",
+                node.next
+            );
+        }
+        let gate = graph
+            .get_node("retry_gate")
+            .expect("review-gauntlet must have a retry_gate node");
+        let NodeType::Script(s) = &gate.node_type else {
+            panic!("retry_gate must be a script node");
+        };
+        assert_eq!(s.script, "scripts/retry_gate.py");
+        assert_eq!(
+            gate.next.as_ref().map(|n| n.as_slice()),
+            Some(&["verdict_gate".to_string()][..]),
+            "retry_gate must fall through statically to verdict_gate: {:?}",
+            gate.next
+        );
+        let build = graph
+            .get_node("build_items")
+            .expect("review-gauntlet must have a build_items node");
+        let fan_out: Vec<String> = maps.iter().map(|m| m.to_string()).collect();
+        assert_eq!(
+            build.next.as_ref().map(|n| n.as_slice()),
+            Some(fan_out.as_slice()),
+            "build_items must still fan out to the four maps: {:?}",
+            build.next
+        );
+        for (key, expected) in [
+            ("lane_attempts", json!({})),
+            ("kept_results", json!({})),
+            ("retry_lanes", json!([])),
+            ("review_incomplete", json!([])),
+            ("gauntlet_started_at", json!(0)),
+        ] {
+            assert_eq!(
+                graph.initial_state.get(key),
+                Some(&expected),
+                "initial_state.{key} must seed the retry loop"
+            );
+        }
+        assert_eq!(graph.settings.timeout, Some(69600));
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/review-gauntlet/scripts/retry_gate.py");
+        assert!(script.exists(), "{} must exist", script.display());
+    }
+
+    /// MAX_RETRY_ELAPSED_SECS in retry_gate.py and settings.timeout in
+    /// graph.yaml live in different files. A re-run admitted at the very end
+    /// of the retry budget can still burn a full lane envelope (max_attempts
+    /// × the slowest lane) plus the script stages, and a graph timeout kills
+    /// from outside — no verdict would be rendered.
+    #[test]
+    fn gauntlet_retry_budget_fits_inside_graph_timeout() {
+        use crate::graph::NodeType;
+        const OTHER_STAGES_MARGIN_SECS: u64 = 1200;
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/review-gauntlet/scripts/retry_gate.py");
+        let source = read_to_string(&script).unwrap();
+        let line = source
+            .lines()
+            .find(|l| l.starts_with("MAX_RETRY_ELAPSED_SECS = "))
+            .expect("retry_gate.py must define MAX_RETRY_ELAPSED_SECS");
+        let max_retry: u64 = line
+            .split_once(" = ")
+            .and_then(|(_, v)| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("MAX_RETRY_ELAPSED_SECS no longer parses: {line}"));
+
+        let graph = load_bundled_graph("review-gauntlet");
+        let max_lane_envelope = graph
+            .nodes
+            .values()
+            .filter_map(|node| match &node.node_type {
+                NodeType::Agent(a) => a.timeout.map(|t| u64::from(a.max_attempts) * t),
+                _ => None,
+            })
+            .max()
+            .expect("review-gauntlet must have agent lanes with timeouts");
+        let graph_timeout = graph
+            .settings
+            .timeout
+            .expect("review-gauntlet must set settings.timeout");
+        assert!(
+            max_retry + max_lane_envelope + OTHER_STAGES_MARGIN_SECS <= graph_timeout,
+            "assets/agents/review-gauntlet/scripts/retry_gate.py MAX_RETRY_ELAPSED_SECS ({max_retry}) + the largest lane envelope, max_attempts × timeout ({max_lane_envelope}) + {OTHER_STAGES_MARGIN_SECS}s margin must fit inside assets/agents/review-gauntlet/graph.yaml settings.timeout ({graph_timeout})"
+        );
+    }
+
     // The value run_checks executes with a shell must never be something an
     // LLM lifted out of the prompt — the prompt also carries pasted plan/diff
     // text from the repo under review.
