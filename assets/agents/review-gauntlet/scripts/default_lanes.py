@@ -3,13 +3,19 @@
 
 Reached ONLY via select_lanes' `fallback:` route, when the additive LLM
 judgment dies after retries. Emits `forced_lanes` — code-review + adversary,
-plus probe when the deterministic signals flagged a consumer-facing surface,
+plus probe when the deterministic signals flagged a consumer-facing surface
+AND a local-run recipe exists (build_items gates probe the same way — a
+probe without a recipe is INCONCLUSIVE by construction),
 plus security when the attack-surface signals (auth/deps/exec) or a hardened
 posture demand it, unioned with any lanes the caller forced (canonicalized
 with the same aliases build_items uses) — which build_items honors exactly,
 so selection degrades WIDER, never narrower. The degradation note goes into
 `lanes_degraded`; build_items folds it into lanes_summary so the final
 report names the degradation.
+
+Fail-closed: if the fallback itself crashes it emits the widest safe
+selection (defaults ∪ security) plus a PIPELINE-FAULT in signals_error so
+verdict_gate blocks — a crashed fallback never narrows selection silently.
 """
 
 import json
@@ -49,7 +55,12 @@ def load_state():
 def main():
     state = load_state()
     lanes = {"code-review", "adversary"}
-    if state.get("consumer_surface"):
+    probe_context = state.get("probe_context")
+    if (
+        state.get("consumer_surface")
+        and isinstance(probe_context, str)
+        and probe_context.strip()
+    ):
         lanes.add("probe")
     # The deterministic security signals are already in state when this
     # fallback runs; a degraded selection must never drop the security lane
@@ -82,9 +93,13 @@ except Exception as e:  # noqa: BLE001 — the fallback itself must never crash
     print(
         json.dumps(
             {
-                "forced_lanes": ["code-review", "adversary"],
+                "forced_lanes": ["code-review", "adversary", "security"],
                 "lanes_degraded": "lane selection degraded to deterministic "
                 f"defaults (fallback script error: {e})",
+                "signals_error": (
+                    f"PIPELINE-FAULT: lane-selection fallback crashed — {e}; "
+                    "lanes widened to defaults ∪ security"
+                ),
             }
         )
     )

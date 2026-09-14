@@ -17,6 +17,8 @@ never kills the graph.
 import json
 import os
 
+# Keep in sync with default_lanes.ALIASES — a caller-forced lane must
+# canonicalize the same way on the degraded path as it does here.
 ALIASES = {
     "code-review": "code-review",
     "code_review": "code-review",

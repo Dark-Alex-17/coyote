@@ -51,8 +51,11 @@ those rules are *structure*:
   (map-over-nothing), which *is* the skip mechanism. All four maps join at
   the verdict gate on equal-length paths.
 - **The verdict is a regex, not an opinion** (`verdict_gate.py`): a missing
-  sentinel is a lane FAILURE, never a pass; any 🔴 in the code-review report
-  blocks regardless of its verdict line; `NEEDS-HUMAN` without 🔴 passes but
+  sentinel is a lane FAILURE, never a pass; the critical count from the
+  code-review report's summary line (raw 🔴 count if absent) blocks
+  regardless of its verdict line; a code-review lane whose own verdict line
+  records a pipeline fault blocks (a degraded review is never a pass);
+  `NEEDS-HUMAN` without 🔴 passes but
   is surfaced under *Human attention required*; probe `INCONCLUSIVE` blocks
   with an environment note — it is never treated as PASS or FAIL.
 - **Verdict independence is structural**: lanes run as isolated sub-agents
@@ -65,7 +68,8 @@ those rules are *structure*:
   lane* — distinct from SKIPPED (not selected). A dead `parse` records a fault
   and jumps straight to the gate (`parse_fault.py`). A dead `select_lanes`
   degrades to a deterministic selection (`default_lanes.py`): code-review +
-  adversary, plus probe on consumer surface, plus security on auth/deps/exec
+  adversary, plus probe on consumer surface *with a local-run recipe*, plus
+  security on auth/deps/exec
   signals or hardened posture, unioned with caller-forced lanes — wider, never
   narrower. A crashed `build_items` records a fault so an all-SKIPPED gate
   still blocks. Fault detection is prefix-anchored — a real review that merely
@@ -77,7 +81,7 @@ those rules are *structure*:
 
 | Lane | Sentinel | Blocks on |
 |------|----------|-----------|
-| code-reviewer | `**Verdict: MERGE-READY \| NEEDS-HUMAN**` | any 🔴 finding; missing sentinel |
+| code-reviewer | `**Verdict: MERGE-READY \| NEEDS-HUMAN**` | critical count from the report's summary line (raw 🔴 count if absent); missing sentinel; own verdict line records a pipeline fault |
 | adversary | `ADVERSARIAL_REVIEW: CONFORMS \| DIVERGES` | DIVERGES; missing sentinel |
 | security-reviewer | `SECURITY_REVIEW: PASS \| FAIL` | FAIL; missing sentinel |
 | probe | `USAGE_PROBE: PASS \| FAIL \| INCONCLUSIVE` | FAIL; INCONCLUSIVE (environment note); missing sentinel |

@@ -41,7 +41,13 @@ variables:
 settings:
   max_loop_iterations: 10
   log_state_snapshots: true
-  timeout: 10800
+  # max over agent lanes of (max_attempts × lane timeout) = 2 × 11400 = 22800
+  # (agent-node retries each get a fresh per-attempt budget,
+  # src/graph/agent.rs retry_transient/bounded_attempt) + 1200 margin for
+  # the script stages (signals/select/build/gate) = 24000; the parse and
+  # select_lanes llm nodes carry no `timeout:` and are bounded by
+  # max_iterations.
+  timeout: 24000
 
 initial_state:
   diff_spec: worktree
@@ -237,7 +243,7 @@ nodes:
   default_lanes:
     id: default_lanes
     type: script
-    description: Deterministic lane-selection fallback (reached only via select_lanes' fallback) — when the additive LLM judgment dies, forces code-review + adversary, plus probe when consumer_surface, plus security on attack-surface signals (auth/deps/exec) or hardened posture, unioned with any caller-forced lanes. Selection degrades WIDER, never narrower; the degradation note flows into lanes_summary via build_items.
+    description: Deterministic lane-selection fallback (reached only via select_lanes' fallback) — when the additive LLM judgment dies, forces code-review + adversary, plus probe when consumer_surface AND a probe_context (local-run recipe) is present, plus security on attack-surface signals (auth/deps/exec) or hardened posture, unioned with any caller-forced lanes. Selection degrades WIDER, never narrower; the degradation note flows into lanes_summary via build_items.
     script: scripts/default_lanes.py
     timeout: 30
     next: build_items
@@ -299,7 +305,12 @@ nodes:
     type: agent
     description: Independent code-quality review lane.
     agent: code-reviewer
-    timeout: 7200
+    # Exceeds the code-reviewer graph's own settings.timeout (10800) by 600 so
+    # the child's graph timeout, not this lane timeout, is the binding bound.
+    # NOTE: the child's own internal retry envelope (its nodes' max_attempts ×
+    # timeouts) is not derived here — deliberately out of scope for this
+    # change; tracked as a follow-up.
+    timeout: 11400
     prompt: |
       Review the code changes in {{project_dir}} (diff: {{diff_spec}}) as an
       independent post-implementation review.
@@ -322,7 +333,12 @@ nodes:
     type: agent
     description: Plan-conformance review lane.
     agent: adversary
-    timeout: 7200
+    # Exceeds the adversary graph's own settings.timeout (9000) by 600 so the
+    # child's graph timeout, not this lane timeout, is the binding bound.
+    # NOTE: the child's own internal retry envelope (its nodes' max_attempts ×
+    # timeouts) is not derived here — deliberately out of scope for this
+    # change; tracked as a follow-up.
+    timeout: 9600
     inputs:
       verification_commands: '{{verification_commands}}'
     prompt: |
@@ -399,7 +415,7 @@ nodes:
   verdict_gate:
     id: verdict_gate
     type: script
-    description: Deterministic sentinel parser and gate. A missing sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks with an environment note; 🔴 findings block regardless of the lane's own verdict line.
+    description: Deterministic sentinel parser and gate. A missing sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks with an environment note; the code-review critical count is read from render.py's summary line (raw 🔴 count if absent) and blocks regardless of the lane's own verdict line; a code-review verdict line that records the nested graph's own pipeline fault blocks as a degraded lane.
     script: scripts/verdict_gate.py
     timeout: 60
     next: done

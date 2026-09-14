@@ -10387,6 +10387,392 @@ mod tests {
     }
 
     #[test]
+    fn gauntlet_verdict_gate_quoted_red_marker_uses_summary_count() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A 🔴 quoted inside a Changes-table row is not a finding: the
+        // critical count comes from render.py's summary line, not a raw
+        // marker count over the whole report.
+        let state = json!({
+            "code_review_results": ["| `route_review.sh` | Fault guard before the 🔴 grep | — |\n\n**Verdict: NEEDS-HUMAN**\n\n*Reviewed 3 files, found 0 critical, 1 warnings, 0 suggestions, 0 nitpicks (0 deferred by quality bar)*"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "PASS", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴 |"),
+            "the summary line's zero critical count must win over a quoted 🔴: {report}"
+        );
+        assert!(
+            !report.contains("🔴 CRITICAL finding(s)"),
+            "a quoted 🔴 must not produce a blocker: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_summary_count_blocks_naming_count() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "code_review_results": ["**Verdict: MERGE-READY**\n\n*Reviewed 3 files, found 2 critical, 0 warnings, 0 suggestions, 0 nitpicks (0 deferred by quality bar)*"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("code-review: 2 🔴 CRITICAL finding(s)"),
+            "the summary line's critical count must block and be named: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_missing_summary_falls_back_to_raw_count() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // No summary line → the raw 🔴 count stays authoritative (fail closed).
+        let state = json!({
+            "code_review_results": ["🔴 [correctness] broken invariant\n\n**Verdict: MERGE-READY**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| code-review | BLOCKED | 1 🔴 finding(s) |"),
+            "without a summary line the raw 🔴 count must block: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_last_summary_line_wins() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // render.py emits its summary line AFTER every finding body, so a
+        // full-shape look-alike quoted earlier in the report must lose to the
+        // real (last) line.
+        let state = json!({
+            "code_review_results": ["#### quoted\n*Reviewed 1 files, found 9 critical, 0 warnings, 0 suggestions, 0 nitpicks (0 deferred by quality bar)*\n\n**Verdict: MERGE-READY**\n\n---\n*Reviewed 3 files, found 0 critical, 0 warnings, 0 suggestions, 0 nitpicks (0 deferred by quality bar)*"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "PASS", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            !report.contains("🔴 CRITICAL finding(s)"),
+            "the last summary line must win over an earlier look-alike: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_nested_code_review_fault_blocks() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // code-reviewer's verdict.py forces NEEDS-HUMAN on its own internal
+        // faults; the nested graph completes with a clean-looking zero
+        // critical count, so the gate must anchor on the verdict line's
+        // degraded-run wording rather than trust the count.
+        let state = json!({
+            "code_review_results": ["# Code Review Summary\n\n**Verdict: NEEDS-HUMAN** — pipeline fault(s) recorded — degraded run; always-human trigger(s) fired\n\n## Walkthrough\n(no walkthrough provided)\n\n---\n*Reviewed 3 files, found 0 critical, 0 warnings, 0 suggestions, 0 nitpicks (0 deferred by quality bar)*"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(
+            out["gauntlet_verdict"], "BLOCKED",
+            "a degraded code-review lane must never pass: {out}"
+        );
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains(
+                "code-review: the lane reported an internal PIPELINE-FAULT (degraded review) — a degraded lane is never a pass"
+            ),
+            "the nested fault must be named as the blocker: {report}"
+        );
+        assert!(
+            report.contains("| code-review | BLOCKED | PIPELINE-FAULT (degraded lane) |"),
+            "the lane table must record the degraded status: {report}"
+        );
+        assert!(
+            !report.contains("GREEN (attention)"),
+            "a degraded lane must not be recorded as attention-only: {report}"
+        );
+
+        // A degraded lane that ALSO carries 🔴 findings must name both
+        // blockers — neither may shadow the other.
+        let state = json!({
+            "code_review_results": ["# Code Review Summary\n\n**Verdict: NEEDS-HUMAN** — 2 🔴 CRITICAL finding(s); pipeline fault(s) recorded — degraded run\n\n---\n*Reviewed 3 files, found 2 critical, 0 warnings, 0 suggestions, 0 nitpicks (0 deferred by quality bar)*"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains(
+                "code-review: the lane reported an internal PIPELINE-FAULT (degraded review) — a degraded lane is never a pass"
+            ),
+            "the fault blocker must survive alongside the reds: {report}"
+        );
+        assert!(
+            report.contains("code-review: 2 🔴 CRITICAL finding(s) — fix before claiming done"),
+            "the reds blocker must survive alongside the fault: {report}"
+        );
+        assert!(
+            report.contains("| code-review | BLOCKED | PIPELINE-FAULT (degraded lane); 2 🔴 |"),
+            "the lane table must record both: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_non_string_lane_result_blocks() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // The map collected an object instead of the lane's rendered text;
+        // it cannot carry a sentinel and must never read as a pass.
+        let state = json!({
+            "code_review_results": [{"verdict": "MERGE-READY"}],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("code-review: malformed lane result (non-string item) — never a pass"),
+            "{report}"
+        );
+        assert!(
+            report.contains("| code-review | BLOCKED | malformed lane result (non-string) |"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_non_fault_needs_human_reason_passes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // The fault anchor must not over-match: a rendered NEEDS-HUMAN reason
+        // made of ordinary findings still passes with attention.
+        let state = json!({
+            "code_review_results": ["# Code Review Summary\n\n**Verdict: NEEDS-HUMAN** — 1 🟡 [correctness] finding(s) outside the deferred section\n\n---\n*Reviewed 2 files, found 0 critical, 1 warnings, 0 suggestions, 0 nitpicks (0 deferred by quality bar)*"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        });
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "PASS", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴 |"),
+            "a non-fault NEEDS-HUMAN must surface as attention: {report}"
+        );
+        assert!(
+            !report.contains("PIPELINE-FAULT"),
+            "no fault may be inferred from an ordinary reason: {report}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_parses_real_render_output() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Pins the render.py ↔ verdict_gate.py contract end to end: the
+        // gate's summary-line regex must match what render.py actually emits,
+        // and a 🔴 quoted inside a finding body must not count.
+        let finding = json!({
+            "id": "F1",
+            "file": "src/lib.rs",
+            "icon": "🟡",
+            "section": "blocking",
+            "marker": "correctness",
+            "title": "Fault guard removed",
+            "block": "#### 🟡 [correctness] Fault guard removed\nThe guard before the 🔴 grep was dropped; a quoted marker now leaks through."
+        });
+        let rendered = run_code_reviewer_script(
+            "render.py",
+            &json!({
+                "changed_files": ["src/lib.rs"],
+                "resolved_rigor": "production",
+                "walkthrough": "Removes a guard.",
+                "changes_rows": [{"file": "src/lib.rs", "desc": "guard removal"}],
+                "verdict_out": {
+                    "verdict": "NEEDS-HUMAN",
+                    "reason": "1 🟡 [correctness] finding(s) outside the deferred section; always-human trigger(s) fired",
+                    "counts": {"🔴": 0, "🟡": 1, "🟢": 0, "💡": 0},
+                    "deferred_count": 0,
+                    "dropped_count": 0,
+                    "dropped_titles": [],
+                    "attention": ["x"],
+                    "findings_final": [finding]
+                }
+            }),
+        );
+        let report = rendered["final_report"].as_str().unwrap();
+        assert!(
+            report.contains("found 0 critical, 1 warnings"),
+            "render.py must emit the summary line: {report}"
+        );
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": [report],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [],
+                "probe_results": []
+            }),
+        );
+        assert_eq!(out["gauntlet_verdict"], "PASS", "{out}");
+        let gauntlet = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            !gauntlet.contains("🔴 CRITICAL finding(s)"),
+            "the rendered summary line must win over the quoted 🔴: {gauntlet}"
+        );
+        assert!(
+            gauntlet.contains("| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴 |"),
+            "the gate must parse render.py's real output: {gauntlet}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_blocks_real_render_of_degraded_code_review() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Pins the verdict.py → render.py → verdict_gate.py fault contract end
+        // to end: the degraded-run reason wording render.py emits on the
+        // verdict line must be what the gate's fault regex anchors on.
+        let rendered = run_code_reviewer_script(
+            "render.py",
+            &json!({
+                "changed_files": ["a.rs"],
+                "verdict_out": {
+                    "verdict": "NEEDS-HUMAN",
+                    "reason": "pipeline fault(s) recorded — degraded run",
+                    "counts": {"🔴": 0, "🟡": 0, "🟢": 0, "💡": 0},
+                    "attention": ["PIPELINE-FAULT: x"],
+                    "findings_final": []
+                }
+            }),
+        );
+        let report = rendered["final_report"].as_str().unwrap();
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": [report],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [],
+                "probe_results": []
+            }),
+        );
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("internal PIPELINE-FAULT (degraded review)"),
+            "a rendered degraded run must block as a fault, not pass on 🔴 = 0: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_blocks_real_render_crash_report() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A non-dict verdict_out makes render.py's main() raise; its crash
+        // guard emits a bare verdict line that the gate must still block on.
+        let rendered = run_code_reviewer_script(
+            "render.py",
+            &json!({"changed_files": ["a.rs"], "verdict_out": "not a dict"}),
+        );
+        let report = rendered["final_report"].as_str().unwrap();
+        assert!(
+            report.starts_with(
+                "# Code Review Summary\n\n**Verdict: NEEDS-HUMAN** — report rendering error:"
+            ),
+            "the crash guard must emit the anchored verdict line: {report}"
+        );
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": [report],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [],
+                "probe_results": []
+            }),
+        );
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("internal PIPELINE-FAULT (degraded review)"),
+            "a crashed render must block via the fault hook: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_alias_tables_stay_in_sync() {
+        // build_items.py and default_lanes.py each carry a copy of the lane
+        // alias table; a caller-forced lane must canonicalize identically on
+        // the normal and degraded paths.
+        fn aliases_block(src: &str) -> String {
+            let start = src
+                .find("ALIASES = {")
+                .unwrap_or_else(|| panic!("no ALIASES table in: {src}"));
+            let end = start + src[start..].find("\n}").unwrap();
+            src[start..end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/agents/review-gauntlet/scripts");
+        let build_items = std::fs::read_to_string(scripts.join("build_items.py")).unwrap();
+        let default_lanes = std::fs::read_to_string(scripts.join("default_lanes.py")).unwrap();
+        assert_eq!(
+            aliases_block(&build_items),
+            aliases_block(&default_lanes),
+            "build_items.ALIASES and default_lanes.ALIASES must be identical"
+        );
+        assert!(
+            build_items.contains("Keep in sync with default_lanes.ALIASES"),
+            "build_items.py must point at its twin table"
+        );
+    }
+
+    #[test]
     fn gauntlet_build_items_crash_fails_closed() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
@@ -10536,11 +10922,14 @@ mod tests {
             "the degradation note must name the deterministic defaults: {out}"
         );
 
-        let probe = run_gauntlet_script("default_lanes.py", &json!({"consumer_surface": true}));
+        let probe = run_gauntlet_script(
+            "default_lanes.py",
+            &json!({"consumer_surface": true, "probe_context": "make run && hurl tests/"}),
+        );
         assert_eq!(
             probe["forced_lanes"],
             json!(["code-review", "adversary", "probe"]),
-            "a consumer surface must widen selection to include probe: {probe}"
+            "a consumer surface with a local-run recipe must widen selection to include probe: {probe}"
         );
 
         let again = run_gauntlet_script("default_lanes.py", &json!({}));
@@ -10603,6 +10992,66 @@ mod tests {
                 "security signal {state} must force the security lane: {out}"
             );
         }
+    }
+
+    #[test]
+    fn gauntlet_default_lanes_probe_requires_probe_context() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // build_items gates probe on a local-run recipe; the fallback must
+        // not force a probe that is INCONCLUSIVE by construction.
+        let out = run_gauntlet_script("default_lanes.py", &json!({"consumer_surface": true}));
+        assert_eq!(
+            out["forced_lanes"],
+            json!(["code-review", "adversary"]),
+            "a consumer surface without a probe_context must not add probe: {out}"
+        );
+
+        let out = run_gauntlet_script(
+            "default_lanes.py",
+            &json!({"consumer_surface": true, "probe_context": "make run && hurl tests/"}),
+        );
+        assert_eq!(
+            out["forced_lanes"],
+            json!(["code-review", "adversary", "probe"]),
+            "a consumer surface with a probe_context must add probe: {out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_default_lanes_crash_widens_and_records_fault() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A truthy non-iterable forced_lanes raises inside main; the guard
+        // must emit the WIDEST safe selection (defaults ∪ security) plus a
+        // PIPELINE-FAULT so verdict_gate blocks — never a narrower pass.
+        let out = run_gauntlet_script(
+            "default_lanes.py",
+            &json!({"forced_lanes": 42, "touches_auth": true}),
+        );
+        assert_eq!(
+            out["forced_lanes"],
+            json!(["code-review", "adversary", "security"]),
+            "a crashed fallback must widen to defaults ∪ security: {out}"
+        );
+        assert!(
+            out["signals_error"]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: lane-selection fallback crashed"),
+            "the crash must surface as a PIPELINE-FAULT: {out}"
+        );
+        assert!(
+            out["lanes_degraded"]
+                .as_str()
+                .unwrap()
+                .contains("fallback script error"),
+            "the degradation note must name the crash: {out}"
+        );
     }
 
     #[test]
