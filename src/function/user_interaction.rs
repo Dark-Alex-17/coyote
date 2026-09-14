@@ -389,8 +389,12 @@ mod tests {
     async fn nonzero_timeout_still_expires_with_the_existing_message() {
         let (tx, rx) = oneshot::channel::<String>();
         let wait = tokio::spawn(await_escalation_reply(rx, 5));
+        tokio::task::yield_now().await;
 
-        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(!wait.is_finished());
+
+        tokio::time::advance(Duration::from_secs(2)).await;
         let v = wait.await.unwrap().unwrap();
         assert_eq!(
             v["error"],
@@ -421,6 +425,7 @@ mod tests {
 
     #[test]
     fn stale_timeout_wording_is_gone_from_shipped_text() {
+        // Split so this file does not match its own needles.
         let needles = [
             concat!("(5-minute", " timeout)"),
             concat!("escalation_timeout:", " 300"),
