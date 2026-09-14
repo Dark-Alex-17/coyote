@@ -92,9 +92,11 @@ pub fn todo_function_declarations() -> Vec<FunctionDeclaration> {
                           incomplete todos intact. Use when you cannot proceed without user input \
                           or a user-side action. NEVER mark unfinished todos as done just to stop \
                           auto-continuation. Auto-continue resumes automatically on the user's \
-                          next message. Unavailable to subagents: they are driven to completion \
-                          autonomously — a subagent needing input must use a user__* tool, which \
-                          escalates to the root agent mid-turn and blocks until answered."
+                          next message. Requires an active session (the pause/resume cycle needs \
+                          cross-turn history). Unavailable to subagents: they are driven to \
+                          completion autonomously — a subagent needing input must use a user__* \
+                          tool, which escalates to the root agent mid-turn and blocks until \
+                          answered."
                 .to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -189,6 +191,15 @@ pub fn handle_todo_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) 
                 }));
             }
 
+            if ctx.session.is_none() {
+                return Ok(json!({
+                    "error": "todo__pause requires an active session: without one there is no \
+                              cross-turn history, so the user's answer would arrive with no \
+                              context to resume from. Ask the user your question directly in \
+                              your reply instead, then end your turn."
+                }));
+            }
+
             let reason = args
                 .get("reason")
                 .and_then(Value::as_str)
@@ -209,5 +220,29 @@ pub fn handle_todo_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) 
             }))
         }
         _ => bail!("Unknown todo action: {action}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AppConfig, AppState, WorkingMode};
+    use std::sync::Arc;
+
+    #[test]
+    fn pause_without_session_returns_teaching_error() {
+        let mut app_state = AppState::test_default();
+        app_state.config = Arc::new(AppConfig {
+            auto_continue: true,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app_state), WorkingMode::Cmd);
+
+        let result =
+            handle_todo_tool(&mut ctx, "todo__pause", &json!({"reason": "need input"})).unwrap();
+
+        let error = result["error"].as_str().unwrap();
+        assert!(error.contains("requires an active session"));
+        assert!(ctx.auto_continue_paused.is_none());
     }
 }

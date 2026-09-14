@@ -52,7 +52,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     1. BEFORE marking a todo done: verify the work compiles/works. No premature completion.
     2. If a todo is broad (e.g. \"implement X and implement Y\"): break it into specific subtasks FIRST using todo__add, then work on those.\n\
     3. Each todo should be atomic and be \"single responsibility\" - completable in one focused action.
-    4. If you are blocked on user input or a user-side action: call todo__pause with the reason, ask the user, and end your turn. NEVER mark unfinished todos done just to stop this reminder.
+    4. If you are blocked on user input or a user-side action: call todo__pause with the reason (if available); otherwise ask the user directly in your reply and end your turn. NEVER mark unfinished todos done just to stop this reminder.
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
@@ -432,6 +432,8 @@ Type ".help" for additional help.
         // Discard any stray terminal-query reply bytes (e.g. late colorsaurus
         // OSC 11 / DA1 responses) so they don't get injected into the prompt.
         drain_stale_tty_input();
+
+        print_pause_banner(&self.ctx.read());
 
         loop {
             if self.abort_signal.aborted_ctrld() {
@@ -927,6 +929,7 @@ pub async fn run_repl_command(
                     let (compressed, active) = replay::snapshot(session);
                     replay::render(app.as_ref(), &compressed, &active)?;
                 }
+                print_pause_banner(ctx);
             }
             ".install" => match parse_repl_install(args) {
                 ReplInstallDispatch::Builtins(category) => config::install_assets(category)?,
@@ -983,6 +986,7 @@ pub async fn run_repl_command(
                     if let Some(session) = &ctx.session {
                         let (compressed, active) = replay::snapshot(session);
                         replay::render(app.as_ref(), &compressed, &active)?;
+                        print_pause_banner(ctx);
                     }
                 }
                 None => {
@@ -1538,22 +1542,7 @@ async fn ask(
         }
 
         reset_continuation(ctx);
-        if let Some(reason) = ctx.auto_continue_paused.clone()
-            && ctx.todo_list.has_incomplete()
-        {
-            let remaining = ctx.todo_list.incomplete_count();
-            let color = if app.light_theme() {
-                nu_ansi_term::Color::LightGray
-            } else {
-                nu_ansi_term::Color::DarkGray
-            };
-            eprintln!(
-                "\n⏸ {}",
-                color.italic().paint(format!(
-                    "Auto-continue paused, awaiting user ({remaining} incomplete todo(s) preserved): {reason}"
-                ))
-            );
-        }
+        print_pause_banner(ctx);
         if ctx.maybe_autoname_session() {
             let color = if app.light_theme() {
                 nu_ansi_term::Color::LightGray
@@ -1654,6 +1643,28 @@ fn should_continue(ctx: &RequestContext) -> bool {
 
 fn reset_continuation(ctx: &mut RequestContext) {
     ctx.reset_continuation_count();
+}
+
+fn pause_banner_text(ctx: &RequestContext) -> Option<String> {
+    let reason = ctx.auto_continue_paused.as_deref()?;
+    if !ctx.todo_list.has_incomplete() {
+        return None;
+    }
+    let remaining = ctx.todo_list.incomplete_count();
+    Some(format!(
+        "Auto-continue paused, awaiting user ({remaining} incomplete todo(s) preserved): {reason}"
+    ))
+}
+
+fn print_pause_banner(ctx: &RequestContext) {
+    if let Some(text) = pause_banner_text(ctx) {
+        let color = if ctx.app.config.light_theme() {
+            nu_ansi_term::Color::LightGray
+        } else {
+            nu_ansi_term::Color::DarkGray
+        };
+        eprintln!("\n⏸ {}", color.italic().paint(text));
+    }
 }
 
 fn unknown_command() -> Result<()> {
@@ -2467,5 +2478,40 @@ mod tests {
         let input = "hello world";
         let result = MULTILINE_RE.captures(input).unwrap();
         assert!(result.is_none());
+    }
+
+    fn banner_ctx() -> RequestContext {
+        use crate::config::{AppState, WorkingMode};
+        RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
+    }
+
+    #[test]
+    fn pause_banner_text_paused_with_incomplete_todos() {
+        let mut ctx = banner_ctx();
+        ctx.add_todo("write code");
+        ctx.add_todo("run tests");
+        ctx.pause_auto_continue("Which database?");
+
+        let text = pause_banner_text(&ctx).unwrap();
+        assert!(text.contains("Which database?"), "{text}");
+        assert!(text.contains("2 incomplete todo(s) preserved"), "{text}");
+    }
+
+    #[test]
+    fn pause_banner_text_none_when_all_todos_complete() {
+        let mut ctx = banner_ctx();
+        let id = ctx.add_todo("write code");
+        ctx.mark_todo_done(id);
+        ctx.pause_auto_continue("Which database?");
+
+        assert_eq!(pause_banner_text(&ctx), None);
+    }
+
+    #[test]
+    fn pause_banner_text_none_when_unpaused() {
+        let mut ctx = banner_ctx();
+        ctx.add_todo("write code");
+
+        assert_eq!(pause_banner_text(&ctx), None);
     }
 }

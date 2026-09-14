@@ -611,20 +611,26 @@ impl RequestContext {
     pub fn init_todo_list(&mut self, goal: &str) {
         self.todo_list = TodoList::new(goal);
         self.auto_continue_paused = None;
+        self.sync_todo_state_to_session();
     }
 
     pub fn add_todo(&mut self, task: &str) -> usize {
-        self.todo_list.add(task)
+        let id = self.todo_list.add(task);
+        self.sync_todo_state_to_session();
+        id
     }
 
     pub fn mark_todo_done(&mut self, id: usize) -> bool {
-        self.todo_list.mark_done(id)
+        let marked = self.todo_list.mark_done(id);
+        self.sync_todo_state_to_session();
+        marked
     }
 
     pub fn clear_todo_list(&mut self) {
         self.todo_list.clear();
         self.auto_continue_count = 0;
         self.auto_continue_paused = None;
+        self.sync_todo_state_to_session();
     }
 
     pub fn increment_auto_continue_count(&mut self) {
@@ -633,10 +639,21 @@ impl RequestContext {
 
     pub fn pause_auto_continue(&mut self, reason: &str) {
         self.auto_continue_paused = Some(reason.to_string());
+        self.sync_todo_state_to_session();
     }
 
     pub fn resume_auto_continue(&mut self) {
         self.auto_continue_paused = None;
+        self.sync_todo_state_to_session();
+    }
+
+    /// Eagerly mirrors todo state into the session copy so every save path
+    /// (`.save session`, exit-time dirty save, flush) serializes the current
+    /// state without each needing its own sync step.
+    fn sync_todo_state_to_session(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.sync_todo_state(&self.todo_list, self.auto_continue_paused.as_deref());
+        }
     }
 
     pub fn reset_continuation_count(&mut self) {
@@ -1024,6 +1041,11 @@ impl RequestContext {
             let sessions_dir = self.sessions_dir();
             session.exit(&sessions_dir, self.working_mode.is_repl())?;
             self.discontinuous_last_message();
+            // Todo state is session-scoped: it was mirrored into the session
+            // just saved, and a stale pause left behind would suppress
+            // continuation in the now-sessionless context.
+            self.todo_list = TodoList::default();
+            self.auto_continue_paused = None;
         }
         Ok(())
     }
@@ -2603,6 +2625,16 @@ impl RequestContext {
         functions.extend(self.select_enabled_functions(role));
         functions.extend(self.select_enabled_mcp_servers(role));
         self.apply_job_tool_visibility(&mut functions);
+
+        // Pausing only makes sense with cross-turn history to resume from;
+        // without a session the user's answer would arrive with no context,
+        // so the declaration is withheld (handle_todo_tool also rejects).
+        // Macro contexts are deliberately sessionless, so pause is stripped
+        // inside isolated macros by design.
+        if self.session.is_none() {
+            let pause_name = format!("{TODO_FUNCTION_PREFIX}pause");
+            functions.retain(|f| f.name != pause_name);
+        }
 
         if functions.is_empty() {
             None
@@ -4626,6 +4658,20 @@ impl RequestContext {
             }
         }
         self.session = session;
+        // Adopt the session's todo state wholesale: a session without any todo
+        // state resets ctx to defaults, so nothing leaks across a session switch.
+        match &self.session {
+            Some(session) => {
+                self.todo_list = session.todo_list().clone();
+                self.auto_continue_paused = session.auto_continue_paused().map(str::to_string);
+            }
+            None => {
+                // Structurally unreachable today (both arms above assign Some);
+                // kept so the no-leakage reset stays explicit.
+                self.todo_list = TodoList::default();
+                self.auto_continue_paused = None;
+            }
+        }
         self.refresh_mcp_tool_filters();
         self.init_agent_session_variables(new_session)?;
         Ok(())
@@ -4762,6 +4808,9 @@ impl RequestContext {
         self.auto_continue_count = 0;
         self.todo_list = TodoList::default();
         self.auto_continue_paused = None;
+        // Defensive: the already-in-a-session bail above guarantees no session
+        // is attached here; this sync only matters if that bail is relaxed.
+        self.sync_todo_state_to_session();
 
         if let Some(session_name) = session_name.as_deref() {
             self.use_session(app, Some(session_name), abort_signal)
@@ -6685,6 +6734,24 @@ mod tests {
     }
 
     #[test]
+    fn select_functions_strips_todo_pause_without_session() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_todo_functions();
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["all".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(!names.contains(&"todo__pause"));
+        assert!(names.contains(&"todo__init"));
+
+        ctx.session = Some(Session::default());
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"todo__pause"));
+    }
+
+    #[test]
     fn select_functions_re_adds_skill_tools_when_role_skills_enabled_unset() {
         let mut ctx = create_test_ctx();
         ctx.tool_scope.functions.append_skill_functions();
@@ -7790,6 +7857,153 @@ mod tests {
         assert!(ctx.session.is_none());
     }
 
+    fn write_paused_todo_session(ctx: &RequestContext, name: &str) {
+        let session_path = ctx.session_file(name);
+        ensure_parent_exists(&session_path).unwrap();
+        write(
+            &session_path,
+            "model: test-seeded:test-chat\nmessages: []\ntodo_list:\n  goal: Ship feature\n  todos:\n    - id: 1\n      desc: Write code\n      done: false\nauto_continue_paused: Which database?\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn todo_mutators_eagerly_sync_to_session() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+
+        ctx.init_todo_list("Ship feature");
+        let id = ctx.add_todo("Write code");
+        {
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.todo_list().goal, "Ship feature");
+            assert_eq!(session.todo_list().todos.len(), 1);
+            assert!(session.dirty());
+        }
+
+        ctx.mark_todo_done(id);
+        assert!(ctx.session.as_ref().unwrap().todo_list().todos[0].done);
+
+        ctx.pause_auto_continue("Need credentials");
+        assert_eq!(
+            ctx.session.as_ref().unwrap().auto_continue_paused(),
+            Some("Need credentials")
+        );
+
+        ctx.resume_auto_continue();
+        assert!(
+            ctx.session
+                .as_ref()
+                .unwrap()
+                .auto_continue_paused()
+                .is_none()
+        );
+
+        ctx.clear_todo_list();
+        assert!(ctx.session.as_ref().unwrap().todo_list().is_default());
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_adopts_persisted_todo_state() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.init_todo_list("stale goal");
+        ctx.pause_auto_continue("stale question");
+        write_paused_todo_session(&ctx, "with-todos");
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, Some("with-todos"), utils::create_abort_signal())).unwrap();
+
+        assert_eq!(ctx.todo_list.goal, "Ship feature");
+        assert_eq!(ctx.todo_list.todos.len(), 1);
+        assert_eq!(ctx.auto_continue_paused.as_deref(), Some("Which database?"));
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_without_todo_state_resets_ctx() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.init_todo_list("stale goal");
+        ctx.add_todo("stale task");
+        ctx.pause_auto_continue("stale question");
+        let session_path = ctx.session_file("plain");
+        ensure_parent_exists(&session_path).unwrap();
+        write(
+            &session_path,
+            "model: test-seeded:test-chat\nmessages: []\n",
+        )
+        .unwrap();
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, Some("plain"), utils::create_abort_signal())).unwrap();
+
+        assert_eq!(ctx.todo_list, TodoList::default());
+        assert!(ctx.auto_continue_paused.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_new_session_carries_in_flight_todo_state() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.init_todo_list("Ship feature");
+        ctx.add_todo("Write code");
+        ctx.pause_auto_continue("Which database?");
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, Some("mid-task"), utils::create_abort_signal())).unwrap();
+
+        assert_eq!(ctx.todo_list.goal, "Ship feature");
+        assert_eq!(ctx.auto_continue_paused.as_deref(), Some("Which database?"));
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.todo_list().goal, "Ship feature");
+        assert_eq!(session.auto_continue_paused(), Some("Which database?"));
+    }
+
+    #[test]
+    #[serial]
+    fn restored_pause_resumes_in_ctx_and_session_mirror() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_paused_todo_session(&ctx, "paused");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("paused"), utils::create_abort_signal())).unwrap();
+        assert_eq!(ctx.auto_continue_paused.as_deref(), Some("Which database?"));
+        assert!(ctx.todo_list.has_incomplete());
+
+        ctx.resume_auto_continue();
+
+        assert!(ctx.auto_continue_paused.is_none());
+        assert!(
+            ctx.session
+                .as_ref()
+                .unwrap()
+                .auto_continue_paused()
+                .is_none(),
+            "a subsequent save must not resurrect the pause"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_resets_todo_and_pause_state() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_paused_todo_session(&ctx, "paused-exit");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("paused-exit"), utils::create_abort_signal()))
+            .unwrap();
+        assert!(ctx.auto_continue_paused.is_some());
+
+        ctx.exit_session().unwrap();
+
+        assert!(ctx.session.is_none());
+        assert_eq!(ctx.todo_list, TodoList::default());
+        assert!(ctx.auto_continue_paused.is_none());
+    }
+
     #[test]
     #[serial]
     fn use_role_obj_and_exit_role_full_cycle() {
@@ -8091,6 +8305,46 @@ mod tests {
             ctx.session.is_some(),
             "a non-isolated macro's agent step must engage the default session as if typed"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_resets_pre_agent_todo_state() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        // No session attached: use_agent bails on an existing one, so the
+        // pre-agent state only ever lives on the bare ctx.
+        ctx.init_todo_list("pre-agent goal");
+        ctx.add_todo("pre-agent task");
+        ctx.pause_auto_continue("pre-agent question");
+
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, Some("agent_session"), abort)).unwrap();
+
+        assert_eq!(ctx.todo_list, TodoList::default());
+        assert!(ctx.auto_continue_paused.is_none());
+        let session = ctx.session.as_ref().expect("agent session should engage");
+        assert!(
+            session.todo_list().is_default(),
+            "pre-agent todo state must not leak into the agent session"
+        );
+        assert!(session.auto_continue_paused().is_none());
     }
 
     fn first_file(dir: &Path) -> Option<PathBuf> {
@@ -9702,13 +9956,17 @@ mod tests {
             pid_file.display()
         );
 
+        // `kill -0` also succeeds on zombies, and in sandboxed environments
+        // orphaned zombies may never get reaped — a Z state counts as dead.
         let alive = |pid: &str| {
-            Command::new("kill")
-                .args(["-0", pid])
+            let out = Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
                 .output()
-                .unwrap()
-                .status
-                .success()
+                .unwrap();
+            out.status.success()
+                && !String::from_utf8_lossy(&out.stdout)
+                    .trim_start()
+                    .starts_with('Z')
         };
         let mut polls = 0;
         let mut still_alive = alive(&pid);

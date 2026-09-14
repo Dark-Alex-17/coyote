@@ -16,7 +16,7 @@ impl TodoStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub id: usize,
     #[serde(alias = "description")]
@@ -24,7 +24,7 @@ pub struct TodoItem {
     pub done: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TodoList {
     #[serde(default)]
     pub goal: String,
@@ -65,6 +65,13 @@ impl TodoList {
 
     pub fn is_empty(&self) -> bool {
         self.todos.is_empty()
+    }
+
+    /// Serde skip predicate for session persistence. Unlike `is_empty` (items
+    /// only), the goal counts: a goal-only list right after `todo__init` must
+    /// still serialize.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 
     pub fn clear(&mut self) {

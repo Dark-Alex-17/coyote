@@ -95,6 +95,10 @@ pub struct Session {
     messages: Vec<Message>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     data_urls: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "TodoList::is_default")]
+    todo_list: TodoList,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_continue_paused: Option<String>,
     #[serde(default, skip_serializing_if = "TokenUsage::is_empty")]
     token_usage: TokenUsage,
 
@@ -143,10 +147,15 @@ impl Session {
         let mut session = Self {
             name: name.to_string(),
             save_session: app.save_session,
+            todo_list: ctx.todo_list.clone(),
+            auto_continue_paused: ctx.auto_continue_paused.clone(),
             ..Default::default()
         };
         session.set_role(role);
-        session.dirty = false;
+        // Undo set_role's dirtying, but stay dirty when carrying in-flight
+        // todo/pause state: `Session::exit` only saves dirty sessions, and a
+        // create-then-exit must not destroy the sole copy of that state.
+        session.dirty = !ctx.todo_list.is_default() || ctx.auto_continue_paused.is_some();
         Ok(session)
     }
 
@@ -202,6 +211,25 @@ impl Session {
 
     pub fn compressed_messages(&self) -> &[Message] {
         &self.compressed_messages
+    }
+
+    pub fn todo_list(&self) -> &TodoList {
+        &self.todo_list
+    }
+
+    pub fn auto_continue_paused(&self) -> Option<&str> {
+        self.auto_continue_paused.as_deref()
+    }
+
+    pub fn sync_todo_state(&mut self, todo_list: &TodoList, auto_continue_paused: Option<&str>) {
+        if self.todo_list == *todo_list
+            && self.auto_continue_paused.as_deref() == auto_continue_paused
+        {
+            return;
+        }
+        self.todo_list = todo_list.clone();
+        self.auto_continue_paused = auto_continue_paused.map(str::to_string);
+        self.dirty = true;
     }
 
     pub fn name(&self) -> &str {
@@ -1203,6 +1231,54 @@ mod tests {
         assert!(!exported.contains("cache_creation_tokens"));
     }
 
+    #[test]
+    fn session_todo_state_survives_yaml_round_trip() {
+        let mut session = Session::default();
+        let mut todo_list = TodoList::new("Ship feature");
+        todo_list.add("Write code");
+        todo_list.add("Write tests");
+        todo_list.mark_done(1);
+        session.sync_todo_state(&todo_list, Some("Which database should tests target?"));
+        assert!(session.dirty());
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(reloaded.todo_list, todo_list);
+        assert_eq!(
+            reloaded.auto_continue_paused.as_deref(),
+            Some("Which database should tests target?")
+        );
+    }
+
+    #[test]
+    fn session_goal_only_todo_list_survives_yaml_round_trip() {
+        // `todo__init` sets a goal before any items exist; the serde skip
+        // predicate must not treat that as an empty list.
+        let mut session = Session::default();
+        session.sync_todo_state(&TodoList::new("Ship feature"), None);
+        assert!(session.dirty());
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(reloaded.todo_list.goal, "Ship feature");
+        assert!(reloaded.todo_list.todos.is_empty());
+    }
+
+    #[test]
+    fn session_without_todo_fields_loads_defaults() {
+        let session: Session = serde_yaml::from_str("model: provider:test\nmessages: []").unwrap();
+
+        assert!(session.todo_list.is_empty());
+        assert_eq!(session.auto_continue_paused, None);
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        assert!(!yaml.contains("todo_list"));
+        assert!(!yaml.contains("auto_continue_paused"));
+    }
+
+    #[test]
     fn session_mcp_tools_survives_yaml_round_trip() {
         let mut session = Session::default();
         let mut mcp_tools = IndexMap::new();
@@ -1299,6 +1375,20 @@ mod tests {
         assert_eq!(session.save_session(), app_config.save_session);
         assert!(session.is_empty());
         assert!(!session.dirty());
+    }
+
+    #[test]
+    fn session_new_from_ctx_with_in_flight_todo_state_is_dirty() {
+        let app_config = Arc::new(AppConfig::default());
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.init_todo_list("Ship feature");
+
+        let session = Session::new_from_ctx(&ctx, &app_config, "mid-task").unwrap();
+
+        assert!(
+            session.dirty(),
+            "carried-in todo state must mark the session dirty, or a create-then-exit skips the only save of it"
+        );
     }
 
     #[test]

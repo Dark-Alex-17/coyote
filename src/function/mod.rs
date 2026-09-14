@@ -2681,7 +2681,7 @@ mod tests {
         FIXTURE_ANNOTATED_TEXT, FIXTURE_ANNOTATED_URI, FIXTURE_BLOB_BYTES, FIXTURE_BLOB_URI,
         FIXTURE_LOG_TEXT, FIXTURE_LOG_URI, FixtureServer, fixture_runtime,
     };
-    use crate::config::{Agent, AgentConfig, AppConfig, AppState, WorkingMode};
+    use crate::config::{Agent, AgentConfig, AppConfig, AppState, Session, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use crate::supervisor::mailbox::Inbox;
     use crate::supervisor::notification::{agent_notification, job_notification};
@@ -5081,6 +5081,9 @@ mod tests {
         };
         let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
         ctx.tool_scope.functions.append_todo_functions();
+        // Pausing requires an active session (there is no cross-turn history
+        // to resume from otherwise), so give the ctx one.
+        ctx.session = Some(Session::default());
 
         // A blank reason is rejected and does not pause.
         let out = run_async(call_with_args("todo__pause", json!({"reason": "   "})).eval(&mut ctx))
@@ -5130,6 +5133,7 @@ mod tests {
         };
         let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
         ctx.tool_scope.functions.append_todo_functions();
+        // session is deliberately None: the subagent reject must win over the session reject.
         ctx.self_agent_id = Some("agent_sisyphus_abc123".to_string());
 
         let out = run_async(
