@@ -8506,7 +8506,10 @@ mod tests {
     #[test]
     fn review_gauntlet_readme_states_retry_and_incomplete_contract() {
         let readmes = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
-        let gauntlet = read_to_string(readmes.join("review-gauntlet/README.md")).unwrap();
+        // Windows checkouts carry CRLF; the paragraph assertion below spans line breaks.
+        let gauntlet = read_to_string(readmes.join("review-gauntlet/README.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
         for edge in [
             "mcr & madv & msec & mpb --> rgate[\"retry_gate",
             "rgate --> gate[\"verdict_gate",
