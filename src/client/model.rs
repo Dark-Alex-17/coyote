@@ -360,7 +360,10 @@ pub struct ModelData {
     pub supports_function_calling: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_levels: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "default_reasoning_level",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub default_reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) no_stream: bool,
@@ -519,5 +522,18 @@ mod tests {
 
         model.data.reasoning_levels.clear();
         assert!(!model.description().contains('🧠'));
+    }
+
+    #[test]
+    fn model_data_accepts_default_reasoning_level_alias() {
+        let yaml = r#"
+name: gpt-5.6-luna
+default_reasoning_level: none
+reasoning_levels: [none, low, medium, high]
+"#;
+
+        let data: ModelData = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(data.default_reasoning_effort.as_deref(), Some("none"));
     }
 }
