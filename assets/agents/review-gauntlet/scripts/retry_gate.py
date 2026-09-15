@@ -30,6 +30,7 @@ hard rules:
 import json
 import os
 import re
+import sys
 import time
 
 # 69600 (graph timeout) − 2 × 11400 (largest lane envelope) − 1200 (script stages)
@@ -184,6 +185,26 @@ def main():
             "review_incomplete": incomplete,
         }
     )
+    prior_notes = state.get("retry_notes")
+    notes = [n for n in prior_notes if isinstance(n, str)] if isinstance(prior_notes, list) else []
+    for lane in declined:
+        notes.append(
+            f"lane {lane} faulted and was NOT re-run "
+            f"(attempts {attempts.get(lane, '?')}/{MAX_ATTEMPTS}"
+            + ("" if within_budget else "; wall-clock budget exhausted")
+            + ") — recorded in review_incomplete"
+        )
+    for lane in retry:
+        notes.append(
+            f"lane {lane} faulted (missing / sentinel-less / degraded report) — "
+            f"re-running: attempt {attempts.get(lane, 0) + 1}/{MAX_ATTEMPTS}"
+        )
+    if retry or declined:
+        # stderr is discarded on success by today's engine but is the
+        # forward-compatible live-visibility channel; retry_notes carries the
+        # same lines into the final report either way.
+        sys.stderr.write("WARN: " + " | ".join(notes[-(len(retry) + len(declined)):]) + "\n")
+    out["retry_notes"] = notes
     if retry:
         out["_next"] = "build_items"
     print(json.dumps(out))

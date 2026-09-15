@@ -51,6 +51,7 @@ settings:
   timeout: 69600
 
 initial_state:
+  retry_notes: []
   diff_spec: worktree
   plan_context: ''
   rigor: production

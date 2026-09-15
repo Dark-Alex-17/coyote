@@ -56,6 +56,7 @@ settings:
 
 initial_state:
   project_dir_in: ''
+  verify_retries: 0
   diff_spec: auto
   intent: ''
   rigor_in: ''
@@ -522,6 +523,14 @@ nodes:
     state_updates:
       verifier_output: '{{output}}'
     fallback: verdict
+    next: verify_gate
+
+  verify_gate:
+    id: verify_gate
+    type: script
+    description: Local verifier-fault retry — when the verifier completed but its output carries PIPELINE-FAULT markers (or the verifier died), re-run the cheap finding-verifier ONCE instead of letting the fault escalate into a full lane re-run at the gauntlet. Falls through to verdict when clean or out of retries; a gate crash falls forward on the declared edge.
+    script: scripts/verify_gate.py
+    timeout: 60
     next: verdict
 
   verdict:

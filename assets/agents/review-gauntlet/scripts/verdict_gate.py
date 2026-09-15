@@ -360,6 +360,11 @@ def main():
         + [f"| {lane} | {status} | {detail} |" for lane, (status, detail) in rows.items()]
     )
     md += "\n\n## Lane selection\n" + (state.get("lanes_summary") or "(none recorded)")
+    _notes = state.get("retry_notes")
+    if isinstance(_notes, list):
+        _shown = [n for n in _notes if isinstance(n, str)][:8]
+        if _shown:
+            md += "\n\n## Pipeline notes\n" + "\n".join(f"- {n}" for n in _shown)
     if blockers:
         md += "\n\n## Blockers\n" + "\n".join(f"- {b}" for b in blockers)
     if attention:

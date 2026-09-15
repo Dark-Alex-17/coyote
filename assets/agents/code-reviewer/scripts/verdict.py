@@ -165,14 +165,32 @@ def main():
         if v.get("id") == "pipeline-fault"
         or (isinstance(v.get("note"), str) and v["note"].lstrip().startswith("PIPELINE-FAULT:"))
     ]
-    if fv_faults:
-        first = fv_faults[0].get("note")
+    # parse_fault's sentinel = the verifier verified NOTHING (hard fault, lane-
+    # degrading). Per-finding verify_fault / crash-guard notes = those findings
+    # simply stand UNVERIFIED (soft: proportionate NEEDS-HUMAN attention — a
+    # ~1 h lane re-run to re-check a few findings is the wrong trade, and the
+    # verify_gate node already retried the verifier locally once).
+    hard_fv = [v for v in fv_faults if v.get("id") == "pipeline-fault"]
+    soft_fv = [v for v in fv_faults if v.get("id") != "pipeline-fault"]
+
+    def _fv_detail(entries):
+        first = entries[0].get("note")
         detail = first.strip().replace("\n", " ") if isinstance(first, str) else ""
         if len(detail) > MAX_DETAIL_CHARS:
             detail = detail[: MAX_DETAIL_CHARS - 1] + "…"
+        return detail
+
+    soft_notes = []
+    if hard_fv:
         faults.append(
-            f"PIPELINE-FAULT: finding verification degraded — {len(fv_faults)} verifier "
-            f"verdict(s) carry a pipeline fault ({detail})"
+            "PIPELINE-FAULT: finding verification degraded — the verifier verified "
+            f"nothing ({_fv_detail(hard_fv)})"
+        )
+    if soft_fv:
+        soft_notes.append(
+            f"Verifier: {len(soft_fv)} finding(s) could not be verified (verifier "
+            f"branch fault: {_fv_detail(soft_fv)}) — they stand above UNVERIFIED; "
+            "verify them manually"
         )
     # Keyed off synth_failure + a non-empty diff, NEVER off findings == [] —
     # a clean review legitimately has zero findings and stays MERGE-READY.
@@ -190,7 +208,7 @@ def main():
     # faults go FIRST and uncapped so the display cap can never hide one;
     # the trigger reason keys off the human-facing triggers alone
     has_triggers = bool(attention)
-    attention = faults + attention[:5]
+    attention = faults + soft_notes + attention[:5]
 
     reasons = []
     if counts["🔴"]:
@@ -200,6 +218,11 @@ def main():
     if faults:
         # CONTRACT: review-gauntlet/verdict_gate.py anchors on this wording
         reasons.append("pipeline fault(s) recorded — degraded run")
+    if soft_notes:
+        # Deliberately does NOT match the gauntlet's degraded-run anchors:
+        # unverified findings are a human-attention item, not a re-runnable
+        # lane fault.
+        reasons.append(f"{len(soft_fv)} finding(s) unverified (verifier branch fault)")
     if has_triggers:
         reasons.append("always-human trigger(s) fired")
     verdict = "NEEDS-HUMAN" if reasons else "MERGE-READY"
