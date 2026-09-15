@@ -192,6 +192,19 @@ def main():
             f"branch fault: {_fv_detail(soft_fv)}) — they stand above UNVERIFIED; "
             "verify them manually"
         )
+    # Files beyond facts.py's 300-file cap were never grouped or reviewed —
+    # disclose the gap and force NEEDS-HUMAN with wording that does NOT match
+    # the gauntlet's degraded-run anchors (a lane re-run cannot fix a cap).
+    coverage_notes = []
+    try:
+        total_files = int(state.get("file_count") or 0)
+    except (TypeError, ValueError):
+        total_files = 0
+    if total_files > len(changed):
+        coverage_notes.append(
+            f"Coverage gap: {total_files - len(changed)} of {total_files} changed files "
+            "were NOT reviewed (file-list cap) — review them manually or split the PR"
+        )
     # Keyed off synth_failure + a non-empty diff, NEVER off findings == [] —
     # a clean review legitimately has zero findings and stays MERGE-READY.
     synth_failure = state.get("synth_failure")
@@ -208,7 +221,7 @@ def main():
     # faults go FIRST and uncapped so the display cap can never hide one;
     # the trigger reason keys off the human-facing triggers alone
     has_triggers = bool(attention)
-    attention = faults + soft_notes + attention[:5]
+    attention = faults + soft_notes + coverage_notes + attention[:5]
 
     reasons = []
     if counts["🔴"]:
@@ -223,6 +236,8 @@ def main():
         # unverified findings are a human-attention item, not a re-runnable
         # lane fault.
         reasons.append(f"{len(soft_fv)} finding(s) unverified (verifier branch fault)")
+    if coverage_notes:
+        reasons.append(f"{total_files - len(changed)} changed file(s) not reviewed (file cap)")
     if has_triggers:
         reasons.append("always-human trigger(s) fired")
     verdict = "NEEDS-HUMAN" if reasons else "MERGE-READY"

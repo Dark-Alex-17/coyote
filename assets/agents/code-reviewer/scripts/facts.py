@@ -80,6 +80,11 @@ except Exception as e:  # noqa: BLE001
 out["resolved_diff_spec"] = resolved
 out["changed_files"] = files[:300]
 out["file_count"] = len(files)
+if len(files) > 300:
+    notes.append(
+        f"file list truncated: {len(files)} changed files, only the first 300 are "
+        "grouped and reviewed"
+    )
 
 
 def diff_text():

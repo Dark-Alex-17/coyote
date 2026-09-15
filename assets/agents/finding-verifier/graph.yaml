@@ -25,7 +25,7 @@ variables:
 settings:
   max_loop_iterations: 8
   log_state_snapshots: true
-  timeout: 900
+  timeout: 3000
 
 initial_state:
   findings_list: []

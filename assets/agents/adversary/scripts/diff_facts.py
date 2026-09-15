@@ -56,8 +56,13 @@ try:
         if line.startswith("+++ b/")
     })
     out["changed_files"] = files[:300]
+    if len(files) > 300:
+        out["diff_note"] += (
+            f" (file list capped at 300 of {len(files)} changed files — use the fs "
+            "tools for the rest)"
+        )
     if len(text) > MAX_DIFF_CHARS:
-        out["diff_note"] = (
+        out["diff_note"] += (
             f" (truncated to {MAX_DIFF_CHARS} chars of {len(text)} — use the fs tools "
             "to inspect files beyond the cut)"
         )
