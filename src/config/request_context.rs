@@ -14601,6 +14601,16 @@ mod tests {
             .map(str::to_owned)
     }
 
+    fn fv_soft_note(out: &serde_json::Value) -> Option<String> {
+        out["verdict_out"]["attention"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str())
+            .find(|a| a.starts_with("Verifier: ") && a.contains("could not be verified"))
+            .map(str::to_owned)
+    }
+
     #[test]
     fn code_reviewer_verdict_fv_duplicate_unknown_faults_count_individually() {
         if !cmd_available("python3") {
@@ -14609,6 +14619,9 @@ mod tests {
         }
         // finding-verifier's crash guard emits every fault entry under the
         // same "unknown" id; an id-indexed dict would collapse them to one.
+        // Non-sentinel faults are SOFT: the findings stand unverified with a
+        // human-attention note, but the lane is NOT flagged as a re-runnable
+        // pipeline fault.
         let entry = json!({
             "id": "unknown",
             "verdict": "UNVERIFIABLE",
@@ -14622,10 +14635,23 @@ mod tests {
         });
         let out = run_code_reviewer_script("verdict.py", &state);
         assert_eq!(out["verdict_out"]["verdict"], "NEEDS-HUMAN", "{out}");
-        let fault = fv_degraded_fault(&out).unwrap_or_else(|| panic!("{out}"));
         assert!(
-            fault.contains("2 verifier verdict(s)"),
-            "each crash-guard entry must count: {fault}"
+            fv_degraded_fault(&out).is_none(),
+            "crash-guard entries are soft faults, not a degraded lane: {out}"
+        );
+        let note = fv_soft_note(&out).unwrap_or_else(|| panic!("{out}"));
+        assert!(
+            note.contains("2 finding(s) could not be verified"),
+            "each crash-guard entry must count: {note}"
+        );
+        let reason = out["verdict_out"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("2 finding(s) unverified (verifier branch fault)"),
+            "the reason must count the unverified findings: {out}"
+        );
+        assert!(
+            !reason.contains("pipeline fault(s) recorded"),
+            "soft faults must not trip the gauntlet's degraded-run anchor: {out}"
         );
     }
 
@@ -14638,6 +14664,8 @@ mod tests {
         // finding-verifier completes "successfully" with parse_fault's
         // sentinel entry inside the payload — not an "Agent node failed:"
         // banner — so the gate must read the sentinel id as a fault.
+        // The sentinel means the verifier verified NOTHING: this is the HARD,
+        // lane-degrading path.
         let state = json!({
             "changed_files": ["a.rs"],
             "domain_reports": ["clean report. DOMAIN_REVIEW_COMPLETE"],
@@ -14665,8 +14693,12 @@ mod tests {
             panic!("the degraded-verification fault must be in attention: {out}")
         });
         assert!(
-            fault.contains("1 verifier verdict(s) carry a pipeline fault"),
-            "the fault must count the faulted verdicts: {fault}"
+            fault.contains("the verifier verified nothing"),
+            "the fault must state that nothing was verified: {fault}"
+        );
+        assert!(
+            fault.contains("parse failed"),
+            "the fault must carry the sentinel's detail: {fault}"
         );
     }
 
@@ -14678,6 +14710,10 @@ mod tests {
         }
         // verify_fault's per-finding entry keeps the real finding id; the
         // fault is recognized by the note's PIPELINE-FAULT prefix.
+        // Per-finding faults are SOFT: the finding stands unverified with a
+        // human-attention note instead of a lane-degrading pipeline fault
+        // (re-running an entire ~1h lane over a few unverified findings is
+        // the wrong trade).
         let state = json!({
             "changed_files": ["a.rs"],
             "domain_reports": ["clean report. DOMAIN_REVIEW_COMPLETE"],
@@ -14694,12 +14730,24 @@ mod tests {
             v["verdict"], "NEEDS-HUMAN",
             "a lane-faulted verifier verdict must block: {out}"
         );
-        let fault = fv_degraded_fault(&out).unwrap_or_else(|| {
-            panic!("the degraded-verification fault must be in attention: {out}")
-        });
         assert!(
-            fault.contains("verifier lane failed after retries"),
-            "the fault must carry the verifier's note: {fault}"
+            fv_degraded_fault(&out).is_none(),
+            "a per-finding fault must not degrade the lane: {out}"
+        );
+        let note = fv_soft_note(&out)
+            .unwrap_or_else(|| panic!("the unverified-findings note must be in attention: {out}"));
+        assert!(
+            note.contains("verifier lane failed after retries"),
+            "the note must carry the verifier's fault detail: {note}"
+        );
+        let reason = v["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("1 finding(s) unverified (verifier branch fault)"),
+            "the reason must count the unverified finding: {out}"
+        );
+        assert!(
+            !reason.contains("pipeline fault(s) recorded"),
+            "soft faults must not trip the gauntlet's degraded-run anchor: {out}"
         );
     }
 
