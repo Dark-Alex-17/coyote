@@ -580,10 +580,13 @@ impl AppConfig {
             self.enabled_mcp_servers = v.map(|raw| super::csv_to_vec(&raw));
         }
 
-        if let Ok(v) = env::var(get_env_name("hooks"))
-            && let Ok(v) = serde_json::from_str(&v)
-        {
-            self.hooks = v;
+        if let Ok(v) = env::var(get_env_name("hooks")) {
+            match serde_json::from_str(&v) {
+                Ok(v) => self.hooks = v,
+                Err(err) => {
+                    debug!("Ignoring malformed hooks env override: {err}")
+                }
+            }
         }
 
         if let Some(v) = super::read_env_value::<String>(&get_env_name("repl_prelude")) {
@@ -834,6 +837,43 @@ mod tests {
         let app = AppConfig::from_config(cfg).unwrap();
 
         assert!(app.hooks.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_envs_overrides_hooks() {
+        let env_name = get_env_name("hooks");
+        let prev = env::var_os(&env_name);
+
+        let mut hooks = crate::hooks::HooksMap::new();
+        hooks.insert(
+            "turn.completed".to_string(),
+            vec![crate::hooks::HookDef {
+                name: "notify".to_string(),
+                command: "./hooks/notify.sh".to_string(),
+            }],
+        );
+
+        let mut app = AppConfig::default();
+
+        unsafe { env::set_var(&env_name, serde_json::to_string(&hooks).unwrap()) };
+        app.load_envs();
+        assert_eq!(app.hooks, hooks);
+
+        unsafe { env::set_var(&env_name, "[not json") };
+        app.load_envs();
+        assert_eq!(app.hooks, hooks);
+
+        unsafe { env::remove_var(&env_name) };
+        app.load_envs();
+        assert_eq!(app.hooks, hooks);
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
+            }
+        }
     }
 
     #[test]

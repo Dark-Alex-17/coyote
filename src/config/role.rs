@@ -558,7 +558,13 @@ fn parse_mcp_tools_map(value: &Value) -> Option<IndexMap<String, Vec<String>>> {
 }
 
 fn parse_hooks_map(value: &Value) -> Option<HooksMap> {
-    serde_json::from_value(value.clone()).ok()
+    match serde_json::from_value(value.clone()) {
+        Ok(map) => Some(map),
+        Err(err) => {
+            debug!("Ignoring malformed hooks configuration: {err}");
+            None
+        }
+    }
 }
 
 fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
