@@ -1,3 +1,113 @@
+## v0.10.3 (2026-09-15)
+
+### Feat
+
+- create a config alias for default_reasoning_level (to match some wording and make the config flexible)
+- support custom resource definitions for openai-compatible Oauth customization
+- Support specifying the compression model to use when compressing a session for greater cost controls
+- Added full cost tracking to Coyote and added it to the default right prompt
+- added support for input/output token cache cost tracking
+- Support persisting paused todo lists to sessions so users can exit and resume paused todo sessions; Also fixed a bug so todo list pausing is only supported when being used in a session since it typically requires multi-turn communication
+- Support token caching to reduce LLM costs in Anthropic models (not typically handled automatically by APIs)
+- **TASK-030**: callers escalate on GAUNTLET_REVIEW_INCOMPLETE instead of findings-routing
+- **TASK-032**: review-gauntlet incomplete-review machine line + ×N attempt details
+- **TASK-029**: review-gauntlet fault-only lane re-run loop
+- **TASK-028**: escalation_timeout 0 waits indefinitely and is the default
+- **graph**: stream llm-node completions so node timeout governs long generations
+- **TASK-023**: deep-research hardening — fail-safe scripts, fault fallbacks, pipeline notes
+- **TASK-020**: finding-verifier + step-runner fail-closed hardening
+- **TASK-019**: code-reviewer fail-closed review pipeline
+- **TASK-018**: review-gauntlet lane degradation + verification passthrough
+- **TASK-017**: adversary execution evidence + fail-closed routing
+- **TASK-016**: engine + test fixes from the Phase-1 re-review
+- **TASK-011**: traverse agent fallback edges in map peer-discovery BFS
+- **TASK-010**: add max_attempts to read-only agent lanes in bundled graphs
+- **TASK-009**: add fallback routing to agent nodes
+- **TASK-008**: add shared transient matcher and retry support to agent nodes
+- Fixed graph agents with new agent variable passing functionality
+- **graph**: warn when a declared variable is shadowed by an initial_state key
+- **agents**: advertise declared agent variables in agent__list_available
+- **agents**: allow passing agent variables to agent__spawn and agent__task_create
+- seed variables into initial graph state
+- Significant code review suite rewrite with improved graph agent features
+- let install commands remove files that have been removed from bundles, both internal and external
+- update the web_search_coyote tool to attempt to use the current model first then fallback to the configured model for web searches
+- expose the current coyote model to tools
+- removed temperature specification in deep-research and finding-verifier agents to make them more univerally usable
+- **graph**: thread the graph abort into llm nodes and tool execution
+- **graph**: abort a graph run on Ctrl-C from anywhere
+- **graph**: warn when an llm node's turn cap is disabled
+- **graph**: treat llm max_iterations: 0 as no turn cap
+- **graph**: warn when the visit cap is disabled
+- **graph**: treat max_loop_iterations: 0 as no visit cap
+- **graph**: warn when a timeout is disabled
+- **graph**: treat timeout: 0 as no wall-clock bound
+- **graph**: validate agent node inputs at load time
+- **graph**: seed a child graph agent's state from an agent node's inputs map
+- **graph**: validate map branch subgraphs instead of single branch nodes
+- **graph**: run map branches as per-item subgraph chains
+- **graph**: accept a `{{template}}` for a map node's `max_concurrency`
+- created the finding-verifier and whetstone agents for continuous code quality improvements
+- teammates flag enabling peer messaging between concurrent graph agent nodes
+- support explicit can_spawn_agents, max_concurrent_agents, and max_agent_depth keys in graph.yaml
+- support setting the tool_timeout in the main config file instead of only via an environment variable
+- Added new environment variable to force showing tool call logging when not in a tty
+
+### Fix
+
+- empty tool results can't cause errors in bedrock, claude, openai, or vertexai clients anymore
+- proper support for reasoning/thinking in bedrock models
+- **TASK-032**: enforce incomplete⇒BLOCKED structurally; anchor adversary degraded detection
+- **TASK-028**: pin example-doc wording; make not-found escalation hint match queue semantics
+- **TASK-028**: pin global-template exclusion, tighten timeout boundary test, reword stale hint
+- **adversary**: red verification runs block CONFORMS; re-derive timeout envelope; robust runner
+- **review-suite**: detect nested finding-verifier faults; harden render/fault markers
+- **review-gauntlet**: summary-line critical count, nested-fault hook, fail-closed lane fallback
+- **graph**: typed ApiStatusError transient classification; warn on bare output_schema
+- **review-suite**: mark example verification commands as placeholders; pin variable description and prompt note
+- **graph**: auto-merge only schema-declared keys from llm output
+- **review-suite**: pass verification_commands as a declared variable, never LLM-extracted from prose
+- **agents**: scrub GRAPH_STATE* from adversary verification commands; raise review-suite max_agent_depth
+- **adversary**: narrow died-marker predicate, degraded banner for died criteria, hermetic script tests
+- **adversary**: fail closed on PIPELINE-FAULT evidence regardless of status; pin bail-chain and validator shape
+- **adversary**: fail closed per criterion when check_criterion dies
+- **engine**: carry full error chain in llm node fault text
+- **TASK-020**: skip POSIX bash script tests on Windows
+- **TASK-020**: surface step-runner LLM-fault captures where the fallback lands
+- **TASK-019**: carry PIPELINE-FAULT prefix through verdict.py's crash guard
+- **TASK-018**: harden verdict_gate fault routing and widen default_lanes fallback
+- **TASK-017**: bound run_checks runtime and fail-close its node-level death
+- **tests**: collision-proof parser test temp files to deflake macOS CI
+- Don't infinitely compress a session once it passes a threshold when the threshold is close to the max token count
+- fix spinner ctrl-c early exit not clearing message and restoring cursor
+- **graph**: build peer retirement guards before spawning their tasks
+- **graph**: reject agents that ship both config.yaml and graph.yaml at load
+- **graph**: bound concurrency caps by the semaphore permit limit
+- **graph**: make turn-cap and template checks consistent across validation modes
+- **graph**: leave output absent after state_updates when it was absent before
+- **graph**: validate the whole max_concurrency template string
+- **graph**: reject as == output_key on map nodes
+- **graph**: inherit the session abort in agent-node children
+- **graph**: retire the teammate identity before structured extraction
+- **graph**: reject a literal max_concurrency of 0 instead of clamping it
+- **graph**: clear peer identity fields after every map chain step
+- **graph**: pick the map teammate identity name by BFS from the branch entry
+- **graph**: name the offending node type when a map branch reaches a disallowed node
+- **function**: build bundled bash tools without writing back to the source tree
+- **agents**: name the map-branch output key in deep-research and finding-verifier
+- **graph**: honor an explicit `output` key in state_updates
+- Fixed the bad formatting in the finding-verifier agent
+- properly anchored the role frontmatter regex so it doesn't catch in-instruction separators
+- support non-object tool result outputs for bedrock
+- exclude null bytes from fs_grep output on binaries
+- suppress subagent error and warning output to stderr/stdout
+
+### Refactor
+
+- **graph**: keep the ordered visit log test-only
+- **graph**: move the cfg(test) OUTPUT_KEY import into llm's test module
+- **graph**: drop the duplicated locator prefix from map chain step errors
+
 ## v0.10.2 (2026-09-04)
 
 ### Feat
