@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod function;
 mod graph;
+mod hooks;
 mod rag;
 mod render;
 mod repl;

@@ -75,6 +75,7 @@ use crate::client::{
     oauth, set_client_models_config,
 };
 use crate::function::{FunctionDeclaration, Functions};
+use crate::hooks::HooksMap;
 use crate::rag::Rag;
 use crate::sandbox::SANDBOX_ENV_FLAG;
 use crate::utils::*;
@@ -162,6 +163,7 @@ const AGENT_GRAPH_FILE_NAME: &str = "graph.yaml";
 const ROLES_DIR_NAME: &str = "roles";
 const SKILLS_DIR_NAME: &str = "skills";
 const MACROS_DIR_NAME: &str = "macros";
+const HOOKS_DIR_NAME: &str = "hooks";
 const ENV_FILE_NAME: &str = ".env";
 const MESSAGES_FILE_NAME: &str = "messages.md";
 const SESSIONS_DIR_NAME: &str = "sessions";
@@ -262,6 +264,9 @@ pub struct Config {
     pub enabled_mcp_servers: Option<Vec<String>>,
     pub mcp_tools: Option<IndexMap<String, Vec<String>>>,
 
+    #[serde(default)]
+    pub hooks: HooksMap,
+
     pub auto_continue: bool,
     pub max_auto_continues: usize,
     pub inject_todo_instructions: bool,
@@ -349,6 +354,8 @@ impl Default for Config {
             mapping_mcp_servers: Default::default(),
             enabled_mcp_servers: None,
             mcp_tools: None,
+
+            hooks: Default::default(),
 
             auto_continue: false,
             max_auto_continues: 10,
@@ -1391,6 +1398,59 @@ clients:
     fn config_template_does_not_carry_the_per_agent_escalation_timeout_key() {
         // `escalation_timeout` is a per-agent setting; the global template must never grow it.
         assert!(!CONFIG_TEMPLATE.contains("escalation_timeout"));
+    }
+
+    #[test]
+    fn config_template_carries_hooks_block_without_global_hooks() {
+        // `global_hooks` is a per-agent whitelist; the global template must never grow it.
+        assert!(CONFIG_TEMPLATE.contains("\nhooks:"));
+        assert!(!CONFIG_TEMPLATE.contains("global_hooks"));
+    }
+
+    #[test]
+    fn config_template_renders_with_empty_hooks() {
+        let clients = json!([{ "type": "openai", "api_key": "sk-test" }]);
+
+        let rendered = render_config_template("openai:gpt-4o", None, &clients).unwrap();
+
+        assert!(rendered.contains("\nhooks:"));
+        assert!(!rendered.contains("global_hooks"));
+
+        let cfg = Config::load_from_str(&rendered).unwrap();
+        assert!(cfg.hooks.is_empty());
+    }
+
+    #[test]
+    fn config_parses_hooks_map_preserving_order() {
+        let yaml = "\
+hooks:
+  tool.started:
+    - name: notify
+      command: ./hooks/notify.sh
+    - name: audit
+      command: ./hooks/audit.sh
+  turn.completed:
+    - name: webhook
+      command: curl -s https://example.com/hook
+";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(
+            cfg.hooks.keys().collect::<Vec<_>>(),
+            vec!["tool.started", "turn.completed"]
+        );
+        assert_eq!(cfg.hooks["tool.started"].len(), 2);
+        assert_eq!(cfg.hooks["tool.started"][0].name, "notify");
+        assert_eq!(cfg.hooks["tool.started"][0].command, "./hooks/notify.sh");
+        assert_eq!(cfg.hooks["turn.completed"][0].name, "webhook");
+    }
+
+    #[test]
+    fn config_without_hooks_parses_unchanged() {
+        let cfg: Config = serde_yaml::from_str("model: openai:gpt-4o").unwrap();
+
+        assert!(cfg.hooks.is_empty());
+        assert_eq!(cfg.model_id, "openai:gpt-4o");
     }
 
     #[test]

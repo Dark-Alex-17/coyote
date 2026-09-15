@@ -2,7 +2,7 @@ use super::role::Role;
 use super::{
     AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME,
     ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME, GLOBAL_TOOLS_DIR_NAME,
-    GLOBAL_TOOLS_UTILS_DIR_NAME, HIDDEN_MCP_FILE_NAME, INSTALLED_BUNDLES_FILE_NAME,
+    GLOBAL_TOOLS_UTILS_DIR_NAME, HIDDEN_MCP_FILE_NAME, HOOKS_DIR_NAME, INSTALLED_BUNDLES_FILE_NAME,
     MACROS_DIR_NAME, MCP_FILE_NAME, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME, ModelsOverride,
     RAGS_DIR_NAME, ROLES_DIR_NAME, SBX_KIT_DIR_NAME, SBX_KIT_HASH_FILE, SBX_MIXIN_FILE_NAME,
     SBX_MIXIN_KITS_DIR_NAME, SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
@@ -182,6 +182,14 @@ pub fn roles_dir() -> PathBuf {
 
 pub fn role_file(name: &str) -> PathBuf {
     roles_dir().join(format!("{name}.md"))
+}
+
+#[allow(dead_code)]
+pub fn hooks_dir() -> PathBuf {
+    match env::var(get_env_name("hooks_dir")) {
+        Ok(value) => PathBuf::from(value),
+        Err(_) => local_dir(HOOKS_DIR_NAME),
+    }
 }
 
 pub fn skills_dir() -> PathBuf {
@@ -938,6 +946,30 @@ mod tests {
             env::set_var(&env_name, &probe);
         }
         assert_eq!(sandbox_kit_override(), Some(probe));
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
+            }
+        }
+    }
+
+    #[test]
+    fn hooks_dir_reflects_env_var_state() {
+        let env_name = get_env_name("hooks_dir");
+        let prev = env::var_os(&env_name);
+
+        unsafe {
+            env::remove_var(&env_name);
+        }
+        assert_eq!(hooks_dir(), config_dir().join("hooks"));
+
+        let probe = PathBuf::from("/tmp/coyote-hooks-dir-probe");
+        unsafe {
+            env::set_var(&env_name, &probe);
+        }
+        assert_eq!(hooks_dir(), probe);
 
         unsafe {
             match prev {

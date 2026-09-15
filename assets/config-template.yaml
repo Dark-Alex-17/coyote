@@ -149,6 +149,18 @@ mcp_tools: null                  # Per-server MCP tool allowlists (glob patterns
                                  #       - list_*
                                  #     slack: []
 
+# ---- Hooks ----
+# Fire-and-forget external commands that run when lifecycle events fire. Each event name
+# maps to a list of named hooks; every listed hook's command runs when that event fires.
+# Hooks never block coyote and never change its output or exit code.
+# See the [Hooks documentation](https://github.com/Dark-Alex-17/coyote/wiki/Hooks) for more details
+hooks: {}                        # Event -> list of named hook commands (default: none)
+                                 # Example:
+                                 #   hooks:
+                                 #     turn.completed:
+                                 #       - name: notify
+                                 #         command: ./hooks/notify.sh
+
 # ---- Auto-Continue (Todo System) ----
 # The auto-continue system provides built-in task tracking for improved reliability.
 # When enabled, the model can create todo lists and the system will automatically

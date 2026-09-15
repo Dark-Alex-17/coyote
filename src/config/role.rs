@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::client::{Message, MessageContent, MessageRole, Model};
+use crate::hooks::HooksMap;
 
 use anyhow::Result;
 use fancy_regex::Regex;
@@ -99,6 +100,8 @@ pub struct Role {
     skill_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     memory: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hooks: Option<HooksMap>,
 
     #[serde(skip)]
     model: Model,
@@ -161,6 +164,7 @@ impl Role {
                         role.skill_instructions = value.as_str().map(|v| v.to_string())
                     }
                     "memory" => role.memory = value.as_bool(),
+                    "hooks" => role.hooks = parse_hooks_map(value),
                     _ => (),
                 }
             }
@@ -247,6 +251,10 @@ impl Role {
         }
         if let Some(memory) = self.memory {
             metadata.push(format!("memory: {memory}"));
+        }
+        if let Some(hooks) = &self.hooks {
+            let inline = serde_json::to_string(hooks).unwrap_or_else(|_| "{}".to_string());
+            metadata.push(format!("hooks: {inline}"));
         }
         if metadata.is_empty() {
             format!("{}\n", self.prompt)
@@ -378,6 +386,11 @@ impl Role {
 
     pub fn memory(&self) -> Option<bool> {
         self.memory
+    }
+
+    #[allow(dead_code)]
+    pub fn hooks(&self) -> Option<&HooksMap> {
+        self.hooks.as_ref()
     }
 
     pub fn skills_enabled(&self) -> Option<bool> {
@@ -544,6 +557,10 @@ fn parse_mcp_tools_map(value: &Value) -> Option<IndexMap<String, Vec<String>>> {
     Some(mcp_tools)
 }
 
+fn parse_hooks_map(value: &Value) -> Option<HooksMap> {
+    serde_json::from_value(value.clone()).ok()
+}
+
 fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
     let mut text = prompt;
     let mut search_input = true;
@@ -639,6 +656,42 @@ mod tests {
             role.enabled_mcp_servers(),
             Some(vec!["github".to_string(), "jira".to_string()])
         );
+    }
+
+    #[test]
+    fn role_hooks_round_trip_through_export() {
+        let content = "---\nhooks:\n  turn.completed:\n    - name: notify\n      command: ./hooks/notify.sh\n---\nPrompt";
+
+        let role = Role::new("test", content);
+
+        let hooks = role.hooks().expect("hooks should be parsed");
+        assert_eq!(hooks["turn.completed"][0].name, "notify");
+        assert_eq!(hooks["turn.completed"][0].command, "./hooks/notify.sh");
+
+        let exported = role.export();
+        assert!(exported.contains("hooks:"));
+
+        let reparsed = Role::new("test", &exported);
+        assert_eq!(reparsed.hooks(), role.hooks());
+        assert_eq!(reparsed.prompt(), "Prompt");
+    }
+
+    #[test]
+    fn role_without_hooks_has_none_and_export_omits_key() {
+        let role = Role::new("test", "---\nmemory: true\n---\nPrompt");
+
+        assert!(role.hooks().is_none());
+        assert!(!role.export().contains("hooks:"));
+    }
+
+    #[test]
+    fn role_malformed_hooks_degrades_to_none() {
+        let content = "---\nhooks: [not, a, map]\n---\nPrompt";
+
+        let role = Role::new("test", content);
+
+        assert!(role.hooks().is_none());
+        assert_eq!(role.prompt(), "Prompt");
     }
 
     #[test]

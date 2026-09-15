@@ -1,4 +1,5 @@
 use crate::config::AgentVariable;
+use crate::hooks::HooksMap;
 use anyhow::Result;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,12 @@ pub struct Graph {
 
     #[serde(default)]
     pub global_tools: Vec<String>,
+
+    #[serde(default)]
+    pub hooks: HooksMap,
+
+    #[serde(default)]
+    pub global_hooks: Vec<String>,
 
     #[serde(default)]
     pub mcp_servers: Vec<String>,
@@ -609,6 +616,52 @@ nodes:
             NodeType::End(end) => assert_eq!(end.output, "{{result}}"),
             _ => panic!("expected End variant"),
         }
+    }
+
+    #[test]
+    fn graph_hooks_and_global_hooks_parse_and_round_trip() {
+        let yaml = r#"
+name: g
+start: e
+hooks:
+  tool.started:
+    - name: notify
+      command: ./hooks/notify.sh
+global_hooks:
+  - tool.started.notify
+nodes:
+  e:
+    id: e
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(graph.hooks["tool.started"][0].name, "notify");
+        assert_eq!(graph.hooks["tool.started"][0].command, "./hooks/notify.sh");
+        assert_eq!(graph.global_hooks, vec!["tool.started.notify"]);
+
+        let reparsed: Graph =
+            serde_yaml::from_str(&serde_yaml::to_string(&graph).unwrap()).unwrap();
+        assert_eq!(reparsed.hooks, graph.hooks);
+        assert_eq!(reparsed.global_hooks, graph.global_hooks);
+    }
+
+    #[test]
+    fn graph_without_hooks_keys_parses_empty() {
+        let yaml = r#"
+name: g
+start: e
+nodes:
+  e:
+    id: e
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(graph.hooks.is_empty());
+        assert!(graph.global_hooks.is_empty());
     }
 
     #[test]
