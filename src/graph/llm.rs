@@ -38,7 +38,15 @@ impl LlmNodeExecutor {
         parent_ctx: &mut RequestContext,
         abort: &AbortSignal,
     ) -> Result<LlmExecutionOutcome> {
-        let result = run(node_id, node, state_manager, parent_ctx, abort).await;
+        let result = run(
+            node_id,
+            node,
+            state_manager,
+            parent_ctx,
+            abort,
+            &mut default_completion_runner(),
+        )
+        .await;
         finish(node, state_manager, parent_ctx, result, abort).await
     }
 }
@@ -94,12 +102,15 @@ fn outcome_from(
     }
 }
 
+/// The runner is a parameter for the same reason `finish` is split out:
+/// tests drive the node scope without a model.
 async fn run(
     node_id: &str,
     node: &LlmNode,
     state_manager: &mut StateManager,
     parent_ctx: &mut RequestContext,
     abort: &AbortSignal,
+    runner: &mut CompletionRunner<'_>,
 ) -> Result<String> {
     let mut instructions: Option<String> = match &node.instructions {
         Some(s) => Some(
@@ -202,14 +213,11 @@ async fn run(
         node.mcp_tools.clone().map(|map| (node_id.to_string(), map)),
     );
     parent_ctx.refresh_mcp_tool_filters();
-    let result = bounded_run(
-        node,
-        &prompt,
-        parent_ctx,
-        abort,
-        &mut default_completion_runner(),
-    )
-    .await;
+    // Inside the node, user__/todo__ builtins require explicit opt-in via the
+    // node's `tools:` list; mem::replace so nested execution restores cleanly.
+    let saved_in_node = std::mem::replace(&mut parent_ctx.in_graph_llm_node, true);
+    let result = bounded_run(node, &prompt, parent_ctx, abort, runner).await;
+    parent_ctx.in_graph_llm_node = saved_in_node;
     parent_ctx.role = saved_role;
     let node_jobs =
         std::mem::replace(&mut parent_ctx.node_job_scope, saved_job_scope).unwrap_or_default();
@@ -1203,6 +1211,63 @@ mod tests {
         assert!(
             captured.starts_with("LLM node structured-extraction failed: "),
             "{captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_scope_flag_is_set_during_the_run_and_restored_on_ok() {
+        let node = node_with(None);
+        let mut state = manager_with(&[]);
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        let abort = create_abort_signal();
+
+        let out = run(
+            "n",
+            &node,
+            &mut state,
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, ctx, _abort| {
+                assert!(
+                    ctx.in_graph_llm_node,
+                    "flag must be set while the node runs"
+                );
+                boxed_completion(async { Ok(("done".to_string(), vec![])) })
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "done");
+        assert!(!ctx.in_graph_llm_node, "flag must not outlive the node");
+    }
+
+    #[tokio::test]
+    async fn node_scope_flag_restores_prior_value_when_the_run_fails() {
+        let node = node_with(None);
+        let mut state = manager_with(&[]);
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+        ctx.in_graph_llm_node = true;
+        let abort = create_abort_signal();
+
+        run(
+            "n",
+            &node,
+            &mut state,
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| {
+                boxed_completion(async { Err(anyhow!("boom")) })
+            }),
+        )
+        .await
+        .expect_err("the runner failure must surface");
+
+        assert!(
+            ctx.in_graph_llm_node,
+            "a nested run must restore the outer scope's flag"
         );
     }
 }

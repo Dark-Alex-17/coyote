@@ -3,6 +3,7 @@ use super::types::{ConcurrencyCap, Graph, NextTargets, Node, NodeType};
 use crate::client::{Model, ModelType};
 use crate::config;
 use crate::config::{Agent, AppConfig, paths};
+use crate::function::user_interaction::USER_FUNCTION_PREFIX;
 use crate::rag::{GraphRagConfig, RagData};
 use anyhow::{Result, bail};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -179,6 +180,7 @@ impl GraphValidator {
         self.validate_max_attempts(graph, &mut result);
         self.validate_fallback_capture(graph, &mut result);
         self.validate_output_schema_properties(graph, &mut result);
+        self.validate_structured_output_user_tools(graph, &mut result);
         self.validate_max_concurrency(graph, &mut result);
         self.validate_max_concurrency_template(graph, &mut result);
         self.validate_orchestration_limits(graph, &mut result);
@@ -455,6 +457,29 @@ impl GraphValidator {
                      `properties` or lift them via `state_updates`"
                 ),
             ));
+        }
+    }
+
+    fn validate_structured_output_user_tools(&self, graph: &Graph, result: &mut ValidationResult) {
+        for (node_id, node) in &graph.nodes {
+            let NodeType::Llm(llm) = &node.node_type else {
+                continue;
+            };
+            if llm.output_schema.is_none() {
+                continue;
+            }
+            let exposes_user_tools = llm.tools.as_ref().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|t| t.trim().starts_with(USER_FUNCTION_PREFIX))
+            });
+            if exposes_user_tools {
+                result.warning(ValidationError::with_node(
+                    node_id,
+                    "structured-output llm node exposes interactive user tools (`user__*`); \
+                     in headless runs a user__ call blocks the node as an escalation",
+                ));
+            }
         }
     }
 
@@ -4681,6 +4706,89 @@ mod tests {
                 .message
                 .contains("declares `fallback` with `output_schema`")),
             "unexpected fallback capture warning: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn structured_output_node_with_user_tools_warns() {
+        let mut node = llm_with_output_schema("l", &["verdict"], Some("end"));
+        if let NodeType::Llm(ref mut n) = node.node_type {
+            n.tools = Some(vec!["user__select".into()]);
+        }
+        let graph = graph_with(vec![("l", node), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|e| e.node_id.as_deref() == Some("l")
+                    && e.message.contains("interactive user tools")),
+            "expected user-tool warning: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn structured_output_node_with_all_tools_does_not_warn() {
+        // `all` is not a valid llm-node tools entry (validate_tools_subset
+        // rejects it at run()), so this advisory stays silent about it.
+        let mut node = llm_with_output_schema("l", &["verdict"], Some("end"));
+        if let NodeType::Llm(ref mut n) = node.node_type {
+            n.tools = Some(vec!["all".into()]);
+        }
+        let graph = graph_with(vec![("l", node), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|e| e.message.contains("interactive user tools")),
+            "unexpected user-tool warning: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn structured_output_node_without_user_tools_does_not_warn() {
+        let mut node = llm_with_output_schema("l", &["verdict"], Some("end"));
+        if let NodeType::Llm(ref mut n) = node.node_type {
+            n.tools = Some(vec![]);
+        }
+        let graph = graph_with(vec![("l", node), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|e| e.message.contains("interactive user tools")),
+            "unexpected user-tool warning: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn non_structured_node_with_user_tools_does_not_warn() {
+        let mut node = llm_node("l", None, Some("end"));
+        if let NodeType::Llm(ref mut n) = node.node_type {
+            n.tools = Some(vec!["user__select".into()]);
+        }
+        let graph = graph_with(vec![("l", node), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|e| e.message.contains("interactive user tools")),
+            "unexpected user-tool warning: {:?}",
             result.warnings
         );
     }

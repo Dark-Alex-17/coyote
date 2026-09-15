@@ -327,6 +327,7 @@ pub struct RequestContext {
     /// Set while a graph LLM node with `mcp_tools` is executing; re-applied as
     /// the last filter layer by every `refresh_mcp_tool_filters` recompute.
     pub active_node_mcp_tools: Option<(String, IndexMap<String, Vec<String>>)>,
+    pub in_graph_llm_node: bool,
 
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
@@ -378,6 +379,7 @@ impl RequestContext {
             declared_function_names: Default::default(),
             node_job_scope: None,
             active_node_mcp_tools: None,
+            in_graph_llm_node: false,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -448,6 +450,7 @@ impl RequestContext {
             declared_function_names: Default::default(),
             node_job_scope: None,
             active_node_mcp_tools: None,
+            in_graph_llm_node: false,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -507,6 +510,7 @@ impl RequestContext {
             declared_function_names: self.declared_function_names.clone(),
             node_job_scope: None,
             active_node_mcp_tools: self.active_node_mcp_tools.clone(),
+            in_graph_llm_node: self.in_graph_llm_node,
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -562,6 +566,7 @@ impl RequestContext {
             declared_function_names: Default::default(),
             node_job_scope: None,
             active_node_mcp_tools: None,
+            in_graph_llm_node: false,
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -2485,10 +2490,11 @@ impl RequestContext {
                     .declarations()
                     .iter()
                     .filter(|v| {
-                        (v.name.starts_with(USER_FUNCTION_PREFIX)
+                        ((!self.in_graph_llm_node && v.name.starts_with(USER_FUNCTION_PREFIX))
                             || (!matches!(role.skills_enabled(), Some(false))
                                 && v.name.starts_with(SKILL_FUNCTION_PREFIX))
-                            || (self.auto_continue_config().enabled
+                            || (!self.in_graph_llm_node
+                                && self.auto_continue_config().enabled
                                 && v.name.starts_with(TODO_FUNCTION_PREFIX))
                             || v.name.starts_with(RAG_FUNCTION_PREFIX)
                             || v.name.starts_with(JOB_FUNCTION_PREFIX))
@@ -2513,8 +2519,9 @@ impl RequestContext {
                         tool_names.contains(&v.name)
                             || (!matches!(agent.skills_enabled(), Some(false))
                                 && v.name.starts_with(SKILL_FUNCTION_PREFIX))
-                            || v.name.starts_with(USER_FUNCTION_PREFIX)
-                            || v.name.starts_with(TODO_FUNCTION_PREFIX)
+                            || (!self.in_graph_llm_node
+                                && (v.name.starts_with(USER_FUNCTION_PREFIX)
+                                    || v.name.starts_with(TODO_FUNCTION_PREFIX)))
                             || v.name.starts_with(AGENT_FUNCTION_PREFIX)
                             || v.name.starts_with(MEMORY_FUNCTION_PREFIX)
                             || v.name.starts_with(RAG_FUNCTION_PREFIX)
@@ -6436,6 +6443,19 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn fork_for_branch_copies_in_graph_llm_node() {
+        let mut ctx = create_test_ctx();
+        ctx.in_graph_llm_node = true;
+
+        let branch = ctx.fork_for_branch();
+
+        assert!(
+            branch.in_graph_llm_node,
+            "parallel map branches inside a node must keep the node's tool gating"
+        );
+    }
+
     fn app_state_with_mcp_config(mcp_server_support: bool, server_names: &[&str]) -> Arc<AppState> {
         app_state_with_mcp_command(mcp_server_support, server_names, "echo")
     }
@@ -7031,6 +7051,210 @@ mod tests {
             names.contains(&"user__select"),
             "user__ tools must survive an agent tool filter, got: {names:?}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn select_functions_graph_llm_node_gates_user_and_todo_tools_under_agent_filter() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_node_gate_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!(
+                "name: {agent_name}\ninstructions: hi\nauto_continue: true\ncan_spawn_agents: true\n"
+            ),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        ctx.in_graph_llm_node = true;
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("user__")),
+            "user__ tools must not leak into a graph llm node, got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("todo__")),
+            "todo__ tools must not leak into a graph llm node, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"agent__spawn"),
+            "agent__ tools keep implicit availability inside a node, got: {names:?}"
+        );
+
+        ctx.in_graph_llm_node = false;
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            names.contains(&"user__select"),
+            "outside a node, subagent escalation via user__ must keep working, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"todo__init"),
+            "outside a node, todo__ tools must survive the agent filter, got: {names:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn select_functions_graph_llm_node_user_tool_opt_in_is_exact() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_node_optin_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["user__select".to_string()]));
+
+        ctx.in_graph_llm_node = true;
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            names.contains(&"user__select"),
+            "an explicitly listed user tool must be offered, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"user__confirm"),
+            "opt-in must not drag in sibling user tools, got: {names:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn select_functions_graph_llm_node_todo_tool_opt_in_is_exact() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_node_todo_optin_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\nauto_continue: true\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["todo__init".to_string()]));
+
+        ctx.in_graph_llm_node = true;
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            names.contains(&"todo__init"),
+            "an explicitly listed todo tool must be offered, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"todo__pause"),
+            "opt-in must not drag in sibling todo tools, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"user__select"),
+            "a todo opt-in must not expose user tools, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn select_functions_all_enabled_tools_exposes_user_tools_despite_node_flag() {
+        // `all` is a role/session `enabled_tools` semantic — graph llm nodes
+        // cannot declare it (validate_tools_subset rejects it at run()). The
+        // flag being set documents that the `all` expansion path bypasses the
+        // in-node gate by design.
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_user_interaction_functions();
+        ctx.in_graph_llm_node = true;
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["all".to_string()]));
+
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            names.contains(&"user__select"),
+            "`all` enabled_tools must expose user tools even inside a node, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn select_functions_graph_llm_node_suppresses_user_tools_without_agent() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_user_interaction_functions();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        ctx.in_graph_llm_node = true;
+        assert!(
+            ctx.select_functions(&role).is_none(),
+            "user__ tools must not leak into a graph llm node without an agent"
+        );
+
+        ctx.in_graph_llm_node = false;
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"user__select"));
+    }
+
+    #[test]
+    fn select_functions_graph_llm_node_suppresses_todo_tools_without_agent() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.auto_continue = true);
+        ctx.tool_scope.functions.append_todo_functions();
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        ctx.in_graph_llm_node = true;
+        assert!(
+            ctx.select_functions(&role).is_none(),
+            "todo__ tools must not leak into a graph llm node without an agent"
+        );
+
+        ctx.in_graph_llm_node = false;
+        let fns = ctx.select_functions(&role).unwrap();
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"todo__init"));
     }
 
     #[test]
