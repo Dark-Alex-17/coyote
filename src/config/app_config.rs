@@ -1,4 +1,5 @@
 use crate::client::{ClientConfig, Model, ModelType, list_models};
+use crate::hooks::HooksMap;
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, drain_stale_tty_input, get_env_name};
 
@@ -51,6 +52,9 @@ pub struct AppConfig {
     #[serde(default, deserialize_with = "super::deserialize_csv_or_vec")]
     pub enabled_mcp_servers: Option<Vec<String>>,
     pub mcp_tools: Option<IndexMap<String, Vec<String>>>,
+
+    #[serde(default)]
+    pub hooks: HooksMap,
 
     pub auto_continue: bool,
     pub max_auto_continues: usize,
@@ -143,6 +147,8 @@ impl Default for AppConfig {
             enabled_mcp_servers: None,
             mcp_tools: None,
 
+            hooks: Default::default(),
+
             auto_continue: false,
             max_auto_continues: 10,
             inject_todo_instructions: true,
@@ -234,6 +240,8 @@ impl AppConfig {
             mapping_mcp_servers: config.mapping_mcp_servers,
             enabled_mcp_servers: config.enabled_mcp_servers,
             mcp_tools: config.mcp_tools,
+
+            hooks: config.hooks,
 
             auto_continue: config.auto_continue,
             max_auto_continues: config.max_auto_continues,
@@ -572,6 +580,12 @@ impl AppConfig {
             self.enabled_mcp_servers = v.map(|raw| super::csv_to_vec(&raw));
         }
 
+        if let Ok(v) = env::var(get_env_name("hooks"))
+            && let Ok(v) = serde_json::from_str(&v)
+        {
+            self.hooks = v;
+        }
+
         if let Some(v) = super::read_env_value::<String>(&get_env_name("repl_prelude")) {
             self.repl_prelude = v;
         }
@@ -786,6 +800,40 @@ mod tests {
         let app = AppConfig::from_config(cfg).unwrap();
 
         assert_eq!(app.clients.len(), 1);
+    }
+
+    #[test]
+    fn from_config_copies_hooks() {
+        let mut hooks = crate::hooks::HooksMap::new();
+        hooks.insert(
+            "turn.completed".to_string(),
+            vec![crate::hooks::HookDef {
+                name: "notify".to_string(),
+                command: "./hooks/notify.sh".to_string(),
+            }],
+        );
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            clients: vec![ClientConfig::default()],
+            hooks: hooks.clone(),
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        assert_eq!(app.hooks, hooks);
+    }
+
+    #[test]
+    fn from_config_defaults_hooks_to_empty() {
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            clients: vec![ClientConfig::default()],
+            ..Config::default()
+        };
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        assert!(app.hooks.is_empty());
     }
 
     #[test]

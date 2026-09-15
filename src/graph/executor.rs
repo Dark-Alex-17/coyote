@@ -928,6 +928,8 @@ mod tests {
             max_concurrent_agents: None,
             max_agent_depth: None,
             global_tools: Vec::new(),
+            hooks: Default::default(),
+            global_hooks: Vec::new(),
             mcp_servers: Vec::new(),
             mcp_tools: None,
             skills_enabled: None,

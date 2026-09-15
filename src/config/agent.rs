@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::hooks::HooksMap;
 use crate::{
     client::Model,
     config::memory,
@@ -848,6 +849,10 @@ pub struct AgentConfig {
     pub mcp_tools: Option<IndexMap<String, Vec<String>>>,
     #[serde(default)]
     pub global_tools: Vec<String>,
+    #[serde(default)]
+    pub hooks: HooksMap,
+    #[serde(default)]
+    pub global_hooks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -917,6 +922,8 @@ impl AgentConfig {
             reasoning_effort: graph.reasoning_effort.clone(),
             description: graph.description.clone(),
             global_tools: graph.global_tools.clone(),
+            hooks: graph.hooks.clone(),
+            global_hooks: graph.global_hooks.clone(),
             mcp_servers: graph.mcp_servers.clone(),
             mcp_tools: graph.mcp_tools.clone(),
             skills_enabled: graph.skills_enabled,
@@ -964,6 +971,11 @@ impl AgentConfig {
             && let Ok(v) = serde_json::from_str(&v)
         {
             self.global_tools = v;
+        }
+        if let Ok(v) = env::var(with_prefix("global_hooks"))
+            && let Ok(v) = serde_json::from_str(&v)
+        {
+            self.global_hooks = v;
         }
         if let Ok(v) = env::var(with_prefix("mcp_servers"))
             && let Ok(v) = serde_json::from_str(&v)
@@ -1337,6 +1349,58 @@ variables:
     }
 
     #[test]
+    fn agent_config_hooks_and_global_hooks_round_trip() {
+        let yaml = "\
+name: hooked
+instructions: hi
+hooks:
+  tool.started:
+    - name: notify
+      command: ./hooks/notify.sh
+global_hooks:
+  - tool.started.notify
+";
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.hooks["tool.started"][0].name, "notify");
+        assert_eq!(config.hooks["tool.started"][0].command, "./hooks/notify.sh");
+        assert_eq!(config.global_hooks, vec!["tool.started.notify"]);
+
+        let serialized = serde_yaml::to_string(&config).unwrap();
+        let reparsed: AgentConfig = serde_yaml::from_str(&serialized).unwrap();
+
+        assert_eq!(reparsed.hooks, config.hooks);
+        assert_eq!(reparsed.global_hooks, config.global_hooks);
+    }
+
+    #[test]
+    fn from_graph_carries_hooks_and_global_hooks() {
+        let yaml = "\
+name: g
+start: e
+hooks:
+  turn.completed:
+    - name: webhook
+      command: curl -s https://example.com/hook
+global_hooks:
+  - turn.completed.webhook
+nodes:
+  e:
+    id: e
+    type: end
+    output: done
+";
+        let graph: graph::Graph = serde_yaml::from_str(yaml).unwrap();
+
+        let config = AgentConfig::from_graph("g", &graph);
+
+        assert_eq!(config.hooks, graph.hooks);
+        assert_eq!(config.global_hooks, graph.global_hooks);
+        assert_eq!(config.hooks["turn.completed"][0].name, "webhook");
+        assert_eq!(config.global_hooks, vec!["turn.completed.webhook"]);
+    }
+
+    #[test]
     fn agent_config_defaults() {
         let yaml = "name: minimal\ninstructions: hi\n";
         let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
@@ -1350,6 +1414,8 @@ variables:
         assert_eq!(config.escalation_timeout, 0);
         assert!(config.mcp_servers.is_empty());
         assert!(config.global_tools.is_empty());
+        assert!(config.hooks.is_empty());
+        assert!(config.global_hooks.is_empty());
         assert!(config.conversation_starters.is_empty());
         assert!(config.variables.is_empty());
         assert!(config.model_id.is_none());
