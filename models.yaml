@@ -10237,10 +10237,10 @@
   - name: ~z-ai/glm-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.9
-    output_price: 3.0
-    cache_read_price: 0.09
-    max_output_tokens: 131072
+    input_price: 0.8775
+    output_price: 2.97
+    cache_read_price: 0.1755
+    max_output_tokens: 235929
     supports_function_calling: true
 - provider: github
   models:
@@ -10399,9 +10399,9 @@
   - name: Qwen/Qwen3.8-27B
     type: chat
     max_input_tokens: 262144
-    input_price: 0.4
-    output_price: 3.0
-    cache_read_price: 0.04
+    input_price: 0.2
+    output_price: 2.5
+    cache_read_price: 0.05
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -10414,7 +10414,7 @@
     max_input_tokens: 1048576
     input_price: 1.2
     output_price: 4.0
-    cache_read_price: 0.12
+    cache_read_price: 0.2
     max_output_tokens: 131072
     supports_function_calling: true
     reasoning_levels:
