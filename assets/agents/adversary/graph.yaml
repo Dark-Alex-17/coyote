@@ -88,6 +88,14 @@ nodes:
         Split compound criteria ("A and B") into separate entries when they are
         independently verifiable. When the caller supplied NO plan/criteria at
         all, emit an empty array — downstream fails closed.
+        The caller's explicit enumeration is AUTHORITATIVE: when the caller
+        declares "these N are the (only) criteria" or supplies a numbered
+        criteria list, extract EXACTLY those N — never add entries they did
+        not enumerate. NEVER mine criteria from sections the caller labels as
+        context ("FACTS", "Quality bar", "context, not criteria", background
+        material) — route those into plan_notes / scope_notes / extra_context
+        instead. Splitting applies only WITHIN a declared criterion; when in
+        doubt, FEWER criteria, verbatim.
       - `diff_spec`: the git diff basis the caller named — a range, a ref/SHA,
         "staged", "worktree", or "auto" when unnamed (a caller phrase like
         "get_diff --base X" means diff_spec = "X").
