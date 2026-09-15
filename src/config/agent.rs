@@ -972,10 +972,13 @@ impl AgentConfig {
         {
             self.global_tools = v;
         }
-        if let Ok(v) = env::var(with_prefix("global_hooks"))
-            && let Ok(v) = serde_json::from_str(&v)
-        {
-            self.global_hooks = v;
+        if let Ok(v) = env::var(with_prefix("global_hooks")) {
+            match serde_json::from_str(&v) {
+                Ok(v) => self.global_hooks = v,
+                Err(err) => {
+                    debug!("Ignoring malformed global_hooks env override for agent '{name}': {err}")
+                }
+            }
         }
         if let Ok(v) = env::var(with_prefix("mcp_servers"))
             && let Ok(v) = serde_json::from_str(&v)
@@ -1371,6 +1374,40 @@ global_hooks:
 
         assert_eq!(reparsed.hooks, config.hooks);
         assert_eq!(reparsed.global_hooks, config.global_hooks);
+    }
+
+    #[test]
+    fn load_envs_overrides_global_hooks() {
+        let yaml = "name: hooks-env-probe\ninstructions: hi\nglobal_hooks:\n  - initial.hook\n";
+        let mut config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+        let env_name = normalize_env_name("hooks-env-probe_global_hooks");
+        let prev = env::var_os(&env_name);
+
+        unsafe {
+            env::set_var(
+                &env_name,
+                r#"["tool.started.notify","turn.completed.webhook"]"#,
+            )
+        };
+        config.load_envs(&AppConfig::default());
+        assert_eq!(
+            config.global_hooks,
+            vec!["tool.started.notify", "turn.completed.webhook"]
+        );
+
+        unsafe { env::set_var(&env_name, "not json") };
+        config.load_envs(&AppConfig::default());
+        assert_eq!(
+            config.global_hooks,
+            vec!["tool.started.notify", "turn.completed.webhook"]
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
+            }
+        }
     }
 
     #[test]
