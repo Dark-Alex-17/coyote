@@ -126,6 +126,16 @@ pub fn handle_todo_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) 
     if !ctx.app.config.function_calling_support {
         bail!("Cannot use todo tools: function calling is disabled.");
     }
+    if ctx.in_graph_llm_node {
+        return Ok(json!({
+            "error": "todo tools are unavailable inside graph llm nodes: they drive chat turn \
+                      loops (auto_continue), and llm nodes have no turn loop. Node \
+                      continuation is owned by the node loop, max_iterations, and graph \
+                      edges. For driven multi-step work, use an agent node whose agent sets \
+                      auto_continue: true."
+        }));
+    }
+
     let auto_config = ctx.auto_continue_config();
     if !auto_config.enabled {
         bail!(
@@ -244,5 +254,29 @@ mod tests {
         let error = result["error"].as_str().unwrap();
         assert!(error.contains("requires an active session"));
         assert!(ctx.auto_continue_paused.is_none());
+    }
+
+    #[test]
+    fn graph_llm_node_returns_teaching_error() {
+        let mut app_state = AppState::test_default();
+        app_state.config = Arc::new(AppConfig {
+            auto_continue: true,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app_state), WorkingMode::Cmd);
+        ctx.in_graph_llm_node = true;
+
+        let result = handle_todo_tool(&mut ctx, "todo__init", &json!({"goal": "g"})).unwrap();
+
+        let error = result["error"].as_str().unwrap();
+        assert!(error.contains("graph llm nodes"));
+        assert!(
+            ctx.todo_list.is_default(),
+            "the guard must fire before any todo state mutation (goal included)"
+        );
+
+        ctx.in_graph_llm_node = false;
+        let result = handle_todo_tool(&mut ctx, "todo__init", &json!({"goal": "g"})).unwrap();
+        assert_eq!(result["status"], "ok");
     }
 }

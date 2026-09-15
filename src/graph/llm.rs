@@ -12,6 +12,7 @@ use crate::function::ToolResult;
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::function::jobs::reap_jobs;
 use crate::function::skill::skill_function_declarations;
+use crate::function::todo::TODO_FUNCTION_PREFIX;
 use crate::utils::AbortSignal;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use log::warn;
@@ -485,6 +486,14 @@ fn validate_tools_subset(
             .map(|d| d.name.as_str())
             .collect();
         for name in regular {
+            if name.starts_with(TODO_FUNCTION_PREFIX) {
+                bail!(
+                    "llm node cannot enable '{name}': todo tools drive chat turn loops \
+                     (auto_continue), which llm nodes don't have. Node continuation is \
+                     owned by the node loop, max_iterations, and graph edges. For driven \
+                     multi-step work, use an agent node whose agent sets auto_continue: true."
+                );
+            }
             if !known.contains(name.as_str()) {
                 let mut avail: Vec<&str> = known.iter().copied().collect();
                 avail.sort();
@@ -792,6 +801,24 @@ mod tests {
 
         assert!(regular.is_empty());
         assert!(mcp.is_empty());
+    }
+
+    #[test]
+    fn validate_tools_subset_rejects_todo_tools() {
+        let mut ctx = plain_ctx();
+        let mut agent = Agent::test_new(AgentConfig {
+            auto_continue: true,
+            ..AgentConfig::default()
+        });
+        agent.functions_mut().append_todo_functions();
+        ctx.agent = Some(agent);
+
+        let err = validate_tools_subset(&["todo__init".to_string()], &[], &ctx).unwrap_err();
+
+        assert!(
+            err.to_string().contains("todo tools drive chat turn loops"),
+            "expected the todo teaching error, got: {err}"
+        );
     }
 
     #[test]

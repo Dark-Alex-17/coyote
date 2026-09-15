@@ -2516,16 +2516,17 @@ impl RequestContext {
 
                 if let Some(ref tool_names) = role_filter {
                     agent_functions.retain(|v| {
-                        tool_names.contains(&v.name)
-                            || (!matches!(agent.skills_enabled(), Some(false))
-                                && v.name.starts_with(SKILL_FUNCTION_PREFIX))
-                            || (!self.in_graph_llm_node
-                                && (v.name.starts_with(USER_FUNCTION_PREFIX)
-                                    || v.name.starts_with(TODO_FUNCTION_PREFIX)))
-                            || v.name.starts_with(AGENT_FUNCTION_PREFIX)
-                            || v.name.starts_with(MEMORY_FUNCTION_PREFIX)
-                            || v.name.starts_with(RAG_FUNCTION_PREFIX)
-                            || v.name.starts_with(JOB_FUNCTION_PREFIX)
+                        !(self.in_graph_llm_node && v.name.starts_with(TODO_FUNCTION_PREFIX))
+                            && (tool_names.contains(&v.name)
+                                || (!matches!(agent.skills_enabled(), Some(false))
+                                    && v.name.starts_with(SKILL_FUNCTION_PREFIX))
+                                || (!self.in_graph_llm_node
+                                    && (v.name.starts_with(USER_FUNCTION_PREFIX)
+                                        || v.name.starts_with(TODO_FUNCTION_PREFIX)))
+                                || v.name.starts_with(AGENT_FUNCTION_PREFIX)
+                                || v.name.starts_with(MEMORY_FUNCTION_PREFIX)
+                                || v.name.starts_with(RAG_FUNCTION_PREFIX)
+                                || v.name.starts_with(JOB_FUNCTION_PREFIX))
                     });
                 }
 
@@ -7153,7 +7154,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn select_functions_graph_llm_node_todo_tool_opt_in_is_exact() {
+    fn select_functions_graph_llm_node_todo_tools_cannot_be_opted_in() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
@@ -7176,22 +7177,21 @@ mod tests {
         run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
 
         let mut role = Role::new("r", "p");
-        role.set_enabled_tools(Some(vec!["todo__init".to_string()]));
+        role.set_enabled_tools(Some(vec![
+            "todo__init".to_string(),
+            "user__select".to_string(),
+        ]));
 
         ctx.in_graph_llm_node = true;
         let fns = ctx.select_functions(&role).unwrap();
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
         assert!(
-            names.contains(&"todo__init"),
-            "an explicitly listed todo tool must be offered, got: {names:?}"
+            !names.iter().any(|n| n.starts_with("todo__")),
+            "todo tools must be denied inside a node even when explicitly listed, got: {names:?}"
         );
         assert!(
-            !names.contains(&"todo__pause"),
-            "opt-in must not drag in sibling todo tools, got: {names:?}"
-        );
-        assert!(
-            !names.contains(&"user__select"),
-            "a todo opt-in must not expose user tools, got: {names:?}"
+            names.contains(&"user__select"),
+            "an explicitly listed user tool must still be offered, got: {names:?}"
         );
     }
 
