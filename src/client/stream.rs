@@ -215,6 +215,14 @@ impl SseHandler {
         !self.buffer.is_empty() || !self.tool_calls.is_empty() || !self.thinking.is_empty()
     }
 
+    /// Whether visible output (text or tool calls) has been accumulated.
+    /// Unlike [`Self::has_received_content`], thinking blocks do not count:
+    /// a stream truncated before any visible output is still an empty
+    /// response to the caller.
+    pub fn has_received_visible_output(&self) -> bool {
+        !self.buffer.is_empty() || !self.tool_calls.is_empty()
+    }
+
     pub fn abort(&self) -> AbortSignal {
         self.abort_signal.clone()
     }

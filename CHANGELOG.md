@@ -17,7 +17,8 @@ reasoning items from the Responses API); older coyote binaries cannot load those
 
 - support `wire_api: responses | chat` on the openai and openai-compatible clients, with wire-aware request patching on both patch layers
 - report token usage (including cached input tokens) on the openai responses path
-- opting a third-party endpoint into `wire_api: responses` sends `include: ["reasoning.encrypted_content"]` and `"strict": false` tool definitions — strict `/v1/responses` servers may reject these as unknown params
+- streaming responses that end with `response.incomplete` now surface the truncation reason (e.g. `max_output_tokens`) when no output was delivered — matching the non-streaming behavior — and record token usage for truncated turns instead of ending silently
+- the responses wire always sends `include: ["reasoning.encrypted_content"]` and `"strict": false` tool definitions; strict third-party `/v1/responses` servers may reject these as unknown params when opted in via `wire_api: responses` (workaround: a `responses`-keyed client patch, e.g. `include: null` for Groq)
 
 ## v0.10.3 (2026-09-15)
 

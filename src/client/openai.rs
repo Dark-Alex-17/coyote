@@ -944,6 +944,18 @@ fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Resu
             None => bail!("Response failed: {data}"),
         },
         Some("response.incomplete") => {
+            // Truncated turns are the most expensive ones; record their
+            // billed usage before deciding how to surface the truncation.
+            if let Some(usage) = openai_parse_responses_usage(&data["response"]["usage"]) {
+                debug!("token-usage: {usage:?}");
+                handler.usage(usage);
+            }
+            // Parity with the non-streaming path (`openai_extract_responses`):
+            // partial text or tool calls are returned rather than discarded
+            // by a hard error; only an empty truncated response bails.
+            if handler.has_received_visible_output() {
+                return Ok(true);
+            }
             match data["response"]["incomplete_details"]["reason"].as_str() {
                 Some(reason) => bail!("The response was cut off: {reason}"),
                 None => bail!("The response was cut off: {data}"),
@@ -1404,6 +1416,53 @@ mod tests {
             err.contains("The response was cut off: max_output_tokens"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn responses_stream_incomplete_without_reason_still_bails() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut handler = SseHandler::new(sender, abort_signal);
+        let event = json!({
+            "type": "response.incomplete",
+            "response": {}
+        });
+
+        let err = openai_responses_handle_event(&event, &mut handler)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("The response was cut off"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn responses_stream_incomplete_with_partial_output_ends_stream_and_records_usage() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut handler = SseHandler::new(sender, abort_signal);
+        handler.set_silent(true);
+        handler.text("partial answer").unwrap();
+        let event = json!({
+            "type": "response.incomplete",
+            "response": {
+                "incomplete_details": { "reason": "max_output_tokens" },
+                "usage": {
+                    "input_tokens": 50,
+                    "output_tokens": 10,
+                    "input_tokens_details": { "cached_tokens": 25 }
+                }
+            }
+        });
+
+        let done = openai_responses_handle_event(&event, &mut handler).unwrap();
+
+        assert!(done, "partial output should end the stream, not bail");
+        let (text, _, _, usage) = handler.take();
+        assert_eq!(text, "partial answer");
+        let usage = usage.expect("usage should be recorded for truncated turns");
+        assert_eq!(usage.input_tokens, Some(50));
+        assert_eq!(usage.output_tokens, Some(10));
+        assert_eq!(usage.cache_read_input_tokens, Some(25));
     }
 
     fn openai_config(name: &str, auth: Option<&str>, oauth: Option<OAuthConfig>) -> OpenAIConfig {
