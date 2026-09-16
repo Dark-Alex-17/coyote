@@ -388,7 +388,6 @@ impl Role {
         self.memory
     }
 
-    #[allow(dead_code)]
     pub fn hooks(&self) -> Option<&HooksMap> {
         self.hooks.as_ref()
     }

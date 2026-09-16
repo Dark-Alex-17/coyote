@@ -640,6 +640,14 @@ impl Agent {
         self.config.compression_model.as_deref()
     }
 
+    pub fn hooks(&self) -> &HooksMap {
+        &self.config.hooks
+    }
+
+    pub fn global_hooks(&self) -> &[String] {
+        &self.config.global_hooks
+    }
+
     pub fn is_dynamic_instructions(&self) -> bool {
         self.config.dynamic_instructions
     }
