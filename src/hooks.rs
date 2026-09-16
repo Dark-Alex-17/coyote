@@ -325,7 +325,7 @@ fn base_envs(event: HookEvent, ctx: &RequestContext) -> Vec<(String, String)> {
     )
 }
 
-fn base_envs_parts(
+pub(crate) fn base_envs_parts(
     event: HookEvent,
     session_name: Option<&str>,
     agent_name: Option<&str>,

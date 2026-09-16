@@ -22,7 +22,6 @@ use crate::utils::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{SecondsFormat, Utc};
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
@@ -84,9 +83,9 @@ impl JobHookSnapshot {
     }
 
     /// Fires `job.completed` or `job.failed`. `fire_resolved` callers supply
-    /// their own base envs, so this mirrors the engine's assembly; the event
-    /// name and timestamp are computed here so they reflect the actual
-    /// outcome rather than the moment the snapshot was taken.
+    /// their own base envs; the event name and timestamp are computed here so
+    /// they reflect the actual outcome rather than the moment the snapshot
+    /// was taken.
     fn fire_terminal(self, success: bool, error: Option<String>) {
         let (event, resolved) = if success {
             (HookEvent::JobCompleted, self.completed)
@@ -96,23 +95,11 @@ impl JobHookSnapshot {
         if resolved.is_empty() {
             return;
         }
-        let mut base_envs = vec![
-            ("COYOTE_EVENT".to_string(), event.as_str().to_string()),
-            (
-                "COYOTE_CONFIG_DIR".to_string(),
-                paths::config_dir().display().to_string(),
-            ),
-            (
-                "COYOTE_EVENT_TIMESTAMP".to_string(),
-                Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            ),
-        ];
-        if let Some(name) = self.session_name {
-            base_envs.push(("COYOTE_SESSION_ID".to_string(), name));
-        }
-        if let Some(name) = self.agent_name {
-            base_envs.push(("COYOTE_AGENT_NAME".to_string(), name));
-        }
+        let base_envs = hooks::base_envs_parts(
+            event,
+            self.session_name.as_deref(),
+            self.agent_name.as_deref(),
+        );
         let mut extras = vec![
             ("COYOTE_JOB_ID", self.job_id),
             ("COYOTE_TOOL_NAME", self.tool),
