@@ -685,6 +685,11 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
                             tool_result.text.clone()
                         };
                         let mut items = vec![];
+                        for block in &tool_result.thinking {
+                            if matches!(block, ThinkingBlock::Reasoning { .. }) {
+                                items.push(json!(block));
+                            }
+                        }
                         if let Some(round_text) = round_text {
                             items.push(json!({
                                 "role": MessageRole::Assistant,
@@ -717,6 +722,7 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
         "model": &model.real_name(),
         "input": input,
         "store": false,
+        "include": ["reasoning.encrypted_content"],
     });
 
     if let Some(v) = model.max_tokens_param() {
@@ -740,6 +746,7 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
             .map(|v| {
                 let mut tool = serde_json::to_value(v).unwrap_or_default();
                 tool["type"] = "function".into();
+                tool["strict"] = false.into();
                 tool
             })
             .collect();
@@ -766,6 +773,7 @@ pub async fn openai_responses_chat_completions(
 pub fn openai_extract_responses(data: &Value) -> Result<ChatCompletionsOutput> {
     let mut text = String::new();
     let mut tool_calls = vec![];
+    let mut thinking = vec![];
 
     if let Some(output) = data["output"].as_array() {
         for item in output {
@@ -797,6 +805,11 @@ pub fn openai_extract_responses(data: &Value) -> Result<ChatCompletionsOutput> {
                         ));
                     }
                 }
+                Some("reasoning") => {
+                    if let Some(block) = reasoning_thinking_block(item) {
+                        thinking.push(block);
+                    }
+                }
                 _ => {}
             }
         }
@@ -808,7 +821,19 @@ pub fn openai_extract_responses(data: &Value) -> Result<ChatCompletionsOutput> {
     Ok(ChatCompletionsOutput {
         text,
         tool_calls,
+        thinking,
         ..Default::default()
+    })
+}
+
+/// Captures a Responses reasoning item verbatim (summary included) so it can
+/// be replayed in later tool-loop rounds; `store: false` makes the replayed
+/// `encrypted_content` the model's only access to its prior reasoning.
+fn reasoning_thinking_block(item: &Value) -> Option<ThinkingBlock> {
+    Some(ThinkingBlock::Reasoning {
+        id: item["id"].as_str()?.to_string(),
+        summary: item["summary"].clone(),
+        encrypted_content: item["encrypted_content"].as_str().map(|v| v.to_string()),
     })
 }
 
@@ -822,41 +847,52 @@ pub async fn openai_responses_streaming(
         }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
-
-        match data["type"].as_str() {
-            Some("response.output_text.delta") => {
-                if let Some(delta) = data["delta"].as_str().filter(|v| !v.is_empty()) {
-                    handler.text(delta)?;
-                }
-            }
-            Some("response.output_item.done") => {
-                let item = &data["item"];
-                if item["type"].as_str() == Some("function_call")
-                    && let (Some(name), Some(arguments_str), Some(call_id)) = (
-                        item["name"].as_str(),
-                        item["arguments"].as_str(),
-                        item["call_id"].as_str(),
-                    )
-                {
-                    let arguments: Value = arguments_str.parse().with_context(|| {
-                        format!("Tool call '{name}' has non-JSON arguments '{arguments_str}'")
-                    })?;
-                    handler.tool_call(ToolCall::new(
-                        name.to_string(),
-                        arguments,
-                        Some(call_id.to_string()),
-                    ))?;
-                }
-            }
-            Some("response.completed") => {
-                return Ok(true);
-            }
-            _ => {}
-        }
-        Ok(false)
+        openai_responses_handle_event(&data, handler)
     };
 
     sse_stream(builder, handle).await
+}
+
+fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Result<bool> {
+    match data["type"].as_str() {
+        Some("response.output_text.delta") => {
+            if let Some(delta) = data["delta"].as_str().filter(|v| !v.is_empty()) {
+                handler.text(delta)?;
+            }
+        }
+        Some("response.output_item.done") => {
+            let item = &data["item"];
+            match item["type"].as_str() {
+                Some("function_call") => {
+                    if let (Some(name), Some(arguments_str), Some(call_id)) = (
+                        item["name"].as_str(),
+                        item["arguments"].as_str(),
+                        item["call_id"].as_str(),
+                    ) {
+                        let arguments: Value = arguments_str.parse().with_context(|| {
+                            format!("Tool call '{name}' has non-JSON arguments '{arguments_str}'")
+                        })?;
+                        handler.tool_call(ToolCall::new(
+                            name.to_string(),
+                            arguments,
+                            Some(call_id.to_string()),
+                        ))?;
+                    }
+                }
+                Some("reasoning") => {
+                    if let Some(block) = reasoning_thinking_block(item) {
+                        handler.thinking_block(block);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some("response.completed") => {
+            return Ok(true);
+        }
+        _ => {}
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -864,6 +900,7 @@ mod tests {
     use super::*;
     use crate::client::access_token::set_access_token;
     use crate::config::AppConfig;
+    use crate::function::{FunctionDeclaration, ToolResult};
     use chrono::Utc;
     use std::sync::Arc;
 
@@ -905,6 +942,213 @@ mod tests {
         let messages = body["messages"].as_array().unwrap();
 
         assert_eq!(messages.len(), 1, "body: {body}");
+    }
+
+    fn reasoning_block(id: &str) -> ThinkingBlock {
+        ThinkingBlock::Reasoning {
+            id: id.to_string(),
+            summary: json!([{ "type": "summary_text", "text": "thinking" }]),
+            encrypted_content: Some("enc123".to_string()),
+        }
+    }
+
+    fn responses_tool_result(
+        id: &str,
+        text: Option<&str>,
+        thinking: Vec<ThinkingBlock>,
+    ) -> ToolResult {
+        ToolResult {
+            call: ToolCall::new("fs_read".into(), json!({"path": "x"}), Some(id.into())),
+            output: json!("ok"),
+            text: text.map(|t| t.to_string()),
+            thinking,
+        }
+    }
+
+    fn build_responses_body(
+        tool_results: Vec<ToolResult>,
+        functions: Option<Vec<FunctionDeclaration>>,
+    ) -> Value {
+        let data = ChatCompletionsData {
+            messages: vec![
+                Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::ToolCalls(MessageContentToolCalls {
+                        tool_results,
+                        text: "first round".to_string(),
+                        sequence: false,
+                    }),
+                ),
+            ],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions,
+            stream: false,
+        };
+        openai_build_responses_body(data, &Model::new("openai", "gpt-test"))
+    }
+
+    #[test]
+    fn responses_body_sets_include_and_strict_false() {
+        let functions = vec![
+            FunctionDeclaration {
+                name: "a".to_string(),
+                description: "a description".to_string(),
+                parameters: Default::default(),
+                agent: false,
+            },
+            FunctionDeclaration {
+                name: "b".to_string(),
+                description: "b description".to_string(),
+                parameters: Default::default(),
+                agent: false,
+            },
+        ];
+        let body = build_responses_body(vec![], Some(functions));
+
+        assert_eq!(
+            body["include"],
+            json!(["reasoning.encrypted_content"]),
+            "body: {body}"
+        );
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2, "body: {body}");
+        for tool in tools {
+            assert_eq!(tool["strict"], json!(false), "body: {body}");
+        }
+    }
+
+    #[test]
+    fn responses_replay_orders_reasoning_first_per_round() {
+        let body = build_responses_body(
+            vec![
+                responses_tool_result("call_A", None, vec![reasoning_block("rs_1")]),
+                responses_tool_result("call_B", Some("round two"), vec![reasoning_block("rs_2")]),
+            ],
+            None,
+        );
+
+        let input = body["input"].as_array().unwrap();
+        let types: Vec<_> = input
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or("text"))
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "text",
+                "reasoning",
+                "text",
+                "function_call",
+                "function_call_output",
+                "reasoning",
+                "text",
+                "function_call",
+                "function_call_output",
+            ],
+            "body: {body}"
+        );
+        assert_eq!(input[1]["id"], "rs_1", "body: {body}");
+        assert_eq!(input[1]["encrypted_content"], "enc123", "body: {body}");
+        assert_eq!(input[2]["content"], "first round", "body: {body}");
+        assert_eq!(input[3]["call_id"], "call_A", "body: {body}");
+        assert_eq!(input[5]["id"], "rs_2", "body: {body}");
+        assert_eq!(input[6]["content"], "round two", "body: {body}");
+        assert_eq!(input[7]["call_id"], "call_B", "body: {body}");
+    }
+
+    #[test]
+    fn responses_body_skips_anthropic_thinking_blocks() {
+        let body = build_responses_body(
+            vec![responses_tool_result(
+                "call_A",
+                None,
+                vec![
+                    ThinkingBlock::Thinking {
+                        thinking: "hmm".to_string(),
+                        signature: "sig123".to_string(),
+                    },
+                    ThinkingBlock::RedactedThinking {
+                        data: "b64data".to_string(),
+                    },
+                ],
+            )],
+            None,
+        );
+
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4, "body: {body}");
+        assert!(
+            input.iter().all(|item| !matches!(
+                item["type"].as_str(),
+                Some("thinking" | "redacted_thinking" | "reasoning")
+            )),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn extract_responses_captures_reasoning_items() {
+        let data = json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{ "type": "summary_text", "text": "thinking" }],
+                    "encrypted_content": "enc123",
+                },
+                { "type": "message", "content": [{ "type": "output_text", "text": "answer" }] },
+            ]
+        });
+
+        let output = openai_extract_responses(&data).unwrap();
+
+        assert_eq!(output.text, "answer");
+        assert_eq!(output.thinking.len(), 1);
+        match &output.thinking[0] {
+            ThinkingBlock::Reasoning {
+                id,
+                summary,
+                encrypted_content,
+            } => {
+                assert_eq!(id, "rs_1");
+                assert_eq!(
+                    summary,
+                    &json!([{ "type": "summary_text", "text": "thinking" }])
+                );
+                assert_eq!(encrypted_content.as_deref(), Some("enc123"));
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_stream_delivers_reasoning_block() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut handler = SseHandler::new(sender, abort_signal);
+        let event = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{ "type": "summary_text", "text": "thinking" }],
+                "encrypted_content": "enc123",
+            }
+        });
+
+        let done = openai_responses_handle_event(&event, &mut handler).unwrap();
+
+        assert!(!done);
+        let (_, _, thinking, _) = handler.take();
+        assert_eq!(thinking.len(), 1);
+        assert!(matches!(
+            &thinking[0],
+            ThinkingBlock::Reasoning { id, encrypted_content, .. }
+                if id == "rs_1" && encrypted_content.as_deref() == Some("enc123")
+        ));
     }
 
     fn openai_config(name: &str, auth: Option<&str>, oauth: Option<OAuthConfig>) -> OpenAIConfig {

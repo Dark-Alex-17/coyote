@@ -188,15 +188,27 @@ pub struct ImageUrl {
     pub url: String,
 }
 
-/// An extended-thinking block returned by Anthropic-protocol models.
-/// Serialized to match the API wire format (`type: thinking` / `type: redacted_thinking`)
+/// An extended-thinking block returned by Anthropic-protocol models or an
+/// OpenAI Responses reasoning item. Serialized to match each API's wire
+/// format (`type: thinking` / `type: redacted_thinking` / `type: reasoning`)
 /// so blocks can be replayed verbatim, signature intact, in subsequent
-/// tool-loop rounds as the API requires.
+/// tool-loop rounds as the APIs require.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThinkingBlock {
-    Thinking { thinking: String, signature: String },
-    RedactedThinking { data: String },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
+    Reasoning {
+        id: String,
+        summary: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -262,4 +274,60 @@ pub fn extract_system_message(messages: &mut Vec<Message>) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn old_session_thinking_blocks_still_deserialize() {
+        let json = json!([
+            { "type": "thinking", "thinking": "hmm", "signature": "sig123" },
+            { "type": "redacted_thinking", "data": "b64data" },
+        ]);
+
+        let blocks: Vec<ThinkingBlock> = serde_json::from_value(json).unwrap();
+
+        assert!(
+            matches!(&blocks[0], ThinkingBlock::Thinking { thinking, signature } if thinking == "hmm" && signature == "sig123")
+        );
+        assert!(
+            matches!(&blocks[1], ThinkingBlock::RedactedThinking { data } if data == "b64data")
+        );
+    }
+
+    #[test]
+    fn reasoning_block_round_trips() {
+        let json = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{ "type": "summary_text", "text": "thinking about it" }],
+            "encrypted_content": "enc123",
+        });
+
+        let block: ThinkingBlock = serde_json::from_value(json.clone()).unwrap();
+
+        assert!(
+            matches!(&block, ThinkingBlock::Reasoning { id, encrypted_content, .. } if id == "rs_1" && encrypted_content.as_deref() == Some("enc123"))
+        );
+        assert_eq!(serde_json::to_value(&block).unwrap(), json);
+    }
+
+    #[test]
+    fn reasoning_block_without_encrypted_content_round_trips() {
+        let json = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [],
+        });
+
+        let block: ThinkingBlock = serde_json::from_value(json.clone()).unwrap();
+
+        assert!(
+            matches!(&block, ThinkingBlock::Reasoning { encrypted_content, .. } if encrypted_content.is_none())
+        );
+        assert_eq!(serde_json::to_value(&block).unwrap(), json);
+    }
 }

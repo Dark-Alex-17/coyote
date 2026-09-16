@@ -407,7 +407,11 @@ pub fn claude_build_chat_completions_body(
                         let mut user_parts = vec![];
                         for (index, tool_result) in tool_results.iter().enumerate() {
                             for block in &tool_result.thinking {
-                                assistant_parts.push(json!(block));
+                                // Responses reasoning items are OpenAI-only;
+                                // drop them when the session moves to Claude.
+                                if !matches!(block, ThinkingBlock::Reasoning { .. }) {
+                                    assistant_parts.push(json!(block));
+                                }
                             }
                             let round_text = if index == 0 && !text.is_empty() {
                                 Some(text.as_str())
@@ -475,7 +479,9 @@ pub fn claude_build_chat_completions_body(
                                 chunk_ids.insert(id);
                             }
                             for block in &tool_result.thinking {
-                                assistant_parts.push(json!(block));
+                                if !matches!(block, ThinkingBlock::Reasoning { .. }) {
+                                    assistant_parts.push(json!(block));
+                                }
                             }
                             let round_text = if index == 0 && !text.is_empty() {
                                 Some(text.as_str())
@@ -873,6 +879,32 @@ mod tests {
         let messages = body["messages"].as_array().unwrap();
 
         assert_eq!(messages.len(), 1, "body: {body}");
+    }
+
+    #[test]
+    fn skips_openai_reasoning_blocks_in_replay() {
+        let reasoning = ToolResult {
+            call: ToolCall::new(
+                "fs_read".into(),
+                json!({"path": "x"}),
+                Some("toolu_A".into()),
+            ),
+            output: json!("ok"),
+            text: None,
+            thinking: vec![ThinkingBlock::Reasoning {
+                id: "rs_1".into(),
+                summary: json!([{ "type": "summary_text", "text": "thinking" }]),
+                encrypted_content: Some("enc123".into()),
+            }],
+        };
+
+        for sequence in [false, true] {
+            let body = build_body_with(vec![reasoning.clone()], "", sequence, false);
+
+            let content = body["messages"][1]["content"].as_array().unwrap();
+            assert_eq!(content.len(), 1, "body: {body}");
+            assert_eq!(content[0]["type"], "tool_use", "body: {body}");
+        }
     }
 
     #[test]
