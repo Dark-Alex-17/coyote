@@ -147,7 +147,7 @@ nodes:
         extra_context:
           type: string
       required: [diff_spec, intent, rigor_in, surfaces_in, project_dir_in, extra_context]
-    max_iterations: 3
+    max_iterations: 6
     max_attempts: 2
     state_updates:
       parse_failure: '{{output}}'
@@ -228,7 +228,7 @@ nodes:
                 type: string
             required: [domain, files]
       required: [groups]
-    max_iterations: 3
+    max_iterations: 6
     max_attempts: 2
     state_updates:
       refine_failure: '{{output}}'

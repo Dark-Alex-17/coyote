@@ -8,6 +8,7 @@ review proceeds fail-closed rather than crashing.
 """
 
 import json
+import re
 import os
 import subprocess
 
@@ -22,6 +23,22 @@ def load_state():
 
 
 state = load_state()
+
+# Zero criteria from a prompt that visibly carries a plan is an extraction
+# failure (observed non-deterministically live), not a fail-closed no-plan
+# run — re-run the parse ONCE before the verdict fails closed on it.
+_crit = state.get("criteria") or []
+_prompt = state.get("initial_prompt") or ""
+if not _crit and isinstance(_prompt, str) and re.search(
+    r"acceptance criteria|PLAN\s*—|Plan / acceptance", _prompt, re.I
+):
+    try:
+        _pr = int(state.get("parse_retries") or 0)
+    except (TypeError, ValueError):
+        _pr = 0
+    if _pr < 1:
+        print(json.dumps({"_next": "parse", "parse_retries": _pr + 1}))
+        raise SystemExit(0)
 proj = os.path.expanduser(
     (state.get("project_dir_in") or "").strip() or state.get("project_dir") or "."
 )

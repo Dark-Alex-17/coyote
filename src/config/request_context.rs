@@ -11545,7 +11545,7 @@ mod tests {
         let NodeType::Llm(holistic) = &holistic.node_type else {
             panic!("holistic must be an llm node");
         };
-        assert_eq!(holistic.max_iterations, 30);
+        assert_eq!(holistic.max_iterations, 45);
     }
 
     const BUNDLED_GRAPHS: [&str; 6] = [

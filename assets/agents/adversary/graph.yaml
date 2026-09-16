@@ -52,6 +52,7 @@ settings:
 
 initial_state:
   project_dir_in: ''
+  parse_retries: 0
   criteria: []
   diff_spec: auto
   plan_notes: ''
@@ -88,6 +89,10 @@ nodes:
         Split compound criteria ("A and B") into separate entries when they are
         independently verifiable. When the caller supplied NO plan/criteria at
         all, emit an empty array — downstream fails closed.
+        An empty array is ONLY correct when the prompt genuinely contains no
+        plan/criteria section — when the prompt carries one (a "Plan /
+        acceptance criteria:" or "PLAN —" block), returning zero criteria is
+        an extraction FAILURE, never a valid result.
         The caller's explicit enumeration is AUTHORITATIVE: when the caller
         declares "these N are the (only) criteria" or supplies a numbered
         criteria list, extract EXACTLY those N — never add entries they did
@@ -348,7 +353,7 @@ nodes:
         observations:
           type: string
       required: [extra_complaints, observations]
-    max_iterations: 30
+    max_iterations: 45
     max_attempts: 2
     state_updates:
       holistic_failure: '{{output}}'
