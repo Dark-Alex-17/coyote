@@ -73,6 +73,7 @@ impl BedrockClient {
             url: _,
             headers,
             body,
+            ..
         } = request_data;
 
         let builder = aws_fetch(
@@ -126,6 +127,7 @@ impl BedrockClient {
             url: _,
             headers,
             body,
+            ..
         } = request_data;
 
         let builder = aws_fetch(
@@ -427,7 +429,9 @@ fn build_chat_completions_body(
                         let mut user_parts = vec![];
                         for (index, tool_result) in tool_results.iter().enumerate() {
                             for block in &tool_result.thinking {
-                                assistant_parts.push(converse_reasoning_block(block));
+                                if let Some(part) = converse_reasoning_block(block) {
+                                    assistant_parts.push(part);
+                                }
                             }
                             let round_text = if index == 0 && !text.is_empty() {
                                 Some(text.as_str())
@@ -496,7 +500,9 @@ fn build_chat_completions_body(
                                 chunk_ids.insert(id);
                             }
                             for block in &tool_result.thinking {
-                                assistant_parts.push(converse_reasoning_block(block));
+                                if let Some(part) = converse_reasoning_block(block) {
+                                    assistant_parts.push(part);
+                                }
                             }
                             let round_text = if index == 0 && !text.is_empty() {
                                 Some(text.as_str())
@@ -661,23 +667,26 @@ fn bedrock_tool_result_content(output: &Value) -> Value {
 }
 
 /// Maps a ThinkingBlock (Anthropic tagged shape) to the Converse
-/// reasoningContent union so signed blocks replay verbatim.
-fn converse_reasoning_block(block: &ThinkingBlock) -> Value {
+/// reasoningContent union so signed blocks replay verbatim. OpenAI Responses
+/// reasoning items have no Converse encoding, so they are dropped when the
+/// session moves to Bedrock.
+fn converse_reasoning_block(block: &ThinkingBlock) -> Option<Value> {
     match block {
         ThinkingBlock::Thinking {
             thinking,
             signature,
-        } => json!({
+        } => Some(json!({
             "reasoningContent": {
                 "reasoningText": {
                     "text": thinking,
                     "signature": signature,
                 }
             }
-        }),
-        ThinkingBlock::RedactedThinking { data } => json!({
+        })),
+        ThinkingBlock::RedactedThinking { data } => Some(json!({
             "reasoningContent": { "redactedContent": data }
-        }),
+        })),
+        ThinkingBlock::Reasoning { .. } => None,
     }
 }
 
@@ -1182,6 +1191,32 @@ mod tests {
                 "body: {body}"
             );
             assert!(content[2].get("toolUse").is_some(), "body: {body}");
+        }
+    }
+
+    #[test]
+    fn skips_openai_reasoning_blocks_in_converse_shape() {
+        let reasoning = ToolResult {
+            call: ToolCall::new(
+                "fs_read".into(),
+                json!({"path": "x"}),
+                Some("tool_A".into()),
+            ),
+            output: json!("ok"),
+            text: None,
+            thinking: vec![ThinkingBlock::Reasoning {
+                id: "rs_1".into(),
+                summary: json!([{ "type": "summary_text", "text": "thinking" }]),
+                encrypted_content: Some("enc123".into()),
+            }],
+        };
+
+        for sequence in [false, true] {
+            let body = build_body_with(vec![reasoning.clone()], "", sequence);
+
+            let content = body["messages"][1]["content"].as_array().unwrap();
+            assert_eq!(content.len(), 1, "body: {body}");
+            assert!(content[0].get("toolUse").is_some(), "body: {body}");
         }
     }
 
