@@ -954,6 +954,10 @@ fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Resu
             // partial text or tool calls are returned rather than discarded
             // by a hard error; only an empty truncated response bails.
             if handler.has_received_visible_output() {
+                debug!(
+                    "response truncated ({}); keeping partial output",
+                    data["response"]["incomplete_details"]["reason"]
+                );
                 return Ok(true);
             }
             match data["response"]["incomplete_details"]["reason"].as_str() {

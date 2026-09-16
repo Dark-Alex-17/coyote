@@ -552,6 +552,23 @@ mod tests {
         assert!(handler.has_received_content());
     }
 
+    /// Pins the deliberate exclusion: thinking blocks count as received
+    /// content but not as visible output, so a thinking-only stream is
+    /// still an empty response to the caller.
+    #[test]
+    fn thinking_blocks_do_not_count_as_visible_output() {
+        let (mut handler, _rx) = new_handler();
+        handler.thinking_block(ThinkingBlock::Thinking {
+            thinking: "hmm".to_string(),
+            signature: "sig".to_string(),
+        });
+        assert!(handler.has_received_content());
+        assert!(!handler.has_received_visible_output());
+
+        handler.text("hello").unwrap();
+        assert!(handler.has_received_visible_output());
+    }
+
     /// Claude splits usage across events: `message_start` carries the input
     /// and cache counts with a provisional output count, `message_delta`
     /// carries only the final output count. Later non-None fields must win.
