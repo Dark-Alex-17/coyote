@@ -140,7 +140,16 @@ async fn main() -> Result<()> {
         return config::list_installed_bundles();
     }
 
-    install_builtins()?;
+    // Inspection flags are look-don't-touch readouts: skip the builtins
+    // bootstrap so a pristine config dir stays empty. On such a dir the
+    // list flags list nothing because nothing is installed, by design.
+    // Agent/role runs still bootstrap: they load builtin tool definitions.
+    let inspection_only = (info_flag || cli.list_secrets || cli.mcp_list)
+        && cli.agent.is_none()
+        && cli.role.is_none();
+    if !inspection_only {
+        install_builtins()?;
+    }
 
     if let Some(category) = cli.install_builtins {
         return config::install_assets(category);
@@ -226,7 +235,15 @@ async fn main() -> Result<()> {
         cli.mcp_list || cli.mcp_get.is_some() || cli.mcp_remove.is_some() || cli.mcp_add.is_some();
     if mcp_action {
         let cfg = Config::load_with_interpolation(true).await?;
-        let app_config = AppConfig::from_config(cfg)?;
+        let app_config = if cli.mcp_list
+            && cli.mcp_get.is_none()
+            && cli.mcp_remove.is_none()
+            && cli.mcp_add.is_none()
+        {
+            AppConfig::from_config_lenient(cfg)?
+        } else {
+            AppConfig::from_config(cfg)?
+        };
         let vault = Vault::init(&app_config)?;
 
         mcp::manage::handle(&cli, &vault)?;
@@ -236,7 +253,16 @@ async fn main() -> Result<()> {
 
     if vault_flags {
         let cfg = Config::load_with_interpolation(true).await?;
-        let app_config = AppConfig::from_config(cfg)?;
+        let app_config = if cli.list_secrets
+            && cli.add_secret.is_none()
+            && cli.get_secret.is_none()
+            && cli.update_secret.is_none()
+            && cli.delete_secret.is_none()
+        {
+            AppConfig::from_config_lenient(cfg)?
+        } else {
+            AppConfig::from_config(cfg)?
+        };
         let vault = Vault::init(&app_config)?;
         return Vault::handle_vault_flags(cli, &vault);
     }
@@ -244,7 +270,11 @@ async fn main() -> Result<()> {
     let abort_signal = create_abort_signal();
     let start_mcp_servers = cli.agent.is_none() && cli.role.is_none();
     let cfg = Config::load_with_interpolation(info_flag).await?;
-    let mut app_config = AppConfig::from_config(cfg)?;
+    let mut app_config = if info_flag {
+        AppConfig::from_config_lenient(cfg)?
+    } else {
+        AppConfig::from_config(cfg)?
+    };
     if cli.no_workspace_mcp {
         app_config.no_workspace_mcp = true;
     }
@@ -258,14 +288,20 @@ async fn main() -> Result<()> {
             log_path,
             start_mcp_servers,
             info_flag,
+            inspection_only,
             abort_signal.clone(),
         )
         .await?,
     );
     let mut ctx = RequestContext::bootstrap(app_state, working_mode, info_flag)?;
     let app_config = Arc::clone(&ctx.app.config);
-    ctx.bootstrap_tools(&app_config, start_mcp_servers, abort_signal.clone())
-        .await?;
+    // Rebuilding the tool scope prunes and builds function binaries;
+    // inspection-only runs are readouts that never execute tools, so skip
+    // it there too.
+    if !inspection_only {
+        ctx.bootstrap_tools(&app_config, start_mcp_servers, abort_signal.clone())
+            .await?;
+    }
 
     {
         let app = &*ctx.app.config;
@@ -306,9 +342,12 @@ async fn run(
     }
 
     if cli.list_models {
-        for model in list_models(ctx.app.config.as_ref(), ModelType::Chat) {
-            println!("{}", model.id());
-        }
+        let models = list_models(ctx.app.config.as_ref(), ModelType::Chat)
+            .iter()
+            .map(|model| model.id())
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("{models}");
         return Ok(());
     }
     if cli.list_roles {

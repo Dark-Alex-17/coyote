@@ -1476,6 +1476,33 @@ global_hooks:
     }
 
     #[test]
+    #[serial_test::serial]
+    fn load_envs_ignores_malformed_global_tools_and_logs_debug() {
+        crate::testing::install_log_collector();
+        let name = "gt-malformed-envtest";
+        let yaml = format!("name: {name}\ninstructions: hi\nglobal_tools:\n  - keep_tool.sh\n");
+        let mut config: AgentConfig = serde_yaml::from_str(&yaml).unwrap();
+        let env_name = normalize_env_name(&format!("{name}_global_tools"));
+        let _guard = crate::testing::EnvVarGuard::set(&env_name, "{not-json");
+
+        config.load_envs(&AppConfig::default());
+
+        assert_eq!(
+            config.global_tools,
+            vec!["keep_tool.sh"],
+            "a malformed override must leave the existing value untouched"
+        );
+        let debugs = crate::testing::debug_snapshot();
+        assert!(
+            debugs.iter().any(|message| {
+                message.contains("Ignoring malformed global_tools env override")
+                    && message.contains(name)
+            }),
+            "expected a debug log for the malformed override: {debugs:?}"
+        );
+    }
+
+    #[test]
     fn from_graph_carries_hooks_and_global_hooks() {
         let yaml = "\
 name: g

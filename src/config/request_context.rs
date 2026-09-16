@@ -417,7 +417,13 @@ impl RequestContext {
         working_mode: WorkingMode,
         info_flag: bool,
     ) -> Result<Self> {
-        let model = Model::retrieve_model(&app.config, &app.config.model_id, ModelType::Chat)?;
+        // A lenient AppConfig (inspection-only run, no resolvable model)
+        // leaves model_id empty; render those readouts with a default model.
+        let model = if info_flag && app.config.model_id.is_empty() {
+            Model::default()
+        } else {
+            Model::retrieve_model(&app.config, &app.config.model_id, ModelType::Chat)?
+        };
 
         let mut functions = app.functions.clone();
         if working_mode.is_repl() {
