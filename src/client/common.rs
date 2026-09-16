@@ -221,23 +221,39 @@ pub trait Client: Sync + Send {
         request_data.into_builder(client)
     }
 
+    /// Patches are chat-shaped unless keyed otherwise: on the Responses wire
+    /// only the `responses` sub-patch of a model patch and the `responses`
+    /// section of a client patch apply, so chat-only keys never leak into a
+    /// responses body.
     fn patch_request_data(&self, request_data: &mut RequestData) {
         let model_type = self.model().model_type();
+        let wire = request_data.wire;
         if let Some(patch) = self.model().patch() {
-            request_data.apply_patch(patch.clone());
+            match wire {
+                WireApi::Chat => request_data.apply_patch(patch.clone()),
+                WireApi::Responses => {
+                    if let Some(patch) = patch.get("responses") {
+                        request_data.apply_patch(patch.clone());
+                    }
+                }
+            }
         }
 
+        let api_name = match wire {
+            WireApi::Responses => "responses",
+            WireApi::Chat => model_type.api_name(),
+        };
         let patch_map = std::env::var(get_env_name(&format!(
-            "patch_{}_{}",
+            "patch_{}_{api_name}",
             self.model().client_name(),
-            model_type.api_name(),
         )))
         .ok()
         .and_then(|v| serde_json::from_str(&v).ok())
         .or_else(|| {
-            self.patch_config()
-                .and_then(|v| model_type.extract_patch(v))
-                .cloned()
+            self.patch_config().and_then(|v| match wire {
+                WireApi::Responses => v.responses.clone(),
+                WireApi::Chat => model_type.extract_patch(v).cloned(),
+            })
         });
         let patch_map = match patch_map {
             Some(v) => v,
@@ -271,16 +287,26 @@ pub struct ExtraConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RequestPatch {
     pub chat_completions: Option<ApiPatch>,
+    pub responses: Option<ApiPatch>,
     pub embeddings: Option<ApiPatch>,
     pub rerank: Option<ApiPatch>,
 }
 
 pub type ApiPatch = IndexMap<String, Value>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WireApi {
+    Responses,
+    Chat,
+}
+
+#[derive(Debug)]
 pub struct RequestData {
     pub url: String,
     pub headers: IndexMap<String, String>,
     pub body: Value,
+    pub wire: WireApi,
 }
 
 impl RequestData {
@@ -292,7 +318,13 @@ impl RequestData {
             url: url.to_string(),
             headers: Default::default(),
             body,
+            wire: WireApi::Chat,
         }
+    }
+
+    pub fn wire(mut self, wire: WireApi) -> Self {
+        self.wire = wire;
+        self
     }
 
     pub fn bearer_auth<T>(&mut self, auth: T)
@@ -312,7 +344,9 @@ impl RequestData {
     }
 
     pub fn into_builder(self, client: &ReqwestClient) -> RequestBuilder {
-        let RequestData { url, headers, body } = self;
+        let RequestData {
+            url, headers, body, ..
+        } = self;
         debug!("Request {url} {body}");
 
         let mut builder = client.post(url);
@@ -1523,5 +1557,223 @@ mod tests {
 
         assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 1);
         assert_paced_reply(&text, &results);
+    }
+
+    /// Minimal client for exercising `patch_request_data`: only the model
+    /// and the client-level patch config matter.
+    struct PatchProbeClient {
+        config: AppConfig,
+        model: Model,
+        patch: Option<RequestPatch>,
+    }
+
+    #[async_trait::async_trait]
+    impl Client for PatchProbeClient {
+        fn app_config(&self) -> &AppConfig {
+            &self.config
+        }
+
+        fn extra_config(&self) -> Option<&ExtraConfig> {
+            None
+        }
+
+        fn patch_config(&self) -> Option<&RequestPatch> {
+            self.patch.as_ref()
+        }
+
+        fn name(&self) -> &str {
+            self.model.client_name()
+        }
+
+        fn model(&self) -> &Model {
+            &self.model
+        }
+
+        async fn chat_completions_inner(
+            &self,
+            _client: &ReqwestClient,
+            _data: ChatCompletionsData,
+        ) -> Result<ChatCompletionsOutput> {
+            bail!("the patch probe makes no requests")
+        }
+
+        async fn chat_completions_streaming_inner(
+            &self,
+            _client: &ReqwestClient,
+            _handler: &mut SseHandler,
+            _data: ChatCompletionsData,
+        ) -> Result<()> {
+            bail!("the patch probe makes no requests")
+        }
+    }
+
+    fn patch_probe(
+        client_name: &str,
+        model_patch: Option<Value>,
+        patch: Option<RequestPatch>,
+    ) -> PatchProbeClient {
+        let mut data = ModelData::new("gpt-test");
+        data.patch = model_patch;
+        PatchProbeClient {
+            config: AppConfig::default(),
+            model: Model::from_config(client_name, &[data]).remove(0),
+            patch,
+        }
+    }
+
+    fn client_patch(json: Value) -> RequestPatch {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn wire_request(wire: WireApi) -> RequestData {
+        RequestData::new("https://example.test/v1", json!({"model": "gpt-test"})).wire(wire)
+    }
+
+    #[test]
+    fn request_patch_accepts_a_responses_section() {
+        let patch = client_patch(json!({
+            "responses": {".*": {"body": {"store": true}}},
+            "chat_completions": {".*": {"body": {"temperature": 0.5}}},
+        }));
+
+        assert!(patch.responses.is_some());
+        assert!(patch.chat_completions.is_some());
+    }
+
+    #[test]
+    fn chat_client_patch_never_touches_the_responses_wire() {
+        let client = patch_probe(
+            "patchprobechatiso",
+            None,
+            Some(client_patch(json!({
+                "chat_completions": {".*": {"body": {"temperature": 0.5}}}
+            }))),
+        );
+        let mut request_data = wire_request(WireApi::Responses);
+        let before = request_data.body.clone();
+
+        client.patch_request_data(&mut request_data);
+
+        assert_eq!(request_data.body, before);
+    }
+
+    #[test]
+    fn responses_client_patch_never_touches_the_chat_wire() {
+        let patch = Some(client_patch(json!({
+            "responses": {".*": {"body": {"store": true}}}
+        })));
+        let client = patch_probe("patchproberespiso", None, patch);
+
+        let mut chat_request = wire_request(WireApi::Chat);
+        let before = chat_request.body.clone();
+        client.patch_request_data(&mut chat_request);
+        assert_eq!(chat_request.body, before);
+
+        let mut responses_request = wire_request(WireApi::Responses);
+        client.patch_request_data(&mut responses_request);
+        assert_eq!(responses_request.body["store"], json!(true));
+    }
+
+    #[test]
+    fn chat_shaped_model_patch_never_touches_the_responses_wire() {
+        let client = patch_probe(
+            "patchprobemodeliso",
+            Some(json!({"body": {"reasoning_effort": "high"}})),
+            None,
+        );
+        let mut request_data = wire_request(WireApi::Responses);
+        let before = request_data.body.clone();
+
+        client.patch_request_data(&mut request_data);
+
+        assert_eq!(request_data.body, before);
+    }
+
+    #[test]
+    fn model_patch_responses_subkey_is_selected_per_wire() {
+        let model_patch = json!({
+            "body": {"temperature": 0.2},
+            "responses": {"body": {"store": true}},
+        });
+        let client = patch_probe("patchprobesubkey", Some(model_patch), None);
+
+        let mut responses_request = wire_request(WireApi::Responses);
+        client.patch_request_data(&mut responses_request);
+        assert_eq!(responses_request.body["store"], json!(true));
+        assert!(responses_request.body.get("temperature").is_none());
+
+        let mut chat_request = wire_request(WireApi::Chat);
+        client.patch_request_data(&mut chat_request);
+        assert_eq!(chat_request.body["temperature"], json!(0.2));
+        assert!(chat_request.body.get("store").is_none());
+    }
+
+    #[test]
+    fn env_patch_override_is_selected_per_wire() {
+        // Unique client name so the env vars cannot race parallel tests.
+        let client_name = "patchprobeenvwire";
+        let responses_env = get_env_name(&format!("patch_{client_name}_responses"));
+        let chat_env = get_env_name(&format!("patch_{client_name}_chat_completions"));
+        unsafe {
+            std::env::set_var(&responses_env, r#"{".*": {"body": {"store": true}}}"#);
+            std::env::set_var(&chat_env, r#"{".*": {"body": {"temperature": 0.7}}}"#);
+        }
+
+        let client = patch_probe(client_name, None, None);
+        let mut responses_request = wire_request(WireApi::Responses);
+        client.patch_request_data(&mut responses_request);
+        let mut chat_request = wire_request(WireApi::Chat);
+        client.patch_request_data(&mut chat_request);
+
+        unsafe {
+            std::env::remove_var(&responses_env);
+            std::env::remove_var(&chat_env);
+        }
+
+        assert_eq!(responses_request.body["store"], json!(true));
+        assert!(responses_request.body.get("temperature").is_none());
+        assert_eq!(chat_request.body["temperature"], json!(0.7));
+        assert!(chat_request.body.get("store").is_none());
+    }
+
+    #[test]
+    fn chat_wire_patching_is_unchanged_by_wire_awareness() {
+        let client = patch_probe(
+            "patchproberegress",
+            Some(json!({"body": {"max_tokens": null}, "headers": {"x-model": "m"}})),
+            Some(client_patch(json!({
+                "chat_completions": {".*": {
+                    "url": "https://patched.example/v1/chat/completions",
+                    "body": {"temperature": 0.9},
+                }}
+            }))),
+        );
+        let mut request_data = RequestData::new(
+            "https://example.test/v1/chat/completions",
+            json!({"model": "gpt-test", "max_tokens": 100}),
+        );
+        request_data.bearer_auth("sk-test");
+
+        client.patch_request_data(&mut request_data);
+
+        assert_eq!(
+            request_data.url,
+            "https://patched.example/v1/chat/completions"
+        );
+        assert_eq!(
+            request_data.body,
+            json!({"model": "gpt-test", "temperature": 0.9})
+        );
+        assert_eq!(
+            request_data.headers.get("x-model").map(String::as_str),
+            Some("m")
+        );
+        assert_eq!(
+            request_data
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer sk-test")
+        );
     }
 }

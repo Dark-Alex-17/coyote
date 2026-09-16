@@ -21,6 +21,7 @@ pub struct OpenAIConfig {
     pub organization_id: Option<String>,
     pub auth: Option<String>,
     pub oauth: Option<Box<OAuthConfig>>,
+    pub wire_api: Option<WireApi>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
@@ -47,12 +48,11 @@ impl Client for OpenAIClient {
         client: &ReqwestClient,
         data: ChatCompletionsData,
     ) -> Result<ChatCompletionsOutput> {
-        let (request_data, uses_codex) = prepare_chat_completions(self, client, data).await?;
+        let (request_data, wire) = prepare_chat_completions(self, client, data).await?;
         let builder = self.request_builder(client, request_data);
-        if uses_codex {
-            openai_responses_chat_completions(builder, self.model()).await
-        } else {
-            openai_chat_completions(builder, self.model()).await
+        match wire {
+            WireApi::Responses => openai_responses_chat_completions(builder, self.model()).await,
+            WireApi::Chat => openai_chat_completions(builder, self.model()).await,
         }
     }
 
@@ -62,13 +62,14 @@ impl Client for OpenAIClient {
         handler: &mut SseHandler,
         data: ChatCompletionsData,
     ) -> Result<()> {
-        let (request_data, uses_codex) = prepare_chat_completions(self, client, data).await?;
+        let (request_data, wire) = prepare_chat_completions(self, client, data).await?;
         let builder = self.request_builder(client, request_data);
 
-        if uses_codex {
-            openai_responses_streaming(builder, handler).await
-        } else {
-            openai_chat_completions_streaming(builder, handler, self.model()).await
+        match wire {
+            WireApi::Responses => openai_responses_streaming(builder, handler).await,
+            WireApi::Chat => {
+                openai_chat_completions_streaming(builder, handler, self.model()).await
+            }
         }
     }
 
@@ -93,11 +94,29 @@ impl Client for OpenAIClient {
     }
 }
 
+/// Codex only speaks the Responses API, so it forces the responses wire and
+/// rejects an explicit `wire_api: chat`. Anywhere else an explicit `wire_api`
+/// wins and the default is chat.
+pub fn resolve_wire_api(
+    explicit: Option<WireApi>,
+    uses_codex: bool,
+    _stock_openai_without_api_base: bool,
+) -> Result<WireApi> {
+    match (uses_codex, explicit) {
+        (true, Some(WireApi::Chat)) => bail!(
+            "the Codex backend only speaks the Responses API; remove `wire_api: chat` or configure an `api_base`"
+        ),
+        (true, _) => Ok(WireApi::Responses),
+        (false, Some(wire)) => Ok(wire),
+        (false, None) => Ok(WireApi::Chat),
+    }
+}
+
 async fn prepare_chat_completions(
     self_: &OpenAIClient,
     client: &ReqwestClient,
     data: ChatCompletionsData,
-) -> Result<(RequestData, bool)> {
+) -> Result<(RequestData, WireApi)> {
     let uses_oauth = self_.config.auth.as_deref() == Some("oauth");
 
     if !uses_oauth && self_.config.oauth.is_some() {
@@ -116,21 +135,28 @@ async fn prepare_chat_completions(
     let uses_stock_provider = matches!(oauth_provider, Some((_, true)));
     // Stock oauth with no `api_base` routes to the ChatGPT codex backend (Responses API).
     let uses_codex = uses_stock_provider && self_.get_api_base().is_err();
+    let wire = resolve_wire_api(
+        self_.config.wire_api,
+        uses_codex,
+        self_.get_api_base().is_err(),
+    )?;
 
     let url = if uses_codex {
         CODEX_API_ENDPOINT.to_string()
     } else {
         let api_base = resolve_api_base(self_)?;
-        format!("{}/chat/completions", api_base.trim_end_matches('/'))
+        match wire {
+            WireApi::Responses => format!("{}/responses", api_base.trim_end_matches('/')),
+            WireApi::Chat => format!("{}/chat/completions", api_base.trim_end_matches('/')),
+        }
     };
 
-    let body = if uses_codex {
-        openai_build_responses_body(data, &self_.model)
-    } else {
-        openai_build_chat_completions_body(data, &self_.model)
+    let body = match wire {
+        WireApi::Responses => openai_build_responses_body(data, &self_.model),
+        WireApi::Chat => openai_build_chat_completions_body(data, &self_.model),
     };
 
-    let mut request_data = RequestData::new(url, body);
+    let mut request_data = RequestData::new(url, body).wire(wire);
 
     if let Some((provider, _)) = oauth_provider {
         let ready = oauth::prepare_oauth_access_token(client, &*provider, self_.name()).await?;
@@ -167,7 +193,7 @@ async fn prepare_chat_completions(
         request_data.header("OpenAI-Organization", organization_id);
     }
 
-    Ok((request_data, uses_codex))
+    Ok((request_data, wire))
 }
 
 async fn prepare_embeddings(
@@ -909,7 +935,11 @@ mod tests {
             .unwrap()
     }
 
-    fn prepare(client: &OpenAIClient) -> Result<(RequestData, bool)> {
+    fn prepare(client: &OpenAIClient) -> Result<(RequestData, WireApi)> {
+        prepare_with_stream(client, false)
+    }
+
+    fn prepare_with_stream(client: &OpenAIClient, stream: bool) -> Result<(RequestData, WireApi)> {
         let data = ChatCompletionsData {
             messages: vec![Message::new(
                 MessageRole::User,
@@ -919,7 +949,7 @@ mod tests {
             top_p: None,
             reasoning_effort: None,
             functions: None,
-            stream: false,
+            stream,
         };
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1006,9 +1036,9 @@ mod tests {
         let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
         set_access_token(name, "codex-at".into(), Utc::now().timestamp() + 3600, None);
 
-        let (request_data, uses_codex) = prepare(&client).unwrap();
+        let (request_data, wire) = prepare(&client).unwrap();
 
-        assert!(uses_codex);
+        assert_eq!(wire, WireApi::Responses);
         assert_eq!(request_data.url, CODEX_API_ENDPOINT);
     }
 
@@ -1024,9 +1054,9 @@ mod tests {
             None,
         );
 
-        let (request_data, uses_codex) = prepare(&client).unwrap();
+        let (request_data, wire) = prepare(&client).unwrap();
 
-        assert!(!uses_codex);
+        assert_eq!(wire, WireApi::Chat);
         assert_eq!(
             request_data.url,
             "https://gateway.example/v1/chat/completions"
@@ -1242,5 +1272,171 @@ mod tests {
             is_stock,
             "bundled models.yaml must not carry an openai oauth block: it would silently disable codex routing for stock ChatGPT oauth users"
         );
+    }
+
+    #[test]
+    fn wire_api_deserializes_on_openai_config() {
+        let config: OpenAIConfig = serde_yaml::from_str("wire_api: responses").unwrap();
+        assert_eq!(config.wire_api, Some(WireApi::Responses));
+
+        let config: OpenAIConfig = serde_yaml::from_str("wire_api: chat").unwrap();
+        assert_eq!(config.wire_api, Some(WireApi::Chat));
+    }
+
+    #[test]
+    fn bogus_wire_api_is_a_config_error() {
+        let err = serde_yaml::from_str::<OpenAIConfig>("wire_api: bogus")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("responses") && err.contains("chat"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolver_codex_defaults_to_responses() {
+        assert_eq!(
+            resolve_wire_api(None, true, false).unwrap(),
+            WireApi::Responses
+        );
+        assert_eq!(
+            resolve_wire_api(Some(WireApi::Responses), true, false).unwrap(),
+            WireApi::Responses
+        );
+    }
+
+    #[test]
+    fn resolver_rejects_explicit_chat_on_codex() {
+        let err = resolve_wire_api(Some(WireApi::Chat), true, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("only speaks the Responses API"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolver_explicit_wins_off_codex() {
+        for stock in [false, true] {
+            assert_eq!(
+                resolve_wire_api(Some(WireApi::Responses), false, stock).unwrap(),
+                WireApi::Responses
+            );
+            assert_eq!(
+                resolve_wire_api(Some(WireApi::Chat), false, stock).unwrap(),
+                WireApi::Chat
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_defaults_to_chat_this_milestone() {
+        for stock in [false, true] {
+            assert_eq!(resolve_wire_api(None, false, stock).unwrap(), WireApi::Chat);
+        }
+    }
+
+    fn api_key_config(name: &str, wire_api: Option<WireApi>) -> OpenAIConfig {
+        OpenAIConfig {
+            name: Some(name.into()),
+            api_key: Some("sk-test".into()),
+            wire_api,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn api_key_openai_defaults_to_the_chat_wire() {
+        let config = api_key_config("openai-wire-default-test", None);
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let (request_data, wire) = prepare(&client).unwrap();
+
+        assert_eq!(wire, WireApi::Chat);
+        assert_eq!(request_data.url, format!("{API_BASE}/chat/completions"));
+        assert!(
+            request_data.body.get("messages").is_some(),
+            "body: {}",
+            request_data.body
+        );
+    }
+
+    #[test]
+    fn explicit_responses_wire_posts_a_responses_body_to_the_responses_endpoint() {
+        let config = api_key_config("openai-wire-responses-test", Some(WireApi::Responses));
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let (request_data, wire) = prepare(&client).unwrap();
+
+        assert_eq!(wire, WireApi::Responses);
+        assert_eq!(request_data.url, format!("{API_BASE}/responses"));
+        assert_eq!(request_data.body["store"], json!(false));
+        assert!(
+            request_data.body.get("input").is_some() && request_data.body.get("messages").is_none(),
+            "body: {}",
+            request_data.body
+        );
+    }
+
+    #[test]
+    fn explicit_responses_wire_forks_the_streaming_path_too() {
+        let config = api_key_config("openai-wire-responses-stream-test", Some(WireApi::Responses));
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let (request_data, wire) = prepare_with_stream(&client, true).unwrap();
+
+        assert_eq!(wire, WireApi::Responses);
+        assert_eq!(request_data.url, format!("{API_BASE}/responses"));
+        assert_eq!(request_data.body["stream"], json!(true));
+        assert!(
+            request_data.body.get("input").is_some(),
+            "body: {}",
+            request_data.body
+        );
+    }
+
+    #[test]
+    fn codex_with_explicit_chat_wire_is_rejected() {
+        let name = "openai-codex-chat-wire-test";
+        let mut config = openai_config(name, Some("oauth"), None);
+        config.wire_api = Some(WireApi::Chat);
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let err = prepare(&client).unwrap_err().to_string();
+
+        assert!(
+            err.contains("only speaks the Responses API"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn codex_responses_body_ignores_a_chat_shaped_model_patch() {
+        let name = "openai-codex-chat-patch-test";
+        let config = openai_config(name, Some("oauth"), None);
+        let mut model_data = ModelData::new("gpt-test");
+        model_data.patch = Some(json!({
+            "body": {
+                "max_tokens": null,
+                "temperature": null,
+                "top_p": null,
+                "reasoning_effort": "high",
+            }
+        }));
+        let mut client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+        client.model = Model::from_config("openai", &[model_data]).remove(0);
+        set_access_token(name, "codex-at".into(), Utc::now().timestamp() + 3600, None);
+
+        let (mut request_data, wire) = prepare(&client).unwrap();
+        assert_eq!(wire, WireApi::Responses);
+        let body_before = request_data.body.clone();
+
+        client.patch_request_data(&mut request_data);
+
+        assert_eq!(request_data.body, body_before, "a chat-shaped model patch must not merge into a responses body");
     }
 }

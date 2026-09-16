@@ -73,6 +73,7 @@ impl BedrockClient {
             url: _,
             headers,
             body,
+            ..
         } = request_data;
 
         let builder = aws_fetch(
@@ -126,6 +127,7 @@ impl BedrockClient {
             url: _,
             headers,
             body,
+            ..
         } = request_data;
 
         let builder = aws_fetch(
