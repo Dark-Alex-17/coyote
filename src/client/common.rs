@@ -1708,6 +1708,38 @@ mod tests {
         assert!(chat_request.body.get("store").is_none());
     }
 
+    /// Pins the silent-ignore contract for a malformed `responses` sub-key:
+    /// model patches are untyped JSON maps and the whole patch layer is
+    /// deliberately lenient — `apply_patch` only reads object-shaped
+    /// `url`/`body`/`headers` keys — so a non-object `responses` sub-key
+    /// degrades to a no-op on the Responses wire (never a request-time
+    /// error, never a partial merge) and stays inert on the Chat wire,
+    /// where the patch's top-level keys still apply normally.
+    #[test]
+    fn malformed_model_patch_responses_subkey_is_silently_ignored() {
+        for malformed in [json!("oops"), json!([{"body": {"store": true}}])] {
+            let model_patch = json!({
+                "body": {"temperature": 0.2},
+                "responses": malformed,
+            });
+            let client = patch_probe("patchprobemalformed", Some(model_patch), None);
+
+            let mut responses_request = wire_request(WireApi::Responses);
+            let before_url = responses_request.url.clone();
+            let before_body = responses_request.body.clone();
+            let before_headers = responses_request.headers.clone();
+            client.patch_request_data(&mut responses_request);
+            assert_eq!(responses_request.url, before_url);
+            assert_eq!(responses_request.body, before_body);
+            assert_eq!(responses_request.headers, before_headers);
+
+            let mut chat_request = wire_request(WireApi::Chat);
+            client.patch_request_data(&mut chat_request);
+            assert_eq!(chat_request.body["temperature"], json!(0.2));
+            assert!(chat_request.body.get("store").is_none());
+        }
+    }
+
     #[test]
     fn env_patch_override_is_selected_per_wire() {
         // Unique client name so the env vars cannot race parallel tests.
