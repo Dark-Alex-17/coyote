@@ -729,14 +729,17 @@ pub fn maybe_spawn_models_refresh(app: &AppConfig) {
 }
 
 impl Config {
-    pub async fn load_with_interpolation(info_flag: bool) -> Result<Self> {
+    pub async fn load_with_interpolation(
+        skip_interpolation: bool,
+        inspection: bool,
+    ) -> Result<Self> {
         let config_path = paths::config_file();
 
         if env::var_os(SANDBOX_ENV_FLAG).is_some() {
             if !config_path.exists() {
                 // Inspection-only flags are look-don't-touch: no first-run
                 // config creation, nothing written.
-                if info_flag {
+                if inspection {
                     return Ok(Self::default());
                 }
                 create_config_file(&config_path).await?;
@@ -756,7 +759,7 @@ impl Config {
                     // Same look-don't-touch rule: never run the interactive
                     // first-run wizard (or write a config) for a flag that
                     // only inspects state.
-                    if info_flag {
+                    if inspection {
                         return Ok(Self::default());
                     }
                     if *IS_STDOUT_TERMINAL {
@@ -769,7 +772,7 @@ impl Config {
             Self::load_from_file(&config_path)?
         };
 
-        if info_flag {
+        if skip_interpolation {
             return Ok(config);
         }
 
@@ -1627,7 +1630,7 @@ hooks:
             std::env::set_var(crate::sandbox::SANDBOX_ENV_FLAG, "1");
         }
 
-        let result = Config::load_with_interpolation(false).await;
+        let result = Config::load_with_interpolation(false, false).await;
         let (_, raw) = Config::load_from_file(&config_path).unwrap();
 
         unsafe {
@@ -1666,7 +1669,7 @@ hooks:
         let _provider = crate::testing::EnvVarGuard::unset(get_env_name("provider"));
         let _platform = crate::testing::EnvVarGuard::unset(get_env_name("platform"));
 
-        let result = Config::load_with_interpolation(true).await;
+        let result = Config::load_with_interpolation(true, true).await;
 
         let leftover: Vec<_> = std::fs::read_dir(&tmp_dir)
             .unwrap()
@@ -1694,7 +1697,7 @@ hooks:
             crate::testing::EnvVarGuard::set(get_env_name("config_file"), &config_path);
         let _sandbox = crate::testing::EnvVarGuard::set(crate::sandbox::SANDBOX_ENV_FLAG, "1");
 
-        let result = Config::load_with_interpolation(true).await;
+        let result = Config::load_with_interpolation(true, true).await;
 
         let created = config_path.exists();
         let _ = std::fs::remove_dir_all(&tmp_dir);

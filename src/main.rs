@@ -113,6 +113,19 @@ async fn main() -> Result<()> {
         || cli.list_macros
         || cli.list_skills
         || cli.list_sessions;
+    // Read-only whitelist: --sync-models is excluded because it downloads
+    // and writes models-override.yaml; combined with a readout flag the run
+    // still writes (run() handles --sync-models first), so it disqualifies
+    // the whole invocation.
+    let readout_flag = (cli.info
+        || cli.list_models
+        || cli.list_roles
+        || cli.list_agents
+        || cli.list_rags
+        || cli.list_macros
+        || cli.list_skills
+        || cli.list_sessions)
+        && !cli.sync_models;
     let vault_flags = cli.add_secret.is_some()
         || cli.get_secret.is_some()
         || cli.update_secret.is_some()
@@ -144,9 +157,15 @@ async fn main() -> Result<()> {
     // bootstrap so a pristine config dir stays empty. On such a dir the
     // list flags list nothing because nothing is installed, by design.
     // Agent/role runs still bootstrap: they load builtin tool definitions.
-    let inspection_only = (info_flag || cli.list_secrets || cli.mcp_list)
-        && cli.agent.is_none()
-        && cli.role.is_none();
+    let mcp_inspect =
+        cli.mcp_list && cli.mcp_get.is_none() && cli.mcp_remove.is_none() && cli.mcp_add.is_none();
+    let vault_inspect = cli.list_secrets
+        && cli.add_secret.is_none()
+        && cli.get_secret.is_none()
+        && cli.update_secret.is_none()
+        && cli.delete_secret.is_none();
+    let inspection_only =
+        (readout_flag || vault_inspect || mcp_inspect) && cli.agent.is_none() && cli.role.is_none();
     if !inspection_only {
         install_builtins()?;
     }
@@ -173,7 +192,7 @@ async fn main() -> Result<()> {
     }
 
     if let Some(client_arg) = &cli.authenticate {
-        let cfg = Config::load_with_interpolation(true).await?;
+        let cfg = Config::load_with_interpolation(true, false).await?;
         let app_config = AppConfig::from_config(cfg)?;
         let (client_name, provider) =
             resolve_oauth_client(client_arg.as_deref(), &app_config.clients)?;
@@ -182,7 +201,7 @@ async fn main() -> Result<()> {
     }
 
     if let Some(server_name) = &cli.auth_mcp {
-        let cfg = Config::load_with_interpolation(true).await?;
+        let cfg = Config::load_with_interpolation(true, false).await?;
         let app_config = AppConfig::from_config(cfg)?;
         let vault = Vault::init(&app_config)?;
         let mcp_path = paths::mcp_config_file();
@@ -234,12 +253,8 @@ async fn main() -> Result<()> {
     let mcp_action =
         cli.mcp_list || cli.mcp_get.is_some() || cli.mcp_remove.is_some() || cli.mcp_add.is_some();
     if mcp_action {
-        let cfg = Config::load_with_interpolation(true).await?;
-        let app_config = if cli.mcp_list
-            && cli.mcp_get.is_none()
-            && cli.mcp_remove.is_none()
-            && cli.mcp_add.is_none()
-        {
+        let cfg = Config::load_with_interpolation(true, mcp_inspect).await?;
+        let app_config = if mcp_inspect {
             AppConfig::from_config_lenient(cfg)?
         } else {
             AppConfig::from_config(cfg)?
@@ -252,13 +267,8 @@ async fn main() -> Result<()> {
     }
 
     if vault_flags {
-        let cfg = Config::load_with_interpolation(true).await?;
-        let app_config = if cli.list_secrets
-            && cli.add_secret.is_none()
-            && cli.get_secret.is_none()
-            && cli.update_secret.is_none()
-            && cli.delete_secret.is_none()
-        {
+        let cfg = Config::load_with_interpolation(true, vault_inspect).await?;
+        let app_config = if vault_inspect {
             AppConfig::from_config_lenient(cfg)?
         } else {
             AppConfig::from_config(cfg)?
@@ -269,8 +279,8 @@ async fn main() -> Result<()> {
 
     let abort_signal = create_abort_signal();
     let start_mcp_servers = cli.agent.is_none() && cli.role.is_none();
-    let cfg = Config::load_with_interpolation(info_flag).await?;
-    let mut app_config = if info_flag {
+    let cfg = Config::load_with_interpolation(info_flag, readout_flag).await?;
+    let mut app_config = if readout_flag {
         AppConfig::from_config_lenient(cfg)?
     } else {
         AppConfig::from_config(cfg)?

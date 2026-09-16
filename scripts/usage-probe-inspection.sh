@@ -82,6 +82,29 @@ probe_flag allow-empty --list-bundles
 probe_flag allow-empty --list-secrets
 probe_flag allow-empty --mcp-list
 
+# --sync-models writes models-override.yaml, so it must NOT behave like an
+# inspection flag: on a fresh empty config dir it takes the bootstrap path
+# (builtins written) and, off a terminal, fails on the missing config.
+# IS_SANDBOX is stripped: the host path is the one under test, and a leaked
+# sandbox flag would reroute the missing config to the wizard prompt.
+echo "== --sync-models on a pristine COYOTE_CONFIG_DIR: bootstrap path, strict failure =="
+sync_cfg="$(mktemp -d "$WORKDIR/cfg.XXXXXX")"
+sync_out="$WORKDIR/sync-out.txt"
+sync_rc=0
+env -u IS_SANDBOX -u COYOTE_PROVIDER -u COYOTE_PLATFORM COYOTE_CONFIG_DIR="$sync_cfg" \
+  timeout 30 "$BIN" --sync-models </dev/null >"$sync_out" 2>&1 || sync_rc=$?
+if [ "$sync_rc" = "124" ]; then
+  fail "--sync-models: hung (likely waiting on a prompt) on an empty config dir"
+else
+  if [ "$sync_rc" = "0" ]; then
+    fail "--sync-models: expected the strict missing-config failure on an empty config dir, got rc=0"
+  fi
+  sync_nwritten="$(find "$sync_cfg" -mindepth 1 | wc -l | tr -d ' ')"
+  if [ "$sync_nwritten" = "0" ]; then
+    fail "--sync-models: expected the builtins bootstrap to populate the empty config dir, found nothing"
+  fi
+fi
+
 if [ "$failures" != "0" ]; then
   echo
   echo "$failures inspection-flag scenario(s) FAILED" >&2
