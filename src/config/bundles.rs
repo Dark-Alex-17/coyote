@@ -1183,6 +1183,13 @@ mod tests {
 
         assert_eq!(resolved.name, "y/mcp_config");
         assert_eq!(resolved.qualified_from.as_deref(), Some("mcp_config"));
+
+        let resolved = store
+            .resolve_bundle_name("https://github.com/z/hooks", None)
+            .unwrap();
+
+        assert_eq!(resolved.name, "z/hooks");
+        assert_eq!(resolved.qualified_from.as_deref(), Some("hooks"));
     }
 
     #[test]

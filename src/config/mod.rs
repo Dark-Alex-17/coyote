@@ -1,6 +1,7 @@
 mod agent;
 mod app_config;
 mod app_state;
+pub(crate) mod builtin_manifest;
 mod bundles;
 mod input;
 mod install_remote;
@@ -75,12 +76,14 @@ use crate::client::{
     oauth, set_client_models_config,
 };
 use crate::function::{FunctionDeclaration, Functions};
+use crate::hooks::HooksMap;
 use crate::rag::Rag;
 use crate::sandbox::SANDBOX_ENV_FLAG;
 use crate::utils::*;
 pub use macros::macro_execute;
 
 use crate::config::macros::Macro;
+use crate::hooks;
 use crate::vault::{
     GlobalVault, Vault, create_vault_password_file, interpolate_secrets, prompt_provider_choice,
 };
@@ -162,6 +165,7 @@ const AGENT_GRAPH_FILE_NAME: &str = "graph.yaml";
 const ROLES_DIR_NAME: &str = "roles";
 const SKILLS_DIR_NAME: &str = "skills";
 const MACROS_DIR_NAME: &str = "macros";
+const HOOKS_DIR_NAME: &str = "hooks";
 const ENV_FILE_NAME: &str = ".env";
 const MESSAGES_FILE_NAME: &str = "messages.md";
 const SESSIONS_DIR_NAME: &str = "sessions";
@@ -262,6 +266,9 @@ pub struct Config {
     pub enabled_mcp_servers: Option<Vec<String>>,
     pub mcp_tools: Option<IndexMap<String, Vec<String>>>,
 
+    #[serde(default)]
+    pub hooks: HooksMap,
+
     pub auto_continue: bool,
     pub max_auto_continues: usize,
     pub inject_todo_instructions: bool,
@@ -350,6 +357,8 @@ impl Default for Config {
             enabled_mcp_servers: None,
             mcp_tools: None,
 
+            hooks: Default::default(),
+
             auto_continue: false,
             max_auto_continues: 10,
             inject_todo_instructions: true,
@@ -412,6 +421,8 @@ pub fn install_builtins() -> Result<()> {
     Agent::install_builtin_agents(false)?;
     Macro::install_macros(false)?;
     Skill::install_builtin_skills(false)?;
+    hooks::install_builtin_hooks(false)?;
+    Role::install_builtin_role_hooks(false)?;
     Ok(())
 }
 
@@ -421,12 +432,20 @@ pub enum AssetCategory {
     Macros,
     Functions,
     Skills,
+    Hooks,
     #[value(name = "mcp-config", alias = "mcp_config")]
     McpConfig,
 }
 
 impl AssetCategory {
-    pub const NAMES: [&'static str; 5] = ["agents", "macros", "functions", "skills", "mcp-config"];
+    pub const NAMES: [&'static str; 6] = [
+        "agents",
+        "macros",
+        "functions",
+        "skills",
+        "hooks",
+        "mcp-config",
+    ];
 
     pub fn parse(name: &str) -> Option<Self> {
         match name {
@@ -434,6 +453,7 @@ impl AssetCategory {
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
             "skills" => Some(Self::Skills),
+            "hooks" => Some(Self::Hooks),
             "mcp-config" | "mcp_config" => Some(Self::McpConfig),
             _ => None,
         }
@@ -453,17 +473,19 @@ pub enum InstallFilter {
     Skills,
     Macros,
     Functions,
+    Hooks,
     #[value(name = "mcp-config", alias = "mcp_config")]
     McpConfig,
 }
 
 impl InstallFilter {
-    pub const NAMES: [&'static str; 6] = [
+    pub const NAMES: [&'static str; 7] = [
         "agents",
         "roles",
         "skills",
         "macros",
         "functions",
+        "hooks",
         "mcp-config",
     ];
 
@@ -474,6 +496,7 @@ impl InstallFilter {
             "skills" => Some(Self::Skills),
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
+            "hooks" => Some(Self::Hooks),
             "mcp-config" | "mcp_config" => Some(Self::McpConfig),
             _ => None,
         }
@@ -486,6 +509,7 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
         AssetCategory::Macros => ("macros", paths::macros_dir()),
         AssetCategory::Functions => ("functions", paths::functions_dir()),
         AssetCategory::Skills => ("skills", paths::skills_dir()),
+        AssetCategory::Hooks => ("hooks", paths::hooks_dir()),
         AssetCategory::McpConfig => ("MCP config", paths::mcp_config_file()),
     };
 
@@ -499,6 +523,7 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
         AssetCategory::Macros => Macro::install_macros(true)?,
         AssetCategory::Functions => Functions::install_builtin_global_tools(true)?,
         AssetCategory::Skills => Skill::install_builtin_skills(true)?,
+        AssetCategory::Hooks => hooks::install_builtin_hooks(true)?,
         AssetCategory::McpConfig => Functions::install_mcp_config()?,
     }
 
@@ -1391,6 +1416,59 @@ clients:
     fn config_template_does_not_carry_the_per_agent_escalation_timeout_key() {
         // `escalation_timeout` is a per-agent setting; the global template must never grow it.
         assert!(!CONFIG_TEMPLATE.contains("escalation_timeout"));
+    }
+
+    #[test]
+    fn config_template_carries_hooks_block_without_global_hooks() {
+        // `global_hooks` is a per-agent whitelist; the global template must never grow it.
+        assert!(CONFIG_TEMPLATE.contains("\nhooks:"));
+        assert!(!CONFIG_TEMPLATE.contains("global_hooks"));
+    }
+
+    #[test]
+    fn config_template_renders_with_empty_hooks() {
+        let clients = json!([{ "type": "openai", "api_key": "sk-test" }]);
+
+        let rendered = render_config_template("openai:gpt-4o", None, &clients).unwrap();
+
+        assert!(rendered.contains("\nhooks:"));
+        assert!(!rendered.contains("global_hooks"));
+
+        let cfg = Config::load_from_str(&rendered).unwrap();
+        assert!(cfg.hooks.is_empty());
+    }
+
+    #[test]
+    fn config_parses_hooks_map_preserving_order() {
+        let yaml = "\
+hooks:
+  tool.started:
+    - name: notify
+      command: ./hooks/notify.sh
+    - name: audit
+      command: ./hooks/audit.sh
+  turn.completed:
+    - name: webhook
+      command: curl -s https://example.com/hook
+";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(
+            cfg.hooks.keys().collect::<Vec<_>>(),
+            vec!["tool.started", "turn.completed"]
+        );
+        assert_eq!(cfg.hooks["tool.started"].len(), 2);
+        assert_eq!(cfg.hooks["tool.started"][0].name, "notify");
+        assert_eq!(cfg.hooks["tool.started"][0].command, "./hooks/notify.sh");
+        assert_eq!(cfg.hooks["turn.completed"][0].name, "webhook");
+    }
+
+    #[test]
+    fn config_without_hooks_parses_unchanged() {
+        let cfg: Config = serde_yaml::from_str("model: openai:gpt-4o").unwrap();
+
+        assert!(cfg.hooks.is_empty());
+        assert_eq!(cfg.model_id, "openai:gpt-4o");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::hooks::HooksMap;
 use crate::{
     client::Model,
     config::memory,
@@ -12,6 +13,7 @@ use crate::{
 };
 
 use super::rag_cache::RagKey;
+use crate::config::builtin_manifest;
 use crate::config::paths;
 use crate::config::prompts::{
     DEFAULT_JOB_INSTRUCTIONS, DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS,
@@ -27,6 +29,7 @@ use fancy_regex::Captures;
 use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::{env, ffi::OsStr, path::Path};
 
 const DEFAULT_AGENT_NAME: &str = "rag";
@@ -45,6 +48,20 @@ pub type AgentVariables = IndexMap<String, String>;
 #[derive(Embed)]
 #[folder = "assets/agents/"]
 struct AgentAssets;
+
+/// Splits an embedded asset path of the form `<agent>/hooks/<file>` into
+/// its agent and hook-file names. Only direct children of `hooks/` count:
+/// they are the only shape the builtin manifest tracks.
+fn parse_direct_hook_path(path: &str) -> Option<(&str, &str)> {
+    let (agent, rest) = path.split_once('/')?;
+    let hook = direct_hook_name(rest)?;
+    Some((agent, hook))
+}
+
+fn direct_hook_name(rest: &str) -> Option<&str> {
+    let name = rest.strip_prefix("hooks/")?;
+    (!name.is_empty() && !name.contains('/')).then_some(name)
+}
 
 #[derive(Debug, Clone)]
 pub struct Agent {
@@ -70,6 +87,7 @@ impl Agent {
             paths::agents_data_dir().display()
         );
 
+        let mut written_hooks: HashMap<String, BTreeSet<String>> = HashMap::new();
         for file in AgentAssets::iter() {
             debug!("Processing agent file: {}", file.as_ref());
 
@@ -96,6 +114,12 @@ impl Agent {
             info!("Creating agent file: {}", file_path.display());
             let mut agent_file = File::create(&file_path)?;
             agent_file.write_all(content.as_bytes())?;
+            if let Some((agent, hook)) = parse_direct_hook_path(file.as_ref()) {
+                written_hooks
+                    .entry(agent.to_string())
+                    .or_default()
+                    .insert(hook.to_string());
+            }
 
             #[cfg(unix)]
             if is_script {
@@ -131,6 +155,27 @@ impl Agent {
                         );
                     }
                 }
+            }
+        }
+
+        // Hook filenames are open-ended (unlike AGENT_DEFINITION_FILES), so
+        // each bundled agent's hooks/ directory reconciles through its
+        // builtin manifest: only files the installer previously shipped are
+        // removal candidates, and user-created files in the same directory
+        // are never touched. Only direct children of hooks/ are tracked;
+        // nested shipped files install but are not reconciled.
+        for (agent, files) in &bundled_files {
+            let shipped: BTreeSet<String> = files
+                .iter()
+                .filter_map(|rest| direct_hook_name(rest))
+                .map(str::to_string)
+                .collect();
+            let written = written_hooks.remove(agent.as_str()).unwrap_or_default();
+            let hooks_dir = paths::agents_data_dir().join(agent).join("hooks");
+            if let Err(err) =
+                builtin_manifest::reconcile_builtin_dir(&hooks_dir, &shipped, &written)
+            {
+                warn!("Failed to reconcile builtin hooks for agent '{agent}': {err}");
             }
         }
 
@@ -639,6 +684,14 @@ impl Agent {
         self.config.compression_model.as_deref()
     }
 
+    pub fn hooks(&self) -> &HooksMap {
+        &self.config.hooks
+    }
+
+    pub fn global_hooks(&self) -> &[String] {
+        &self.config.global_hooks
+    }
+
     pub fn is_dynamic_instructions(&self) -> bool {
         self.config.dynamic_instructions
     }
@@ -848,6 +901,10 @@ pub struct AgentConfig {
     pub mcp_tools: Option<IndexMap<String, Vec<String>>>,
     #[serde(default)]
     pub global_tools: Vec<String>,
+    #[serde(default)]
+    pub hooks: HooksMap,
+    #[serde(default)]
+    pub global_hooks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -917,6 +974,8 @@ impl AgentConfig {
             reasoning_effort: graph.reasoning_effort.clone(),
             description: graph.description.clone(),
             global_tools: graph.global_tools.clone(),
+            hooks: graph.hooks.clone(),
+            global_hooks: graph.global_hooks.clone(),
             mcp_servers: graph.mcp_servers.clone(),
             mcp_tools: graph.mcp_tools.clone(),
             skills_enabled: graph.skills_enabled,
@@ -964,6 +1023,14 @@ impl AgentConfig {
             && let Ok(v) = serde_json::from_str(&v)
         {
             self.global_tools = v;
+        }
+        if let Ok(v) = env::var(with_prefix("global_hooks")) {
+            match serde_json::from_str(&v) {
+                Ok(v) => self.global_hooks = v,
+                Err(err) => {
+                    debug!("Ignoring malformed global_hooks env override for agent '{name}': {err}")
+                }
+            }
         }
         if let Ok(v) = env::var(with_prefix("mcp_servers"))
             && let Ok(v) = serde_json::from_str(&v)
@@ -1296,6 +1363,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_direct_hook_path_accepts_only_direct_hook_children() {
+        assert_eq!(parse_direct_hook_path("x/hooks/a.sh"), Some(("x", "a.sh")));
+        assert_eq!(parse_direct_hook_path("x/hooks/nested/a.sh"), None);
+        assert_eq!(parse_direct_hook_path("hooks/a.sh"), None);
+        assert_eq!(parse_direct_hook_path("x/hooks/"), None);
+        assert_eq!(parse_direct_hook_path("x/config.yaml"), None);
+        assert_eq!(parse_direct_hook_path("config.yaml"), None);
+    }
+
+    #[test]
     fn agent_config_parses_from_yaml() {
         let yaml = r#"
 name: test-agent
@@ -1337,6 +1414,92 @@ variables:
     }
 
     #[test]
+    fn agent_config_hooks_and_global_hooks_round_trip() {
+        let yaml = "\
+name: hooked
+instructions: hi
+hooks:
+  tool.started:
+    - name: notify
+      command: ./hooks/notify.sh
+global_hooks:
+  - tool.started.notify
+";
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.hooks["tool.started"][0].name, "notify");
+        assert_eq!(config.hooks["tool.started"][0].command, "./hooks/notify.sh");
+        assert_eq!(config.global_hooks, vec!["tool.started.notify"]);
+
+        let serialized = serde_yaml::to_string(&config).unwrap();
+        let reparsed: AgentConfig = serde_yaml::from_str(&serialized).unwrap();
+
+        assert_eq!(reparsed.hooks, config.hooks);
+        assert_eq!(reparsed.global_hooks, config.global_hooks);
+    }
+
+    #[test]
+    fn load_envs_overrides_global_hooks() {
+        let yaml = "name: hooks-env-probe\ninstructions: hi\nglobal_hooks:\n  - initial.hook\n";
+        let mut config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+        let env_name = normalize_env_name("hooks-env-probe_global_hooks");
+        let prev = env::var_os(&env_name);
+
+        unsafe {
+            env::set_var(
+                &env_name,
+                r#"["tool.started.notify","turn.completed.webhook"]"#,
+            )
+        };
+        config.load_envs(&AppConfig::default());
+        assert_eq!(
+            config.global_hooks,
+            vec!["tool.started.notify", "turn.completed.webhook"]
+        );
+
+        unsafe { env::set_var(&env_name, "not json") };
+        config.load_envs(&AppConfig::default());
+        assert_eq!(
+            config.global_hooks,
+            vec!["tool.started.notify", "turn.completed.webhook"]
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
+            }
+        }
+    }
+
+    #[test]
+    fn from_graph_carries_hooks_and_global_hooks() {
+        let yaml = "\
+name: g
+start: e
+hooks:
+  turn.completed:
+    - name: webhook
+      command: curl -s https://example.com/hook
+global_hooks:
+  - turn.completed.webhook
+nodes:
+  e:
+    id: e
+    type: end
+    output: done
+";
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
+        let config = AgentConfig::from_graph("g", &graph);
+
+        assert_eq!(config.hooks, graph.hooks);
+        assert_eq!(config.global_hooks, graph.global_hooks);
+        assert_eq!(config.hooks["turn.completed"][0].name, "webhook");
+        assert_eq!(config.global_hooks, vec!["turn.completed.webhook"]);
+    }
+
+    #[test]
     fn agent_config_defaults() {
         let yaml = "name: minimal\ninstructions: hi\n";
         let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
@@ -1350,6 +1513,8 @@ variables:
         assert_eq!(config.escalation_timeout, 0);
         assert!(config.mcp_servers.is_empty());
         assert!(config.global_tools.is_empty());
+        assert!(config.hooks.is_empty());
+        assert!(config.global_hooks.is_empty());
         assert!(config.conversation_starters.is_empty());
         assert!(config.variables.is_empty());
         assert!(config.model_id.is_none());

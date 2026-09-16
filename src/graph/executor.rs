@@ -1,6 +1,6 @@
 use super::agent::{AgentExecutionOutcome, AgentNodeExecutor};
 use super::llm::{LlmExecutionOutcome, LlmNodeExecutor};
-use super::logging::{GraphLogger, narrate_node_complete, narrate_node_failed};
+use super::logging::{GraphLogger, narrate_node_complete, narrate_node_failed, node_type_label};
 use super::map::MapNodeExecutor;
 use super::rag::RagNodeExecutor;
 use super::script::ScriptExecutor;
@@ -11,6 +11,8 @@ use super::user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 use super::validator::{AgentValidationContext, GraphValidator};
 use super::wall_clock;
 use crate::config::{AgentVariable, AgentVariables, RenderMode, RequestContext};
+use crate::function::agents::hook_base_envs;
+use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
 use crate::utils::{AbortSignal, wait_abort_signal, wait_user_interrupt};
 use anyhow::{Context, Result, anyhow, bail};
@@ -234,6 +236,16 @@ impl GraphExecutor {
                     })?
                     .clone();
                 logger.node_start(&node, in_super_step);
+                let node_hooks = NodeHookEmitter::resolve(ctx, node_id, node_type_label(&node));
+                hooks::fire(
+                    HookEvent::GraphNodeStarted,
+                    ctx,
+                    &[
+                        ("COYOTE_NODE_ID", node_id.clone()),
+                        ("COYOTE_NODE_TYPE", node_hooks.node_type.to_string()),
+                    ],
+                    None,
+                );
                 let branch_state = state.fork_for_branch_state();
                 let mut branch_ctx = ctx.fork_for_branch();
                 let mut peer_id: Option<String> = None;
@@ -281,6 +293,7 @@ impl GraphExecutor {
                             "aborted",
                             in_super_step,
                         );
+                        node_hooks.failed(Duration::default(), "aborted");
                         return (
                             current.clone(),
                             branch_state,
@@ -315,6 +328,7 @@ impl GraphExecutor {
                                 route.as_deref(),
                                 in_super_step,
                             );
+                            node_hooks.completed(elapsed, route.as_deref());
                         }
                         Ok(StepResult::End(_)) => {
                             narrate_node_complete(
@@ -324,6 +338,7 @@ impl GraphExecutor {
                                 Some("END"),
                                 in_super_step,
                             );
+                            node_hooks.completed(elapsed, Some("END"));
                         }
                         Err(e) => {
                             narrate_node_failed(
@@ -333,6 +348,7 @@ impl GraphExecutor {
                                 &e.to_string(),
                                 in_super_step,
                             );
+                            node_hooks.failed(elapsed, &e.to_string());
                         }
                     }
                     (current, state, result, elapsed)
@@ -496,6 +512,67 @@ fn provision_frontier_peers(
         assignments.insert(node_id, (id, inbox));
     }
     (Some(registry), assignments)
+}
+
+struct NodeHookEmitter {
+    completed: Vec<ResolvedHook>,
+    failed: Vec<ResolvedHook>,
+    session_name: Option<String>,
+    agent_name: Option<String>,
+    node_id: String,
+    node_type: &'static str,
+}
+
+impl NodeHookEmitter {
+    fn resolve(ctx: &RequestContext, node_id: &str, node_type: &'static str) -> Self {
+        Self {
+            completed: ctx.resolved_hooks(HookEvent::GraphNodeCompleted),
+            failed: ctx.resolved_hooks(HookEvent::GraphNodeFailed),
+            session_name: ctx
+                .session
+                .as_ref()
+                .map(|session| session.name().to_string()),
+            agent_name: ctx.agent.as_ref().map(|agent| agent.name().to_string()),
+            node_id: node_id.to_string(),
+            node_type,
+        }
+    }
+
+    fn extras(&self, elapsed: Duration) -> Vec<(&'static str, String)> {
+        vec![
+            ("COYOTE_NODE_ID", self.node_id.clone()),
+            ("COYOTE_NODE_TYPE", self.node_type.to_string()),
+            ("COYOTE_NODE_DURATION_MS", elapsed.as_millis().to_string()),
+        ]
+    }
+
+    fn dispatch(&self, event: HookEvent, resolved: &[ResolvedHook], extras: &[(&str, String)]) {
+        hooks::fire_resolved(
+            event,
+            resolved.to_vec(),
+            hook_base_envs(
+                event,
+                self.session_name.as_deref(),
+                self.agent_name.as_deref(),
+            ),
+            extras,
+            None,
+        );
+    }
+
+    fn completed(&self, elapsed: Duration, route: Option<&str>) {
+        let mut extras = self.extras(elapsed);
+        if let Some(route) = route {
+            extras.push(("COYOTE_NODE_ROUTE", route.to_string()));
+        }
+        self.dispatch(HookEvent::GraphNodeCompleted, &self.completed, &extras);
+    }
+
+    fn failed(&self, elapsed: Duration, error: &str) {
+        let mut extras = self.extras(elapsed);
+        extras.push(("COYOTE_NODE_ERROR", error.to_string()));
+        self.dispatch(HookEvent::GraphNodeFailed, &self.failed, &extras);
+    }
 }
 
 pub(super) struct TaskCancelGuard(Vec<AbortHandle>);
@@ -928,6 +1005,8 @@ mod tests {
             max_concurrent_agents: None,
             max_agent_depth: None,
             global_tools: Vec::new(),
+            hooks: Default::default(),
+            global_hooks: Vec::new(),
             mcp_servers: Vec::new(),
             mcp_tools: None,
             skills_enabled: None,
@@ -1048,9 +1127,10 @@ mod tests {
 mod integration_tests {
     use super::*;
     use crate::config::paths;
-    use crate::config::{AppState, WorkingMode};
+    use crate::config::{Agent, AgentConfig, AppConfig, AppState, WorkingMode};
     #[cfg(unix)]
     use crate::function::jobs::RingBuf;
+    use crate::hooks::HookDef;
     #[cfg(unix)]
     use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor, notification};
     use crate::utils::{create_abort_signal, get_env_name, temp_file};
@@ -1064,6 +1144,33 @@ mod integration_tests {
 
     fn cmd_available(name: &str) -> bool {
         which::which(name).is_ok()
+    }
+
+    fn hooks_config(entries: &[(&str, &str)]) -> hooks::HooksMap {
+        let mut map = hooks::HooksMap::new();
+        for (event, name) in entries {
+            map.entry((*event).to_string()).or_default().push(HookDef {
+                name: (*name).to_string(),
+                command: "true".to_string(),
+            });
+        }
+        map
+    }
+
+    fn ctx_with_global_hooks(hooks: hooks::HooksMap) -> RequestContext {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            hooks,
+            ..Default::default()
+        });
+        RequestContext::new(Arc::new(app), WorkingMode::Cmd)
+    }
+
+    fn hook_captures_named(name: &str) -> Vec<hooks::test_sink::Capture> {
+        hooks::test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name == name)
+            .collect()
     }
 
     struct TestWorkspace {
@@ -1206,6 +1313,364 @@ nodes:
             .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
 
         assert_eq!(result, "held|held");
+    }
+
+    /// An agent node that fails but declares a fallback must surface the
+    /// failure to observers as `agent.failed`, fired at the point of
+    /// failure, even though the fallback then converts it into a normal
+    /// node completion that routes to the fallback target — so the same
+    /// node also yields `graph.node.completed`, never `graph.node.failed`.
+    #[tokio::test]
+    async fn agent_node_failure_with_fallback_fires_agent_failed_and_node_completed() {
+        let _sink = hooks::test_sink::install();
+        let mut ctx = ctx_with_global_hooks(hooks_config(&[
+            ("agent.failed", "t037_fb_agent_failed"),
+            ("graph.node.completed", "t037_fb_node_completed"),
+            ("graph.node.failed", "t037_fb_node_failed"),
+        ]));
+        // Forces the agent node to fail before it ever loads the (absent)
+        // agent from disk, keeping the test hermetic.
+        ctx.current_depth = crate::config::default_max_agent_depth();
+
+        let yaml = r#"
+name: t
+settings:
+  validate_before_run: false
+start: worker
+nodes:
+  worker:
+    type: agent
+    agent: missing_agent
+    prompt: p
+    fallback: recover
+    next: done
+  recover:
+    type: end
+    output: recovered
+  done:
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, ".")
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+        assert_eq!(result, "recovered");
+
+        let agent_failed = hook_captures_named("t037_fb_agent_failed");
+        assert_eq!(agent_failed.len(), 1, "{agent_failed:?}");
+        assert_eq!(agent_failed[0].envs["COYOTE_EVENT"], "agent.failed");
+        assert_eq!(agent_failed[0].envs["COYOTE_AGENT_ID"], "worker");
+        assert_eq!(agent_failed[0].envs["COYOTE_AGENT_NAME"], "missing_agent");
+        assert!(
+            agent_failed[0].envs["COYOTE_AGENT_ERROR"].contains("Max agent depth exceeded"),
+            "{:?}",
+            agent_failed[0].envs
+        );
+
+        let node_completed = hook_captures_named("t037_fb_node_completed");
+        let worker_completed: Vec<_> = node_completed
+            .iter()
+            .filter(|capture| capture.envs["COYOTE_NODE_ID"] == "worker")
+            .collect();
+        assert_eq!(worker_completed.len(), 1, "{node_completed:?}");
+        assert_eq!(worker_completed[0].envs["COYOTE_NODE_TYPE"], "agent");
+        assert_eq!(worker_completed[0].envs["COYOTE_NODE_ROUTE"], "recover");
+
+        let node_failed = hook_captures_named("t037_fb_node_failed");
+        assert!(
+            node_failed
+                .iter()
+                .all(|capture| capture.envs["COYOTE_NODE_ID"] != "worker"),
+            "a node that continues via fallback must not fire graph.node.failed: {node_failed:?}"
+        );
+    }
+
+    /// Two branches running in the same super-step each carry their own
+    /// node metadata, captured task-locally before the branch was spawned;
+    /// the distinct routes prove one branch's metadata never leaks into a
+    /// sibling's events.
+    #[tokio::test]
+    async fn parallel_super_step_branches_fire_per_node_metadata() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let _sink = hooks::test_sink::install();
+        let ws = TestWorkspace::new();
+        for script in [
+            "dispatcher.sh",
+            "worker_a.sh",
+            "worker_b.sh",
+            "sink_a.sh",
+            "sink_b.sh",
+        ] {
+            ws.write_script(script, "#!/bin/bash\necho '{}'\n");
+        }
+        let mut ctx = ctx_with_global_hooks(hooks_config(&[
+            ("graph.node.started", "t037_par_started"),
+            ("graph.node.completed", "t037_par_completed"),
+        ]));
+
+        let yaml = r#"
+name: t
+start: dispatcher
+nodes:
+  dispatcher:
+    type: script
+    script: dispatcher.sh
+    state_updates: {}
+    next: [worker_a, worker_b]
+  worker_a:
+    type: script
+    script: worker_a.sh
+    state_updates: {}
+    next: sink_a
+  worker_b:
+    type: script
+    script: worker_b.sh
+    state_updates: {}
+    next: sink_b
+  sink_a:
+    type: script
+    script: sink_a.sh
+    state_updates: {}
+    next: join
+  sink_b:
+    type: script
+    script: sink_b.sh
+    state_updates: {}
+    next: join
+  join:
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+        assert_eq!(result, "done");
+
+        let started = hook_captures_named("t037_par_started");
+        for node_id in [
+            "dispatcher",
+            "worker_a",
+            "worker_b",
+            "sink_a",
+            "sink_b",
+            "join",
+        ] {
+            assert_eq!(
+                started
+                    .iter()
+                    .filter(|capture| capture.envs["COYOTE_NODE_ID"] == node_id)
+                    .count(),
+                1,
+                "exactly one graph.node.started for '{node_id}': {started:?}"
+            );
+        }
+
+        let completed = hook_captures_named("t037_par_completed");
+        let completed_route = |node_id: &str| -> String {
+            let matches: Vec<_> = completed
+                .iter()
+                .filter(|capture| capture.envs["COYOTE_NODE_ID"] == node_id)
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "exactly one graph.node.completed for '{node_id}': {completed:?}"
+            );
+            let expected_type = if node_id == "join" { "end" } else { "script" };
+            assert_eq!(matches[0].envs["COYOTE_NODE_TYPE"], expected_type);
+            let duration = &matches[0].envs["COYOTE_NODE_DURATION_MS"];
+            let _: u128 = duration
+                .parse()
+                .unwrap_or_else(|_| panic!("non-numeric duration for '{node_id}': {duration}"));
+            matches[0].envs["COYOTE_NODE_ROUTE"].clone()
+        };
+        assert_eq!(completed_route("dispatcher"), "worker_a, worker_b");
+        assert_eq!(completed_route("worker_a"), "sink_a");
+        assert_eq!(completed_route("worker_b"), "sink_b");
+        assert_eq!(completed_route("sink_a"), "join");
+        assert_eq!(completed_route("sink_b"), "join");
+        assert_eq!(completed_route("join"), "END");
+    }
+
+    /// A graph agent's hooks come from graph.yaml's top level: they resolve
+    /// through the agent scope end-to-end, while a global hook on the same
+    /// event stays gated off because the agent whitelisted nothing.
+    #[tokio::test]
+    async fn graph_agent_hooks_resolve_from_graph_yaml_top_level() {
+        let _sink = hooks::test_sink::install();
+        let mut ctx =
+            ctx_with_global_hooks(hooks_config(&[("graph.node.completed", "t037_gy_global")]));
+
+        let yaml = r#"
+name: hooked_graph
+settings:
+  validate_before_run: false
+start: done
+hooks:
+  graph.node.started:
+    - name: t037_gy_started
+      command: "true"
+  graph.node.completed:
+    - name: t037_gy_completed
+      command: "true"
+nodes:
+  done:
+    type: end
+    output: ok
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        ctx.agent = Some(Agent::test_new(AgentConfig::from_graph(
+            "hooked_graph",
+            &graph,
+        )));
+
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, ".")
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+        assert_eq!(result, "ok");
+
+        let started = hook_captures_named("t037_gy_started");
+        assert_eq!(started.len(), 1, "{started:?}");
+        assert_eq!(started[0].envs["COYOTE_EVENT"], "graph.node.started");
+        assert_eq!(started[0].envs["COYOTE_NODE_ID"], "done");
+        assert_eq!(started[0].envs["COYOTE_NODE_TYPE"], "end");
+        assert_eq!(started[0].envs["COYOTE_AGENT_NAME"], "hooked_graph");
+
+        let completed = hook_captures_named("t037_gy_completed");
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert_eq!(completed[0].envs["COYOTE_NODE_ID"], "done");
+        assert_eq!(completed[0].envs["COYOTE_NODE_ROUTE"], "END");
+        assert_eq!(completed[0].envs["COYOTE_AGENT_NAME"], "hooked_graph");
+
+        assert!(
+            hook_captures_named("t037_gy_global").is_empty(),
+            "an agent context must not run global hooks it did not whitelist"
+        );
+    }
+
+    /// A node that genuinely fails — no fallback to absorb the error — fires
+    /// `graph.node.failed` with the full payload observers rely on: the node's
+    /// id and type, a numeric duration, and the error text, even though the
+    /// failure then propagates out of the executor.
+    #[tokio::test]
+    async fn genuine_node_failure_fires_graph_node_failed_with_payload() {
+        let _sink = hooks::test_sink::install();
+        let mut ctx = ctx_with_global_hooks(hooks_config(&[(
+            "graph.node.failed",
+            "t037_gf_node_failed",
+        )]));
+        // Forces the agent node to fail before it ever loads the (absent)
+        // agent from disk, keeping the test hermetic.
+        ctx.current_depth = crate::config::default_max_agent_depth();
+
+        let yaml = r#"
+name: t
+settings:
+  validate_before_run: false
+start: worker
+nodes:
+  worker:
+    type: agent
+    agent: missing_agent
+    prompt: p
+    next: done
+  done:
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, ".")
+            .execute(&mut ctx, abort)
+            .await;
+        let error = result.expect_err("a node failure without a fallback must propagate");
+
+        let failed = hook_captures_named("t037_gf_node_failed");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        let envs = &failed[0].envs;
+        assert_eq!(envs["COYOTE_EVENT"], "graph.node.failed");
+        assert_eq!(envs["COYOTE_NODE_ID"], "worker");
+        assert_eq!(envs["COYOTE_NODE_TYPE"], "agent");
+        let duration = &envs["COYOTE_NODE_DURATION_MS"];
+        let _: u128 = duration
+            .parse()
+            .unwrap_or_else(|_| panic!("non-numeric duration: {duration}"));
+        assert!(!envs["COYOTE_NODE_ERROR"].is_empty(), "{envs:?}");
+        assert!(
+            format!("{error:#}").contains("Max agent depth exceeded"),
+            "unexpected executor error: {error:#}"
+        );
+    }
+
+    /// A malformed hook definition reaching the executor seam through
+    /// graph.yaml's top level — an entry whose command is blank — degrades
+    /// safely: the node still runs, the malformed hook is skipped with a
+    /// debug log, and a well-formed sibling on the same event still fires.
+    #[tokio::test]
+    async fn malformed_graph_yaml_hook_is_skipped_without_breaking_the_node() {
+        crate::testing::install_warn_collector();
+        let _sink = hooks::test_sink::install();
+        let mut ctx = make_ctx();
+
+        let yaml = r#"
+name: hooked_graph
+settings:
+  validate_before_run: false
+start: done
+hooks:
+  graph.node.completed:
+    - name: t037_mal_empty
+      command: "   "
+    - name: t037_mal_valid
+      command: "true"
+nodes:
+  done:
+    type: end
+    output: ok
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        ctx.agent = Some(Agent::test_new(AgentConfig::from_graph(
+            "hooked_graph",
+            &graph,
+        )));
+
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, ".")
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+        assert_eq!(result, "ok");
+
+        assert!(
+            hook_captures_named("t037_mal_empty").is_empty(),
+            "a blank-command hook must be skipped, not dispatched"
+        );
+        let valid = hook_captures_named("t037_mal_valid");
+        assert_eq!(valid.len(), 1, "{valid:?}");
+        assert_eq!(valid[0].envs["COYOTE_NODE_ID"], "done");
+
+        let debugs: Vec<String> = crate::testing::debug_messages()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(
+            debugs
+                .iter()
+                .any(|message| message.contains("t037_mal_empty")
+                    && message.contains("empty command")),
+            "expected a debug log for the skipped hook: {debugs:?}"
+        );
     }
 
     /// Declared variables are seeded into state at run start, so the agent
