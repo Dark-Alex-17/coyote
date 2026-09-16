@@ -1641,6 +1641,15 @@ mod tests {
     }
 
     #[test]
+    fn non_map_request_patch_responses_section_is_rejected() {
+        let err = serde_json::from_value::<RequestPatch>(json!({"responses": "bogus"}))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("expected a map"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn chat_client_patch_never_touches_the_responses_wire() {
         let client = patch_probe(
             "patchprobechatiso",

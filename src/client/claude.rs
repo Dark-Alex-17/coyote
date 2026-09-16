@@ -407,9 +407,14 @@ pub fn claude_build_chat_completions_body(
                         let mut user_parts = vec![];
                         for (index, tool_result) in tool_results.iter().enumerate() {
                             for block in &tool_result.thinking {
-                                // Responses reasoning items are OpenAI-only;
-                                // drop them when the session moves to Claude.
-                                if !matches!(block, ThinkingBlock::Reasoning { .. }) {
+                                // Only Anthropic thinking blocks replay here;
+                                // Responses reasoning items (and any future
+                                // variant) are dropped.
+                                if matches!(
+                                    block,
+                                    ThinkingBlock::Thinking { .. }
+                                        | ThinkingBlock::RedactedThinking { .. }
+                                ) {
                                     assistant_parts.push(json!(block));
                                 }
                             }
@@ -479,7 +484,14 @@ pub fn claude_build_chat_completions_body(
                                 chunk_ids.insert(id);
                             }
                             for block in &tool_result.thinking {
-                                if !matches!(block, ThinkingBlock::Reasoning { .. }) {
+                                // Only Anthropic thinking blocks replay here;
+                                // Responses reasoning items (and any future
+                                // variant) are dropped.
+                                if matches!(
+                                    block,
+                                    ThinkingBlock::Thinking { .. }
+                                        | ThinkingBlock::RedactedThinking { .. }
+                                ) {
                                     assistant_parts.push(json!(block));
                                 }
                             }
@@ -882,8 +894,8 @@ mod tests {
     }
 
     #[test]
-    fn skips_openai_reasoning_blocks_in_replay() {
-        let reasoning = ToolResult {
+    fn replays_only_anthropic_thinking_blocks() {
+        let mixed = ToolResult {
             call: ToolCall::new(
                 "fs_read".into(),
                 json!({"path": "x"}),
@@ -891,19 +903,35 @@ mod tests {
             ),
             output: json!("ok"),
             text: None,
-            thinking: vec![ThinkingBlock::Reasoning {
-                id: "rs_1".into(),
-                summary: json!([{ "type": "summary_text", "text": "thinking" }]),
-                encrypted_content: Some("enc123".into()),
-            }],
+            thinking: vec![
+                ThinkingBlock::Thinking {
+                    thinking: "hmm".into(),
+                    signature: "sig123".into(),
+                },
+                ThinkingBlock::RedactedThinking {
+                    data: "b64data".into(),
+                },
+                ThinkingBlock::Reasoning {
+                    id: "rs_1".into(),
+                    summary: json!([{ "type": "summary_text", "text": "thinking" }]),
+                    encrypted_content: Some("enc123".into()),
+                },
+            ],
         };
 
         for sequence in [false, true] {
-            let body = build_body_with(vec![reasoning.clone()], "", sequence, false);
+            let body = build_body_with(vec![mixed.clone()], "", sequence, false);
 
             let content = body["messages"][1]["content"].as_array().unwrap();
-            assert_eq!(content.len(), 1, "body: {body}");
-            assert_eq!(content[0]["type"], "tool_use", "body: {body}");
+            let types: Vec<_> = content
+                .iter()
+                .map(|block| block["type"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                types,
+                ["thinking", "redacted_thinking", "tool_use"],
+                "body: {body}"
+            );
         }
     }
 

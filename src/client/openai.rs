@@ -96,11 +96,12 @@ impl Client for OpenAIClient {
 
 /// Codex only speaks the Responses API, so it forces the responses wire and
 /// rejects an explicit `wire_api: chat`. Anywhere else an explicit `wire_api`
-/// wins and the default is chat.
+/// wins; without one, stock openai (api.openai.com, no custom `api_base`)
+/// defaults to responses and everything else defaults to chat.
 pub fn resolve_wire_api(
     explicit: Option<WireApi>,
     uses_codex: bool,
-    _stock_openai_without_api_base: bool,
+    stock_openai_without_api_base: bool,
 ) -> Result<WireApi> {
     match (uses_codex, explicit) {
         (true, Some(WireApi::Chat)) => bail!(
@@ -108,6 +109,7 @@ pub fn resolve_wire_api(
         ),
         (true, _) => Ok(WireApi::Responses),
         (false, Some(wire)) => Ok(wire),
+        (false, None) if stock_openai_without_api_base => Ok(WireApi::Responses),
         (false, None) => Ok(WireApi::Chat),
     }
 }
@@ -135,10 +137,15 @@ async fn prepare_chat_completions(
     let uses_stock_provider = matches!(oauth_provider, Some((_, true)));
     // Stock oauth with no `api_base` routes to the ChatGPT codex backend (Responses API).
     let uses_codex = uses_stock_provider && self_.get_api_base().is_err();
+    // Stock-openai traffic means api.openai.com: an api-key client (no oauth
+    // at all) or stock oauth, either way without a custom `api_base`. A
+    // config-oauth gateway missing its required `api_base` must not qualify.
+    let stock_openai_without_api_base =
+        (oauth_provider.is_none() || uses_stock_provider) && self_.get_api_base().is_err();
     let wire = resolve_wire_api(
         self_.config.wire_api,
         uses_codex,
-        self_.get_api_base().is_err(),
+        stock_openai_without_api_base,
     )?;
 
     let url = if uses_codex {
@@ -686,8 +693,25 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
                         };
                         let mut items = vec![];
                         for block in &tool_result.thinking {
-                            if matches!(block, ThinkingBlock::Reasoning { .. }) {
-                                items.push(json!(block));
+                            if let ThinkingBlock::Reasoning {
+                                id,
+                                summary,
+                                encrypted_content,
+                            } = block
+                            {
+                                // Under `store: false` the API 400s on an
+                                // id-only reasoning item, which would wedge a
+                                // persisted session; it also rejects a null
+                                // summary, so normalize it to an empty array.
+                                if encrypted_content.is_none() {
+                                    debug!("dropping reasoning item '{id}': no encrypted_content");
+                                    continue;
+                                }
+                                let mut item = json!(block);
+                                if summary.is_null() {
+                                    item["summary"] = json!([]);
+                                }
+                                items.push(item);
                             }
                         }
                         if let Some(round_text) = round_text {
@@ -816,13 +840,19 @@ pub fn openai_extract_responses(data: &Value) -> Result<ChatCompletionsOutput> {
     }
 
     if text.is_empty() && tool_calls.is_empty() {
+        if data["status"].as_str() == Some("incomplete") {
+            match data["incomplete_details"]["reason"].as_str() {
+                Some(reason) => bail!("The response was cut off: {reason}"),
+                None => bail!("The response was cut off: {data}"),
+            }
+        }
         bail!("Invalid response data: {data}");
     }
     Ok(ChatCompletionsOutput {
         text,
         tool_calls,
         thinking,
-        ..Default::default()
+        usage: openai_parse_responses_usage(&data["usage"]),
     })
 }
 
@@ -834,6 +864,21 @@ fn reasoning_thinking_block(item: &Value) -> Option<ThinkingBlock> {
         id: item["id"].as_str()?.to_string(),
         summary: item["summary"].clone(),
         encrypted_content: item["encrypted_content"].as_str().map(|v| v.to_string()),
+    })
+}
+
+/// OpenAI reports cached input under `input_tokens_details` and has no
+/// cache-creation concept, so that field stays `None`.
+fn openai_parse_responses_usage(usage: &Value) -> Option<TokenUsage> {
+    if !usage.is_object() {
+        return None;
+    }
+
+    Some(TokenUsage {
+        input_tokens: usage["input_tokens"].as_u64(),
+        output_tokens: usage["output_tokens"].as_u64(),
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: usage["input_tokens_details"]["cached_tokens"].as_u64(),
     })
 }
 
@@ -888,8 +933,20 @@ fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Resu
             }
         }
         Some("response.completed") => {
+            if let Some(usage) = openai_parse_responses_usage(&data["response"]["usage"]) {
+                debug!("token-usage: {usage:?}");
+                handler.usage(usage);
+            }
             return Ok(true);
         }
+        Some("response.failed") => match data["response"]["error"]["message"].as_str() {
+            Some(message) => bail!("Response failed: {message}"),
+            None => bail!("Response failed: {data}"),
+        },
+        Some("error") => match data["message"].as_str() {
+            Some(message) => bail!("Stream error: {message}"),
+            None => bail!("Stream error: {data}"),
+        },
         _ => {}
     }
     Ok(false)
@@ -1090,6 +1147,51 @@ mod tests {
     }
 
     #[test]
+    fn responses_replay_skips_reasoning_without_encrypted_content() {
+        let body = build_responses_body(
+            vec![responses_tool_result(
+                "call_A",
+                None,
+                vec![ThinkingBlock::Reasoning {
+                    id: "rs_1".to_string(),
+                    summary: json!([]),
+                    encrypted_content: None,
+                }],
+            )],
+            None,
+        );
+
+        let input = body["input"].as_array().unwrap();
+        assert!(
+            input.iter().all(|item| item["type"] != "reasoning"),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn responses_replay_normalizes_null_summary_to_empty_array() {
+        let body = build_responses_body(
+            vec![responses_tool_result(
+                "call_A",
+                None,
+                vec![ThinkingBlock::Reasoning {
+                    id: "rs_1".to_string(),
+                    summary: Value::Null,
+                    encrypted_content: Some("enc123".to_string()),
+                }],
+            )],
+            None,
+        );
+
+        let input = body["input"].as_array().unwrap();
+        let item = input
+            .iter()
+            .find(|item| item["type"] == "reasoning")
+            .unwrap();
+        assert_eq!(item["summary"], json!([]), "body: {body}");
+    }
+
+    #[test]
     fn extract_responses_captures_reasoning_items() {
         let data = json!({
             "output": [
@@ -1125,6 +1227,64 @@ mod tests {
     }
 
     #[test]
+    fn extract_responses_parses_usage() {
+        let data = json!({
+            "output": [
+                { "type": "message", "content": [{ "type": "output_text", "text": "answer" }] },
+            ],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "input_tokens_details": { "cached_tokens": 60 },
+            }
+        });
+
+        let output = openai_extract_responses(&data).unwrap();
+
+        let usage = output.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, Some(60));
+    }
+
+    #[test]
+    fn extract_responses_without_usage_leaves_it_none() {
+        let data = json!({
+            "output": [
+                { "type": "message", "content": [{ "type": "output_text", "text": "answer" }] },
+            ]
+        });
+
+        assert!(openai_extract_responses(&data).unwrap().usage.is_none());
+    }
+
+    #[test]
+    fn extract_responses_incomplete_status_surfaces_reason() {
+        let data = json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": []
+        });
+
+        let err = openai_extract_responses(&data).unwrap_err().to_string();
+
+        assert!(
+            err.contains("cut off") && err.contains("max_output_tokens"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_responses_incomplete_without_reason_still_bails() {
+        let data = json!({ "status": "incomplete", "output": [] });
+
+        let err = openai_extract_responses(&data).unwrap_err().to_string();
+
+        assert!(err.contains("cut off"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn responses_stream_delivers_reasoning_block() {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let abort_signal = crate::utils::create_abort_signal();
@@ -1149,6 +1309,73 @@ mod tests {
             ThinkingBlock::Reasoning { id, encrypted_content, .. }
                 if id == "rs_1" && encrypted_content.as_deref() == Some("enc123")
         ));
+    }
+
+    #[test]
+    fn responses_stream_completed_delivers_usage() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut handler = SseHandler::new(sender, abort_signal);
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "input_tokens_details": { "cached_tokens": 60 },
+                }
+            }
+        });
+
+        let done = openai_responses_handle_event(&event, &mut handler).unwrap();
+
+        assert!(done);
+        let (_, _, _, usage) = handler.take();
+        let usage = usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, Some(60));
+    }
+
+    #[test]
+    fn responses_stream_failed_event_bails_with_message() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut handler = SseHandler::new(sender, abort_signal);
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "error": { "code": "server_error", "message": "The model had an issue" }
+            }
+        });
+
+        let err = openai_responses_handle_event(&event, &mut handler)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("The model had an issue"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn responses_stream_error_event_bails_with_message() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut handler = SseHandler::new(sender, abort_signal);
+        let event = json!({
+            "type": "error",
+            "code": "rate_limit_exceeded",
+            "message": "Rate limit reached",
+        });
+
+        let err = openai_responses_handle_event(&event, &mut handler)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Rate limit reached"), "unexpected error: {err}");
     }
 
     fn openai_config(name: &str, auth: Option<&str>, oauth: Option<OAuthConfig>) -> OpenAIConfig {
@@ -1304,6 +1531,27 @@ mod tests {
         assert_eq!(
             request_data.url,
             "https://gateway.example/v1/chat/completions"
+        );
+    }
+
+    /// A config-oauth gateway missing its required `api_base` must never
+    /// count as stock-openai traffic: its provider resolves as non-stock, so
+    /// the wire resolver sees `stock=false`, and the request dies on the
+    /// missing-api_base config error instead of adopting codex routing.
+    #[test]
+    fn config_oauth_without_api_base_is_not_stock_openai_traffic() {
+        let name = "openai-gate-no-apibase-wire-test";
+        let mut config = openai_config(name, Some("oauth"), Some(minimal_oauth_config()));
+        config.api_base = None;
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let (_, is_stock) = resolve_oauth_provider(&client).unwrap();
+        assert!(!is_stock, "an inline oauth block is a config provider");
+
+        let err = prepare(&client).unwrap_err().to_string();
+        assert!(
+            err.contains("refusing to fall back"),
+            "unexpected error: {err}"
         );
     }
 
@@ -1519,6 +1767,64 @@ mod tests {
     }
 
     #[test]
+    fn shipped_catalog_o_series_selects_responses_sub_patches() {
+        let bundled: Vec<ProviderModels> = serde_yaml::from_str(MODELS_YAML).unwrap();
+        let openai = bundled
+            .iter()
+            .find(|p| p.provider == "openai")
+            .expect("bundled models.yaml must carry an openai provider");
+
+        for (name, effort) in [
+            ("o4-mini", None),
+            ("o3", None),
+            ("o3-mini", None),
+            ("o4-mini-high", Some("high")),
+            ("o3-high", Some("high")),
+            ("o3-mini-high", Some("high")),
+        ] {
+            let data = openai
+                .models
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("model '{name}' missing from bundled models.yaml"));
+            let config = api_key_config("openai", None);
+            let mut client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+            client.model = Model::from_config("openai", std::slice::from_ref(data)).remove(0);
+            let mut request_data = RequestData::new(
+                format!("{API_BASE}/responses"),
+                json!({ "model": name, "temperature": 0.5, "top_p": 0.9 }),
+            )
+            .wire(WireApi::Responses);
+
+            client.patch_request_data(&mut request_data);
+
+            assert!(
+                request_data.body.get("temperature").is_none(),
+                "{name}: {}",
+                request_data.body
+            );
+            assert!(
+                request_data.body.get("top_p").is_none(),
+                "{name}: {}",
+                request_data.body
+            );
+            match effort {
+                Some(effort) => assert_eq!(
+                    request_data.body["reasoning"]["effort"],
+                    json!(effort),
+                    "{name}: {}",
+                    request_data.body
+                ),
+                None => assert!(
+                    request_data.body.get("reasoning").is_none(),
+                    "{name}: {}",
+                    request_data.body
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn wire_api_deserializes_on_openai_config() {
         let config: OpenAIConfig = serde_yaml::from_str("wire_api: responses").unwrap();
         assert_eq!(config.wire_api, Some(WireApi::Responses));
@@ -1578,10 +1884,16 @@ mod tests {
     }
 
     #[test]
-    fn resolver_defaults_to_chat_this_milestone() {
-        for stock in [false, true] {
-            assert_eq!(resolve_wire_api(None, false, stock).unwrap(), WireApi::Chat);
-        }
+    fn resolver_defaults_stock_openai_to_responses() {
+        assert_eq!(
+            resolve_wire_api(None, false, true).unwrap(),
+            WireApi::Responses
+        );
+    }
+
+    #[test]
+    fn resolver_defaults_to_chat_off_stock() {
+        assert_eq!(resolve_wire_api(None, false, false).unwrap(), WireApi::Chat);
     }
 
     fn api_key_config(name: &str, wire_api: Option<WireApi>) -> OpenAIConfig {
@@ -1594,14 +1906,34 @@ mod tests {
     }
 
     #[test]
-    fn api_key_openai_defaults_to_the_chat_wire() {
+    fn api_key_openai_defaults_to_the_responses_wire() {
         let config = api_key_config("openai-wire-default-test", None);
         let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
 
         let (request_data, wire) = prepare(&client).unwrap();
 
+        assert_eq!(wire, WireApi::Responses);
+        assert_eq!(request_data.url, format!("{API_BASE}/responses"));
+        assert!(
+            request_data.body.get("input").is_some() && request_data.body.get("messages").is_none(),
+            "body: {}",
+            request_data.body
+        );
+    }
+
+    #[test]
+    fn api_key_openai_with_custom_api_base_defaults_to_the_chat_wire() {
+        let mut config = api_key_config("openai-wire-custom-base-test", None);
+        config.api_base = Some("https://gateway.example/v1".into());
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let (request_data, wire) = prepare(&client).unwrap();
+
         assert_eq!(wire, WireApi::Chat);
-        assert_eq!(request_data.url, format!("{API_BASE}/chat/completions"));
+        assert_eq!(
+            request_data.url,
+            "https://gateway.example/v1/chat/completions"
+        );
         assert!(
             request_data.body.get("messages").is_some(),
             "body: {}",
