@@ -6955,9 +6955,9 @@
   - name: deepseek/deepseek-v4-flash-0731
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.055
-    output_price: 0.11
-    cache_read_price: 0.011
+    input_price: 0.06
+    output_price: 0.12
+    cache_read_price: 0.012
     max_output_tokens: 943718
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731:batch
@@ -7430,8 +7430,8 @@
   - name: gryphe/mythomax-l2-13b
     type: chat
     max_input_tokens: 8192
-    input_price: 0.06
-    output_price: 0.06
+    input_price: 0.08
+    output_price: 0.11
     max_output_tokens: 3686
   - name: ibm-granite/granite-4.0-h-micro
     type: chat
@@ -9800,7 +9800,6 @@
     input_price: 0.4
     output_price: 0.4
     max_output_tokens: 819200
-    supports_function_calling: true
   - name: thinkingmachines/inkling
     type: chat
     max_input_tokens: 1048576
@@ -10065,9 +10064,9 @@
   - name: z-ai/glm-5.3-flash
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.1
-    output_price: 0.3333
-    cache_read_price: 0.02
+    input_price: 0.09
+    output_price: 0.3
+    cache_read_price: 0.018
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
@@ -10261,10 +10260,10 @@
   - name: ~z-ai/glm-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.85
-    output_price: 2.8985
-    cache_read_price: 0.17
-    max_output_tokens: 943718
+    input_price: 0.8775
+    output_price: 2.97
+    cache_read_price: 0.1755
+    max_output_tokens: 235929
     supports_function_calling: true
 - provider: github
   models:
