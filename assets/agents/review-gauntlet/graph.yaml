@@ -115,8 +115,10 @@ nodes:
         the change (absolute path preferred); empty string when the caller
         named none.
       - `plan_context`: the plan / spec / acceptance-criteria text the
-        implementation must satisfy, verbatim (or a file path the caller
-        pointed at). Empty string when the caller supplied none.
+        implementation must satisfy, copied through VERBATIM — never
+        summarize it and never replace pasted text with file paths or a
+        sentence saying it was included; the adversary lane fails closed on
+        whatever you drop. Empty string when the caller supplied none.
       - `rigor`: poc | prototype | production. Default "production" when
         not stated.
       - `security_posture`: prototype | standard | hardened. Default

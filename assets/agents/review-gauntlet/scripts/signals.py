@@ -38,6 +38,25 @@ def git(*args):
 
 
 out = {"project_dir": proj}
+
+# Deterministic plan_context recovery: the parse LLM proved a lossy channel
+# for verbatim spec text (observed replacing ~4 KB of pasted criteria with
+# file paths + a summary sentence). When the raw prompt carries the callers'
+# labeled plan block, cut it out verbatim and override the extraction — but
+# only when the recovered block is LONGER, so a good extraction is never
+# degraded. The adversary lane fails closed on whatever goes missing here.
+_prompt = state.get("initial_prompt")
+if isinstance(_prompt, str) and _prompt:
+    _m = re.search(
+        r"Plan / acceptance criteria:\s*(.+?)"
+        r"(?=\n\s*(?:Local-run recipe|Forced lanes|Rigor:|Security posture:|Extra context)\b|\Z)",
+        _prompt,
+        re.S | re.I,
+    )
+    if _m:
+        _block = _m.group(1).strip()
+        if len(_block) > len((state.get("plan_context") or "").strip()):
+            out["plan_context"] = _block
 # retry_gate measures its wall-clock budget from this stamp; it is set
 # before the git work so a failed diff still starts the clock.
 if not state.get("gauntlet_started_at"):

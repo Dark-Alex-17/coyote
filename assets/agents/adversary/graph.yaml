@@ -37,7 +37,9 @@ variables:
     description: |
       JSON array of shell commands the CALLER declares for the deterministic
       run_checks stage — e.g. '["cargo test --all"]'. Never inferred from the
-      prompt; empty array = none declared.
+      prompt; empty array = none declared. Must not boot shared stacks or
+      services (compose projects, fixed ports) — those collide with the probe
+      lane running in parallel.
     default: '[]'
 
 settings:
