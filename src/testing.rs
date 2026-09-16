@@ -1,6 +1,7 @@
 //! Test-only helpers shared across modules' unit tests.
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
+use std::ffi::{OsStr, OsString};
 use std::sync::{Mutex, Once, OnceLock};
 
 struct TestLogCollector;
@@ -44,6 +45,25 @@ pub(crate) fn debug_messages() -> &'static Mutex<Vec<String>> {
     DEBUG_MESSAGES.get_or_init(Mutex::default)
 }
 
+/// A copy of everything in [`warn_messages`], recovering from poisoning the
+/// same way the collector itself does.
+pub(crate) fn warn_snapshot() -> Vec<String> {
+    snapshot_of(warn_messages())
+}
+
+/// A copy of everything in [`debug_messages`], recovering from poisoning the
+/// same way the collector itself does.
+pub(crate) fn debug_snapshot() -> Vec<String> {
+    snapshot_of(debug_messages())
+}
+
+fn snapshot_of(buffer: &Mutex<Vec<String>>) -> Vec<String> {
+    buffer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 impl Log for TestLogCollector {
     fn enabled(&self, metadata: &Metadata) -> bool {
         captures_warn(metadata) || captures_hooks_debug(metadata)
@@ -68,15 +88,55 @@ impl Log for TestLogCollector {
     fn flush(&self) {}
 }
 
-/// Installs the process-wide log collector. `log::set_logger` accepts one
-/// logger per process, so every test that captures warns or hooks debug
-/// output must install through this shared entry point. The max level is
-/// Debug so the hooks debug capture sees its records; warn capture is
-/// unaffected.
-pub(crate) fn install_warn_collector() {
+/// Installs the process-wide log collector capturing warn-level messages and
+/// hooks-module debug messages. `log::set_logger` accepts one logger per
+/// process, so every test that captures either stream must install through
+/// this shared entry point. The max level is Debug so the hooks debug capture
+/// sees its records; warn capture is unaffected.
+pub(crate) fn install_log_collector() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         log::set_logger(&TestLogCollector).expect("no other logger should be installed");
         log::set_max_level(LevelFilter::Debug);
     });
+}
+
+/// Sets (or removes) an environment variable for the guard's lifetime and
+/// restores the previous value on drop, including on panic, so a failing
+/// assertion cannot leak the override into subsequent tests. Tests using it
+/// must serialize (`#[serial]`) — the process environment is global.
+pub(crate) struct EnvVarGuard {
+    key: String,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    pub(crate) fn set(key: impl Into<String>, value: impl AsRef<OsStr>) -> Self {
+        let key = key.into();
+        let previous = std::env::var_os(&key);
+        unsafe {
+            std::env::set_var(&key, value);
+        }
+        Self { key, previous }
+    }
+
+    pub(crate) fn unset(key: impl Into<String>) -> Self {
+        let key = key.into();
+        let previous = std::env::var_os(&key);
+        unsafe {
+            std::env::remove_var(&key);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(previous) => std::env::set_var(&self.key, previous),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
 }

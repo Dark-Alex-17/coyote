@@ -73,7 +73,6 @@ pub type HooksMap = IndexMap<String, Vec<HookDef>>;
 
 /// Every event hooks can be attached to. `as_str` yields the dotted name used
 /// as the key in `hooks:` maps and in `global_hooks` whitelist entries.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
     TurnStarted,
@@ -150,7 +149,6 @@ impl RequestContext {
     /// when the active role was moved into (or restored by) a session, from
     /// the hooks snapshot the session captured via `Session::set_role` /
     /// `Session::load_from_ctx`.
-    #[allow(dead_code)]
     pub fn resolved_hooks(&self, event: HookEvent) -> Vec<ResolvedHook> {
         resolve_hooks(
             event,
@@ -248,7 +246,6 @@ fn push_defs(event_name: &str, defs: &[HookDef], cwd: &Path, out: &mut Vec<Resol
     }
 }
 
-#[allow(dead_code)]
 pub fn fire(
     event: HookEvent,
     ctx: &RequestContext,
@@ -265,7 +262,6 @@ pub fn fire(
 
 /// Dispatches already-resolved hooks, for call sites that outlive the context
 /// borrow they resolved from. Same fire-and-forget semantics as [`fire`].
-#[allow(dead_code)]
 pub fn fire_resolved(
     event: HookEvent,
     resolved: Vec<ResolvedHook>,
@@ -352,7 +348,6 @@ impl Drop for SpawnAckGuard {
 /// or until `timeout` elapses. For exit-path call sites only (session end /
 /// final turn): this waits for child spawn, never completion. Hook children
 /// deliberately outlive coyote as orphans.
-#[allow(dead_code)]
 pub async fn drain_pending(timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     while PENDING_SPAWNS.load(Ordering::SeqCst) > 0 {
@@ -379,6 +374,11 @@ fn base_envs(event: HookEvent, ctx: &RequestContext) -> Vec<(String, String)> {
     )
 }
 
+/// The single construction site for the base env set every hook receives.
+/// [`base_envs`] feeds it from a live context; detached call sites that
+/// dispatch pre-resolved snapshots after their context is gone pass the
+/// names they captured with the snapshot. The timestamp is taken here, at
+/// fire time, so it reflects when the event actually happened.
 pub(crate) fn base_envs_parts(
     event: HookEvent,
     session_name: Option<&str>,
@@ -513,7 +513,6 @@ async fn run_hook(
 /// truncation pass, because that value is engine-generated, inherently short,
 /// and a truncated path would be corrupt rather than merely trimmed. Exported
 /// for call sites that need the bound before dispatch.
-#[allow(dead_code)]
 pub fn truncate_env_value(value: &str) -> &str {
     const MAX_ENV_VALUE_BYTES: usize = 2048;
     if value.len() <= MAX_ENV_VALUE_BYTES {
@@ -604,7 +603,6 @@ pub(crate) mod test_sink {
 
     /// A copy of everything recorded so far, for tests that filter by a hook
     /// name unique to their fixture.
-    #[allow(dead_code)]
     pub fn snapshot() -> Vec<Capture> {
         CAPTURES
             .lock()
@@ -649,19 +647,16 @@ mod tests {
     #[serial]
     fn install_builtin_hooks_installs_executable_scripts_and_honors_force() {
         let env_name = crate::utils::get_env_name("hooks_dir");
-        let prev = env::var_os(&env_name);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let root = env::temp_dir().join(format!("coyote-hooks-install-{unique}"));
-        unsafe {
-            env::set_var(&env_name, &root);
-        }
+        let env_guard = crate::testing::EnvVarGuard::set(&env_name, &root);
 
-        // Capture every outcome first and assert only after the env var is
-        // restored, so a failed assertion cannot leave the hooks-dir override
-        // pointing at a deleted temp dir for subsequent tests.
+        // Capture every outcome first and assert only after cleanup: the
+        // guard restores the env var even on panic, but the temp dir removal
+        // below still has to run before any assertion can bail out.
         let notify = root.join("notify.sh");
         let log_events = root.join("log-events.sh");
         let fresh = install_builtin_hooks(false);
@@ -680,12 +675,7 @@ mod tests {
         let force = install_builtin_hooks(true);
         let after_force = std::fs::read_to_string(&notify);
 
-        unsafe {
-            match prev {
-                Some(v) => env::set_var(&env_name, v),
-                None => env::remove_var(&env_name),
-            }
-        }
+        drop(env_guard);
         let _ = std::fs::remove_dir_all(&root);
 
         fresh.unwrap();
@@ -897,7 +887,7 @@ mod tests {
 
     #[test]
     fn unknown_whitelist_entries_log_debug_and_stay_inert() {
-        crate::testing::install_warn_collector();
+        crate::testing::install_log_collector();
         let global = hooks_map("turn.started", &[("a", "cmd-a")]);
         let gate = vec![
             "turn.started.a".to_string(),
@@ -913,10 +903,7 @@ mod tests {
         );
 
         assert_eq!(names(&resolved), ["a"]);
-        let debugs: Vec<String> = crate::testing::debug_messages()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let debugs = crate::testing::debug_snapshot();
         assert!(debugs.iter().any(|message| {
             message.contains("turn.started.nonexistent-marker-xyz")
                 && message.contains("for agent 'gate-agent-xyz'")
@@ -925,7 +912,7 @@ mod tests {
 
     #[test]
     fn empty_global_map_short_circuits_whitelist_diagnostics() {
-        crate::testing::install_warn_collector();
+        crate::testing::install_log_collector();
         let global = HooksMap::default();
         let role = hooks_map("turn.started", &[("role-only", "role-cmd")]);
         let gate = vec!["turn.started.x-shortcircuit-marker-p3q".to_string()];
@@ -939,10 +926,7 @@ mod tests {
         );
 
         assert_eq!(names(&resolved), ["role-only"]);
-        let debugs: Vec<String> = crate::testing::debug_messages()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let debugs = crate::testing::debug_snapshot();
         assert!(
             debugs
                 .iter()
@@ -1171,15 +1155,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     #[serial]
     async fn drain_pending_logs_when_the_timeout_expires() {
-        crate::testing::install_warn_collector();
+        crate::testing::install_log_collector();
         let pending = SpawnAckGuard::register();
 
         drain_pending(Duration::from_millis(50)).await;
 
-        let debugs: Vec<String> = crate::testing::debug_messages()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let debugs = crate::testing::debug_snapshot();
         assert!(
             debugs
                 .iter()
@@ -1206,7 +1187,7 @@ mod tests {
     #[test]
     #[serial]
     fn fire_resolved_without_runtime_skips_instead_of_panicking() {
-        crate::testing::install_warn_collector();
+        crate::testing::install_log_collector();
         let hook = ResolvedHook {
             name: "no-runtime-marker-a7c".to_string(),
             full_name: "turn.failed.no-runtime-marker-a7c".to_string(),
@@ -1216,10 +1197,7 @@ mod tests {
 
         fire_resolved(HookEvent::TurnFailed, vec![hook], Vec::new(), &[], None);
 
-        let debugs: Vec<String> = crate::testing::debug_messages()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let debugs = crate::testing::debug_snapshot();
         assert!(debugs.iter().any(|message| {
             message.contains("no-runtime-marker-a7c")
                 && message.contains("no Tokio runtime on this thread")
@@ -1229,7 +1207,7 @@ mod tests {
     #[test]
     #[serial]
     fn fire_without_runtime_skips_instead_of_panicking() {
-        crate::testing::install_warn_collector();
+        crate::testing::install_log_collector();
         let ctx = ctx_with_global_hooks(hooks_map(
             "turn.failed",
             &[("fire-no-runtime-marker-b8d", "true")],
@@ -1237,10 +1215,7 @@ mod tests {
 
         fire(HookEvent::TurnFailed, &ctx, &[], None);
 
-        let debugs: Vec<String> = crate::testing::debug_messages()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let debugs = crate::testing::debug_snapshot();
         assert!(debugs.iter().any(|message| {
             message.contains("fire-no-runtime-marker-b8d")
                 && message.contains("no Tokio runtime on this thread")
@@ -1249,7 +1224,7 @@ mod tests {
 
     #[test]
     fn debug_capture_excludes_non_hooks_targets() {
-        crate::testing::install_warn_collector();
+        crate::testing::install_log_collector();
         let hook = ResolvedHook {
             name: "included-marker-k2v".to_string(),
             full_name: "turn.failed.included-marker-k2v".to_string(),
@@ -1267,10 +1242,7 @@ mod tests {
         );
         fire_resolved(HookEvent::TurnFailed, vec![hook], Vec::new(), &[], None);
 
-        let debugs: Vec<String> = crate::testing::debug_messages()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let debugs = crate::testing::debug_snapshot();
         assert!(
             debugs
                 .iter()
@@ -1291,7 +1263,7 @@ mod tests {
     #[test]
     #[serial]
     fn debug_capture_recovers_after_buffer_poisoning() {
-        crate::testing::install_warn_collector();
+        crate::testing::install_log_collector();
         std::thread::spawn(|| {
             let _held = crate::testing::debug_messages().lock().unwrap();
             panic!("poison the debug buffer");
@@ -1342,27 +1314,21 @@ mod tests {
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
         struct TestConfigDirGuard {
-            key: String,
-            previous: Option<std::ffi::OsString>,
+            _env: crate::testing::EnvVarGuard,
             path: PathBuf,
         }
 
         impl TestConfigDirGuard {
             fn new() -> Self {
                 let key = get_env_name("config_dir");
-                let previous = env::var_os(&key);
                 let unique = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_nanos();
                 let path = env::temp_dir().join(format!("coyote-hooks-tests-{unique}"));
                 create_dir_all(&path).unwrap();
-                unsafe {
-                    env::set_var(&key, &path);
-                }
                 Self {
-                    key,
-                    previous,
+                    _env: crate::testing::EnvVarGuard::set(key, &path),
                     path,
                 }
             }
@@ -1370,15 +1336,6 @@ mod tests {
 
         impl Drop for TestConfigDirGuard {
             fn drop(&mut self) {
-                if let Some(previous) = &self.previous {
-                    unsafe {
-                        env::set_var(&self.key, previous);
-                    }
-                } else {
-                    unsafe {
-                        env::remove_var(&self.key);
-                    }
-                }
                 let _ = remove_dir_all(&self.path);
             }
         }
@@ -1548,7 +1505,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn error_paths_log_debug_only() {
-            crate::testing::install_warn_collector();
+            crate::testing::install_log_collector();
             let empty_cwd = env::temp_dir();
             let hooks = vec![
                 ResolvedHook {
@@ -1568,10 +1525,7 @@ mod tests {
             fire_resolved(HookEvent::TurnFailed, hooks, Vec::new(), &[], None);
             drain_pending(Duration::from_secs(10)).await;
 
-            let debugs: Vec<String> = crate::testing::debug_messages()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
+            let debugs = crate::testing::debug_snapshot();
             let empty_cwd_display = empty_cwd.display().to_string();
             assert!(debugs.iter().any(|message| {
                 message.contains("empty-marker-f5b")
@@ -1582,17 +1536,14 @@ mod tests {
                 message.contains("Failed to spawn hook 'turn.failed.badcwd-marker-f5b'")
                     && message.contains("/nonexistent/coyote-badcwd-marker-f5b")
             }));
-            let warns: Vec<String> = crate::testing::warn_messages()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
+            let warns = crate::testing::warn_snapshot();
             assert!(warns.iter().all(|message| !message.contains("marker-f5b")));
         }
 
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn failing_hook_never_disturbs_the_engine() {
-            crate::testing::install_warn_collector();
+            crate::testing::install_log_collector();
             let guard = TestConfigDirGuard::new();
             let first = guard.path.join("first-out");
             let second = guard.path.join("second-out");
@@ -1618,10 +1569,7 @@ mod tests {
             );
             wait_for("second hook output", || second.exists()).await;
 
-            let warns: Vec<String> = crate::testing::warn_messages()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
+            let warns = crate::testing::warn_snapshot();
             assert!(
                 warns
                     .iter()
@@ -1665,7 +1613,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn payload_write_failure_still_runs_hook_without_payload_env() {
-            crate::testing::install_warn_collector();
+            crate::testing::install_log_collector();
             let guard = TestConfigDirGuard::new();
             let out = guard.path.join("env-out");
             let _payload_dir = PayloadDirOverrideGuard::new(guard.path.join("missing-payload-dir"));
@@ -1689,10 +1637,7 @@ mod tests {
                     .lines()
                     .all(|line| !line.starts_with("COYOTE_HOOK_PAYLOAD_FILE="))
             );
-            let debugs: Vec<String> = crate::testing::debug_messages()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
+            let debugs = crate::testing::debug_snapshot();
             assert!(debugs.iter().any(|message| message.contains(
                 "Failed to write payload file for hook 'tool.started.payload-fallback-marker'"
             )));
@@ -1727,6 +1672,43 @@ mod tests {
             let second_path = std::fs::read_to_string(&second).unwrap();
             assert!(!first_path.is_empty());
             assert_ne!(first_path, second_path);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial]
+        async fn payload_paths_differ_within_one_fire() {
+            let guard = TestConfigDirGuard::new();
+            let first = guard.path.join("first-path");
+            let second = guard.path.join("second-path");
+            let command_first = r#"printf '%s' "$COYOTE_HOOK_PAYLOAD_FILE" > "$HOOK_PATH_FIRST.tmp" && mv "$HOOK_PATH_FIRST.tmp" "$HOOK_PATH_FIRST""#;
+            let command_second = r#"printf '%s' "$COYOTE_HOOK_PAYLOAD_FILE" > "$HOOK_PATH_SECOND.tmp" && mv "$HOOK_PATH_SECOND.tmp" "$HOOK_PATH_SECOND""#;
+            let ctx = ctx_with_global_hooks(hooks_map(
+                "tool.started",
+                &[
+                    ("same-fire-a", command_first),
+                    ("same-fire-b", command_second),
+                ],
+            ));
+
+            fire(
+                HookEvent::ToolStarted,
+                &ctx,
+                &[
+                    ("HOOK_PATH_FIRST", first.display().to_string()),
+                    ("HOOK_PATH_SECOND", second.display().to_string()),
+                ],
+                Some("{}".to_string()),
+            );
+            wait_for("both payload paths", || first.exists() && second.exists()).await;
+
+            let first_path = std::fs::read_to_string(&first).unwrap();
+            let second_path = std::fs::read_to_string(&second).unwrap();
+            assert!(!first_path.is_empty());
+            assert!(!second_path.is_empty());
+            assert_ne!(
+                first_path, second_path,
+                "each hook of one fire must get its own payload file"
+            );
         }
 
         #[tokio::test]

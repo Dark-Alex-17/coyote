@@ -579,9 +579,9 @@ fn llm_failed_extras(
     }
     extras.push((
         "COYOTE_LLM_ERROR",
-        // `{:#}` renders the whole context chain, so the root cause survives
-        // the `context(...)` wrapping the client trait defaults apply.
-        err.map(|err| format!("{err:#}"))
+        // The immediate error only, matching COYOTE_TOOL_ERROR; the context
+        // chain below it stays out of the env.
+        err.map(|err| err.to_string())
             .unwrap_or_else(|| "Aborted.".to_string()),
     ));
 
@@ -1862,12 +1862,10 @@ mod tests {
             failed.envs.get("COYOTE_LLM_STATUS").map(String::as_str),
             Some("429")
         );
-        assert!(
-            failed
-                .envs
-                .get("COYOTE_LLM_ERROR")
-                .unwrap()
-                .contains("error (status: 429)")
+        assert_eq!(
+            failed.envs.get("COYOTE_LLM_ERROR").map(String::as_str),
+            Some("Failed to call chat-completions api"),
+            "the env must carry the immediate error only, not the context chain"
         );
         assert!(!failed.envs.contains_key("COYOTE_LLM_DURATION_MS"));
     }

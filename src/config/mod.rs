@@ -734,6 +734,11 @@ impl Config {
 
         if env::var_os(SANDBOX_ENV_FLAG).is_some() {
             if !config_path.exists() {
+                // Inspection-only flags are look-don't-touch: no first-run
+                // config creation, nothing written.
+                if info_flag {
+                    return Ok(Self::default());
+                }
                 create_config_file(&config_path).await?;
             }
 
@@ -748,6 +753,12 @@ impl Config {
             {
                 Some(v) => (Self::load_dynamic(&v)?, String::new()),
                 None => {
+                    // Same look-don't-touch rule: never run the interactive
+                    // first-run wizard (or write a config) for a flag that
+                    // only inspects state.
+                    if info_flag {
+                        return Ok(Self::default());
+                    }
                     if *IS_STDOUT_TERMINAL {
                         create_config_file(&config_path).await?;
                     }
@@ -1637,6 +1648,60 @@ hooks:
         assert!(
             raw.contains("{{ANTHROPIC_API_KEY}}"),
             "placeholder should be preserved as a literal string in sandbox mode"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn info_flag_with_missing_config_skips_wizard_and_writes_nothing() {
+        let unique = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_dir = env::temp_dir().join(format!("coyote-info-bypass-{unique}"));
+        create_dir_all(&tmp_dir).unwrap();
+        let _config_dir = crate::testing::EnvVarGuard::set(get_env_name("config_dir"), &tmp_dir);
+        let _config_file = crate::testing::EnvVarGuard::unset(get_env_name("config_file"));
+        let _sandbox = crate::testing::EnvVarGuard::unset(crate::sandbox::SANDBOX_ENV_FLAG);
+        let _provider = crate::testing::EnvVarGuard::unset(get_env_name("provider"));
+        let _platform = crate::testing::EnvVarGuard::unset(get_env_name("platform"));
+
+        let result = Config::load_with_interpolation(true).await;
+
+        let leftover: Vec<_> = std::fs::read_dir(&tmp_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        result.expect("inspection flags must load a default config without a config file");
+        assert!(
+            leftover.is_empty(),
+            "inspection flags must not write anything: {leftover:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_info_flag_with_missing_config_writes_nothing() {
+        let unique = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_dir = env::temp_dir().join(format!("coyote-sandbox-info-bypass-{unique}"));
+        create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.yaml");
+        let _config_file =
+            crate::testing::EnvVarGuard::set(get_env_name("config_file"), &config_path);
+        let _sandbox = crate::testing::EnvVarGuard::set(crate::sandbox::SANDBOX_ENV_FLAG, "1");
+
+        let result = Config::load_with_interpolation(true).await;
+
+        let created = config_path.exists();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        result.expect("inspection flags must load a default config in sandbox mode too");
+        assert!(
+            !created,
+            "inspection flags must not create the sandbox config file"
         );
     }
 

@@ -11,7 +11,6 @@ use super::user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 use super::validator::{AgentValidationContext, GraphValidator};
 use super::wall_clock;
 use crate::config::{AgentVariable, AgentVariables, RenderMode, RequestContext};
-use crate::function::agents::hook_base_envs;
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
 use crate::utils::{AbortSignal, wait_abort_signal, wait_user_interrupt};
@@ -550,7 +549,7 @@ impl NodeHookEmitter {
         hooks::fire_resolved(
             event,
             resolved.to_vec(),
-            hook_base_envs(
+            hooks::base_envs_parts(
                 event,
                 self.session_name.as_deref(),
                 self.agent_name.as_deref(),
@@ -1619,7 +1618,7 @@ nodes:
     /// debug log, and a well-formed sibling on the same event still fires.
     #[tokio::test]
     async fn malformed_graph_yaml_hook_is_skipped_without_breaking_the_node() {
-        crate::testing::install_warn_collector();
+        crate::testing::install_log_collector();
         let _sink = hooks::test_sink::install();
         let mut ctx = make_ctx();
 
@@ -1660,10 +1659,7 @@ nodes:
         assert_eq!(valid.len(), 1, "{valid:?}");
         assert_eq!(valid[0].envs["COYOTE_NODE_ID"], "done");
 
-        let debugs: Vec<String> = crate::testing::debug_messages()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let debugs = crate::testing::debug_snapshot();
         assert!(
             debugs
                 .iter()

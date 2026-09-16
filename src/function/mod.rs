@@ -4795,6 +4795,27 @@ mod tests {
     fn built_shims_resolve_paths_at_runtime_after_relocation() {
         use std::os::unix::fs::PermissionsExt;
 
+        // A shim written moments ago can still be open for writing somewhere
+        // in the process (schedule-dependent), making exec fail with
+        // ETXTBSY; retry briefly instead of flaking.
+        fn output_with_etxtbsy_retry(
+            command: &mut process::Command,
+        ) -> std::io::Result<process::Output> {
+            let mut attempts = 0;
+            loop {
+                match command.output() {
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && attempts < 10 =>
+                    {
+                        attempts += 1;
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    ret => return ret,
+                }
+            }
+        }
+
         let root = temp_file("-shim-relocate-", "");
         let home_a = root.join("home-a");
         let config_a = home_a.join("coyote");
@@ -4858,14 +4879,14 @@ mod tests {
             return;
         }
 
-        let output = process::Command::new(&moved_shim)
+        let mut command = process::Command::new(&moved_shim);
+        command
             .arg("{}")
             .env_remove(&config_env)
             .env_remove(&functions_env)
             .env_remove("LLM_OUTPUT")
-            .env_remove("LLM_TOOL_DATA_FILE")
-            .output()
-            .unwrap();
+            .env_remove("LLM_TOOL_DATA_FILE");
+        let output = output_with_etxtbsy_retry(&mut command).unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success(),

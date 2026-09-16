@@ -1019,10 +1019,13 @@ impl AgentConfig {
         if let Some(v) = read_env_value::<String>(&with_prefix("reasoning_effort")) {
             self.reasoning_effort = v;
         }
-        if let Ok(v) = env::var(with_prefix("global_tools"))
-            && let Ok(v) = serde_json::from_str(&v)
-        {
-            self.global_tools = v;
+        if let Ok(v) = env::var(with_prefix("global_tools")) {
+            match serde_json::from_str(&v) {
+                Ok(v) => self.global_tools = v,
+                Err(err) => {
+                    debug!("Ignoring malformed global_tools env override for agent '{name}': {err}")
+                }
+            }
         }
         if let Ok(v) = env::var(with_prefix("global_hooks")) {
             match serde_json::from_str(&v) {

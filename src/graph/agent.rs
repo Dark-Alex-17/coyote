@@ -340,7 +340,7 @@ mod tests {
     use super::*;
     use crate::config::{AppState, WorkingMode, default_max_agent_depth};
     use crate::supervisor::mailbox::{Inbox, PeerRegistry, graph_agent_id};
-    use crate::testing::{install_warn_collector, warn_messages};
+    use crate::testing::{install_log_collector, warn_snapshot};
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -676,7 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_transient_warns_once_per_retried_attempt_with_the_context_chain() {
-        install_warn_collector();
+        install_log_collector();
         let mut ctx = plain_ctx();
         let node = retryable_node(3);
         let mut attempts = 0u32;
@@ -700,12 +700,9 @@ mod tests {
         .expect_err("all attempts fail");
 
         assert_eq!(attempts, 3);
-        let warns: Vec<String> = warn_messages()
-            .lock()
-            .unwrap()
-            .iter()
+        let warns: Vec<String> = warn_snapshot()
+            .into_iter()
             .filter(|m| m.contains("'warn_capture'"))
-            .cloned()
             .collect();
         assert_eq!(
             warns.len(),
@@ -861,7 +858,7 @@ mod tests {
 
     #[test]
     fn outcome_from_fallback_warn_names_the_node_and_the_fallback_target() {
-        install_warn_collector();
+        install_log_collector();
         let mut node = node_with("hi", None);
         node.fallback = Some("recover".into());
         let mut state = manager_with(&[]);
@@ -875,12 +872,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome, AgentExecutionOutcome::FellBack("recover".into()));
-        let warns: Vec<String> = warn_messages()
-            .lock()
-            .unwrap()
-            .iter()
+        let warns: Vec<String> = warn_snapshot()
+            .into_iter()
             .filter(|m| m.contains("'fallback_warn_capture'"))
-            .cloned()
             .collect();
         assert_eq!(warns.len(), 1, "exactly one fallback warn: {warns:?}");
         assert!(

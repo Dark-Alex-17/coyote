@@ -4,7 +4,7 @@ use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::{
     Agent, AgentVariable, AgentVariables, AppState, Input, RequestContext, Role, RoleLike,
     default_max_agent_depth, effective_max_concurrent_jobs, jobs_enabled,
-    list_agents_with_descriptions, load_agent_variables, paths,
+    list_agents_with_descriptions, load_agent_variables,
 };
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
@@ -15,7 +15,7 @@ use crate::utils::{AbortSignal, create_abort_signal, wait_abort_signal, wait_use
 use crate::graph;
 use crate::repl::DEFAULT_CONTINUATION_PROMPT;
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use indexmap::IndexMap;
 use log::{debug, warn};
 use parking_lot::RwLock;
@@ -997,36 +997,6 @@ fn sync_agent_functions_to_ctx(ctx: &mut RequestContext) -> Result<()> {
     Ok(())
 }
 
-/// Mirrors the base-env contract `hooks::fire` assembles from a live context,
-/// for detached call sites that dispatch pre-resolved hook snapshots after
-/// the context they were resolved from is gone. The names are captured by
-/// the caller when it takes the snapshot; the timestamp is taken here, at
-/// fire time, so it reflects when the event actually happened.
-pub(crate) fn hook_base_envs(
-    event: HookEvent,
-    session_name: Option<&str>,
-    agent_name: Option<&str>,
-) -> Vec<(String, String)> {
-    let mut envs = vec![
-        ("COYOTE_EVENT".to_string(), event.as_str().to_string()),
-        (
-            "COYOTE_CONFIG_DIR".to_string(),
-            paths::config_dir().display().to_string(),
-        ),
-        (
-            "COYOTE_EVENT_TIMESTAMP".to_string(),
-            Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        ),
-    ];
-    if let Some(name) = session_name {
-        envs.push(("COYOTE_SESSION_ID".to_string(), name.to_string()));
-    }
-    if let Some(name) = agent_name {
-        envs.push(("COYOTE_AGENT_NAME".to_string(), name.to_string()));
-    }
-    envs
-}
-
 /// Pre-resolved `agent.completed`/`agent.failed` snapshots for a spawned
 /// agent's result arms, captured from the child context before the spawn
 /// task takes ownership of it. Resolving against the child keeps global
@@ -1070,7 +1040,7 @@ impl SpawnResultHooks {
         hooks::fire_resolved(
             event,
             resolved,
-            hook_base_envs(event, self.session_name.as_deref(), Some(&self.agent_name)),
+            hooks::base_envs_parts(event, self.session_name.as_deref(), Some(&self.agent_name)),
             &extras,
             None,
         );
@@ -2377,8 +2347,8 @@ mod tests {
     }
 
     #[test]
-    fn hook_base_envs_carries_optional_names_only_when_present() {
-        let envs = hook_base_envs(HookEvent::AgentCompleted, None, None);
+    fn agent_event_base_envs_carry_optional_names_only_when_present() {
+        let envs = hooks::base_envs_parts(HookEvent::AgentCompleted, None, None);
         let keys: Vec<&str> = envs.iter().map(|(key, _)| key.as_str()).collect();
         assert!(keys.contains(&"COYOTE_EVENT"));
         assert!(keys.contains(&"COYOTE_CONFIG_DIR"));
@@ -2390,7 +2360,7 @@ mod tests {
                 .any(|(key, value)| key == "COYOTE_EVENT" && value == "agent.completed")
         );
 
-        let envs = hook_base_envs(HookEvent::AgentFailed, Some("sess"), Some("bot"));
+        let envs = hooks::base_envs_parts(HookEvent::AgentFailed, Some("sess"), Some("bot"));
         assert!(
             envs.iter()
                 .any(|(key, value)| key == "COYOTE_SESSION_ID" && value == "sess")

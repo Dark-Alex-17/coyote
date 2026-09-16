@@ -241,6 +241,10 @@ impl BundleStore {
             same_name_other_source: None,
         };
 
+        // Reserved names are the `--install-builtins` categories. `roles` is
+        // deliberately NOT among them: builtin roles are not installable that
+        // way (some are coupled to flag-specific coyote behavior), so the
+        // asymmetry with InstallFilter is intended.
         let reserved = AssetCategory::parse(&base).is_some();
         let collision = self.source_of_other_bundle(&base, &canonical);
         if reserved || collision.is_some() {
