@@ -23,10 +23,16 @@ set -e
 #   - perplexity:*
 #   - ernie:*
 #   - claude:*                       (Anthropic native web_search server tool)
-#   - openai:gpt-4o-search-preview   (and -mini-; requires an api-key openai
-#                                     client — the codex OAuth path uses the
-#                                     Responses API where this parameter
-#                                     does not exist)
+#   - openai:gpt-4o*/gpt-4.1*/gpt-5*/o3*/o4*
+#     OpenAI serves web search through two different mechanisms depending on
+#     the wire API the client resolves (the script cannot pick the wire):
+#     Chat Completions serves it via `web_search_options` on the chat-only
+#     *-search-preview models, while the Responses API serves it via its
+#     native `web_search` tool on regular models. Both request patches are
+#     exported (request patching is wire-aware, so the resolved wire applies
+#     exactly one) and openai searches run as an attempt chain: the
+#     chat-completions mechanism first, then the Responses mechanism, and
+#     the search fails only when both attempts fail.
 # @env WEB_SEARCH_USE_CURRENT_MODEL=true Prefer the running session's model when it natively supports web search.
 # @env LLM_OUTPUT=/dev/stdout The output path
 
@@ -34,7 +40,7 @@ set -e
 supports_native_search() {
     case "$1" in
     gemini:* | vertexai:gemini-* | perplexity:* | ernie:* | claude:*) return 0 ;;
-    openai:gpt-4o*search-preview*) return 0 ;;
+    openai:gpt-4o* | openai:gpt-4.1* | openai:gpt-5* | openai:o3* | openai:o4*) return 0 ;;
     *) return 1 ;;
     esac
 }
@@ -46,7 +52,8 @@ export_search_patch() {
         COYOTE_PATCH_VERTEXAI_CHAT_COMPLETIONS \
         COYOTE_PATCH_ERNIE_CHAT_COMPLETIONS \
         COYOTE_PATCH_CLAUDE_CHAT_COMPLETIONS \
-        COYOTE_PATCH_OPENAI_CHAT_COMPLETIONS
+        COYOTE_PATCH_OPENAI_CHAT_COMPLETIONS \
+        COYOTE_PATCH_OPENAI_RESPONSES
 
     case "${1%%:*}" in
     gemini)
@@ -65,18 +72,67 @@ export_search_patch() {
         export COYOTE_PATCH_CLAUDE_CHAT_COMPLETIONS='{".*":{"body":{"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":5}]}}}'
         ;;
     openai)
-        # Chat Completions native search exists only on the search-preview
-        # models; the regex scopes the patch so other OpenAI models run
-        # unpatched instead of erroring on an unsupported parameter.
+        # Both patches are exported; request patching is wire-aware, so the
+        # client's resolved wire applies exactly one of them. Each regex
+        # scopes its patch to the models that actually support that
+        # mechanism, so other OpenAI models run unpatched instead of
+        # erroring on an unsupported parameter:
+        #   - Chat Completions native search exists only on the chat-only
+        #     *-search-preview models (`web_search_options`).
+        #   - The Responses API serves search through its native
+        #     `web_search` tool, which only some model families support.
         export COYOTE_PATCH_OPENAI_CHAT_COMPLETIONS='{"gpt-4o.*search-preview.*":{"body":{"web_search_options":{}}}}'
+        export COYOTE_PATCH_OPENAI_RESPONSES='{"(gpt-4o|gpt-4\\.1|gpt-5|o3|o4).*":{"body":{"tools":[{"type":"web_search"}]}}}'
         ;;
     esac
+}
+
+# Maps an openai model to the one used for the chat-completions attempt:
+# Chat Completions web search is served only by the *-search-preview models.
+openai_chat_search_model() {
+    case "${1#openai:}" in
+    gpt-4o*search-preview*) echo "$1" ;;
+    gpt-4o-mini*) echo "openai:gpt-4o-mini-search-preview" ;;
+    *) echo "openai:gpt-4o-search-preview" ;;
+    esac
+}
+
+# Maps an openai model to the one used for the Responses attempt: the
+# *-search-preview models are chat-only and do not exist on /v1/responses,
+# so they map back to their base models.
+openai_responses_search_model() {
+    case "${1#openai:}" in
+    gpt-4o-mini-search-preview*) echo "openai:gpt-4o-mini" ;;
+    gpt-4o*search-preview*) echo "openai:gpt-4o" ;;
+    *) echo "$1" ;;
+    esac
+}
+
+# OpenAI attempt chain: try the chat-completions mechanism first (works when
+# the client's wire is chat); if that fails — e.g. the client resolved the
+# responses wire, where the search-preview models do not exist — retry with
+# the Responses mechanism on a responses-capable model. Fails when both
+# attempts fail.
+# shellcheck disable=SC2154
+run_openai_search() {
+    if coyote -m "$(openai_chat_search_model "$1")" "$argc_query" >>"$LLM_OUTPUT"; then
+        return 0
+    fi
+    echo "web_search: openai chat-completions attempt failed; retrying via the Responses API" >&2
+    coyote -m "$(openai_responses_search_model "$1")" "$argc_query" >>"$LLM_OUTPUT"
 }
 
 # shellcheck disable=SC2154
 run_search() {
     export_search_patch "$1"
-    coyote -m "$1" "$argc_query" >>"$LLM_OUTPUT"
+    case "$1" in
+    openai:*)
+        run_openai_search "$1"
+        ;;
+    *)
+        coyote -m "$1" "$argc_query" >>"$LLM_OUTPUT"
+        ;;
+    esac
 }
 
 main() {
