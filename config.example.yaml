@@ -385,6 +385,20 @@ clients:
     auth: null                                          # When set to 'oauth', Coyote will use OAuth instead of an API key
                                                         # Authenticate with `coyote --authenticate` or `.authenticate` in the REPL
     prompt_cache: true                                  # Optional - enable Anthropic prompt caching (default: true)
+    # Optional: custom OAuth endpoints (e.g. a private gateway). Requires `auth: oauth` above.
+    # With `auth: oauth` and no `oauth:` block you get the stock Claude Pro/Max provider; adding
+    # `oauth:` switches to generic OAuth against your endpoints (the Claude-Code system-prefix
+    # and anthropic-beta header are not sent). An `oauth:` block makes `api_base` REQUIRED —
+    # Coyote refuses to fall back to api.anthropic.com with a gateway token.
+    # auth: oauth
+    # api_base: https://gateway.example/anthropic/v1
+    # oauth:
+    #   client_id: '{{GATEWAY_CLIENT_ID}}'
+    #   device_authorization_url: https://auth.gateway.example/oauth/device_authorization
+    #   token_url: https://auth.gateway.example/oauth/token
+    #   flow: device_code
+    #   scopes: [claude.chat]
+    #   resource: https://gateway.example/v1
 
   # See https://docs.mistral.ai/
   - type: openai-compatible

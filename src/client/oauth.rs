@@ -211,6 +211,9 @@ pub trait OAuthProvider: Send + Sync {
     fn use_pkce_in_device_flow(&self) -> bool {
         false
     }
+    fn requires_issuer_stamp(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +224,10 @@ pub struct OAuthTokens {
     pub expires_at: i64,
     #[serde(default)]
     pub account_id: Option<String>,
+    /// `"{token_url}|{client_id}"` of the issuing provider, stamped on save.
+    /// `None` on files predating the stamp; those are grandfathered.
+    #[serde(default)]
+    pub issuer: Option<String>,
 }
 
 const TOKEN_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -376,9 +383,10 @@ async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Resul
         refresh_token,
         expires_at,
         account_id,
+        issuer: None,
     };
 
-    save_oauth_tokens(client_name, &tokens)?;
+    store_tokens(client_name, provider, tokens)?;
 
     println!(
         "Successfully authenticated client '{}' with {} via OAuth. Tokens saved.",
@@ -430,8 +438,9 @@ async fn run_client_credentials_flow(
         refresh_token: None,
         expires_at,
         account_id: provider.extract_account_id(&response),
+        issuer: None,
     };
-    save_oauth_tokens(client_name, &tokens)?;
+    store_tokens(client_name, provider, tokens)?;
 
     Ok(())
 }
@@ -597,8 +606,9 @@ async fn run_device_code_flow(provider: &dyn OAuthProvider, client_name: &str) -
                 refresh_token,
                 expires_at,
                 account_id,
+                issuer: None,
             };
-            save_oauth_tokens(client_name, &tokens)?;
+            store_tokens(client_name, provider, tokens)?;
             println!(
                 "Successfully authenticated client '{}' with {} via OAuth (device_code). Tokens saved.",
                 client_name,
@@ -637,12 +647,22 @@ pub fn load_oauth_tokens(client_name: &str) -> Option<OAuthTokens> {
     serde_json::from_str(&content).ok()
 }
 
-fn save_oauth_tokens(client_name: &str, tokens: &OAuthTokens) -> Result<()> {
+/// Stamps the issuer fingerprint of `provider` before writing so stored
+/// tokens stay bound to the provider that issued them.
+fn save_oauth_tokens(
+    client_name: &str,
+    provider: &(impl OAuthProvider + ?Sized),
+    tokens: &OAuthTokens,
+) -> Result<()> {
+    let tokens = OAuthTokens {
+        issuer: Some(issuer_fingerprint(provider)),
+        ..tokens.clone()
+    };
     let path = paths::token_file(client_name);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(tokens)?;
+    let json = serde_json::to_string_pretty(&tokens)?;
     // Write-then-rename so a crash mid-write never truncates the live token file.
     let mut tmp = path.clone().into_os_string();
     tmp.push(".tmp");
@@ -658,6 +678,35 @@ fn save_oauth_tokens(client_name: &str, tokens: &OAuthTokens) -> Result<()> {
     options.open(&tmp)?.write_all(json.as_bytes())?;
     fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+/// Persists freshly-minted tokens and primes the in-memory cache so a running
+/// session picks them up immediately instead of the stale token.
+fn store_tokens(
+    client_name: &str,
+    provider: &(impl OAuthProvider + ?Sized),
+    tokens: OAuthTokens,
+) -> Result<()> {
+    save_oauth_tokens(client_name, provider, &tokens)?;
+    set_access_token(
+        client_name,
+        tokens.access_token,
+        tokens.expires_at,
+        tokens.account_id,
+    );
+    clear_rejected(client_name);
+    Ok(())
+}
+
+fn issuer_fingerprint(provider: &(impl OAuthProvider + ?Sized)) -> String {
+    format!("{}|{}", provider.token_url(), provider.client_id())
+}
+
+fn issuer_matches(tokens: &OAuthTokens, provider: &(impl OAuthProvider + ?Sized)) -> bool {
+    match &tokens.issuer {
+        Some(issuer) => *issuer == issuer_fingerprint(provider),
+        None => !provider.requires_issuer_stamp(),
+    }
 }
 
 pub(crate) fn token_response_keys(response: &Value) -> String {
@@ -764,9 +813,10 @@ pub async fn refresh_oauth_token(
         refresh_token,
         expires_at,
         account_id,
+        issuer: None,
     };
 
-    save_oauth_tokens(client_name, &new_tokens)?;
+    save_oauth_tokens(client_name, provider, &new_tokens)?;
 
     Ok(new_tokens)
 }
@@ -799,6 +849,10 @@ pub async fn prepare_oauth_access_token(
         None => return Ok(false),
     };
 
+    if !issuer_matches(&tokens, provider) {
+        return Ok(false);
+    }
+
     let tokens = if Utc::now().timestamp() >= tokens.expires_at
         || is_rejected(client_name, &tokens.access_token)
     {
@@ -816,6 +870,10 @@ pub async fn prepare_oauth_access_token(
             Some(t) => t,
             None => return Ok(false),
         };
+
+        if !issuer_matches(&tokens, provider) {
+            return Ok(false);
+        }
 
         if Utc::now().timestamp() >= tokens.expires_at
             || is_rejected(client_name, &tokens.access_token)
@@ -1005,6 +1063,46 @@ pub fn get_oauth_provider(provider_type: &str) -> Option<Box<dyn OAuthProvider>>
     }
 }
 
+pub(crate) fn config_oauth_for_client(
+    client_config: &ClientConfig,
+    all_provider_models: &[ProviderModels],
+) -> Option<OAuthConfig> {
+    let (client_name, _, _) = client_config_info(client_config);
+    let user_oauth = match client_config {
+        ClientConfig::OpenAICompatibleConfig(c) => c.oauth.clone().map(|b| *b),
+        ClientConfig::ClaudeConfig(c) => c.oauth.clone().map(|b| *b),
+        _ => return None,
+    };
+    let base = all_provider_models
+        .iter()
+        .find(|p| p.provider == client_name)
+        .and_then(|p| p.oauth.clone());
+    match (base, user_oauth) {
+        (None, None) => None,
+        (Some(b), None) => Some(b),
+        (None, Some(u)) => Some(u),
+        (Some(b), Some(u)) => Some(b.merge(u)),
+    }
+}
+
+pub(crate) fn claude_oauth_provider_for_client(
+    client_config: &ClientConfig,
+    all_provider_models: &[ProviderModels],
+) -> (Box<dyn OAuthProvider>, bool) {
+    let (client_name, _, _) = client_config_info(client_config);
+    match config_oauth_for_client(client_config, all_provider_models) {
+        Some(merged) => (
+            Box::new(OpenAICompatibleOAuthProvider {
+                config: merged,
+                client_name: client_name.to_string(),
+                requires_issuer_stamp: true,
+            }),
+            false,
+        ),
+        None => (Box::new(super::claude_oauth::ClaudeOAuthProvider), true),
+    }
+}
+
 pub fn get_oauth_provider_for_client(
     client_config: &ClientConfig,
     all_provider_models: &[ProviderModels],
@@ -1015,22 +1113,18 @@ pub fn get_oauth_provider_for_client(
     }
 
     match client_config {
-        ClientConfig::OpenAICompatibleConfig(c) => {
-            let base = all_provider_models
-                .iter()
-                .find(|p| p.provider == client_name)
-                .and_then(|p| p.oauth.clone());
-            let user_oauth = c.oauth.clone().map(|b| *b);
-            let merged = match (base, user_oauth) {
-                (None, None) => return None,
-                (Some(b), None) => b,
-                (None, Some(u)) => u,
-                (Some(b), Some(u)) => b.merge(u),
-            };
+        ClientConfig::OpenAICompatibleConfig(_) => {
+            let merged = config_oauth_for_client(client_config, all_provider_models)?;
             Some(Box::new(OpenAICompatibleOAuthProvider {
                 config: merged,
                 client_name: client_name.to_string(),
+                requires_issuer_stamp: false,
             }))
+        }
+        ClientConfig::ClaudeConfig(_) => {
+            let (provider, _) =
+                claude_oauth_provider_for_client(client_config, all_provider_models);
+            Some(provider)
         }
         _ => get_oauth_provider(provider_type),
     }
@@ -1097,6 +1191,7 @@ mod tests {
 
     use super::*;
     use crate::client::access_token::{distrust_access_token, get_access_token};
+    use crate::client::claude::ClaudeConfig;
     use crate::client::openai_compatible::OpenAICompatibleConfig;
     use crate::client::{ModelData, ProviderModels};
     use crate::utils::get_env_name;
@@ -1324,6 +1419,24 @@ echo_pkce_in_token_exchange: true
         })
     }
 
+    fn make_claude_client(
+        name: &str,
+        auth: Option<&str>,
+        oauth: Option<OAuthConfig>,
+    ) -> ClientConfig {
+        ClientConfig::ClaudeConfig(ClaudeConfig {
+            name: Some(name.into()),
+            api_key: None,
+            api_base: None,
+            auth: auth.map(str::to_string),
+            oauth: oauth.map(Box::new),
+            models: vec![],
+            prompt_cache: None,
+            patch: None,
+            extra: None,
+        })
+    }
+
     #[test]
     fn get_oauth_provider_for_client_merges_defaults_with_user_override() {
         let base = base_config();
@@ -1387,6 +1500,87 @@ echo_pkce_in_token_exchange: true
     }
 
     #[test]
+    fn claude_client_with_user_oauth_block_uses_generic_provider() {
+        let mut user = empty_user_override("gateway-id", "https://gateway.example/token");
+        user.device_authorization_url = Some("https://gateway.example/device".into());
+        let cc = make_claude_client("claude", Some("oauth"), Some(user));
+
+        let provider = get_oauth_provider_for_client(&cc, &[]).unwrap();
+
+        assert_eq!(provider.provider_name(), "claude");
+        assert_eq!(provider.client_id(), "gateway-id");
+        assert_eq!(provider.token_url(), "https://gateway.example/token");
+        assert_eq!(
+            provider.device_authorization_url(),
+            Some("https://gateway.example/device")
+        );
+    }
+
+    #[test]
+    fn claude_client_without_oauth_block_falls_back_to_stock_provider() {
+        let cc = make_claude_client("claude", Some("oauth"), None);
+
+        let provider = get_oauth_provider_for_client(&cc, &[]).unwrap();
+
+        assert_eq!(provider.provider_name(), "claude");
+        assert_eq!(provider.client_id(), "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+        assert_eq!(
+            provider.extra_request_headers(),
+            vec![("anthropic-beta", "oauth-2025-04-20")]
+        );
+    }
+
+    #[test]
+    fn claude_client_merges_bundled_defaults_with_user_override() {
+        let base = base_config();
+        let user = empty_user_override("user-id", "https://user.example/token");
+        let models = vec![make_provider_models("claude", Some(base))];
+        let cc = make_claude_client("claude", Some("oauth"), Some(user));
+
+        let provider = get_oauth_provider_for_client(&cc, &models).unwrap();
+
+        assert_eq!(provider.provider_name(), "claude");
+        assert_eq!(provider.client_id(), "user-id");
+        assert_eq!(provider.token_url(), "https://user.example/token");
+        assert_eq!(provider.authorize_url(), "https://base.example/authorize");
+    }
+
+    #[test]
+    fn claude_bundled_only_oauth_block_uses_generic_provider() {
+        let base = base_config();
+        let models = vec![make_provider_models("claude", Some(base))];
+        let cc = make_claude_client("claude", Some("oauth"), None);
+
+        let (provider, is_stock) = claude_oauth_provider_for_client(&cc, &models);
+
+        assert!(!is_stock);
+        assert_eq!(provider.client_id(), "base-id");
+        assert_eq!(provider.token_url(), "https://base.example/token");
+        assert!(provider.extra_request_headers().is_empty());
+    }
+
+    #[test]
+    fn claude_config_provider_requires_issuer_stamp() {
+        let user = empty_user_override("gateway-id", "https://gateway.example/token");
+        let cc = make_claude_client("claude", Some("oauth"), Some(user));
+
+        let (provider, is_stock) = claude_oauth_provider_for_client(&cc, &[]);
+
+        assert!(!is_stock);
+        assert!(provider.requires_issuer_stamp());
+    }
+
+    #[test]
+    fn claude_stock_provider_grandfathers_legacy_tokens() {
+        let cc = make_claude_client("claude", Some("oauth"), None);
+
+        let (provider, is_stock) = claude_oauth_provider_for_client(&cc, &[]);
+
+        assert!(is_stock);
+        assert!(!provider.requires_issuer_stamp());
+    }
+
+    #[test]
     fn openai_compatible_provider_joins_scopes_with_spaces() {
         let mut cfg = base_config();
         cfg.scopes = vec!["one".into(), "two".into(), "three".into()];
@@ -1394,6 +1588,7 @@ echo_pkce_in_token_exchange: true
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         assert_eq!(provider.scopes(), "one two three");
@@ -1408,6 +1603,7 @@ echo_pkce_in_token_exchange: true
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         assert_eq!(
@@ -1425,6 +1621,7 @@ echo_pkce_in_token_exchange: true
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         assert!(provider.uses_localhost_redirect());
@@ -1436,6 +1633,7 @@ echo_pkce_in_token_exchange: true
         let provider = OpenAICompatibleOAuthProvider {
             config: base_config(),
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         assert!(provider.extra_token_params().is_empty());
@@ -1546,6 +1744,7 @@ echo_pkce_in_token_exchange: true
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         assert_eq!(
@@ -1559,6 +1758,7 @@ echo_pkce_in_token_exchange: true
         let provider = OpenAICompatibleOAuthProvider {
             config: base_config(),
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         assert!(provider.device_authorization_url().is_none());
@@ -1569,6 +1769,7 @@ echo_pkce_in_token_exchange: true
         let provider = OpenAICompatibleOAuthProvider {
             config: base_config(),
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         assert!(!provider.use_pkce_in_device_flow());
@@ -1582,6 +1783,7 @@ echo_pkce_in_token_exchange: true
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         assert!(provider.use_pkce_in_device_flow());
@@ -1596,6 +1798,7 @@ echo_pkce_in_token_exchange: true
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         assert_eq!(provider.resource(), Some("https://rs.example/"));
@@ -1655,6 +1858,7 @@ echo_pkce_in_token_exchange: true
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         assert!(provider.fixed_redirect_uri().is_none());
@@ -1669,6 +1873,7 @@ echo_pkce_in_token_exchange: true
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         assert_eq!(
@@ -1686,6 +1891,7 @@ echo_pkce_in_token_exchange: true
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         assert_eq!(
@@ -1815,6 +2021,7 @@ extra_token_params:
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         let request = build_token_request(
@@ -1967,6 +2174,7 @@ extra_token_params:
         let provider = OpenAICompatibleOAuthProvider {
             config: base_config(),
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         let request = build_token_request(
@@ -1991,6 +2199,7 @@ extra_token_params:
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         let url = build_authorize_url(
@@ -2010,6 +2219,7 @@ extra_token_params:
         let provider = OpenAICompatibleOAuthProvider {
             config: base_config(),
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         let url = build_authorize_url(
@@ -2032,6 +2242,7 @@ extra_token_params:
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         let url = build_authorize_url(
@@ -2062,6 +2273,7 @@ extra_token_params:
         let provider = OpenAICompatibleOAuthProvider {
             config: cfg,
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         let params = build_device_authorization_params(&provider, "a b", None);
@@ -2076,6 +2288,7 @@ extra_token_params:
         let provider = OpenAICompatibleOAuthProvider {
             config: base_config(),
             client_name: "test".into(),
+            requires_issuer_stamp: false,
         };
 
         let params = build_device_authorization_params(&provider, "a b", Some("challenge"));
@@ -2094,9 +2307,10 @@ extra_token_params:
                 refresh_token: Some("rt-456".into()),
                 expires_at: 1234567890,
                 account_id: Some("acct-789".into()),
+                issuer: None,
             };
 
-            save_oauth_tokens("atomic-test", &tokens).unwrap();
+            save_oauth_tokens("atomic-test", &ResourceStubProvider, &tokens).unwrap();
 
             let loaded = load_oauth_tokens("atomic-test").unwrap();
             assert_eq!(loaded.access_token, "at-123");
@@ -2130,11 +2344,13 @@ extra_token_params:
             let expires_at = Utc::now().timestamp() + 3600;
             save_oauth_tokens(
                 client_name,
+                &ResourceStubProvider,
                 &OAuthTokens {
                     access_token: "rejected-at".into(),
                     refresh_token: None,
                     expires_at,
                     account_id: None,
+                    issuer: None,
                 },
             )
             .unwrap();
@@ -2169,11 +2385,13 @@ extra_token_params:
             assert!(distrust_access_token(client_name, "rejected-at"));
             save_oauth_tokens(
                 client_name,
+                &ResourceStubProvider,
                 &OAuthTokens {
                     access_token: "fresh-at".into(),
                     refresh_token: None,
                     expires_at,
                     account_id: None,
+                    issuer: None,
                 },
             )
             .unwrap();
@@ -2195,6 +2413,219 @@ extra_token_params:
                 !is_rejected(client_name, "rejected-at"),
                 "marker not cleared after successful prepare"
             );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn store_tokens_caches_token_and_clears_rejection() {
+        with_temp_cache(|| {
+            let client_name = "store-tokens-test";
+            let expires_at = Utc::now().timestamp() + 3600;
+            set_access_token(client_name, "old-at".into(), expires_at, None);
+            assert!(distrust_access_token(client_name, "old-at"));
+
+            store_tokens(
+                client_name,
+                &ResourceStubProvider,
+                OAuthTokens {
+                    access_token: "fresh-at".into(),
+                    refresh_token: None,
+                    expires_at,
+                    account_id: None,
+                    issuer: None,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(get_access_token(client_name).unwrap(), "fresh-at");
+            assert!(is_valid_access_token(client_name));
+            assert!(
+                !is_rejected(client_name, "old-at"),
+                "rejection marker not cleared by store_tokens"
+            );
+        });
+    }
+
+    fn write_raw_token_file(client_name: &str, json: &str) {
+        let path = paths::token_file(client_name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, json).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn save_oauth_tokens_stamps_issuer_fingerprint() {
+        with_temp_cache(|| {
+            save_oauth_tokens(
+                "issuer-stamp-test",
+                &ResourceStubProvider,
+                &OAuthTokens {
+                    access_token: "at".into(),
+                    refresh_token: None,
+                    expires_at: 1234567890,
+                    account_id: None,
+                    issuer: None,
+                },
+            )
+            .unwrap();
+
+            let loaded = load_oauth_tokens("issuer-stamp-test").unwrap();
+            assert_eq!(
+                loaded.issuer.as_deref(),
+                Some("https://as.example/token|stub-client")
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_rejects_unexpired_tokens_with_mismatched_issuer() {
+        with_temp_cache(|| {
+            let client_name = "issuer-mismatch-valid-test";
+            let expires_at = Utc::now().timestamp() + 3600;
+            write_raw_token_file(
+                client_name,
+                &format!(
+                    r#"{{"access_token":"foreign-at","expires_at":{expires_at},"issuer":"https://old.example/token|old-client"}}"#
+                ),
+            );
+
+            let ready = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(prepare_oauth_access_token(
+                    &ReqwestClient::new(),
+                    &ResourceStubProvider,
+                    client_name,
+                ))
+                .unwrap();
+
+            assert!(!ready);
+            assert!(
+                get_access_token(client_name).is_err(),
+                "foreign token must not enter the cache"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_rejects_expired_mismatched_issuer_without_refreshing() {
+        with_temp_cache(|| {
+            let client_name = "issuer-mismatch-expired-test";
+            write_raw_token_file(
+                client_name,
+                r#"{"access_token":"foreign-at","refresh_token":"foreign-rt","expires_at":0,"issuer":"https://old.example/token|old-client"}"#,
+            );
+
+            // A refresh attempt would POST to the stub's token_url and fail
+            // with a transport error; Ok(false) proves the refresh token was
+            // never forwarded.
+            let ready = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(prepare_oauth_access_token(
+                    &ReqwestClient::new(),
+                    &ResourceStubProvider,
+                    client_name,
+                ))
+                .unwrap();
+
+            assert!(!ready);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_accepts_legacy_tokens_without_issuer() {
+        with_temp_cache(|| {
+            let client_name = "issuer-legacy-test";
+            let expires_at = Utc::now().timestamp() + 3600;
+            write_raw_token_file(
+                client_name,
+                &format!(r#"{{"access_token":"legacy-at","expires_at":{expires_at}}}"#),
+            );
+
+            let ready = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(prepare_oauth_access_token(
+                    &ReqwestClient::new(),
+                    &ResourceStubProvider,
+                    client_name,
+                ))
+                .unwrap();
+
+            assert!(ready);
+            assert_eq!(get_access_token(client_name).unwrap(), "legacy-at");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_rejects_legacy_tokens_for_claude_config_provider() {
+        with_temp_cache(|| {
+            let client_name = "issuer-legacy-claude-config-test";
+            let user = empty_user_override("gateway-id", "https://gateway.example/token");
+            let cc = make_claude_client(client_name, Some("oauth"), Some(user));
+            let (provider, _) = claude_oauth_provider_for_client(&cc, &[]);
+            write_raw_token_file(
+                client_name,
+                r#"{"access_token":"legacy-at","refresh_token":"legacy-rt","expires_at":0}"#,
+            );
+
+            // Legacy files predate config-driven claude oauth, so they are
+            // Anthropic-issued; Ok(false) proves neither the access token
+            // nor the refresh token reaches the configured endpoint.
+            let ready = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(prepare_oauth_access_token(
+                    &ReqwestClient::new(),
+                    &*provider,
+                    client_name,
+                ))
+                .unwrap();
+
+            assert!(!ready);
+            assert!(
+                get_access_token(client_name).is_err(),
+                "legacy token must not enter the cache"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_accepts_legacy_tokens_for_stock_claude_provider() {
+        with_temp_cache(|| {
+            let client_name = "issuer-legacy-claude-stock-test";
+            let cc = make_claude_client(client_name, Some("oauth"), None);
+            let (provider, _) = claude_oauth_provider_for_client(&cc, &[]);
+            let expires_at = Utc::now().timestamp() + 3600;
+            write_raw_token_file(
+                client_name,
+                &format!(r#"{{"access_token":"legacy-at","expires_at":{expires_at}}}"#),
+            );
+
+            let ready = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(prepare_oauth_access_token(
+                    &ReqwestClient::new(),
+                    &*provider,
+                    client_name,
+                ))
+                .unwrap();
+
+            assert!(ready);
+            assert_eq!(get_access_token(client_name).unwrap(), "legacy-at");
         });
     }
 

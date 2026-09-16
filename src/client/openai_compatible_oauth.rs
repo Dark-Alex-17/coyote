@@ -5,6 +5,7 @@ use super::oauth::{OAuthConfig, OAuthFlow, OAuthProvider, TokenRequestFormat};
 pub struct OpenAICompatibleOAuthProvider {
     pub config: OAuthConfig,
     pub client_name: String,
+    pub requires_issuer_stamp: bool,
 }
 
 fn is_loopback_uri(uri: &str) -> bool {
@@ -121,5 +122,9 @@ impl OAuthProvider for OpenAICompatibleOAuthProvider {
 
     fn use_pkce_in_device_flow(&self) -> bool {
         self.config.use_pkce_in_device_flow
+    }
+
+    fn requires_issuer_stamp(&self) -> bool {
+        self.requires_issuer_stamp
     }
 }

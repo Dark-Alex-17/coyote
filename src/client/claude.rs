@@ -2,13 +2,12 @@ use std::collections::HashSet;
 use std::mem;
 
 use super::access_token::get_access_token;
-use super::claude_oauth::ClaudeOAuthProvider;
-use super::oauth::{self, OAuthProvider};
+use super::oauth::{self, OAuthConfig};
 use super::*;
 
 use crate::utils::strip_think_tag;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -22,6 +21,7 @@ pub struct ClaudeConfig {
     pub api_key: Option<String>,
     pub api_base: Option<String>,
     pub auth: Option<String>,
+    pub oauth: Option<Box<OAuthConfig>>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub prompt_cache: Option<bool>,
@@ -71,9 +71,7 @@ async fn prepare_chat_completions(
     client: &ReqwestClient,
     data: ChatCompletionsData,
 ) -> Result<RequestData> {
-    let api_base = self_
-        .get_api_base()
-        .unwrap_or_else(|_| API_BASE.to_string());
+    let api_base = resolve_api_base(self_)?;
 
     let url = format!("{}/messages", api_base.trim_end_matches('/'));
     let body = claude_build_chat_completions_body(
@@ -88,22 +86,46 @@ async fn prepare_chat_completions(
 
     let uses_oauth = self_.config.auth.as_deref() == Some("oauth");
 
+    if !uses_oauth && self_.config.oauth.is_some() {
+        bail!(
+            "'{}' has an `oauth:` block configured but `auth: oauth` is not set; the oauth block would be ignored. Set `auth: oauth` (and run 'coyote --authenticate {}') or remove the oauth block.",
+            self_.name(),
+            self_.name()
+        );
+    }
+
     if uses_oauth {
-        let provider = ClaudeOAuthProvider;
-        let ready = oauth::prepare_oauth_access_token(client, &provider, self_.name()).await?;
+        let client_name = self_.name();
+        let app_config = self_.app_config();
+        let cc = app_config
+            .clients
+            .iter()
+            .find(|cc| {
+                matches!(
+                    cc,
+                    ClientConfig::ClaudeConfig(c)
+                    if c.name.as_deref().unwrap_or(ClaudeClient::NAME) == client_name
+                )
+            })
+            .ok_or_else(|| anyhow!("Could not locate ClientConfig entry for '{}'", client_name))?;
+        let (provider, uses_stock_provider) =
+            oauth::claude_oauth_provider_for_client(cc, &ALL_PROVIDER_MODELS);
+        let ready = oauth::prepare_oauth_access_token(client, &*provider, client_name).await?;
         if !ready {
             bail!(
                 "OAuth configured but no tokens found for '{}'. Run: 'coyote --authenticate {}' or '.authenticate' in the REPL",
-                self_.name(),
-                self_.name()
+                client_name,
+                client_name
             );
         }
-        let token = get_access_token(self_.name())?;
+        let token = get_access_token(client_name)?;
         request_data.bearer_auth(token);
         for (key, value) in provider.extra_request_headers() {
             request_data.header(key, value);
         }
-        inject_oauth_system_prompt(&mut request_data.body);
+        if uses_stock_provider {
+            inject_oauth_system_prompt(&mut request_data.body);
+        }
     } else if let Ok(api_key) = self_.get_api_key() {
         request_data.header("x-api-key", api_key);
     } else {
@@ -115,6 +137,21 @@ async fn prepare_chat_completions(
     }
 
     Ok(request_data)
+}
+
+/// A config-driven `oauth:` block requires an explicit `api_base`; the stock fallback would send
+/// the oauth token to the wrong host.
+fn resolve_api_base(self_: &ClaudeClient) -> Result<String> {
+    match self_.get_api_base() {
+        Ok(api_base) => Ok(api_base),
+        Err(_) if self_.config.oauth.is_none() => Ok(API_BASE.to_string()),
+        Err(_) => bail!(
+            "'{}' has a custom `oauth:` block but no `api_base`; refusing to fall back to {} (the oauth token would be sent to the wrong host). Set `api_base` on the '{}' client entry.",
+            self_.name(),
+            API_BASE,
+            self_.name()
+        ),
+    }
 }
 
 /// Anthropic requires OAuth-authenticated requests to include a Claude Code
@@ -632,7 +669,11 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::access_token::set_access_token;
+    use crate::config::AppConfig;
     use crate::function::{FunctionDeclaration, ToolCall, ToolResult};
+    use chrono::Utc;
+    use std::sync::Arc;
 
     fn tool_result(id: &str, text: Option<&str>) -> ToolResult {
         ToolResult {
@@ -904,5 +945,281 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(5));
         assert_eq!(usage.cache_creation_input_tokens, Some(100));
         assert_eq!(usage.cache_read_input_tokens, Some(200));
+    }
+
+    fn claude_config(name: &str, auth: Option<&str>, oauth: Option<OAuthConfig>) -> ClaudeConfig {
+        ClaudeConfig {
+            name: Some(name.into()),
+            api_key: None,
+            api_base: oauth.as_ref().map(|_| "https://gateway.example/v1".to_string()),
+            auth: auth.map(str::to_string),
+            oauth: oauth.map(Box::new),
+            models: vec![],
+            prompt_cache: None,
+            patch: None,
+            extra: None,
+        }
+    }
+
+    fn minimal_oauth_config() -> OAuthConfig {
+        serde_yaml::from_str("client_id: gateway\ntoken_url: https://gateway.example/token")
+            .unwrap()
+    }
+
+    fn make_client(config: ClaudeConfig, clients: Vec<ClientConfig>) -> ClaudeClient {
+        ClaudeClient {
+            app_config: Arc::new(AppConfig {
+                clients,
+                ..AppConfig::default()
+            }),
+            config,
+            model: Model::new("claude", "claude-test"),
+        }
+    }
+
+    fn prepare(client: &ClaudeClient) -> Result<RequestData> {
+        let data = ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".to_string()),
+            )],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream: false,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(prepare_chat_completions(
+                client,
+                &ReqwestClient::new(),
+                data,
+            ))
+    }
+
+    #[test]
+    fn oauth_stock_provider_applies_claude_code_spoof() {
+        let name = "claude-gate-stock-test";
+        let config = claude_config(name, Some("oauth"), None);
+        let client = make_client(config.clone(), vec![ClientConfig::ClaudeConfig(config)]);
+        set_access_token(name, "stock-at".into(), Utc::now().timestamp() + 3600, None);
+
+        let request_data = prepare(&client).unwrap();
+
+        assert_eq!(
+            request_data
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer stock-at")
+        );
+        assert_eq!(
+            request_data
+                .headers
+                .get("anthropic-beta")
+                .map(String::as_str),
+            Some("oauth-2025-04-20")
+        );
+        assert_eq!(request_data.body["system"][0]["text"], CLAUDE_CODE_PREFIX);
+    }
+
+    #[test]
+    fn oauth_config_provider_skips_claude_code_spoof() {
+        let name = "claude-gate-gateway-test";
+        let config = claude_config(name, Some("oauth"), Some(minimal_oauth_config()));
+        let client = make_client(config.clone(), vec![ClientConfig::ClaudeConfig(config)]);
+        set_access_token(name, "gateway-at".into(), Utc::now().timestamp() + 3600, None);
+
+        let request_data = prepare(&client).unwrap();
+
+        assert_eq!(
+            request_data
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer gateway-at")
+        );
+        assert!(
+            !request_data.headers.contains_key("anthropic-beta"),
+            "headers: {:?}",
+            request_data.headers
+        );
+        assert!(
+            request_data.body.get("system").is_none(),
+            "body: {}",
+            request_data.body
+        );
+    }
+
+    #[test]
+    fn api_key_auth_sets_x_api_key_without_spoof() {
+        let name = "claude-gate-apikey-test";
+        let mut config = claude_config(name, None, None);
+        config.api_key = Some("sk-test".into());
+        let client = make_client(config.clone(), vec![ClientConfig::ClaudeConfig(config)]);
+
+        let request_data = prepare(&client).unwrap();
+
+        assert_eq!(
+            request_data.headers.get("x-api-key").map(String::as_str),
+            Some("sk-test")
+        );
+        assert!(!request_data.headers.contains_key("authorization"));
+        assert!(!request_data.headers.contains_key("anthropic-beta"));
+        assert!(
+            request_data.body.get("system").is_none(),
+            "body: {}",
+            request_data.body
+        );
+    }
+
+    #[test]
+    fn oauth_block_without_auth_oauth_is_rejected() {
+        let name = "claude-gate-contradiction-test";
+        let mut config = claude_config(name, None, Some(minimal_oauth_config()));
+        config.api_key = Some("sk-test".into());
+        let client = make_client(config.clone(), vec![ClientConfig::ClaudeConfig(config)]);
+
+        let err = match prepare(&client) {
+            Ok(_) => panic!("expected the contradictory config to be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            err.contains("has an `oauth:` block configured but `auth: oauth` is not set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn oauth_block_without_api_base_is_rejected() {
+        let name = "claude-gate-apibase-missing-test";
+        let mut config = claude_config(name, Some("oauth"), Some(minimal_oauth_config()));
+        config.api_base = None;
+        let client = make_client(config.clone(), vec![ClientConfig::ClaudeConfig(config)]);
+
+        let err = resolve_api_base(&client).unwrap_err().to_string();
+
+        assert!(
+            err.contains(name) && err.contains("refusing to fall back"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn oauth_block_with_api_base_resolves_it() {
+        let name = "claude-gate-apibase-set-test";
+        let config = claude_config(name, Some("oauth"), Some(minimal_oauth_config()));
+        let client = make_client(config.clone(), vec![ClientConfig::ClaudeConfig(config)]);
+
+        let api_base = resolve_api_base(&client).unwrap();
+
+        assert_eq!(api_base, "https://gateway.example/v1");
+    }
+
+    #[test]
+    fn no_oauth_block_falls_back_to_stock_api_base() {
+        let name = "claude-gate-apibase-fallback-test";
+        let config = claude_config(name, None, None);
+        let client = make_client(config.clone(), vec![ClientConfig::ClaudeConfig(config)]);
+
+        let api_base = resolve_api_base(&client).unwrap();
+
+        assert_eq!(api_base, API_BASE);
+    }
+
+    #[test]
+    fn oauth_lookup_resolves_entry_matching_client_name() {
+        let name = "claude-gate-lookup-test";
+        // The sibling entry resolves to the stock provider; if the lookup
+        // ignored the name it would apply the Claude Code spoof here.
+        let sibling = claude_config("claude-gate-lookup-sibling-test", Some("oauth"), None);
+        let config = claude_config(name, Some("oauth"), Some(minimal_oauth_config()));
+        let client = make_client(
+            config.clone(),
+            vec![
+                ClientConfig::ClaudeConfig(sibling),
+                ClientConfig::ClaudeConfig(config),
+            ],
+        );
+        set_access_token(name, "lookup-at".into(), Utc::now().timestamp() + 3600, None);
+
+        let request_data = prepare(&client).unwrap();
+
+        assert_eq!(
+            request_data
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer lookup-at")
+        );
+        assert!(!request_data.headers.contains_key("anthropic-beta"));
+        assert!(request_data.body.get("system").is_none());
+    }
+
+    #[test]
+    fn oauth_lookup_falls_back_to_default_name_for_unnamed_entry() {
+        // An entry with `name: None` must match a client named "claude" via
+        // the `unwrap_or(ClaudeClient::NAME)` fallback.
+        let sibling = claude_config("claude-gate-fallback-sibling-test", Some("oauth"), None);
+        let mut config = claude_config("ignored", Some("oauth"), Some(minimal_oauth_config()));
+        config.name = None;
+        let client = make_client(
+            config.clone(),
+            vec![
+                ClientConfig::ClaudeConfig(sibling),
+                ClientConfig::ClaudeConfig(config),
+            ],
+        );
+        set_access_token(
+            ClaudeClient::NAME,
+            "fallback-at".into(),
+            Utc::now().timestamp() + 3600,
+            None,
+        );
+
+        let request_data = prepare(&client).unwrap();
+
+        assert_eq!(
+            request_data
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer fallback-at")
+        );
+        assert!(!request_data.headers.contains_key("anthropic-beta"));
+        assert!(request_data.body.get("system").is_none());
+    }
+
+    #[test]
+    fn oauth_lookup_errors_when_config_entry_missing() {
+        let config = claude_config("claude-gate-missing-test", Some("oauth"), None);
+        let client = make_client(config, vec![]);
+
+        let err = match prepare(&client) {
+            Ok(_) => panic!("expected the lookup to fail"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            err.contains("Could not locate ClientConfig entry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn shipped_catalog_resolves_stock_claude_provider() {
+        let cc = ClientConfig::ClaudeConfig(claude_config("claude", Some("oauth"), None));
+        let bundled: Vec<ProviderModels> = serde_yaml::from_str(MODELS_YAML).unwrap();
+
+        let (_, is_stock) = oauth::claude_oauth_provider_for_client(&cc, &bundled);
+
+        assert!(
+            is_stock,
+            "bundled models.yaml must not carry a claude oauth block: it would silently drop the Claude Code spoof for stock Pro/Max users"
+        );
     }
 }
