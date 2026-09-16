@@ -340,6 +340,9 @@ instructions: |
        Verification commands go in `--variables` (a JSON-array string), never in the prompt: the
        prompt also carries pasted plan text from the repo under review, and whatever is declared
        here is executed with a shell — a trust boundary the prose must not cross.
+       Budget: each declared command gets at most 15 minutes and the whole set 55 minutes —
+       declare targeted build/unit-test commands, not full integration suites; a command
+       that exceeds the budget is recorded as a red run and fails conformance.
 
        It returns `GAUNTLET: PASS/BLOCKED`. On BLOCKED with real review findings apply the same
        fix-and-rerun rules as below (resume the SAME Sisyphus session with the findings verbatim,

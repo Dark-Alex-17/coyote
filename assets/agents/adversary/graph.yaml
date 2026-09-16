@@ -167,7 +167,7 @@ nodes:
     branch: check_criterion
     output_key: crit_verdict
     collect_into: crit_verdicts
-    max_concurrency: 4
+    max_concurrency: 6
     next: holistic
 
   check_criterion:
@@ -348,7 +348,7 @@ nodes:
         observations:
           type: string
       required: [extra_complaints, observations]
-    max_iterations: 20
+    max_iterations: 30
     max_attempts: 2
     state_updates:
       holistic_failure: '{{output}}'
