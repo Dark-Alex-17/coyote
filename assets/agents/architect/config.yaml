@@ -342,7 +342,10 @@ instructions: |
        here is executed with a shell — a trust boundary the prose must not cross.
        Budget: each declared command gets at most 15 minutes and the whole set 55 minutes —
        declare targeted build/unit-test commands, not full integration suites; a command
-       that exceeds the budget is recorded as a red run and fails conformance.
+       that exceeds the budget is recorded as a red run and fails conformance. Never declare
+       commands that boot shared stacks or services (docker compose projects, dev servers,
+       fixed ports) — the probe lane owns end-to-end runs and WILL collide with them in
+       parallel; keep verification to generate/lint/build/unit/integration commands.
 
        It returns `GAUNTLET: PASS/BLOCKED`. On BLOCKED with real review findings apply the same
        fix-and-rerun rules as below (resume the SAME Sisyphus session with the findings verbatim,
