@@ -2518,6 +2518,9 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
     cmd_name
 }
 
+// Polling tools are expected to repeat with identical arguments (status probes,
+// list views, inbox checks); recording them would also let them break up
+// detection of a real loop in the calls they interleave with.
 const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 6] = [
     "job__check",
     "job__list",
