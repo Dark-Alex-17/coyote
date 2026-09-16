@@ -2019,6 +2019,7 @@ mod tests {
     use crate::hooks::{HookDef, HooksMap, test_sink};
     use anyhow::anyhow;
     use serial_test::serial;
+    use std::future::Future;
 
     const TURN_EVENTS: [&str; 4] = [
         "turn.started",
@@ -2161,25 +2162,52 @@ mod tests {
         assert_eq!(turn_counts(marker), (1, 0, 1, 0));
     }
 
-    #[tokio::test]
+    /// Drives a deep REPL future to completion on a thread with extra stack
+    /// headroom: nested `run_repl_command`/`compress_session` poll frames
+    /// are deep in debug builds and overflow the default test-thread stack
+    /// (Windows exhausts it first).
+    fn run_async<F>(f: F) -> F::Output
+    where
+        F: Future + Send,
+        F::Output: Send,
+    {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(f)
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
+
+    #[test]
     #[serial]
-    async fn compress_command_failure_fires_no_session_compressed() {
+    fn compress_command_failure_fires_no_session_compressed() {
         let _sink = test_sink::install();
         let marker = "compress-fail-z9t";
-        let mut ctx = ctx_with_hooks(&["session.compressed"], marker);
-        ctx.session = Some(Session::default());
-        let abort_signal = create_abort_signal();
+        run_async(async {
+            let mut ctx = ctx_with_hooks(&["session.compressed"], marker);
+            ctx.session = Some(Session::default());
+            let abort_signal = create_abort_signal();
 
-        // Boxed: `run_repl_command`'s state machine is far larger than a test
-        // thread's stack.
-        let result = Box::pin(run_repl_command(
-            &mut ctx,
-            abort_signal,
-            ".compress session",
-        ))
-        .await;
+            // Boxed: `run_repl_command`'s state machine is far larger than a
+            // test thread's stack.
+            let result = Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal,
+                ".compress session",
+            ))
+            .await;
 
-        assert!(result.is_err(), "compressing an empty session must fail");
+            assert!(result.is_err(), "compressing an empty session must fail");
+        });
         assert_eq!(
             test_sink::snapshot()
                 .iter()
@@ -2231,27 +2259,29 @@ mod tests {
             .count()
     }
 
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn compress_command_success_fires_session_compressed_once() {
+    fn compress_command_success_fires_session_compressed_once() {
         let _sink = test_sink::install();
         let marker = "compress-ok-w2p";
-        let mut ctx = compressible_ctx(marker);
-        let abort_signal = create_abort_signal();
+        run_async(async {
+            let mut ctx = compressible_ctx(marker);
+            let abort_signal = create_abort_signal();
 
-        // Boxed: `run_repl_command`'s state machine is far larger than a test
-        // thread's stack.
-        let result = Box::pin(run_repl_command(
-            &mut ctx,
-            abort_signal,
-            ".compress session",
-        ))
-        .await;
+            // Boxed: `run_repl_command`'s state machine is far larger than a
+            // test thread's stack.
+            let result = Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal,
+                ".compress session",
+            ))
+            .await;
 
-        assert!(
-            result.is_ok(),
-            "dry-run compression must succeed: {result:?}"
-        );
+            assert!(
+                result.is_ok(),
+                "dry-run compression must succeed: {result:?}"
+            );
+        });
         assert_eq!(
             session_compressed_count(marker),
             1,
@@ -2259,17 +2289,18 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn auto_compress_success_fires_session_compressed_once() {
+    fn auto_compress_success_fires_session_compressed_once() {
         // Covers the ask-loop call site through its extracted seam;
         // driving `needs_compression` itself requires a full LLM turn and
         // is exercised end-to-end by integration coverage, not here.
         let _sink = test_sink::install();
         let marker = "auto-compress-ok-f8r";
-        let mut ctx = compressible_ctx(marker);
-
-        auto_compress_session(&mut ctx).await;
+        run_async(async {
+            let mut ctx = compressible_ctx(marker);
+            auto_compress_session(&mut ctx).await;
+        });
 
         assert_eq!(
             session_compressed_count(marker),
@@ -2278,17 +2309,18 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn auto_compress_failure_fires_no_session_compressed_and_swallows_error() {
+    fn auto_compress_failure_fires_no_session_compressed_and_swallows_error() {
         let _sink = test_sink::install();
         let marker = "auto-compress-fail-d3k";
-        let mut ctx = compressible_ctx(marker);
-        // An empty session makes compress_session fail; the seam must
-        // swallow the error (no panic, no propagation) and fire nothing.
-        ctx.session = Some(Session::default());
-
-        auto_compress_session(&mut ctx).await;
+        run_async(async {
+            let mut ctx = compressible_ctx(marker);
+            // An empty session makes compress_session fail; the seam must
+            // swallow the error (no panic, no propagation) and fire nothing.
+            ctx.session = Some(Session::default());
+            auto_compress_session(&mut ctx).await;
+        });
 
         assert_eq!(
             session_compressed_count(marker),
