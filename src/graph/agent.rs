@@ -6,6 +6,7 @@ use super::types::AgentNode;
 use super::wall_clock;
 use crate::config::RequestContext;
 use crate::function::agents::run_agent_for_graph;
+use crate::hooks::{self, HookEvent};
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
 use crate::utils::create_abort_signal;
 use anyhow::{Context, Error, Result, anyhow};
@@ -35,6 +36,14 @@ impl AgentNodeExecutor {
         parent_ctx: &mut RequestContext,
         retire_peer_on_return: bool,
     ) -> Result<AgentExecutionOutcome> {
+        // The teammate identity doubles as the agent's id for observers; the
+        // run consumes it off the ctx, so it is captured up front. Nodes
+        // without one are identified by their node id.
+        let agent_hook_id = parent_ctx
+            .peer_assignment
+            .as_ref()
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| node_id.to_string());
         let result = run(
             node_id,
             node,
@@ -43,6 +52,21 @@ impl AgentNodeExecutor {
             retire_peer_on_return,
         )
         .await;
+        // Fired at the point of failure, before a declared fallback converts
+        // it into a successful route: observers must see the agent's failure
+        // even when the node itself continues.
+        if let Err(e) = &result {
+            hooks::fire(
+                HookEvent::AgentFailed,
+                parent_ctx,
+                &[
+                    ("COYOTE_AGENT_ID", agent_hook_id),
+                    ("COYOTE_AGENT_NAME", node.agent.clone()),
+                    ("COYOTE_AGENT_ERROR", format!("{e:#}")),
+                ],
+                None,
+            );
+        }
         outcome_from(node_id, node, state_manager, result)
     }
 }
