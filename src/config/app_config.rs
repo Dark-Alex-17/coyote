@@ -807,7 +807,7 @@ mod tests {
 
     #[test]
     fn from_config_copies_hooks() {
-        let mut hooks = crate::hooks::HooksMap::new();
+        let mut hooks = HooksMap::new();
         hooks.insert(
             "turn.completed".to_string(),
             vec![crate::hooks::HookDef {
@@ -845,7 +845,7 @@ mod tests {
         let env_name = get_env_name("hooks");
         let prev = env::var_os(&env_name);
 
-        let mut hooks = crate::hooks::HooksMap::new();
+        let mut hooks = HooksMap::new();
         hooks.insert(
             "turn.completed".to_string(),
             vec![crate::hooks::HookDef {

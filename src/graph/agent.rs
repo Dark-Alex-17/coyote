@@ -36,9 +36,6 @@ impl AgentNodeExecutor {
         parent_ctx: &mut RequestContext,
         retire_peer_on_return: bool,
     ) -> Result<AgentExecutionOutcome> {
-        // The teammate identity doubles as the agent's id for observers; the
-        // run consumes it off the ctx, so it is captured up front. Nodes
-        // without one are identified by their node id.
         let agent_hook_id = parent_ctx
             .peer_assignment
             .as_ref()
@@ -52,9 +49,6 @@ impl AgentNodeExecutor {
             retire_peer_on_return,
         )
         .await;
-        // Fired at the point of failure, before a declared fallback converts
-        // it into a successful route: observers must see the agent's failure
-        // even when the node itself continues.
         if let Err(e) = &result {
             hooks::fire(
                 HookEvent::AgentFailed,

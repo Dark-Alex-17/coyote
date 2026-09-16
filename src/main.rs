@@ -706,11 +706,6 @@ async fn shell_execute(
                     if code == 0 && app.save_shell_history {
                         let _ = append_to_shell_history(&shell.name, &eval_str, code);
                     }
-                    // `process::exit` never returns, so the dispatch
-                    // wrapper's bracket close in `run()` is unreachable
-                    // from here: close the top-level agent bracket now.
-                    // The agent run itself succeeded — the exit code
-                    // belongs to the user's shell command, not to us.
                     ctx.top_level_agent_finished(None);
                     hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
                     process::exit(code);
@@ -760,9 +755,6 @@ async fn shell_execute(
     Ok(())
 }
 
-/// The LLM portion of one shell-execute turn — everything the turn bracket
-/// measures. The interactive follow-up menu (execute/revise/describe/copy)
-/// runs after the turn has already completed.
 async fn shell_execute_turn(
     ctx: &mut RequestContext,
     input: &Input,

@@ -514,12 +514,6 @@ fn provision_frontier_peers(
     (Some(registry), assignments)
 }
 
-/// Pre-resolved `graph.node.completed`/`graph.node.failed` snapshots plus
-/// the metadata one branch task needs to fire them. Captured per branch
-/// before the branch is spawned: every parallel super-step branch owns its
-/// emitter, so node metadata never crosses between concurrent tasks and no
-/// task borrows the context it was forked from. Base envs are rebuilt at
-/// fire time so the timestamp reflects when the node actually finished.
 struct NodeHookEmitter {
     completed: Vec<ResolvedHook>,
     failed: Vec<ResolvedHook>,
@@ -1152,8 +1146,8 @@ mod integration_tests {
         which::which(name).is_ok()
     }
 
-    fn hooks_config(entries: &[(&str, &str)]) -> crate::hooks::HooksMap {
-        let mut map = crate::hooks::HooksMap::new();
+    fn hooks_config(entries: &[(&str, &str)]) -> hooks::HooksMap {
+        let mut map = hooks::HooksMap::new();
         for (event, name) in entries {
             map.entry((*event).to_string()).or_default().push(HookDef {
                 name: (*name).to_string(),
@@ -1163,7 +1157,7 @@ mod integration_tests {
         map
     }
 
-    fn ctx_with_global_hooks(hooks: crate::hooks::HooksMap) -> RequestContext {
+    fn ctx_with_global_hooks(hooks: hooks::HooksMap) -> RequestContext {
         let mut app = AppState::test_default();
         app.config = Arc::new(AppConfig {
             hooks,
@@ -1172,8 +1166,8 @@ mod integration_tests {
         RequestContext::new(Arc::new(app), WorkingMode::Cmd)
     }
 
-    fn hook_captures_named(name: &str) -> Vec<crate::hooks::test_sink::Capture> {
-        crate::hooks::test_sink::snapshot()
+    fn hook_captures_named(name: &str) -> Vec<hooks::test_sink::Capture> {
+        hooks::test_sink::snapshot()
             .into_iter()
             .filter(|capture| capture.hook_name == name)
             .collect()
@@ -1328,7 +1322,7 @@ nodes:
     /// node also yields `graph.node.completed`, never `graph.node.failed`.
     #[tokio::test]
     async fn agent_node_failure_with_fallback_fires_agent_failed_and_node_completed() {
-        let _sink = crate::hooks::test_sink::install();
+        let _sink = hooks::test_sink::install();
         let mut ctx = ctx_with_global_hooks(hooks_config(&[
             ("agent.failed", "t037_fb_agent_failed"),
             ("graph.node.completed", "t037_fb_node_completed"),
@@ -1404,7 +1398,7 @@ nodes:
             eprintln!("skipping: bash not available");
             return;
         }
-        let _sink = crate::hooks::test_sink::install();
+        let _sink = hooks::test_sink::install();
         let ws = TestWorkspace::new();
         for script in [
             "dispatcher.sh",
@@ -1512,7 +1506,7 @@ nodes:
     /// event stays gated off because the agent whitelisted nothing.
     #[tokio::test]
     async fn graph_agent_hooks_resolve_from_graph_yaml_top_level() {
-        let _sink = crate::hooks::test_sink::install();
+        let _sink = hooks::test_sink::install();
         let mut ctx =
             ctx_with_global_hooks(hooks_config(&[("graph.node.completed", "t037_gy_global")]));
 
@@ -1571,7 +1565,7 @@ nodes:
     /// failure then propagates out of the executor.
     #[tokio::test]
     async fn genuine_node_failure_fires_graph_node_failed_with_payload() {
-        let _sink = crate::hooks::test_sink::install();
+        let _sink = hooks::test_sink::install();
         let mut ctx = ctx_with_global_hooks(hooks_config(&[(
             "graph.node.failed",
             "t037_gf_node_failed",
@@ -1626,7 +1620,7 @@ nodes:
     #[tokio::test]
     async fn malformed_graph_yaml_hook_is_skipped_without_breaking_the_node() {
         crate::testing::install_warn_collector();
-        let _sink = crate::hooks::test_sink::install();
+        let _sink = hooks::test_sink::install();
         let mut ctx = make_ctx();
 
         let yaml = r#"

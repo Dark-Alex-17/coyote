@@ -203,13 +203,6 @@ pub fn discover() -> Result<Vec<DiscoveredMixin>> {
     for path in collect_mixins(&paths::roles_dir(), &[ScanMode::Flat]) {
         out.push(read_mixin(path)?);
     }
-    // Mirrors the role-hook working directory (role hook commands run with
-    // cwd = roles_dir), so `./hooks/*.sbx-mixin.yaml` beside a role resolves
-    // the same way the role's hook commands do — intentionally NOT
-    // paths::hooks_dir(). The agent-hook working directory
-    // (`<agents>/<agent>/hooks/` — agent hooks run with cwd = the agent's
-    // data dir) is deliberately not scanned here either; agent-dir scanning
-    // above covers `<agents>/<agent>/*.sbx-mixin.yaml` only.
     for path in collect_mixins(&paths::roles_dir().join("hooks"), &[ScanMode::Flat]) {
         out.push(read_mixin(path)?);
     }

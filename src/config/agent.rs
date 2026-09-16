@@ -1489,7 +1489,7 @@ nodes:
     type: end
     output: done
 ";
-        let graph: graph::Graph = serde_yaml::from_str(yaml).unwrap();
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
 
         let config = AgentConfig::from_graph("g", &graph);
 

@@ -2418,6 +2418,7 @@ fn print_secret_summary(added: &[String], deferred: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
     use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
     use crate::sandbox::SANDBOX_ENV_FLAG;
     use crate::utils::get_env_name;
@@ -2710,8 +2711,6 @@ mod tests {
         assert!(out.functions_tools.is_none() && out.mcp_json.is_none());
     }
 
-    /// `--filter hooks` used to be an inert arm that always produced an empty
-    /// layout; it now selects the bundle's top-level hooks directory.
     #[test]
     fn apply_filter_hooks_keeps_only_hooks() {
         let l = RemoteLayout {
@@ -3624,8 +3623,9 @@ mod tests {
     fn assert_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(path).unwrap().permissions().mode();
-        assert!(
-            mode & 0o111 != 0,
+        assert_ne!(
+            mode & 0o111,
+            0,
             "{} must carry the executable bit",
             path.display()
         );
@@ -3932,7 +3932,7 @@ mod tests {
         }
         let _guard = TestVaultConfigGuard::new("prov-builtin");
 
-        crate::config::install_assets(crate::config::AssetCategory::Macros).unwrap();
+        config::install_assets(config::AssetCategory::Macros).unwrap();
 
         assert!(fs::read_dir(paths::macros_dir()).unwrap().next().is_some());
         assert!(!paths::installed_bundles_file().exists());
@@ -3957,7 +3957,7 @@ mod tests {
 
         // Capture outcomes before restoring the env var so a failed assertion
         // cannot leave the hooks-dir override pointing at a deleted temp dir.
-        let result = crate::config::install_assets(crate::config::AssetCategory::Hooks);
+        let result = config::install_assets(AssetCategory::Hooks);
         let installed = (
             hooks_dir.join("notify.sh").is_file(),
             hooks_dir.join("log-events.sh").is_file(),

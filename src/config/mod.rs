@@ -83,6 +83,7 @@ use crate::utils::*;
 pub use macros::macro_execute;
 
 use crate::config::macros::Macro;
+use crate::hooks;
 use crate::vault::{
     GlobalVault, Vault, create_vault_password_file, interpolate_secrets, prompt_provider_choice,
 };
@@ -420,7 +421,7 @@ pub fn install_builtins() -> Result<()> {
     Agent::install_builtin_agents(false)?;
     Macro::install_macros(false)?;
     Skill::install_builtin_skills(false)?;
-    crate::hooks::install_builtin_hooks(false)?;
+    hooks::install_builtin_hooks(false)?;
     Role::install_builtin_role_hooks(false)?;
     Ok(())
 }
@@ -522,7 +523,7 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
         AssetCategory::Macros => Macro::install_macros(true)?,
         AssetCategory::Functions => Functions::install_builtin_global_tools(true)?,
         AssetCategory::Skills => Skill::install_builtin_skills(true)?,
-        AssetCategory::Hooks => crate::hooks::install_builtin_hooks(true)?,
+        AssetCategory::Hooks => hooks::install_builtin_hooks(true)?,
         AssetCategory::McpConfig => Functions::install_mcp_config()?,
     }
 

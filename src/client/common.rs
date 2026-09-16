@@ -547,10 +547,6 @@ pub async fn create_openai_compatible_client_config(
     Ok(Some((model, clients)))
 }
 
-/// Base extras every `llm.request.*` event carries. The three transport
-/// functions below are the single seam family for these events: they cover
-/// every provider and every caller, so the `Client` trait and per-provider
-/// code stay uninstrumented.
 fn llm_request_extras(client: &dyn Client) -> Vec<(&'static str, String)> {
     vec![
         ("COYOTE_LLM_PROVIDER", client.name().to_string()),
@@ -567,10 +563,6 @@ fn llm_completed_extras(client: &dyn Client, started_at: Instant) -> Vec<(&'stat
     extras
 }
 
-/// `aborted` marks a user interrupt; otherwise the error is `api_error` when
-/// it bottoms out in an [`ApiStatusError`] (which also yields
-/// `COYOTE_LLM_STATUS`), else `other`. Abort paths that produce no error
-/// object report `Aborted.`.
 fn llm_failed_extras(
     client: &dyn Client,
     err: Option<&anyhow::Error>,
@@ -592,6 +584,7 @@ fn llm_failed_extras(
         err.map(|err| format!("{err:#}"))
             .unwrap_or_else(|| "Aborted.".to_string()),
     ));
+
     extras
 }
 
@@ -1136,6 +1129,7 @@ mod tests {
 
     use super::super::access_token::{is_rejected, set_access_token};
     use crate::config::{AppState, WorkingMode};
+    use anyhow::Error;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::Instant;
@@ -1352,8 +1346,8 @@ mod tests {
 
     /// Wrapped in `.context(...)` so every test below proves the downcast
     /// works through an anyhow context chain, as in the trait methods.
-    fn api_status_error(status: u16) -> anyhow::Error {
-        anyhow::Error::new(ApiStatusError {
+    fn api_status_error(status: u16) -> Error {
+        Error::new(ApiStatusError {
             status,
             message: format!("error (status: {status})"),
         })
@@ -1709,8 +1703,8 @@ mod tests {
             }
         }
 
-        fn error(&self) -> anyhow::Error {
-            anyhow::Error::new(ApiStatusError {
+        fn error(&self) -> Error {
+            Error::new(ApiStatusError {
                 status: self.status,
                 message: format!("error (status: {})", self.status),
             })
@@ -1757,7 +1751,7 @@ mod tests {
         }
     }
 
-    fn llm_hooks_map(marker: &str) -> crate::hooks::HooksMap {
+    fn llm_hooks_map(marker: &str) -> hooks::HooksMap {
         [
             "llm.request.started",
             "llm.request.completed",
@@ -1787,8 +1781,8 @@ mod tests {
         ctx
     }
 
-    fn llm_captures(marker: &str) -> Vec<crate::hooks::test_sink::Capture> {
-        crate::hooks::test_sink::snapshot()
+    fn llm_captures(marker: &str) -> Vec<hooks::test_sink::Capture> {
+        hooks::test_sink::snapshot()
             .into_iter()
             .filter(|capture| capture.hook_name == marker)
             .collect()
@@ -1802,7 +1796,7 @@ mod tests {
         let input = Input::from_str(&ctx, "hi", None).unwrap();
         let mut client = paced_client(false);
         client.nonstream_replies = true;
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         call_chat_completions(
             &input,
@@ -1838,7 +1832,7 @@ mod tests {
         let mut ctx = llm_hooked_ctx(marker);
         let input = Input::from_str(&ctx, "hi", None).unwrap();
         let client = FailingStatusClient::new(429);
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         let err = call_chat_completions(
             &input,
@@ -1885,7 +1879,7 @@ mod tests {
         let mut ctx = llm_hooked_ctx(marker);
         let input = Input::from_str(&ctx, "hi", None).unwrap();
         let client = paced_client(false);
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         call_chat_completions_streaming(&input, &client, &mut ctx, create_abort_signal())
             .await
@@ -1911,7 +1905,7 @@ mod tests {
             tokio::time::sleep(PACED_GAP * PACED_DELTAS as u32 + Duration::from_secs(30)).await;
             trigger.set_ctrlc();
         });
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         let err = call_chat_completions_streaming(&input, &client, &mut ctx, abort)
             .await
@@ -1936,7 +1930,7 @@ mod tests {
         let mut ctx = llm_hooked_ctx(marker);
         let input = Input::from_str(&ctx, "hi", None).unwrap();
         let client = paced_client(false);
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
             .await
@@ -1969,7 +1963,7 @@ mod tests {
             tokio::time::sleep(PACED_GAP * PACED_DELTAS as u32 + Duration::from_secs(30)).await;
             trigger.set_ctrlc();
         });
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         let err = call_chat_completions_streaming_quiet(&input, &client, &mut ctx, abort)
             .await
@@ -1997,7 +1991,7 @@ mod tests {
         let mut ctx = llm_hooked_ctx(marker);
         let input = Input::from_str(&ctx, "hi", None).unwrap();
         let client = FailingStatusClient::new(500);
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         let err =
             call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())

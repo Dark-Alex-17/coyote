@@ -4733,8 +4733,6 @@ impl RequestContext {
         }
         self.refresh_mcp_tool_filters();
         self.init_agent_session_variables(new_session)?;
-        // NEW sessions only, and only once the session is fully engaged on
-        // the context; resuming an existing session fires nothing.
         if created_new_session {
             hooks::fire(HookEvent::SessionStarted, self, &[], None);
         }
@@ -4933,24 +4931,18 @@ impl RequestContext {
         Ok(())
     }
 
-    /// Opens the top-level `agent.*` bracket: fires `agent.started` once per
-    /// agent-context lifetime when the ROOT context runs with a loaded agent
-    /// (headless `--agent` dispatch, or entering an agent interactively).
-    /// Spawned sub-agents are bracketed at their spawn seam instead, never
-    /// here. Synthesizes and stores `COYOTE_AGENT_ID` under the
-    /// `top-<agent-name>-<8-char alphanumeric nonce>` scheme; calling this
-    /// again while the bracket is open, or without an agent, is a no-op —
-    /// per-message granularity belongs to `turn.*`, not `agent.*`.
     pub fn top_level_agent_started(&mut self) {
         if self.top_level_agent_id.is_some() {
             return;
         }
+
         let Some(agent) = self.agent.as_ref() else {
             return;
         };
         let nonce = Alphanumeric.sample_string(&mut rand::rng(), 8);
         let id = format!("top-{}-{nonce}", agent.name());
         self.top_level_agent_id = Some(id.clone());
+
         hooks::fire(
             HookEvent::AgentStarted,
             self,
@@ -4959,15 +4951,11 @@ impl RequestContext {
         );
     }
 
-    /// Closes the top-level `agent.*` bracket: fires `agent.completed`, or
-    /// `agent.failed` carrying `COYOTE_AGENT_ERROR` when the run ended in an
-    /// error. No-op unless [`Self::top_level_agent_started`] opened the
-    /// bracket; the stored id is consumed so exactly one terminal event
-    /// fires per lifetime.
     pub fn top_level_agent_finished(&mut self, error: Option<&Error>) {
         let Some(id) = self.top_level_agent_id.take() else {
             return;
         };
+
         match error {
             None => hooks::fire(
                 HookEvent::AgentCompleted,

@@ -1695,11 +1695,6 @@ fn print_turn_divider() {
     println!();
 }
 
-/// Auto-compression seam for the ask loop: `session.compressed` fires only
-/// when compression actually succeeded. A failed auto-compression is
-/// survivable mid-session, so the error is logged and swallowed rather
-/// than aborting the turn — unlike `.compress session`, which surfaces
-/// the failure to the user.
 async fn auto_compress_session(ctx: &mut RequestContext) {
     match ctx.compress_session().await {
         Ok(()) => hooks::fire(HookEvent::SessionCompressed, ctx, &[], None),

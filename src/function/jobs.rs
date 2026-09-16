@@ -54,10 +54,6 @@ pub fn is_agent_task(supervisor: Option<&Arc<RwLock<Supervisor>>>, id: &str) -> 
         || supervisor.is_some_and(|sup| sup.read().has_agent(id))
 }
 
-/// Terminal-event hooks for one job, resolved on the caller's context before
-/// the task is spawned (`build_env_snapshot` precedent) so the detached
-/// closure owns everything it fires with. Session and agent names are
-/// snapshotted because the context is gone by fire time.
 struct JobHookSnapshot {
     completed: Vec<ResolvedHook>,
     failed: Vec<ResolvedHook>,
@@ -92,9 +88,11 @@ impl JobHookSnapshot {
         } else {
             (HookEvent::JobFailed, self.failed)
         };
+
         if resolved.is_empty() {
             return;
         }
+
         let base_envs = hooks::base_envs_parts(
             event,
             self.session_name.as_deref(),
@@ -104,9 +102,11 @@ impl JobHookSnapshot {
             ("COYOTE_JOB_ID", self.job_id),
             ("COYOTE_TOOL_NAME", self.tool),
         ];
+
         if let Some(error) = error {
             extras.push(("COYOTE_JOB_ERROR", error));
         }
+
         hooks::fire_resolved(event, resolved, base_envs, &extras, None);
     }
 }
@@ -3208,13 +3208,13 @@ mod tests {
         assert!(ctx.supervisor.is_none(), "no job may be spawned");
     }
 
-    fn job_hooks_map(marker: &str) -> crate::hooks::HooksMap {
+    fn job_hooks_map(marker: &str) -> hooks::HooksMap {
         ["job.started", "job.completed", "job.failed"]
             .into_iter()
             .map(|event| {
                 (
                     event.to_string(),
-                    vec![crate::hooks::HookDef {
+                    vec![hooks::HookDef {
                         name: marker.to_string(),
                         command: "true".to_string(),
                     }],
@@ -3230,8 +3230,8 @@ mod tests {
         RequestContext::new(app, WorkingMode::Cmd)
     }
 
-    fn job_captures(marker: &str) -> Vec<crate::hooks::test_sink::Capture> {
-        crate::hooks::test_sink::snapshot()
+    fn job_captures(marker: &str) -> Vec<hooks::test_sink::Capture> {
+        hooks::test_sink::snapshot()
             .into_iter()
             .filter(|capture| capture.hook_name == marker)
             .collect()
@@ -3245,7 +3245,7 @@ mod tests {
             let marker = "job-hooks-ok-x7x";
             let mut ctx = job_hooked_ctx(marker);
             ctx.declared_function_names.insert("echo".into());
-            let _guard = crate::hooks::test_sink::install();
+            let _guard = hooks::test_sink::install();
 
             let started = handle_start(&mut ctx, &json!({"tool": "echo", "arguments": {}}))
                 .await
@@ -3300,7 +3300,7 @@ mod tests {
             let marker = "job-hooks-fail-x7x";
             let mut ctx = job_hooked_ctx(marker);
             ctx.declared_function_names.insert("false".into());
-            let _guard = crate::hooks::test_sink::install();
+            let _guard = hooks::test_sink::install();
 
             let started = handle_start(&mut ctx, &json!({"tool": "false", "arguments": {}}))
                 .await
@@ -3344,7 +3344,7 @@ mod tests {
             filter.push_layer(LayerSource::Global, &[]);
             runtime.tool_filters.insert("fixture".to_string(), filter);
             ctx.tool_scope.mcp_runtime = runtime;
-            let _guard = crate::hooks::test_sink::install();
+            let _guard = hooks::test_sink::install();
 
             let started = handle_start(
                 &mut ctx,
@@ -3382,7 +3382,7 @@ mod tests {
     fn rejected_job_start_fires_no_hooks() {
         let marker = "job-hooks-rejected-x7x";
         let mut ctx = job_hooked_ctx(marker);
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         let result = run_async(handle_start(
             &mut ctx,

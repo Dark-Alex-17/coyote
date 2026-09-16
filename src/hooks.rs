@@ -248,10 +248,6 @@ fn push_defs(event_name: &str, defs: &[HookDef], cwd: &Path, out: &mut Vec<Resol
     }
 }
 
-/// Fires every hook configured for `event` in `ctx`. Fire-and-forget: each
-/// hook runs in its own detached task and nothing about its outcome — exit
-/// status, stdout, stderr — is awaited or read. `payload` carries the tool
-/// arguments JSON for `tool.*` events; pass `None` otherwise.
 #[allow(dead_code)]
 pub fn fire(
     event: HookEvent,
@@ -263,6 +259,7 @@ pub fn fire(
     if resolved.is_empty() {
         return;
     }
+
     fire_resolved(event, resolved, base_envs(event, ctx), extras, payload);
 }
 
@@ -407,9 +404,6 @@ pub(crate) fn base_envs_parts(
     envs
 }
 
-/// Creates the payload file fresh (`create_new`) with owner-only permissions,
-/// so a pre-existing path — symlink or otherwise — is an error. On failure
-/// the hook still runs, just without `COYOTE_HOOK_PAYLOAD_FILE`.
 async fn write_payload_file(path: &Path, json: &str) -> std::io::Result<()> {
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -423,9 +417,6 @@ async fn write_payload_file(path: &Path, json: &str) -> std::io::Result<()> {
 #[cfg(test)]
 static PAYLOAD_DIR_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Directory payload files are written to: `std::env::temp_dir()`, except in
-/// tests, where `PAYLOAD_DIR_OVERRIDE` redirects it without touching
-/// process-global state like `TMPDIR`.
 fn payload_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = PAYLOAD_DIR_OVERRIDE

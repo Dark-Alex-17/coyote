@@ -1539,12 +1539,6 @@ impl ToolCall {
         Ok(result)
     }
 
-    /// Evaluates the call, firing `tool.*` hooks around it: `tool.started`
-    /// once the name and arguments are resolved, then exactly one of
-    /// `tool.completed` / `tool.failed`. A failure before resolution
-    /// (unknown tool, malformed arguments) fires `tool.failed` alone. Hooks
-    /// are pure observers — the returned value is exactly what the tool
-    /// produced.
     pub async fn eval(&self, ctx: &mut RequestContext) -> Result<Value> {
         let result = self.eval_inner(ctx).await;
         if let Err(err) = &result {
@@ -5308,13 +5302,13 @@ mod tests {
         }
     }
 
-    fn tool_hooks_map(marker: &str) -> crate::hooks::HooksMap {
+    fn tool_hooks_map(marker: &str) -> hooks::HooksMap {
         ["tool.started", "tool.completed", "tool.failed"]
             .into_iter()
             .map(|event| {
                 (
                     event.to_string(),
-                    vec![crate::hooks::HookDef {
+                    vec![hooks::HookDef {
                         name: marker.to_string(),
                         command: "true".to_string(),
                     }],
@@ -5334,8 +5328,8 @@ mod tests {
         RequestContext::new(Arc::new(app), WorkingMode::Cmd)
     }
 
-    fn tool_captures(marker: &str) -> Vec<crate::hooks::test_sink::Capture> {
-        crate::hooks::test_sink::snapshot()
+    fn tool_captures(marker: &str) -> Vec<hooks::test_sink::Capture> {
+        hooks::test_sink::snapshot()
             .into_iter()
             .filter(|capture| capture.hook_name == marker)
             .collect()
@@ -5351,7 +5345,7 @@ mod tests {
             config.auto_continue = true;
         });
         ctx.tool_scope.functions.append_todo_functions();
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         let output =
             run_async(call_with_args("todo__init", json!({"goal": "g"})).eval(&mut ctx)).unwrap();
@@ -5389,7 +5383,7 @@ mod tests {
             ctx.tool_scope
                 .functions
                 .append_mcp_meta_functions(vec![tools_only("fixture")]);
-            let _guard = crate::hooks::test_sink::install();
+            let _guard = hooks::test_sink::install();
 
             let output = call_with_args("mcp_invoke_fixture", json!({"tool": "dup"}))
                 .eval(&mut ctx)
@@ -5424,7 +5418,7 @@ mod tests {
                 parameters: JsonSchema::default(),
                 agent: false,
             });
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         let output = run_async(call_with_args("echo", json!({"x": 1})).eval(&mut ctx)).unwrap();
 
@@ -5454,7 +5448,7 @@ mod tests {
                 parameters: JsonSchema::default(),
                 agent: false,
             });
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         let output = run_async(call_with_args("false", json!({})).eval(&mut ctx)).unwrap();
 
@@ -5485,7 +5479,7 @@ mod tests {
         let mut plain = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         plain.tool_scope.functions.append_todo_functions();
         let call = call_with_args("todo__done", json!({}));
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         let hooked_output = run_async(call.eval(&mut hooked)).unwrap();
         let plain_output = run_async(call.eval(&mut plain)).unwrap();
@@ -5517,7 +5511,7 @@ mod tests {
         let marker = "tool-hooks-user-x7x";
         let mut ctx = ctx_with_tool_hooks(marker, |_| {});
         ctx.tool_scope.functions.append_user_interaction_functions();
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         let output = run_async(call_with_args("user__confirm", json!({})).eval(&mut ctx)).unwrap();
 
@@ -5554,7 +5548,7 @@ mod tests {
         let mut hooked = ctx_with_tool_hooks(marker, |_| {});
         let mut plain = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         let call = call_with_args("nonexistent_tool", json!({}));
-        let _guard = crate::hooks::test_sink::install();
+        let _guard = hooks::test_sink::install();
 
         let hooked_err = run_async(call.eval(&mut hooked)).unwrap_err();
         let plain_err = run_async(call.eval(&mut plain)).unwrap_err();

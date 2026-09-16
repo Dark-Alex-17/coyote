@@ -15,16 +15,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-/// Hidden per-directory record of the files the builtin installer shipped
-/// there. Format: one plain filename per line (LF-separated, sorted); no
-/// path separators, and never the manifest itself. Written non-executable
-/// through the same atomic-write path as other installed files.
 pub(crate) const BUILTIN_MANIFEST_FILE: &str = ".builtin-manifest";
 
-/// True when `name` aliases the manifest file on some real-world filesystem:
-/// the comparison ignores trailing dots/spaces (Windows strips them at
-/// creation) and folds Unicode case (case-insensitive APFS/NTFS volumes fold
-/// beyond ASCII, e.g. U+017F ſ → s).
 pub(crate) fn is_builtin_manifest_name(name: &str) -> bool {
     name.trim_end_matches(['.', ' '])
         .to_uppercase()
@@ -36,8 +28,8 @@ pub(crate) fn is_builtin_manifest_name(name: &str) -> bool {
 /// absent from `shipped`. The manifest is then rewritten to the names this
 /// installer actually owns: files written this run (`written`), plus shipped
 /// names it already owned, plus stale files whose removal failed (kept so a
-/// later run retries). A shipped name the installer declined to write — a
-/// pre-existing user file with a colliding name — is never claimed.
+/// later run retries). A shipped name the installer declined to write (e.g., a
+/// pre-existing user file with a colliding name) is never claimed.
 ///
 /// Failure modes degrade toward keeping files: a missing or unreadable
 /// manifest yields no deletions, and entries that are not plain filenames
@@ -137,8 +129,9 @@ fn write_manifest(dir: &Path, names: &BTreeSet<String>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::utils;
+    use std::path::PathBuf;
 
-    fn fresh_dir(label: &str) -> std::path::PathBuf {
+    fn fresh_dir(label: &str) -> PathBuf {
         let dir = utils::temp_file(label, "");
         fs::create_dir_all(&dir).unwrap();
         dir

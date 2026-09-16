@@ -1039,9 +1039,9 @@ Input 1
             .collect()
     }
 
-    fn hooks_fixture_dir(label: &str) -> std::path::PathBuf {
-        let dir = crate::utils::temp_file(label, "");
-        std::fs::create_dir_all(&dir).unwrap();
+    fn hooks_fixture_dir(label: &str) -> PathBuf {
+        let dir = temp_file(label, "");
+        create_dir_all(&dir).unwrap();
         dir.join("hooks")
     }
 
@@ -1052,55 +1052,42 @@ Input 1
         install_and_reconcile_role_hooks(&dir, &fixture(&[("a.sh", "#!/bin/sh\n")]), false)
             .unwrap();
 
+        assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "#!/bin/sh\n");
         assert_eq!(
-            std::fs::read_to_string(dir.join("a.sh")).unwrap(),
-            "#!/bin/sh\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE)).unwrap(),
+            read_to_string(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE)).unwrap(),
             "a.sh\n"
         );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.join("a.sh"))
+            let mode = fs::metadata(dir.join("a.sh")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "role hook scripts install executable");
+            let manifest_mode = fs::metadata(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE))
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_eq!(mode & 0o777, 0o755, "role hook scripts install executable");
-            let manifest_mode =
-                std::fs::metadata(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE))
-                    .unwrap()
-                    .permissions()
-                    .mode();
             assert_eq!(
                 manifest_mode & 0o111,
                 0,
                 "the manifest must never be executable"
             );
         }
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[test]
     fn role_hooks_install_overwrites_only_with_force() {
         let dir = hooks_fixture_dir("role-hooks-force-");
         let shipped = fixture(&[("a.sh", "new content\n")]);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.sh"), "SENTINEL").unwrap();
+        create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.sh"), "SENTINEL").unwrap();
 
         install_and_reconcile_role_hooks(&dir, &shipped, false).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("a.sh")).unwrap(),
-            "SENTINEL"
-        );
+        assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "SENTINEL");
 
         install_and_reconcile_role_hooks(&dir, &shipped, true).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("a.sh")).unwrap(),
-            "new content\n"
-        );
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "new content\n");
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[test]
@@ -1113,7 +1100,7 @@ Input 1
             false,
         )
         .unwrap();
-        std::fs::write(dir.join("user.sh"), "user-owned").unwrap();
+        fs::write(dir.join("user.sh"), "user-owned").unwrap();
 
         install_and_reconcile_role_hooks(&dir, &fixture(&[("keep.sh", "#!/bin/sh\n")]), false)
             .unwrap();
@@ -1125,17 +1112,17 @@ Input 1
         assert!(dir.join("keep.sh").exists());
         assert!(dir.join("user.sh").exists(), "user file survives reconcile");
         assert_eq!(
-            std::fs::read_to_string(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE)).unwrap(),
+            read_to_string(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE)).unwrap(),
             "keep.sh\n"
         );
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[test]
     fn role_hooks_never_claim_a_preexisting_user_file() {
         let dir = hooks_fixture_dir("role-hooks-unclaimed-");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.sh"), "user-owned").unwrap();
+        create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.sh"), "user-owned").unwrap();
 
         install_and_reconcile_role_hooks(&dir, &fixture(&[("a.sh", "#!/bin/sh\n")]), false)
             .unwrap();
@@ -1146,11 +1133,11 @@ Input 1
 
         install_and_reconcile_role_hooks(&dir, &[], false).unwrap();
         assert_eq!(
-            std::fs::read_to_string(dir.join("a.sh")).unwrap(),
+            read_to_string(dir.join("a.sh")).unwrap(),
             "user-owned",
             "the user file survives the hook being dropped from the embed"
         );
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[test]
@@ -1160,6 +1147,6 @@ Input 1
         install_and_reconcile_role_hooks(&dir, &[], false).unwrap();
 
         assert!(!dir.exists(), "an empty shipped set must not create hooks/");
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 }

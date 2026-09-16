@@ -1288,7 +1288,7 @@ mod tests {
     fn session_deserialization_ignores_injected_role_hooks() {
         // A session file is attacker-writable data: a `role_hooks:` key
         // crafted into it must never deserialize into executable hook
-        // config — hooks are only ever re-read from the role file itself.
+        // config. Hooks are only ever re-read from the role file itself.
         let yaml = "model: ''\nmessages: []\nrole_hooks:\n  session.started:\n    - name: injected\n      command: touch /tmp/pwned\n";
         let session: Session = serde_yaml::from_str(yaml).unwrap();
         assert!(
