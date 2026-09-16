@@ -1565,6 +1565,120 @@ nodes:
         );
     }
 
+    /// A node that genuinely fails — no fallback to absorb the error — fires
+    /// `graph.node.failed` with the full payload observers rely on: the node's
+    /// id and type, a numeric duration, and the error text, even though the
+    /// failure then propagates out of the executor.
+    #[tokio::test]
+    async fn genuine_node_failure_fires_graph_node_failed_with_payload() {
+        let _sink = crate::hooks::test_sink::install();
+        let mut ctx = ctx_with_global_hooks(hooks_config(&[(
+            "graph.node.failed",
+            "t037_gf_node_failed",
+        )]));
+        // Forces the agent node to fail before it ever loads the (absent)
+        // agent from disk, keeping the test hermetic.
+        ctx.current_depth = crate::config::default_max_agent_depth();
+
+        let yaml = r#"
+name: t
+settings:
+  validate_before_run: false
+start: worker
+nodes:
+  worker:
+    type: agent
+    agent: missing_agent
+    prompt: p
+    next: done
+  done:
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, ".")
+            .execute(&mut ctx, abort)
+            .await;
+        let error = result.expect_err("a node failure without a fallback must propagate");
+
+        let failed = hook_captures_named("t037_gf_node_failed");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        let envs = &failed[0].envs;
+        assert_eq!(envs["COYOTE_EVENT"], "graph.node.failed");
+        assert_eq!(envs["COYOTE_NODE_ID"], "worker");
+        assert_eq!(envs["COYOTE_NODE_TYPE"], "agent");
+        let duration = &envs["COYOTE_NODE_DURATION_MS"];
+        let _: u128 = duration
+            .parse()
+            .unwrap_or_else(|_| panic!("non-numeric duration: {duration}"));
+        assert!(!envs["COYOTE_NODE_ERROR"].is_empty(), "{envs:?}");
+        assert!(
+            format!("{error:#}").contains("Max agent depth exceeded"),
+            "unexpected executor error: {error:#}"
+        );
+    }
+
+    /// A malformed hook definition reaching the executor seam through
+    /// graph.yaml's top level — an entry whose command is blank — degrades
+    /// safely: the node still runs, the malformed hook is skipped with a
+    /// debug log, and a well-formed sibling on the same event still fires.
+    #[tokio::test]
+    async fn malformed_graph_yaml_hook_is_skipped_without_breaking_the_node() {
+        crate::testing::install_warn_collector();
+        let _sink = crate::hooks::test_sink::install();
+        let mut ctx = make_ctx();
+
+        let yaml = r#"
+name: hooked_graph
+settings:
+  validate_before_run: false
+start: done
+hooks:
+  graph.node.completed:
+    - name: t037_mal_empty
+      command: "   "
+    - name: t037_mal_valid
+      command: "true"
+nodes:
+  done:
+    type: end
+    output: ok
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        ctx.agent = Some(Agent::test_new(AgentConfig::from_graph(
+            "hooked_graph",
+            &graph,
+        )));
+
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, ".")
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+        assert_eq!(result, "ok");
+
+        assert!(
+            hook_captures_named("t037_mal_empty").is_empty(),
+            "a blank-command hook must be skipped, not dispatched"
+        );
+        let valid = hook_captures_named("t037_mal_valid");
+        assert_eq!(valid.len(), 1, "{valid:?}");
+        assert_eq!(valid[0].envs["COYOTE_NODE_ID"], "done");
+
+        let debugs: Vec<String> = crate::testing::debug_messages()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(
+            debugs
+                .iter()
+                .any(|message| message.contains("t037_mal_empty")
+                    && message.contains("empty command")),
+            "expected a debug log for the skipped hook: {debugs:?}"
+        );
+    }
+
     /// Declared variables are seeded into state at run start, so the agent
     /// node's strict prompt interpolation of `{{foo}}` succeeds instead of
     /// bailing with "not found in state". `ctx.agent` is None here, so each
