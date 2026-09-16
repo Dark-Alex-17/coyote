@@ -3,6 +3,7 @@ use super::todo::TodoList;
 use super::*;
 
 use crate::client::{Message, MessageContent, MessageRole, TokenUsage};
+use crate::hooks::HooksMap;
 use crate::render::MarkdownRender;
 
 use anyhow::{Context, Result, bail};
@@ -113,6 +114,8 @@ pub struct Session {
     #[serde(skip)]
     role_prompt: String,
     #[serde(skip)]
+    role_hooks: Option<HooksMap>,
+    #[serde(skip)]
     name: String,
     #[serde(skip)]
     path: Option<String>,
@@ -193,6 +196,7 @@ impl Session {
             && let Ok(role) = ctx.retrieve_role(app, role_name)
         {
             session.role_prompt = role.prompt().to_string();
+            session.role_hooks = role.hooks().cloned();
         }
 
         session.update_tokens();
@@ -252,6 +256,13 @@ impl Session {
 
     pub fn role_name(&self) -> Option<&str> {
         self.role_name.as_deref()
+    }
+
+    /// Hooks of the role this session holds. `set_role` snapshots them
+    /// because only the frontmatter-stripped role prompt is persisted;
+    /// `load_from_ctx` restores them by re-reading the role file on resume.
+    pub fn role_hooks(&self) -> Option<&HooksMap> {
+        self.role_hooks.as_ref()
     }
 
     pub fn dirty(&self) -> bool {
@@ -561,6 +572,7 @@ impl Session {
         self.model = role.model().clone();
         self.role_name = convert_option_string(role.name());
         self.role_prompt = role.prompt().to_string();
+        self.role_hooks = role.hooks().cloned();
         self.dirty = true;
         self.update_tokens();
     }
@@ -568,11 +580,13 @@ impl Session {
     pub fn clear_role(&mut self) {
         self.role_name = None;
         self.role_prompt.clear();
+        self.role_hooks = None;
     }
 
     pub fn sync_agent(&mut self, agent: &Agent) {
         self.role_name = None;
         self.role_prompt = agent.interpolated_instructions();
+        self.role_hooks = None;
         self.agent_variables = agent.variables().clone();
         self.agent_instructions = self.role_prompt.clone();
         if let Some(threshold) = agent.compression_threshold() {
@@ -1109,6 +1123,25 @@ mod tests {
         assert_eq!(session.name(), "");
         assert_eq!(session.role_name(), None);
         assert!(!session.dirty());
+    }
+
+    #[test]
+    fn set_role_captures_and_clear_role_drops_role_hooks() {
+        let content = "---\nhooks:\n  turn.completed:\n    - name: role-probe\n      command: role-cmd\n---\nPrompt";
+        let mut session = Session::default();
+
+        session.set_role(Role::new("hooked", content));
+        let hooks = session.role_hooks().expect("set_role must snapshot hooks");
+        assert_eq!(hooks["turn.completed"][0].name, "role-probe");
+
+        session.clear_role();
+        assert!(session.role_hooks().is_none());
+
+        session.set_role(Role::new("plain", "No frontmatter"));
+        assert!(
+            session.role_hooks().is_none(),
+            "a role without hooks must not leave a stale snapshot"
+        );
     }
 
     fn push_interrupted_turn(session: &mut Session) {

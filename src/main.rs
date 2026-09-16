@@ -23,7 +23,8 @@ extern crate log;
 
 use crate::cli::Cli;
 use crate::client::{
-    ModelType, call_chat_completions, call_chat_completions_streaming, catalog, list_models, oauth,
+    Client, ModelType, call_chat_completions, call_chat_completions_streaming, catalog,
+    list_models, oauth,
 };
 use crate::config::instructions::WORKSPACE_INSTRUCTIONS_FILE_NAME;
 use crate::config::{
@@ -36,7 +37,7 @@ use crate::config::{memory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::mcp::McpServersConfig;
 use crate::render::{prompt_theme, render_error};
-use crate::repl::Repl;
+use crate::repl::{EXIT_HOOK_DRAIN_TIMEOUT, Repl, TurnBracket};
 use crate::utils::*;
 use crate::vault::{Vault, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
@@ -387,6 +388,7 @@ async fn run(
         let app = Arc::clone(&ctx.app.config);
         ctx.use_agent(app.as_ref(), agent, session, abort_signal.clone())
             .await?;
+        ctx.top_level_agent_started();
     } else {
         let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
         if let Some(prompt) = &cli.temp_role {
@@ -523,9 +525,14 @@ async fn run(
         return Ok(());
     }
     if cli.execute && !is_repl {
-        let input = create_input(&ctx, text, &cli.file, abort_signal.clone()).await?;
-        shell_execute(&mut ctx, &SHELL, input, abort_signal.clone()).await?;
-        return Ok(());
+        let result = async {
+            let input = create_input(&ctx, text, &cli.file, abort_signal.clone()).await?;
+            shell_execute(&mut ctx, &SHELL, input, abort_signal.clone()).await
+        }
+        .await;
+        ctx.top_level_agent_finished(result.as_ref().err());
+        hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
+        return result;
     }
 
     {
@@ -545,9 +552,15 @@ async fn run(
 
     match is_repl {
         false => {
-            let mut input = create_input(&ctx, text, &cli.file, abort_signal.clone()).await?;
-            input.use_embeddings(abort_signal.clone()).await?;
-            start_directive(&mut ctx, input, cli.code, abort_signal).await
+            let result = async {
+                let mut input = create_input(&ctx, text, &cli.file, abort_signal.clone()).await?;
+                input.use_embeddings(abort_signal.clone()).await?;
+                start_directive(&mut ctx, input, cli.code, abort_signal.clone()).await
+            }
+            .await;
+            ctx.top_level_agent_finished(result.as_ref().err());
+            hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
+            result
         }
         true => {
             if !*IS_STDOUT_TERMINAL {
@@ -560,6 +573,17 @@ async fn run(
 }
 
 async fn start_directive(
+    ctx: &mut RequestContext,
+    input: Input,
+    code_mode: bool,
+    abort_signal: AbortSignal,
+) -> Result<()> {
+    let bracket = TurnBracket::enter(ctx);
+    let result = start_directive_inner(ctx, input, code_mode, abort_signal.clone()).await;
+    bracket.finish(ctx, &abort_signal, result)
+}
+
+async fn start_directive_inner(
     ctx: &mut RequestContext,
     input: Input,
     code_mode: bool,
@@ -639,22 +663,10 @@ async fn shell_execute(
     abort_signal: AbortSignal,
 ) -> Result<()> {
     let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
-    let client = input.create_client()?;
-    ctx.before_chat_completion(&input)?;
-    let (eval_str, _) = call_chat_completions(
-        &input,
-        false,
-        true,
-        client.as_ref(),
-        ctx,
-        abort_signal.clone(),
-    )
-    .await?;
-
-    ctx.after_chat_completion(app.as_ref(), &input, &eval_str, &[])?;
-    if eval_str.is_empty() {
-        bail!("No command generated");
-    }
+    // Each revision round is its own turn: the recursive 'r' call re-enters.
+    let bracket = TurnBracket::enter(ctx);
+    let result = shell_execute_turn(ctx, &input, abort_signal.clone()).await;
+    let (client, eval_str) = bracket.finish(ctx, &abort_signal, result)?;
     if app.dry_run {
         app.print_markdown(&eval_str)?;
         return Ok(());
@@ -680,6 +692,7 @@ async fn shell_execute(
                     if code == 0 && app.save_shell_history {
                         let _ = append_to_shell_history(&shell.name, &eval_str, code);
                     }
+                    hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
                     process::exit(code);
                 }
                 'r' => {
@@ -725,6 +738,27 @@ async fn shell_execute(
         println!("{eval_str}");
     }
     Ok(())
+}
+
+/// The LLM portion of one shell-execute turn — everything the turn bracket
+/// measures. The interactive follow-up menu (execute/revise/describe/copy)
+/// runs after the turn has already completed.
+async fn shell_execute_turn(
+    ctx: &mut RequestContext,
+    input: &Input,
+    abort_signal: AbortSignal,
+) -> Result<(Box<dyn Client>, String)> {
+    let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
+    let client = input.create_client()?;
+    ctx.before_chat_completion(input)?;
+    let (eval_str, _) =
+        call_chat_completions(input, false, true, client.as_ref(), ctx, abort_signal).await?;
+
+    ctx.after_chat_completion(app.as_ref(), input, &eval_str, &[])?;
+    if eval_str.is_empty() {
+        bail!("No command generated");
+    }
+    Ok((client, eval_str))
 }
 
 async fn create_input(

@@ -97,9 +97,10 @@ impl RequestContext {
     /// (whitelisted through `global_hooks` when an agent is active), then
     /// role, then agent. Duplicate names across scopes all fire.
     ///
-    /// Role hooks resolve only while the role is held directly on the context;
-    /// a role held by an active session is not consulted, because sessions do
-    /// not carry hooks. Resolution through sessions is a call-site concern.
+    /// Role hooks resolve from the role held directly on the context or,
+    /// when the active role was moved into (or restored by) a session, from
+    /// the hooks snapshot the session captured via `Session::set_role` /
+    /// `Session::load_from_ctx`.
     #[allow(dead_code)]
     pub fn resolved_hooks(&self, event: HookEvent) -> Vec<ResolvedHook> {
         resolve_hooks(
@@ -108,7 +109,14 @@ impl RequestContext {
             self.agent
                 .as_ref()
                 .map(|agent| (agent.global_hooks(), agent.name())),
-            self.role.as_ref().and_then(|role| role.hooks()),
+            self.role
+                .as_ref()
+                .and_then(|role| role.hooks())
+                .or_else(|| {
+                    self.session
+                        .as_ref()
+                        .and_then(|session| session.role_hooks())
+                }),
             self.agent
                 .as_ref()
                 .map(|agent| (agent.hooks(), agent.name())),

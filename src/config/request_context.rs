@@ -50,6 +50,7 @@ use super::memory::{
     DEFAULT_MEMORY_CAP_WITH_TOOLS, DEFAULT_MEMORY_CAP_WITHOUT_TOOLS, MemoryStore, WorkspaceMemory,
 };
 use crate::graph;
+use crate::hooks::{self, HookEvent};
 use anyhow::{Context, Error, Result, bail};
 use colored::Colorize;
 use gman::providers::SupportedProvider;
@@ -59,6 +60,7 @@ use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Va
 use log::warn;
 use parking_lot::RwLock;
 use prompts::DEFAULT_SKILL_INSTRUCTIONS;
+use rand::distr::{Alphanumeric, SampleString};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
 use std::io::Write;
@@ -354,6 +356,13 @@ pub struct RequestContext {
 
     pub session_abort: Option<AbortSignal>,
 
+    /// Synthesized `COYOTE_AGENT_ID` for a top-level agent run (headless
+    /// `--agent` dispatch or an interactive agent context). Scheme:
+    /// `top-<agent-name>-<8-char alphanumeric nonce>`; spawned sub-agents
+    /// carry supervisor-issued ids instead. `Some` exactly while the
+    /// top-level `agent.*` bracket is open.
+    pub top_level_agent_id: Option<String>,
+
     pub render_mode: RenderMode,
 }
 
@@ -398,6 +407,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
+            top_level_agent_id: None,
             render_mode: RenderMode::default(),
         }
     }
@@ -469,6 +479,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
+            top_level_agent_id: None,
             render_mode: RenderMode::default(),
         };
         ctx.refresh_mcp_tool_filters();
@@ -529,6 +540,9 @@ impl RequestContext {
             auto_continue_paused: self.auto_continue_paused.clone(),
             pending_prefill: None,
             session_abort: self.session_abort.clone(),
+            // Branches never own the top-level `agent.*` bracket; only the
+            // root flow that opened it may fire its terminal event.
+            top_level_agent_id: None,
             render_mode: self.render_mode,
         }
     }
@@ -585,6 +599,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
+            top_level_agent_id: None,
             render_mode: parent.render_mode,
         }
     }
@@ -1054,6 +1069,12 @@ impl RequestContext {
     }
 
     pub fn exit_session(&mut self) -> Result<()> {
+        // Fired while the session is still attached so the hook sees
+        // COYOTE_SESSION_ID and session-held role hooks still resolve; no
+        // session means no event.
+        if self.session.is_some() {
+            hooks::fire(HookEvent::SessionEnded, self, &[], None);
+        }
         if let Some(mut session) = self.session.take() {
             let sessions_dir = self.sessions_dir();
             session.exit(&sessions_dir, self.working_mode.is_repl())?;
@@ -4613,6 +4634,7 @@ impl RequestContext {
             );
         }
         let mut session;
+        let mut created_new_session = false;
         match session_name {
             None | Some(TEMP_SESSION_NAME) => {
                 let session_file = self.session_file(TEMP_SESSION_NAME);
@@ -4622,11 +4644,13 @@ impl RequestContext {
                     })?;
                 }
                 session = Some(Session::new_from_ctx(self, app, TEMP_SESSION_NAME)?);
+                created_new_session = true;
             }
             Some(name) => {
                 let session_path = self.session_file(name);
                 if !session_path.exists() {
                     session = Some(Session::new_from_ctx(self, app, name)?);
+                    created_new_session = true;
                 } else {
                     session = Some(Session::load_from_ctx(self, app, name, &session_path)?);
                 }
@@ -4709,6 +4733,11 @@ impl RequestContext {
         }
         self.refresh_mcp_tool_filters();
         self.init_agent_session_variables(new_session)?;
+        // NEW sessions only, and only once the session is fully engaged on
+        // the context; resuming an existing session fires nothing.
+        if created_new_session {
+            hooks::fire(HookEvent::SessionStarted, self, &[], None);
+        }
         Ok(())
     }
 
@@ -4874,6 +4903,9 @@ impl RequestContext {
             tool_tracker,
         };
 
+        // Interactive switch-away closes the top-level agent bracket while
+        // the agent is still attached, so agent-scoped hooks resolve.
+        self.top_level_agent_finished(None);
         if self.agent.take().is_some() {
             if let Some(supervisor) = self.supervisor.clone() {
                 supervisor.read().cancel_recursive();
@@ -4899,6 +4931,60 @@ impl RequestContext {
             self.discontinuous_last_message();
         }
         Ok(())
+    }
+
+    /// Opens the top-level `agent.*` bracket: fires `agent.started` once per
+    /// agent-context lifetime when the ROOT context runs with a loaded agent
+    /// (headless `--agent` dispatch, or entering an agent interactively).
+    /// Spawned sub-agents are bracketed at their spawn seam instead, never
+    /// here. Synthesizes and stores `COYOTE_AGENT_ID` under the
+    /// `top-<agent-name>-<8-char alphanumeric nonce>` scheme; calling this
+    /// again while the bracket is open, or without an agent, is a no-op —
+    /// per-message granularity belongs to `turn.*`, not `agent.*`.
+    pub fn top_level_agent_started(&mut self) {
+        if self.top_level_agent_id.is_some() {
+            return;
+        }
+        let Some(agent) = self.agent.as_ref() else {
+            return;
+        };
+        let nonce = Alphanumeric.sample_string(&mut rand::rng(), 8);
+        let id = format!("top-{}-{nonce}", agent.name());
+        self.top_level_agent_id = Some(id.clone());
+        hooks::fire(
+            HookEvent::AgentStarted,
+            self,
+            &[("COYOTE_AGENT_ID", id)],
+            None,
+        );
+    }
+
+    /// Closes the top-level `agent.*` bracket: fires `agent.completed`, or
+    /// `agent.failed` carrying `COYOTE_AGENT_ERROR` when the run ended in an
+    /// error. No-op unless [`Self::top_level_agent_started`] opened the
+    /// bracket; the stored id is consumed so exactly one terminal event
+    /// fires per lifetime.
+    pub fn top_level_agent_finished(&mut self, error: Option<&Error>) {
+        let Some(id) = self.top_level_agent_id.take() else {
+            return;
+        };
+        match error {
+            None => hooks::fire(
+                HookEvent::AgentCompleted,
+                self,
+                &[("COYOTE_AGENT_ID", id)],
+                None,
+            ),
+            Some(err) => hooks::fire(
+                HookEvent::AgentFailed,
+                self,
+                &[
+                    ("COYOTE_AGENT_ID", id),
+                    ("COYOTE_AGENT_ERROR", format!("{err:#}")),
+                ],
+                None,
+            ),
+        }
     }
 
     pub async fn edit_role(&mut self, app: &AppConfig, abort_signal: AbortSignal) -> Result<()> {
@@ -5421,6 +5507,7 @@ mod tests {
     use crate::config::tool_scope::test_fixtures::{FixtureServer, fixture_runtime};
     use crate::function::jobs::RingBuf;
     use crate::function::{ToolCall, skill};
+    use crate::hooks::{HookDef, HooksMap, test_sink};
     use crate::mcp::{McpServer, McpServerFeatures, McpServersConfig, McpTransportType};
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
@@ -5428,6 +5515,7 @@ mod tests {
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
+    use anyhow::anyhow;
     use rmcp::model::PromptArgument;
     use serde_json::json;
     use serial_test::serial;
@@ -8228,6 +8316,349 @@ mod tests {
 
         ctx.exit_session().unwrap();
         assert!(ctx.session.is_none());
+    }
+
+    fn hooks_map_of(events: &[&str], marker: &str) -> HooksMap {
+        let mut map = HooksMap::default();
+        for event in events {
+            map.insert(
+                event.to_string(),
+                vec![HookDef {
+                    name: format!("{marker}-{event}"),
+                    command: "true".to_string(),
+                }],
+            );
+        }
+        map
+    }
+
+    fn marker_captures(marker: &str) -> Vec<test_sink::Capture> {
+        test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name.starts_with(marker))
+            .collect()
+    }
+
+    /// Writes an agent whose config carries agent-scoped hooks for every
+    /// `agent.*` event, named `<marker>-<event>`.
+    fn seed_agent_with_hooks(agent_name: &str, marker: &str) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        let mut config = format!("name: {agent_name}\ninstructions: hi\nhooks:\n");
+        for event in ["agent.started", "agent.completed", "agent.failed"] {
+            config.push_str(&format!(
+                "  {event}:\n    - name: {marker}-{event}\n      command: 'true'\n"
+            ));
+        }
+        write(agent_dir.join("config.yaml"), config).unwrap();
+    }
+
+    fn unique_name(prefix: &str) -> String {
+        format!(
+            "{prefix}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_fires_session_started_for_new_sessions_only() {
+        let _guard = TestConfigDirGuard::new();
+        let sessions_dir = paths::local_dir("sessions");
+        create_dir_all(&sessions_dir).unwrap();
+        let _sink = test_sink::install();
+        let marker = "sess-started-q8n";
+
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.started"], marker));
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_session(&app, Some("hook-fresh"), abort.clone())).unwrap();
+
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 1, "a new session fires exactly one event");
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_SESSION_ID")
+                .map(String::as_str),
+            Some("hook-fresh")
+        );
+
+        // Resuming a persisted session fires nothing.
+        write_paused_todo_session(&ctx, "hook-resume");
+        let mut resumed_ctx = create_test_ctx();
+        resumed_ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.started"], marker));
+        let resumed_app = resumed_ctx.app.config.clone();
+        run_async(resumed_ctx.use_session(&resumed_app, Some("hook-resume"), abort)).unwrap();
+        assert_eq!(
+            marker_captures(marker).len(),
+            1,
+            "resume must not fire session.started"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_fires_session_ended_only_with_a_session() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-ended-w5c";
+
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.ended"], marker));
+
+        // Sessionless (headless) exit path: nothing fires.
+        ctx.exit_session().unwrap();
+        assert!(marker_captures(marker).is_empty());
+
+        ctx.session = Some(Session::default());
+        ctx.exit_session().unwrap();
+        ctx.exit_session().unwrap();
+        assert_eq!(
+            marker_captures(marker).len(),
+            1,
+            "session.ended fires exactly once, only while a session is attached"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn chat_completion_seams_fire_no_turn_events_in_child_contexts() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "child-turn-b4h";
+
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| {
+            app.hooks = hooks_map_of(
+                &[
+                    "turn.started",
+                    "turn.completed",
+                    "turn.interrupted",
+                    "turn.failed",
+                ],
+                marker,
+            )
+        });
+        let app = ctx.app.config.clone();
+
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+        ctx.before_chat_completion(&input).unwrap();
+        ctx.after_chat_completion(&app, &input, "output", &[])
+            .unwrap();
+
+        assert!(
+            marker_captures(marker).is_empty(),
+            "per-round chat-completion seams must never fire turn events"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn top_level_agent_bracket_fires_started_and_completed_once() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "agent-top-ok-m2s";
+        let agent_name = unique_name("hook_agent");
+        seed_agent_with_hooks(&agent_name, marker);
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        ctx.top_level_agent_started();
+        // Per agent RUN, never per message: re-entering while open is a no-op.
+        ctx.top_level_agent_started();
+        ctx.top_level_agent_finished(None);
+        ctx.top_level_agent_finished(None);
+
+        let captures = marker_captures(marker);
+        let started: Vec<_> = captures
+            .iter()
+            .filter(|capture| capture.hook_name == format!("{marker}-agent.started"))
+            .collect();
+        let completed: Vec<_> = captures
+            .iter()
+            .filter(|capture| capture.hook_name == format!("{marker}-agent.completed"))
+            .collect();
+        assert_eq!(started.len(), 1);
+        assert_eq!(completed.len(), 1);
+        assert!(
+            captures
+                .iter()
+                .all(|capture| capture.hook_name != format!("{marker}-agent.failed"))
+        );
+        let id = started[0]
+            .envs
+            .get("COYOTE_AGENT_ID")
+            .expect("agent id env");
+        assert!(
+            id.starts_with(&format!("top-{agent_name}-")),
+            "synthesized id must follow the top-<agent>-<nonce> scheme: {id}"
+        );
+        assert_eq!(completed[0].envs.get("COYOTE_AGENT_ID"), Some(id));
+        assert_eq!(
+            started[0].envs.get("COYOTE_AGENT_NAME").map(String::as_str),
+            Some(agent_name.as_str())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn top_level_agent_failure_fires_agent_failed_with_error() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "agent-top-err-f7d";
+        let agent_name = unique_name("hook_agent");
+        seed_agent_with_hooks(&agent_name, marker);
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+
+        ctx.top_level_agent_started();
+        let err = anyhow!("dispatch exploded");
+        ctx.top_level_agent_finished(Some(&err));
+
+        let captures = marker_captures(marker);
+        let failed: Vec<_> = captures
+            .iter()
+            .filter(|capture| capture.hook_name == format!("{marker}-agent.failed"))
+            .collect();
+        assert_eq!(failed.len(), 1);
+        assert!(
+            captures
+                .iter()
+                .all(|capture| capture.hook_name != format!("{marker}-agent.completed"))
+        );
+        assert_eq!(
+            failed[0].envs.get("COYOTE_AGENT_ERROR").map(String::as_str),
+            Some("dispatch exploded")
+        );
+        assert!(failed[0].envs.contains_key("COYOTE_AGENT_ID"));
+    }
+
+    #[test]
+    #[serial]
+    fn top_level_agent_helpers_noop_without_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "agent-top-role-only-c9k";
+
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| {
+            app.hooks = hooks_map_of(
+                &["agent.started", "agent.completed", "agent.failed"],
+                marker,
+            )
+        });
+        ctx.role = Some(Role::new("plain", "prompt"));
+
+        ctx.top_level_agent_started();
+        ctx.top_level_agent_finished(None);
+
+        assert!(
+            marker_captures(marker).is_empty(),
+            "a role-only context must fire no agent events"
+        );
+        assert!(ctx.top_level_agent_id.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn exit_agent_closes_top_level_agent_bracket() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "agent-top-exit-v3p";
+        let agent_name = unique_name("hook_agent");
+        seed_agent_with_hooks(&agent_name, marker);
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+        ctx.top_level_agent_started();
+
+        ctx.exit_agent(&app).unwrap();
+        // A later exit seam (REPL teardown) must not double-fire.
+        ctx.top_level_agent_finished(None);
+
+        let captures = marker_captures(marker);
+        assert_eq!(
+            captures
+                .iter()
+                .filter(|capture| capture.hook_name == format!("{marker}-agent.completed"))
+                .count(),
+            1,
+            "switch-away fires the terminal event exactly once"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_hooks_resolves_role_hooks_held_by_fresh_session() {
+        let _guard = TestConfigDirGuard::new();
+        let sessions_dir = paths::local_dir("sessions");
+        create_dir_all(&sessions_dir).unwrap();
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_session(&app, Some("role-holder"), abort)).unwrap();
+
+        let role_content = "---\nhooks:\n  turn.completed:\n    - name: session-role-probe\n      command: role-cmd\n---\nPrompt";
+        ctx.use_role_obj(Role::new("hooked-role", role_content))
+            .unwrap();
+        assert!(
+            ctx.role.is_none(),
+            "use_role_obj must move the role into the active session"
+        );
+
+        let resolved = ctx.resolved_hooks(HookEvent::TurnCompleted);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "session-role-probe");
+        assert_eq!(resolved[0].command, "role-cmd");
+        assert_eq!(resolved[0].cwd, paths::roles_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_hooks_resolves_role_hooks_after_session_resume() {
+        let _guard = TestConfigDirGuard::new();
+        let sessions_dir = paths::local_dir("sessions");
+        create_dir_all(&sessions_dir).unwrap();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        write(
+            roles_dir.join("resume-hooked.md"),
+            "---\nhooks:\n  session.ended:\n    - name: resume-role-probe\n      command: role-cmd\n---\nYou are hooked.",
+        )
+        .unwrap();
+
+        let seed_ctx = create_test_ctx();
+        let session_path = seed_ctx.session_file("resume-role");
+        ensure_parent_exists(&session_path).unwrap();
+        write(
+            &session_path,
+            "model: test-seeded:test-chat\nrole_name: resume-hooked\nmessages: []\n",
+        )
+        .unwrap();
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_session(&app, Some("resume-role"), abort)).unwrap();
+        assert!(ctx.role.is_none());
+
+        let resolved = ctx.resolved_hooks(HookEvent::SessionEnded);
+        assert_eq!(resolved.len(), 1, "resumed session must restore role hooks");
+        assert_eq!(resolved[0].name, "resume-role-probe");
     }
 
     fn write_paused_todo_session(ctx: &RequestContext, name: &str) {

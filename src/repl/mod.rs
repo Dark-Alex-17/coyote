@@ -17,6 +17,7 @@ use crate::config::{
 };
 use crate::config::{AssetCategory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
+use crate::hooks::{self, HookEvent};
 use crate::render::render_error;
 use crate::utils::{
     AbortSignal, SHELL, abortable_run_with_spinner, create_abort_signal, dimmed_text,
@@ -41,10 +42,57 @@ use reedline::{
 use reedline::{MenuBuilder, Signal};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::time::Duration;
 use std::{env, process, sync::Arc};
 use tokio::task;
 
 const MENU_NAME: &str = "completion_menu";
+
+/// Bounded wait applied at process-exit seams (REPL teardown, headless and
+/// shell-execute exits) so already-fired exit hooks — `session.ended`, the
+/// final `turn.*` / `agent.*` events — finish spawning before the process
+/// tears down. Never used mid-session.
+pub(crate) const EXIT_HOOK_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Brackets one user-visible turn at an outer boundary (`ask`,
+/// `start_directive`, `shell_execute`): `enter` fires `turn.started`, and
+/// `finish` fires exactly one of `turn.completed` / `turn.interrupted` /
+/// `turn.failed`. The interrupted-vs-failed discrimination lives here and
+/// nowhere else: a ctrl-c abort wins over the result, then an error means
+/// failed (carrying `COYOTE_ERROR`), otherwise completed. Tool rounds,
+/// auto-continue, and compression retries run inside one bracket and never
+/// re-fire turn events.
+pub(crate) struct TurnBracket(());
+
+impl TurnBracket {
+    #[must_use]
+    pub(crate) fn enter(ctx: &RequestContext) -> Self {
+        hooks::fire(HookEvent::TurnStarted, ctx, &[], None);
+        Self(())
+    }
+
+    pub(crate) fn finish<T>(
+        self,
+        ctx: &RequestContext,
+        abort_signal: &AbortSignal,
+        result: Result<T>,
+    ) -> Result<T> {
+        if abort_signal.aborted_ctrlc() {
+            hooks::fire(HookEvent::TurnInterrupted, ctx, &[], None);
+        } else {
+            match &result {
+                Ok(_) => hooks::fire(HookEvent::TurnCompleted, ctx, &[], None),
+                Err(err) => hooks::fire(
+                    HookEvent::TurnFailed,
+                    ctx,
+                    &[("COYOTE_ERROR", format!("{err:#}"))],
+                    None,
+                ),
+            }
+        }
+        result
+    }
+}
 
 pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     [SYSTEM REMINDER - TODO CONTINUATION]
@@ -482,8 +530,12 @@ Type ".help" for additional help.
             supervisor.read().cancel_recursive();
         }
 
-        self.ctx.write().exit_session()?;
-        Ok(())
+        let exit_result = self.ctx.write().exit_session();
+        self.ctx
+            .write()
+            .top_level_agent_finished(exit_result.as_ref().err());
+        hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
+        exit_result
     }
 
     fn create_editor(ctx: Arc<RwLock<RequestContext>>, app: &AppConfig) -> Result<Reedline> {
@@ -983,6 +1035,7 @@ pub async fn run_repl_command(
                     let app = Arc::clone(&ctx.app.config);
                     ctx.use_agent(app.as_ref(), agent_name, session_name, abort_signal.clone())
                         .await?;
+                    ctx.top_level_agent_started();
                     if let Some(session) = &ctx.session {
                         let (compressed, active) = replay::snapshot(session);
                         replay::render(app.as_ref(), &compressed, &active)?;
@@ -1090,6 +1143,7 @@ pub async fn run_repl_command(
                         abort_signal.clone(),
                     )
                     .await?;
+                    hooks::fire(HookEvent::SessionCompressed, ctx, &[], None);
                     println!("✓ Successfully compressed the session.");
                 }
                 _ => {
@@ -1434,6 +1488,17 @@ async fn ask(
     input: Input,
     with_embeddings: bool,
 ) -> Result<()> {
+    let bracket = TurnBracket::enter(ctx);
+    let result = ask_inner(ctx, abort_signal.clone(), input, with_embeddings).await;
+    bracket.finish(ctx, &abort_signal, result)
+}
+
+async fn ask_inner(
+    ctx: &mut RequestContext,
+    abort_signal: AbortSignal,
+    input: Input,
+    with_embeddings: bool,
+) -> Result<()> {
     let mut input = input;
     let mut with_embeddings = with_embeddings;
     loop {
@@ -1579,8 +1644,9 @@ async fn ask(
             };
             eprintln!("\n📢 {}", color.italic().paint("Compressing the session."),);
 
-            if let Err(err) = ctx.compress_session().await {
-                warn!("Failed to compress the session: {err}");
+            match ctx.compress_session().await {
+                Ok(()) => hooks::fire(HookEvent::SessionCompressed, ctx, &[], None),
+                Err(err) => warn!("Failed to compress the session: {err}"),
             }
             if let Some(session) = ctx.session.as_mut() {
                 session.set_compressing(false);
@@ -1939,6 +2005,180 @@ pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AppState, Session, WorkingMode};
+    use crate::hooks::{HookDef, HooksMap, test_sink};
+    use anyhow::anyhow;
+    use serial_test::serial;
+
+    const TURN_EVENTS: [&str; 4] = [
+        "turn.started",
+        "turn.completed",
+        "turn.interrupted",
+        "turn.failed",
+    ];
+
+    fn ctx_with_hooks(events: &[&str], marker: &str) -> RequestContext {
+        let mut hooks_map = HooksMap::default();
+        for event in events {
+            hooks_map.insert(
+                event.to_string(),
+                vec![HookDef {
+                    name: format!("{marker}-{event}"),
+                    command: "true".to_string(),
+                }],
+            );
+        }
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            hooks: hooks_map,
+            ..Default::default()
+        });
+        RequestContext::new(Arc::new(app), WorkingMode::Repl)
+    }
+
+    /// Sink captures for `marker`, ordered (started, completed, interrupted, failed).
+    fn turn_counts(marker: &str) -> (usize, usize, usize, usize) {
+        let captures = test_sink::snapshot();
+        let count = |event: &str| {
+            captures
+                .iter()
+                .filter(|capture| capture.hook_name == format!("{marker}-{event}"))
+                .count()
+        };
+        (
+            count("turn.started"),
+            count("turn.completed"),
+            count("turn.interrupted"),
+            count("turn.failed"),
+        )
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn turn_bracket_ok_final_fires_started_and_completed() {
+        let _sink = test_sink::install();
+        let marker = "tb-ok-x7q";
+        let ctx = ctx_with_hooks(&TURN_EVENTS, marker);
+        let abort_signal = create_abort_signal();
+
+        let bracket = TurnBracket::enter(&ctx);
+        let result: Result<()> = async { Ok(()) }.await;
+        bracket.finish(&ctx, &abort_signal, result).unwrap();
+
+        assert_eq!(turn_counts(marker), (1, 1, 0, 0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn turn_bracket_tool_rounds_then_final_fire_one_turn() {
+        let _sink = test_sink::install();
+        let marker = "tb-rounds-p2m";
+        let ctx = ctx_with_hooks(&TURN_EVENTS, marker);
+        let abort_signal = create_abort_signal();
+
+        let bracket = TurnBracket::enter(&ctx);
+        let result: Result<()> = async {
+            // Simulates a turn that loops through tool rounds before the
+            // final round; rounds happen inside the bracket and never re-fire.
+            let mut rounds = 0;
+            loop {
+                rounds += 1;
+                if rounds == 3 {
+                    break Ok(());
+                }
+            }
+        }
+        .await;
+        bracket.finish(&ctx, &abort_signal, result).unwrap();
+
+        assert_eq!(turn_counts(marker), (1, 1, 0, 0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn turn_bracket_error_fires_failed_with_error_env() {
+        let _sink = test_sink::install();
+        let marker = "tb-err-k4d";
+        let ctx = ctx_with_hooks(&TURN_EVENTS, marker);
+        let abort_signal = create_abort_signal();
+
+        let bracket = TurnBracket::enter(&ctx);
+        let result: Result<()> = async { Err(anyhow!("turn exploded")) }.await;
+        let err = bracket.finish(&ctx, &abort_signal, result).unwrap_err();
+        assert_eq!(err.to_string(), "turn exploded");
+
+        assert_eq!(turn_counts(marker), (1, 0, 0, 1));
+        let captures = test_sink::snapshot();
+        let failed = captures
+            .iter()
+            .find(|capture| capture.hook_name == format!("{marker}-turn.failed"))
+            .expect("turn.failed capture");
+        assert_eq!(
+            failed.envs.get("COYOTE_ERROR").map(String::as_str),
+            Some("turn exploded")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn turn_bracket_ctrlc_error_fires_interrupted_not_failed() {
+        let _sink = test_sink::install();
+        let marker = "tb-ctrlc-err-j6w";
+        let ctx = ctx_with_hooks(&TURN_EVENTS, marker);
+        let abort_signal = create_abort_signal();
+        abort_signal.set_ctrlc();
+
+        let bracket = TurnBracket::enter(&ctx);
+        let result: Result<()> = async { Err(anyhow!("Aborted!")) }.await;
+        assert!(bracket.finish(&ctx, &abort_signal, result).is_err());
+
+        assert_eq!(turn_counts(marker), (1, 0, 1, 0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn turn_bracket_ctrlc_with_ok_exit_fires_interrupted() {
+        let _sink = test_sink::install();
+        let marker = "tb-ctrlc-ok-r3v";
+        let ctx = ctx_with_hooks(&TURN_EVENTS, marker);
+        let abort_signal = create_abort_signal();
+        abort_signal.set_ctrlc();
+
+        let bracket = TurnBracket::enter(&ctx);
+        let result: Result<()> = async { Ok(()) }.await;
+        bracket.finish(&ctx, &abort_signal, result).unwrap();
+
+        assert_eq!(turn_counts(marker), (1, 0, 1, 0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn compress_command_failure_fires_no_session_compressed() {
+        let _sink = test_sink::install();
+        let marker = "compress-fail-z9t";
+        let mut ctx = ctx_with_hooks(&["session.compressed"], marker);
+        ctx.session = Some(Session::default());
+        let abort_signal = create_abort_signal();
+
+        // Boxed: `run_repl_command`'s state machine is far larger than a test
+        // thread's stack.
+        let result = Box::pin(run_repl_command(
+            &mut ctx,
+            abort_signal,
+            ".compress session",
+        ))
+        .await;
+
+        assert!(result.is_err(), "compressing an empty session must fail");
+        assert_eq!(
+            test_sink::snapshot()
+                .iter()
+                .filter(|capture| capture.hook_name.starts_with(marker))
+                .count(),
+            0,
+            "a failed compression must fire no session.compressed hook"
+        );
+    }
 
     #[test]
     fn test_process_command_line() {
