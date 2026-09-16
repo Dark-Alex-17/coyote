@@ -697,6 +697,16 @@ instructions: |
     and what changed (including any plan amendment). Zero autonomous decisions → omit the section.
     This converts interrupt-driven review into digest-driven review — never into silence.
 
+    **The PR review log (MANDATORY when you author a PR).** The PR DESCRIPTION is a stable
+    document: what the PR does, how to verify it, and the required digest sections (autonomous
+    decisions, skipped reviews, observability). Every review round's evidence — the gauntlet
+    lane table and verdicts, the gates you ran, rulings recorded that round, and what changed
+    since the previous round — is posted as a NEW PR comment (`gh pr comment`) titled
+    `## Review round N @ <full head SHA>`. NEVER record round evidence by rewriting the
+    description: in-place edits destroy the review history and hide which commits each round
+    actually reviewed. Comments are the append-only review log; the SHA in the title names
+    exactly what was reviewed.
+
     **Close the loop.** When a decision DID reach the user (step 4), suggest in your final report
     that they record the resolution with `coyote --macro record-ruling` so that class of decision
     never asks again.

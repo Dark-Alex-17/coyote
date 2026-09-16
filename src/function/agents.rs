@@ -4,8 +4,9 @@ use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::{
     Agent, AgentVariable, AgentVariables, AppState, Input, RequestContext, Role, RoleLike,
     default_max_agent_depth, effective_max_concurrent_jobs, jobs_enabled,
-    list_agents_with_descriptions, load_agent_variables,
+    list_agents_with_descriptions, load_agent_variables, paths,
 };
+use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
 use crate::supervisor::notification::agent_notification;
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor, TaskKind};
@@ -14,7 +15,7 @@ use crate::utils::{AbortSignal, create_abort_signal, wait_abort_signal, wait_use
 use crate::graph;
 use crate::repl::DEFAULT_CONTINUATION_PROMPT;
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 use indexmap::IndexMap;
 use log::{debug, warn};
 use parking_lot::RwLock;
@@ -996,6 +997,86 @@ fn sync_agent_functions_to_ctx(ctx: &mut RequestContext) -> Result<()> {
     Ok(())
 }
 
+/// Mirrors the base-env contract `hooks::fire` assembles from a live context,
+/// for detached call sites that dispatch pre-resolved hook snapshots after
+/// the context they were resolved from is gone. The names are captured by
+/// the caller when it takes the snapshot; the timestamp is taken here, at
+/// fire time, so it reflects when the event actually happened.
+pub(crate) fn hook_base_envs(
+    event: HookEvent,
+    session_name: Option<&str>,
+    agent_name: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut envs = vec![
+        ("COYOTE_EVENT".to_string(), event.as_str().to_string()),
+        (
+            "COYOTE_CONFIG_DIR".to_string(),
+            paths::config_dir().display().to_string(),
+        ),
+        (
+            "COYOTE_EVENT_TIMESTAMP".to_string(),
+            Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        ),
+    ];
+    if let Some(name) = session_name {
+        envs.push(("COYOTE_SESSION_ID".to_string(), name.to_string()));
+    }
+    if let Some(name) = agent_name {
+        envs.push(("COYOTE_AGENT_NAME".to_string(), name.to_string()));
+    }
+    envs
+}
+
+/// Pre-resolved `agent.completed`/`agent.failed` snapshots for a spawned
+/// agent's result arms, captured from the child context before the spawn
+/// task takes ownership of it. Resolving against the child keeps global
+/// hooks gated by the child's own whitelist, the same gate every other
+/// event fired from the child's context goes through.
+struct SpawnResultHooks {
+    completed: Vec<ResolvedHook>,
+    failed: Vec<ResolvedHook>,
+    session_name: Option<String>,
+    agent_id: String,
+    agent_name: String,
+}
+
+impl SpawnResultHooks {
+    fn resolve(child_ctx: &RequestContext, agent_id: &str, agent_name: &str) -> Self {
+        Self {
+            completed: child_ctx.resolved_hooks(HookEvent::AgentCompleted),
+            failed: child_ctx.resolved_hooks(HookEvent::AgentFailed),
+            session_name: child_ctx
+                .session
+                .as_ref()
+                .map(|session| session.name().to_string()),
+            agent_id: agent_id.to_string(),
+            agent_name: agent_name.to_string(),
+        }
+    }
+
+    /// Fires `agent.completed`, or `agent.failed` when `error` is given.
+    fn fire(self, error: Option<&str>) {
+        let mut extras = vec![
+            ("COYOTE_AGENT_ID", self.agent_id),
+            ("COYOTE_AGENT_NAME", self.agent_name.clone()),
+        ];
+        let (event, resolved) = match error {
+            None => (HookEvent::AgentCompleted, self.completed),
+            Some(error) => {
+                extras.push(("COYOTE_AGENT_ERROR", error.to_string()));
+                (HookEvent::AgentFailed, self.failed)
+            }
+        };
+        hooks::fire_resolved(
+            event,
+            resolved,
+            hook_base_envs(event, self.session_name.as_deref(), Some(&self.agent_name)),
+            &extras,
+            None,
+        );
+    }
+}
+
 async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let agent_name = args
         .get("agent")
@@ -1149,6 +1230,19 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
 
     debug!("Spawning child agent '{agent_name}' as '{agent_id}'");
 
+    hooks::fire(
+        HookEvent::AgentStarted,
+        &child_ctx,
+        &[
+            ("COYOTE_AGENT_ID", agent_id.clone()),
+            ("COYOTE_AGENT_NAME", agent_name.clone()),
+        ],
+        None,
+    );
+    // Resolved before the spawn: the result arms outlive the child context
+    // the snapshots come from.
+    let result_hooks = SpawnResultHooks::resolve(&child_ctx, &agent_id, &agent_name);
+
     let spawn_agent_id = agent_id.clone();
     let spawn_agent_name = agent_name.clone();
     let spawn_abort = child_abort.clone();
@@ -1173,6 +1267,10 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             },
         };
         let success = agent_result.exit_status == AgentExitStatus::Completed;
+        match &agent_result.exit_status {
+            AgentExitStatus::Completed => result_hooks.fire(None),
+            AgentExitStatus::Failed(e) => result_hooks.fire(Some(e)),
+        }
         spawn_notifications.push(agent_notification(
             &agent_result.id,
             &agent_result.agent_name,
@@ -2152,6 +2250,155 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    /// A graph agent whose graph.yaml wires `agent.*` hooks at its top
+    /// level. With `failing`, the start node references a script that does
+    /// not exist, so the child run fails at runtime — after the spawn seam
+    /// has already fired `agent.started`.
+    fn write_graph_agent_with_hooks(agent_name: &str, marker: &str, failing: bool) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        let (start, nodes) = if failing {
+            (
+                "work",
+                "  work:\n    type: script\n    script: missing.sh\n    next: done\n  done:\n    type: end\n    output: done\n",
+            )
+        } else {
+            ("done", "  done:\n    type: end\n    output: done\n")
+        };
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\n\
+                 start: {start}\n\
+                 settings:\n\
+                 \x20 validate_before_run: false\n\
+                 hooks:\n\
+                 \x20 agent.started:\n\
+                 \x20   - name: {marker}_started\n\
+                 \x20     command: \"true\"\n\
+                 \x20 agent.completed:\n\
+                 \x20   - name: {marker}_completed\n\
+                 \x20     command: \"true\"\n\
+                 \x20 agent.failed:\n\
+                 \x20   - name: {marker}_failed\n\
+                 \x20     command: \"true\"\n\
+                 nodes:\n\
+                 {nodes}"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn hook_captures_named(name: &str) -> Vec<hooks::test_sink::Capture> {
+        hooks::test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name == name)
+            .collect()
+    }
+
+    /// Spawns an agent through the supervisor seam and awaits its spawn
+    /// task, returning the spawn id. The result arms fire their hooks
+    /// before that task returns, so the sink is complete afterwards.
+    fn spawn_and_collect(agent_name: &str) -> String {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let spawned = handle_spawn(&mut ctx, &json!({"agent": agent_name, "prompt": "hi"}))
+                .await
+                .unwrap();
+            assert_eq!(spawned["status"], "ok", "{spawned}");
+            let id = spawned["id"].as_str().unwrap().to_string();
+            let handle = ctx
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .take(&id)
+                .expect("spawned agent must be registered");
+            handle
+                .join_handle
+                .await
+                .expect("spawn task must not panic")
+                .expect("spawn task must return an AgentResult");
+            id
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn spawned_agent_success_fires_started_and_completed_with_matching_id() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_hook_spawn_ok");
+        write_graph_agent_with_hooks(&agent_name, "t037_spawn_ok", false);
+
+        let id = spawn_and_collect(&agent_name);
+
+        let started = hook_captures_named("t037_spawn_ok_started");
+        assert_eq!(started.len(), 1, "{started:?}");
+        assert_eq!(started[0].envs["COYOTE_EVENT"], "agent.started");
+        assert_eq!(started[0].envs["COYOTE_AGENT_ID"], id);
+        assert_eq!(started[0].envs["COYOTE_AGENT_NAME"], agent_name);
+
+        let completed = hook_captures_named("t037_spawn_ok_completed");
+        assert_eq!(completed.len(), 1, "{completed:?}");
+        assert_eq!(completed[0].envs["COYOTE_EVENT"], "agent.completed");
+        assert_eq!(completed[0].envs["COYOTE_AGENT_ID"], id);
+        assert_eq!(completed[0].envs["COYOTE_AGENT_NAME"], agent_name);
+
+        assert!(hook_captures_named("t037_spawn_ok_failed").is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn spawned_agent_failure_fires_started_and_failed_with_matching_id() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_hook_spawn_fail");
+        write_graph_agent_with_hooks(&agent_name, "t037_spawn_fail", true);
+
+        let id = spawn_and_collect(&agent_name);
+
+        let started = hook_captures_named("t037_spawn_fail_started");
+        assert_eq!(started.len(), 1, "{started:?}");
+        assert_eq!(started[0].envs["COYOTE_AGENT_ID"], id);
+
+        let failed = hook_captures_named("t037_spawn_fail_failed");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].envs["COYOTE_EVENT"], "agent.failed");
+        assert_eq!(failed[0].envs["COYOTE_AGENT_ID"], id);
+        assert!(
+            !failed[0].envs["COYOTE_AGENT_ERROR"].is_empty(),
+            "a failed spawn must carry its error"
+        );
+
+        assert!(hook_captures_named("t037_spawn_fail_completed").is_empty());
+    }
+
+    #[test]
+    fn hook_base_envs_carries_optional_names_only_when_present() {
+        let envs = hook_base_envs(HookEvent::AgentCompleted, None, None);
+        let keys: Vec<&str> = envs.iter().map(|(key, _)| key.as_str()).collect();
+        assert!(keys.contains(&"COYOTE_EVENT"));
+        assert!(keys.contains(&"COYOTE_CONFIG_DIR"));
+        assert!(keys.contains(&"COYOTE_EVENT_TIMESTAMP"));
+        assert!(!keys.contains(&"COYOTE_SESSION_ID"));
+        assert!(!keys.contains(&"COYOTE_AGENT_NAME"));
+        assert!(
+            envs.iter()
+                .any(|(key, value)| key == "COYOTE_EVENT" && value == "agent.completed")
+        );
+
+        let envs = hook_base_envs(HookEvent::AgentFailed, Some("sess"), Some("bot"));
+        assert!(
+            envs.iter()
+                .any(|(key, value)| key == "COYOTE_SESSION_ID" && value == "sess")
+        );
+        assert!(
+            envs.iter()
+                .any(|(key, value)| key == "COYOTE_AGENT_NAME" && value == "bot")
+        );
     }
 
     fn run_agent_for_graph_error(

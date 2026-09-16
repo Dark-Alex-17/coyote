@@ -369,6 +369,10 @@ instructions: |
        The direct `adversary`/probe spawns below are the FALLBACK when the gauntlet is not installed;
        on that path an adversary/probe result that is ONLY a `PIPELINE-FAULT` (no verdict on the
        code) is likewise an infrastructure fault to retry, never a divergence.
+       Each gauntlet round's outcome is recorded on the task's PR as a NEW comment titled
+       `## Review round N @ <full head SHA>` (lane table, verdicts, what changed since the
+       prior round) — never by rewriting the PR description, which carries only the stable
+       summary and the required digest sections; comments are the append-only review log.
      - **Spawn `adversary`** with the diff base and the criteria pasted in:
 
        ```

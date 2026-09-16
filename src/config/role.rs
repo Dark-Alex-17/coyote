@@ -1,12 +1,17 @@
 use super::*;
 
 use crate::client::{Message, MessageContent, MessageRole, Model};
+use crate::config::builtin_manifest;
+use crate::function::write_file_atomic;
+use crate::hooks::HooksMap;
 
 use anyhow::Result;
 use fancy_regex::Regex;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::LazyLock;
 
 pub const SHELL_ROLE: &str = "shell";
@@ -99,6 +104,8 @@ pub struct Role {
     skill_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     memory: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hooks: Option<HooksMap>,
 
     #[serde(skip)]
     model: Model,
@@ -161,6 +168,7 @@ impl Role {
                         role.skill_instructions = value.as_str().map(|v| v.to_string())
                     }
                     "memory" => role.memory = value.as_bool(),
+                    "hooks" => role.hooks = parse_hooks_map(value),
                     _ => (),
                 }
             }
@@ -179,6 +187,26 @@ impl Role {
         RolesAsset::iter()
             .filter_map(|v| v.strip_suffix(".md").map(|v| v.to_string()))
             .collect()
+    }
+
+    /// Installs builtin role hook scripts into `<roles_dir>/hooks/` and
+    /// reconciles ones a release stopped shipping. This is the only builtin
+    /// install machinery roles have: general role installation deliberately
+    /// does not exist (builtin roles load straight from the embed).
+    pub fn install_builtin_role_hooks(force: bool) -> Result<()> {
+        let shipped: Vec<(String, String)> = RolesAsset::iter()
+            .filter_map(|file| {
+                let name = file.as_ref().strip_prefix("hooks/")?;
+                if name.is_empty() || name.contains('/') {
+                    return None;
+                }
+                let embedded = RolesAsset::get(file.as_ref())?;
+                let content = unsafe { std::str::from_utf8_unchecked(&embedded.data) };
+                Some((name.to_string(), content.to_string()))
+            })
+            .collect();
+
+        install_and_reconcile_role_hooks(&paths::roles_dir().join("hooks"), &shipped, force)
     }
 
     pub fn has_args(&self) -> bool {
@@ -247,6 +275,10 @@ impl Role {
         }
         if let Some(memory) = self.memory {
             metadata.push(format!("memory: {memory}"));
+        }
+        if let Some(hooks) = &self.hooks {
+            let inline = serde_json::to_string(hooks).unwrap_or_else(|_| "{}".to_string());
+            metadata.push(format!("hooks: {inline}"));
         }
         if metadata.is_empty() {
             format!("{}\n", self.prompt)
@@ -378,6 +410,10 @@ impl Role {
 
     pub fn memory(&self) -> Option<bool> {
         self.memory
+    }
+
+    pub fn hooks(&self) -> Option<&HooksMap> {
+        self.hooks.as_ref()
     }
 
     pub fn skills_enabled(&self) -> Option<bool> {
@@ -544,6 +580,16 @@ fn parse_mcp_tools_map(value: &Value) -> Option<IndexMap<String, Vec<String>>> {
     Some(mcp_tools)
 }
 
+fn parse_hooks_map(value: &Value) -> Option<HooksMap> {
+    match serde_json::from_value(value.clone()) {
+        Ok(map) => Some(map),
+        Err(err) => {
+            debug!("Ignoring malformed hooks configuration: {err}");
+            None
+        }
+    }
+}
+
 fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
     let mut text = prompt;
     let mut search_input = true;
@@ -590,6 +636,46 @@ fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
     }
 
     (prompt, vec![])
+}
+
+/// Only direct children of the hooks/ directory are supported: they are the
+/// only shape the builtin manifest tracks, so nested asset paths are skipped
+/// by the caller rather than installed unreconciled.
+fn install_and_reconcile_role_hooks(
+    dir: &Path,
+    shipped: &[(String, String)],
+    force: bool,
+) -> Result<()> {
+    if !shipped.is_empty() {
+        info!("Installing built-in role hooks in {}", dir.display());
+    }
+    let mut written = BTreeSet::new();
+    for (name, content) in shipped {
+        let path = dir.join(name);
+        if path.exists() && !force {
+            debug!(
+                "Role hook file already exists, skipping: {}",
+                path.display()
+            );
+            continue;
+        }
+        ensure_parent_exists(&path)?;
+        info!("Creating role hook file: {}", path.display());
+        write_file_atomic(&path, content, Some(0o755))?;
+        written.insert(name.clone());
+    }
+
+    let names: BTreeSet<String> = shipped.iter().map(|(name, _)| name.clone()).collect();
+    // Reconciliation is best-effort housekeeping: a failure here must not
+    // abort startup (install_builtins), matching the agent-side policy.
+    if let Err(err) = builtin_manifest::reconcile_builtin_dir(dir, &names, &written) {
+        warn!(
+            "Failed to reconcile builtin role hooks in {}: {err}",
+            dir.display()
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -639,6 +725,42 @@ mod tests {
             role.enabled_mcp_servers(),
             Some(vec!["github".to_string(), "jira".to_string()])
         );
+    }
+
+    #[test]
+    fn role_hooks_round_trip_through_export() {
+        let content = "---\nhooks:\n  turn.completed:\n    - name: notify\n      command: ./hooks/notify.sh\n---\nPrompt";
+
+        let role = Role::new("test", content);
+
+        let hooks = role.hooks().expect("hooks should be parsed");
+        assert_eq!(hooks["turn.completed"][0].name, "notify");
+        assert_eq!(hooks["turn.completed"][0].command, "./hooks/notify.sh");
+
+        let exported = role.export();
+        assert!(exported.contains("hooks:"));
+
+        let reparsed = Role::new("test", &exported);
+        assert_eq!(reparsed.hooks(), role.hooks());
+        assert_eq!(reparsed.prompt(), "Prompt");
+    }
+
+    #[test]
+    fn role_without_hooks_has_none_and_export_omits_key() {
+        let role = Role::new("test", "---\nmemory: true\n---\nPrompt");
+
+        assert!(role.hooks().is_none());
+        assert!(!role.export().contains("hooks:"));
+    }
+
+    #[test]
+    fn role_malformed_hooks_degrades_to_none() {
+        let content = "---\nhooks: [not, a, map]\n---\nPrompt";
+
+        let role = Role::new("test", content);
+
+        assert!(role.hooks().is_none());
+        assert_eq!(role.prompt(), "Prompt");
     }
 
     #[test]
@@ -908,5 +1030,123 @@ Input 1
 "#;
 
         assert_eq!(parse_structure_prompt(prompt), (prompt, vec![]));
+    }
+
+    fn fixture(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(name, content)| (name.to_string(), content.to_string()))
+            .collect()
+    }
+
+    fn hooks_fixture_dir(label: &str) -> PathBuf {
+        let dir = temp_file(label, "");
+        create_dir_all(&dir).unwrap();
+        dir.join("hooks")
+    }
+
+    #[test]
+    fn role_hooks_install_writes_scripts_and_manifest() {
+        let dir = hooks_fixture_dir("role-hooks-install-");
+
+        install_and_reconcile_role_hooks(&dir, &fixture(&[("a.sh", "#!/bin/sh\n")]), false)
+            .unwrap();
+
+        assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "#!/bin/sh\n");
+        assert_eq!(
+            read_to_string(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE)).unwrap(),
+            "a.sh\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join("a.sh")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "role hook scripts install executable");
+            let manifest_mode = fs::metadata(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                manifest_mode & 0o111,
+                0,
+                "the manifest must never be executable"
+            );
+        }
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn role_hooks_install_overwrites_only_with_force() {
+        let dir = hooks_fixture_dir("role-hooks-force-");
+        let shipped = fixture(&[("a.sh", "new content\n")]);
+        create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.sh"), "SENTINEL").unwrap();
+
+        install_and_reconcile_role_hooks(&dir, &shipped, false).unwrap();
+        assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "SENTINEL");
+
+        install_and_reconcile_role_hooks(&dir, &shipped, true).unwrap();
+        assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "new content\n");
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn role_hooks_reconcile_removes_dropped_hook_and_keeps_user_files() {
+        let dir = hooks_fixture_dir("role-hooks-reconcile-");
+
+        install_and_reconcile_role_hooks(
+            &dir,
+            &fixture(&[("keep.sh", "#!/bin/sh\n"), ("drop.sh", "#!/bin/sh\n")]),
+            false,
+        )
+        .unwrap();
+        fs::write(dir.join("user.sh"), "user-owned").unwrap();
+
+        install_and_reconcile_role_hooks(&dir, &fixture(&[("keep.sh", "#!/bin/sh\n")]), false)
+            .unwrap();
+
+        assert!(
+            !dir.join("drop.sh").exists(),
+            "dropped builtin hook removed"
+        );
+        assert!(dir.join("keep.sh").exists());
+        assert!(dir.join("user.sh").exists(), "user file survives reconcile");
+        assert_eq!(
+            read_to_string(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE)).unwrap(),
+            "keep.sh\n"
+        );
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn role_hooks_never_claim_a_preexisting_user_file() {
+        let dir = hooks_fixture_dir("role-hooks-unclaimed-");
+        create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.sh"), "user-owned").unwrap();
+
+        install_and_reconcile_role_hooks(&dir, &fixture(&[("a.sh", "#!/bin/sh\n")]), false)
+            .unwrap();
+        assert!(
+            !dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE).exists(),
+            "a skipped pre-existing file must not be claimed by the manifest"
+        );
+
+        install_and_reconcile_role_hooks(&dir, &[], false).unwrap();
+        assert_eq!(
+            read_to_string(dir.join("a.sh")).unwrap(),
+            "user-owned",
+            "the user file survives the hook being dropped from the embed"
+        );
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn role_hooks_empty_shipped_set_creates_nothing() {
+        let dir = hooks_fixture_dir("role-hooks-empty-");
+
+        install_and_reconcile_role_hooks(&dir, &[], false).unwrap();
+
+        assert!(!dir.exists(), "an empty shipped set must not create hooks/");
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 }

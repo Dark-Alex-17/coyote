@@ -2,6 +2,7 @@ use super::*;
 
 use super::access_token::{distrust_access_token, get_access_token};
 use crate::config::{RenderMode, paths};
+use crate::hooks::{self, HookEvent};
 use crate::{
     config::{AppConfig, Input, RequestContext},
     function::{FunctionDeclaration, ToolCall, ToolResult, eval_tool_calls},
@@ -20,7 +21,7 @@ use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::unbounded_channel;
 
 pub const MODELS_YAML: &str = include_str!("../../models.yaml");
@@ -580,6 +581,47 @@ pub async fn create_openai_compatible_client_config(
     Ok(Some((model, clients)))
 }
 
+fn llm_request_extras(client: &dyn Client) -> Vec<(&'static str, String)> {
+    vec![
+        ("COYOTE_LLM_PROVIDER", client.name().to_string()),
+        ("COYOTE_LLM_MODEL", client.model().id()),
+    ]
+}
+
+fn llm_completed_extras(client: &dyn Client, started_at: Instant) -> Vec<(&'static str, String)> {
+    let mut extras = llm_request_extras(client);
+    extras.push((
+        "COYOTE_LLM_DURATION_MS",
+        started_at.elapsed().as_millis().to_string(),
+    ));
+    extras
+}
+
+fn llm_failed_extras(
+    client: &dyn Client,
+    err: Option<&anyhow::Error>,
+    aborted: bool,
+) -> Vec<(&'static str, String)> {
+    let mut extras = llm_request_extras(client);
+    if aborted {
+        extras.push(("COYOTE_LLM_ERROR_KIND", "aborted".to_string()));
+    } else if let Some(api_err) = err.and_then(|err| err.downcast_ref::<ApiStatusError>()) {
+        extras.push(("COYOTE_LLM_ERROR_KIND", "api_error".to_string()));
+        extras.push(("COYOTE_LLM_STATUS", api_err.status.to_string()));
+    } else {
+        extras.push(("COYOTE_LLM_ERROR_KIND", "other".to_string()));
+    }
+    extras.push((
+        "COYOTE_LLM_ERROR",
+        // `{:#}` renders the whole context chain, so the root cause survives
+        // the `context(...)` wrapping the client trait defaults apply.
+        err.map(|err| format!("{err:#}"))
+            .unwrap_or_else(|| "Aborted.".to_string()),
+    ));
+
+    extras
+}
+
 pub async fn call_chat_completions(
     input: &Input,
     print: bool,
@@ -591,15 +633,28 @@ pub async fn call_chat_completions(
     let is_child_agent = ctx.current_depth > 0;
     let suppress_spinner = is_child_agent || ctx.render_mode == RenderMode::Silent;
     let spinner_message = if suppress_spinner { "" } else { "Generating" };
+    hooks::fire(
+        HookEvent::LlmRequestStarted,
+        ctx,
+        &llm_request_extras(client),
+        None,
+    );
+    let request_started_at = Instant::now();
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
         spinner_message,
-        abort_signal,
+        abort_signal.clone(),
     )
     .await;
 
     match ret {
         Ok(ret) => {
+            hooks::fire(
+                HookEvent::LlmRequestCompleted,
+                ctx,
+                &llm_completed_extras(client, request_started_at),
+                None,
+            );
             let ChatCompletionsOutput {
                 mut text,
                 tool_calls,
@@ -617,7 +672,15 @@ pub async fn call_chat_completions(
             ctx.record_token_usage(usage, client.model());
             finish_completion(ctx, text, tool_calls, thinking).await
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            hooks::fire(
+                HookEvent::LlmRequestFailed,
+                ctx,
+                &llm_failed_extras(client, Some(&err), abort_signal.aborted()),
+                None,
+            );
+            Err(err)
+        }
     }
 }
 
@@ -634,6 +697,13 @@ pub async fn call_chat_completions_streaming(
         handler.set_silent(true);
     }
 
+    hooks::fire(
+        HookEvent::LlmRequestStarted,
+        ctx,
+        &llm_request_extras(client),
+        None,
+    );
+    let request_started_at = Instant::now();
     let (send_ret, render_ret) = tokio::join!(
         client.chat_completions_streaming(input, &mut handler),
         render_stream(rx, client.app_config(), abort_signal.clone(), silent),
@@ -649,12 +719,32 @@ pub async fn call_chat_completions_streaming(
     ctx.record_token_usage(usage, client.model());
 
     if aborted_ctrld {
+        hooks::fire(
+            HookEvent::LlmRequestFailed,
+            ctx,
+            &llm_failed_extras(client, None, true),
+            None,
+        );
         bail!("Aborted.");
     }
 
-    render_ret?;
+    if let Err(err) = render_ret {
+        hooks::fire(
+            HookEvent::LlmRequestFailed,
+            ctx,
+            &llm_failed_extras(client, Some(&err), false),
+            None,
+        );
+        return Err(err);
+    }
 
     if aborted_ctrlc {
+        hooks::fire(
+            HookEvent::LlmRequestFailed,
+            ctx,
+            &llm_failed_extras(client, None, true),
+            None,
+        );
         if !ctx.working_mode.is_repl() || ctx.session.is_none() {
             bail!("Aborted.");
         }
@@ -678,6 +768,12 @@ pub async fn call_chat_completions_streaming(
 
     match send_ret {
         Ok(_) => {
+            hooks::fire(
+                HookEvent::LlmRequestCompleted,
+                ctx,
+                &llm_completed_extras(client, request_started_at),
+                None,
+            );
             if !silent && !text.is_empty() && !text.ends_with('\n') {
                 println!();
             }
@@ -687,6 +783,12 @@ pub async fn call_chat_completions_streaming(
             if !silent && !text.is_empty() {
                 println!();
             }
+            hooks::fire(
+                HookEvent::LlmRequestFailed,
+                ctx,
+                &llm_failed_extras(client, Some(&err), false),
+                None,
+            );
             Err(err)
         }
     }
@@ -709,10 +811,36 @@ pub async fn call_chat_completions_streaming_quiet(
     ctx: &mut RequestContext,
     abort_signal: AbortSignal,
 ) -> Result<(String, Vec<ToolResult>)> {
+    hooks::fire(
+        HookEvent::LlmRequestStarted,
+        ctx,
+        &llm_request_extras(client),
+        None,
+    );
+    let request_started_at = Instant::now();
     if client.model().no_stream() {
         let output = tokio::select! {
-            ret = client.chat_completions(input.clone()) => ret?,
-            _ = wait_abort_signal(&abort_signal) => bail!("Aborted."),
+            ret = client.chat_completions(input.clone()) => match ret {
+                Ok(output) => output,
+                Err(err) => {
+                    hooks::fire(
+                        HookEvent::LlmRequestFailed,
+                        ctx,
+                        &llm_failed_extras(client, Some(&err), false),
+                        None,
+                    );
+                    return Err(err);
+                }
+            },
+            _ = wait_abort_signal(&abort_signal) => {
+                hooks::fire(
+                    HookEvent::LlmRequestFailed,
+                    ctx,
+                    &llm_failed_extras(client, None, true),
+                    None,
+                );
+                bail!("Aborted.")
+            }
         };
         let ChatCompletionsOutput {
             text,
@@ -722,8 +850,20 @@ pub async fn call_chat_completions_streaming_quiet(
         } = output;
         ctx.record_token_usage(usage, client.model());
         if abort_signal.aborted() {
+            hooks::fire(
+                HookEvent::LlmRequestFailed,
+                ctx,
+                &llm_failed_extras(client, None, true),
+                None,
+            );
             bail!("Aborted.");
         }
+        hooks::fire(
+            HookEvent::LlmRequestCompleted,
+            ctx,
+            &llm_completed_extras(client, request_started_at),
+            None,
+        );
         return finish_completion(ctx, text, tool_calls, thinking).await;
     }
 
@@ -739,10 +879,30 @@ pub async fn call_chat_completions_streaming_quiet(
     ctx.record_token_usage(usage, client.model());
 
     if abort_signal.aborted() {
+        hooks::fire(
+            HookEvent::LlmRequestFailed,
+            ctx,
+            &llm_failed_extras(client, None, true),
+            None,
+        );
         bail!("Aborted.");
     }
-    send_ret?;
+    if let Err(err) = send_ret {
+        hooks::fire(
+            HookEvent::LlmRequestFailed,
+            ctx,
+            &llm_failed_extras(client, Some(&err), false),
+            None,
+        );
+        return Err(err);
+    }
 
+    hooks::fire(
+        HookEvent::LlmRequestCompleted,
+        ctx,
+        &llm_completed_extras(client, request_started_at),
+        None,
+    );
     finish_completion(ctx, text, tool_calls, thinking).await
 }
 
@@ -1003,6 +1163,7 @@ mod tests {
 
     use super::super::access_token::{is_rejected, set_access_token};
     use crate::config::{AppState, WorkingMode};
+    use anyhow::Error;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::Instant;
@@ -1219,8 +1380,8 @@ mod tests {
 
     /// Wrapped in `.context(...)` so every test below proves the downcast
     /// works through an anyhow context chain, as in the trait methods.
-    fn api_status_error(status: u16) -> anyhow::Error {
-        anyhow::Error::new(ApiStatusError {
+    fn api_status_error(status: u16) -> Error {
+        Error::new(ApiStatusError {
             status,
             message: format!("error (status: {status})"),
         })
@@ -1557,6 +1718,333 @@ mod tests {
 
         assert_eq!(client.streaming_calls.load(Ordering::SeqCst), 1);
         assert_paced_reply(&text, &results);
+    }
+
+    /// Fake provider whose every request fails with an [`ApiStatusError`],
+    /// wrapped in the same context chain the real trait defaults produce.
+    struct FailingStatusClient {
+        config: AppConfig,
+        model: Model,
+        status: u16,
+    }
+
+    impl FailingStatusClient {
+        fn new(status: u16) -> Self {
+            Self {
+                config: AppConfig::default(),
+                model: Model::default(),
+                status,
+            }
+        }
+
+        fn error(&self) -> Error {
+            Error::new(ApiStatusError {
+                status: self.status,
+                message: format!("error (status: {})", self.status),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Client for FailingStatusClient {
+        fn app_config(&self) -> &AppConfig {
+            &self.config
+        }
+
+        fn extra_config(&self) -> Option<&ExtraConfig> {
+            None
+        }
+
+        fn patch_config(&self) -> Option<&RequestPatch> {
+            None
+        }
+
+        fn name(&self) -> &str {
+            "failing-status"
+        }
+
+        fn model(&self) -> &Model {
+            &self.model
+        }
+
+        async fn chat_completions_inner(
+            &self,
+            _client: &ReqwestClient,
+            _data: ChatCompletionsData,
+        ) -> Result<ChatCompletionsOutput> {
+            Err(self.error())
+        }
+
+        async fn chat_completions_streaming_inner(
+            &self,
+            _client: &ReqwestClient,
+            _handler: &mut SseHandler,
+            _data: ChatCompletionsData,
+        ) -> Result<()> {
+            Err(self.error())
+        }
+    }
+
+    fn llm_hooks_map(marker: &str) -> hooks::HooksMap {
+        [
+            "llm.request.started",
+            "llm.request.completed",
+            "llm.request.failed",
+        ]
+        .into_iter()
+        .map(|event| {
+            (
+                event.to_string(),
+                vec![crate::hooks::HookDef {
+                    name: marker.to_string(),
+                    command: "true".to_string(),
+                }],
+            )
+        })
+        .collect()
+    }
+
+    fn llm_hooked_ctx(marker: &str) -> RequestContext {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            hooks: llm_hooks_map(marker),
+            ..Default::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.render_mode = RenderMode::Silent;
+        ctx
+    }
+
+    fn llm_captures(marker: &str) -> Vec<hooks::test_sink::Capture> {
+        hooks::test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name == marker)
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn plain_transport_fires_llm_request_started_and_completed() {
+        let marker = "llm-hooks-plain-ok-x7x";
+        let mut ctx = llm_hooked_ctx(marker);
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = paced_client(false);
+        client.nonstream_replies = true;
+        let _guard = hooks::test_sink::install();
+
+        call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        let captures = llm_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::LlmRequestStarted);
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_LLM_PROVIDER")
+                .map(String::as_str),
+            Some("paced-stream")
+        );
+        assert!(captures[0].envs.contains_key("COYOTE_LLM_MODEL"));
+        assert_eq!(captures[1].event, HookEvent::LlmRequestCompleted);
+        assert!(captures[1].envs.contains_key("COYOTE_LLM_DURATION_MS"));
+        assert!(!captures[1].envs.contains_key("COYOTE_LLM_ERROR_KIND"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plain_transport_fires_llm_request_failed_with_api_error_kind() {
+        let marker = "llm-hooks-plain-api-err-x7x";
+        let mut ctx = llm_hooked_ctx(marker);
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = FailingStatusClient::new(429);
+        let _guard = hooks::test_sink::install();
+
+        let err = call_chat_completions(
+            &input,
+            false,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.downcast_ref::<ApiStatusError>().is_some(),
+            "hooks must not change the error: {err:?}"
+        );
+        let captures = llm_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::LlmRequestStarted);
+        let failed = &captures[1];
+        assert_eq!(failed.event, HookEvent::LlmRequestFailed);
+        assert_eq!(
+            failed.envs.get("COYOTE_LLM_ERROR_KIND").map(String::as_str),
+            Some("api_error")
+        );
+        assert_eq!(
+            failed.envs.get("COYOTE_LLM_STATUS").map(String::as_str),
+            Some("429")
+        );
+        assert!(
+            failed
+                .envs
+                .get("COYOTE_LLM_ERROR")
+                .unwrap()
+                .contains("error (status: 429)")
+        );
+        assert!(!failed.envs.contains_key("COYOTE_LLM_DURATION_MS"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn streaming_transport_fires_llm_request_started_and_completed() {
+        let marker = "llm-hooks-stream-ok-x7x";
+        let mut ctx = llm_hooked_ctx(marker);
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = paced_client(false);
+        let _guard = hooks::test_sink::install();
+
+        call_chat_completions_streaming(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        let captures = llm_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::LlmRequestStarted);
+        assert_eq!(captures[1].event, HookEvent::LlmRequestCompleted);
+        assert!(captures[1].envs.contains_key("COYOTE_LLM_DURATION_MS"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn streaming_transport_abort_fires_llm_request_failed_aborted() {
+        let marker = "llm-hooks-stream-abort-x7x";
+        let mut ctx = llm_hooked_ctx(marker);
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = paced_client(true);
+        let abort = create_abort_signal();
+        let trigger = abort.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PACED_GAP * PACED_DELTAS as u32 + Duration::from_secs(30)).await;
+            trigger.set_ctrlc();
+        });
+        let _guard = hooks::test_sink::install();
+
+        let err = call_chat_completions_streaming(&input, &client, &mut ctx, abort)
+            .await
+            .expect_err("an aborted stream must not succeed");
+
+        assert_eq!(err.to_string(), "Aborted.");
+        let captures = llm_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        let failed = &captures[1];
+        assert_eq!(failed.event, HookEvent::LlmRequestFailed);
+        assert_eq!(
+            failed.envs.get("COYOTE_LLM_ERROR_KIND").map(String::as_str),
+            Some("aborted")
+        );
+        assert!(!failed.envs.contains_key("COYOTE_LLM_STATUS"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn quiet_transport_fires_llm_request_started_and_completed() {
+        let marker = "llm-hooks-quiet-ok-x7x";
+        let mut ctx = llm_hooked_ctx(marker);
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = paced_client(false);
+        let _guard = hooks::test_sink::install();
+
+        call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        let captures = llm_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::LlmRequestStarted);
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_LLM_PROVIDER")
+                .map(String::as_str),
+            Some("paced-stream")
+        );
+        assert_eq!(captures[1].event, HookEvent::LlmRequestCompleted);
+        assert!(captures[1].envs.contains_key("COYOTE_LLM_DURATION_MS"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn quiet_transport_abort_fires_llm_request_failed_aborted() {
+        let marker = "llm-hooks-quiet-abort-x7x";
+        let mut ctx = llm_hooked_ctx(marker);
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = paced_client(true);
+        let abort = create_abort_signal();
+        let trigger = abort.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PACED_GAP * PACED_DELTAS as u32 + Duration::from_secs(30)).await;
+            trigger.set_ctrlc();
+        });
+        let _guard = hooks::test_sink::install();
+
+        let err = call_chat_completions_streaming_quiet(&input, &client, &mut ctx, abort)
+            .await
+            .expect_err("an aborted stream must not succeed");
+
+        assert_eq!(err.to_string(), "Aborted.");
+        let captures = llm_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        let failed = &captures[1];
+        assert_eq!(failed.event, HookEvent::LlmRequestFailed);
+        assert_eq!(
+            failed.envs.get("COYOTE_LLM_ERROR_KIND").map(String::as_str),
+            Some("aborted")
+        );
+        assert_eq!(
+            failed.envs.get("COYOTE_LLM_ERROR").map(String::as_str),
+            Some("Aborted.")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn quiet_transport_fires_llm_request_failed_with_api_error_kind() {
+        let marker = "llm-hooks-quiet-api-err-x7x";
+        let mut ctx = llm_hooked_ctx(marker);
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = FailingStatusClient::new(500);
+        let _guard = hooks::test_sink::install();
+
+        let err =
+            call_chat_completions_streaming_quiet(&input, &client, &mut ctx, create_abort_signal())
+                .await
+                .unwrap_err();
+
+        assert!(err.downcast_ref::<ApiStatusError>().is_some());
+        let captures = llm_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        let failed = &captures[1];
+        assert_eq!(failed.event, HookEvent::LlmRequestFailed);
+        assert_eq!(
+            failed.envs.get("COYOTE_LLM_ERROR_KIND").map(String::as_str),
+            Some("api_error")
+        );
+        assert_eq!(
+            failed.envs.get("COYOTE_LLM_STATUS").map(String::as_str),
+            Some("500")
+        );
     }
 
     /// Minimal client for exercising `patch_request_data`: only the model

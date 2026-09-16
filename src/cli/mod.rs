@@ -609,6 +609,10 @@ mod tests {
             parse(&["--install-builtins", "mcp_config"]).install_builtins,
             Some(AssetCategory::McpConfig)
         );
+        assert_eq!(
+            parse(&["--install-builtins", "hooks"]).install_builtins,
+            Some(AssetCategory::Hooks)
+        );
     }
 
     #[test]
@@ -620,12 +624,14 @@ mod tests {
         assert!(category.get_name_and_aliases().any(|n| n == "mcp_config"));
         assert!(AssetCategory::NAMES.contains(&"mcp-config"));
         assert!(!AssetCategory::NAMES.contains(&"mcp_config"));
+        assert!(AssetCategory::NAMES.contains(&"hooks"));
 
         let filter = InstallFilter::McpConfig.to_possible_value().unwrap();
         assert_eq!(filter.get_name(), "mcp-config");
         assert!(filter.get_name_and_aliases().any(|n| n == "mcp_config"));
         assert!(InstallFilter::NAMES.contains(&"mcp-config"));
         assert!(!InstallFilter::NAMES.contains(&"mcp_config"));
+        assert!(InstallFilter::NAMES.contains(&"hooks"));
     }
 
     #[test]
@@ -684,6 +690,10 @@ mod tests {
             ])
             .filter,
             Some(InstallFilter::McpConfig)
+        );
+        assert_eq!(
+            parse(&["--install", "https://github.com/x/y", "--filter", "hooks"]).filter,
+            Some(InstallFilter::Hooks)
         );
     }
 
