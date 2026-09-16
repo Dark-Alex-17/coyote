@@ -5497,6 +5497,7 @@ mod tests {
     use crate::config::AppState;
     use crate::config::agent::AgentConfig;
     use crate::config::bundles::BundleStore;
+    use crate::config::conflict::InstallMode;
     use crate::config::mcp_tool_policy::LayerSource;
     use crate::config::tool_scope::test_fixtures::{FixtureServer, fixture_runtime};
     use crate::function::jobs::RingBuf;
@@ -9184,19 +9185,19 @@ mod tests {
     fn install_builtin_agents_force_overwrites_only_with_force() {
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
         let file =
             first_file(&paths::agents_data_dir()).expect("bundled agents should be installed");
 
         write(&file, "SENTINEL").unwrap();
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
         assert_eq!(
             read_to_string(&file).unwrap(),
             "SENTINEL",
             "non-force install must not overwrite an existing file"
         );
 
-        Agent::install_builtin_agents(true).unwrap();
+        Agent::install_builtin_agents(InstallMode::Force).unwrap();
         assert_ne!(
             read_to_string(&file).unwrap(),
             "SENTINEL",
@@ -9209,7 +9210,7 @@ mod tests {
     fn install_builtin_agents_removes_stale_definition_files() {
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         let agents_dir = paths::agents_data_dir();
         // Simulate an upgrade from an older install: coder used to ship
@@ -9230,7 +9231,7 @@ mod tests {
         create_dir_all(agents_dir.join("myagent")).unwrap();
         write(agents_dir.join("myagent").join("config.yaml"), "keep").unwrap();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         assert!(
             !agents_dir.join("coder").join("config.yaml").exists(),
@@ -9270,12 +9271,12 @@ mod tests {
     fn install_builtin_agents_removes_stale_graph_for_config_agent() {
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         let agents_dir = paths::agents_data_dir();
         write(agents_dir.join("architect").join("graph.yaml"), "stale").unwrap();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         assert!(
             !agents_dir.join("architect").join("graph.yaml").exists(),
@@ -9291,7 +9292,7 @@ mod tests {
 
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         let agents_dir = paths::agents_data_dir();
         // Simulate an upgrade from an older install whose coder shipped a
@@ -9303,14 +9304,20 @@ mod tests {
         write(hooks_dir.join(BUILTIN_MANIFEST_FILE), "old-hook.sh\n").unwrap();
         write(hooks_dir.join("old-hook.sh"), "stale").unwrap();
         write(hooks_dir.join("user-hook.sh"), "user-owned").unwrap();
-        // A custom agent outside the bundle is never reconciled, even with a
-        // manifest present.
-        let custom_hooks = agents_dir.join("myagent").join("hooks");
-        create_dir_all(&custom_hooks).unwrap();
-        write(custom_hooks.join(BUILTIN_MANIFEST_FILE), "custom.sh\n").unwrap();
-        write(custom_hooks.join("custom.sh"), "keep").unwrap();
+        // An agent directory carrying a builtin manifest but absent from the
+        // embed is a removed builtin agent: the sweep deletes exactly the
+        // manifest-owned files, sparing anything user-created alongside.
+        let removed_hooks = agents_dir.join("myagent").join("hooks");
+        create_dir_all(&removed_hooks).unwrap();
+        write(removed_hooks.join(BUILTIN_MANIFEST_FILE), "shipped.sh\n").unwrap();
+        write(removed_hooks.join("shipped.sh"), "stale").unwrap();
+        write(removed_hooks.join("user-note.sh"), "keep").unwrap();
+        // A user agent never has a manifest, so the sweep must not touch it.
+        let user_hooks = agents_dir.join("useragent").join("hooks");
+        create_dir_all(&user_hooks).unwrap();
+        write(user_hooks.join("mine.sh"), "keep").unwrap();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         assert!(
             !hooks_dir.join("old-hook.sh").exists(),
@@ -9325,10 +9332,18 @@ mod tests {
             "an empty shipped set removes the manifest itself"
         );
         assert!(
-            custom_hooks.join("custom.sh").exists(),
-            "custom agents outside the bundle must survive reconciliation"
+            !removed_hooks.join("shipped.sh").exists(),
+            "manifest-owned hooks of a removed builtin agent must be swept"
         );
-        assert!(custom_hooks.join(BUILTIN_MANIFEST_FILE).exists());
+        assert!(!removed_hooks.join(BUILTIN_MANIFEST_FILE).exists());
+        assert!(
+            removed_hooks.join("user-note.sh").exists(),
+            "user files beside a removed agent's manifest must survive the sweep"
+        );
+        assert!(
+            user_hooks.join("mine.sh").exists(),
+            "agent dirs without a manifest must never be touched"
+        );
     }
 
     #[test]
@@ -9372,7 +9387,7 @@ mod tests {
     #[serial]
     fn bundled_assets_pin_task_queue_guidance() {
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         // 1. Architect config: the parallel-mode "Task-queue mirroring"
         //    section with all five HARD RULES.
@@ -9441,7 +9456,7 @@ mod tests {
     #[serial]
     fn bundled_assets_pin_review_incomplete_escalation() {
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         // Every anchor is a single-line prefix so YAML re-wrapping cannot
         // break the pin; clauses that wrap differently per config are split
@@ -9605,7 +9620,7 @@ mod tests {
     #[serial]
     fn bundled_assets_pin_verification_commands_as_declared_variable() {
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         const VARIABLES_FORM: &str =
             "--variables {\"verification_commands\": \"[\\\"cargo test --all\\\"";
@@ -9796,7 +9811,7 @@ mod tests {
         }
 
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         for (name, expected) in [
             ("architect", 10),
@@ -9915,7 +9930,7 @@ mod tests {
 
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
         Skill::install_builtin_skills(false).unwrap();
 
         let mut checked = Vec::new();
@@ -10142,7 +10157,7 @@ mod tests {
         let engine_seeded = ["initial_prompt", "output", "choice", "input"];
 
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         let mut checked = Vec::new();
         for entry in std::fs::read_dir(paths::agents_data_dir()).unwrap() {

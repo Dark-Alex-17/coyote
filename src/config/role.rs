@@ -2,6 +2,7 @@ use super::*;
 
 use crate::client::{Message, MessageContent, MessageRole, Model};
 use crate::config::builtin_manifest;
+use crate::config::conflict::{self, InstallMode, StickyMode};
 use crate::function::write_file_atomic;
 use crate::hooks::HooksMap;
 
@@ -193,7 +194,7 @@ impl Role {
     /// reconciles ones a release stopped shipping. This is the only builtin
     /// install machinery roles have: general role installation deliberately
     /// does not exist (builtin roles load straight from the embed).
-    pub fn install_builtin_role_hooks(force: bool) -> Result<()> {
+    pub fn install_builtin_role_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Result<()> {
         let shipped: Vec<(String, String)> = RolesAsset::iter()
             .filter_map(|file| {
                 let name = file.as_ref().strip_prefix("hooks/")?;
@@ -206,7 +207,7 @@ impl Role {
             })
             .collect();
 
-        install_and_reconcile_role_hooks(&paths::roles_dir().join("hooks"), &shipped, force)
+        install_and_reconcile_role_hooks(&paths::roles_dir().join("hooks"), &shipped, mode, sticky)
     }
 
     pub fn has_args(&self) -> bool {
@@ -641,10 +642,11 @@ fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
 /// Only direct children of the hooks/ directory are supported: they are the
 /// only shape the builtin manifest tracks, so nested asset paths are skipped
 /// by the caller rather than installed unreconciled.
-fn install_and_reconcile_role_hooks(
+pub(crate) fn install_and_reconcile_role_hooks(
     dir: &Path,
     shipped: &[(String, String)],
-    force: bool,
+    mode: InstallMode,
+    sticky: &mut StickyMode,
 ) -> Result<()> {
     if !shipped.is_empty() {
         info!("Installing built-in role hooks in {}", dir.display());
@@ -652,7 +654,9 @@ fn install_and_reconcile_role_hooks(
     let mut written = BTreeSet::new();
     for (name, content) in shipped {
         let path = dir.join(name);
-        if path.exists() && !force {
+        if path.exists()
+            && !conflict::should_replace_existing(&path, content, "roles", mode, sticky)?
+        {
             debug!(
                 "Role hook file already exists, skipping: {}",
                 path.display()
@@ -1049,8 +1053,13 @@ Input 1
     fn role_hooks_install_writes_scripts_and_manifest() {
         let dir = hooks_fixture_dir("role-hooks-install-");
 
-        install_and_reconcile_role_hooks(&dir, &fixture(&[("a.sh", "#!/bin/sh\n")]), false)
-            .unwrap();
+        install_and_reconcile_role_hooks(
+            &dir,
+            &fixture(&[("a.sh", "#!/bin/sh\n")]),
+            InstallMode::Skip,
+            &mut StickyMode::None,
+        )
+        .unwrap();
 
         assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "#!/bin/sh\n");
         assert_eq!(
@@ -1082,11 +1091,47 @@ Input 1
         create_dir_all(&dir).unwrap();
         fs::write(dir.join("a.sh"), "SENTINEL").unwrap();
 
-        install_and_reconcile_role_hooks(&dir, &shipped, false).unwrap();
+        install_and_reconcile_role_hooks(&dir, &shipped, InstallMode::Skip, &mut StickyMode::None)
+            .unwrap();
         assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "SENTINEL");
 
-        install_and_reconcile_role_hooks(&dir, &shipped, true).unwrap();
+        install_and_reconcile_role_hooks(&dir, &shipped, InstallMode::Force, &mut StickyMode::None)
+            .unwrap();
         assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "new content\n");
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn role_hooks_prompt_mode_asks_per_conflict_and_honors_sticky() {
+        use crate::config::conflict::prompt_script;
+
+        let dir = hooks_fixture_dir("role-hooks-prompt-");
+        let shipped = fixture(&[("a.sh", "new content\n"), ("b.sh", "new content\n")]);
+        create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.sh"), "local a").unwrap();
+        fs::write(dir.join("b.sh"), "local b").unwrap();
+
+        // First conflict answered per-file, second by the sticky replace-all.
+        let script = prompt_script::install(&["replace-all"]);
+        let mut sticky = StickyMode::None;
+        install_and_reconcile_role_hooks(&dir, &shipped, InstallMode::Prompt, &mut sticky).unwrap();
+        assert_eq!(prompt_script::prompts_asked(), 1);
+        assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "new content\n");
+        assert_eq!(read_to_string(dir.join("b.sh")).unwrap(), "new content\n");
+        assert_eq!(sticky, StickyMode::ReplaceAll);
+        drop(script);
+
+        // A sticky mode carried in from an earlier location suppresses all
+        // prompting: `--install-builtins hooks` shares one sticky scope
+        // across the global, role, and agent hook locations.
+        fs::write(dir.join("a.sh"), "local again").unwrap();
+        let script = prompt_script::install(&[]);
+        let mut sticky = StickyMode::KeepAll;
+        install_and_reconcile_role_hooks(&dir, &shipped, InstallMode::Prompt, &mut sticky).unwrap();
+        assert_eq!(prompt_script::prompts_asked(), 0);
+        assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "local again");
+        drop(script);
         let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 
@@ -1097,13 +1142,19 @@ Input 1
         install_and_reconcile_role_hooks(
             &dir,
             &fixture(&[("keep.sh", "#!/bin/sh\n"), ("drop.sh", "#!/bin/sh\n")]),
-            false,
+            InstallMode::Skip,
+            &mut StickyMode::None,
         )
         .unwrap();
         fs::write(dir.join("user.sh"), "user-owned").unwrap();
 
-        install_and_reconcile_role_hooks(&dir, &fixture(&[("keep.sh", "#!/bin/sh\n")]), false)
-            .unwrap();
+        install_and_reconcile_role_hooks(
+            &dir,
+            &fixture(&[("keep.sh", "#!/bin/sh\n")]),
+            InstallMode::Skip,
+            &mut StickyMode::None,
+        )
+        .unwrap();
 
         assert!(
             !dir.join("drop.sh").exists(),
@@ -1124,14 +1175,20 @@ Input 1
         create_dir_all(&dir).unwrap();
         fs::write(dir.join("a.sh"), "user-owned").unwrap();
 
-        install_and_reconcile_role_hooks(&dir, &fixture(&[("a.sh", "#!/bin/sh\n")]), false)
-            .unwrap();
+        install_and_reconcile_role_hooks(
+            &dir,
+            &fixture(&[("a.sh", "#!/bin/sh\n")]),
+            InstallMode::Skip,
+            &mut StickyMode::None,
+        )
+        .unwrap();
         assert!(
             !dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE).exists(),
             "a skipped pre-existing file must not be claimed by the manifest"
         );
 
-        install_and_reconcile_role_hooks(&dir, &[], false).unwrap();
+        install_and_reconcile_role_hooks(&dir, &[], InstallMode::Skip, &mut StickyMode::None)
+            .unwrap();
         assert_eq!(
             read_to_string(dir.join("a.sh")).unwrap(),
             "user-owned",
@@ -1144,7 +1201,8 @@ Input 1
     fn role_hooks_empty_shipped_set_creates_nothing() {
         let dir = hooks_fixture_dir("role-hooks-empty-");
 
-        install_and_reconcile_role_hooks(&dir, &[], false).unwrap();
+        install_and_reconcile_role_hooks(&dir, &[], InstallMode::Skip, &mut StickyMode::None)
+            .unwrap();
 
         assert!(!dir.exists(), "an empty shipped set must not create hooks/");
         let _ = fs::remove_dir_all(dir.parent().unwrap());

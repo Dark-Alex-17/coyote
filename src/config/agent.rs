@@ -14,11 +14,13 @@ use crate::{
 
 use super::rag_cache::RagKey;
 use crate::config::builtin_manifest;
+use crate::config::conflict::{self, InstallMode, StickyMode};
 use crate::config::paths;
 use crate::config::prompts::{
     DEFAULT_JOB_INSTRUCTIONS, DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS,
     DEFAULT_TODO_INSTRUCTIONS, DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
+use crate::function::write_file_atomic;
 use crate::graph::types::RagNode;
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
@@ -29,7 +31,7 @@ use fancy_regex::Captures;
 use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::{env, ffi::OsStr, path::Path};
 
 const DEFAULT_AGENT_NAME: &str = "rag";
@@ -63,6 +65,91 @@ fn direct_hook_name(rest: &str) -> Option<&str> {
     (!name.is_empty() && !name.contains('/')).then_some(name)
 }
 
+/// Installs one bundled agent's hook scripts under `<agent>/hooks/` and
+/// reconciles that directory through its builtin manifest, mirroring the
+/// role-side hook installer.
+pub(crate) fn install_and_reconcile_agent_hooks(
+    agent: &str,
+    shipped: &[(String, String)],
+    mode: InstallMode,
+    sticky: &mut StickyMode,
+) -> Result<()> {
+    let dir = paths::agents_data_dir().join(agent).join("hooks");
+    let mut written = BTreeSet::new();
+    for (name, content) in shipped {
+        let path = dir.join(name);
+        if path.exists()
+            && !conflict::should_replace_existing(&path, content, "agents", mode, sticky)?
+        {
+            debug!(
+                "Agent hook file already exists, skipping: {}",
+                path.display()
+            );
+            continue;
+        }
+        ensure_parent_exists(&path)?;
+        info!("Creating agent hook file: {}", path.display());
+        write_file_atomic(&path, content, Some(0o755))?;
+        written.insert(name.clone());
+    }
+
+    let names: BTreeSet<String> = shipped.iter().map(|(name, _)| name.clone()).collect();
+    // Reconciliation is best-effort housekeeping: a failure here must not
+    // abort the install, matching the role-side policy.
+    if let Err(err) = builtin_manifest::reconcile_builtin_dir(&dir, &names, &written) {
+        warn!("Failed to reconcile builtin hooks for agent '{agent}': {err}");
+    }
+    Ok(())
+}
+
+/// An agent the embed stopped bundling is never visited by the per-agent
+/// reconcile loop, so its installed hooks and manifest would orphan forever.
+/// Any agent directory that carries a builtin hooks manifest but is absent
+/// from the current embed gets its manifest-owned hooks removed, each
+/// deletion logged individually by the reconcile. Only the installer writes
+/// manifests, but a manual copy of a builtin agent directory carries the
+/// hidden manifest along: files it lists are treated as installer-owned and
+/// swept, while files absent from the manifest always survive.
+/// Best-effort: a failure here must not abort the install.
+fn sweep_removed_agent_hooks(bundled_files: &HashMap<String, HashSet<String>>) {
+    let entries = match std::fs::read_dir(paths::agents_data_dir()) {
+        Ok(entries) => entries,
+        Err(err) => {
+            warn!("Failed to scan agents dir for removed-agent hooks: {err}");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if bundled_files.contains_key(name) {
+            continue;
+        }
+        let hooks_dir = entry.path().join("hooks");
+        if !hooks_dir
+            .join(builtin_manifest::BUILTIN_MANIFEST_FILE)
+            .is_file()
+        {
+            continue;
+        }
+        info!(
+            "Removing hooks shipped by removed built-in agent '{name}' in {}",
+            hooks_dir.display()
+        );
+        if let Err(err) =
+            builtin_manifest::reconcile_builtin_dir(&hooks_dir, &BTreeSet::new(), &BTreeSet::new())
+        {
+            warn!("Failed to reconcile builtin hooks for removed agent '{name}': {err}");
+            continue;
+        }
+        // remove_dir only succeeds on an empty directory, so a user file
+        // left behind keeps the directory in place.
+        let _ = std::fs::remove_dir(&hooks_dir);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     name: String,
@@ -81,12 +168,16 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn install_builtin_agents(force: bool) -> Result<()> {
+    pub fn install_builtin_agents(mode: InstallMode) -> Result<()> {
         info!(
             "Installing built-in agents in {}",
             paths::agents_data_dir().display()
         );
 
+        // Whole-agent installs run Skip (startup) or Force (reinstall); a
+        // Prompt caller would still get coherent per-file conflict handling,
+        // scoped to this run.
+        let mut sticky = StickyMode::None;
         let mut written_hooks: HashMap<String, BTreeSet<String>> = HashMap::new();
         for file in AgentAssets::iter() {
             debug!("Processing agent file: {}", file.as_ref());
@@ -102,7 +193,15 @@ impl Agent {
             #[cfg_attr(not(unix), expect(unused))]
             let is_script = matches!(file_extension.as_deref(), Some("sh") | Some("py"));
 
-            if file_path.exists() && !force {
+            if file_path.exists()
+                && !conflict::should_replace_existing(
+                    &file_path,
+                    content,
+                    "agents",
+                    mode,
+                    &mut sticky,
+                )?
+            {
                 debug!(
                     "Agent file already exists, skipping: {}",
                     file_path.display()
@@ -179,6 +278,38 @@ impl Agent {
             }
         }
 
+        sweep_removed_agent_hooks(&bundled_files);
+
+        Ok(())
+    }
+
+    /// Refreshes only the bundled agents' hook scripts, leaving every other
+    /// agent file alone: the hooks asset category must be able to update all
+    /// hook locations without reinstalling whole agents.
+    /// Every bundled agent's hooks/ directory reconciles, even when the
+    /// current embed ships no hooks for it.
+    pub fn install_builtin_agent_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Result<()> {
+        // Every bundled agent gets an entry, hooks or not: an agent whose
+        // hook assets were all dropped still needs its hooks/ directory
+        // reconciled so manifest-owned leftovers are removed.
+        let mut shipped: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for file in AgentAssets::iter() {
+            let Some((agent, rest)) = file.as_ref().split_once('/') else {
+                continue;
+            };
+            let hooks = shipped.entry(agent.to_string()).or_default();
+            let Some(hook) = direct_hook_name(rest) else {
+                continue;
+            };
+            let embedded = AgentAssets::get(&file)
+                .ok_or_else(|| anyhow!("Failed to load embedded agent file: {}", file.as_ref()))?;
+            let content = unsafe { std::str::from_utf8_unchecked(&embedded.data) };
+            hooks.push((hook.to_string(), content.to_string()));
+        }
+
+        for (agent, files) in &shipped {
+            install_and_reconcile_agent_hooks(agent, files, mode, sticky)?;
+        }
         Ok(())
     }
 
@@ -1925,5 +2056,168 @@ nodes: {}
             baseline.strip_prefix("hi").unwrap()
         );
         assert_eq!(output, expected);
+    }
+
+    /// Points the config dir at a fresh temp directory for the guard's
+    /// lifetime and removes it on drop. Tests using it must serialize.
+    struct TestConfigDirGuard {
+        _env: crate::testing::EnvVarGuard,
+        root: PathBuf,
+    }
+
+    impl TestConfigDirGuard {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = env::temp_dir().join(format!("coyote-{label}-{unique}"));
+            std::fs::create_dir_all(&root).unwrap();
+            Self {
+                _env: crate::testing::EnvVarGuard::set(
+                    crate::utils::get_env_name("config_dir"),
+                    &root,
+                ),
+                root,
+            }
+        }
+    }
+
+    impl Drop for TestConfigDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn fixture(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(name, content)| (name.to_string(), content.to_string()))
+            .collect()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agent_hooks_prompt_mode_asks_per_conflict_and_honors_sticky() {
+        use crate::config::conflict::prompt_script;
+
+        let _guard = TestConfigDirGuard::new("agent-hooks-prompt");
+        let shipped = fixture(&[("a.sh", "new content\n"), ("b.sh", "new content\n")]);
+        let dir = paths::agents_data_dir().join("probe").join("hooks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.sh"), "local a").unwrap();
+        std::fs::write(dir.join("b.sh"), "local b").unwrap();
+
+        // First conflict answered per-file, second by the sticky replace-all.
+        let script = prompt_script::install(&["replace-all"]);
+        let mut sticky = StickyMode::None;
+        install_and_reconcile_agent_hooks("probe", &shipped, InstallMode::Prompt, &mut sticky)
+            .unwrap();
+        assert_eq!(prompt_script::prompts_asked(), 1);
+        assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "new content\n");
+        assert_eq!(read_to_string(dir.join("b.sh")).unwrap(), "new content\n");
+        assert_eq!(sticky, StickyMode::ReplaceAll);
+        assert_eq!(
+            read_to_string(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE)).unwrap(),
+            "a.sh\nb.sh\n"
+        );
+        drop(script);
+
+        // A sticky mode carried in from an earlier location suppresses all
+        // prompting: `--install-builtins hooks` shares one sticky scope
+        // across the global, role, and agent hook locations.
+        std::fs::write(dir.join("a.sh"), "local again").unwrap();
+        let script = prompt_script::install(&[]);
+        let mut sticky = StickyMode::KeepAll;
+        install_and_reconcile_agent_hooks("probe", &shipped, InstallMode::Prompt, &mut sticky)
+            .unwrap();
+        assert_eq!(prompt_script::prompts_asked(), 0);
+        assert_eq!(read_to_string(dir.join("a.sh")).unwrap(), "local again");
+        drop(script);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agent_hooks_reconcile_adds_updates_and_drops_within_a_shipped_agent() {
+        let _guard = TestConfigDirGuard::new("agent-hooks-reconcile");
+        let dir = paths::agents_data_dir().join("probe").join("hooks");
+
+        install_and_reconcile_agent_hooks(
+            "probe",
+            &fixture(&[("keep.sh", "v1\n"), ("drop.sh", "#!/bin/sh\n")]),
+            InstallMode::Skip,
+            &mut StickyMode::None,
+        )
+        .unwrap();
+        std::fs::write(dir.join("user.sh"), "user-owned").unwrap();
+
+        install_and_reconcile_agent_hooks(
+            "probe",
+            &fixture(&[("keep.sh", "v2\n"), ("added.sh", "#!/bin/sh\n")]),
+            InstallMode::Force,
+            &mut StickyMode::None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_to_string(dir.join("keep.sh")).unwrap(),
+            "v2\n",
+            "a still-shipped hook updates under Force"
+        );
+        assert_eq!(
+            read_to_string(dir.join("added.sh")).unwrap(),
+            "#!/bin/sh\n",
+            "a newly shipped hook is added"
+        );
+        assert!(
+            !dir.join("drop.sh").exists(),
+            "a dropped hook reconciles away"
+        );
+        assert_eq!(
+            read_to_string(dir.join("user.sh")).unwrap(),
+            "user-owned",
+            "user files in the same dir survive"
+        );
+        assert_eq!(
+            read_to_string(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE)).unwrap(),
+            "added.sh\nkeep.sh\n"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_builtin_agent_hooks_reconciles_hookless_bundled_agents() {
+        let _guard = TestConfigDirGuard::new("agent-hooks-hookless");
+        let agent = AgentAssets::iter()
+            .filter_map(|file| {
+                file.as_ref()
+                    .split_once('/')
+                    .map(|(agent, _)| agent.to_string())
+            })
+            .find(|agent| {
+                !AgentAssets::iter().any(|file| {
+                    parse_direct_hook_path(file.as_ref())
+                        .is_some_and(|(hook_agent, _)| hook_agent == agent)
+                })
+            })
+            .expect("at least one bundled agent ships no hooks");
+        let dir = paths::agents_data_dir().join(&agent).join("hooks");
+        // A manifest-owned hook left over from a release that shipped it.
+        install_and_reconcile_agent_hooks(
+            &agent,
+            &fixture(&[("stale.sh", "#!/bin/sh\n")]),
+            InstallMode::Skip,
+            &mut StickyMode::None,
+        )
+        .unwrap();
+        std::fs::write(dir.join("user.sh"), "user-owned").unwrap();
+
+        Agent::install_builtin_agent_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+
+        assert!(
+            !dir.join("stale.sh").exists(),
+            "a still-bundled agent with no hook assets must reconcile its hooks dir"
+        );
+        assert_eq!(read_to_string(dir.join("user.sh")).unwrap(), "user-owned");
     }
 }

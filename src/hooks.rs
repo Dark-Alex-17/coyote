@@ -1,4 +1,5 @@
-use crate::config::{RequestContext, ensure_parent_exists, paths};
+use crate::config::conflict::{self, InstallMode, StickyMode};
+use crate::config::{RequestContext, builtin_manifest, ensure_parent_exists, paths};
 use crate::function::write_file_atomic;
 
 use anyhow::{Result, anyhow};
@@ -7,6 +8,7 @@ use indexmap::IndexMap;
 use rand::distr::{Alphanumeric, SampleString};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,13 +21,14 @@ use tokio::sync::Notify;
 #[folder = "assets/hooks/"]
 struct HookAssets;
 
-pub fn install_builtin_hooks(force: bool) -> Result<()> {
+pub fn install_builtin_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Result<()> {
     info!(
         "Installing built-in example hooks in {}",
         paths::hooks_dir().display()
     );
 
     let mut wrote_any = false;
+    let mut written = BTreeSet::new();
     for file in HookAssets::iter() {
         debug!("Processing hook file: {}", file.as_ref());
 
@@ -34,7 +37,9 @@ pub fn install_builtin_hooks(force: bool) -> Result<()> {
         let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
         let file_path = paths::hooks_dir().join(file.as_ref());
 
-        if file_path.exists() && !force {
+        if file_path.exists()
+            && !conflict::should_replace_existing(&file_path, content, "hooks", mode, sticky)?
+        {
             debug!(
                 "Hook file already exists, skipping: {}",
                 file_path.display()
@@ -46,6 +51,28 @@ pub fn install_builtin_hooks(force: bool) -> Result<()> {
         info!("Creating hook file: {}", file_path.display());
         write_file_atomic(&file_path, content, Some(0o755))?;
         wrote_any = true;
+        if !file.as_ref().contains('/') {
+            written.insert(file.as_ref().to_string());
+        }
+    }
+
+    // Only direct children of the hooks dir reconcile through the builtin
+    // manifest — the only shape it tracks — so a hook a release stops
+    // shipping is removed while user scripts in the same directory are
+    // never touched.
+    let shipped: BTreeSet<String> = HookAssets::iter()
+        .map(|file| file.as_ref().to_string())
+        .filter(|name| !name.contains('/'))
+        .collect();
+    // Reconciliation is best-effort housekeeping: a failure here must not
+    // abort startup (install_builtins), matching the role/agent-side policy.
+    if let Err(err) =
+        builtin_manifest::reconcile_builtin_dir(&paths::hooks_dir(), &shipped, &written)
+    {
+        warn!(
+            "Failed to reconcile builtin hooks in {}: {err}",
+            paths::hooks_dir().display()
+        );
     }
 
     if wrote_any && paths::hooks_dir() != paths::config_dir().join("hooks") {
@@ -614,6 +641,7 @@ pub(crate) mod test_sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::conflict::prompt_script;
     use crate::config::{AppConfig, AppState, Role, WorkingMode};
     use serial_test::serial;
     use std::env;
@@ -643,6 +671,36 @@ mod tests {
         RequestContext::new(Arc::new(app), WorkingMode::Cmd)
     }
 
+    /// Points the hooks dir at a fresh temp directory for the guard's
+    /// lifetime and removes it on drop. Tests using it must serialize.
+    struct HooksDirGuard {
+        _env: crate::testing::EnvVarGuard,
+        root: PathBuf,
+    }
+
+    impl HooksDirGuard {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = env::temp_dir().join(format!("coyote-{label}-{unique}"));
+            Self {
+                _env: crate::testing::EnvVarGuard::set(
+                    crate::utils::get_env_name("hooks_dir"),
+                    &root,
+                ),
+                root,
+            }
+        }
+    }
+
+    impl Drop for HooksDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     #[serial]
     fn install_builtin_hooks_installs_executable_scripts_and_honors_force() {
@@ -659,7 +717,7 @@ mod tests {
         // below still has to run before any assertion can bail out.
         let notify = root.join("notify.sh");
         let log_events = root.join("log-events.sh");
-        let fresh = install_builtin_hooks(false);
+        let fresh = install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None);
         let installed = (notify.is_file(), log_events.is_file());
         #[cfg(unix)]
         let modes: Vec<std::io::Result<u32>> = {
@@ -670,9 +728,9 @@ mod tests {
                 .collect()
         };
         let modified = std::fs::write(&notify, "modified");
-        let no_force = install_builtin_hooks(false);
+        let no_force = install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None);
         let after_no_force = std::fs::read_to_string(&notify);
-        let force = install_builtin_hooks(true);
+        let force = install_builtin_hooks(InstallMode::Force, &mut StickyMode::None);
         let after_force = std::fs::read_to_string(&notify);
 
         drop(env_guard);
@@ -695,6 +753,148 @@ mod tests {
         assert_eq!(after_no_force.unwrap(), "modified");
         force.unwrap();
         assert!(after_force.unwrap().starts_with("#!/usr/bin/env bash"));
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_hooks_skip_mode_never_prompts_even_on_a_terminal() {
+        let guard = HooksDirGuard::new("hooks-skip-no-prompt");
+        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        let notify = guard.root.join("notify.sh");
+        std::fs::write(&notify, "modified").unwrap();
+
+        // A forced terminal with no scripted answers: any prompt would panic
+        // and the counter would move.
+        let _script = prompt_script::install(&[]);
+        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+
+        assert_eq!(prompt_script::prompts_asked(), 0);
+        assert_eq!(std::fs::read_to_string(&notify).unwrap(), "modified");
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_hooks_prompt_mode_asks_only_for_differing_files() {
+        let guard = HooksDirGuard::new("hooks-prompt-conflict");
+        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        let notify = guard.root.join("notify.sh");
+        std::fs::write(&notify, "modified").unwrap();
+
+        // log-events.sh is identical to the embed, so only notify.sh asks.
+        let script = prompt_script::install(&["keep"]);
+        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+        assert_eq!(prompt_script::prompts_asked(), 1);
+        assert_eq!(std::fs::read_to_string(&notify).unwrap(), "modified");
+        drop(script);
+
+        let script = prompt_script::install(&["replace"]);
+        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+        assert_eq!(prompt_script::prompts_asked(), 1);
+        assert!(
+            std::fs::read_to_string(&notify)
+                .unwrap()
+                .starts_with("#!/usr/bin/env bash")
+        );
+        drop(script);
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_hooks_prompt_mode_writes_missing_files_without_asking() {
+        let guard = HooksDirGuard::new("hooks-prompt-missing");
+        let _script = prompt_script::install(&[]);
+
+        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+
+        assert_eq!(prompt_script::prompts_asked(), 0);
+        assert!(guard.root.join("notify.sh").is_file());
+        assert!(guard.root.join("log-events.sh").is_file());
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_hooks_prompt_mode_keeps_local_files_without_a_terminal() {
+        let guard = HooksDirGuard::new("hooks-prompt-non-tty");
+        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        let notify = guard.root.join("notify.sh");
+        std::fs::write(&notify, "modified").unwrap();
+
+        let _script = prompt_script::install_non_interactive();
+        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+
+        assert_eq!(prompt_script::prompts_asked(), 0);
+        assert_eq!(std::fs::read_to_string(&notify).unwrap(), "modified");
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_hooks_keep_all_covers_every_remaining_conflict() {
+        let guard = HooksDirGuard::new("hooks-prompt-keep-all");
+        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        let notify = guard.root.join("notify.sh");
+        let log_events = guard.root.join("log-events.sh");
+        std::fs::write(&notify, "modified notify").unwrap();
+        std::fs::write(&log_events, "modified log-events").unwrap();
+
+        let _script = prompt_script::install(&["keep-all"]);
+        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+
+        assert_eq!(prompt_script::prompts_asked(), 1);
+        assert_eq!(std::fs::read_to_string(&notify).unwrap(), "modified notify");
+        assert_eq!(
+            std::fs::read_to_string(&log_events).unwrap(),
+            "modified log-events"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_hooks_removes_stale_shipped_hooks_via_manifest() {
+        use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
+
+        let guard = HooksDirGuard::new("hooks-manifest-stale");
+        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+
+        // Simulate an upgrade from a release that also shipped old-hook.sh:
+        // the manifest records it, so reinstall removes it — while a user
+        // script absent from the manifest survives.
+        std::fs::write(
+            guard.root.join(BUILTIN_MANIFEST_FILE),
+            "log-events.sh\nnotify.sh\nold-hook.sh\n",
+        )
+        .unwrap();
+        std::fs::write(guard.root.join("old-hook.sh"), "stale").unwrap();
+        std::fs::write(guard.root.join("user-hook.sh"), "user-owned").unwrap();
+
+        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+
+        assert!(!guard.root.join("old-hook.sh").exists());
+        assert_eq!(
+            std::fs::read_to_string(guard.root.join("user-hook.sh")).unwrap(),
+            "user-owned"
+        );
+        assert_eq!(
+            std::fs::read_to_string(guard.root.join(BUILTIN_MANIFEST_FILE)).unwrap(),
+            "log-events.sh\nnotify.sh\n"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_hooks_malformed_manifest_deletes_nothing() {
+        use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
+
+        let guard = HooksDirGuard::new("hooks-manifest-malformed");
+        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        std::fs::write(guard.root.join(BUILTIN_MANIFEST_FILE), [0xff, 0xfe, 0x00]).unwrap();
+        std::fs::write(guard.root.join("old-hook.sh"), "keep").unwrap();
+
+        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+
+        assert!(
+            guard.root.join("old-hook.sh").exists(),
+            "an unreadable manifest must fail safe toward keeping files"
+        );
     }
 
     /// The example hooks are plain scripts, not argc tools: they live outside

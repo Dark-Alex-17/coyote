@@ -3,6 +3,7 @@ use super::bundles::{
     hash_file,
 };
 use crate::config::builtin_manifest::is_builtin_manifest_name;
+use crate::config::conflict::{ConflictAction, NonInteractive, StickyMode, resolve_conflict};
 use crate::config::{AssetCategory, BUNDLE_MANIFEST_FILE, InstallFilter, paths};
 #[cfg(not(windows))]
 use crate::function::Language;
@@ -1886,18 +1887,6 @@ fn count_kind(plan: &InstallPlan, cat: TopCategory, kind: PlannedKind) -> usize 
         .count()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum StickyMode {
-    None,
-    KeepAll,
-    ReplaceAll,
-}
-
-enum ConflictAction {
-    Keep,
-    Replace,
-}
-
 #[derive(Debug)]
 struct ApplyReport {
     new_count: usize,
@@ -1937,7 +1926,12 @@ fn apply_plan(
                 record_written_file(store, bundle, planned, FileAction::Replaced)?;
                 report.refreshed_count += 1;
             }
-            PlannedKind::Conflict => match resolve_conflict(planned, &mut sticky)? {
+            PlannedKind::Conflict => match resolve_conflict(
+                &planned.dst,
+                planned.top_category.label(),
+                &mut sticky,
+                NonInteractive::Bail,
+            )? {
                 ConflictAction::Keep => report.kept_count += 1,
                 ConflictAction::Replace => {
                     write_file(&planned.src, &planned.dst)?;
@@ -2035,50 +2029,6 @@ fn record_mcp_merge(store: &mut BundleStore, bundle: &str, report: &McpMergeRepo
     }
 
     store.record_mcp_servers(bundle, entries)
-}
-
-fn resolve_conflict(planned: &PlannedFile, sticky: &mut StickyMode) -> Result<ConflictAction> {
-    match *sticky {
-        StickyMode::KeepAll => return Ok(ConflictAction::Keep),
-        StickyMode::ReplaceAll => return Ok(ConflictAction::Replace),
-        StickyMode::None => {}
-    }
-
-    if !*IS_STDOUT_TERMINAL {
-        bail!(
-            "Refusing to overwrite local file {} non-interactively. \
-             Re-run in a terminal, with --install-force (installs), \
-             or with --yes (updates).",
-            planned.dst.display()
-        );
-    }
-
-    let prompt = format!(
-        "Conflict at {} (category: {})",
-        planned.dst.display(),
-        planned.top_category.label()
-    );
-    let choice = Select::new(
-        &prompt,
-        vec!["keep", "replace", "keep-all", "replace-all", "abort"],
-    )
-    .prompt()
-    .with_context(|| "failed to read conflict choice")?;
-
-    match choice {
-        "keep" => Ok(ConflictAction::Keep),
-        "replace" => Ok(ConflictAction::Replace),
-        "keep-all" => {
-            *sticky = StickyMode::KeepAll;
-            Ok(ConflictAction::Keep)
-        }
-        "replace-all" => {
-            *sticky = StickyMode::ReplaceAll;
-            Ok(ConflictAction::Replace)
-        }
-        "abort" => bail!("Install aborted by user at conflict resolution."),
-        _ => unreachable!("inquire::Select returned an unexpected option"),
-    }
 }
 
 fn write_file(src: &Path, dst: &Path) -> Result<()> {

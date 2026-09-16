@@ -9,10 +9,16 @@
 #   B) a failing/missing-script hook never changes coyote's stdout, stderr, or
 #      exit code.
 #   C) `coyote --install-builtins hooks` installs both bundled example scripts
-#      0755 into <config_dir>/hooks via the real CLI, and a second invocation
-#      (force reinstall) overwrites local edits back to the packaged content.
+#      0755 into <config_dir>/hooks via the real CLI; a non-interactive re-run
+#      keeps locally modified scripts while still installing missing ones.
 #   D) `coyote --agent <bundled-agent> --info` (an inspection flag) fires ZERO
 #      agent.* hook events.
+#   E) `coyote --install-builtins hooks` reconciles manifest-owned leftovers
+#      in roles/hooks and each bundled agent's hooks dir, sparing user files.
+#   F) top-level hooks-dir manifest reconcile: a stale shipped hook is removed
+#      on reinstall; a malformed manifest deletes NOTHING (fail-safe).
+#   G) a plain startup sweeps manifest-owned hooks of removed builtin agents
+#      while leaving user agent dirs and user files untouched.
 #
 # Not covered here (see src/function/mod.rs tests for tool.* + payload-file
 # coverage instead): a live tool.started firing requires a real LLM round
@@ -143,16 +149,20 @@ if command -v stat > /dev/null 2>&1; then
   [ "$mode_log" = "755" ] || fail "log-events.sh mode is $mode_log, expected 755"
 fi
 
-# Modify a script locally, then re-run --install-builtins hooks: it always
-# forces (no confirmation prompt on non-tty stdout), so the local edit must
-# be overwritten back to the packaged content.
+# Modify one script locally and delete the other, then re-run
+# --install-builtins hooks: without a terminal the conflict resolution keeps
+# local files, so the edit must survive while the missing script is
+# reinstalled from the packaged content.
 echo "# LOCALLY MODIFIED" > "$CFG_C/hooks/notify.sh"
+rm "$CFG_C/hooks/log-events.sh"
 COYOTE_CONFIG_DIR="$CFG_C" "$BIN" --install-builtins hooks > "$WORKDIR/install2.out" 2>&1
 grep -q "LOCALLY MODIFIED" "$CFG_C/hooks/notify.sh" \
-  && fail "force reinstall did not overwrite the locally modified notify.sh"
-grep -q '^#!/usr/bin/env bash' "$CFG_C/hooks/notify.sh" \
-  || fail "notify.sh was not restored to the packaged script"
-echo "PASS: --install-builtins hooks installs both scripts 0755 and force-overwrites local edits"
+  || fail "non-interactive reinstall overwrote the locally modified notify.sh"
+[ -f "$CFG_C/hooks/log-events.sh" ] \
+  || fail "reinstall did not restore the deleted log-events.sh"
+grep -q '^#!/usr/bin/env bash' "$CFG_C/hooks/log-events.sh" \
+  || fail "log-events.sh was not restored to the packaged script"
+echo "PASS: --install-builtins hooks installs both scripts 0755; re-runs keep modified files and restore missing ones"
 
 echo "== Scenario C2: cold-start auto-bootstrap fills the hooks dir but never forces =="
 CFG_C2="$WORKDIR/c2"
@@ -227,6 +237,103 @@ COYOTE_CONFIG_DIR="$CFG_D" "$BIN" --agent "$AGENT_NAME" --info > /dev/null 2>&1
 sleep 1
 [ -s "$AGENT_LOG" ] && fail "expected zero agent.* events from --agent --info, got: $(cat "$AGENT_LOG")"
 echo "PASS: --agent $AGENT_NAME --info fired zero agent.* hook events"
+
+echo "== Scenario E: --install-builtins hooks reconciles roles/hooks and agent hooks dirs =="
+CFG_E="$WORKDIR/e"
+AGENT_E="$(ls "$REPO_ROOT/assets/agents" | head -1)"
+mkdir -p "$CFG_E/roles/hooks" "$CFG_E/agents/$AGENT_E/hooks"
+# Manifest-owned leftovers a previous release shipped, plus user files that
+# must survive the refresh in both locations.
+printf 'stale-role.sh\n' > "$CFG_E/roles/hooks/.builtin-manifest"
+echo "stale" > "$CFG_E/roles/hooks/stale-role.sh"
+echo "mine" > "$CFG_E/roles/hooks/user-role.sh"
+printf 'stale-agent.sh\n' > "$CFG_E/agents/$AGENT_E/hooks/.builtin-manifest"
+echo "stale" > "$CFG_E/agents/$AGENT_E/hooks/stale-agent.sh"
+echo "mine" > "$CFG_E/agents/$AGENT_E/hooks/user-agent.sh"
+
+COYOTE_CONFIG_DIR="$CFG_E" "$BIN" --install-builtins hooks > "$WORKDIR/install_e.out" 2>&1 \
+  || fail "--install-builtins hooks failed: $(cat "$WORKDIR/install_e.out")"
+
+[ -f "$CFG_E/hooks/notify.sh" ] || fail "global hooks were not installed"
+[ ! -f "$CFG_E/roles/hooks/stale-role.sh" ] \
+  || fail "manifest-owned stale role hook survived the refresh"
+[ "$(cat "$CFG_E/roles/hooks/user-role.sh")" = "mine" ] \
+  || fail "user file in roles/hooks was touched by the refresh"
+[ ! -f "$CFG_E/agents/$AGENT_E/hooks/stale-agent.sh" ] \
+  || fail "manifest-owned stale agent hook survived the refresh"
+[ "$(cat "$CFG_E/agents/$AGENT_E/hooks/user-agent.sh")" = "mine" ] \
+  || fail "user file in the agent hooks dir was touched by the refresh"
+echo "PASS: refresh reconciles roles/hooks and bundled-agent hooks, sparing user files"
+
+echo "== Scenario F: top-level manifest reconcile removes stale hooks; malformed manifest deletes nothing =="
+CFG_F="$WORKDIR/f"
+mkdir -p "$CFG_F"
+COYOTE_CONFIG_DIR="$CFG_F" "$BIN" --install-builtins hooks > /dev/null 2>&1
+[ -f "$CFG_F/hooks/.builtin-manifest" ] \
+  || fail "install did not write a .builtin-manifest to the top-level hooks dir"
+
+# Simulate an upgrade from a release that also shipped old-hook.sh: the
+# manifest records it, so reinstall must remove it — while a user script
+# absent from the manifest survives.
+printf 'log-events.sh\nnotify.sh\nold-hook.sh\n' > "$CFG_F/hooks/.builtin-manifest"
+echo "stale" > "$CFG_F/hooks/old-hook.sh"
+echo "mine" > "$CFG_F/hooks/user-hook.sh"
+COYOTE_CONFIG_DIR="$CFG_F" "$BIN" --install-builtins hooks > /dev/null 2>&1
+[ ! -f "$CFG_F/hooks/old-hook.sh" ] \
+  || fail "stale shipped hook recorded in the manifest was not removed on reinstall"
+[ "$(cat "$CFG_F/hooks/user-hook.sh")" = "mine" ] \
+  || fail "user hook script was deleted or modified by manifest reconcile"
+grep -q 'old-hook.sh' "$CFG_F/hooks/.builtin-manifest" \
+  && fail "manifest still lists the removed stale hook"
+
+# Fail-safe: a malformed (non-UTF8) manifest must delete NOTHING and must
+# not fail the command.
+printf '\xff\xfe\x00' > "$CFG_F/hooks/.builtin-manifest"
+echo "keep" > "$CFG_F/hooks/orphan.sh"
+exit_f=0
+COYOTE_CONFIG_DIR="$CFG_F" "$BIN" --install-builtins hooks > "$WORKDIR/install_f.out" 2>&1 || exit_f=$?
+[ "$exit_f" = "0" ] \
+  || fail "reinstall failed on a malformed manifest (exit $exit_f): $(cat "$WORKDIR/install_f.out")"
+[ -f "$CFG_F/hooks/orphan.sh" ] \
+  || fail "a malformed manifest caused a deletion (fail-safe broken)"
+[ -f "$CFG_F/hooks/notify.sh" ] && [ -f "$CFG_F/hooks/log-events.sh" ] \
+  || fail "shipped hooks missing after malformed-manifest reinstall"
+echo "PASS: stale manifest-owned hook removed; user files survive; malformed manifest deletes nothing"
+
+echo "== Scenario G: plain startup sweeps removed-builtin-agent hooks, spares user agents =="
+CFG_G="$WORKDIR/g"
+mkdir -p "$CFG_G"
+write_dryrun_config "$CFG_G"
+# ghost: a removed builtin agent (has a manifest, absent from the embed)
+# with a user file beside the manifest-owned hook -> hooks dir survives
+# with only the user file.
+mkdir -p "$CFG_G/agents/ghost/hooks"
+printf 'shipped.sh\n' > "$CFG_G/agents/ghost/hooks/.builtin-manifest"
+echo "stale" > "$CFG_G/agents/ghost/hooks/shipped.sh"
+echo "mine" > "$CFG_G/agents/ghost/hooks/user.sh"
+# ghost2: same, but nothing user-owned -> the emptied hooks dir is removed.
+mkdir -p "$CFG_G/agents/ghost2/hooks"
+printf 'shipped.sh\n' > "$CFG_G/agents/ghost2/hooks/.builtin-manifest"
+echo "stale" > "$CFG_G/agents/ghost2/hooks/shipped.sh"
+# mine: a user agent with no manifest -> never touched.
+mkdir -p "$CFG_G/agents/mine/hooks"
+echo "mine" > "$CFG_G/agents/mine/hooks/mine.sh"
+
+COYOTE_CONFIG_DIR="$CFG_G" "$BIN" --no-stream "say exactly: hi" > /dev/null
+
+[ ! -f "$CFG_G/agents/ghost/hooks/shipped.sh" ] \
+  || fail "removed-agent sweep left the manifest-owned hook behind"
+[ ! -f "$CFG_G/agents/ghost/hooks/.builtin-manifest" ] \
+  || fail "removed-agent sweep left the manifest behind"
+[ "$(cat "$CFG_G/agents/ghost/hooks/user.sh")" = "mine" ] \
+  || fail "removed-agent sweep deleted a user file"
+[ ! -d "$CFG_G/agents/ghost2/hooks" ] \
+  || fail "emptied hooks dir of a removed agent was not removed"
+[ -d "$CFG_G/agents/ghost2" ] \
+  || fail "sweep removed more than the hooks dir of a removed agent"
+[ "$(cat "$CFG_G/agents/mine/hooks/mine.sh")" = "mine" ] \
+  || fail "sweep touched a user agent dir without a manifest"
+echo "PASS: startup sweep removes only manifest-owned hooks of removed agents"
 
 echo
 echo "ALL SCENARIOS PASSED"

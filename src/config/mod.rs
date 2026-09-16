@@ -3,6 +3,7 @@ mod app_config;
 mod app_state;
 pub(crate) mod builtin_manifest;
 mod bundles;
+pub(crate) mod conflict;
 mod input;
 mod install_remote;
 pub(crate) mod instructions;
@@ -37,6 +38,7 @@ pub use self::app_config::AppConfig;
 pub use self::app_state::AppState;
 pub(crate) use self::bundles::installed_bundle_names;
 pub use self::bundles::list_installed_bundles;
+use self::conflict::{InstallMode, StickyMode};
 pub use self::input::Input;
 pub use self::install_remote::{
     DEFAULT_GIT_HOST, install_or_update, install_or_update_from_repl_args, uninstall_bundle,
@@ -418,11 +420,11 @@ impl Default for Config {
 
 pub fn install_builtins() -> Result<()> {
     Functions::install_builtin_global_tools(false)?;
-    Agent::install_builtin_agents(false)?;
+    Agent::install_builtin_agents(InstallMode::Skip)?;
     Macro::install_macros(false)?;
     Skill::install_builtin_skills(false)?;
-    hooks::install_builtin_hooks(false)?;
-    Role::install_builtin_role_hooks(false)?;
+    hooks::install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None)?;
+    Role::install_builtin_role_hooks(InstallMode::Skip, &mut StickyMode::None)?;
     Ok(())
 }
 
@@ -519,11 +521,19 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
     }
 
     match category {
-        AssetCategory::Agents => Agent::install_builtin_agents(true)?,
+        AssetCategory::Agents => Agent::install_builtin_agents(InstallMode::Force)?,
         AssetCategory::Macros => Macro::install_macros(true)?,
         AssetCategory::Functions => Functions::install_builtin_global_tools(true)?,
         AssetCategory::Skills => Skill::install_builtin_skills(true)?,
-        AssetCategory::Hooks => hooks::install_builtin_hooks(true)?,
+        AssetCategory::Hooks => {
+            // One sticky scope spans all three hook locations, so a
+            // keep-all/replace-all answer carries through the whole refresh,
+            // matching bundle-install semantics.
+            let mut sticky = StickyMode::None;
+            hooks::install_builtin_hooks(InstallMode::Prompt, &mut sticky)?;
+            Role::install_builtin_role_hooks(InstallMode::Prompt, &mut sticky)?;
+            Agent::install_builtin_agent_hooks(InstallMode::Prompt, &mut sticky)?;
+        }
         AssetCategory::McpConfig => Functions::install_mcp_config()?,
     }
 
@@ -542,6 +552,14 @@ fn confirm_asset_overwrite(category: AssetCategory, label: &str, target: &Path) 
              at {}. New servers from the bundled template will be added; any \
              MCP servers you have already configured (including custom secret \
              references) are left untouched.",
+            target.display()
+        ),
+        AssetCategory::Hooks => format!(
+            "Refreshing bundled hooks installs any missing bundled hook \
+             scripts in {}, the roles hooks directory, and each bundled \
+             agent's hooks directory. Where a local copy differs from the \
+             bundled version you are asked per file whether to keep or \
+             replace it; non-interactive runs keep local files.",
             target.display()
         ),
         _ => format!(
@@ -1804,5 +1822,144 @@ hooks:
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    /// Points the config dir at a fresh temp directory for the guard's
+    /// lifetime and removes it on drop. Tests using it must serialize.
+    struct TestConfigDirGuard {
+        _env: crate::testing::EnvVarGuard,
+        root: PathBuf,
+    }
+
+    impl TestConfigDirGuard {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = env::temp_dir().join(format!("coyote-{label}-{unique}"));
+            fs::create_dir_all(&root).unwrap();
+            Self {
+                _env: crate::testing::EnvVarGuard::set(get_env_name("config_dir"), &root),
+                root,
+            }
+        }
+    }
+
+    impl Drop for TestConfigDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_assets_hooks_shares_one_sticky_scope_across_all_three_locations() {
+        use crate::config::conflict::prompt_script;
+
+        let _guard = TestConfigDirGuard::new("hooks-three-locations");
+        let notify = paths::hooks_dir().join("notify.sh");
+        let role_dir = paths::roles_dir().join("hooks");
+        let agent_dir = paths::agents_data_dir().join("probe").join("hooks");
+        let shipped = vec![("hook.sh".to_string(), "shipped\n".to_string())];
+
+        // Drives the exact three installers `install_assets(Hooks)` runs,
+        // threading one sticky scope through all of them.
+        let refresh = |sticky: &mut StickyMode| {
+            hooks::install_builtin_hooks(InstallMode::Prompt, sticky).unwrap();
+            role::install_and_reconcile_role_hooks(
+                &role_dir,
+                &shipped,
+                InstallMode::Prompt,
+                sticky,
+            )
+            .unwrap();
+            agent::install_and_reconcile_agent_hooks(
+                "probe",
+                &shipped,
+                InstallMode::Prompt,
+                sticky,
+            )
+            .unwrap();
+        };
+        let modify_all = || {
+            fs::write(&notify, "local global").unwrap();
+            fs::write(role_dir.join("hook.sh"), "local role").unwrap();
+            fs::write(agent_dir.join("hook.sh"), "local agent").unwrap();
+        };
+
+        let script = prompt_script::install(&[]);
+        refresh(&mut StickyMode::None);
+        assert_eq!(
+            prompt_script::prompts_asked(),
+            0,
+            "a clean install asks nothing"
+        );
+        drop(script);
+
+        // One replace-all at the first (global) conflict must silently
+        // replace the role and agent conflicts too.
+        modify_all();
+        let script = prompt_script::install(&["replace-all"]);
+        let mut sticky = StickyMode::None;
+        refresh(&mut sticky);
+        assert_eq!(prompt_script::prompts_asked(), 1);
+        assert_eq!(sticky, StickyMode::ReplaceAll);
+        assert!(
+            fs::read_to_string(&notify)
+                .unwrap()
+                .starts_with("#!/usr/bin/env bash")
+        );
+        assert_eq!(
+            fs::read_to_string(role_dir.join("hook.sh")).unwrap(),
+            "shipped\n"
+        );
+        assert_eq!(
+            fs::read_to_string(agent_dir.join("hook.sh")).unwrap(),
+            "shipped\n"
+        );
+        drop(script);
+
+        // And one keep-all must keep every location's local edit.
+        modify_all();
+        let script = prompt_script::install(&["keep-all"]);
+        let mut sticky = StickyMode::None;
+        refresh(&mut sticky);
+        assert_eq!(prompt_script::prompts_asked(), 1);
+        assert_eq!(sticky, StickyMode::KeepAll);
+        assert_eq!(fs::read_to_string(&notify).unwrap(), "local global");
+        assert_eq!(
+            fs::read_to_string(role_dir.join("hook.sh")).unwrap(),
+            "local role"
+        );
+        assert_eq!(
+            fs::read_to_string(agent_dir.join("hook.sh")).unwrap(),
+            "local agent"
+        );
+        drop(script);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_builtins_never_prompts_and_keeps_local_hook_edits() {
+        use crate::config::conflict::prompt_script;
+
+        let _guard = TestConfigDirGuard::new("install-builtins-startup");
+        install_builtins().unwrap();
+        let notify = paths::hooks_dir().join("notify.sh");
+        fs::write(&notify, "# local edit").unwrap();
+
+        // A forced terminal with no scripted answers: any prompt would panic
+        // and the counter would move.
+        let script = prompt_script::install(&[]);
+        install_builtins().unwrap();
+        assert_eq!(prompt_script::prompts_asked(), 0);
+        assert_eq!(fs::read_to_string(&notify).unwrap(), "# local edit");
+        drop(script);
+
+        let _script = prompt_script::install_non_interactive();
+        install_builtins().unwrap();
+        assert_eq!(prompt_script::prompts_asked(), 0);
+        assert_eq!(fs::read_to_string(&notify).unwrap(), "# local edit");
     }
 }
