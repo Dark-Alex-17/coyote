@@ -288,7 +288,7 @@ mod tests {
             { "type": "redacted_thinking", "data": "b64data" },
         ]);
 
-        let blocks: Vec<ThinkingBlock> = serde_json::from_value(json).unwrap();
+        let blocks: Vec<ThinkingBlock> = serde_json::from_value(json.clone()).unwrap();
 
         assert!(
             matches!(&blocks[0], ThinkingBlock::Thinking { thinking, signature } if thinking == "hmm" && signature == "sig123")
@@ -296,6 +296,7 @@ mod tests {
         assert!(
             matches!(&blocks[1], ThinkingBlock::RedactedThinking { data } if data == "b64data")
         );
+        assert_eq!(serde_json::to_value(&blocks).unwrap(), json);
     }
 
     #[test]
@@ -329,5 +330,32 @@ mod tests {
             matches!(&block, ThinkingBlock::Reasoning { encrypted_content, .. } if encrypted_content.is_none())
         );
         assert_eq!(serde_json::to_value(&block).unwrap(), json);
+    }
+
+    #[test]
+    fn thinking_blocks_round_trip_through_yaml() {
+        let json = json!([
+            { "type": "thinking", "thinking": "hmm", "signature": "sig123" },
+            { "type": "redacted_thinking", "data": "b64data" },
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{ "type": "summary_text", "text": "thinking about it" }],
+                "encrypted_content": "enc123",
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_2",
+                "summary": [],
+            },
+        ]);
+
+        let blocks: Vec<ThinkingBlock> = serde_json::from_value(json.clone()).unwrap();
+
+        let yaml = serde_yaml::to_string(&blocks).unwrap();
+        assert!(!yaml.contains("encrypted_content: null"));
+
+        let restored: Vec<ThinkingBlock> = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), json);
     }
 }
