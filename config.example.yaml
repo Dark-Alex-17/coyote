@@ -338,6 +338,9 @@ clients:
     api_base: https://api.openai.com/v1               # Optional
     api_key: '{{OPENAI_API_KEY}}'                     # You can either hard-code or inject secrets from the Coyote vault
     organization_id: org-xxx                          # Optional
+    auth: null                                        # When set to 'oauth', Coyote will use OAuth instead of an API key
+                                                      # Authenticate with `coyote --authenticate` or `.authenticate` in the REPL
+    # Supports a custom `oauth:` block like the claude client below. `api_base` is REQUIRED with it
 
   # For any platform compatible with OpenAI's API
   - type: openai-compatible

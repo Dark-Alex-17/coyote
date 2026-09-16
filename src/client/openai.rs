@@ -1,11 +1,11 @@
 use super::access_token::{get_access_token, get_access_token_account_id};
-use super::oauth::{self, OAuthProvider};
+use super::oauth::{self, OAuthConfig, OAuthProvider};
 use super::openai_oauth::OpenAIOAuthProvider;
 use super::*;
 
 use crate::utils::strip_think_tag;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -20,6 +20,7 @@ pub struct OpenAIConfig {
     pub api_base: Option<String>,
     pub organization_id: Option<String>,
     pub auth: Option<String>,
+    pub oauth: Option<Box<OAuthConfig>>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
@@ -46,9 +47,7 @@ impl Client for OpenAIClient {
         client: &ReqwestClient,
         data: ChatCompletionsData,
     ) -> Result<ChatCompletionsOutput> {
-        let uses_codex =
-            self.config.auth.as_deref() == Some("oauth") && self.get_api_base().is_err();
-        let request_data = prepare_chat_completions(self, client, data).await?;
+        let (request_data, uses_codex) = prepare_chat_completions(self, client, data).await?;
         let builder = self.request_builder(client, request_data);
         if uses_codex {
             openai_responses_chat_completions(builder, self.model()).await
@@ -63,9 +62,7 @@ impl Client for OpenAIClient {
         handler: &mut SseHandler,
         data: ChatCompletionsData,
     ) -> Result<()> {
-        let uses_codex =
-            self.config.auth.as_deref() == Some("oauth") && self.get_api_base().is_err();
-        let request_data = prepare_chat_completions(self, client, data).await?;
+        let (request_data, uses_codex) = prepare_chat_completions(self, client, data).await?;
         let builder = self.request_builder(client, request_data);
 
         if uses_codex {
@@ -100,18 +97,30 @@ async fn prepare_chat_completions(
     self_: &OpenAIClient,
     client: &ReqwestClient,
     data: ChatCompletionsData,
-) -> Result<RequestData> {
+) -> Result<(RequestData, bool)> {
     let uses_oauth = self_.config.auth.as_deref() == Some("oauth");
-    let has_custom_base = self_.get_api_base().is_ok();
 
-    let uses_codex = uses_oauth && !has_custom_base;
+    if !uses_oauth && self_.config.oauth.is_some() {
+        bail!(
+            "'{}' has an `oauth:` block configured but `auth: oauth` is not set; the oauth block would be ignored. Set `auth: oauth` (and run 'coyote --authenticate {}') or remove the oauth block.",
+            self_.name(),
+            self_.name()
+        );
+    }
+
+    let oauth_provider = if uses_oauth {
+        Some(resolve_oauth_provider(self_)?)
+    } else {
+        None
+    };
+    let uses_stock_provider = matches!(oauth_provider, Some((_, true)));
+    // Stock oauth with no `api_base` routes to the ChatGPT codex backend (Responses API).
+    let uses_codex = uses_stock_provider && self_.get_api_base().is_err();
 
     let url = if uses_codex {
         CODEX_API_ENDPOINT.to_string()
     } else {
-        let api_base = self_
-            .get_api_base()
-            .unwrap_or_else(|_| API_BASE.to_string());
+        let api_base = resolve_api_base(self_)?;
         format!("{}/chat/completions", api_base.trim_end_matches('/'))
     };
 
@@ -123,9 +132,8 @@ async fn prepare_chat_completions(
 
     let mut request_data = RequestData::new(url, body);
 
-    if uses_oauth {
-        let provider = OpenAIOAuthProvider;
-        let ready = oauth::prepare_oauth_access_token(client, &provider, self_.name()).await?;
+    if let Some((provider, _)) = oauth_provider {
+        let ready = oauth::prepare_oauth_access_token(client, &*provider, self_.name()).await?;
 
         if !ready {
             bail!(
@@ -138,9 +146,67 @@ async fn prepare_chat_completions(
         let token = get_access_token(self_.name())?;
         request_data.bearer_auth(token);
 
-        if let Some(account_id) = get_access_token_account_id(self_.name()) {
+        if uses_stock_provider && let Some(account_id) = get_access_token_account_id(self_.name()) {
             request_data.header("ChatGPT-Account-Id", account_id);
         }
+
+        for (key, value) in provider.extra_request_headers() {
+            request_data.header(key, value);
+        }
+    } else if let Ok(api_key) = self_.get_api_key() {
+        request_data.bearer_auth(api_key);
+    } else {
+        bail!(
+            "No authentication configured for '{}'. Set `api_key` or use `auth: oauth` with `coyote --authenticate {}`.",
+            self_.name(),
+            self_.name()
+        );
+    }
+
+    if let Some(organization_id) = &self_.config.organization_id {
+        request_data.header("OpenAI-Organization", organization_id);
+    }
+
+    Ok((request_data, uses_codex))
+}
+
+async fn prepare_embeddings(
+    self_: &OpenAIClient,
+    client: &ReqwestClient,
+    data: &EmbeddingsData,
+) -> Result<RequestData> {
+    let uses_oauth = self_.config.auth.as_deref() == Some("oauth");
+
+    if !uses_oauth && self_.config.oauth.is_some() {
+        bail!(
+            "'{}' has an `oauth:` block configured but `auth: oauth` is not set; the oauth block would be ignored. Set `auth: oauth` (and run 'coyote --authenticate {}') or remove the oauth block.",
+            self_.name(),
+            self_.name()
+        );
+    }
+
+    let api_base = resolve_api_base(self_)?;
+
+    let url = format!("{}/embeddings", api_base.trim_end_matches('/'));
+
+    let body = openai_build_embeddings_body(data, &self_.model);
+
+    let mut request_data = RequestData::new(url, body);
+
+    if uses_oauth {
+        let (provider, _) = resolve_oauth_provider(self_)?;
+        let ready = oauth::prepare_oauth_access_token(client, &*provider, self_.name()).await?;
+
+        if !ready {
+            bail!(
+                "OAuth configured but no tokens found for '{}'. Run: 'coyote --authenticate {}' or '.authenticate' in the REPL",
+                self_.name(),
+                self_.name()
+            );
+        }
+
+        let token = get_access_token(self_.name())?;
+        request_data.bearer_auth(token);
 
         for (key, value) in provider.extra_request_headers() {
             request_data.header(key, value);
@@ -162,50 +228,59 @@ async fn prepare_chat_completions(
     Ok(request_data)
 }
 
-async fn prepare_embeddings(
+fn resolve_api_base(self_: &OpenAIClient) -> Result<String> {
+    resolve_api_base_against(self_, &ALL_PROVIDER_MODELS)
+}
+
+fn resolve_api_base_against(
     self_: &OpenAIClient,
-    client: &ReqwestClient,
-    data: &EmbeddingsData,
-) -> Result<RequestData> {
-    let api_base = self_
-        .get_api_base()
-        .unwrap_or_else(|_| API_BASE.to_string());
-
-    let url = format!("{api_base}/embeddings");
-
-    let body = openai_build_embeddings_body(data, &self_.model);
-
-    let mut request_data = RequestData::new(url, body);
-
-    if self_.config.auth.as_deref() == Some("oauth") {
-        let provider = OpenAIOAuthProvider;
-        let ready = oauth::prepare_oauth_access_token(client, &provider, self_.name()).await?;
-
-        if !ready {
-            bail!(
-                "OAuth configured but no tokens found for '{}'. Run: 'coyote --authenticate {}' or '.authenticate' in the REPL",
-                self_.name(),
-                self_.name()
-            );
-        }
-
-        let token = get_access_token(self_.name())?;
-        request_data.bearer_auth(token);
-    } else if let Ok(api_key) = self_.get_api_key() {
-        request_data.bearer_auth(api_key);
-    } else {
+    all_provider_models: &[ProviderModels],
+) -> Result<String> {
+    if let Ok(api_base) = self_.get_api_base() {
+        return Ok(api_base);
+    }
+    let uses_config_oauth = self_.config.auth.as_deref() == Some("oauth")
+        && match locate_client_config(self_) {
+            Ok(cc) => oauth::config_oauth_for_client(cc, all_provider_models).is_some(),
+            // Safe: on locate failure, provider resolution bails when an inline oauth block exists; otherwise the stock provider is used and issuer-stamped gateway tokens are rejected before attach.
+            Err(_) => self_.config.oauth.is_some(),
+        };
+    if uses_config_oauth {
         bail!(
-            "No authentication configured for '{}'. Set `api_key` or use `auth: oauth` with `coyote --authenticate {}`.",
+            "'{}' has a config-driven OAuth configuration (an `oauth:` block in the client entry or models catalog) but no `api_base`; refusing to fall back to {} (the oauth token would be sent to the wrong host). Set `api_base` on the '{}' client entry.",
             self_.name(),
+            API_BASE,
             self_.name()
         );
     }
+    Ok(API_BASE.to_string())
+}
 
-    if let Some(organization_id) = &self_.config.organization_id {
-        request_data.header("OpenAI-Organization", organization_id);
+fn locate_client_config(self_: &OpenAIClient) -> Result<&ClientConfig> {
+    let client_name = self_.name();
+    self_
+        .app_config()
+        .clients
+        .iter()
+        .find(|cc| {
+            matches!(
+                cc,
+                ClientConfig::OpenAIConfig(c)
+                if c.name.as_deref().unwrap_or(OpenAIClient::NAME) == client_name
+            )
+        })
+        .ok_or_else(|| anyhow!("Could not locate ClientConfig entry for '{}'", client_name))
+}
+
+fn resolve_oauth_provider(self_: &OpenAIClient) -> Result<(Box<dyn OAuthProvider>, bool)> {
+    match locate_client_config(self_) {
+        Ok(cc) => Ok(oauth::openai_oauth_provider_for_client(
+            cc,
+            &ALL_PROVIDER_MODELS,
+        )),
+        Err(_) if self_.config.oauth.is_none() => Ok((Box::new(OpenAIOAuthProvider), true)),
+        Err(err) => Err(err),
     }
-
-    Ok(request_data)
 }
 
 pub async fn openai_chat_completions(
@@ -362,50 +437,51 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
     } = data;
 
     let messages_len = messages.len();
-    let messages: Vec<Value> = messages
-        .into_iter()
-        .enumerate()
-        .flat_map(|(i, message)| {
-            let Message { role, content } = message;
-            match content {
-                MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results,
-                    text,
-                    sequence,
-                }) => {
-                    // Empty tool_results (reachable via deserialized sessions) must not emit empty tool_calls.
-                    if tool_results.is_empty() {
-                        vec![]
-                    } else if !sequence {
-                        let tool_calls: Vec<_> = tool_results
-                            .iter()
-                            .map(|tool_result| {
-                                json!({
-                                    "id": tool_result.call.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_result.call.name,
-                                        "arguments": tool_result.call.arguments.to_string(),
-                                    },
+    let messages: Vec<Value> =
+        messages
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, message)| {
+                let Message { role, content } = message;
+                match content {
+                    MessageContent::ToolCalls(MessageContentToolCalls {
+                        tool_results,
+                        text,
+                        sequence,
+                    }) => {
+                        // Empty tool_results (reachable via deserialized sessions) must not emit empty tool_calls.
+                        if tool_results.is_empty() {
+                            vec![]
+                        } else if !sequence {
+                            let tool_calls: Vec<_> = tool_results
+                                .iter()
+                                .map(|tool_result| {
+                                    json!({
+                                        "id": tool_result.call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_result.call.name,
+                                            "arguments": tool_result.call.arguments.to_string(),
+                                        },
+                                    })
                                 })
-                            })
-                            .collect();
-                        let mut assistant_message =
-                            json!({ "role": MessageRole::Assistant, "tool_calls": tool_calls });
-                        if !text.is_empty() {
-                            assistant_message["content"] = strip_think_tag(&text).into();
-                        }
-                        let mut messages = vec![assistant_message];
-                        for tool_result in tool_results {
-                            messages.push(json!({
-                                "role": "tool",
-                                "content": tool_result.output.to_string(),
-                                "tool_call_id": tool_result.call.id,
-                            }));
-                        }
-                        messages
-                    } else {
-                        tool_results.into_iter().enumerate().flat_map(|(index, tool_result)| {
+                                .collect();
+                            let mut assistant_message =
+                                json!({ "role": MessageRole::Assistant, "tool_calls": tool_calls });
+                            if !text.is_empty() {
+                                assistant_message["content"] = strip_think_tag(&text).into();
+                            }
+                            let mut messages = vec![assistant_message];
+                            for tool_result in tool_results {
+                                messages.push(json!({
+                                    "role": "tool",
+                                    "content": tool_result.output.to_string(),
+                                    "tool_call_id": tool_result.call.id,
+                                }));
+                            }
+                            messages
+                        } else {
+                            tool_results.into_iter().enumerate().flat_map(|(index, tool_result)| {
                             let round_text = if index == 0 && !text.is_empty() {
                                 Some(text.clone())
                             } else {
@@ -437,16 +513,16 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                             ]
 
                         }).collect()
+                        }
                     }
+                    MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
+                        vec![json!({ "role": role, "content": strip_think_tag(&text) }
+                        )]
+                    }
+                    _ => vec![json!({ "role": role, "content": content })],
                 }
-                MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
-                    vec![json!({ "role": role, "content": strip_think_tag(&text) }
-                    )]
-                }
-                _ => vec![json!({ "role": role, "content": content })],
-            }
-        })
-        .collect();
+            })
+            .collect();
 
     let mut body = json!({
         "model": &model.real_name(),
@@ -536,7 +612,11 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     } else {
         text.to_string()
     };
-    let output = ChatCompletionsOutput { text, tool_calls, ..Default::default() };
+    let output = ChatCompletionsOutput {
+        text,
+        tool_calls,
+        ..Default::default()
+    };
     Ok(output)
 }
 
@@ -699,7 +779,11 @@ pub fn openai_extract_responses(data: &Value) -> Result<ChatCompletionsOutput> {
     if text.is_empty() && tool_calls.is_empty() {
         bail!("Invalid response data: {data}");
     }
-    Ok(ChatCompletionsOutput { text, tool_calls, ..Default::default() })
+    Ok(ChatCompletionsOutput {
+        text,
+        tool_calls,
+        ..Default::default()
+    })
 }
 
 pub async fn openai_responses_streaming(
@@ -752,6 +836,10 @@ pub async fn openai_responses_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::access_token::set_access_token;
+    use crate::config::AppConfig;
+    use chrono::Utc;
+    use std::sync::Arc;
 
     fn build_body(sequence: bool) -> Value {
         let data = ChatCompletionsData {
@@ -791,5 +879,368 @@ mod tests {
         let messages = body["messages"].as_array().unwrap();
 
         assert_eq!(messages.len(), 1, "body: {body}");
+    }
+
+    fn openai_config(name: &str, auth: Option<&str>, oauth: Option<OAuthConfig>) -> OpenAIConfig {
+        OpenAIConfig {
+            name: Some(name.into()),
+            api_base: oauth
+                .as_ref()
+                .map(|_| "https://gateway.example/v1".to_string()),
+            auth: auth.map(str::to_string),
+            oauth: oauth.map(Box::new),
+            ..Default::default()
+        }
+    }
+
+    fn make_client(config: OpenAIConfig, clients: Vec<ClientConfig>) -> OpenAIClient {
+        OpenAIClient {
+            app_config: Arc::new(AppConfig {
+                clients,
+                ..AppConfig::default()
+            }),
+            config,
+            model: Model::new("openai", "gpt-test"),
+        }
+    }
+
+    fn minimal_oauth_config() -> OAuthConfig {
+        serde_yaml::from_str("client_id: gateway\ntoken_url: https://gateway.example/token")
+            .unwrap()
+    }
+
+    fn prepare(client: &OpenAIClient) -> Result<(RequestData, bool)> {
+        let data = ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".to_string()),
+            )],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream: false,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(prepare_chat_completions(
+                client,
+                &ReqwestClient::new(),
+                data,
+            ))
+    }
+
+    fn prepare_embed(client: &OpenAIClient) -> Result<RequestData> {
+        let data = EmbeddingsData::new(vec!["hello".to_string()], false);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(prepare_embeddings(client, &ReqwestClient::new(), &data))
+    }
+
+    #[test]
+    fn oauth_block_without_api_base_is_rejected() {
+        let name = "openai-gate-apibase-missing-test";
+        let mut config = openai_config(name, Some("oauth"), Some(minimal_oauth_config()));
+        config.api_base = None;
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let err = resolve_api_base(&client).unwrap_err().to_string();
+
+        assert!(
+            err.contains(name) && err.contains("refusing to fall back"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn catalog_only_oauth_block_without_api_base_is_rejected() {
+        let name = "openai-gate-catalog-oauth-test";
+        let config = openai_config(name, Some("oauth"), None);
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+        let catalog = vec![ProviderModels {
+            provider: name.into(),
+            oauth: Some(minimal_oauth_config()),
+            models: vec![],
+        }];
+
+        let err = resolve_api_base_against(&client, &catalog)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains(name) && err.contains("refusing to fall back"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn oauth_block_with_api_base_resolves_it() {
+        let name = "openai-gate-apibase-set-test";
+        let config = openai_config(name, Some("oauth"), Some(minimal_oauth_config()));
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let api_base = resolve_api_base(&client).unwrap();
+
+        assert_eq!(api_base, "https://gateway.example/v1");
+    }
+
+    #[test]
+    fn no_oauth_block_falls_back_to_stock_api_base() {
+        let name = "openai-gate-apibase-fallback-test";
+        let config = openai_config(name, None, None);
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let api_base = resolve_api_base(&client).unwrap();
+
+        assert_eq!(api_base, API_BASE);
+    }
+
+    #[test]
+    fn stock_oauth_without_api_base_routes_to_codex() {
+        let name = "openai-gate-codex-test";
+        let config = openai_config(name, Some("oauth"), None);
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+        set_access_token(name, "codex-at".into(), Utc::now().timestamp() + 3600, None);
+
+        let (request_data, uses_codex) = prepare(&client).unwrap();
+
+        assert!(uses_codex);
+        assert_eq!(request_data.url, CODEX_API_ENDPOINT);
+    }
+
+    #[test]
+    fn config_oauth_block_skips_codex_routing() {
+        let name = "openai-gate-gateway-codex-test";
+        let config = openai_config(name, Some("oauth"), Some(minimal_oauth_config()));
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+        set_access_token(
+            name,
+            "gateway-at".into(),
+            Utc::now().timestamp() + 3600,
+            None,
+        );
+
+        let (request_data, uses_codex) = prepare(&client).unwrap();
+
+        assert!(!uses_codex);
+        assert_eq!(
+            request_data.url,
+            "https://gateway.example/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn oauth_block_without_auth_oauth_is_rejected() {
+        let name = "openai-gate-contradiction-test";
+        let mut config = openai_config(name, None, Some(minimal_oauth_config()));
+        config.api_key = Some("sk-test".into());
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let err = match prepare(&client) {
+            Ok(_) => panic!("expected the contradictory config to be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            err.contains("has an `oauth:` block configured but `auth: oauth` is not set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_oauth_extra_request_headers_reach_request() {
+        let name = "openai-gate-extra-headers-test";
+        let oauth: OAuthConfig = serde_yaml::from_str(
+            "client_id: gateway\ntoken_url: https://gateway.example/token\nextra_request_headers:\n  x-gateway-tenant: acme",
+        )
+        .unwrap();
+        let config = openai_config(name, Some("oauth"), Some(oauth));
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+        set_access_token(
+            name,
+            "gateway-at".into(),
+            Utc::now().timestamp() + 3600,
+            None,
+        );
+
+        let (request_data, _) = prepare(&client).unwrap();
+
+        assert_eq!(
+            request_data
+                .headers
+                .get("x-gateway-tenant")
+                .map(String::as_str),
+            Some("acme")
+        );
+    }
+
+    #[test]
+    fn config_oauth_embeddings_url_trims_trailing_slash() {
+        let name = "openai-gate-embed-oauth-test";
+        let mut config = openai_config(name, Some("oauth"), Some(minimal_oauth_config()));
+        config.api_base = Some("https://gateway.example/v1/".into());
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+        set_access_token(
+            name,
+            "gateway-at".into(),
+            Utc::now().timestamp() + 3600,
+            None,
+        );
+
+        let request_data = prepare_embed(&client).unwrap();
+
+        assert_eq!(request_data.url, "https://gateway.example/v1/embeddings");
+        assert_eq!(
+            request_data
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer gateway-at")
+        );
+    }
+
+    #[test]
+    fn oauth_block_without_api_base_is_rejected_in_embeddings() {
+        let name = "openai-gate-embed-apibase-missing-test";
+        let mut config = openai_config(name, Some("oauth"), Some(minimal_oauth_config()));
+        config.api_base = None;
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let err = match prepare_embed(&client) {
+            Ok(_) => panic!("expected the missing api_base to be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            err.contains(name) && err.contains("refusing to fall back"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn catalog_oauth_block_with_api_key_auth_falls_back_to_stock_api_base() {
+        let name = "openai-gate-catalog-apikey-test";
+        let mut config = openai_config(name, None, None);
+        config.api_key = Some("sk-test".into());
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+        let catalog = vec![ProviderModels {
+            provider: name.into(),
+            oauth: Some(minimal_oauth_config()),
+            models: vec![],
+        }];
+
+        let api_base = resolve_api_base_against(&client, &catalog).unwrap();
+
+        assert_eq!(api_base, API_BASE);
+    }
+
+    #[test]
+    fn missing_config_entry_without_inline_oauth_resolves_stock_provider() {
+        let config = openai_config("openai-gate-missing-entry-test", Some("oauth"), None);
+        let client = make_client(config, vec![]);
+
+        let (_, is_stock) = resolve_oauth_provider(&client).unwrap();
+
+        assert!(is_stock);
+    }
+
+    #[test]
+    fn missing_config_entry_with_inline_oauth_is_a_hard_error() {
+        let config = openai_config(
+            "openai-gate-missing-entry-inline-test",
+            Some("oauth"),
+            Some(minimal_oauth_config()),
+        );
+        let client = make_client(config, vec![]);
+
+        let err = match resolve_oauth_provider(&client) {
+            Ok(_) => panic!("expected the missing ClientConfig entry to be a hard error"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            err.contains("Could not locate ClientConfig entry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn stock_oauth_attaches_chatgpt_account_id_header() {
+        let name = "openai-gate-account-id-stock-test";
+        let config = openai_config(name, Some("oauth"), None);
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+        set_access_token(
+            name,
+            "codex-at".into(),
+            Utc::now().timestamp() + 3600,
+            Some("acct-123".into()),
+        );
+
+        let (request_data, _) = prepare(&client).unwrap();
+
+        assert_eq!(
+            request_data
+                .headers
+                .get("ChatGPT-Account-Id")
+                .map(String::as_str),
+            Some("acct-123")
+        );
+    }
+
+    #[test]
+    fn config_oauth_block_omits_chatgpt_account_id_header() {
+        let name = "openai-gate-account-id-gateway-test";
+        let config = openai_config(name, Some("oauth"), Some(minimal_oauth_config()));
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+        set_access_token(
+            name,
+            "gateway-at".into(),
+            Utc::now().timestamp() + 3600,
+            Some("acct-123".into()),
+        );
+
+        let (request_data, _) = prepare(&client).unwrap();
+
+        assert!(
+            !request_data.headers.contains_key("ChatGPT-Account-Id"),
+            "headers: {:?}",
+            request_data.headers
+        );
+    }
+
+    #[test]
+    fn auth_mismatch_bails_before_missing_api_base_guard() {
+        let name = "openai-gate-bail-order-test";
+        let mut config = openai_config(name, None, Some(minimal_oauth_config()));
+        config.api_base = None;
+        let client = make_client(config.clone(), vec![ClientConfig::OpenAIConfig(config)]);
+
+        let err = match prepare(&client) {
+            Ok(_) => panic!("expected the contradictory config to be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            err.contains("has an `oauth:` block configured but `auth: oauth` is not set")
+                && !err.contains("refusing to fall back"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn shipped_catalog_resolves_stock_openai_provider() {
+        let cc = ClientConfig::OpenAIConfig(openai_config("openai", Some("oauth"), None));
+        let bundled: Vec<ProviderModels> = serde_yaml::from_str(MODELS_YAML).unwrap();
+
+        let (_, is_stock) = oauth::openai_oauth_provider_for_client(&cc, &bundled);
+
+        assert!(
+            is_stock,
+            "bundled models.yaml must not carry an openai oauth block: it would silently disable codex routing for stock ChatGPT oauth users"
+        );
     }
 }

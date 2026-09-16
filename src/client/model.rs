@@ -536,4 +536,25 @@ reasoning_levels: [none, low, medium, high]
 
         assert_eq!(data.default_reasoning_effort.as_deref(), Some("none"));
     }
+
+    #[test]
+    fn shipped_catalog_carries_no_credentials_and_only_intended_oauth_defaults() {
+        assert!(
+            !super::super::common::MODELS_YAML.contains("api_key"),
+            "the shipped models.yaml must never carry an api key: the model catalog is credential-free by policy"
+        );
+
+        let bundled: Vec<ProviderModels> =
+            serde_yaml::from_str(super::super::common::MODELS_YAML).unwrap();
+        let with_oauth: Vec<&str> = bundled
+            .iter()
+            .filter(|p| p.oauth.is_some())
+            .map(|p| p.provider.as_str())
+            .collect();
+        assert_eq!(
+            with_oauth,
+            ["xai"],
+            "oauth blocks in the shipped models.yaml are limited to providers with no built-in stock oauth path (currently only xai's bundled defaults); adding one for claude/openai/gemini would silently swap stock oauth users onto a non-stock provider"
+        );
+    }
 }

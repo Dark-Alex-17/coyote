@@ -1,5 +1,8 @@
 use super::access_token::{clear_rejected, is_rejected, is_valid_access_token, set_access_token};
+use super::claude_oauth::ClaudeOAuthProvider;
+use super::gemini_oauth::GeminiOAuthProvider;
 use super::openai_compatible_oauth::OpenAICompatibleOAuthProvider;
+use super::openai_oauth::OpenAIOAuthProvider;
 use super::{ClientConfig, ProviderModels};
 use crate::config::paths;
 use anyhow::{Context, Error, Result, anyhow, bail};
@@ -1056,9 +1059,9 @@ fn listen_for_oauth_callback(redirect_uri: &str) -> Result<(String, String)> {
 
 pub fn get_oauth_provider(provider_type: &str) -> Option<Box<dyn OAuthProvider>> {
     match provider_type {
-        "claude" => Some(Box::new(super::claude_oauth::ClaudeOAuthProvider)),
-        "gemini" => Some(Box::new(super::gemini_oauth::GeminiOAuthProvider)),
-        "openai" => Some(Box::new(super::openai_oauth::OpenAIOAuthProvider)),
+        "claude" => Some(Box::new(ClaudeOAuthProvider)),
+        "gemini" => Some(Box::new(GeminiOAuthProvider)),
+        "openai" => Some(Box::new(OpenAIOAuthProvider)),
         _ => None,
     }
 }
@@ -1071,6 +1074,8 @@ pub(crate) fn config_oauth_for_client(
     let user_oauth = match client_config {
         ClientConfig::OpenAICompatibleConfig(c) => c.oauth.clone().map(|b| *b),
         ClientConfig::ClaudeConfig(c) => c.oauth.clone().map(|b| *b),
+        ClientConfig::OpenAIConfig(c) => c.oauth.clone().map(|b| *b),
+        ClientConfig::GeminiConfig(c) => c.oauth.clone().map(|b| *b),
         _ => return None,
     };
     let base = all_provider_models
@@ -1085,9 +1090,12 @@ pub(crate) fn config_oauth_for_client(
     }
 }
 
-pub(crate) fn claude_oauth_provider_for_client(
+/// Resolves a config-driven `oauth:` block to the generic provider, or falls back to `stock`.
+/// Returns the provider and whether the stock provider is in use.
+fn oauth_provider_for_client(
     client_config: &ClientConfig,
     all_provider_models: &[ProviderModels],
+    stock: fn() -> Box<dyn OAuthProvider>,
 ) -> (Box<dyn OAuthProvider>, bool) {
     let (client_name, _, _) = client_config_info(client_config);
     match config_oauth_for_client(client_config, all_provider_models) {
@@ -1099,8 +1107,35 @@ pub(crate) fn claude_oauth_provider_for_client(
             }),
             false,
         ),
-        None => (Box::new(super::claude_oauth::ClaudeOAuthProvider), true),
+        None => (stock(), true),
     }
+}
+
+pub(crate) fn claude_oauth_provider_for_client(
+    client_config: &ClientConfig,
+    all_provider_models: &[ProviderModels],
+) -> (Box<dyn OAuthProvider>, bool) {
+    oauth_provider_for_client(client_config, all_provider_models, || {
+        Box::new(ClaudeOAuthProvider)
+    })
+}
+
+pub(crate) fn openai_oauth_provider_for_client(
+    client_config: &ClientConfig,
+    all_provider_models: &[ProviderModels],
+) -> (Box<dyn OAuthProvider>, bool) {
+    oauth_provider_for_client(client_config, all_provider_models, || {
+        Box::new(OpenAIOAuthProvider)
+    })
+}
+
+pub(crate) fn gemini_oauth_provider_for_client(
+    client_config: &ClientConfig,
+    all_provider_models: &[ProviderModels],
+) -> (Box<dyn OAuthProvider>, bool) {
+    oauth_provider_for_client(client_config, all_provider_models, || {
+        Box::new(GeminiOAuthProvider)
+    })
 }
 
 pub fn get_oauth_provider_for_client(
@@ -1124,6 +1159,16 @@ pub fn get_oauth_provider_for_client(
         ClientConfig::ClaudeConfig(_) => {
             let (provider, _) =
                 claude_oauth_provider_for_client(client_config, all_provider_models);
+            Some(provider)
+        }
+        ClientConfig::OpenAIConfig(_) => {
+            let (provider, _) =
+                openai_oauth_provider_for_client(client_config, all_provider_models);
+            Some(provider)
+        }
+        ClientConfig::GeminiConfig(_) => {
+            let (provider, _) =
+                gemini_oauth_provider_for_client(client_config, all_provider_models);
             Some(provider)
         }
         _ => get_oauth_provider(provider_type),
@@ -1192,6 +1237,8 @@ mod tests {
     use super::*;
     use crate::client::access_token::{distrust_access_token, get_access_token};
     use crate::client::claude::ClaudeConfig;
+    use crate::client::gemini::GeminiConfig;
+    use crate::client::openai::OpenAIConfig;
     use crate::client::openai_compatible::OpenAICompatibleConfig;
     use crate::client::{ModelData, ProviderModels};
     use crate::utils::get_env_name;
@@ -1437,6 +1484,41 @@ echo_pkce_in_token_exchange: true
         })
     }
 
+    fn make_openai_client(
+        name: &str,
+        auth: Option<&str>,
+        oauth: Option<OAuthConfig>,
+    ) -> ClientConfig {
+        ClientConfig::OpenAIConfig(OpenAIConfig {
+            name: Some(name.into()),
+            api_key: None,
+            api_base: None,
+            organization_id: None,
+            auth: auth.map(str::to_string),
+            oauth: oauth.map(Box::new),
+            models: vec![],
+            patch: None,
+            extra: None,
+        })
+    }
+
+    fn make_gemini_client(
+        name: &str,
+        auth: Option<&str>,
+        oauth: Option<OAuthConfig>,
+    ) -> ClientConfig {
+        ClientConfig::GeminiConfig(GeminiConfig {
+            name: Some(name.into()),
+            api_key: None,
+            api_base: None,
+            auth: auth.map(str::to_string),
+            oauth: oauth.map(Box::new),
+            models: vec![],
+            patch: None,
+            extra: None,
+        })
+    }
+
     #[test]
     fn get_oauth_provider_for_client_merges_defaults_with_user_override() {
         let base = base_config();
@@ -1575,6 +1657,92 @@ echo_pkce_in_token_exchange: true
         let cc = make_claude_client("claude", Some("oauth"), None);
 
         let (provider, is_stock) = claude_oauth_provider_for_client(&cc, &[]);
+
+        assert!(is_stock);
+        assert!(!provider.requires_issuer_stamp());
+    }
+
+    #[test]
+    fn openai_client_with_user_oauth_block_uses_generic_provider() {
+        let user = empty_user_override("gateway-id", "https://gateway.example/token");
+        let cc = make_openai_client("openai", Some("oauth"), Some(user));
+
+        let provider = get_oauth_provider_for_client(&cc, &[]).unwrap();
+
+        assert_eq!(provider.provider_name(), "openai");
+        assert_eq!(provider.client_id(), "gateway-id");
+        assert_eq!(provider.token_url(), "https://gateway.example/token");
+    }
+
+    #[test]
+    fn openai_client_without_oauth_block_falls_back_to_stock_provider() {
+        let cc = make_openai_client("openai", Some("oauth"), None);
+
+        let provider = get_oauth_provider_for_client(&cc, &[]).unwrap();
+
+        assert_eq!(provider.provider_name(), "openai");
+        assert_eq!(provider.client_id(), "app_EMoamEEZ73f0CkXaXp7hrann");
+    }
+
+    #[test]
+    fn openai_config_provider_requires_issuer_stamp() {
+        let user = empty_user_override("gateway-id", "https://gateway.example/token");
+        let cc = make_openai_client("openai", Some("oauth"), Some(user));
+
+        let (provider, is_stock) = openai_oauth_provider_for_client(&cc, &[]);
+
+        assert!(!is_stock);
+        assert!(provider.requires_issuer_stamp());
+    }
+
+    #[test]
+    fn openai_stock_provider_grandfathers_legacy_tokens() {
+        let cc = make_openai_client("openai", Some("oauth"), None);
+
+        let (provider, is_stock) = openai_oauth_provider_for_client(&cc, &[]);
+
+        assert!(is_stock);
+        assert!(!provider.requires_issuer_stamp());
+    }
+
+    #[test]
+    fn gemini_client_with_user_oauth_block_uses_generic_provider() {
+        let user = empty_user_override("gateway-id", "https://gateway.example/token");
+        let cc = make_gemini_client("gemini", Some("oauth"), Some(user));
+
+        let provider = get_oauth_provider_for_client(&cc, &[]).unwrap();
+
+        assert_eq!(provider.provider_name(), "gemini");
+        assert_eq!(provider.client_id(), "gateway-id");
+        assert_eq!(provider.token_url(), "https://gateway.example/token");
+    }
+
+    #[test]
+    fn gemini_client_without_oauth_block_falls_back_to_stock_provider() {
+        let cc = make_gemini_client("gemini", Some("oauth"), None);
+
+        let provider = get_oauth_provider_for_client(&cc, &[]).unwrap();
+
+        assert_eq!(provider.provider_name(), "gemini");
+        assert_eq!(provider.token_url(), "https://oauth2.googleapis.com/token");
+    }
+
+    #[test]
+    fn gemini_config_provider_requires_issuer_stamp() {
+        let user = empty_user_override("gateway-id", "https://gateway.example/token");
+        let cc = make_gemini_client("gemini", Some("oauth"), Some(user));
+
+        let (provider, is_stock) = gemini_oauth_provider_for_client(&cc, &[]);
+
+        assert!(!is_stock);
+        assert!(provider.requires_issuer_stamp());
+    }
+
+    #[test]
+    fn gemini_stock_provider_grandfathers_legacy_tokens() {
+        let cc = make_gemini_client("gemini", Some("oauth"), None);
+
+        let (provider, is_stock) = gemini_oauth_provider_for_client(&cc, &[]);
 
         assert!(is_stock);
         assert!(!provider.requires_issuer_stamp());
