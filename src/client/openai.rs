@@ -943,6 +943,12 @@ fn openai_responses_handle_event(data: &Value, handler: &mut SseHandler) -> Resu
             Some(message) => bail!("Response failed: {message}"),
             None => bail!("Response failed: {data}"),
         },
+        Some("response.incomplete") => {
+            match data["response"]["incomplete_details"]["reason"].as_str() {
+                Some(reason) => bail!("The response was cut off: {reason}"),
+                None => bail!("The response was cut off: {data}"),
+            }
+        }
         Some("error") => match data["message"].as_str() {
             Some(message) => bail!("Stream error: {message}"),
             None => bail!("Stream error: {data}"),
@@ -1376,6 +1382,28 @@ mod tests {
             .to_string();
 
         assert!(err.contains("Rate limit reached"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn responses_stream_incomplete_event_bails_with_reason() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut handler = SseHandler::new(sender, abort_signal);
+        let event = json!({
+            "type": "response.incomplete",
+            "response": {
+                "incomplete_details": { "reason": "max_output_tokens" }
+            }
+        });
+
+        let err = openai_responses_handle_event(&event, &mut handler)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("The response was cut off: max_output_tokens"),
+            "unexpected error: {err}"
+        );
     }
 
     fn openai_config(name: &str, auth: Option<&str>, oauth: Option<OAuthConfig>) -> OpenAIConfig {
