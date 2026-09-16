@@ -248,7 +248,7 @@ pub fn fire_resolved(
             .collect();
 
         #[cfg(test)]
-        if test_sink::record(event, &hook, &envs) {
+        if test_sink::record(event, &hook, &envs, payload.as_deref()) {
             continue;
         }
 
@@ -496,6 +496,11 @@ pub(crate) mod test_sink {
         pub event: HookEvent,
         pub hook_name: String,
         pub envs: HashMap<String, String>,
+        /// The tool-arguments JSON as handed to dispatch; `None` for events
+        /// that carry no payload.
+        pub payload: Option<String>,
+        /// The working directory the hook would have spawned in.
+        pub cwd: std::path::PathBuf,
     }
 
     /// Suppresses process spawning and records every dispatch synchronously
@@ -518,7 +523,12 @@ pub(crate) mod test_sink {
         }
     }
 
-    pub(super) fn record(event: HookEvent, hook: &ResolvedHook, envs: &[(String, String)]) -> bool {
+    pub(super) fn record(
+        event: HookEvent,
+        hook: &ResolvedHook,
+        envs: &[(String, String)],
+        payload: Option<&str>,
+    ) -> bool {
         if INSTALLED.load(Ordering::SeqCst) == 0 {
             return false;
         }
@@ -529,6 +539,8 @@ pub(crate) mod test_sink {
                 event,
                 hook_name: hook.name.clone(),
                 envs: envs.iter().cloned().collect(),
+                payload: payload.map(str::to_string),
+                cwd: hook.cwd.clone(),
             });
         true
     }
@@ -901,7 +913,7 @@ mod tests {
             command: "true".to_string(),
             cwd: env::temp_dir(),
         };
-        assert!(test_sink::record(HookEvent::TurnFailed, &hook, &[]));
+        assert!(test_sink::record(HookEvent::TurnFailed, &hook, &[], None));
 
         let captures = test_sink::drain();
         assert!(

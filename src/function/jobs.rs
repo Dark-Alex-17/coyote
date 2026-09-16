@@ -9,6 +9,7 @@ use crate::config::{
     McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled, paths,
 };
 use crate::graph;
+use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
     MCP_PROMPT_META_FUNCTION_NAME_PREFIX, MCP_READ_META_FUNCTION_NAME_PREFIX,
@@ -21,6 +22,7 @@ use crate::utils::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{SecondsFormat, Utc};
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
@@ -51,6 +53,75 @@ pub fn is_agent_task(supervisor: Option<&Arc<RwLock<Supervisor>>>, id: &str) -> 
     id.starts_with("agent_")
         || id.starts_with("graph_agent_")
         || supervisor.is_some_and(|sup| sup.read().has_agent(id))
+}
+
+/// Terminal-event hooks for one job, resolved on the caller's context before
+/// the task is spawned (`build_env_snapshot` precedent) so the detached
+/// closure owns everything it fires with. Session and agent names are
+/// snapshotted because the context is gone by fire time.
+struct JobHookSnapshot {
+    completed: Vec<ResolvedHook>,
+    failed: Vec<ResolvedHook>,
+    session_name: Option<String>,
+    agent_name: Option<String>,
+    job_id: String,
+    tool: String,
+}
+
+impl JobHookSnapshot {
+    fn resolve(ctx: &RequestContext, job_id: &str, tool: &str) -> Self {
+        Self {
+            completed: ctx.resolved_hooks(HookEvent::JobCompleted),
+            failed: ctx.resolved_hooks(HookEvent::JobFailed),
+            session_name: ctx
+                .session
+                .as_ref()
+                .map(|session| session.name().to_string()),
+            agent_name: ctx.agent.as_ref().map(|agent| agent.name().to_string()),
+            job_id: job_id.to_string(),
+            tool: tool.to_string(),
+        }
+    }
+
+    /// Fires `job.completed` or `job.failed`. `fire_resolved` callers supply
+    /// their own base envs, so this mirrors the engine's assembly; the event
+    /// name and timestamp are computed here so they reflect the actual
+    /// outcome rather than the moment the snapshot was taken.
+    fn fire_terminal(self, success: bool, error: Option<String>) {
+        let (event, resolved) = if success {
+            (HookEvent::JobCompleted, self.completed)
+        } else {
+            (HookEvent::JobFailed, self.failed)
+        };
+        if resolved.is_empty() {
+            return;
+        }
+        let mut base_envs = vec![
+            ("COYOTE_EVENT".to_string(), event.as_str().to_string()),
+            (
+                "COYOTE_CONFIG_DIR".to_string(),
+                paths::config_dir().display().to_string(),
+            ),
+            (
+                "COYOTE_EVENT_TIMESTAMP".to_string(),
+                Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            ),
+        ];
+        if let Some(name) = self.session_name {
+            base_envs.push(("COYOTE_SESSION_ID".to_string(), name));
+        }
+        if let Some(name) = self.agent_name {
+            base_envs.push(("COYOTE_AGENT_NAME".to_string(), name));
+        }
+        let mut extras = vec![
+            ("COYOTE_JOB_ID", self.job_id),
+            ("COYOTE_TOOL_NAME", self.tool),
+        ];
+        if let Some(error) = error {
+            extras.push(("COYOTE_JOB_ERROR", error));
+        }
+        hooks::fire_resolved(event, resolved, base_envs, &extras, None);
+    }
 }
 
 pub struct RingBuf {
@@ -470,15 +541,27 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         let task_notifications = Arc::clone(&ctx.notification_queue);
         let notify_id = job_id.clone();
         let notify_tool = tool.clone();
+        let hook_snapshot = JobHookSnapshot::resolve(ctx, &job_id, &tool);
+        hooks::fire(
+            HookEvent::JobStarted,
+            ctx,
+            &[
+                ("COYOTE_JOB_ID", job_id.clone()),
+                ("COYOTE_TOOL_NAME", tool.clone()),
+            ],
+            None,
+        );
         tokio::spawn(async move {
             let result = run_mcp_job(job_ctx, server, inner_tool, inner_args).await;
             let success = result.is_ok();
+            let error = result.as_ref().err().map(|err| err.to_string());
             task_state.lock().status = if success {
                 JobStatus::Completed
             } else {
                 JobStatus::Failed
             };
             task_notifications.push(job_notification(&notify_id, &notify_tool, success));
+            hook_snapshot.fire_terminal(success, error);
             result
         })
     } else {
@@ -488,9 +571,26 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         let task_notifications = Arc::clone(&ctx.notification_queue);
         let notify_id = job_id.clone();
         let notify_tool = tool.clone();
+        let hook_snapshot = JobHookSnapshot::resolve(ctx, &job_id, &tool);
+        hooks::fire(
+            HookEvent::JobStarted,
+            ctx,
+            &[
+                ("COYOTE_JOB_ID", job_id.clone()),
+                ("COYOTE_TOOL_NAME", tool.clone()),
+            ],
+            None,
+        );
         tokio::spawn(async move {
             let result = run_process_job(snapshot, Arc::clone(&task_state), task_buf).await;
             let success = matches!(&result, Ok(job_result) if job_result.exit_code == Some(0));
+            let error = (!success).then(|| match &result {
+                Err(err) => err.to_string(),
+                Ok(job_result) => match job_result.exit_code {
+                    Some(code) => format!("exited with code {code}"),
+                    None => "terminated without an exit code".to_string(),
+                },
+            });
             let mut job_state = task_state.lock();
             job_state.pgid = None;
             job_state.status = if success {
@@ -502,6 +602,7 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             drop(job_state);
 
             task_notifications.push(job_notification(&notify_id, &notify_tool, success));
+            hook_snapshot.fire_terminal(success, error);
             result
         })
     };
@@ -3118,5 +3219,191 @@ mod tests {
                 .contains("not enabled in this context")
         );
         assert!(ctx.supervisor.is_none(), "no job may be spawned");
+    }
+
+    fn job_hooks_map(marker: &str) -> crate::hooks::HooksMap {
+        ["job.started", "job.completed", "job.failed"]
+            .into_iter()
+            .map(|event| {
+                (
+                    event.to_string(),
+                    vec![crate::hooks::HookDef {
+                        name: marker.to_string(),
+                        command: "true".to_string(),
+                    }],
+                )
+            })
+            .collect()
+    }
+
+    fn job_hooked_ctx(marker: &str) -> RequestContext {
+        let app = app_state_with_config(|config| {
+            config.hooks = job_hooks_map(marker);
+        });
+        RequestContext::new(app, WorkingMode::Cmd)
+    }
+
+    fn job_captures(marker: &str) -> Vec<crate::hooks::test_sink::Capture> {
+        crate::hooks::test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name == marker)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn job_hooks_fire_started_and_completed() {
+        run_async(async {
+            let marker = "job-hooks-ok-x7x";
+            let mut ctx = job_hooked_ctx(marker);
+            ctx.declared_function_names.insert("echo".into());
+            let _guard = crate::hooks::test_sink::install();
+
+            let started = handle_start(&mut ctx, &json!({"tool": "echo", "arguments": {}}))
+                .await
+                .unwrap();
+            assert_eq!(started["status"], "ok");
+            let job_id = started["job_id"].as_str().unwrap().to_string();
+
+            // `job.started` is dispatched before `handle_start` returns.
+            let captures = job_captures(marker);
+            assert_eq!(captures.len(), 1, "{captures:?}");
+            assert_eq!(captures[0].event, HookEvent::JobStarted);
+            assert_eq!(
+                captures[0].envs.get("COYOTE_JOB_ID").map(String::as_str),
+                Some(job_id.as_str())
+            );
+            assert_eq!(
+                captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
+                Some("echo")
+            );
+
+            let collected = handle_collect(&ctx, &json!({"id": job_id})).await.unwrap();
+            assert_eq!(collected["status"], "completed");
+
+            let captures = job_captures(marker);
+            assert_eq!(captures.len(), 2, "{captures:?}");
+            let completed = &captures[1];
+            assert_eq!(completed.event, HookEvent::JobCompleted);
+            assert_eq!(
+                completed.envs.get("COYOTE_EVENT").map(String::as_str),
+                Some("job.completed")
+            );
+            assert_eq!(
+                completed.envs.get("COYOTE_JOB_ID").map(String::as_str),
+                Some(job_id.as_str())
+            );
+            assert_eq!(
+                completed.envs.get("COYOTE_TOOL_NAME").map(String::as_str),
+                Some("echo")
+            );
+            assert!(completed.envs.contains_key("COYOTE_CONFIG_DIR"));
+            assert!(completed.envs.contains_key("COYOTE_EVENT_TIMESTAMP"));
+            assert!(!completed.envs.contains_key("COYOTE_SESSION_ID"));
+            assert!(!completed.envs.contains_key("COYOTE_JOB_ERROR"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn job_hooks_fire_failed_with_job_error() {
+        run_async(async {
+            let marker = "job-hooks-fail-x7x";
+            let mut ctx = job_hooked_ctx(marker);
+            ctx.declared_function_names.insert("false".into());
+            let _guard = crate::hooks::test_sink::install();
+
+            let started = handle_start(&mut ctx, &json!({"tool": "false", "arguments": {}}))
+                .await
+                .unwrap();
+            let job_id = started["job_id"].as_str().unwrap().to_string();
+
+            let collected = handle_collect(&ctx, &json!({"id": job_id})).await.unwrap();
+            assert_eq!(collected["status"], "failed");
+
+            let captures = job_captures(marker);
+            assert_eq!(captures.len(), 2, "{captures:?}");
+            assert_eq!(captures[0].event, HookEvent::JobStarted);
+            let failed = &captures[1];
+            assert_eq!(failed.event, HookEvent::JobFailed);
+            assert_eq!(
+                failed.envs.get("COYOTE_EVENT").map(String::as_str),
+                Some("job.failed")
+            );
+            assert_eq!(
+                failed.envs.get("COYOTE_JOB_ID").map(String::as_str),
+                Some(job_id.as_str())
+            );
+            assert_eq!(
+                failed.envs.get("COYOTE_JOB_ERROR").map(String::as_str),
+                Some("exited with code 1")
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn job_hooks_fire_for_mcp_jobs() {
+        run_async(async {
+            let marker = "job-hooks-mcp-x7x";
+            let mut ctx = job_hooked_ctx(marker);
+            ctx.declared_function_names
+                .insert("mcp_invoke_fixture".into());
+            let fixture = FixtureServer::default();
+            let (mut runtime, _server) = fixture_runtime(fixture).await;
+            let mut filter = ToolFilter::default();
+            filter.push_layer(LayerSource::Global, &[]);
+            runtime.tool_filters.insert("fixture".to_string(), filter);
+            ctx.tool_scope.mcp_runtime = runtime;
+            let _guard = crate::hooks::test_sink::install();
+
+            let started = handle_start(
+                &mut ctx,
+                &json!({"tool": "mcp_invoke_fixture", "arguments": {"tool": "dup"}}),
+            )
+            .await
+            .unwrap();
+            let job_id = started["job_id"].as_str().unwrap().to_string();
+
+            let collected = handle_collect(&ctx, &json!({"id": job_id})).await.unwrap();
+            assert_eq!(collected["status"], "failed");
+
+            let captures = job_captures(marker);
+            assert_eq!(captures.len(), 2, "{captures:?}");
+            assert_eq!(captures[0].event, HookEvent::JobStarted);
+            assert_eq!(
+                captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
+                Some("mcp_invoke_fixture")
+            );
+            let failed = &captures[1];
+            assert_eq!(failed.event, HookEvent::JobFailed);
+            assert!(
+                failed
+                    .envs
+                    .get("COYOTE_JOB_ERROR")
+                    .unwrap()
+                    .contains("dup not found"),
+                "{failed:?}"
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rejected_job_start_fires_no_hooks() {
+        let marker = "job-hooks-rejected-x7x";
+        let mut ctx = job_hooked_ctx(marker);
+        let _guard = crate::hooks::test_sink::install();
+
+        let result = run_async(handle_start(
+            &mut ctx,
+            &json!({"tool": "undeclared_tool", "arguments": {}}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert!(job_captures(marker).is_empty());
     }
 }

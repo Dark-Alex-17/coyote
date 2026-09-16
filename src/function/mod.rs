@@ -17,6 +17,7 @@ use crate::{
 
 use crate::config::ensure_parent_exists;
 use crate::config::paths;
+use crate::hooks::{self, HookEvent};
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
     MCP_META_FUNCTION_PREFIXES, MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
@@ -1538,7 +1539,29 @@ impl ToolCall {
         Ok(result)
     }
 
+    /// Evaluates the call, firing `tool.*` hooks around it: `tool.started`
+    /// once the name and arguments are resolved, then exactly one of
+    /// `tool.completed` / `tool.failed`. A failure before resolution
+    /// (unknown tool, malformed arguments) fires `tool.failed` alone. Hooks
+    /// are pure observers — the returned value is exactly what the tool
+    /// produced.
     pub async fn eval(&self, ctx: &mut RequestContext) -> Result<Value> {
+        let result = self.eval_inner(ctx).await;
+        if let Err(err) = &result {
+            hooks::fire(
+                HookEvent::ToolFailed,
+                ctx,
+                &[
+                    ("COYOTE_TOOL_NAME", self.name.clone()),
+                    ("COYOTE_TOOL_ERROR", err.to_string()),
+                ],
+                None,
+            );
+        }
+        result
+    }
+
+    async fn eval_inner(&self, ctx: &mut RequestContext) -> Result<Value> {
         let agent = ctx.agent.clone();
         let functions = ctx.tool_scope.functions.clone();
         let current_depth = ctx.current_depth;
@@ -1566,7 +1589,8 @@ impl ToolCall {
             );
         };
 
-        cmd_args.push(json_data.to_string());
+        let args_json = json_data.to_string();
+        cmd_args.push(args_json.clone());
 
         if (*IS_STDOUT_TERMINAL || *SHOW_TOOL_CALLS)
             && current_depth == 0
@@ -1574,6 +1598,14 @@ impl ToolCall {
         {
             println!("{}", format_call_log(&cmd_name, &cmd_args, &json_data));
         }
+
+        hooks::fire(
+            HookEvent::ToolStarted,
+            ctx,
+            &[("COYOTE_TOOL_NAME", self.name.clone())],
+            Some(args_json.clone()),
+        );
+        let tool_started_at = Instant::now();
 
         let output = match cmd_name.as_str() {
             _ if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) => {
@@ -1698,6 +1730,38 @@ impl ToolCall {
                     .unwrap_or_else(|| json!({"output": e.to_string()})),
             },
         };
+
+        match output.get("tool_call_error") {
+            Some(error) => {
+                let error = error
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| error.to_string());
+                hooks::fire(
+                    HookEvent::ToolFailed,
+                    ctx,
+                    &[
+                        ("COYOTE_TOOL_NAME", self.name.clone()),
+                        ("COYOTE_TOOL_ERROR", error),
+                    ],
+                    Some(args_json),
+                );
+            }
+            None => {
+                hooks::fire(
+                    HookEvent::ToolCompleted,
+                    ctx,
+                    &[
+                        ("COYOTE_TOOL_NAME", self.name.clone()),
+                        (
+                            "COYOTE_TOOL_DURATION_MS",
+                            tool_started_at.elapsed().as_millis().to_string(),
+                        ),
+                    ],
+                    Some(args_json),
+                );
+            }
+        }
 
         Ok(output)
     }
@@ -5242,5 +5306,242 @@ mod tests {
             let err = out["tool_call_error"].as_str().unwrap();
             assert!(err.starts_with(expected), "{name}: {err}");
         }
+    }
+
+    fn tool_hooks_map(marker: &str) -> crate::hooks::HooksMap {
+        ["tool.started", "tool.completed", "tool.failed"]
+            .into_iter()
+            .map(|event| {
+                (
+                    event.to_string(),
+                    vec![crate::hooks::HookDef {
+                        name: marker.to_string(),
+                        command: "true".to_string(),
+                    }],
+                )
+            })
+            .collect()
+    }
+
+    fn ctx_with_tool_hooks(marker: &str, update: impl FnOnce(&mut AppConfig)) -> RequestContext {
+        let mut app = AppState::test_default();
+        let mut config = AppConfig {
+            hooks: tool_hooks_map(marker),
+            ..Default::default()
+        };
+        update(&mut config);
+        app.config = Arc::new(config);
+        RequestContext::new(Arc::new(app), WorkingMode::Cmd)
+    }
+
+    fn tool_captures(marker: &str) -> Vec<crate::hooks::test_sink::Capture> {
+        crate::hooks::test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name == marker)
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn eval_fires_started_and_completed_for_builtin_tools() {
+        use crate::hooks::HookEvent;
+        let marker = "tool-hooks-builtin-ok-x7x";
+        let mut ctx = ctx_with_tool_hooks(marker, |config| {
+            config.function_calling_support = true;
+            config.auto_continue = true;
+        });
+        ctx.tool_scope.functions.append_todo_functions();
+        let _guard = crate::hooks::test_sink::install();
+
+        let output =
+            run_async(call_with_args("todo__init", json!({"goal": "g"})).eval(&mut ctx)).unwrap();
+
+        assert_eq!(output["status"], "ok");
+        let captures = tool_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::ToolStarted);
+        assert_eq!(
+            captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
+            Some("todo__init")
+        );
+        assert_eq!(captures[0].payload.as_deref(), Some(r#"{"goal":"g"}"#));
+        assert_eq!(captures[0].cwd, paths::config_dir());
+        assert_eq!(captures[1].event, HookEvent::ToolCompleted);
+        assert!(captures[1].envs.contains_key("COYOTE_TOOL_DURATION_MS"));
+        assert_eq!(captures[1].payload.as_deref(), Some(r#"{"goal":"g"}"#));
+    }
+
+    #[test]
+    #[serial]
+    fn eval_fires_started_and_completed_for_mcp_meta_tools() {
+        use crate::hooks::HookEvent;
+        let marker = "tool-hooks-mcp-ok-x7x";
+        run_async(async {
+            let mut result = CallToolResult::success(vec![ContentBlock::text("hi")]);
+            result.structured_content = Some(json!({"ok": true}));
+            let fixture = FixtureServer {
+                tool_result: Some(result),
+                ..Default::default()
+            };
+            let (runtime, _server) = fixture_runtime(fixture).await;
+            let mut ctx = ctx_with_tool_hooks(marker, |_| {});
+            ctx.tool_scope.mcp_runtime = runtime;
+            ctx.tool_scope
+                .functions
+                .append_mcp_meta_functions(vec![tools_only("fixture")]);
+            let _guard = crate::hooks::test_sink::install();
+
+            let output = call_with_args("mcp_invoke_fixture", json!({"tool": "dup"}))
+                .eval(&mut ctx)
+                .await
+                .unwrap();
+
+            assert_eq!(output["isError"], false);
+            let captures = tool_captures(marker);
+            assert_eq!(captures.len(), 2, "{captures:?}");
+            assert_eq!(captures[0].event, HookEvent::ToolStarted);
+            assert_eq!(
+                captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
+                Some("mcp_invoke_fixture")
+            );
+            assert_eq!(captures[0].payload.as_deref(), Some(r#"{"tool":"dup"}"#));
+            assert_eq!(captures[1].event, HookEvent::ToolCompleted);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_fires_started_and_completed_for_external_command_tools() {
+        use crate::hooks::HookEvent;
+        let marker = "tool-hooks-external-ok-x7x";
+        let mut ctx = ctx_with_tool_hooks(marker, |_| {});
+        ctx.tool_scope
+            .functions
+            .append_declaration(FunctionDeclaration {
+                name: "echo".to_string(),
+                description: String::new(),
+                parameters: JsonSchema::default(),
+                agent: false,
+            });
+        let _guard = crate::hooks::test_sink::install();
+
+        let output = run_async(call_with_args("echo", json!({"x": 1})).eval(&mut ctx)).unwrap();
+
+        assert_eq!(output, Value::Null);
+        let captures = tool_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::ToolStarted);
+        assert_eq!(
+            captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
+            Some("echo")
+        );
+        assert_eq!(captures[1].event, HookEvent::ToolCompleted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_fires_failed_for_external_command_nonzero_exit() {
+        use crate::hooks::HookEvent;
+        let marker = "tool-hooks-external-fail-x7x";
+        let mut ctx = ctx_with_tool_hooks(marker, |_| {});
+        ctx.tool_scope
+            .functions
+            .append_declaration(FunctionDeclaration {
+                name: "false".to_string(),
+                description: String::new(),
+                parameters: JsonSchema::default(),
+                agent: false,
+            });
+        let _guard = crate::hooks::test_sink::install();
+
+        let output = run_async(call_with_args("false", json!({})).eval(&mut ctx)).unwrap();
+
+        assert!(output["tool_call_error"].is_string());
+        let captures = tool_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::ToolStarted);
+        assert_eq!(captures[1].event, HookEvent::ToolFailed);
+        assert!(
+            captures[1]
+                .envs
+                .get("COYOTE_TOOL_ERROR")
+                .unwrap()
+                .contains("exited with code 1")
+        );
+        assert!(!captures[1].envs.contains_key("COYOTE_TOOL_DURATION_MS"));
+    }
+
+    #[test]
+    #[serial]
+    fn eval_fires_failed_on_error_shaped_output_with_identical_result() {
+        use crate::hooks::HookEvent;
+        let marker = "tool-hooks-error-shape-x7x";
+        // Default config leaves todo tools disabled, so the handler bails
+        // and eval shapes the failure as a `tool_call_error` output.
+        let mut hooked = ctx_with_tool_hooks(marker, |_| {});
+        hooked.tool_scope.functions.append_todo_functions();
+        let mut plain = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        plain.tool_scope.functions.append_todo_functions();
+        let call = call_with_args("todo__done", json!({}));
+        let _guard = crate::hooks::test_sink::install();
+
+        let hooked_output = run_async(call.eval(&mut hooked)).unwrap();
+        let plain_output = run_async(call.eval(&mut plain)).unwrap();
+
+        assert_eq!(
+            hooked_output.to_string(),
+            plain_output.to_string(),
+            "hooks must not change the tool result"
+        );
+        let error = hooked_output["tool_call_error"].as_str().unwrap();
+        assert!(error.starts_with("Todo tool failed:"), "{error}");
+        let captures = tool_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::ToolStarted);
+        assert_eq!(captures[1].event, HookEvent::ToolFailed);
+        assert_eq!(
+            captures[1]
+                .envs
+                .get("COYOTE_TOOL_ERROR")
+                .map(String::as_str),
+            Some(error)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn eval_err_fires_failed_without_started_and_identical_error() {
+        use crate::hooks::HookEvent;
+        let marker = "tool-hooks-eval-err-x7x";
+        let mut hooked = ctx_with_tool_hooks(marker, |_| {});
+        let mut plain = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let call = call_with_args("nonexistent_tool", json!({}));
+        let _guard = crate::hooks::test_sink::install();
+
+        let hooked_err = run_async(call.eval(&mut hooked)).unwrap_err();
+        let plain_err = run_async(call.eval(&mut plain)).unwrap_err();
+
+        assert_eq!(
+            hooked_err.to_string(),
+            plain_err.to_string(),
+            "hooks must not change the error"
+        );
+        let captures = tool_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::ToolFailed);
+        assert_eq!(
+            captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
+            Some("nonexistent_tool")
+        );
+        assert!(
+            captures[0]
+                .envs
+                .get("COYOTE_TOOL_ERROR")
+                .unwrap()
+                .contains("Unexpected call")
+        );
+        assert!(captures[0].payload.is_none());
     }
 }
