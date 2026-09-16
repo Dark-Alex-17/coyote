@@ -388,7 +388,12 @@ async fn run(
         let app = Arc::clone(&ctx.app.config);
         ctx.use_agent(app.as_ref(), agent, session, abort_signal.clone())
             .await?;
-        ctx.top_level_agent_started();
+        // The top-level agent bracket does NOT open here: the inspection
+        // flags below (--list-sessions, --info, --macro, --rebuild-rag,
+        // --init-*) return early without running the agent, and an open
+        // bracket on those paths would leak `agent.started` with no
+        // terminal event. It opens at the dispatch sites further down,
+        // where an agent run is actually committed.
     } else {
         let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
         if let Some(prompt) = &cli.temp_role {
@@ -525,6 +530,9 @@ async fn run(
         return Ok(());
     }
     if cli.execute && !is_repl {
+        // Dispatch committed: open the top-level agent bracket only now,
+        // past every inspection-flag early return above.
+        ctx.top_level_agent_started();
         let result = async {
             let input = create_input(&ctx, text, &cli.file, abort_signal.clone()).await?;
             shell_execute(&mut ctx, &SHELL, input, abort_signal.clone()).await
@@ -550,6 +558,12 @@ async fn run(
         return acp::run_acp_server(ctx, abort_signal).await;
     }
 
+    // Dispatch committed (headless directive or REPL): open the top-level
+    // agent bracket only now, past every inspection-flag early return
+    // above. The ACP server stays unbracketed deliberately. The headless
+    // arm closes the bracket below; the REPL closes it at teardown (or on
+    // an interactive agent switch).
+    ctx.top_level_agent_started();
     match is_repl {
         false => {
             let result = async {
@@ -692,6 +706,12 @@ async fn shell_execute(
                     if code == 0 && app.save_shell_history {
                         let _ = append_to_shell_history(&shell.name, &eval_str, code);
                     }
+                    // `process::exit` never returns, so the dispatch
+                    // wrapper's bracket close in `run()` is unreachable
+                    // from here: close the top-level agent bracket now.
+                    // The agent run itself succeeded — the exit code
+                    // belongs to the user's shell command, not to us.
+                    ctx.top_level_agent_finished(None);
                     hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
                     process::exit(code);
                 }

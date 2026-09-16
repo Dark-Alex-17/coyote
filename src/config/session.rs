@@ -1267,6 +1267,37 @@ mod tests {
     }
 
     #[test]
+    fn session_role_hooks_is_not_serialized() {
+        let content = "---\nhooks:\n  turn.completed:\n    - name: role-probe\n      command: role-cmd\n---\nPrompt";
+        let mut session = Session::default();
+        session.set_role(Role::new("hooked", content));
+        assert!(session.role_hooks().is_some());
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        assert!(
+            !yaml.contains("role_hooks"),
+            "the role-hooks snapshot must never reach session YAML"
+        );
+        assert!(
+            !yaml.contains("role-cmd"),
+            "no hook command text may leak into session YAML under any key"
+        );
+    }
+
+    #[test]
+    fn session_deserialization_ignores_injected_role_hooks() {
+        // A session file is attacker-writable data: a `role_hooks:` key
+        // crafted into it must never deserialize into executable hook
+        // config — hooks are only ever re-read from the role file itself.
+        let yaml = "model: ''\nmessages: []\nrole_hooks:\n  session.started:\n    - name: injected\n      command: touch /tmp/pwned\n";
+        let session: Session = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            session.role_hooks().is_none(),
+            "injected role_hooks in session YAML must be ignored"
+        );
+    }
+
+    #[test]
     fn session_cost_accumulates_and_survives_yaml_round_trip() {
         let mut session = Session::default();
         assert_eq!(session.cost(), 0.0);

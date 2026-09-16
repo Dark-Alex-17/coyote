@@ -1644,10 +1644,7 @@ async fn ask_inner(
             };
             eprintln!("\n📢 {}", color.italic().paint("Compressing the session."),);
 
-            match ctx.compress_session().await {
-                Ok(()) => hooks::fire(HookEvent::SessionCompressed, ctx, &[], None),
-                Err(err) => warn!("Failed to compress the session: {err}"),
-            }
+            auto_compress_session(ctx).await;
             if let Some(session) = ctx.session.as_mut() {
                 session.set_compressing(false);
             }
@@ -1696,6 +1693,18 @@ fn print_turn_divider() {
         .unwrap_or(33);
     println!("{}", dimmed_text(&"─".repeat(width)));
     println!();
+}
+
+/// Auto-compression seam for the ask loop: `session.compressed` fires only
+/// when compression actually succeeded. A failed auto-compression is
+/// survivable mid-session, so the error is logged and swallowed rather
+/// than aborting the turn — unlike `.compress session`, which surfaces
+/// the failure to the user.
+async fn auto_compress_session(ctx: &mut RequestContext) {
+    match ctx.compress_session().await {
+        Ok(()) => hooks::fire(HookEvent::SessionCompressed, ctx, &[], None),
+        Err(err) => warn!("Failed to compress the session: {err}"),
+    }
 }
 
 fn should_continue(ctx: &RequestContext) -> bool {
@@ -2005,7 +2014,8 @@ pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppState, Session, WorkingMode};
+    use crate::client::{ClientConfig, Model};
+    use crate::config::{AppState, RoleLike, Session, WorkingMode};
     use crate::hooks::{HookDef, HooksMap, test_sink};
     use anyhow::anyhow;
     use serial_test::serial;
@@ -2177,6 +2187,113 @@ mod tests {
                 .count(),
             0,
             "a failed compression must fire no session.compressed hook"
+        );
+    }
+
+    /// A ctx whose compression can actually SUCCEED offline: `dry_run`
+    /// makes the summarization call echo instead of hitting the network,
+    /// the default openai client config makes the session model
+    /// resolvable, and the session already holds a user exchange so
+    /// `compress_session` has something to summarize.
+    fn compressible_ctx(marker: &str) -> RequestContext {
+        let mut hooks_map = HooksMap::default();
+        hooks_map.insert(
+            "session.compressed".to_string(),
+            vec![HookDef {
+                name: format!("{marker}-session.compressed"),
+                command: "true".to_string(),
+            }],
+        );
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            hooks: hooks_map,
+            dry_run: true,
+            clients: vec![ClientConfig::default()],
+            ..Default::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+        let mut session = Session::default();
+        session.set_model(Model::new("openai", "test-compress-model"));
+        ctx.session = Some(session);
+        let input = Input::from_str(&ctx, "hello there", None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "hi")
+            .unwrap();
+        ctx
+    }
+
+    fn session_compressed_count(marker: &str) -> usize {
+        test_sink::snapshot()
+            .iter()
+            .filter(|capture| capture.hook_name == format!("{marker}-session.compressed"))
+            .count()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn compress_command_success_fires_session_compressed_once() {
+        let _sink = test_sink::install();
+        let marker = "compress-ok-w2p";
+        let mut ctx = compressible_ctx(marker);
+        let abort_signal = create_abort_signal();
+
+        // Boxed: `run_repl_command`'s state machine is far larger than a test
+        // thread's stack.
+        let result = Box::pin(run_repl_command(
+            &mut ctx,
+            abort_signal,
+            ".compress session",
+        ))
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "dry-run compression must succeed: {result:?}"
+        );
+        assert_eq!(
+            session_compressed_count(marker),
+            1,
+            "a successful `.compress session` must fire session.compressed exactly once"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn auto_compress_success_fires_session_compressed_once() {
+        // Covers the ask-loop call site through its extracted seam;
+        // driving `needs_compression` itself requires a full LLM turn and
+        // is exercised end-to-end by integration coverage, not here.
+        let _sink = test_sink::install();
+        let marker = "auto-compress-ok-f8r";
+        let mut ctx = compressible_ctx(marker);
+
+        auto_compress_session(&mut ctx).await;
+
+        assert_eq!(
+            session_compressed_count(marker),
+            1,
+            "a successful auto-compression must fire session.compressed exactly once"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn auto_compress_failure_fires_no_session_compressed_and_swallows_error() {
+        let _sink = test_sink::install();
+        let marker = "auto-compress-fail-d3k";
+        let mut ctx = compressible_ctx(marker);
+        // An empty session makes compress_session fail; the seam must
+        // swallow the error (no panic, no propagation) and fire nothing.
+        ctx.session = Some(Session::default());
+
+        auto_compress_session(&mut ctx).await;
+
+        assert_eq!(
+            session_compressed_count(marker),
+            0,
+            "a failed auto-compression must fire no session.compressed hook"
         );
     }
 
