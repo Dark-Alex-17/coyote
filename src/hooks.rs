@@ -1,8 +1,11 @@
-use crate::config::{RequestContext, paths};
+use crate::config::{RequestContext, ensure_parent_exists, paths};
+use crate::function::write_file_atomic;
 
+use anyhow::{Result, anyhow};
 use chrono::{SecondsFormat, Utc};
 use indexmap::IndexMap;
 use rand::distr::{Alphanumeric, SampleString};
+use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -11,6 +14,52 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Notify;
+
+#[derive(Embed)]
+#[folder = "assets/hooks/"]
+struct HookAssets;
+
+pub fn install_builtin_hooks(force: bool) -> Result<()> {
+    info!(
+        "Installing built-in example hooks in {}",
+        paths::hooks_dir().display()
+    );
+
+    let mut wrote_any = false;
+    for file in HookAssets::iter() {
+        debug!("Processing hook file: {}", file.as_ref());
+
+        let embedded_file = HookAssets::get(&file)
+            .ok_or_else(|| anyhow!("Failed to load embedded hook file: {}", file.as_ref()))?;
+        let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
+        let file_path = paths::hooks_dir().join(file.as_ref());
+
+        if file_path.exists() && !force {
+            debug!(
+                "Hook file already exists, skipping: {}",
+                file_path.display()
+            );
+            continue;
+        }
+
+        ensure_parent_exists(&file_path)?;
+        info!("Creating hook file: {}", file_path.display());
+        write_file_atomic(&file_path, content, Some(0o755))?;
+        wrote_any = true;
+    }
+
+    if wrote_any && paths::hooks_dir() != paths::config_dir().join("hooks") {
+        warn!(
+            "{} overrides the hooks dir: example scripts install to {}, but relative \
+             global-hook commands resolve against {}",
+            crate::utils::get_env_name("hooks_dir"),
+            paths::hooks_dir().display(),
+            paths::config_dir().display()
+        );
+    }
+
+    Ok(())
+}
 
 /// A single named hook: an external command to run when its event fires.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -603,6 +652,174 @@ mod tests {
             ..Default::default()
         });
         RequestContext::new(Arc::new(app), WorkingMode::Cmd)
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_hooks_installs_executable_scripts_and_honors_force() {
+        let env_name = crate::utils::get_env_name("hooks_dir");
+        let prev = env::var_os(&env_name);
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("coyote-hooks-install-{unique}"));
+        unsafe {
+            env::set_var(&env_name, &root);
+        }
+
+        // Capture every outcome first and assert only after the env var is
+        // restored, so a failed assertion cannot leave the hooks-dir override
+        // pointing at a deleted temp dir for subsequent tests.
+        let notify = root.join("notify.sh");
+        let log_events = root.join("log-events.sh");
+        let fresh = install_builtin_hooks(false);
+        let installed = (notify.is_file(), log_events.is_file());
+        #[cfg(unix)]
+        let modes: Vec<std::io::Result<u32>> = {
+            use std::os::unix::fs::PermissionsExt;
+            [&notify, &log_events]
+                .iter()
+                .map(|path| std::fs::metadata(path).map(|meta| meta.permissions().mode() & 0o777))
+                .collect()
+        };
+        let modified = std::fs::write(&notify, "modified");
+        let no_force = install_builtin_hooks(false);
+        let after_no_force = std::fs::read_to_string(&notify);
+        let force = install_builtin_hooks(true);
+        let after_force = std::fs::read_to_string(&notify);
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        fresh.unwrap();
+        assert!(installed.0, "notify.sh must be installed");
+        assert!(installed.1, "log-events.sh must be installed");
+        #[cfg(unix)]
+        for (path, mode) in [&notify, &log_events].into_iter().zip(modes) {
+            assert_eq!(
+                mode.unwrap(),
+                0o755,
+                "{} must be executable",
+                path.display()
+            );
+        }
+        modified.unwrap();
+        no_force.unwrap();
+        assert_eq!(after_no_force.unwrap(), "modified");
+        force.unwrap();
+        assert!(after_force.unwrap().starts_with("#!/usr/bin/env bash"));
+    }
+
+    /// The example hooks are plain scripts, not argc tools: they live outside
+    /// `assets/functions/tools/`, so the argc regeneration that runs during
+    /// tests must never have stamped them with an ARGC-BUILD block.
+    #[test]
+    fn builtin_hook_assets_are_not_argc_tools() {
+        let files: Vec<String> = HookAssets::iter()
+            .map(|file| file.as_ref().to_string())
+            .collect();
+        assert!(files.contains(&"notify.sh".to_string()), "{files:?}");
+        assert!(files.contains(&"log-events.sh".to_string()), "{files:?}");
+
+        for file in HookAssets::iter() {
+            let embedded = HookAssets::get(&file).unwrap();
+            let content = std::str::from_utf8(&embedded.data).unwrap();
+            assert!(
+                !content.contains("ARGC-BUILD"),
+                "{} must not contain an ARGC-BUILD block",
+                file.as_ref()
+            );
+            assert!(
+                !content.contains("# @cmd"),
+                "{} must not use argc annotations",
+                file.as_ref()
+            );
+        }
+    }
+
+    #[test]
+    fn notify_script_prefers_notify_send_then_osascript_then_echo() {
+        let embedded = HookAssets::get("notify.sh").unwrap();
+        let content = std::str::from_utf8(&embedded.data).unwrap();
+        let notify_send = content.find("notify-send").expect("notify-send branch");
+        let osascript = content.find("osascript").expect("osascript branch");
+        let echo = content.find("echo \"[$title]").expect("echo fallback");
+        assert!(notify_send < osascript);
+        assert!(osascript < echo);
+    }
+
+    #[test]
+    fn log_events_script_defaults_to_tmp_log_behind_env_override() {
+        let embedded = HookAssets::get("log-events.sh").unwrap();
+        let content = std::str::from_utf8(&embedded.data).unwrap();
+        assert!(content.contains("COYOTE_HOOK_LOG"));
+        assert!(content.contains("/tmp/coyote-hooks.log"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_events_script_appends_event_and_env_snapshot() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/hooks/log-events.sh");
+        let log =
+            env::temp_dir().join(format!("coyote-log-events-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+
+        let status = std::process::Command::new("bash")
+            .arg(&script)
+            .env("COYOTE_HOOK_LOG", &log)
+            .env("COYOTE_EVENT", "turn.completed")
+            .env("COYOTE_AGENT_NAME", "demo-agent")
+            .env("COYOTE_SECRET_DEMO", "hunter2")
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        let logged = std::fs::read_to_string(&log).unwrap();
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&log).unwrap().permissions().mode()
+        };
+        let _ = std::fs::remove_file(&log);
+        assert!(logged.contains("turn.completed"), "{logged}");
+        assert!(logged.contains("COYOTE_EVENT=turn.completed"), "{logged}");
+        assert!(logged.contains("COYOTE_AGENT_NAME=demo-agent"), "{logged}");
+        assert!(!logged.contains("COYOTE_SECRET_"), "{logged}");
+        assert!(!logged.contains("hunter2"), "{logged}");
+        assert_eq!(mode & 0o777, 0o600, "log file should be created 0600");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notify_script_falls_back_to_echo_without_notifiers() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/hooks/notify.sh");
+        // An empty PATH hides notify-send and osascript; echo is a bash
+        // builtin, so only the fallback branch can produce output.
+        let mut cmd = std::process::Command::new("/bin/bash");
+        cmd.arg(&script)
+            .env("PATH", "")
+            .env("COYOTE_EVENT", "turn.completed")
+            .env("COYOTE_TOOL_NAME", "demo");
+        // Detach from any controlling terminal so the script cannot open
+        // /dev/tty and must fall back to captured stdout.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let output = cmd.output().unwrap();
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("turn.completed"), "{stdout}");
+        assert!(stdout.contains("tool=demo"), "{stdout}");
     }
 
     #[test]

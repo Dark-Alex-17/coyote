@@ -200,6 +200,19 @@ pub fn discover() -> Result<Vec<DiscoveredMixin>> {
     for path in collect_mixins(&paths::rags_dir(), &[ScanMode::Flat]) {
         out.push(read_mixin(path)?);
     }
+    for path in collect_mixins(&paths::roles_dir(), &[ScanMode::Flat]) {
+        out.push(read_mixin(path)?);
+    }
+    // Mirrors the role-hook working directory (role hook commands run with
+    // cwd = roles_dir), so `./hooks/*.sbx-mixin.yaml` beside a role resolves
+    // the same way the role's hook commands do — intentionally NOT
+    // paths::hooks_dir(). The agent-hook working directory
+    // (`<agents>/<agent>/hooks/` — agent hooks run with cwd = the agent's
+    // data dir) is deliberately not scanned here either; agent-dir scanning
+    // above covers `<agents>/<agent>/*.sbx-mixin.yaml` only.
+    for path in collect_mixins(&paths::roles_dir().join("hooks"), &[ScanMode::Flat]) {
+        out.push(read_mixin(path)?);
+    }
 
     if let Ok(cwd) = env::current_dir()
         && let Some(path) = paths::find_workspace_sbx_mixin(&cwd)
@@ -936,6 +949,55 @@ network:
         let root = unique_root("flat-missing");
         let absent = root.join("nope");
         assert!(collect_mixins(&absent, &[ScanMode::Flat]).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn discover_scans_roles_and_role_hooks_mixins() {
+        use crate::utils::get_env_name;
+
+        let root = unique_root("discover-roles");
+        let roles = root.join("roles");
+        fs::create_dir_all(roles.join("hooks")).unwrap();
+        let role_mixin = roles.join("review.sbx-mixin.yaml");
+        let hook_mixin = roles.join("hooks").join("notify.sbx-mixin.yaml");
+        fs::write(&role_mixin, "kind: mixin\n").unwrap();
+        fs::write(&hook_mixin, "kind: mixin\n").unwrap();
+
+        let config_env = get_env_name("config_dir");
+        let roles_env = get_env_name("roles_dir");
+        let prev_config = env::var_os(&config_env);
+        let prev_roles = env::var_os(&roles_env);
+        unsafe {
+            env::set_var(&config_env, &root);
+            env::set_var(&roles_env, &roles);
+        }
+
+        let discovered = discover();
+
+        unsafe {
+            match prev_config {
+                Some(v) => env::set_var(&config_env, v),
+                None => env::remove_var(&config_env),
+            }
+            match prev_roles {
+                Some(v) => env::set_var(&roles_env, v),
+                None => env::remove_var(&roles_env),
+            }
+        }
+
+        let found: Vec<PathBuf> = discovered
+            .unwrap()
+            .into_iter()
+            .map(|mixin| mixin.path)
+            .collect();
+        assert!(found.contains(&role_mixin), "missing role mixin: {found:?}");
+        assert!(
+            found.contains(&hook_mixin),
+            "missing role hook mixin: {found:?}"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

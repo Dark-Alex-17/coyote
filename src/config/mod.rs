@@ -419,6 +419,7 @@ pub fn install_builtins() -> Result<()> {
     Agent::install_builtin_agents(false)?;
     Macro::install_macros(false)?;
     Skill::install_builtin_skills(false)?;
+    crate::hooks::install_builtin_hooks(false)?;
     Ok(())
 }
 
@@ -428,12 +429,20 @@ pub enum AssetCategory {
     Macros,
     Functions,
     Skills,
+    Hooks,
     #[value(name = "mcp-config", alias = "mcp_config")]
     McpConfig,
 }
 
 impl AssetCategory {
-    pub const NAMES: [&'static str; 5] = ["agents", "macros", "functions", "skills", "mcp-config"];
+    pub const NAMES: [&'static str; 6] = [
+        "agents",
+        "macros",
+        "functions",
+        "skills",
+        "hooks",
+        "mcp-config",
+    ];
 
     pub fn parse(name: &str) -> Option<Self> {
         match name {
@@ -441,6 +450,7 @@ impl AssetCategory {
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
             "skills" => Some(Self::Skills),
+            "hooks" => Some(Self::Hooks),
             "mcp-config" | "mcp_config" => Some(Self::McpConfig),
             _ => None,
         }
@@ -460,17 +470,19 @@ pub enum InstallFilter {
     Skills,
     Macros,
     Functions,
+    Hooks,
     #[value(name = "mcp-config", alias = "mcp_config")]
     McpConfig,
 }
 
 impl InstallFilter {
-    pub const NAMES: [&'static str; 6] = [
+    pub const NAMES: [&'static str; 7] = [
         "agents",
         "roles",
         "skills",
         "macros",
         "functions",
+        "hooks",
         "mcp-config",
     ];
 
@@ -481,6 +493,7 @@ impl InstallFilter {
             "skills" => Some(Self::Skills),
             "macros" => Some(Self::Macros),
             "functions" => Some(Self::Functions),
+            "hooks" => Some(Self::Hooks),
             "mcp-config" | "mcp_config" => Some(Self::McpConfig),
             _ => None,
         }
@@ -493,6 +506,7 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
         AssetCategory::Macros => ("macros", paths::macros_dir()),
         AssetCategory::Functions => ("functions", paths::functions_dir()),
         AssetCategory::Skills => ("skills", paths::skills_dir()),
+        AssetCategory::Hooks => ("hooks", paths::hooks_dir()),
         AssetCategory::McpConfig => ("MCP config", paths::mcp_config_file()),
     };
 
@@ -506,6 +520,7 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
         AssetCategory::Macros => Macro::install_macros(true)?,
         AssetCategory::Functions => Functions::install_builtin_global_tools(true)?,
         AssetCategory::Skills => Skill::install_builtin_skills(true)?,
+        AssetCategory::Hooks => crate::hooks::install_builtin_hooks(true)?,
         AssetCategory::McpConfig => Functions::install_mcp_config()?,
     }
 

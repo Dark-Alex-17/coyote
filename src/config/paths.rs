@@ -184,7 +184,6 @@ pub fn role_file(name: &str) -> PathBuf {
     roles_dir().join(format!("{name}.md"))
 }
 
-#[allow(dead_code)]
 pub fn hooks_dir() -> PathBuf {
     match env::var(get_env_name("hooks_dir")) {
         Ok(value) => PathBuf::from(value),
@@ -956,6 +955,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn hooks_dir_reflects_env_var_state() {
         let env_name = get_env_name("hooks_dir");
         let prev = env::var_os(&env_name);

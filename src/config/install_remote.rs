@@ -1540,6 +1540,10 @@ fn apply_filter(mut layout: RemoteLayout, filter: Option<InstallFilter>) -> Remo
             functions_tools: layout.functions_tools.take(),
             ..base
         },
+        // Bundles cannot ship hooks yet: RemoteLayout has no hooks field, so
+        // this filter always yields an empty layout. Bundle-side hooks support
+        // (layout field, scan, is_empty) lands together with TopCategory::Hooks.
+        InstallFilter::Hooks => base,
         InstallFilter::McpConfig => RemoteLayout {
             mcp_json: layout.mcp_json.take(),
             ..base
@@ -3660,6 +3664,44 @@ mod tests {
 
         assert!(fs::read_dir(paths::macros_dir()).unwrap().next().is_some());
         assert!(!paths::installed_bundles_file().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn builtin_hooks_category_installs_example_scripts() {
+        if *IS_STDOUT_TERMINAL {
+            eprintln!(
+                "Skipping builtin_hooks_category_installs_example_scripts: requires non-TTY stdout"
+            );
+            return;
+        }
+        let _guard = TestVaultConfigGuard::new("prov-hooks");
+        let hooks_key = get_env_name("hooks_dir");
+        let previous_hooks = env::var_os(&hooks_key);
+        let hooks_dir = fresh_temp_dir("prov-hooks-dir-");
+        unsafe {
+            env::set_var(&hooks_key, &hooks_dir);
+        }
+
+        // Capture outcomes before restoring the env var so a failed assertion
+        // cannot leave the hooks-dir override pointing at a deleted temp dir.
+        let result = crate::config::install_assets(crate::config::AssetCategory::Hooks);
+        let installed = (
+            hooks_dir.join("notify.sh").is_file(),
+            hooks_dir.join("log-events.sh").is_file(),
+        );
+
+        unsafe {
+            match previous_hooks {
+                Some(v) => env::set_var(&hooks_key, v),
+                None => env::remove_var(&hooks_key),
+            }
+        }
+        let _ = fs::remove_dir_all(&hooks_dir);
+
+        result.unwrap();
+        assert!(installed.0, "notify.sh must be installed");
+        assert!(installed.1, "log-events.sh must be installed");
     }
 
     #[test]
