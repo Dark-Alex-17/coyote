@@ -1,3 +1,24 @@
+## Unreleased
+
+### BREAKING CHANGE
+
+- The stock `openai` client (no custom `api_base`) now defaults to the OpenAI Responses API
+(`/v1/responses`) instead of Chat Completions. Pin the old wire by adding `wire_api: chat` to the
+client block. Openai clients with a custom `api_base` and `openai-compatible` clients still
+default to `chat`; Codex OAuth always uses `responses` (`wire_api: chat` there is a config error).
+- Request patches are now wire-aware and chat-keyed patches never apply to the responses wire: if
+your stock openai client relied on `patch.chat_completions` blocks (or top-level model patches),
+migrate them to the sibling `patch.responses` key / the model patch's `responses:` sub-key
+(env override: `COYOTE_PATCH_<client>_RESPONSES`).
+- Sessions saved after this change may contain the new `reasoning` thinking blocks (encrypted
+reasoning items from the Responses API); older coyote binaries cannot load those sessions.
+
+### Feat
+
+- support `wire_api: responses | chat` on the openai and openai-compatible clients, with wire-aware request patching on both patch layers
+- report token usage (including cached input tokens) on the openai responses path
+- opting a third-party endpoint into `wire_api: responses` sends `include: ["reasoning.encrypted_content"]` and `"strict": false` tool definitions — strict `/v1/responses` servers may reject these as unknown params
+
 ## v0.10.3 (2026-09-15)
 
 ### Feat
