@@ -5512,6 +5512,42 @@ mod tests {
 
     #[test]
     #[serial]
+    fn eval_fires_hooks_with_exact_user_prefixed_tool_name() {
+        use crate::hooks::HookEvent;
+        let marker = "tool-hooks-user-x7x";
+        let mut ctx = ctx_with_tool_hooks(marker, |_| {});
+        ctx.tool_scope.functions.append_user_interaction_functions();
+        let _guard = crate::hooks::test_sink::install();
+
+        let output = run_async(call_with_args("user__confirm", json!({})).eval(&mut ctx)).unwrap();
+
+        // Without a question the user handler errors before prompting, so the
+        // error-shaped output must fire started + failed with the exact name.
+        let error = output["tool_call_error"].as_str().unwrap();
+        assert!(error.starts_with("User interaction failed"), "{error}");
+        let captures = tool_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::ToolStarted);
+        assert_eq!(
+            captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
+            Some("user__confirm")
+        );
+        assert_eq!(captures[1].event, HookEvent::ToolFailed);
+        assert_eq!(
+            captures[1].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
+            Some("user__confirm")
+        );
+        assert_eq!(
+            captures[1]
+                .envs
+                .get("COYOTE_TOOL_ERROR")
+                .map(String::as_str),
+            Some(error)
+        );
+    }
+
+    #[test]
+    #[serial]
     fn eval_err_fires_failed_without_started_and_identical_error() {
         use crate::hooks::HookEvent;
         let marker = "tool-hooks-eval-err-x7x";
