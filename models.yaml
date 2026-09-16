@@ -3092,10 +3092,10 @@
   - name: au.anthropic.claude-opus-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -3140,10 +3140,10 @@
   - name: jp.anthropic.claude-opus-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -3156,10 +3156,10 @@
   - name: us.anthropic.claude-opus-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     require_max_tokens: true
     supports_vision: true
@@ -3377,10 +3377,10 @@
   - name: au.anthropic.claude-sonnet-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 2.0
-    output_price: 10.0
-    cache_read_price: 0.2
-    cache_write_price: 2.5
+    input_price: 2.2
+    output_price: 11.0
+    cache_read_price: 0.22
+    cache_write_price: 2.75
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -3425,10 +3425,10 @@
   - name: jp.anthropic.claude-sonnet-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 2.0
-    output_price: 10.0
-    cache_read_price: 0.2
-    cache_write_price: 2.5
+    input_price: 2.2
+    output_price: 11.0
+    cache_read_price: 0.22
+    cache_write_price: 2.75
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -3441,10 +3441,10 @@
   - name: us.anthropic.claude-sonnet-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 2.0
-    output_price: 10.0
-    cache_read_price: 0.2
-    cache_write_price: 2.5
+    input_price: 2.2
+    output_price: 11.0
+    cache_read_price: 0.22
+    cache_write_price: 2.75
     max_output_tokens: 128000
     require_max_tokens: true
     supports_vision: true
@@ -3507,10 +3507,10 @@
   - name: us.anthropic.claude-fable-5
     type: chat
     max_input_tokens: 1000000
-    input_price: 10.0
-    output_price: 50.0
-    cache_read_price: 1.0
-    cache_write_price: 12.5
+    input_price: 11.0
+    output_price: 55.0
+    cache_read_price: 1.1
+    cache_write_price: 13.75
     max_output_tokens: 128000
     require_max_tokens: true
     supports_vision: true
@@ -3541,10 +3541,10 @@
   - name: au.anthropic.claude-opus-4-8
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -3589,10 +3589,10 @@
   - name: jp.anthropic.claude-opus-4-8
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -3605,10 +3605,10 @@
   - name: us.anthropic.claude-opus-4-8
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     require_max_tokens: true
     supports_vision: true
@@ -3716,10 +3716,10 @@
   - name: jp.anthropic.claude-opus-4-7
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -3732,10 +3732,10 @@
   - name: us.anthropic.claude-opus-4-7
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     require_max_tokens: true
     supports_vision: true
@@ -3805,11 +3805,11 @@
   - name: anthropic.claude-sonnet-4-6
     type: chat
     max_input_tokens: 1000000
-    input_price: 3.0
-    output_price: 15.0
-    cache_read_price: 0.3
-    cache_write_price: 3.75
-    max_output_tokens: 64000
+    input_price: 3.3
+    output_price: 16.5
+    cache_read_price: 0.33
+    cache_write_price: 4.125
+    max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
     reasoning_levels:
@@ -3839,7 +3839,7 @@
     output_price: 16.5
     cache_read_price: 0.33
     cache_write_price: 4.125
-    max_output_tokens: 64000
+    max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
     reasoning_levels:
@@ -3854,7 +3854,7 @@
     output_price: 15.0
     cache_read_price: 0.3
     cache_write_price: 3.75
-    max_output_tokens: 64000
+    max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
     reasoning_levels:
@@ -3865,11 +3865,11 @@
   - name: jp.anthropic.claude-sonnet-4-6
     type: chat
     max_input_tokens: 1000000
-    input_price: 3.0
-    output_price: 15.0
-    cache_read_price: 0.3
-    cache_write_price: 3.75
-    max_output_tokens: 64000
+    input_price: 3.3
+    output_price: 16.5
+    cache_read_price: 0.33
+    cache_write_price: 4.125
+    max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
     reasoning_levels:
@@ -3880,11 +3880,11 @@
   - name: us.anthropic.claude-sonnet-4-6
     type: chat
     max_input_tokens: 1000000
-    input_price: 3.0
-    output_price: 15.0
-    cache_read_price: 0.3
-    cache_write_price: 3.75
-    max_output_tokens: 64000
+    input_price: 3.3
+    output_price: 16.5
+    cache_read_price: 0.33
+    cache_write_price: 4.125
+    max_output_tokens: 128000
     require_max_tokens: true
     supports_vision: true
     supports_function_calling: true
@@ -3898,10 +3898,10 @@
     type: chat
     real_name: us.anthropic.claude-sonnet-4-6
     max_input_tokens: 1000000
-    input_price: 3.0
-    output_price: 15.0
-    cache_read_price: 0.3
-    cache_write_price: 3.75
+    input_price: 3.3
+    output_price: 16.5
+    cache_read_price: 0.33
+    cache_write_price: 4.125
     patch:
       body:
         inferenceConfig:
@@ -3932,10 +3932,10 @@
   - name: anthropic.claude-opus-4-6-v1
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -3947,10 +3947,10 @@
   - name: au.anthropic.claude-opus-4-6-v1
     type: chat
     max_input_tokens: 1000000
-    input_price: 16.5
-    output_price: 82.5
-    cache_read_price: 1.65
-    cache_write_price: 20.625
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -3992,10 +3992,10 @@
   - name: us.anthropic.claude-opus-4-6-v1
     type: chat
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 128000
     require_max_tokens: true
     supports_vision: true
@@ -4010,10 +4010,10 @@
     type: chat
     real_name: us.anthropic.claude-opus-4-6-v1
     max_input_tokens: 1000000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     patch:
       body:
         inferenceConfig:
@@ -4186,6 +4186,13 @@
     output_price: 1.85
     max_output_tokens: 81920
     supports_function_calling: true
+  - name: moonshot.kimi-k2-thinking
+    type: chat
+    max_input_tokens: 262143
+    input_price: 0.6
+    output_price: 2.5
+    max_output_tokens: 16000
+    supports_function_calling: true
   - name: anthropic.claude-opus-4-5-20251101-v1:0
     type: chat
     max_input_tokens: 200000
@@ -4231,10 +4238,10 @@
   - name: us.anthropic.claude-opus-4-5-20251101-v1:0
     type: chat
     max_input_tokens: 200000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     max_output_tokens: 64000
     require_max_tokens: true
     supports_vision: true
@@ -4247,10 +4254,10 @@
     type: chat
     real_name: us.anthropic.claude-opus-4-5-20251101-v1:0
     max_input_tokens: 200000
-    input_price: 5.0
-    output_price: 25.0
-    cache_read_price: 0.5
-    cache_write_price: 6.25
+    input_price: 5.5
+    output_price: 27.5
+    cache_read_price: 0.55
+    cache_write_price: 6.875
     patch:
       body:
         inferenceConfig:
@@ -4263,13 +4270,6 @@
     max_output_tokens: 24000
     require_max_tokens: true
     supports_vision: true
-  - name: moonshot.kimi-k2-thinking
-    type: chat
-    max_input_tokens: 262143
-    input_price: 0.6
-    output_price: 2.5
-    max_output_tokens: 16000
-    supports_function_calling: true
   - name: openai.gpt-oss-safeguard-120b
     type: chat
     max_input_tokens: 128000
@@ -4320,10 +4320,10 @@
   - name: au.anthropic.claude-haiku-4-5-20251001-v1:0
     type: chat
     max_input_tokens: 200000
-    input_price: 1.0
-    output_price: 5.0
-    cache_read_price: 0.1
-    cache_write_price: 1.25
+    input_price: 1.1
+    output_price: 5.5
+    cache_read_price: 0.11
+    cache_write_price: 1.375
     max_output_tokens: 64000
     supports_vision: true
     supports_function_calling: true
@@ -4350,20 +4350,20 @@
   - name: jp.anthropic.claude-haiku-4-5-20251001-v1:0
     type: chat
     max_input_tokens: 200000
-    input_price: 1.0
-    output_price: 5.0
-    cache_read_price: 0.1
-    cache_write_price: 1.25
+    input_price: 1.1
+    output_price: 5.5
+    cache_read_price: 0.11
+    cache_write_price: 1.375
     max_output_tokens: 64000
     supports_vision: true
     supports_function_calling: true
   - name: us.anthropic.claude-haiku-4-5-20251001-v1:0
     type: chat
     max_input_tokens: 200000
-    input_price: 1.0
-    output_price: 5.0
-    cache_read_price: 0.1
-    cache_write_price: 1.25
+    input_price: 1.1
+    output_price: 5.5
+    cache_read_price: 0.11
+    cache_write_price: 1.375
     max_output_tokens: 64000
     require_max_tokens: true
     supports_vision: true
@@ -4372,10 +4372,10 @@
     type: chat
     real_name: us.anthropic.claude-haiku-4-5-20251001-v1:0
     max_input_tokens: 200000
-    input_price: 1.0
-    output_price: 5.0
-    cache_read_price: 0.1
-    cache_write_price: 1.25
+    input_price: 1.1
+    output_price: 5.5
+    cache_read_price: 0.11
+    cache_write_price: 1.375
     patch:
       body:
         inferenceConfig:
@@ -4401,10 +4401,10 @@
   - name: au.anthropic.claude-sonnet-4-5-20250929-v1:0
     type: chat
     max_input_tokens: 200000
-    input_price: 3.0
-    output_price: 15.0
-    cache_read_price: 0.3
-    cache_write_price: 3.75
+    input_price: 3.3
+    output_price: 16.5
+    cache_read_price: 0.33
+    cache_write_price: 4.125
     max_output_tokens: 64000
     supports_vision: true
     supports_function_calling: true
@@ -4431,20 +4431,20 @@
   - name: jp.anthropic.claude-sonnet-4-5-20250929-v1:0
     type: chat
     max_input_tokens: 200000
-    input_price: 3.0
-    output_price: 15.0
-    cache_read_price: 0.3
-    cache_write_price: 3.75
+    input_price: 3.3
+    output_price: 16.5
+    cache_read_price: 0.33
+    cache_write_price: 4.125
     max_output_tokens: 64000
     supports_vision: true
     supports_function_calling: true
   - name: us.anthropic.claude-sonnet-4-5-20250929-v1:0
     type: chat
     max_input_tokens: 200000
-    input_price: 3.0
-    output_price: 15.0
-    cache_read_price: 0.3
-    cache_write_price: 3.75
+    input_price: 3.3
+    output_price: 16.5
+    cache_read_price: 0.33
+    cache_write_price: 4.125
     max_output_tokens: 64000
     require_max_tokens: true
     supports_vision: true
@@ -4453,10 +4453,10 @@
     type: chat
     real_name: us.anthropic.claude-sonnet-4-5-20250929-v1:0
     max_input_tokens: 200000
-    input_price: 3.0
-    output_price: 15.0
-    cache_read_price: 0.3
-    cache_write_price: 3.75
+    input_price: 3.3
+    output_price: 16.5
+    cache_read_price: 0.33
+    cache_write_price: 4.125
     patch:
       body:
         inferenceConfig:
@@ -4627,6 +4627,47 @@
     input_price: 0.1
     output_price: 0.3
     max_output_tokens: 8192
+    supports_function_calling: true
+  - name: apac.anthropic.claude-sonnet-4-20250514-v1:0
+    type: chat
+    max_input_tokens: 200000
+    input_price: 3.0
+    output_price: 15.0
+    cache_read_price: 0.3
+    cache_write_price: 3.75
+    max_output_tokens: 64000
+    supports_vision: true
+    supports_function_calling: true
+  - name: eu.anthropic.claude-sonnet-4-20250514-v1:0
+    type: chat
+    max_input_tokens: 200000
+    input_price: 3.0
+    output_price: 15.0
+    cache_read_price: 0.3
+    cache_write_price: 3.75
+    max_output_tokens: 64000
+    supports_vision: true
+    supports_function_calling: true
+  - name: global.anthropic.claude-sonnet-4-20250514-v1:0
+    type: chat
+    max_input_tokens: 200000
+    input_price: 3.0
+    output_price: 15.0
+    cache_read_price: 0.3
+    cache_write_price: 3.75
+    max_output_tokens: 64000
+    supports_vision: true
+    supports_function_calling: true
+  - name: us.anthropic.claude-sonnet-4-20250514-v1:0
+    type: chat
+    max_input_tokens: 200000
+    input_price: 3.0
+    output_price: 15.0
+    cache_read_price: 0.3
+    cache_write_price: 3.75
+    max_output_tokens: 64000
+    require_max_tokens: true
+    supports_vision: true
     supports_function_calling: true
   - name: us.amazon.nova-premier-v1:0
     type: chat
@@ -6914,9 +6955,9 @@
   - name: deepseek/deepseek-v4-flash-0731
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.06
-    output_price: 0.12
-    cache_read_price: 0.012
+    input_price: 0.055
+    output_price: 0.11
+    cache_read_price: 0.011
     max_output_tokens: 943718
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731:batch
@@ -7364,14 +7405,6 @@
     max_output_tokens: 16384
     supports_vision: true
     supports_function_calling: true
-  - name: google/gemma-4-31b-it:batch
-    type: chat
-    max_input_tokens: 262144
-    input_price: 0.39
-    output_price: 0.97
-    max_output_tokens: 235929
-    supports_vision: true
-    supports_function_calling: true
   - name: google/gemma-4-31b-it:free
     type: chat
     max_input_tokens: 262144
@@ -7670,7 +7703,7 @@
   - name: minimax/minimax-m1
     type: chat
     max_input_tokens: 1000000
-    input_price: 0.55
+    input_price: 0.4
     output_price: 2.2
     max_output_tokens: 40000
     supports_function_calling: true
@@ -7916,8 +7949,8 @@
   - name: mistralai/mistral-small-3.2-24b-instruct
     type: chat
     max_input_tokens: 256000
-    input_price: 0.075
-    output_price: 0.2
+    input_price: 0.0938
+    output_price: 0.25
     max_output_tokens: 16384
     supports_vision: true
     supports_function_calling: true
@@ -7980,9 +8013,9 @@
   - name: moonshotai/kimi-k2.7-code
     type: chat
     max_input_tokens: 262144
-    input_price: 0.71
-    output_price: 3.5
-    cache_read_price: 0.15
+    input_price: 0.7062
+    output_price: 3.21
+    cache_read_price: 0.18
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -8083,10 +8116,10 @@
   - name: nvidia/nemotron-3-ultra-550b-a55b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.6
-    output_price: 2.4
-    cache_read_price: 0.12
-    max_output_tokens: 182520
+    input_price: 0.625
+    output_price: 3.125
+    cache_read_price: 0.1875
+    max_output_tokens: 32768
     supports_function_calling: true
   - name: nvidia/nemotron-3-ultra-550b-a55b:free
     type: chat
@@ -8969,12 +9002,6 @@
     cache_read_price: 0.03
     max_output_tokens: 117964
     supports_function_calling: true
-  - name: openai/gpt-oss-20b:batch
-    type: chat
-    max_input_tokens: 131072
-    input_price: 0.05
-    output_price: 0.2
-    max_output_tokens: 117964
   - name: openai/gpt-oss-safeguard-20b
     type: chat
     max_input_tokens: 131072
@@ -9792,15 +9819,6 @@
     max_output_tokens: 262144
     supports_vision: true
     supports_function_calling: true
-  - name: thinkingmachines/inkling-small:batch
-    type: chat
-    max_input_tokens: 524288
-    input_price: 0.5
-    output_price: 1.2
-    cache_read_price: 0.1
-    max_output_tokens: 471859
-    supports_vision: true
-    supports_function_calling: true
   - name: thinkingmachines/inkling-small:free
     type: chat
     max_input_tokens: 1048576
@@ -10030,6 +10048,12 @@
     cache_read_price: 0.07
     max_output_tokens: 943718
     supports_function_calling: true
+  - name: z-ai/glm-5.2:free
+    type: chat
+    max_input_tokens: 32768
+    input_price: 0.0
+    output_price: 0.0
+    max_output_tokens: 29491
   - name: z-ai/glm-5.3
     type: chat
     max_input_tokens: 1310720
@@ -10041,9 +10065,9 @@
   - name: z-ai/glm-5.3-flash
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.15
-    output_price: 0.5
-    cache_read_price: 0.03
+    input_price: 0.1
+    output_price: 0.3333
+    cache_read_price: 0.02
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
@@ -10237,10 +10261,10 @@
   - name: ~z-ai/glm-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.8775
-    output_price: 2.97
-    cache_read_price: 0.1755
-    max_output_tokens: 235929
+    input_price: 0.85
+    output_price: 2.8985
+    cache_read_price: 0.17
+    max_output_tokens: 943718
     supports_function_calling: true
 - provider: github
   models:
