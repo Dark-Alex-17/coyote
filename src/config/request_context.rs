@@ -9292,6 +9292,53 @@ mod tests {
 
     #[test]
     #[serial]
+    fn install_builtin_agents_reconciles_hooks_subdir_via_manifest() {
+        use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
+
+        let _guard = TestConfigDirGuard::new();
+
+        Agent::install_builtin_agents(false).unwrap();
+
+        let agents_dir = paths::agents_data_dir();
+        // Simulate an upgrade from an older install whose coder shipped a
+        // hook script that the current embed no longer contains: the manifest
+        // records it, so reconciliation removes it — while a user-created
+        // script in the same directory (absent from the manifest) survives.
+        let hooks_dir = agents_dir.join("coder").join("hooks");
+        create_dir_all(&hooks_dir).unwrap();
+        write(hooks_dir.join(BUILTIN_MANIFEST_FILE), "old-hook.sh\n").unwrap();
+        write(hooks_dir.join("old-hook.sh"), "stale").unwrap();
+        write(hooks_dir.join("user-hook.sh"), "user-owned").unwrap();
+        // A custom agent outside the bundle is never reconciled, even with a
+        // manifest present.
+        let custom_hooks = agents_dir.join("myagent").join("hooks");
+        create_dir_all(&custom_hooks).unwrap();
+        write(custom_hooks.join(BUILTIN_MANIFEST_FILE), "custom.sh\n").unwrap();
+        write(custom_hooks.join("custom.sh"), "keep").unwrap();
+
+        Agent::install_builtin_agents(false).unwrap();
+
+        assert!(
+            !hooks_dir.join("old-hook.sh").exists(),
+            "manifest-listed hook absent from the embed must be removed"
+        );
+        assert!(
+            hooks_dir.join("user-hook.sh").exists(),
+            "user-created hook files must survive reconciliation"
+        );
+        assert!(
+            !hooks_dir.join(BUILTIN_MANIFEST_FILE).exists(),
+            "an empty shipped set removes the manifest itself"
+        );
+        assert!(
+            custom_hooks.join("custom.sh").exists(),
+            "custom agents outside the bundle must survive reconciliation"
+        );
+        assert!(custom_hooks.join(BUILTIN_MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    #[serial]
     fn install_builtin_skills_force_overwrites_only_with_force() {
         let _guard = TestConfigDirGuard::new();
 

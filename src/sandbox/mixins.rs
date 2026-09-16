@@ -965,6 +965,12 @@ network:
         let hook_mixin = roles.join("hooks").join("notify.sbx-mixin.yaml");
         fs::write(&role_mixin, "kind: mixin\n").unwrap();
         fs::write(&hook_mixin, "kind: mixin\n").unwrap();
+        // The builtin installer's hidden manifest lives in the same dir but
+        // is not a mixin and must never be picked up by the flat scan.
+        let manifest = roles
+            .join("hooks")
+            .join(crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE);
+        fs::write(&manifest, "notify.sh\n").unwrap();
 
         let config_env = get_env_name("config_dir");
         let roles_env = get_env_name("roles_dir");
@@ -997,6 +1003,10 @@ network:
         assert!(
             found.contains(&hook_mixin),
             "missing role hook mixin: {found:?}"
+        );
+        assert!(
+            !found.contains(&manifest),
+            "builtin manifest must not be scanned as a mixin: {found:?}"
         );
 
         let _ = fs::remove_dir_all(&root);

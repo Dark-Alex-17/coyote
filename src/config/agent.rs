@@ -13,6 +13,7 @@ use crate::{
 };
 
 use super::rag_cache::RagKey;
+use crate::config::builtin_manifest;
 use crate::config::paths;
 use crate::config::prompts::{
     DEFAULT_JOB_INSTRUCTIONS, DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS,
@@ -28,6 +29,7 @@ use fancy_regex::Captures;
 use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::{env, ffi::OsStr, path::Path};
 
 const DEFAULT_AGENT_NAME: &str = "rag";
@@ -46,6 +48,20 @@ pub type AgentVariables = IndexMap<String, String>;
 #[derive(Embed)]
 #[folder = "assets/agents/"]
 struct AgentAssets;
+
+/// Splits an embedded asset path of the form `<agent>/hooks/<file>` into
+/// its agent and hook-file names. Only direct children of `hooks/` count:
+/// they are the only shape the builtin manifest tracks.
+fn parse_direct_hook_path(path: &str) -> Option<(&str, &str)> {
+    let (agent, rest) = path.split_once('/')?;
+    let hook = direct_hook_name(rest)?;
+    Some((agent, hook))
+}
+
+fn direct_hook_name(rest: &str) -> Option<&str> {
+    let name = rest.strip_prefix("hooks/")?;
+    (!name.is_empty() && !name.contains('/')).then_some(name)
+}
 
 #[derive(Debug, Clone)]
 pub struct Agent {
@@ -71,6 +87,7 @@ impl Agent {
             paths::agents_data_dir().display()
         );
 
+        let mut written_hooks: HashMap<String, BTreeSet<String>> = HashMap::new();
         for file in AgentAssets::iter() {
             debug!("Processing agent file: {}", file.as_ref());
 
@@ -97,6 +114,12 @@ impl Agent {
             info!("Creating agent file: {}", file_path.display());
             let mut agent_file = File::create(&file_path)?;
             agent_file.write_all(content.as_bytes())?;
+            if let Some((agent, hook)) = parse_direct_hook_path(file.as_ref()) {
+                written_hooks
+                    .entry(agent.to_string())
+                    .or_default()
+                    .insert(hook.to_string());
+            }
 
             #[cfg(unix)]
             if is_script {
@@ -132,6 +155,27 @@ impl Agent {
                         );
                     }
                 }
+            }
+        }
+
+        // Hook filenames are open-ended (unlike AGENT_DEFINITION_FILES), so
+        // each bundled agent's hooks/ directory reconciles through its
+        // builtin manifest: only files the installer previously shipped are
+        // removal candidates, and user-created files in the same directory
+        // are never touched. Only direct children of hooks/ are tracked;
+        // nested shipped files install but are not reconciled.
+        for (agent, files) in &bundled_files {
+            let shipped: BTreeSet<String> = files
+                .iter()
+                .filter_map(|rest| direct_hook_name(rest))
+                .map(str::to_string)
+                .collect();
+            let written = written_hooks.remove(agent.as_str()).unwrap_or_default();
+            let hooks_dir = paths::agents_data_dir().join(agent).join("hooks");
+            if let Err(err) =
+                builtin_manifest::reconcile_builtin_dir(&hooks_dir, &shipped, &written)
+            {
+                warn!("Failed to reconcile builtin hooks for agent '{agent}': {err}");
             }
         }
 
@@ -1317,6 +1361,16 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_direct_hook_path_accepts_only_direct_hook_children() {
+        assert_eq!(parse_direct_hook_path("x/hooks/a.sh"), Some(("x", "a.sh")));
+        assert_eq!(parse_direct_hook_path("x/hooks/nested/a.sh"), None);
+        assert_eq!(parse_direct_hook_path("hooks/a.sh"), None);
+        assert_eq!(parse_direct_hook_path("x/hooks/"), None);
+        assert_eq!(parse_direct_hook_path("x/config.yaml"), None);
+        assert_eq!(parse_direct_hook_path("config.yaml"), None);
+    }
 
     #[test]
     fn agent_config_parses_from_yaml() {

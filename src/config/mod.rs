@@ -1,6 +1,7 @@
 mod agent;
 mod app_config;
 mod app_state;
+pub(crate) mod builtin_manifest;
 mod bundles;
 mod input;
 mod install_remote;
@@ -420,6 +421,7 @@ pub fn install_builtins() -> Result<()> {
     Macro::install_macros(false)?;
     Skill::install_builtin_skills(false)?;
     crate::hooks::install_builtin_hooks(false)?;
+    Role::install_builtin_role_hooks(false)?;
     Ok(())
 }
 

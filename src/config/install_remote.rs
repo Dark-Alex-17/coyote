@@ -2,6 +2,7 @@ use super::bundles::{
     BundleStore, FileAction, FileRecord, InstallMetadata, McpAction, McpServerRecord, hash_bytes,
     hash_file,
 };
+use crate::config::builtin_manifest::is_builtin_manifest_name;
 use crate::config::{AssetCategory, BUNDLE_MANIFEST_FILE, InstallFilter, paths};
 #[cfg(not(windows))]
 use crate::function::Language;
@@ -32,7 +33,7 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
     if layout.is_empty() {
         println!(
             "No recognized assets found in {git_url}. Expected one or more of: \
-             agents/, roles/, skills/, macros/, functions/tools/, mcp.json"
+             agents/, roles/, skills/, macros/, functions/tools/, hooks/, mcp.json"
         );
         return Ok(());
     }
@@ -805,7 +806,7 @@ fn is_safe_relative_path(path: &str) -> bool {
 /// Rejects names Windows refuses or silently rewrites (alternate data stream
 /// colons, reserved device names, trailing dots or spaces) so a recorded path
 /// denotes the same regular file on every platform.
-fn is_safe_component(name: &str) -> bool {
+pub(crate) fn is_safe_component(name: &str) -> bool {
     !name.contains(':')
         && !name.ends_with('.')
         && !name.ends_with(' ')
@@ -1270,6 +1271,7 @@ struct RemoteLayout {
     roles: Option<PathBuf>,
     skills: Option<PathBuf>,
     macros: Option<PathBuf>,
+    hooks: Option<PathBuf>,
     functions_tools: Option<PathBuf>,
     mcp_json: Option<PathBuf>,
     manifest: Option<BundleManifest>,
@@ -1282,6 +1284,7 @@ impl RemoteLayout {
             && self.roles.is_none()
             && self.skills.is_none()
             && self.macros.is_none()
+            && self.hooks.is_none()
             && self.functions_tools.is_none()
             && self.mcp_json.is_none()
     }
@@ -1311,6 +1314,11 @@ fn scan_remote_layout(root: &Path) -> Result<RemoteLayout> {
     let macros = root.join("macros");
     if macros.is_dir() {
         layout.macros = Some(macros);
+    }
+
+    let hooks = root.join("hooks");
+    if hooks.is_dir() {
+        layout.hooks = Some(hooks);
     }
 
     let root_mcp = root.join("mcp.json");
@@ -1540,10 +1548,10 @@ fn apply_filter(mut layout: RemoteLayout, filter: Option<InstallFilter>) -> Remo
             functions_tools: layout.functions_tools.take(),
             ..base
         },
-        // Bundles cannot ship hooks yet: RemoteLayout has no hooks field, so
-        // this filter always yields an empty layout. Bundle-side hooks support
-        // (layout field, scan, is_empty) lands together with TopCategory::Hooks.
-        InstallFilter::Hooks => base,
+        InstallFilter::Hooks => RemoteLayout {
+            hooks: layout.hooks.take(),
+            ..base
+        },
         InstallFilter::McpConfig => RemoteLayout {
             mcp_json: layout.mcp_json.take(),
             ..base
@@ -1595,6 +1603,7 @@ enum TopCategory {
     Roles,
     Skills,
     Macros,
+    Hooks,
     FunctionsTools,
 }
 
@@ -1605,6 +1614,7 @@ impl TopCategory {
             TopCategory::Roles => "roles",
             TopCategory::Skills => "skills",
             TopCategory::Macros => "macros",
+            TopCategory::Hooks => "hooks",
             TopCategory::FunctionsTools => "functions/tools",
         }
     }
@@ -1623,6 +1633,8 @@ enum PlannedKind {
 struct PlannedFile {
     src: PathBuf,
     dst: PathBuf,
+    /// Path relative to the category's source directory in the bundle.
+    rel: PathBuf,
     kind: PlannedKind,
     top_category: TopCategory,
 }
@@ -1664,6 +1676,9 @@ fn plan_changes(layout: &RemoteLayout) -> Result<InstallPlan> {
             &mut files,
         )?;
     }
+    if let Some(src_dir) = &layout.hooks {
+        plan_dir_into(src_dir, &paths::hooks_dir(), TopCategory::Hooks, &mut files)?;
+    }
     if let Some(src_dir) = &layout.functions_tools {
         plan_dir_into(
             src_dir,
@@ -1690,7 +1705,28 @@ fn plan_dir_into(
     for src in walk_files(src_dir)? {
         let rel = src
             .strip_prefix(src_dir)
-            .expect("walk_files only returns paths under src_dir");
+            .expect("walk_files only returns paths under src_dir")
+            .to_path_buf();
+
+        // The builtin installer's per-directory manifests drive stale-file
+        // deletion; letting a bundle install one would hand it control over
+        // which local files the next builtin reconcile removes. Every path
+        // component is checked (a bundle-shipped DIRECTORY of that name would
+        // permanently occupy the manifest path and disable reconciliation),
+        // under the filesystem-alias-aware match of is_builtin_manifest_name.
+        let is_builtin_manifest = rel.components().any(|c| match c.as_os_str().to_str() {
+            Some(name) => is_builtin_manifest_name(name),
+            // A non-UTF-8 name can never equal the ASCII manifest constant.
+            None => false,
+        });
+        if is_builtin_manifest {
+            log::warn!(
+                "Ignoring bundle file {} ({}): the name is reserved for the builtin installer",
+                rel.display(),
+                category.label()
+            );
+            continue;
+        }
 
         if category == TopCategory::Skills {
             let skill_name = rel
@@ -1711,11 +1747,12 @@ fn plan_dir_into(
             })?;
         }
 
-        let dst = dst_dir.join(rel);
+        let dst = dst_dir.join(&rel);
         let kind = classify_file(&src, &dst)?;
         out.push(PlannedFile {
             src,
             dst,
+            rel,
             kind,
             top_category: category,
         });
@@ -1794,6 +1831,7 @@ fn print_plan_summary(plan: &InstallPlan) {
         TopCategory::Roles,
         TopCategory::Skills,
         TopCategory::Macros,
+        TopCategory::Hooks,
         TopCategory::FunctionsTools,
     ] {
         let new_ = count_kind(plan, cat, PlannedKind::New);
@@ -1812,6 +1850,33 @@ fn print_plan_summary(plan: &InstallPlan) {
             println!("{line}");
         }
     }
+
+    for line in hook_script_lines(plan) {
+        println!("{line}");
+    }
+}
+
+/// Bundle-shipped hook scripts execute on the user's machine once wired into
+/// config, so every planned file landing under a hooks/ directory is called
+/// out individually. Visibility only: installing them needs no extra approval.
+fn hook_script_lines(plan: &InstallPlan) -> Vec<String> {
+    plan.files
+        .iter()
+        .filter(|planned| {
+            planned.top_category == TopCategory::Hooks
+                || planned
+                    .rel
+                    .parent()
+                    .is_some_and(|parent| parent.components().any(|c| c.as_os_str() == "hooks"))
+        })
+        .map(|planned| {
+            let rel = planned.rel.to_string_lossy().replace('\\', "/");
+            format!(
+                "bundle defines hook script: {}/{rel}",
+                planned.top_category.label()
+            )
+        })
+        .collect()
 }
 
 fn count_kind(plan: &InstallPlan, cat: TopCategory, kind: PlannedKind) -> usize {
@@ -2353,6 +2418,7 @@ fn print_secret_summary(added: &[String], deferred: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
     use crate::sandbox::SANDBOX_ENV_FLAG;
     use crate::utils::get_env_name;
     use serial_test::serial;
@@ -2555,6 +2621,7 @@ mod tests {
             roles: Some(PathBuf::from("r")),
             skills: Some(PathBuf::from("s")),
             macros: Some(PathBuf::from("m")),
+            hooks: Some(PathBuf::from("h")),
             functions_tools: Some(PathBuf::from("f")),
             mcp_json: Some(PathBuf::from("j")),
             ..RemoteLayout::default()
@@ -2564,6 +2631,7 @@ mod tests {
 
         assert!(out.agents.is_some() && out.roles.is_some() && out.skills.is_some());
         assert!(out.macros.is_some() && out.functions_tools.is_some() && out.mcp_json.is_some());
+        assert!(out.hooks.is_some());
     }
 
     #[test]
@@ -2642,6 +2710,39 @@ mod tests {
         assert!(out.functions_tools.is_none() && out.mcp_json.is_none());
     }
 
+    /// `--filter hooks` used to be an inert arm that always produced an empty
+    /// layout; it now selects the bundle's top-level hooks directory.
+    #[test]
+    fn apply_filter_hooks_keeps_only_hooks() {
+        let l = RemoteLayout {
+            agents: Some(PathBuf::from("a")),
+            roles: Some(PathBuf::from("r")),
+            skills: Some(PathBuf::from("s")),
+            macros: Some(PathBuf::from("m")),
+            hooks: Some(PathBuf::from("h")),
+            functions_tools: Some(PathBuf::from("f")),
+            mcp_json: Some(PathBuf::from("j")),
+            ..RemoteLayout::default()
+        };
+
+        let out = apply_filter(l, Some(InstallFilter::Hooks));
+
+        assert_eq!(out.hooks, Some(PathBuf::from("h")));
+        assert!(!out.is_empty());
+        assert!(out.agents.is_none() && out.roles.is_none() && out.skills.is_none());
+        assert!(out.macros.is_none() && out.functions_tools.is_none() && out.mcp_json.is_none());
+    }
+
+    #[test]
+    fn remote_layout_with_only_hooks_is_not_empty() {
+        let l = RemoteLayout {
+            hooks: Some(PathBuf::from("h")),
+            ..RemoteLayout::default()
+        };
+
+        assert!(!l.is_empty());
+    }
+
     #[test]
     fn walk_files_skips_dot_git_and_collects_regular_files() {
         let root = fresh_temp_dir("walk-test-");
@@ -2688,6 +2789,7 @@ mod tests {
         fs::create_dir_all(root.join("roles")).unwrap();
         fs::create_dir_all(root.join("skills")).unwrap();
         fs::create_dir_all(root.join("macros")).unwrap();
+        fs::create_dir_all(root.join("hooks")).unwrap();
         fs::create_dir_all(root.join("functions/tools")).unwrap();
         touch(&root.join("functions/mcp.json"));
         touch(&root.join("README.md"));
@@ -2697,8 +2799,26 @@ mod tests {
         assert!(layout.roles.is_some());
         assert!(layout.skills.is_some());
         assert!(layout.macros.is_some());
+        assert!(layout.hooks.is_some());
         assert!(layout.functions_tools.is_some());
         assert!(layout.mcp_json.is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_remote_layout_finds_hooks_only() {
+        let root = fresh_temp_dir("scan-hooks-only-");
+        fs::create_dir_all(root.join("hooks")).unwrap();
+        touch(&root.join("hooks/notify.sh"));
+
+        let layout = scan_remote_layout(&root).unwrap();
+
+        assert_eq!(layout.hooks, Some(root.join("hooks")));
+        assert!(layout.agents.is_none());
+        assert!(layout.roles.is_none());
+        assert!(layout.macros.is_none());
+        assert!(layout.functions_tools.is_none());
+        assert!(layout.mcp_json.is_none());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2754,6 +2874,71 @@ mod tests {
 
         assert!(layout.is_empty());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_dir_into_skips_bundle_shipped_builtin_manifests() {
+        let root = fresh_temp_dir("plan-manifest-skip-");
+        let src_dir = root.join("hooks");
+        touch(&src_dir.join("notify.sh"));
+        touch(&src_dir.join(BUILTIN_MANIFEST_FILE));
+        touch(&src_dir.join(format!("sub/{BUILTIN_MANIFEST_FILE}")));
+        // Case and trailing-dot variants alias the real manifest path on
+        // case-insensitive filesystems; they live in separate subdirs so this
+        // fixture also builds on such filesystems without name collisions.
+        touch(&src_dir.join("sub2/.BUILTIN-MANIFEST"));
+        touch(&src_dir.join("sub3/.Builtin-Manifest."));
+        // A DIRECTORY of the manifest name would occupy the manifest path and
+        // disable reconciliation; a Unicode case-fold alias (U+017F ſ → s)
+        // aliases it on case-insensitive APFS/NTFS volumes.
+        touch(&src_dir.join("sub4/.builtin-manifest/payload.sh"));
+        touch(&src_dir.join("sub5/.builtin-manifeſt"));
+        let dst_dir = root.join("dst");
+
+        let mut files = Vec::new();
+        plan_dir_into(&src_dir, &dst_dir, TopCategory::Hooks, &mut files).unwrap();
+
+        let rels: Vec<&Path> = files.iter().map(|p| p.rel.as_path()).collect();
+        assert_eq!(
+            rels,
+            vec![Path::new("notify.sh")],
+            "a bundle must never install a builtin manifest: it would hand the \
+             bundle control over builtin stale-file deletion"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hook_script_lines_cover_every_hooks_dir_and_nothing_else() {
+        let file = |rel: &str, cat: TopCategory| PlannedFile {
+            src: PathBuf::from("src").join(rel),
+            dst: PathBuf::from("dst").join(rel),
+            rel: PathBuf::from(rel),
+            kind: PlannedKind::New,
+            top_category: cat,
+        };
+        let plan = InstallPlan {
+            files: vec![
+                file("notify.sh", TopCategory::Hooks),
+                file("x/hooks/pre.sh", TopCategory::Agents),
+                file("hooks/role-hook.sh", TopCategory::Roles),
+                file("x/config.yaml", TopCategory::Agents),
+                file("reviewer.md", TopCategory::Roles),
+                file("hello.yaml", TopCategory::Macros),
+            ],
+            mcp_json: None,
+        };
+
+        let lines = hook_script_lines(&plan);
+
+        assert_eq!(
+            lines,
+            vec![
+                "bundle defines hook script: hooks/notify.sh",
+                "bundle defines hook script: agents/x/hooks/pre.sh",
+                "bundle defines hook script: roles/hooks/role-hook.sh",
+            ]
+        );
     }
 
     #[test]
@@ -3424,6 +3609,90 @@ mod tests {
         let _ = fs::remove_dir_all(&src_root);
     }
 
+    fn hooks_fixture_bundle(label: &str) -> (PathBuf, PathBuf) {
+        let src_root = fresh_temp_dir(label);
+        let repo = src_root.join("hooky");
+        write_src(&repo, "hooks/notify-me.sh", "#!/bin/sh\necho hi\n");
+        write_src(&repo, "roles/hooks/role-hook.sh", "#!/bin/sh\n");
+        write_src(&repo, "agents/x/hooks/pre.sh", "#!/bin/sh\n");
+        write_src(&repo, "macros/hello.yaml", "name: hello\n");
+        init_bundle_repo(&repo);
+        (src_root, repo)
+    }
+
+    #[cfg(unix)]
+    fn assert_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).unwrap().permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "{} must carry the executable bit",
+            path.display()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_remote_installs_all_hooks_dirs_and_records_hooks_category() {
+        let _guard = TestVaultConfigGuard::new("prov-hooks-dirs");
+        let (src_root, repo) = hooks_fixture_bundle("prov-hooks-dirs-src-");
+
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+
+        let top = paths::hooks_dir().join("notify-me.sh");
+        let role = paths::roles_dir().join("hooks/role-hook.sh");
+        let agent = paths::agents_data_dir().join("x/hooks/pre.sh");
+        assert!(top.is_file(), "top-level hooks/ installs to hooks_dir");
+        assert!(role.is_file(), "roles/hooks/ installs via the roles walk");
+        assert!(
+            agent.is_file(),
+            "agents/<name>/hooks/ installs via the agents walk"
+        );
+        #[cfg(unix)]
+        {
+            assert_executable(&top);
+            assert_executable(&role);
+            assert_executable(&agent);
+        }
+
+        let store = BundleStore::load().unwrap();
+        let record = store.get("hooky").unwrap();
+        let category_of = |path: &str| {
+            record
+                .files
+                .iter()
+                .find(|f| f.path == path)
+                .unwrap_or_else(|| panic!("no provenance row for {path}"))
+                .category
+                .clone()
+        };
+        assert_eq!(category_of("hooks/notify-me.sh"), "hooks");
+        assert_eq!(category_of("roles/hooks/role-hook.sh"), "roles");
+        assert_eq!(category_of("agents/x/hooks/pre.sh"), "agents");
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    #[serial]
+    fn install_remote_filter_hooks_restricts_to_top_level_hooks_dir() {
+        let _guard = TestVaultConfigGuard::new("prov-hooks-filter");
+        let (src_root, repo) = hooks_fixture_bundle("prov-hooks-filter-src-");
+
+        install_remote(repo.to_str().unwrap(), Some(InstallFilter::Hooks), false).unwrap();
+
+        assert!(paths::hooks_dir().join("notify-me.sh").is_file());
+        assert!(!paths::roles_dir().join("hooks/role-hook.sh").exists());
+        assert!(!paths::agents_data_dir().join("x/hooks/pre.sh").exists());
+        assert!(!paths::macros_dir().join("hello.yaml").exists());
+
+        let store = BundleStore::load().unwrap();
+        let record = store.get("hooky").unwrap();
+        assert_eq!(record.files.len(), 1);
+        assert_eq!(record.files[0].path, "hooks/notify-me.sh");
+        assert_eq!(record.files[0].category, "hooks");
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
     #[test]
     #[serial]
     fn install_remote_without_manifest_uses_repo_slug_and_short_sha_version() {
@@ -3471,12 +3740,14 @@ mod tests {
                 PlannedFile {
                     src: src_new,
                     dst: dst_new.clone(),
+                    rel: PathBuf::from("new.yaml"),
                     kind: PlannedKind::New,
                     top_category: TopCategory::Macros,
                 },
                 PlannedFile {
                     src: src_conflict,
                     dst: dst_conflict.clone(),
+                    rel: PathBuf::from("conflict.yaml"),
                     kind: PlannedKind::Conflict,
                     top_category: TopCategory::Macros,
                 },
@@ -3529,6 +3800,7 @@ mod tests {
             files: vec![PlannedFile {
                 src,
                 dst: dst.clone(),
+                rel: PathBuf::from("owned.yaml"),
                 kind: PlannedKind::Conflict,
                 top_category: TopCategory::Macros,
             }],
@@ -3840,6 +4112,7 @@ mod tests {
             files: vec![PlannedFile {
                 src,
                 dst: dst.clone(),
+                rel: PathBuf::from("owned.yaml"),
                 kind: PlannedKind::Conflict,
                 top_category: TopCategory::Macros,
             }],
@@ -3886,6 +4159,7 @@ mod tests {
             files: vec![PlannedFile {
                 src,
                 dst: dst.clone(),
+                rel: PathBuf::from("owned.yaml"),
                 kind: PlannedKind::Conflict,
                 top_category: TopCategory::Macros,
             }],
@@ -3965,6 +4239,7 @@ mod tests {
             files: vec![PlannedFile {
                 src,
                 dst: dst.clone(),
+                rel: PathBuf::from("shared.yaml"),
                 kind: PlannedKind::Conflict,
                 top_category: TopCategory::Macros,
             }],
@@ -4237,6 +4512,7 @@ mod tests {
             files: vec![PlannedFile {
                 src: dir.join("bundle-src/agents/foo/graph.yaml"),
                 dst: dir.join("agents/foo/graph.yaml"),
+                rel: PathBuf::from("foo/graph.yaml"),
                 kind: PlannedKind::New,
                 top_category: TopCategory::Agents,
             }],
@@ -4279,6 +4555,7 @@ mod tests {
             files: vec![PlannedFile {
                 src: dir.join("bundle-src/agents/foo/graph.yaml"),
                 dst: dir.join("agents/foo/graph.yaml"),
+                rel: PathBuf::from("foo/graph.yaml"),
                 kind: PlannedKind::New,
                 top_category: TopCategory::Agents,
             }],

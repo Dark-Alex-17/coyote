@@ -1,6 +1,8 @@
 use super::*;
 
 use crate::client::{Message, MessageContent, MessageRole, Model};
+use crate::config::builtin_manifest;
+use crate::function::write_file_atomic;
 use crate::hooks::HooksMap;
 
 use anyhow::Result;
@@ -8,6 +10,8 @@ use fancy_regex::Regex;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::LazyLock;
 
 pub const SHELL_ROLE: &str = "shell";
@@ -183,6 +187,26 @@ impl Role {
         RolesAsset::iter()
             .filter_map(|v| v.strip_suffix(".md").map(|v| v.to_string()))
             .collect()
+    }
+
+    /// Installs builtin role hook scripts into `<roles_dir>/hooks/` and
+    /// reconciles ones a release stopped shipping. This is the only builtin
+    /// install machinery roles have: general role installation deliberately
+    /// does not exist (builtin roles load straight from the embed).
+    pub fn install_builtin_role_hooks(force: bool) -> Result<()> {
+        let shipped: Vec<(String, String)> = RolesAsset::iter()
+            .filter_map(|file| {
+                let name = file.as_ref().strip_prefix("hooks/")?;
+                if name.is_empty() || name.contains('/') {
+                    return None;
+                }
+                let embedded = RolesAsset::get(file.as_ref())?;
+                let content = unsafe { std::str::from_utf8_unchecked(&embedded.data) };
+                Some((name.to_string(), content.to_string()))
+            })
+            .collect();
+
+        install_and_reconcile_role_hooks(&paths::roles_dir().join("hooks"), &shipped, force)
     }
 
     pub fn has_args(&self) -> bool {
@@ -614,6 +638,46 @@ fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
     (prompt, vec![])
 }
 
+/// Only direct children of the hooks/ directory are supported: they are the
+/// only shape the builtin manifest tracks, so nested asset paths are skipped
+/// by the caller rather than installed unreconciled.
+fn install_and_reconcile_role_hooks(
+    dir: &Path,
+    shipped: &[(String, String)],
+    force: bool,
+) -> Result<()> {
+    if !shipped.is_empty() {
+        info!("Installing built-in role hooks in {}", dir.display());
+    }
+    let mut written = BTreeSet::new();
+    for (name, content) in shipped {
+        let path = dir.join(name);
+        if path.exists() && !force {
+            debug!(
+                "Role hook file already exists, skipping: {}",
+                path.display()
+            );
+            continue;
+        }
+        ensure_parent_exists(&path)?;
+        info!("Creating role hook file: {}", path.display());
+        write_file_atomic(&path, content, Some(0o755))?;
+        written.insert(name.clone());
+    }
+
+    let names: BTreeSet<String> = shipped.iter().map(|(name, _)| name.clone()).collect();
+    // Reconciliation is best-effort housekeeping: a failure here must not
+    // abort startup (install_builtins), matching the agent-side policy.
+    if let Err(err) = builtin_manifest::reconcile_builtin_dir(dir, &names, &written) {
+        warn!(
+            "Failed to reconcile builtin role hooks in {}: {err}",
+            dir.display()
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,5 +1030,136 @@ Input 1
 "#;
 
         assert_eq!(parse_structure_prompt(prompt), (prompt, vec![]));
+    }
+
+    fn fixture(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(name, content)| (name.to_string(), content.to_string()))
+            .collect()
+    }
+
+    fn hooks_fixture_dir(label: &str) -> std::path::PathBuf {
+        let dir = crate::utils::temp_file(label, "");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("hooks")
+    }
+
+    #[test]
+    fn role_hooks_install_writes_scripts_and_manifest() {
+        let dir = hooks_fixture_dir("role-hooks-install-");
+
+        install_and_reconcile_role_hooks(&dir, &fixture(&[("a.sh", "#!/bin/sh\n")]), false)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.sh")).unwrap(),
+            "#!/bin/sh\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE)).unwrap(),
+            "a.sh\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("a.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755, "role hook scripts install executable");
+            let manifest_mode =
+                std::fs::metadata(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+            assert_eq!(
+                manifest_mode & 0o111,
+                0,
+                "the manifest must never be executable"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn role_hooks_install_overwrites_only_with_force() {
+        let dir = hooks_fixture_dir("role-hooks-force-");
+        let shipped = fixture(&[("a.sh", "new content\n")]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.sh"), "SENTINEL").unwrap();
+
+        install_and_reconcile_role_hooks(&dir, &shipped, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.sh")).unwrap(),
+            "SENTINEL"
+        );
+
+        install_and_reconcile_role_hooks(&dir, &shipped, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.sh")).unwrap(),
+            "new content\n"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn role_hooks_reconcile_removes_dropped_hook_and_keeps_user_files() {
+        let dir = hooks_fixture_dir("role-hooks-reconcile-");
+
+        install_and_reconcile_role_hooks(
+            &dir,
+            &fixture(&[("keep.sh", "#!/bin/sh\n"), ("drop.sh", "#!/bin/sh\n")]),
+            false,
+        )
+        .unwrap();
+        std::fs::write(dir.join("user.sh"), "user-owned").unwrap();
+
+        install_and_reconcile_role_hooks(&dir, &fixture(&[("keep.sh", "#!/bin/sh\n")]), false)
+            .unwrap();
+
+        assert!(
+            !dir.join("drop.sh").exists(),
+            "dropped builtin hook removed"
+        );
+        assert!(dir.join("keep.sh").exists());
+        assert!(dir.join("user.sh").exists(), "user file survives reconcile");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE)).unwrap(),
+            "keep.sh\n"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn role_hooks_never_claim_a_preexisting_user_file() {
+        let dir = hooks_fixture_dir("role-hooks-unclaimed-");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.sh"), "user-owned").unwrap();
+
+        install_and_reconcile_role_hooks(&dir, &fixture(&[("a.sh", "#!/bin/sh\n")]), false)
+            .unwrap();
+        assert!(
+            !dir.join(builtin_manifest::BUILTIN_MANIFEST_FILE).exists(),
+            "a skipped pre-existing file must not be claimed by the manifest"
+        );
+
+        install_and_reconcile_role_hooks(&dir, &[], false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.sh")).unwrap(),
+            "user-owned",
+            "the user file survives the hook being dropped from the embed"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn role_hooks_empty_shipped_set_creates_nothing() {
+        let dir = hooks_fixture_dir("role-hooks-empty-");
+
+        install_and_reconcile_role_hooks(&dir, &[], false).unwrap();
+
+        assert!(!dir.exists(), "an empty shipped set must not create hooks/");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }
