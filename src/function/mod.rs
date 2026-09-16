@@ -2518,13 +2518,13 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
     cmd_name
 }
 
-// Polling tools are expected to repeat; recording them would also let them
-// break up detection of a real loop in the calls they interleave with.
-const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 4] = [
+const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 6] = [
     "job__check",
     "job__list",
     "agent__check",
     "agent__list_running",
+    "agent__task_list",
+    "agent__check_inbox",
 ];
 
 fn is_loop_tracker_exempt(name: &str) -> bool {
@@ -3328,10 +3328,12 @@ mod tests {
             "job__list",
             "agent__check",
             "agent__list_running",
+            "agent__task_list",
+            "agent__check_inbox",
         ]
         .into_iter()
         .collect();
-        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 4);
+        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 6);
         assert_eq!(actual, expected);
     }
 
@@ -3366,6 +3368,29 @@ mod tests {
         tracker.record_call(x.clone());
 
         assert!(tracker.check_loop(&x).is_some());
+    }
+
+    /// Zero-argument polls (`agent__check_inbox`, `agent__task_list`) are
+    /// byte-identical on every call, so the protocol-mandated "check your inbox
+    /// after each round" cadence must never read as a loop — even when the
+    /// polls are back-to-back and well past the repeat threshold.
+    #[test]
+    fn tracker_zero_arg_polls_never_trip_even_when_consecutive() {
+        for name in ["agent__check_inbox", "agent__task_list"] {
+            let mut tracker = ToolCallTracker::default();
+            let poll = call_with_args(name, json!({}));
+            for _ in 0..10 {
+                assert!(
+                    tracker.check_loop(&poll).is_none(),
+                    "{name} must never trip the loop tracker"
+                );
+                tracker.record_call(poll.clone());
+            }
+            assert!(
+                tracker.last_calls.is_empty(),
+                "{name} must not be recorded in the call history"
+            );
+        }
     }
 
     #[test]
