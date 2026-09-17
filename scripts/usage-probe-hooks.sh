@@ -19,6 +19,12 @@
 #      on reinstall; a malformed manifest deletes NOTHING (fail-safe).
 #   G) a plain startup sweeps manifest-owned hooks of removed builtin agents
 #      while leaving user agent dirs and user files untouched.
+#   H) the INSTALLED bundled scripts behave as documented when run directly:
+#      log-events.sh defaults under ${XDG_STATE_HOME:-$HOME/.local/state}/coyote/
+#      (0600, UTC ISO-8601 header, secrets filtered, symlink at the default
+#      path refused) and notify.sh's no-notifier/no-tty fallback strips
+#      ANSI/OSC control bytes; the hooks-dir .builtin-manifest is never
+#      installed executable.
 #
 # Not covered here (see src/function/mod.rs tests for tool.* + payload-file
 # coverage instead): a live tool.started firing requires a real LLM round
@@ -372,6 +378,85 @@ COYOTE_CONFIG_DIR="$CFG_G" "$BIN" --no-stream "say exactly: hi" > /dev/null
 [ "$(cat "$CFG_G/agents/mine/hooks/mine.sh")" = "mine" ] \
   || fail "sweep touched a user agent dir without a manifest"
 echo "PASS: startup sweep removes only manifest-owned hooks of removed agents"
+
+echo "== Scenario H: bundled hook scripts behave as documented when run directly =="
+# The two shipped scripts are consumer-facing artifacts in their own right.
+# Exercise the INSTALLED copies (real CLI install) the way a hook runner or a
+# manual invocation would: clean env, no COYOTE_HOOK_LOG, no notifier
+# binaries, no controlling terminal.
+CFG_H="$WORKDIR/h"
+mkdir -p "$CFG_H"
+COYOTE_CONFIG_DIR="$CFG_H" "$BIN" --install-builtins hooks > /dev/null 2>&1
+LOG_SCRIPT="$CFG_H/hooks/log-events.sh"
+NOTIFY_SCRIPT="$CFG_H/hooks/notify.sh"
+[ -x "$LOG_SCRIPT" ] || fail "installed log-events.sh missing or non-executable"
+[ -x "$NOTIFY_SCRIPT" ] || fail "installed notify.sh missing or non-executable"
+
+# The manifest the installer drops beside the scripts is NOT a script: the
+# unified exec-bit predicate must leave it non-executable.
+if [ -f "$CFG_H/hooks/.builtin-manifest" ]; then
+  [ ! -x "$CFG_H/hooks/.builtin-manifest" ] \
+    || fail ".builtin-manifest in the hooks dir is executable; non-script files must stay non-executable"
+fi
+
+# H1: with COYOTE_HOOK_LOG unset the log defaults under XDG_STATE_HOME, is
+# created 0600, carries a UTC ISO-8601 header, and never logs COYOTE_SECRET_*.
+XDG_H="$WORKDIR/h-xdg"
+env -u COYOTE_HOOK_LOG XDG_STATE_HOME="$XDG_H" HOME="$WORKDIR/h-home-unused" \
+  COYOTE_EVENT=probe.event COYOTE_HOOK_NAME=probe COYOTE_SECRET_TOKEN=hunter2 \
+  bash "$LOG_SCRIPT" || fail "log-events.sh exited non-zero on the XDG default path"
+HLOG="$XDG_H/coyote/hooks.log"
+[ -f "$HLOG" ] || fail "log-events.sh did not default to \$XDG_STATE_HOME/coyote/hooks.log"
+if command -v stat > /dev/null 2>&1; then
+  mode_hlog="$(stat -c '%a' "$HLOG" 2>/dev/null || stat -f '%Lp' "$HLOG")"
+  [ "$mode_hlog" = "600" ] || fail "default hook log mode is $mode_hlog, expected 600"
+fi
+grep -Eq '^=== [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z probe\.event$' "$HLOG" \
+  || fail "log header is not a UTC ISO-8601 timestamp: $(head -1 "$HLOG")"
+grep -q '^COYOTE_EVENT=probe.event$' "$HLOG" \
+  || fail "log snapshot is missing COYOTE_EVENT"
+! grep -q 'hunter2' "$HLOG" \
+  || fail "COYOTE_SECRET_* value leaked into the hook log"
+
+# H2: with XDG_STATE_HOME also unset, the log falls back to
+# $HOME/.local/state/coyote/hooks.log.
+HOME_H="$WORKDIR/h-home"
+mkdir -p "$HOME_H"
+env -u COYOTE_HOOK_LOG -u XDG_STATE_HOME HOME="$HOME_H" COYOTE_EVENT=probe.event \
+  bash "$LOG_SCRIPT" || fail "log-events.sh exited non-zero on the HOME default path"
+[ -f "$HOME_H/.local/state/coyote/hooks.log" ] \
+  || fail "log-events.sh did not fall back to ~/.local/state/coyote/hooks.log"
+
+# H3: a symlink planted at the DEFAULT log path is refused — exit 0, target
+# untouched (the hardening must hold on the new default location too).
+HOME_S="$WORKDIR/h-sym"
+mkdir -p "$HOME_S/.local/state/coyote"
+VICTIM_H="$WORKDIR/h-victim.txt"
+echo "untouched" > "$VICTIM_H"
+ln -s "$VICTIM_H" "$HOME_S/.local/state/coyote/hooks.log"
+env -u COYOTE_HOOK_LOG -u XDG_STATE_HOME HOME="$HOME_S" COYOTE_EVENT=probe.event \
+  bash "$LOG_SCRIPT" || fail "log-events.sh exited non-zero when refusing a symlink"
+[ "$(cat "$VICTIM_H")" = "untouched" ] \
+  || fail "log-events.sh wrote through a symlink planted at the default log path"
+
+# H4: notify.sh with no notifier on PATH and no controlling terminal falls
+# back to stdout with control bytes (ESC/BEL, i.e. ANSI + OSC) stripped from
+# model-influenced values.
+BIN_H="$WORKDIR/h-bin"
+mkdir -p "$BIN_H"
+ln -s "$(command -v tr)" "$BIN_H/tr"
+NOTIFY_OUT="$WORKDIR/h-notify.out"
+rc_h=0
+setsid -w env -i PATH="$BIN_H" \
+  COYOTE_EVENT=turn.completed \
+  COYOTE_TOOL_NAME="$(printf 'evil\033]0;own\007\033[31mred')" \
+  "$(command -v bash)" "$NOTIFY_SCRIPT" > "$NOTIFY_OUT" 2> /dev/null || rc_h=$?
+[ "$rc_h" = "0" ] || fail "notify.sh fallback exited $rc_h"
+grep -Fq '[coyote] turn.completed tool=evil]0;own[31mred' "$NOTIFY_OUT" \
+  || fail "notify.sh fallback output missing/unsanitized: $(cat "$NOTIFY_OUT")"
+! LC_ALL=C grep -q "$(printf '\033')" "$NOTIFY_OUT" \
+  || fail "ANSI/OSC escape bytes leaked through the notify.sh tty fallback"
+echo "PASS: installed hook scripts honor XDG default, 0600, UTC timestamps, symlink refusal, secret filter, and ANSI-stripped notify fallback"
 
 echo
 echo "ALL SCENARIOS PASSED"
