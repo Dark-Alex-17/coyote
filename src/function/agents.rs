@@ -4,7 +4,7 @@ use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::{
     Agent, AgentVariable, AgentVariables, AppState, Input, RequestContext, Role, RoleLike,
     default_max_agent_depth, effective_max_concurrent_jobs, jobs_enabled,
-    list_agents_with_descriptions, load_agent_variables, paths,
+    list_agents_with_descriptions, load_agent_variables,
 };
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
@@ -15,7 +15,8 @@ use crate::utils::{AbortSignal, create_abort_signal, wait_abort_signal, wait_use
 use crate::graph;
 use crate::repl::DEFAULT_CONTINUATION_PROMPT;
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
+use hooks::McpServerHooks;
 use indexmap::IndexMap;
 use log::{debug, warn};
 use parking_lot::RwLock;
@@ -961,10 +962,11 @@ async fn populate_agent_mcp_runtime(ctx: &mut RequestContext, server_ids: &[Stri
         })
         .unwrap_or_default();
 
+    let mcp_hooks = McpServerHooks::resolve(ctx);
     for (id, spec) in server_specs {
         let handle = app
             .mcp_factory
-            .acquire(&id, &spec, app.mcp_log_path.as_deref())
+            .acquire(&id, &spec, app.mcp_log_path.as_deref(), &mcp_hooks)
             .await?;
         ctx.tool_scope.mcp_runtime.insert(id, handle);
     }
@@ -997,44 +999,15 @@ fn sync_agent_functions_to_ctx(ctx: &mut RequestContext) -> Result<()> {
     Ok(())
 }
 
-/// Mirrors the base-env contract `hooks::fire` assembles from a live context,
-/// for detached call sites that dispatch pre-resolved hook snapshots after
-/// the context they were resolved from is gone. The names are captured by
-/// the caller when it takes the snapshot; the timestamp is taken here, at
-/// fire time, so it reflects when the event actually happened.
-pub(crate) fn hook_base_envs(
-    event: HookEvent,
-    session_name: Option<&str>,
-    agent_name: Option<&str>,
-) -> Vec<(String, String)> {
-    let mut envs = vec![
-        ("COYOTE_EVENT".to_string(), event.as_str().to_string()),
-        (
-            "COYOTE_CONFIG_DIR".to_string(),
-            paths::config_dir().display().to_string(),
-        ),
-        (
-            "COYOTE_EVENT_TIMESTAMP".to_string(),
-            Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        ),
-    ];
-    if let Some(name) = session_name {
-        envs.push(("COYOTE_SESSION_ID".to_string(), name.to_string()));
-    }
-    if let Some(name) = agent_name {
-        envs.push(("COYOTE_AGENT_NAME".to_string(), name.to_string()));
-    }
-    envs
-}
-
-/// Pre-resolved `agent.completed`/`agent.failed` snapshots for a spawned
-/// agent's result arms, captured from the child context before the spawn
-/// task takes ownership of it. Resolving against the child keeps global
-/// hooks gated by the child's own whitelist, the same gate every other
-/// event fired from the child's context goes through.
+/// Pre-resolved `agent.completed`/`agent.interrupted`/`agent.failed`
+/// snapshots for a spawned agent's result arms, captured from the child
+/// context before the spawn task takes ownership of it. Resolving against
+/// the child keeps global hooks gated by the child's own whitelist, the
+/// same gate every other event fired from the child's context goes through.
 struct SpawnResultHooks {
     completed: Vec<ResolvedHook>,
     failed: Vec<ResolvedHook>,
+    interrupted: Vec<ResolvedHook>,
     session_name: Option<String>,
     agent_id: String,
     agent_name: String,
@@ -1045,6 +1018,7 @@ impl SpawnResultHooks {
         Self {
             completed: child_ctx.resolved_hooks(HookEvent::AgentCompleted),
             failed: child_ctx.resolved_hooks(HookEvent::AgentFailed),
+            interrupted: child_ctx.resolved_hooks(HookEvent::AgentInterrupted),
             session_name: child_ctx
                 .session
                 .as_ref()
@@ -1054,14 +1028,16 @@ impl SpawnResultHooks {
         }
     }
 
-    /// Fires `agent.completed`, or `agent.failed` when `error` is given.
-    fn fire(self, error: Option<&str>) {
+    fn fire(self, error: Option<&str>, child_abort: &AbortSignal) {
         let mut extras = vec![
             ("COYOTE_AGENT_ID", self.agent_id),
             ("COYOTE_AGENT_NAME", self.agent_name.clone()),
         ];
         let (event, resolved) = match error {
             None => (HookEvent::AgentCompleted, self.completed),
+            Some(_) if child_abort.aborted_ctrlc() => {
+                (HookEvent::AgentInterrupted, self.interrupted)
+            }
             Some(error) => {
                 extras.push(("COYOTE_AGENT_ERROR", error.to_string()));
                 (HookEvent::AgentFailed, self.failed)
@@ -1070,7 +1046,7 @@ impl SpawnResultHooks {
         hooks::fire_resolved(
             event,
             resolved,
-            hook_base_envs(event, self.session_name.as_deref(), Some(&self.agent_name)),
+            hooks::base_envs_parts(event, self.session_name.as_deref(), Some(&self.agent_name)),
             &extras,
             None,
         );
@@ -1246,6 +1222,7 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let spawn_agent_id = agent_id.clone();
     let spawn_agent_name = agent_name.clone();
     let spawn_abort = child_abort.clone();
+    let hook_abort = child_abort.clone();
     let spawn_notifications = Arc::clone(&ctx.notification_queue);
     let child_supervisor = child_ctx.supervisor.clone();
 
@@ -1268,8 +1245,8 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         };
         let success = agent_result.exit_status == AgentExitStatus::Completed;
         match &agent_result.exit_status {
-            AgentExitStatus::Completed => result_hooks.fire(None),
-            AgentExitStatus::Failed(e) => result_hooks.fire(Some(e)),
+            AgentExitStatus::Completed => result_hooks.fire(None, &hook_abort),
+            AgentExitStatus::Failed(e) => result_hooks.fire(Some(e), &hook_abort),
         }
         spawn_notifications.push(agent_notification(
             &agent_result.id,
@@ -1801,6 +1778,18 @@ fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Val
             let from_agent = request.from_agent_name.clone();
             let question = request.question.clone();
             let _ = request.reply_tx.send(reply.to_string());
+            hooks::fire(
+                HookEvent::EscalationAnswered,
+                ctx,
+                &[
+                    ("COYOTE_ESCALATION_ID", escalation_id.to_string()),
+                    ("COYOTE_ESCALATION_FROM_AGENT_ID", request.from_agent_id),
+                    ("COYOTE_ESCALATION_FROM_AGENT_NAME", from_agent.clone()),
+                    ("COYOTE_ESCALATION_QUESTION", question.clone()),
+                    ("COYOTE_ESCALATION_REPLY", reply.to_string()),
+                ],
+                None,
+            );
             Ok(json!({
                 "status": "ok",
                 "message": format!("Reply sent to agent '{from_agent}' for escalation '{escalation_id}'"),
@@ -2281,6 +2270,9 @@ mod tests {
                  \x20 agent.completed:\n\
                  \x20   - name: {marker}_completed\n\
                  \x20     command: \"true\"\n\
+                 \x20 agent.interrupted:\n\
+                 \x20   - name: {marker}_interrupted\n\
+                 \x20     command: \"true\"\n\
                  \x20 agent.failed:\n\
                  \x20   - name: {marker}_failed\n\
                  \x20     command: \"true\"\n\
@@ -2377,8 +2369,56 @@ mod tests {
     }
 
     #[test]
-    fn hook_base_envs_carries_optional_names_only_when_present() {
-        let envs = hook_base_envs(HookEvent::AgentCompleted, None, None);
+    #[serial]
+    fn cancelled_spawned_agent_fires_interrupted_not_failed() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_hook_spawn_cancel");
+        write_graph_agent_with_hooks(&agent_name, "t049_spawn_cancel", true);
+
+        let id = run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            let spawned = handle_spawn(&mut ctx, &json!({"agent": agent_name, "prompt": "hi"}))
+                .await
+                .unwrap();
+            assert_eq!(spawned["status"], "ok", "{spawned}");
+            let id = spawned["id"].as_str().unwrap().to_string();
+            let handle = ctx
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .take(&id)
+                .expect("spawned agent must be registered");
+            // The `agent__cancel` signal, fired before the spawn task runs:
+            // on this current-thread runtime the task only progresses once
+            // awaited, so its failure arm observes the ctrl-c deterministically.
+            handle.abort_signal.set_ctrlc();
+            handle
+                .join_handle
+                .await
+                .expect("spawn task must not panic")
+                .expect("spawn task must return an AgentResult");
+            id
+        });
+
+        let interrupted = hook_captures_named("t049_spawn_cancel_interrupted");
+        assert_eq!(interrupted.len(), 1, "{interrupted:?}");
+        assert_eq!(interrupted[0].envs["COYOTE_EVENT"], "agent.interrupted");
+        assert_eq!(interrupted[0].envs["COYOTE_AGENT_ID"], id);
+        assert_eq!(interrupted[0].envs["COYOTE_AGENT_NAME"], agent_name);
+        assert!(
+            !interrupted[0].envs.contains_key("COYOTE_AGENT_ERROR"),
+            "an interruption is not a failure and carries no error env"
+        );
+
+        assert!(hook_captures_named("t049_spawn_cancel_failed").is_empty());
+        assert!(hook_captures_named("t049_spawn_cancel_completed").is_empty());
+    }
+
+    #[test]
+    fn agent_event_base_envs_carry_optional_names_only_when_present() {
+        let envs = hooks::base_envs_parts(HookEvent::AgentCompleted, None, None);
         let keys: Vec<&str> = envs.iter().map(|(key, _)| key.as_str()).collect();
         assert!(keys.contains(&"COYOTE_EVENT"));
         assert!(keys.contains(&"COYOTE_CONFIG_DIR"));
@@ -2390,7 +2430,7 @@ mod tests {
                 .any(|(key, value)| key == "COYOTE_EVENT" && value == "agent.completed")
         );
 
-        let envs = hook_base_envs(HookEvent::AgentFailed, Some("sess"), Some("bot"));
+        let envs = hooks::base_envs_parts(HookEvent::AgentFailed, Some("sess"), Some("bot"));
         assert!(
             envs.iter()
                 .any(|(key, value)| key == "COYOTE_SESSION_ID" && value == "sess")
@@ -3352,6 +3392,79 @@ mod tests {
         let result =
             handle_reply_escalation(&mut ctx, &json!({"escalation_id": "x", "reply": "y"}));
         assert!(result.is_err());
+    }
+
+    /// `escalation.answered` belongs to the successful take -> reply arm
+    /// alone: exactly once per escalation, and never from the failure arms
+    /// (unknown id, already-taken id).
+    #[test]
+    #[serial]
+    fn reply_escalation_fires_answered_once_and_never_on_failure_arms() {
+        let _sink = hooks::test_sink::install();
+        let marker = "t049_answered_once";
+        let mut hooks_map = hooks::HooksMap::default();
+        hooks_map.insert(
+            "escalation.answered".to_string(),
+            vec![hooks::HookDef {
+                name: marker.to_string(),
+                command: "true".to_string(),
+            }],
+        );
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            hooks: hooks_map,
+            ..Default::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let queue = Arc::new(EscalationQueue::new());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        queue.submit(EscalationRequest {
+            id: "esc_once".into(),
+            from_agent_id: "a1".into(),
+            from_agent_name: "explore".into(),
+            question: "[input] What do?".into(),
+            options: None,
+            reply_tx: tx,
+        });
+        ctx.escalation_queue = Some(queue);
+
+        // Unknown id: an error result, and no event.
+        let miss = handle_reply_escalation(
+            &mut ctx,
+            &json!({"escalation_id": "missing", "reply": "nope"}),
+        )
+        .unwrap();
+        assert_eq!(miss["status"], "error");
+        assert!(
+            hook_captures_named(marker).is_empty(),
+            "a failed reply must not fire escalation.answered"
+        );
+
+        // The successful take -> reply arm fires it exactly once.
+        let ok = handle_reply_escalation(
+            &mut ctx,
+            &json!({"escalation_id": "esc_once", "reply": "do X"}),
+        )
+        .unwrap();
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(rx.blocking_recv().unwrap(), "do X");
+        let answered = hook_captures_named(marker);
+        assert_eq!(answered.len(), 1, "{answered:?}");
+        assert_eq!(answered[0].envs["COYOTE_ESCALATION_ID"], "esc_once");
+        assert_eq!(answered[0].envs["COYOTE_ESCALATION_REPLY"], "do X");
+
+        // Replying again to the same id hits the already-taken arm: still one.
+        let again = handle_reply_escalation(
+            &mut ctx,
+            &json!({"escalation_id": "esc_once", "reply": "again"}),
+        )
+        .unwrap();
+        assert_eq!(again["status"], "error");
+        assert_eq!(
+            hook_captures_named(marker).len(),
+            1,
+            "a second reply must not re-fire escalation.answered"
+        );
     }
 
     #[test]

@@ -50,16 +50,32 @@ impl AgentNodeExecutor {
         )
         .await;
         if let Err(e) = &result {
-            hooks::fire(
-                HookEvent::AgentFailed,
-                parent_ctx,
-                &[
-                    ("COYOTE_AGENT_ID", agent_hook_id),
-                    ("COYOTE_AGENT_NAME", node.agent.clone()),
-                    ("COYOTE_AGENT_ERROR", format!("{e:#}")),
-                ],
-                None,
-            );
+            if parent_ctx
+                .session_abort
+                .as_ref()
+                .is_some_and(|signal| signal.aborted_ctrlc())
+            {
+                hooks::fire(
+                    HookEvent::AgentInterrupted,
+                    parent_ctx,
+                    &[
+                        ("COYOTE_AGENT_ID", agent_hook_id),
+                        ("COYOTE_AGENT_NAME", node.agent.clone()),
+                    ],
+                    None,
+                );
+            } else {
+                hooks::fire(
+                    HookEvent::AgentFailed,
+                    parent_ctx,
+                    &[
+                        ("COYOTE_AGENT_ID", agent_hook_id),
+                        ("COYOTE_AGENT_NAME", node.agent.clone()),
+                        ("COYOTE_AGENT_ERROR", format!("{e:#}")),
+                    ],
+                    None,
+                );
+            }
         }
         outcome_from(node_id, node, state_manager, result)
     }
@@ -338,10 +354,12 @@ fn apply_state_updates(node: &AgentNode, state_manager: &mut StateManager, outpu
 mod tests {
     use super::super::types::AgentNode;
     use super::*;
-    use crate::config::{AppState, WorkingMode, default_max_agent_depth};
+    use crate::config::{AppConfig, AppState, WorkingMode, default_max_agent_depth};
+    use crate::hooks::{HookDef, HooksMap, test_sink};
     use crate::supervisor::mailbox::{Inbox, PeerRegistry, graph_agent_id};
-    use crate::testing::{install_warn_collector, warn_messages};
+    use crate::testing::{install_log_collector, warn_snapshot};
     use serde_json::json;
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -414,6 +432,95 @@ mod tests {
 
     fn plain_ctx() -> RequestContext {
         RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
+    }
+
+    fn ctx_with_agent_hooks(marker: &str) -> RequestContext {
+        let mut hooks = HooksMap::default();
+        for event in ["agent.interrupted", "agent.failed"] {
+            hooks.insert(
+                event.to_string(),
+                vec![HookDef {
+                    name: format!("{marker}-{event}"),
+                    command: "true".to_string(),
+                }],
+            );
+        }
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            hooks,
+            ..Default::default()
+        });
+        RequestContext::new(Arc::new(app), WorkingMode::Cmd)
+    }
+
+    /// A fired session signal (the user's interrupt) reclassifies a failed
+    /// agent node: `agent.interrupted` fires instead of `agent.failed`.
+    #[tokio::test]
+    #[serial]
+    async fn execute_failure_with_fired_session_abort_fires_agent_interrupted() {
+        let _sink = test_sink::install();
+        let marker = "graph-agent-int-z2f";
+        let mut ctx = ctx_with_agent_hooks(marker);
+        // Past max depth the node fails before touching agent config on disk.
+        ctx.current_depth = default_max_agent_depth();
+        let session = create_abort_signal();
+        session.set_ctrlc();
+        ctx.session_abort = Some(session);
+        let node = node_with("hi", None);
+        let mut state = manager_with(&[]);
+
+        AgentNodeExecutor::execute("test_node", &node, &mut state, &mut ctx, false)
+            .await
+            .expect_err("agent past max depth should fail");
+
+        let captures: Vec<_> = test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name.starts_with(marker))
+            .collect();
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(captures[0].hook_name, format!("{marker}-agent.interrupted"));
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_AGENT_NAME")
+                .map(String::as_str),
+            Some("test_agent")
+        );
+        assert!(
+            !captures[0].envs.contains_key("COYOTE_AGENT_ERROR"),
+            "an interruption is not a failure and carries no error env"
+        );
+    }
+
+    /// The inverse gate: a failure whose session signal never fired stays
+    /// `agent.failed` with its error env — the presence of a signal alone
+    /// must not reclassify a real failure as an interruption.
+    #[tokio::test]
+    #[serial]
+    async fn execute_failure_without_fired_session_abort_fires_agent_failed() {
+        let _sink = test_sink::install();
+        let marker = "graph-agent-fail-inv-x7q";
+        let mut ctx = ctx_with_agent_hooks(marker);
+        // Past max depth the node fails before touching agent config on disk.
+        ctx.current_depth = default_max_agent_depth();
+        ctx.session_abort = Some(create_abort_signal());
+        let node = node_with("hi", None);
+        let mut state = manager_with(&[]);
+
+        AgentNodeExecutor::execute("test_node", &node, &mut state, &mut ctx, false)
+            .await
+            .expect_err("agent past max depth should fail");
+
+        let captures: Vec<_> = test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name.starts_with(marker))
+            .collect();
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(captures[0].hook_name, format!("{marker}-agent.failed"));
+        assert!(
+            captures[0].envs.contains_key("COYOTE_AGENT_ERROR"),
+            "a real failure keeps its error env"
+        );
     }
 
     fn retryable_node(max_attempts: u32) -> AgentNode {
@@ -676,7 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_transient_warns_once_per_retried_attempt_with_the_context_chain() {
-        install_warn_collector();
+        install_log_collector();
         let mut ctx = plain_ctx();
         let node = retryable_node(3);
         let mut attempts = 0u32;
@@ -700,12 +807,9 @@ mod tests {
         .expect_err("all attempts fail");
 
         assert_eq!(attempts, 3);
-        let warns: Vec<String> = warn_messages()
-            .lock()
-            .unwrap()
-            .iter()
+        let warns: Vec<String> = warn_snapshot()
+            .into_iter()
             .filter(|m| m.contains("'warn_capture'"))
-            .cloned()
             .collect();
         assert_eq!(
             warns.len(),
@@ -861,7 +965,7 @@ mod tests {
 
     #[test]
     fn outcome_from_fallback_warn_names_the_node_and_the_fallback_target() {
-        install_warn_collector();
+        install_log_collector();
         let mut node = node_with("hi", None);
         node.fallback = Some("recover".into());
         let mut state = manager_with(&[]);
@@ -875,12 +979,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome, AgentExecutionOutcome::FellBack("recover".into()));
-        let warns: Vec<String> = warn_messages()
-            .lock()
-            .unwrap()
-            .iter()
+        let warns: Vec<String> = warn_snapshot()
+            .into_iter()
             .filter(|m| m.contains("'fallback_warn_capture'"))
-            .cloned()
             .collect();
         assert_eq!(warns.len(), 1, "exactly one fallback warn: {warns:?}");
         assert!(

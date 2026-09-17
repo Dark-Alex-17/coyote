@@ -111,6 +111,18 @@ impl JobHookSnapshot {
     }
 }
 
+fn fire_job_started(ctx: &RequestContext, job_id: &str, tool: &str) {
+    hooks::fire(
+        HookEvent::JobStarted,
+        ctx,
+        &[
+            ("COYOTE_JOB_ID", job_id.to_string()),
+            ("COYOTE_TOOL_NAME", tool.to_string()),
+        ],
+        None,
+    );
+}
+
 pub struct RingBuf {
     buf: Vec<u8>,
     capacity: usize,
@@ -529,15 +541,7 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         let notify_id = job_id.clone();
         let notify_tool = tool.clone();
         let hook_snapshot = JobHookSnapshot::resolve(ctx, &job_id, &tool);
-        hooks::fire(
-            HookEvent::JobStarted,
-            ctx,
-            &[
-                ("COYOTE_JOB_ID", job_id.clone()),
-                ("COYOTE_TOOL_NAME", tool.clone()),
-            ],
-            None,
-        );
+        fire_job_started(ctx, &job_id, &tool);
         tokio::spawn(async move {
             let result = run_mcp_job(job_ctx, server, inner_tool, inner_args).await;
             let success = result.is_ok();
@@ -559,15 +563,7 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         let notify_id = job_id.clone();
         let notify_tool = tool.clone();
         let hook_snapshot = JobHookSnapshot::resolve(ctx, &job_id, &tool);
-        hooks::fire(
-            HookEvent::JobStarted,
-            ctx,
-            &[
-                ("COYOTE_JOB_ID", job_id.clone()),
-                ("COYOTE_TOOL_NAME", tool.clone()),
-            ],
-            None,
-        );
+        fire_job_started(ctx, &job_id, &tool);
         tokio::spawn(async move {
             let result = run_process_job(snapshot, Arc::clone(&task_state), task_buf).await;
             let success = matches!(&result, Ok(job_result) if job_result.exit_code == Some(0));

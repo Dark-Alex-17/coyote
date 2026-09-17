@@ -47,3 +47,61 @@ impl RagCache {
         Ok(arc)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::hooks::test_sink;
+    use crate::rag::RagData;
+    use anyhow::anyhow;
+    use serial_test::serial;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A cache hit must never reach the loader: the loader closure is where
+    /// a real RAG build (and its `rag.sync.*` hook dispatch) happens, so
+    /// returning the cached entry is what keeps warm-cache lookups silent.
+    #[tokio::test]
+    #[serial]
+    async fn cache_hit_returns_the_cached_rag_without_running_the_loader() {
+        let _sink = test_sink::install();
+        test_sink::drain();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-rag-cache-hit-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kb.yaml");
+        let data = RagData {
+            driver: "yaml".to_string(),
+            // The only embedding model resolvable in tests; see
+            // `seed_model_registries` in the request_context tests.
+            embedding_model: "test-seeded:test-embedder".to_string(),
+            chunk_size: 1000,
+            chunk_overlap: 100,
+            top_k: 5,
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_yaml::to_string(&data).unwrap()).unwrap();
+        let rag = Arc::new(Rag::load(&AppConfig::default(), "kb", &path).await.unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let cache = RagCache::default();
+        let key = RagKey::Named("kb".to_string());
+        cache.insert(key.clone(), &rag);
+
+        let loaded = cache
+            .load_with(key, || async {
+                Err(anyhow!("a cache hit must not rebuild"))
+            })
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&loaded, &rag));
+        assert!(
+            test_sink::drain().is_empty(),
+            "a cache hit must dispatch no hooks"
+        );
+    }
+}

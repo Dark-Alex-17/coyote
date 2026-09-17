@@ -3,9 +3,10 @@ use super::bundles::{
     hash_file,
 };
 use crate::config::builtin_manifest::is_builtin_manifest_name;
-use crate::config::{AssetCategory, BUNDLE_MANIFEST_FILE, InstallFilter, paths};
-#[cfg(not(windows))]
-use crate::function::Language;
+use crate::config::conflict::{ConflictAction, NonInteractive, StickyMode, resolve_conflict};
+use crate::config::{
+    AssetCategory, BUNDLE_MANIFEST_FILE, InstallFilter, paths, set_executable_bit_if_script,
+};
 use crate::mcp::{McpServer, McpServersConfig};
 use crate::utils;
 use crate::utils::IS_STDOUT_TERMINAL;
@@ -1857,18 +1858,12 @@ fn print_plan_summary(plan: &InstallPlan) {
 }
 
 /// Bundle-shipped hook scripts execute on the user's machine once wired into
-/// config, so every planned file landing under a hooks/ directory is called
-/// out individually. Visibility only: installing them needs no extra approval.
+/// config, so every planned file landing in a hook location is called out
+/// individually. Visibility only: installing them needs no extra approval.
 fn hook_script_lines(plan: &InstallPlan) -> Vec<String> {
     plan.files
         .iter()
-        .filter(|planned| {
-            planned.top_category == TopCategory::Hooks
-                || planned
-                    .rel
-                    .parent()
-                    .is_some_and(|parent| parent.components().any(|c| c.as_os_str() == "hooks"))
-        })
+        .filter(|planned| is_hook_location(planned))
         .map(|planned| {
             let rel = planned.rel.to_string_lossy().replace('\\', "/");
             format!(
@@ -1879,23 +1874,21 @@ fn hook_script_lines(plan: &InstallPlan) -> Vec<String> {
         .collect()
 }
 
+fn is_hook_location(planned: &PlannedFile) -> bool {
+    let components: Vec<_> = planned.rel.components().collect();
+    match planned.top_category {
+        TopCategory::Hooks => true,
+        TopCategory::Agents => components.len() == 3 && components[1].as_os_str() == "hooks",
+        TopCategory::Roles => components.len() == 2 && components[0].as_os_str() == "hooks",
+        _ => false,
+    }
+}
+
 fn count_kind(plan: &InstallPlan, cat: TopCategory, kind: PlannedKind) -> usize {
     plan.files
         .iter()
         .filter(|p| p.top_category == cat && p.kind == kind)
         .count()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum StickyMode {
-    None,
-    KeepAll,
-    ReplaceAll,
-}
-
-enum ConflictAction {
-    Keep,
-    Replace,
 }
 
 #[derive(Debug)]
@@ -1937,7 +1930,12 @@ fn apply_plan(
                 record_written_file(store, bundle, planned, FileAction::Replaced)?;
                 report.refreshed_count += 1;
             }
-            PlannedKind::Conflict => match resolve_conflict(planned, &mut sticky)? {
+            PlannedKind::Conflict => match resolve_conflict(
+                &planned.dst,
+                planned.top_category.label(),
+                &mut sticky,
+                NonInteractive::Bail,
+            )? {
                 ConflictAction::Keep => report.kept_count += 1,
                 ConflictAction::Replace => {
                     write_file(&planned.src, &planned.dst)?;
@@ -2037,50 +2035,6 @@ fn record_mcp_merge(store: &mut BundleStore, bundle: &str, report: &McpMergeRepo
     store.record_mcp_servers(bundle, entries)
 }
 
-fn resolve_conflict(planned: &PlannedFile, sticky: &mut StickyMode) -> Result<ConflictAction> {
-    match *sticky {
-        StickyMode::KeepAll => return Ok(ConflictAction::Keep),
-        StickyMode::ReplaceAll => return Ok(ConflictAction::Replace),
-        StickyMode::None => {}
-    }
-
-    if !*IS_STDOUT_TERMINAL {
-        bail!(
-            "Refusing to overwrite local file {} non-interactively. \
-             Re-run in a terminal, with --install-force (installs), \
-             or with --yes (updates).",
-            planned.dst.display()
-        );
-    }
-
-    let prompt = format!(
-        "Conflict at {} (category: {})",
-        planned.dst.display(),
-        planned.top_category.label()
-    );
-    let choice = Select::new(
-        &prompt,
-        vec!["keep", "replace", "keep-all", "replace-all", "abort"],
-    )
-    .prompt()
-    .with_context(|| "failed to read conflict choice")?;
-
-    match choice {
-        "keep" => Ok(ConflictAction::Keep),
-        "replace" => Ok(ConflictAction::Replace),
-        "keep-all" => {
-            *sticky = StickyMode::KeepAll;
-            Ok(ConflictAction::Keep)
-        }
-        "replace-all" => {
-            *sticky = StickyMode::ReplaceAll;
-            Ok(ConflictAction::Replace)
-        }
-        "abort" => bail!("Install aborted by user at conflict resolution."),
-        _ => unreachable!("inquire::Select returned an unexpected option"),
-    }
-}
-
 fn write_file(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)
@@ -2089,26 +2043,6 @@ fn write_file(src: &Path, dst: &Path) -> Result<()> {
     fs::copy(src, dst)
         .with_context(|| format!("failed to copy {} to {}", src.display(), dst.display()))?;
     set_executable_bit_if_script(dst)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_executable_bit_if_script(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Some(ext) = path.extension().and_then(OsStr::to_str) else {
-        return Ok(());
-    };
-    if Language::from_extension(ext) == Language::Unsupported {
-        return Ok(());
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("chmod {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_executable_bit_if_script(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -2924,6 +2858,11 @@ mod tests {
                 file("x/config.yaml", TopCategory::Agents),
                 file("reviewer.md", TopCategory::Roles),
                 file("hello.yaml", TopCategory::Macros),
+                file("x/hooks/nested/deep.sh", TopCategory::Agents),
+                file("x/sub/hooks/pre.sh", TopCategory::Agents),
+                file("sub/hooks/extra.sh", TopCategory::Roles),
+                file("my-skill/hooks/tool.sh", TopCategory::Skills),
+                file("my-macro/hooks/tool.sh", TopCategory::Macros),
             ],
             mcp_json: None,
         };

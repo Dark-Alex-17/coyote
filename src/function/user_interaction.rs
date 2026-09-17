@@ -1,5 +1,6 @@
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::RequestContext;
+use crate::hooks::{self, HookEvent};
 use crate::supervisor::escalation::{EscalationRequest, new_escalation_id};
 use crate::utils::{ACP_SERVER, HEADLESS, queue_acp_permission};
 
@@ -278,22 +279,37 @@ async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> R
     let escalation_id = new_escalation_id();
     let (tx, rx) = oneshot::channel();
 
+    let question = format!("[{action}] {question}");
     let request = EscalationRequest {
         id: escalation_id.clone(),
-        from_agent_id,
+        from_agent_id: from_agent_id.clone(),
         from_agent_name: from_agent_name.clone(),
-        question: format!("[{action}] {question}"),
+        question: question.clone(),
         options,
         reply_tx: tx,
     };
 
     root_queue.submit(request);
 
+    hooks::fire(
+        HookEvent::EscalationRaised,
+        ctx,
+        &[
+            ("COYOTE_ESCALATION_ID", escalation_id),
+            ("COYOTE_ESCALATION_FROM_AGENT_ID", from_agent_id),
+            ("COYOTE_ESCALATION_FROM_AGENT_NAME", from_agent_name),
+            ("COYOTE_ESCALATION_QUESTION", question),
+        ],
+        None,
+    );
+
     await_escalation_reply(rx, timeout_secs).await
 }
 
 /// Waits for the parent's reply. `timeout_secs == 0` waits indefinitely; a
 /// dropped sender (the parent cancelled the request) resolves either way.
+/// Both fallback arms resolve without touching the escalation queue, so
+/// neither fires an escalation event: the request was never answered.
 async fn await_escalation_reply(rx: oneshot::Receiver<String>, timeout_secs: u64) -> Result<Value> {
     let reply = if timeout_secs == 0 {
         rx.await
@@ -346,8 +362,14 @@ fn parse_options(args: &Value) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AppConfig, AppState, WorkingMode};
+    use crate::function::agents::handle_agent_tool;
+    use crate::hooks::{HookDef, HooksMap, test_sink};
+    use crate::supervisor::escalation::EscalationQueue;
+    use serial_test::serial;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     #[test]
     fn headless_select_returns_structured_json() {
@@ -372,6 +394,160 @@ mod tests {
     #[test]
     fn escalation_timeout_defaults_to_unlimited() {
         assert_eq!(DEFAULT_ESCALATION_TIMEOUT_SECS, 0);
+    }
+
+    fn ctx_with_escalation_hooks(marker: &str) -> RequestContext {
+        let mut hooks = HooksMap::default();
+        for event in ["escalation.raised", "escalation.answered"] {
+            hooks.insert(
+                event.to_string(),
+                vec![HookDef {
+                    name: format!("{marker}-{event}"),
+                    command: "true".to_string(),
+                }],
+            );
+        }
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            hooks,
+            ..Default::default()
+        });
+        RequestContext::new(Arc::new(app), WorkingMode::Cmd)
+    }
+
+    fn marker_captures(marker: &str, event: &str) -> Vec<test_sink::Capture> {
+        test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name == format!("{marker}-{event}"))
+            .collect()
+    }
+
+    /// `escalation.raised` (child seam) and `escalation.answered` (parent
+    /// seam) must describe the same origin agent for one escalation id: the
+    /// answered envs come from the taken queue request, never from the
+    /// replying context.
+    #[tokio::test]
+    #[serial]
+    async fn escalation_raised_and_answered_agree_on_origin_envs() {
+        let _sink = test_sink::install();
+        let marker = "esc-parity-k4w";
+
+        let queue = Arc::new(EscalationQueue::new());
+        let mut child_ctx = ctx_with_escalation_hooks(marker);
+        child_ctx.escalation_queue = Some(Arc::clone(&queue));
+        child_ctx.self_agent_id = Some("esc-child-1".to_string());
+        let mut parent_ctx = ctx_with_escalation_hooks(marker);
+        parent_ctx.escalation_queue = Some(Arc::clone(&queue));
+
+        let raise_args = json!({ "question": "which db?" });
+        let raise = handle_escalated(&child_ctx, "input", &raise_args);
+        let reply = async {
+            // Bounded poll: on the current-thread runtime the raise future
+            // submits before its first await, so this resolves immediately.
+            let mut escalation_id = None;
+            for _ in 0..1000 {
+                if let Some(entry) = queue.pending_summary().first() {
+                    escalation_id = entry["escalation_id"].as_str().map(str::to_string);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let escalation_id = escalation_id.expect("escalation must reach the queue");
+            handle_agent_tool(
+                &mut parent_ctx,
+                "agent__reply_escalation",
+                &json!({ "escalation_id": escalation_id, "reply": "postgres" }),
+            )
+            .await
+            .unwrap()
+        };
+        let (raised_result, replied) = tokio::join!(raise, reply);
+        assert_eq!(raised_result.unwrap()["answer"], "postgres");
+        assert_eq!(replied["status"], "ok");
+
+        let raised = marker_captures(marker, "escalation.raised");
+        let answered = marker_captures(marker, "escalation.answered");
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(answered.len(), 1, "{answered:?}");
+        for key in [
+            "COYOTE_ESCALATION_ID",
+            "COYOTE_ESCALATION_FROM_AGENT_ID",
+            "COYOTE_ESCALATION_FROM_AGENT_NAME",
+            "COYOTE_ESCALATION_QUESTION",
+        ] {
+            assert!(raised[0].envs.contains_key(key), "{key} missing on raised");
+            assert_eq!(raised[0].envs.get(key), answered[0].envs.get(key), "{key}");
+        }
+        assert_eq!(
+            raised[0]
+                .envs
+                .get("COYOTE_ESCALATION_FROM_AGENT_ID")
+                .map(String::as_str),
+            Some("esc-child-1")
+        );
+        assert_eq!(
+            raised[0]
+                .envs
+                .get("COYOTE_ESCALATION_QUESTION")
+                .map(String::as_str),
+            Some("[input] which db?")
+        );
+        assert_eq!(
+            answered[0]
+                .envs
+                .get("COYOTE_ESCALATION_REPLY")
+                .map(String::as_str),
+            Some("postgres")
+        );
+        assert!(!raised[0].envs.contains_key("COYOTE_ESCALATION_REPLY"));
+    }
+
+    /// `COYOTE_ESCALATION_QUESTION` rides through the standard env
+    /// truncation: a huge question is trimmed to 2048 bytes on the raised
+    /// seam, never passed through whole.
+    #[tokio::test]
+    #[serial]
+    async fn escalation_question_env_is_truncated_to_2048_bytes() {
+        let _sink = test_sink::install();
+        let marker = "esc-trunc-p9j";
+
+        let queue = Arc::new(EscalationQueue::new());
+        let mut child_ctx = ctx_with_escalation_hooks(marker);
+        child_ctx.escalation_queue = Some(Arc::clone(&queue));
+        child_ctx.self_agent_id = Some("esc-child-trunc".to_string());
+
+        let raise_args = json!({ "question": "q".repeat(3000) });
+        let raise = handle_escalated(&child_ctx, "input", &raise_args);
+        let reply = async {
+            // Bounded poll: on the current-thread runtime the raise future
+            // submits before its first await, so this resolves immediately.
+            let mut request = None;
+            for _ in 0..1000 {
+                if let Some(entry) = queue.pending_summary().first() {
+                    let id = entry["escalation_id"].as_str().unwrap().to_string();
+                    request = queue.take(&id);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let request = request.expect("escalation must reach the queue");
+            let _ = request.reply_tx.send("ok".to_string());
+        };
+        let (raised_result, ()) = tokio::join!(raise, reply);
+        assert_eq!(raised_result.unwrap()["answer"], "ok");
+
+        let raised = marker_captures(marker, "escalation.raised");
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        let question = raised[0]
+            .envs
+            .get("COYOTE_ESCALATION_QUESTION")
+            .expect("QUESTION env must be present on escalation.raised");
+        assert_eq!(
+            question.len(),
+            2048,
+            "QUESTION env must be 2048-byte truncated"
+        );
+        assert!(question.starts_with("[input] qqq"));
     }
 
     #[tokio::test(start_paused = true)]

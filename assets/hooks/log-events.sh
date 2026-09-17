@@ -4,7 +4,8 @@
 # each one carries.
 #
 # Env vars read:
-#   COYOTE_HOOK_LOG   log file to append to (default: /tmp/coyote-hooks.log)
+#   COYOTE_HOOK_LOG   log file to append to
+#                     (default: ${XDG_STATE_HOME:-$HOME/.local/state}/coyote/hooks.log)
 #   COYOTE_*          everything coyote sets for the event is dumped verbatim
 #
 # Secrets (COYOTE_SECRET_*) are excluded from the snapshot; widening the grep
@@ -26,15 +27,15 @@
 
 set -u
 
-log_file="${COYOTE_HOOK_LOG:-/tmp/coyote-hooks.log}"
+log_file="${COYOTE_HOOK_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/coyote/hooks.log}"
 
-# The default lives in shared /tmp: refuse to append through a symlink someone
-# else planted there. Point COYOTE_HOOK_LOG at a private path to avoid the
-# shared directory entirely.
+# COYOTE_HOOK_LOG may point into a shared directory: refuse to append through
+# a symlink someone else planted there.
 [ -L "$log_file" ] && exit 0
 umask 077
+mkdir -p "$(dirname "$log_file")" 2> /dev/null || true
 {
-  echo "=== $(date '+%Y-%m-%dT%H:%M:%S%z') ${COYOTE_EVENT:-unknown}"
+  echo "=== $(date -u '+%Y-%m-%dT%H:%M:%SZ') ${COYOTE_EVENT:-unknown}"
   env | grep '^COYOTE_' | grep -v '^COYOTE_SECRET_' | sort
   echo
 } >> "$log_file" 2> /dev/null || true

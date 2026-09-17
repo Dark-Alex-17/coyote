@@ -38,5 +38,8 @@ elif command -v osascript > /dev/null 2>&1; then
 else
   # coyote discards hook stdout, so aim the fallback at the controlling
   # terminal when one exists; plain stdout keeps direct/manual runs working.
-  { echo "[$title] $body" > /dev/tty; } 2> /dev/null || echo "[$title] $body"
+  # $body carries model-influenced values: strip control bytes (including
+  # ESC, so ANSI/OSC sequences cannot drive the terminal) before echoing.
+  safe_line="$(printf '%s' "[$title] $body" | tr -d '\000-\010\013\014\016-\037\177')"
+  { echo "$safe_line" > /dev/tty; } 2> /dev/null || echo "$safe_line"
 fi

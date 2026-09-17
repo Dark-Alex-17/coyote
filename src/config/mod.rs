@@ -3,6 +3,7 @@ mod app_config;
 mod app_state;
 pub(crate) mod builtin_manifest;
 mod bundles;
+pub(crate) mod conflict;
 mod input;
 mod install_remote;
 pub(crate) mod instructions;
@@ -37,6 +38,7 @@ pub use self::app_config::AppConfig;
 pub use self::app_state::AppState;
 pub(crate) use self::bundles::installed_bundle_names;
 pub use self::bundles::list_installed_bundles;
+use self::conflict::{InstallMode, StickyMode};
 pub use self::input::Input;
 pub use self::install_remote::{
     DEFAULT_GIT_HOST, install_or_update, install_or_update_from_repl_args, uninstall_bundle,
@@ -417,12 +419,13 @@ impl Default for Config {
 }
 
 pub fn install_builtins() -> Result<()> {
+    hooks::sweep_stale_payload_files();
     Functions::install_builtin_global_tools(false)?;
-    Agent::install_builtin_agents(false)?;
+    Agent::install_builtin_agents(InstallMode::Skip)?;
     Macro::install_macros(false)?;
     Skill::install_builtin_skills(false)?;
-    hooks::install_builtin_hooks(false)?;
-    Role::install_builtin_role_hooks(false)?;
+    hooks::install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None)?;
+    Role::install_builtin_role_hooks(InstallMode::Skip, &mut StickyMode::None)?;
     Ok(())
 }
 
@@ -519,11 +522,16 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
     }
 
     match category {
-        AssetCategory::Agents => Agent::install_builtin_agents(true)?,
+        AssetCategory::Agents => Agent::install_builtin_agents(InstallMode::Force)?,
         AssetCategory::Macros => Macro::install_macros(true)?,
         AssetCategory::Functions => Functions::install_builtin_global_tools(true)?,
         AssetCategory::Skills => Skill::install_builtin_skills(true)?,
-        AssetCategory::Hooks => hooks::install_builtin_hooks(true)?,
+        AssetCategory::Hooks => {
+            let mut sticky = StickyMode::None;
+            hooks::install_builtin_hooks(InstallMode::Prompt, &mut sticky)?;
+            Role::install_builtin_role_hooks(InstallMode::Prompt, &mut sticky)?;
+            Agent::install_builtin_agent_hooks(InstallMode::Prompt, &mut sticky)?;
+        }
         AssetCategory::McpConfig => Functions::install_mcp_config()?,
     }
 
@@ -542,6 +550,14 @@ fn confirm_asset_overwrite(category: AssetCategory, label: &str, target: &Path) 
              at {}. New servers from the bundled template will be added; any \
              MCP servers you have already configured (including custom secret \
              references) are left untouched.",
+            target.display()
+        ),
+        AssetCategory::Hooks => format!(
+            "Refreshing bundled hooks installs any missing bundled hook \
+             scripts in {}, the roles hooks directory, and each bundled \
+             agent's hooks directory. Where a local copy differs from the \
+             bundled version you are asked per file whether to keep or \
+             replace it; non-interactive runs keep local files.",
             target.display()
         ),
         _ => format!(
@@ -729,11 +745,17 @@ pub fn maybe_spawn_models_refresh(app: &AppConfig) {
 }
 
 impl Config {
-    pub async fn load_with_interpolation(info_flag: bool) -> Result<Self> {
+    pub async fn load_with_interpolation(
+        skip_interpolation: bool,
+        inspection: bool,
+    ) -> Result<Self> {
         let config_path = paths::config_file();
 
         if env::var_os(SANDBOX_ENV_FLAG).is_some() {
             if !config_path.exists() {
+                if inspection {
+                    return Ok(Self::default());
+                }
                 create_config_file(&config_path).await?;
             }
 
@@ -748,6 +770,9 @@ impl Config {
             {
                 Some(v) => (Self::load_dynamic(&v)?, String::new()),
                 None => {
+                    if inspection {
+                        return Ok(Self::default());
+                    }
                     if *IS_STDOUT_TERMINAL {
                         create_config_file(&config_path).await?;
                     }
@@ -758,7 +783,7 @@ impl Config {
             Self::load_from_file(&config_path)?
         };
 
-        if info_flag {
+        if skip_interpolation {
             return Ok(config);
         }
 
@@ -1117,6 +1142,32 @@ pub(crate) fn ensure_parent_exists(path: &Path) -> Result<()> {
             )
         })?;
     }
+    Ok(())
+}
+
+/// The one exec-bit policy for every hook/agent installer: a file is
+/// executable iff `Language::from_extension` recognizes its extension.
+/// Users may keep non-executable support files in hooks directories, so
+/// installers must write plain and then apply this predicate — never
+/// blanket-0755.
+#[cfg(unix)]
+pub(crate) fn set_executable_bit_if_script(path: &Path) -> Result<()> {
+    use crate::function::Language;
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(ext) = path.extension().and_then(std::ffi::OsStr::to_str) else {
+        return Ok(());
+    };
+    if Language::from_extension(ext) == Language::Unsupported {
+        return Ok(());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn set_executable_bit_if_script(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1593,12 +1644,12 @@ hooks:
         use std::fs;
         use std::time;
 
-        let unique = time::SystemTime::now()
+        let unique = SystemTime::now()
             .duration_since(time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let tmp_dir = std::env::temp_dir().join(format!("coyote-sandbox-cfg-{unique}"));
-        fs::create_dir_all(&tmp_dir).unwrap();
+        let tmp_dir = env::temp_dir().join(format!("coyote-sandbox-cfg-{unique}"));
+        create_dir_all(&tmp_dir).unwrap();
         let config_path = tmp_dir.join("config.yaml");
 
         fs::write(
@@ -1608,25 +1659,25 @@ hooks:
         .unwrap();
 
         let config_env = get_env_name("config_file");
-        let prev_config = std::env::var_os(&config_env);
-        let prev_sandbox = std::env::var_os(crate::sandbox::SANDBOX_ENV_FLAG);
+        let prev_config = env::var_os(&config_env);
+        let prev_sandbox = env::var_os(SANDBOX_ENV_FLAG);
 
         unsafe {
-            std::env::set_var(&config_env, &config_path);
-            std::env::set_var(crate::sandbox::SANDBOX_ENV_FLAG, "1");
+            env::set_var(&config_env, &config_path);
+            env::set_var(SANDBOX_ENV_FLAG, "1");
         }
 
-        let result = Config::load_with_interpolation(false).await;
+        let result = Config::load_with_interpolation(false, false).await;
         let (_, raw) = Config::load_from_file(&config_path).unwrap();
 
         unsafe {
             match prev_config {
-                Some(v) => std::env::set_var(&config_env, v),
-                None => std::env::remove_var(&config_env),
+                Some(v) => env::set_var(&config_env, v),
+                None => env::remove_var(&config_env),
             }
             match prev_sandbox {
-                Some(v) => std::env::set_var(crate::sandbox::SANDBOX_ENV_FLAG, v),
-                None => std::env::remove_var(crate::sandbox::SANDBOX_ENV_FLAG),
+                Some(v) => env::set_var(SANDBOX_ENV_FLAG, v),
+                None => env::remove_var(SANDBOX_ENV_FLAG),
             }
         }
         let _ = fs::remove_dir_all(&tmp_dir);
@@ -1637,6 +1688,60 @@ hooks:
         assert!(
             raw.contains("{{ANTHROPIC_API_KEY}}"),
             "placeholder should be preserved as a literal string in sandbox mode"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn info_flag_with_missing_config_skips_wizard_and_writes_nothing() {
+        let unique = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_dir = env::temp_dir().join(format!("coyote-info-bypass-{unique}"));
+        create_dir_all(&tmp_dir).unwrap();
+        let _config_dir = crate::testing::EnvVarGuard::set(get_env_name("config_dir"), &tmp_dir);
+        let _config_file = crate::testing::EnvVarGuard::unset(get_env_name("config_file"));
+        let _sandbox = crate::testing::EnvVarGuard::unset(SANDBOX_ENV_FLAG);
+        let _provider = crate::testing::EnvVarGuard::unset(get_env_name("provider"));
+        let _platform = crate::testing::EnvVarGuard::unset(get_env_name("platform"));
+
+        let result = Config::load_with_interpolation(true, true).await;
+
+        let leftover: Vec<_> = read_dir(&tmp_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let _ = fs::remove_dir_all(&tmp_dir);
+        result.expect("inspection flags must load a default config without a config file");
+        assert!(
+            leftover.is_empty(),
+            "inspection flags must not write anything: {leftover:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_info_flag_with_missing_config_writes_nothing() {
+        let unique = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_dir = env::temp_dir().join(format!("coyote-sandbox-info-bypass-{unique}"));
+        create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.yaml");
+        let _config_file =
+            crate::testing::EnvVarGuard::set(get_env_name("config_file"), &config_path);
+        let _sandbox = crate::testing::EnvVarGuard::set(SANDBOX_ENV_FLAG, "1");
+
+        let result = Config::load_with_interpolation(true, true).await;
+
+        let created = config_path.exists();
+        let _ = fs::remove_dir_all(&tmp_dir);
+        result.expect("inspection flags must load a default config in sandbox mode too");
+        assert!(
+            !created,
+            "inspection flags must not create the sandbox config file"
         );
     }
 
@@ -1719,7 +1824,7 @@ hooks:
             let written = write_models_override(vec![entry()]).unwrap();
             assert_eq!(written, path);
             let mut tmp_name = path.as_os_str().to_os_string();
-            tmp_name.push(format!(".{}.tmp", std::process::id()));
+            tmp_name.push(format!(".{}.tmp", process::id()));
             assert!(!PathBuf::from(tmp_name).exists());
             let loaded = paths::local_models_override().unwrap();
             assert_eq!(loaded.len(), 1);
@@ -1736,5 +1841,118 @@ hooks:
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    use crate::testing::TestConfigDirGuard;
+
+    #[test]
+    #[serial_test::serial]
+    fn install_assets_hooks_shares_one_sticky_scope_across_all_three_locations() {
+        use crate::config::conflict::prompt_script;
+
+        let _guard = TestConfigDirGuard::new("hooks-three-locations");
+        let notify = paths::hooks_dir().join("notify.sh");
+        let role_dir = paths::roles_dir().join("hooks");
+        let agent_dir = paths::agents_data_dir().join("probe").join("hooks");
+        let shipped = vec![("hook.sh".to_string(), "shipped\n".to_string())];
+
+        // Drives the exact three installers `install_assets(Hooks)` runs,
+        // threading one sticky scope through all of them.
+        let refresh = |sticky: &mut StickyMode| {
+            hooks::install_builtin_hooks(InstallMode::Prompt, sticky).unwrap();
+            role::install_and_reconcile_role_hooks(
+                &role_dir,
+                &shipped,
+                InstallMode::Prompt,
+                sticky,
+            )
+            .unwrap();
+            agent::install_and_reconcile_agent_hooks(
+                "probe",
+                &shipped,
+                InstallMode::Prompt,
+                sticky,
+            )
+            .unwrap();
+        };
+        let modify_all = || {
+            fs::write(&notify, "local global").unwrap();
+            fs::write(role_dir.join("hook.sh"), "local role").unwrap();
+            fs::write(agent_dir.join("hook.sh"), "local agent").unwrap();
+        };
+
+        let script = prompt_script::install(&[]);
+        refresh(&mut StickyMode::None);
+        assert_eq!(
+            prompt_script::prompts_asked(),
+            0,
+            "a clean install asks nothing"
+        );
+        drop(script);
+
+        // One replace-all at the first (global) conflict must silently
+        // replace the role and agent conflicts too.
+        modify_all();
+        let script = prompt_script::install(&["replace-all"]);
+        let mut sticky = StickyMode::None;
+        refresh(&mut sticky);
+        assert_eq!(prompt_script::prompts_asked(), 1);
+        assert_eq!(sticky, StickyMode::ReplaceAll);
+        assert!(
+            read_to_string(&notify)
+                .unwrap()
+                .starts_with("#!/usr/bin/env bash")
+        );
+        assert_eq!(
+            read_to_string(role_dir.join("hook.sh")).unwrap(),
+            "shipped\n"
+        );
+        assert_eq!(
+            read_to_string(agent_dir.join("hook.sh")).unwrap(),
+            "shipped\n"
+        );
+        drop(script);
+
+        // And one keep-all must keep every location's local edit.
+        modify_all();
+        let script = prompt_script::install(&["keep-all"]);
+        let mut sticky = StickyMode::None;
+        refresh(&mut sticky);
+        assert_eq!(prompt_script::prompts_asked(), 1);
+        assert_eq!(sticky, StickyMode::KeepAll);
+        assert_eq!(read_to_string(&notify).unwrap(), "local global");
+        assert_eq!(
+            read_to_string(role_dir.join("hook.sh")).unwrap(),
+            "local role"
+        );
+        assert_eq!(
+            read_to_string(agent_dir.join("hook.sh")).unwrap(),
+            "local agent"
+        );
+        drop(script);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_builtins_never_prompts_and_keeps_local_hook_edits() {
+        use crate::config::conflict::prompt_script;
+
+        let _guard = TestConfigDirGuard::new("install-builtins-startup");
+        install_builtins().unwrap();
+        let notify = paths::hooks_dir().join("notify.sh");
+        fs::write(&notify, "# local edit").unwrap();
+
+        // A forced terminal with no scripted answers: any prompt would panic
+        // and the counter would move.
+        let script = prompt_script::install(&[]);
+        install_builtins().unwrap();
+        assert_eq!(prompt_script::prompts_asked(), 0);
+        assert_eq!(read_to_string(&notify).unwrap(), "# local edit");
+        drop(script);
+
+        let _script = prompt_script::install_non_interactive();
+        install_builtins().unwrap();
+        assert_eq!(prompt_script::prompts_asked(), 0);
+        assert_eq!(read_to_string(&notify).unwrap(), "# local edit");
     }
 }

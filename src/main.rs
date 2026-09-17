@@ -58,8 +58,37 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::{env, fs, process, sync::Arc};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+const MAIN_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+/// Bootstraps the async entry point on a dedicated thread with an explicit
+/// large stack instead of `#[tokio::main]`, which would poll the root
+/// future on the (small, non-configurable) OS main thread. Everything else
+/// matches the macro expansion: same multi-thread runtime flavor, same
+/// `enable_all()` driver set (so `tokio::signal::ctrl_c()` keeps working),
+/// same `block_on` of the async body, and the `Result` propagates
+/// unchanged. Worker threads get the same headroom because spawned tasks
+/// (graph nodes, subagents) embed the same class of giant state machine.
+/// The thread is named "main" and panics are re-raised on the real main
+/// thread without re-invoking the panic hook, keeping panic output and the
+/// exit code identical to the direct arrangement.
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("main".into())
+        .stack_size(MAIN_STACK_SIZE)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(MAIN_STACK_SIZE)
+                .build()
+                .expect("failed to build the tokio runtime")
+                .block_on(async_main())
+        })
+        .expect("failed to spawn the main bootstrap thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+async fn async_main() -> Result<()> {
     load_env_file()?;
     CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
@@ -113,6 +142,15 @@ async fn main() -> Result<()> {
         || cli.list_macros
         || cli.list_skills
         || cli.list_sessions;
+    let readout_flag = (cli.info
+        || cli.list_models
+        || cli.list_roles
+        || cli.list_agents
+        || cli.list_rags
+        || cli.list_macros
+        || cli.list_skills
+        || cli.list_sessions)
+        && !cli.sync_models;
     let vault_flags = cli.add_secret.is_some()
         || cli.get_secret.is_some()
         || cli.update_secret.is_some()
@@ -140,7 +178,18 @@ async fn main() -> Result<()> {
         return config::list_installed_bundles();
     }
 
-    install_builtins()?;
+    let mcp_inspect =
+        cli.mcp_list && cli.mcp_get.is_none() && cli.mcp_remove.is_none() && cli.mcp_add.is_none();
+    let vault_inspect = cli.list_secrets
+        && cli.add_secret.is_none()
+        && cli.get_secret.is_none()
+        && cli.update_secret.is_none()
+        && cli.delete_secret.is_none();
+    let inspection_only =
+        (readout_flag || vault_inspect || mcp_inspect) && cli.agent.is_none() && cli.role.is_none();
+    if !inspection_only {
+        install_builtins()?;
+    }
 
     if let Some(category) = cli.install_builtins {
         return config::install_assets(category);
@@ -164,7 +213,7 @@ async fn main() -> Result<()> {
     }
 
     if let Some(client_arg) = &cli.authenticate {
-        let cfg = Config::load_with_interpolation(true).await?;
+        let cfg = Config::load_with_interpolation(true, false).await?;
         let app_config = AppConfig::from_config(cfg)?;
         let (client_name, provider) =
             resolve_oauth_client(client_arg.as_deref(), &app_config.clients)?;
@@ -173,7 +222,7 @@ async fn main() -> Result<()> {
     }
 
     if let Some(server_name) = &cli.auth_mcp {
-        let cfg = Config::load_with_interpolation(true).await?;
+        let cfg = Config::load_with_interpolation(true, false).await?;
         let app_config = AppConfig::from_config(cfg)?;
         let vault = Vault::init(&app_config)?;
         let mcp_path = paths::mcp_config_file();
@@ -225,9 +274,17 @@ async fn main() -> Result<()> {
     let mcp_action =
         cli.mcp_list || cli.mcp_get.is_some() || cli.mcp_remove.is_some() || cli.mcp_add.is_some();
     if mcp_action {
-        let cfg = Config::load_with_interpolation(true).await?;
-        let app_config = AppConfig::from_config(cfg)?;
-        let vault = Vault::init(&app_config)?;
+        let cfg = Config::load_with_interpolation(true, mcp_inspect).await?;
+        let app_config = if mcp_inspect {
+            AppConfig::from_config_lenient(cfg)?
+        } else {
+            AppConfig::from_config(cfg)?
+        };
+        let vault = if mcp_inspect {
+            Vault::init_lenient(&app_config)
+        } else {
+            Vault::init(&app_config)?
+        };
 
         mcp::manage::handle(&cli, &vault)?;
 
@@ -235,16 +292,24 @@ async fn main() -> Result<()> {
     }
 
     if vault_flags {
-        let cfg = Config::load_with_interpolation(true).await?;
-        let app_config = AppConfig::from_config(cfg)?;
+        let cfg = Config::load_with_interpolation(true, vault_inspect).await?;
+        let app_config = if vault_inspect {
+            AppConfig::from_config_lenient(cfg)?
+        } else {
+            AppConfig::from_config(cfg)?
+        };
         let vault = Vault::init(&app_config)?;
         return Vault::handle_vault_flags(cli, &vault);
     }
 
     let abort_signal = create_abort_signal();
     let start_mcp_servers = cli.agent.is_none() && cli.role.is_none();
-    let cfg = Config::load_with_interpolation(info_flag).await?;
-    let mut app_config = AppConfig::from_config(cfg)?;
+    let cfg = Config::load_with_interpolation(info_flag, readout_flag).await?;
+    let mut app_config = if readout_flag {
+        AppConfig::from_config_lenient(cfg)?
+    } else {
+        AppConfig::from_config(cfg)?
+    };
     if cli.no_workspace_mcp {
         app_config.no_workspace_mcp = true;
     }
@@ -258,14 +323,17 @@ async fn main() -> Result<()> {
             log_path,
             start_mcp_servers,
             info_flag,
+            inspection_only,
             abort_signal.clone(),
         )
         .await?,
     );
     let mut ctx = RequestContext::bootstrap(app_state, working_mode, info_flag)?;
     let app_config = Arc::clone(&ctx.app.config);
-    ctx.bootstrap_tools(&app_config, start_mcp_servers, abort_signal.clone())
-        .await?;
+    if !inspection_only {
+        ctx.bootstrap_tools(&app_config, start_mcp_servers, abort_signal.clone())
+            .await?;
+    }
 
     {
         let app = &*ctx.app.config;
@@ -306,9 +374,12 @@ async fn run(
     }
 
     if cli.list_models {
-        for model in list_models(ctx.app.config.as_ref(), ModelType::Chat) {
-            println!("{}", model.id());
-        }
+        let models = list_models(ctx.app.config.as_ref(), ModelType::Chat)
+            .iter()
+            .map(|model| model.id())
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("{models}");
         return Ok(());
     }
     if cli.list_roles {
@@ -389,11 +460,12 @@ async fn run(
         ctx.use_agent(app.as_ref(), agent, session, abort_signal.clone())
             .await?;
         // The top-level agent bracket does NOT open here: the inspection
-        // flags below (--list-sessions, --info, --macro, --rebuild-rag,
-        // --init-*) return early without running the agent, and an open
-        // bracket on those paths would leak `agent.started` with no
-        // terminal event. It opens at the dispatch sites further down,
-        // where an agent run is actually committed.
+        // flags below (--list-sessions, --info, --rebuild-rag, --init-*)
+        // return early without running the agent, and an open bracket on
+        // those paths would leak `agent.started` with no terminal event.
+        // It opens at the dispatch sites further down, where a run is
+        // actually committed, including the --macro arm, which executes
+        // rather than inspects.
     } else {
         let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
         if let Some(prompt) = &cli.temp_role {
@@ -526,8 +598,11 @@ async fn run(
         }
     }
     if let Some(name) = &cli.macro_name {
-        macro_execute(&mut ctx, name, text.as_deref(), abort_signal.clone()).await?;
-        return Ok(());
+        ctx.top_level_agent_started();
+        let result = macro_execute(&mut ctx, name, text.as_deref(), abort_signal.clone()).await;
+        ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
+        hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
+        return result;
     }
     if cli.execute && !is_repl {
         // Dispatch committed: open the top-level agent bracket only now,
@@ -538,7 +613,7 @@ async fn run(
             shell_execute(&mut ctx, &SHELL, input, abort_signal.clone()).await
         }
         .await;
-        ctx.top_level_agent_finished(result.as_ref().err());
+        ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
         hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
         return result;
     }
@@ -572,7 +647,7 @@ async fn run(
                 start_directive(&mut ctx, input, cli.code, abort_signal.clone()).await
             }
             .await;
-            ctx.top_level_agent_finished(result.as_ref().err());
+            ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
             hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
             result
         }
@@ -706,7 +781,7 @@ async fn shell_execute(
                     if code == 0 && app.save_shell_history {
                         let _ = append_to_shell_history(&shell.name, &eval_str, code);
                     }
-                    ctx.top_level_agent_finished(None);
+                    ctx.top_level_agent_finished(None, None);
                     hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
                     process::exit(code);
                 }

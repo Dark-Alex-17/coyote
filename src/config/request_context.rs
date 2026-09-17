@@ -54,6 +54,7 @@ use crate::hooks::{self, HookEvent};
 use anyhow::{Context, Error, Result, bail};
 use colored::Colorize;
 use gman::providers::SupportedProvider;
+use hooks::{McpServerHooks, RagSyncHooks};
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
@@ -417,7 +418,11 @@ impl RequestContext {
         working_mode: WorkingMode,
         info_flag: bool,
     ) -> Result<Self> {
-        let model = Model::retrieve_model(&app.config, &app.config.model_id, ModelType::Chat)?;
+        let model = if info_flag && app.config.model_id.is_empty() {
+            Model::default()
+        } else {
+            Model::retrieve_model(&app.config, &app.config.model_id, ModelType::Chat)?
+        };
 
         let mut functions = app.functions.clone();
         if working_mode.is_repl() {
@@ -1073,7 +1078,12 @@ impl RequestContext {
         // COYOTE_SESSION_ID and session-held role hooks still resolve; no
         // session means no event.
         if self.session.is_some() {
-            hooks::fire(HookEvent::SessionEnded, self, &[], None);
+            hooks::fire(
+                HookEvent::SessionEnded,
+                self,
+                &hooks::role_extras(self),
+                None,
+            );
         }
         if let Some(mut session) = self.session.take() {
             let sessions_dir = self.sessions_dir();
@@ -4402,6 +4412,7 @@ impl RequestContext {
 
             if !server_ids.is_empty() {
                 let app_ref = &self.app;
+                let mcp_hooks = McpServerHooks::resolve(self);
                 let acquire_all = async {
                     let mut handles = Vec::new();
                     let mut auth_required = Vec::new();
@@ -4409,7 +4420,7 @@ impl RequestContext {
                         if let Some(spec) = mcp_config.mcp_servers.get(id) {
                             match app_ref
                                 .mcp_factory
-                                .acquire(id, spec, app_ref.mcp_log_path.as_deref())
+                                .acquire(id, spec, app_ref.mcp_log_path.as_deref(), &mcp_hooks)
                                 .await
                             {
                                 Ok(handle) => handles.push((id.clone(), handle)),
@@ -4734,7 +4745,19 @@ impl RequestContext {
         self.refresh_mcp_tool_filters();
         self.init_agent_session_variables(new_session)?;
         if created_new_session {
-            hooks::fire(HookEvent::SessionStarted, self, &[], None);
+            hooks::fire(
+                HookEvent::SessionStarted,
+                self,
+                &hooks::role_extras(self),
+                None,
+            );
+        } else {
+            hooks::fire(
+                HookEvent::SessionResumed,
+                self,
+                &hooks::role_extras(self),
+                None,
+            );
         }
         Ok(())
     }
@@ -4903,7 +4926,10 @@ impl RequestContext {
 
         // Interactive switch-away closes the top-level agent bracket while
         // the agent is still attached, so agent-scoped hooks resolve.
-        self.top_level_agent_finished(None);
+        // No abort signal on purpose: switching away is a deliberate exit,
+        // never an interruption, even though cancel_recursive tears the
+        // agent's children down just below.
+        self.top_level_agent_finished(None, None);
         if self.agent.take().is_some() {
             if let Some(supervisor) = self.supervisor.clone() {
                 supervisor.read().cancel_recursive();
@@ -4951,10 +4977,24 @@ impl RequestContext {
         );
     }
 
-    pub fn top_level_agent_finished(&mut self, error: Option<&Error>) {
+    pub fn top_level_agent_finished(
+        &mut self,
+        error: Option<&Error>,
+        abort_signal: Option<&AbortSignal>,
+    ) {
         let Some(id) = self.top_level_agent_id.take() else {
             return;
         };
+
+        if abort_signal.is_some_and(|signal| signal.aborted_ctrlc()) {
+            hooks::fire(
+                HookEvent::AgentInterrupted,
+                self,
+                &[("COYOTE_AGENT_ID", id)],
+                None,
+            );
+            return;
+        }
 
         match error {
             None => hooks::fire(
@@ -5311,6 +5351,7 @@ impl RequestContext {
         let vault = self.app.vault.clone();
         let rag_cache = self.rag_cache();
         let working_mode = self.working_mode;
+        let sync_hooks = RagSyncHooks::resolve(self);
 
         let (rag, rag_key): (Arc<Rag>, Option<RagKey>) = match rag {
             None => {
@@ -5329,6 +5370,7 @@ impl RequestContext {
                             &[],
                             abort_signal.clone(),
                             false,
+                            sync_hooks,
                         )
                         .await?,
                     ),
@@ -5350,8 +5392,16 @@ impl RequestContext {
                                 if working_mode.is_cmd() {
                                     bail!("Unknown RAG '{name}'");
                                 }
-                                Rag::init(&app, name, &rag_path, &[], abort_signal.clone(), true)
-                                    .await
+                                Rag::init(
+                                    &app,
+                                    name,
+                                    &rag_path,
+                                    &[],
+                                    abort_signal.clone(),
+                                    true,
+                                    sync_hooks,
+                                )
+                                .await
                             } else {
                                 Rag::load_async(&app, &vault, name, &rag_path).await
                             }
@@ -5435,6 +5485,7 @@ impl RequestContext {
             false,
             &self.app.config,
             abort_signal,
+            RagSyncHooks::resolve(self),
         )
         .await?;
         self.rag = Some(Arc::new(rag));
@@ -5465,8 +5516,15 @@ impl RequestContext {
              This will call the embedding API and may take a while.",
             rag.file_count()
         );
-        rag.refresh_document_paths(&document_paths, true, true, &self.app.config, abort_signal)
-            .await?;
+        rag.refresh_document_paths(
+            &document_paths,
+            true,
+            true,
+            &self.app.config,
+            abort_signal,
+            RagSyncHooks::resolve(self),
+        )
+        .await?;
         self.rag = Some(Arc::new(rag));
         Ok(())
     }
@@ -5491,6 +5549,7 @@ mod tests {
     use crate::config::AppState;
     use crate::config::agent::AgentConfig;
     use crate::config::bundles::BundleStore;
+    use crate::config::conflict::InstallMode;
     use crate::config::mcp_tool_policy::LayerSource;
     use crate::config::tool_scope::test_fixtures::{FixtureServer, fixture_runtime};
     use crate::function::jobs::RingBuf;
@@ -8333,7 +8392,12 @@ mod tests {
         let agent_dir = paths::agent_data_dir(agent_name);
         create_dir_all(&agent_dir).unwrap();
         let mut config = format!("name: {agent_name}\ninstructions: hi\nhooks:\n");
-        for event in ["agent.started", "agent.completed", "agent.failed"] {
+        for event in [
+            "agent.started",
+            "agent.completed",
+            "agent.interrupted",
+            "agent.failed",
+        ] {
             config.push_str(&format!(
                 "  {event}:\n    - name: {marker}-{event}\n      command: 'true'\n"
             ));
@@ -8353,7 +8417,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn use_session_fires_session_started_for_new_sessions_only() {
+    fn use_session_discriminates_session_started_from_session_resumed() {
         let _guard = TestConfigDirGuard::new();
         let sessions_dir = paths::local_dir("sessions");
         create_dir_all(&sessions_dir).unwrap();
@@ -8361,13 +8425,17 @@ mod tests {
         let marker = "sess-started-q8n";
 
         let mut ctx = create_test_ctx();
-        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.started"], marker));
+        ctx.update_app_config(|app| {
+            app.hooks = hooks_map_of(&["session.started", "session.resumed"], marker)
+        });
+        ctx.role = Some(Role::new("started-role", "Prompt"));
         let app = ctx.app.config.clone();
         let abort = utils::create_abort_signal();
         run_async(ctx.use_session(&app, Some("hook-fresh"), abort.clone())).unwrap();
 
         let captures = marker_captures(marker);
         assert_eq!(captures.len(), 1, "a new session fires exactly one event");
+        assert_eq!(captures[0].hook_name, format!("{marker}-session.started"));
         assert_eq!(
             captures[0]
                 .envs
@@ -8375,17 +8443,46 @@ mod tests {
                 .map(String::as_str),
             Some("hook-fresh")
         );
+        assert_eq!(
+            captures[0].envs.get("COYOTE_ROLE").map(String::as_str),
+            Some("started-role"),
+            "session.started must carry the active role"
+        );
 
-        // Resuming a persisted session fires nothing.
-        write_paused_todo_session(&ctx, "hook-resume");
+        // Resuming a persisted session fires session.resumed, never
+        // session.started, and carries the role the session holds.
+        let session_path = ctx.session_file("hook-resume");
+        ensure_parent_exists(&session_path).unwrap();
+        write(
+            &session_path,
+            "model: test-seeded:test-chat\nrole_name: resumed-role\nmessages: []\n",
+        )
+        .unwrap();
         let mut resumed_ctx = create_test_ctx();
-        resumed_ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.started"], marker));
+        resumed_ctx.update_app_config(|app| {
+            app.hooks = hooks_map_of(&["session.started", "session.resumed"], marker)
+        });
         let resumed_app = resumed_ctx.app.config.clone();
         run_async(resumed_ctx.use_session(&resumed_app, Some("hook-resume"), abort)).unwrap();
+        let captures = marker_captures(marker);
+        let started: Vec<_> = captures
+            .iter()
+            .filter(|capture| capture.hook_name == format!("{marker}-session.started"))
+            .collect();
+        let resumed: Vec<_> = captures
+            .iter()
+            .filter(|capture| capture.hook_name == format!("{marker}-session.resumed"))
+            .collect();
+        assert_eq!(started.len(), 1, "resume must not fire session.started");
+        assert_eq!(resumed.len(), 1, "resume fires exactly one session.resumed");
         assert_eq!(
-            marker_captures(marker).len(),
-            1,
-            "resume must not fire session.started"
+            resumed[0].envs.get("COYOTE_SESSION_ID").map(String::as_str),
+            Some("hook-resume")
+        );
+        assert_eq!(
+            resumed[0].envs.get("COYOTE_ROLE").map(String::as_str),
+            Some("resumed-role"),
+            "session.resumed must carry the session-held role"
         );
     }
 
@@ -8403,13 +8500,21 @@ mod tests {
         ctx.exit_session().unwrap();
         assert!(marker_captures(marker).is_empty());
 
-        ctx.session = Some(Session::default());
+        let mut session = Session::default();
+        session.set_role(Role::new("ended-role", "Prompt"));
+        ctx.session = Some(session);
         ctx.exit_session().unwrap();
         ctx.exit_session().unwrap();
+        let captures = marker_captures(marker);
         assert_eq!(
-            marker_captures(marker).len(),
+            captures.len(),
             1,
             "session.ended fires exactly once, only while a session is attached"
+        );
+        assert_eq!(
+            captures[0].envs.get("COYOTE_ROLE").map(String::as_str),
+            Some("ended-role"),
+            "session.ended must fire while the session-held role is still attached"
         );
     }
 
@@ -8462,8 +8567,8 @@ mod tests {
         ctx.top_level_agent_started();
         // Per agent RUN, never per message: re-entering while open is a no-op.
         ctx.top_level_agent_started();
-        ctx.top_level_agent_finished(None);
-        ctx.top_level_agent_finished(None);
+        ctx.top_level_agent_finished(None, None);
+        ctx.top_level_agent_finished(None, None);
 
         let captures = marker_captures(marker);
         let started: Vec<_> = captures
@@ -8512,7 +8617,7 @@ mod tests {
 
         ctx.top_level_agent_started();
         let err = anyhow!("dispatch exploded");
-        ctx.top_level_agent_finished(Some(&err));
+        ctx.top_level_agent_finished(Some(&err), None);
 
         let captures = marker_captures(marker);
         let failed: Vec<_> = captures
@@ -8534,6 +8639,124 @@ mod tests {
 
     #[test]
     #[serial]
+    fn top_level_agent_ctrlc_fires_agent_interrupted_not_failed() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "agent-top-int-r6t";
+        let agent_name = unique_name("hook_agent");
+        seed_agent_with_hooks(&agent_name, marker);
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort.clone())).unwrap();
+
+        ctx.top_level_agent_started();
+        abort.set_ctrlc();
+        // The fired signal, not the error text, decides: even with an error
+        // in hand the bracket reports an interruption.
+        let err = anyhow!("Aborted.");
+        ctx.top_level_agent_finished(Some(&err), Some(&abort));
+
+        let captures = marker_captures(marker);
+        let interrupted: Vec<_> = captures
+            .iter()
+            .filter(|capture| capture.hook_name == format!("{marker}-agent.interrupted"))
+            .collect();
+        assert_eq!(interrupted.len(), 1);
+        assert!(interrupted[0].envs.contains_key("COYOTE_AGENT_ID"));
+        assert!(
+            !interrupted[0].envs.contains_key("COYOTE_AGENT_ERROR"),
+            "an interruption is not a failure and carries no error env"
+        );
+        assert!(captures.iter().all(|capture| {
+            capture.hook_name != format!("{marker}-agent.failed")
+                && capture.hook_name != format!("{marker}-agent.completed")
+        }));
+    }
+
+    #[test]
+    #[serial]
+    fn top_level_agent_ctrlc_without_error_fires_agent_interrupted() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "agent-top-int-noerr-v4d";
+        let agent_name = unique_name("hook_agent");
+        seed_agent_with_hooks(&agent_name, marker);
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort.clone())).unwrap();
+
+        ctx.top_level_agent_started();
+        abort.set_ctrlc();
+        // Signal-first: a latched ctrl-c means interrupted even when the run
+        // surfaced no error at all.
+        ctx.top_level_agent_finished(None, Some(&abort));
+
+        let captures = marker_captures(marker);
+        assert_eq!(
+            captures
+                .iter()
+                .filter(|capture| capture.hook_name == format!("{marker}-agent.interrupted"))
+                .count(),
+            1
+        );
+        assert!(
+            captures
+                .iter()
+                .all(|capture| capture.hook_name != format!("{marker}-agent.completed")),
+            "a ctrl-c'd run must not report completion"
+        );
+    }
+
+    /// The REPL's advertised exit path -- ctrl-c at an idle prompt (which
+    /// prints "To exit, press Ctrl+D"), then ctrl-d -- is a deliberate exit:
+    /// with no active tasks to cancel the prompt latch stays clear, so
+    /// teardown fires agent.completed, never agent.interrupted.
+    #[test]
+    #[serial]
+    fn idle_prompt_ctrlc_then_ctrld_exit_fires_agent_completed() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "agent-top-idle-cc-w2b";
+        let agent_name = unique_name("hook_agent");
+        seed_agent_with_hooks(&agent_name, marker);
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort.clone())).unwrap();
+        ctx.top_level_agent_started();
+
+        // Ctrl-c at the idle prompt: nothing to cancel, so no latch.
+        let supervisor = Arc::new(RwLock::new(Supervisor::new(4, 3)));
+        crate::repl::latch_prompt_interrupt(&abort, &supervisor);
+        assert!(!abort.aborted_ctrlc());
+
+        // Ctrl-d exits; teardown sees only the ctrl-d flag.
+        abort.set_ctrld();
+        ctx.top_level_agent_finished(None, Some(&abort));
+
+        let captures = marker_captures(marker);
+        assert_eq!(
+            captures
+                .iter()
+                .filter(|capture| capture.hook_name == format!("{marker}-agent.completed"))
+                .count(),
+            1
+        );
+        assert!(
+            captures
+                .iter()
+                .all(|capture| capture.hook_name != format!("{marker}-agent.interrupted")),
+            "a deliberate exit is never an interruption"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn top_level_agent_helpers_noop_without_agent() {
         let _guard = TestConfigDirGuard::new();
         let _sink = test_sink::install();
@@ -8549,7 +8772,7 @@ mod tests {
         ctx.role = Some(Role::new("plain", "prompt"));
 
         ctx.top_level_agent_started();
-        ctx.top_level_agent_finished(None);
+        ctx.top_level_agent_finished(None, None);
 
         assert!(
             marker_captures(marker).is_empty(),
@@ -8575,7 +8798,7 @@ mod tests {
 
         ctx.exit_agent(&app).unwrap();
         // A later exit seam (REPL teardown) must not double-fire.
-        ctx.top_level_agent_finished(None);
+        ctx.top_level_agent_finished(None, None);
 
         let captures = marker_captures(marker);
         assert_eq!(
@@ -9178,19 +9401,19 @@ mod tests {
     fn install_builtin_agents_force_overwrites_only_with_force() {
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
         let file =
             first_file(&paths::agents_data_dir()).expect("bundled agents should be installed");
 
         write(&file, "SENTINEL").unwrap();
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
         assert_eq!(
             read_to_string(&file).unwrap(),
             "SENTINEL",
             "non-force install must not overwrite an existing file"
         );
 
-        Agent::install_builtin_agents(true).unwrap();
+        Agent::install_builtin_agents(InstallMode::Force).unwrap();
         assert_ne!(
             read_to_string(&file).unwrap(),
             "SENTINEL",
@@ -9203,7 +9426,7 @@ mod tests {
     fn install_builtin_agents_removes_stale_definition_files() {
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         let agents_dir = paths::agents_data_dir();
         // Simulate an upgrade from an older install: coder used to ship
@@ -9224,7 +9447,7 @@ mod tests {
         create_dir_all(agents_dir.join("myagent")).unwrap();
         write(agents_dir.join("myagent").join("config.yaml"), "keep").unwrap();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         assert!(
             !agents_dir.join("coder").join("config.yaml").exists(),
@@ -9264,12 +9487,12 @@ mod tests {
     fn install_builtin_agents_removes_stale_graph_for_config_agent() {
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         let agents_dir = paths::agents_data_dir();
         write(agents_dir.join("architect").join("graph.yaml"), "stale").unwrap();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         assert!(
             !agents_dir.join("architect").join("graph.yaml").exists(),
@@ -9285,7 +9508,7 @@ mod tests {
 
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         let agents_dir = paths::agents_data_dir();
         // Simulate an upgrade from an older install whose coder shipped a
@@ -9297,14 +9520,20 @@ mod tests {
         write(hooks_dir.join(BUILTIN_MANIFEST_FILE), "old-hook.sh\n").unwrap();
         write(hooks_dir.join("old-hook.sh"), "stale").unwrap();
         write(hooks_dir.join("user-hook.sh"), "user-owned").unwrap();
-        // A custom agent outside the bundle is never reconciled, even with a
-        // manifest present.
-        let custom_hooks = agents_dir.join("myagent").join("hooks");
-        create_dir_all(&custom_hooks).unwrap();
-        write(custom_hooks.join(BUILTIN_MANIFEST_FILE), "custom.sh\n").unwrap();
-        write(custom_hooks.join("custom.sh"), "keep").unwrap();
+        // An agent directory carrying a builtin manifest but absent from the
+        // embed is a removed builtin agent: the sweep deletes exactly the
+        // manifest-owned files, sparing anything user-created alongside.
+        let removed_hooks = agents_dir.join("myagent").join("hooks");
+        create_dir_all(&removed_hooks).unwrap();
+        write(removed_hooks.join(BUILTIN_MANIFEST_FILE), "shipped.sh\n").unwrap();
+        write(removed_hooks.join("shipped.sh"), "stale").unwrap();
+        write(removed_hooks.join("user-note.sh"), "keep").unwrap();
+        // A user agent never has a manifest, so the sweep must not touch it.
+        let user_hooks = agents_dir.join("useragent").join("hooks");
+        create_dir_all(&user_hooks).unwrap();
+        write(user_hooks.join("mine.sh"), "keep").unwrap();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         assert!(
             !hooks_dir.join("old-hook.sh").exists(),
@@ -9319,10 +9548,18 @@ mod tests {
             "an empty shipped set removes the manifest itself"
         );
         assert!(
-            custom_hooks.join("custom.sh").exists(),
-            "custom agents outside the bundle must survive reconciliation"
+            !removed_hooks.join("shipped.sh").exists(),
+            "manifest-owned hooks of a removed builtin agent must be swept"
         );
-        assert!(custom_hooks.join(BUILTIN_MANIFEST_FILE).exists());
+        assert!(!removed_hooks.join(BUILTIN_MANIFEST_FILE).exists());
+        assert!(
+            removed_hooks.join("user-note.sh").exists(),
+            "user files beside a removed agent's manifest must survive the sweep"
+        );
+        assert!(
+            user_hooks.join("mine.sh").exists(),
+            "agent dirs without a manifest must never be touched"
+        );
     }
 
     #[test]
@@ -9366,7 +9603,7 @@ mod tests {
     #[serial]
     fn bundled_assets_pin_task_queue_guidance() {
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         // 1. Architect config: the parallel-mode "Task-queue mirroring"
         //    section with all five HARD RULES.
@@ -9435,7 +9672,7 @@ mod tests {
     #[serial]
     fn bundled_assets_pin_review_incomplete_escalation() {
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         // Every anchor is a single-line prefix so YAML re-wrapping cannot
         // break the pin; clauses that wrap differently per config are split
@@ -9599,7 +9836,7 @@ mod tests {
     #[serial]
     fn bundled_assets_pin_verification_commands_as_declared_variable() {
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         const VARIABLES_FORM: &str =
             "--variables {\"verification_commands\": \"[\\\"cargo test --all\\\"";
@@ -9790,7 +10027,7 @@ mod tests {
         }
 
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         for (name, expected) in [
             ("architect", 10),
@@ -9909,7 +10146,7 @@ mod tests {
 
         let _guard = TestConfigDirGuard::new();
 
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
         Skill::install_builtin_skills(false).unwrap();
 
         let mut checked = Vec::new();
@@ -10136,7 +10373,7 @@ mod tests {
         let engine_seeded = ["initial_prompt", "output", "choice", "input"];
 
         let _guard = TestConfigDirGuard::new();
-        Agent::install_builtin_agents(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         let mut checked = Vec::new();
         for entry in std::fs::read_dir(paths::agents_data_dir()).unwrap() {
@@ -10255,13 +10492,24 @@ mod tests {
 
     // Scripts' load_state() prefers GRAPH_STATE_FILE over GRAPH_STATE, so an
     // inherited live state file (adversary verifying this repo) must not win.
+    // run_checks.py's review-stack flock defaults to ONE system-wide path;
+    // concurrent tests (or a real review running on this machine) would
+    // contend on it, and the losers' 5s-sleep retry loop burns the tight
+    // test deadlines. Every spawned script gets its own throwaway lock path.
     fn adversary_script_command(script: &str, state: &serde_json::Value) -> Command {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        static STACK_LOCK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/adversary/scripts")
             .join(script);
+        let lock_path = env::temp_dir().join(format!(
+            "coyote-adversary-test-stack-{}-{}.lock",
+            std::process::id(),
+            STACK_LOCK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let mut cmd = Command::new("python3");
         cmd.arg(&path)
             .env("GRAPH_STATE", state.to_string())
+            .env("ADVERSARY_STACK_LOCK_PATH", &lock_path)
             .env_remove("GRAPH_STATE_FILE");
         cmd
     }
@@ -10851,6 +11099,67 @@ mod tests {
             elapsed < Duration::from_secs(30),
             "the post-kill drain must be bounded by DRAIN_TIMEOUT_SECS, took {elapsed:?}: {results:?}"
         );
+    }
+
+    /// ADVERSARY_STACK_LOCK_PATH must relocate the review-stack flock:
+    /// without it, every concurrent run_checks.py (parallel tests, or a real
+    /// review on the same machine) contends on the one system-wide lock path
+    /// and the losers' retry loop burns the total deadline budget.
+    #[test]
+    #[cfg(unix)]
+    fn adversary_run_checks_stack_lock_path_is_env_overridable() {
+        if !cmd_available("python3") || !cmd_available("sh") {
+            eprintln!("skipping: python3 or sh not available");
+            return;
+        }
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = env::temp_dir().join(format!(
+            "coyote-adversary-run-checks-lockpath-{}-{unique}",
+            std::process::id()
+        ));
+        create_dir_all(&tmp).unwrap();
+        // A not-yet-existing subdir pins the makedirs-on-override behavior.
+        let lock_path = tmp.join("override").join("stack.lock");
+        let lock_env = lock_path.to_str().unwrap();
+        let state = json!({"verification_commands": ["true"]});
+
+        // Two sequential runs with the same override: the lock fd is held
+        // only for the process lifetime, so the second run must acquire
+        // immediately — and both use the OVERRIDDEN location.
+        for run in 0..2 {
+            let out = run_adversary_script_env(
+                "run_checks.py",
+                &state,
+                &[("ADVERSARY_STACK_LOCK_PATH", lock_env)],
+            );
+            assert_eq!(
+                out["exec_results"][0]["exit"], 0,
+                "run {run}: the declared command must run to completion: {out}"
+            );
+            assert!(
+                lock_path.exists(),
+                "run {run}: the stack lock must be taken at the overridden path {}",
+                lock_path.display()
+            );
+        }
+
+        // No declared commands → the lock is skipped entirely: a fresh
+        // override path must never be created.
+        let skipped = tmp.join("skipped.lock");
+        let _ = run_adversary_script_env(
+            "run_checks.py",
+            &json!({}),
+            &[("ADVERSARY_STACK_LOCK_PATH", skipped.to_str().unwrap())],
+        );
+        assert!(
+            !skipped.exists(),
+            "with no declared commands the lock must be skipped, but {} was created",
+            skipped.display()
+        );
+        let _ = remove_dir_all(&tmp);
     }
 
     /// TOTAL_DEADLINE_SECS in run_checks.py and the run_checks node's

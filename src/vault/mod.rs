@@ -332,7 +332,13 @@ impl Vault {
         }
 
         if cli.list_secrets {
-            vault.list_secrets(true)?;
+            if vault.sandbox_mode {
+                println!(
+                    "The vault is unavailable in sandbox mode. Use `coyote --list-secrets` on your host."
+                );
+            } else {
+                vault.list_secrets(true)?;
+            }
         }
 
         Ok(())
@@ -409,5 +415,24 @@ mod tests {
                 None => std::env::remove_var("IS_SANDBOX"),
             }
         }
+    }
+
+    #[test]
+    fn list_secrets_flag_ok_in_sandbox() {
+        use clap::Parser;
+
+        // Built directly rather than via IS_SANDBOX so this test cannot race
+        // the env juggling in vault_disabled_in_sandbox.
+        let vault = Vault {
+            sandbox_mode: true,
+            ..Vault::default()
+        };
+        let cli = Cli::try_parse_from(["coyote", "--list-secrets"]).unwrap();
+
+        // Pins the --list-secrets sandbox contract: rc=0 with an informational
+        // readout instead of the hard failure the mutating flags keep. The
+        // message goes straight to stdout, so only Ok is asserted here.
+        Vault::handle_vault_flags(cli, &vault)
+            .expect("--list-secrets must succeed in sandbox mode");
     }
 }

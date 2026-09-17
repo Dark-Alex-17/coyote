@@ -23,6 +23,22 @@ pub(crate) fn is_builtin_manifest_name(name: &str) -> bool {
         .eq_ignore_ascii_case(BUILTIN_MANIFEST_FILE)
 }
 
+/// NTFS 8.3 short names (`BUILTI~1`, `builti~1.sh`) can alias any long
+/// filename on the same volume, including the manifest itself, so an entry
+/// shaped like one is never accepted: it could direct a deletion at a file
+/// the manifest never named.
+fn is_ntfs_short_name_alias(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    let Some((base, digits)) = stem.rsplit_once('~') else {
+        return false;
+    };
+    !base.is_empty()
+        && base.len() <= 8
+        && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '~')
+        && !digits.is_empty()
+        && digits.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Reconciles `dir` against the currently shipped set of builtin filenames:
 /// a file is removed ONLY if it appears in the previous manifest AND is
 /// absent from `shipped`. The manifest is then rewritten to the names this
@@ -83,7 +99,7 @@ fn read_manifest(dir: &Path) -> BTreeSet<String> {
             if line.is_empty() || is_builtin_manifest_name(line) {
                 return false;
             }
-            if !is_plain_file_name(line) {
+            if !is_plain_file_name(line) || is_ntfs_short_name_alias(line) {
                 debug!(
                     "Ignoring suspicious builtin manifest entry in {}: {line:?}",
                     path.display()
@@ -289,5 +305,94 @@ mod tests {
         assert!(!is_builtin_manifest_name("builtin-manifest"));
         assert!(!is_builtin_manifest_name(".builtin-manifesto"));
         assert!(!is_builtin_manifest_name("notify.sh"));
+    }
+
+    #[test]
+    fn ntfs_short_name_aliases_are_detected() {
+        assert!(is_ntfs_short_name_alias("BUILTI~1"));
+        assert!(is_ntfs_short_name_alias("builti~1.sh"));
+        assert!(is_ntfs_short_name_alias("NOTIFY~12"));
+        assert!(is_ntfs_short_name_alias("A~1"));
+        assert!(!is_ntfs_short_name_alias("notify.sh"));
+        assert!(!is_ntfs_short_name_alias("my~hook.sh"));
+        assert!(!is_ntfs_short_name_alias("~1"));
+        assert!(!is_ntfs_short_name_alias("way-too-long~1"));
+        assert!(!is_ntfs_short_name_alias(".builtin-manifest"));
+    }
+
+    /// This fixture is unrealizable on NTFS: `.builtin-manifest` gets an
+    /// auto-generated 8.3 short name of exactly this shape (`BUILTI~1`), so
+    /// writing `dir/BUILTI~1` opens the manifest through its alias and
+    /// clobbers it instead of creating a distinct file — the precise
+    /// collision [`is_ntfs_short_name_alias`] defends against. Only
+    /// filesystems without 8.3 aliasing can host alias-shaped names as real,
+    /// distinct files; Windows coverage lives in
+    /// `ntfs_short_name_entries_never_accepted_on_windows` below.
+    #[cfg(unix)]
+    #[test]
+    fn ntfs_short_name_entries_never_direct_deletions() {
+        let dir = fresh_dir("builtin-manifest-shortname-");
+        fs::write(dir.join(BUILTIN_MANIFEST_FILE), "BUILTI~1\nbuilti~1.sh\n").unwrap();
+        fs::write(dir.join("BUILTI~1"), "keep").unwrap();
+        fs::write(dir.join("builti~1.sh"), "keep").unwrap();
+
+        reconcile_builtin_dir(&dir, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+
+        assert!(
+            dir.join("BUILTI~1").exists() && dir.join("builti~1.sh").exists(),
+            "8.3-alias-shaped manifest entries must never be removal candidates"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Windows counterpart of `ntfs_short_name_entries_never_direct_deletions`:
+    /// alias-shaped files cannot exist as distinct fixtures here, so the guard
+    /// invariant is proven through the manifest filter instead. Only entries
+    /// accepted into the previous-manifest set can become removal candidates
+    /// (`previous.difference(shipped)`) or be claimed as owned
+    /// (`shipped ∩ previous`); listing the alias names in `shipped` makes the
+    /// second path observable in the rewritten manifest — a broken guard
+    /// would claim them. Where the volume generates 8.3 short names, the
+    /// self-collision that makes the unix fixture unrealizable is also
+    /// asserted directly; where generation is disabled, the alias simply
+    /// never materializes and the invariant assertions stand on their own.
+    #[cfg(windows)]
+    #[test]
+    fn ntfs_short_name_entries_never_accepted_on_windows() {
+        let dir = fresh_dir("builtin-manifest-shortname-win-");
+        fs::write(
+            dir.join(BUILTIN_MANIFEST_FILE),
+            "BUILTI~1\nbuilti~1.sh\nkept.sh\n",
+        )
+        .unwrap();
+        fs::write(dir.join("kept.sh"), "current").unwrap();
+
+        let alias = dir.join("BUILTI~1");
+        if alias.exists() {
+            assert_eq!(
+                fs::read_to_string(&alias).unwrap(),
+                fs::read_to_string(dir.join(BUILTIN_MANIFEST_FILE)).unwrap(),
+                "the 8.3 alias opens the manifest itself, not a distinct file"
+            );
+        }
+
+        reconcile_builtin_dir(
+            &dir,
+            &shipped(&["BUILTI~1", "builti~1.sh", "kept.sh"]),
+            &shipped(&[]),
+        )
+        .unwrap();
+
+        assert!(dir.join("kept.sh").exists(), "real shipped file untouched");
+        assert!(
+            dir.join(BUILTIN_MANIFEST_FILE).exists(),
+            "manifest survives reconciliation"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(BUILTIN_MANIFEST_FILE)).unwrap(),
+            "kept.sh\n",
+            "alias-shaped entries are never accepted: neither removal candidates nor claimed"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

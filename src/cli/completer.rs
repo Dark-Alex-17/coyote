@@ -51,12 +51,12 @@ pub(super) fn model_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 fn load_app_config_for_completion() -> anyhow::Result<AppConfig> {
     let h = tokio::runtime::Handle::try_current().ok();
     let cfg = match h {
-        Some(handle) => {
-            tokio::task::block_in_place(|| handle.block_on(Config::load_with_interpolation(true)))?
-        }
+        Some(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(Config::load_with_interpolation(true, true))
+        })?,
         None => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(Config::load_with_interpolation(true))?
+            rt.block_on(Config::load_with_interpolation(true, true))?
         }
     };
     AppConfig::from_config(cfg)

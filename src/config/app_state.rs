@@ -43,6 +43,7 @@ impl AppState {
         log_path: Option<PathBuf>,
         start_mcp_servers: bool,
         lenient_vault: bool,
+        inspection: bool,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
         let vault = if lenient_vault {
@@ -74,7 +75,11 @@ impl AppState {
             }
         }
 
-        let mut functions = Functions::init(config.visible_tools.as_deref())?;
+        let mut functions = if inspection {
+            Functions::default()
+        } else {
+            Functions::init(config.visible_tools.as_deref())?
+        };
         if !mcp_registry.is_empty() && config.mcp_server_support {
             functions.append_mcp_meta_functions(mcp_registry.server_features());
         }

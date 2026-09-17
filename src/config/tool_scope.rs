@@ -918,7 +918,7 @@ mod tests {
     use super::*;
     use crate::config::mcp_tool_policy::LayerSource;
     use crate::function::ToolCall;
-    use crate::testing::{install_warn_collector, warn_messages};
+    use crate::testing::{install_log_collector, warn_snapshot};
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -1083,7 +1083,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_items_warns_when_resource_listing_fails() {
-        install_warn_collector();
+        install_log_collector();
         let fixture = FixtureServer {
             resources_capability: true,
             fail_resource_listings: true,
@@ -1093,7 +1093,7 @@ mod tests {
 
         runtime.catalog_items("fixture").await.unwrap();
 
-        let messages = warn_messages().lock().unwrap();
+        let messages = warn_snapshot();
         assert!(
             messages
                 .iter()
@@ -1547,7 +1547,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_catalog_degrades_when_one_server_fails() {
-        install_warn_collector();
+        install_log_collector();
         let healthy = FixtureServer {
             prompts_capability: true,
             ..Default::default()
@@ -1564,7 +1564,7 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].server, "fixture");
-        let messages = warn_messages().lock().unwrap();
+        let messages = warn_snapshot();
         assert!(
             messages
                 .iter()
@@ -1794,7 +1794,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_items_warns_on_dead_context_patterns() {
-        install_warn_collector();
+        install_log_collector();
         let (mut runtime, _server) = fixture_runtime(FixtureServer::default()).await;
         let mut filter = single_layer_filter(LayerSource::Global, &["*"]);
         filter.push_layer(LayerSource::Session, &["zzz_*".to_string()]);
@@ -1802,7 +1802,7 @@ mod tests {
 
         runtime.catalog_items("fixture").await.unwrap();
 
-        let messages = warn_messages().lock().unwrap();
+        let messages = warn_snapshot();
         assert!(
             messages.iter().any(|msg| msg.contains("'zzz_*'")
                 && msg.contains("session (.set)")

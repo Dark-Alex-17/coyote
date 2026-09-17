@@ -210,6 +210,18 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn from_config(config: super::Config) -> Result<Self> {
+        Self::from_config_impl(config, true)
+    }
+
+    /// Like [`Self::from_config`], but tolerates a config with no resolvable
+    /// model: `model_id` stays empty instead of failing with "No available
+    /// model". For inspection readouts (--info, --list-*, --mcp-list,
+    /// --list-secrets), which render model fields as absent/default.
+    pub fn from_config_lenient(config: super::Config) -> Result<Self> {
+        Self::from_config_impl(config, false)
+    }
+
+    fn from_config_impl(config: super::Config, require_model: bool) -> Result<Self> {
         let mut app_config = Self {
             model_id: config.model_id,
             temperature: config.temperature,
@@ -306,7 +318,13 @@ impl AppConfig {
         }
         app_config.setup_document_loaders();
         app_config.setup_user_agent();
-        app_config.resolve_model()?;
+        if require_model {
+            app_config.resolve_model()?;
+        } else {
+            // Model-less is fine here: model_id stays empty and inspection
+            // callers substitute Model::default().
+            let _ = app_config.resolve_model();
+        }
         app_config.validate_reasoning_effort()?;
         Ok(app_config)
     }
@@ -1267,6 +1285,18 @@ mod tests {
 
         let result = app.resolve_model();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_config_errors_when_no_model_available() {
+        let result = AppConfig::from_config(Config::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_config_lenient_tolerates_missing_model() {
+        let app = AppConfig::from_config_lenient(Config::default()).unwrap();
+        assert!(app.model_id.is_empty());
     }
 
     #[test]
