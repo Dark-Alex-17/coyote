@@ -481,6 +481,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                         tool_results,
                         text,
                         sequence,
+                        ..
                     }) => {
                         // Empty tool_results (reachable via deserialized sessions) must not emit empty tool_calls.
                         if tool_results.is_empty() {
@@ -681,7 +682,7 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
                 MessageContent::ToolCalls(MessageContentToolCalls {
                     tool_results,
                     text,
-                    sequence: _,
+                    ..
                 }) => tool_results
                     .into_iter()
                     .enumerate()
@@ -993,6 +994,7 @@ mod tests {
                         tool_results: vec![],
                         text: "leftover text".to_string(),
                         sequence,
+                        round_starts: vec![],
                     }),
                 ),
             ],
@@ -1057,6 +1059,7 @@ mod tests {
                         tool_results,
                         text: "first round".to_string(),
                         sequence: false,
+                        round_starts: vec![],
                     }),
                 ),
             ],

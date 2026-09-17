@@ -423,6 +423,7 @@ fn build_chat_completions_body(
                     tool_results,
                     text,
                     sequence,
+                    round_starts,
                 }) => {
                     if !sequence {
                         let mut assistant_parts = vec![];
@@ -472,11 +473,15 @@ fn build_chat_completions_body(
                         }
                     } else {
                         // One pair per round: Claude can reuse tool_use IDs across API calls.
-                        // A round boundary is detected by the presence of round text, but
-                        // rounds where the model emitted only tool calls (no narration)
-                        // carry no text marker. As a backstop, also split whenever a
-                        // toolUseId would repeat within the current assistant message.
-                        // Converse rejects duplicate toolUseIds in a single message.
+                        // Round boundaries are recorded in `round_starts` at merge time.
+                        // Splitting per round also keeps the serialized history append-only
+                        // across tool-loop iterations, so prompt caching keeps hitting on
+                        // earlier rounds instead of rewriting them every request.
+                        // Sessions recorded before round tracking carry no `round_starts`;
+                        // for those, fall back to the presence of round text, plus an ID
+                        // backstop: split whenever a toolUseId would repeat within the
+                        // current assistant message. Converse rejects duplicate toolUseIds
+                        // in a single message.
                         let mut messages = vec![];
                         let mut assistant_parts: Vec<Value> = vec![];
                         let mut user_parts: Vec<Value> = vec![];
@@ -487,7 +492,11 @@ fn build_chat_completions_body(
                                 .id
                                 .as_deref()
                                 .is_some_and(|id| chunk_ids.contains(id));
-                            if index > 0 && (tool_result.text.is_some() || id_collision) {
+                            if index > 0
+                                && (round_starts.contains(&index)
+                                    || tool_result.text.is_some()
+                                    || id_collision)
+                            {
                                 messages.push(
                                     json!({ "role": "assistant", "content": assistant_parts }),
                                 );
@@ -896,6 +905,7 @@ mod tests {
                         tool_results,
                         text: text.to_string(),
                         sequence,
+                        round_starts: vec![],
                     }),
                 ),
             ],
@@ -910,6 +920,29 @@ mod tests {
 
     fn build_body(tool_results: Vec<ToolResult>) -> Value {
         build_body_with(tool_results, "", true)
+    }
+
+    fn build_body_rounds(tool_results: Vec<ToolResult>, round_starts: Vec<usize>) -> Value {
+        let data = ChatCompletionsData {
+            messages: vec![
+                Message::new(MessageRole::User, MessageContent::Text("hello".to_string())),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::ToolCalls(MessageContentToolCalls {
+                        tool_results,
+                        text: String::new(),
+                        sequence: true,
+                        round_starts,
+                    }),
+                ),
+            ],
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            functions: None,
+            stream: false,
+        };
+        build_chat_completions_body(data, &Model::new("bedrock", "test"), false).unwrap()
     }
 
     fn tool_result_content_block(output: Value) -> Value {
@@ -1067,6 +1100,9 @@ mod tests {
         assert_unique_tool_use_ids_per_message(&body);
     }
 
+    /// Legacy sessions recorded before round tracking carry no
+    /// `round_starts`; without a text marker or an ID collision their
+    /// textless rounds still serialize merged (the pre-round-tracking shape).
     #[test]
     fn sequence_keeps_textless_rounds_merged_when_ids_are_unique() {
         let body = build_body(vec![
@@ -1079,6 +1115,64 @@ mod tests {
 
         assert_eq!(messages.len(), 3, "body: {body}");
         assert_unique_tool_use_ids_per_message(&body);
+    }
+
+    /// Regression: textless tool-loop rounds must split into one
+    /// assistant/user pair per recorded round so the serialized history stays
+    /// append-only across iterations and prompt caching keeps hitting on
+    /// earlier rounds (mirrors the claude client's round_starts handling).
+    #[test]
+    fn sequence_splits_on_round_starts_without_text() {
+        let body = build_body_rounds(
+            vec![
+                sequence_tool_result("toolu_A", None),
+                sequence_tool_result("toolu_B", None),
+                sequence_tool_result("toolu_C", None),
+            ],
+            vec![1, 2],
+        );
+
+        let messages = body["messages"].as_array().unwrap();
+
+        // user + 3 × (assistant, user) — one pair per round.
+        assert_eq!(messages.len(), 7, "body: {body}");
+        for pair in messages[1..].chunks(2) {
+            assert_eq!(pair[0]["role"], "assistant", "body: {body}");
+            assert_eq!(pair[0]["content"].as_array().unwrap().len(), 1);
+            assert_eq!(pair[1]["role"], "user", "body: {body}");
+        }
+        assert_unique_tool_use_ids_per_message(&body);
+    }
+
+    /// The serialized history must be append-only across tool-loop
+    /// iterations: request N+1's messages must start with exactly request N's
+    /// messages, so the prompt-cache prefix keeps matching.
+    #[test]
+    fn round_history_is_append_only_across_iterations() {
+        let two = build_body_rounds(
+            vec![
+                sequence_tool_result("toolu_A", None),
+                sequence_tool_result("toolu_B", None),
+            ],
+            vec![1],
+        );
+        let three = build_body_rounds(
+            vec![
+                sequence_tool_result("toolu_A", None),
+                sequence_tool_result("toolu_B", None),
+                sequence_tool_result("toolu_C", None),
+            ],
+            vec![1, 2],
+        );
+
+        let two_messages = two["messages"].as_array().unwrap();
+        let three_messages = three["messages"].as_array().unwrap();
+
+        assert_eq!(
+            &three_messages[..two_messages.len()],
+            &two_messages[..],
+            "two: {two}, three: {three}"
+        );
     }
 
     #[test]

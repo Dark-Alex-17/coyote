@@ -216,6 +216,16 @@ pub struct MessageContentToolCalls {
     pub tool_results: Vec<ToolResult>,
     pub text: String,
     pub sequence: bool,
+    /// Indices into `tool_results` where a new tool-call round begins (the
+    /// first round implicitly starts at index 0). Recorded by `merge()` on
+    /// every merge, so serializers can emit one assistant/user pair per
+    /// round even when the model produced no narration text for a round.
+    /// Keeping each round in its own message pair makes the request history
+    /// append-only across tool-loop iterations, which prefix-based prompt
+    /// caches require to produce growing cache reads instead of rewriting
+    /// the whole accumulated history on every request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub round_starts: Vec<usize>,
 }
 
 impl MessageContentToolCalls {
@@ -224,6 +234,7 @@ impl MessageContentToolCalls {
             tool_results,
             text,
             sequence: false,
+            round_starts: vec![],
         }
     }
 
@@ -232,6 +243,9 @@ impl MessageContentToolCalls {
             && let Some(first) = tool_results.first_mut()
         {
             first.text = Some(text);
+        }
+        if !self.tool_results.is_empty() && !tool_results.is_empty() {
+            self.round_starts.push(self.tool_results.len());
         }
         self.tool_results.extend(tool_results);
         self.sequence = true;
@@ -357,5 +371,57 @@ mod tests {
 
         let restored: Vec<ThinkingBlock> = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(serde_json::to_value(&restored).unwrap(), json);
+    }
+
+    /// Session files recorded before round tracking carry no `round_starts`
+    /// key — they must deserialize to an empty default, and an empty
+    /// `round_starts` must be skipped on serialize so new files keep the old
+    /// shape until a merge actually records a round boundary.
+    #[test]
+    fn tool_calls_round_starts_defaults_and_skips_when_empty() {
+        let json = json!({
+            "tool_results": [],
+            "text": "t",
+            "sequence": true,
+        });
+
+        let parsed: MessageContentToolCalls = serde_json::from_value(json).unwrap();
+        assert!(parsed.round_starts.is_empty());
+
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            serialized.get("round_starts").is_none(),
+            "serialized: {serialized}"
+        );
+    }
+
+    #[test]
+    fn tool_calls_round_starts_round_trip_through_yaml() {
+        let mut tool_calls = MessageContentToolCalls::new(vec![], "t".to_string());
+        tool_calls.round_starts = vec![1, 3];
+
+        let yaml = serde_yaml::to_string(&tool_calls).unwrap();
+        let restored: MessageContentToolCalls = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(restored.round_starts, vec![1, 3]);
+    }
+
+    /// Each `merge()` call is one tool-loop round: the boundary index must be
+    /// recorded even when the model produced no narration text for the round.
+    #[test]
+    fn merge_records_round_start_per_call() {
+        let tool_result = |id: &str| {
+            crate::function::ToolResult::new(
+                crate::function::ToolCall::new("t".into(), json!({}), Some(id.to_string())),
+                json!("ok"),
+            )
+        };
+        let mut tool_calls = MessageContentToolCalls::new(vec![tool_result("a")], String::new());
+
+        tool_calls.merge(vec![tool_result("b"), tool_result("c")], String::new());
+        tool_calls.merge(vec![tool_result("d")], String::new());
+
+        assert!(tool_calls.sequence);
+        assert_eq!(tool_calls.round_starts, vec![1, 3]);
     }
 }
