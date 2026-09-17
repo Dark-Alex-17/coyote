@@ -961,10 +961,11 @@ async fn populate_agent_mcp_runtime(ctx: &mut RequestContext, server_ids: &[Stri
         })
         .unwrap_or_default();
 
+    let mcp_hooks = hooks::McpServerHooks::resolve(ctx);
     for (id, spec) in server_specs {
         let handle = app
             .mcp_factory
-            .acquire(&id, &spec, app.mcp_log_path.as_deref())
+            .acquire(&id, &spec, app.mcp_log_path.as_deref(), &mcp_hooks)
             .await?;
         ctx.tool_scope.mcp_runtime.insert(id, handle);
     }

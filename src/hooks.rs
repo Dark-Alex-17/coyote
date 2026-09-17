@@ -132,6 +132,11 @@ pub enum HookEvent {
     JobStarted,
     JobCompleted,
     JobFailed,
+    RagSyncStarted,
+    RagSyncCompleted,
+    RagSyncFailed,
+    McpServerConnected,
+    McpServerFailed,
 }
 
 impl HookEvent {
@@ -163,10 +168,15 @@ impl HookEvent {
             HookEvent::JobStarted => "job.started",
             HookEvent::JobCompleted => "job.completed",
             HookEvent::JobFailed => "job.failed",
+            HookEvent::RagSyncStarted => "rag.sync.started",
+            HookEvent::RagSyncCompleted => "rag.sync.completed",
+            HookEvent::RagSyncFailed => "rag.sync.failed",
+            HookEvent::McpServerConnected => "mcp.server.connected",
+            HookEvent::McpServerFailed => "mcp.server.failed",
         }
     }
 
-    const ALL: [HookEvent; 26] = [
+    const ALL: [HookEvent; 31] = [
         HookEvent::TurnStarted,
         HookEvent::TurnCompleted,
         HookEvent::TurnInterrupted,
@@ -193,6 +203,11 @@ impl HookEvent {
         HookEvent::JobStarted,
         HookEvent::JobCompleted,
         HookEvent::JobFailed,
+        HookEvent::RagSyncStarted,
+        HookEvent::RagSyncCompleted,
+        HookEvent::RagSyncFailed,
+        HookEvent::McpServerConnected,
+        HookEvent::McpServerFailed,
     ];
 }
 
@@ -206,6 +221,191 @@ pub struct ResolvedHook {
     pub full_name: String,
     pub command: String,
     pub cwd: PathBuf,
+}
+
+/// Pre-resolved `rag.sync.*` hooks plus the names `base_envs_parts` needs,
+/// carried by value into the context-free RAG build funnels (`Rag::init`,
+/// `Rag::init_with_config`, `Rag::refresh_document_paths`). Resolution
+/// happens where the caller's identity is known; dispatch happens inside the
+/// funnel, bracketing the one real sync it performs — so cache hits, pure
+/// loads, and attaches (which never enter a funnel) fire nothing.
+#[derive(Debug, Clone, Default)]
+pub struct RagSyncHooks {
+    started: Vec<ResolvedHook>,
+    completed: Vec<ResolvedHook>,
+    failed: Vec<ResolvedHook>,
+    session_name: Option<String>,
+    agent_name: Option<String>,
+}
+
+impl RagSyncHooks {
+    pub fn resolve(ctx: &RequestContext) -> Self {
+        Self {
+            started: ctx.resolved_hooks(HookEvent::RagSyncStarted),
+            completed: ctx.resolved_hooks(HookEvent::RagSyncCompleted),
+            failed: ctx.resolved_hooks(HookEvent::RagSyncFailed),
+            session_name: ctx
+                .session
+                .as_ref()
+                .map(|session| session.name().to_string()),
+            agent_name: ctx.agent.as_ref().map(|agent| agent.name().to_string()),
+        }
+    }
+
+    /// Resolution for `Agent::init`, which builds agent and graph-node RAGs
+    /// before any context carries the agent: the whitelist gate and the
+    /// agent's own hooks come straight from the config being constructed.
+    /// No session or role exists at that point.
+    pub fn resolve_for_agent(
+        global_hooks: &HooksMap,
+        gate: &[String],
+        agent_hooks: &HooksMap,
+        agent_name: &str,
+    ) -> Self {
+        let resolve = |event| {
+            resolve_hooks(
+                event,
+                global_hooks,
+                Some((gate, agent_name)),
+                None,
+                Some((agent_hooks, agent_name)),
+            )
+        };
+        Self {
+            started: resolve(HookEvent::RagSyncStarted),
+            completed: resolve(HookEvent::RagSyncCompleted),
+            failed: resolve(HookEvent::RagSyncFailed),
+            session_name: None,
+            agent_name: Some(agent_name.to_string()),
+        }
+    }
+
+    pub fn fire_started(&self, rag_name: &str, rag_path: &str) {
+        self.fire(
+            HookEvent::RagSyncStarted,
+            &self.started,
+            rag_name,
+            rag_path,
+            &[],
+        );
+    }
+
+    pub fn fire_completed(&self, rag_name: &str, rag_path: &str, doc_count: usize) {
+        self.fire(
+            HookEvent::RagSyncCompleted,
+            &self.completed,
+            rag_name,
+            rag_path,
+            &[("COYOTE_RAG_DOC_COUNT", doc_count.to_string())],
+        );
+    }
+
+    /// A user abort mid-sync counts as a failure: the funnel's sync came
+    /// back `Err` either way, and the knowledge base was not (re)built.
+    pub fn fire_failed(&self, rag_name: &str, rag_path: &str, error: &anyhow::Error) {
+        self.fire(
+            HookEvent::RagSyncFailed,
+            &self.failed,
+            rag_name,
+            rag_path,
+            &[("COYOTE_ERROR", format!("{error:#}"))],
+        );
+    }
+
+    fn fire(
+        &self,
+        event: HookEvent,
+        resolved: &[ResolvedHook],
+        rag_name: &str,
+        rag_path: &str,
+        extras: &[(&str, String)],
+    ) {
+        if resolved.is_empty() {
+            return;
+        }
+        let base_envs = base_envs_parts(
+            event,
+            self.session_name.as_deref(),
+            self.agent_name.as_deref(),
+        );
+        let mut envs = vec![
+            ("COYOTE_RAG_NAME", rag_name.to_string()),
+            ("COYOTE_RAG_PATH", rag_path.to_string()),
+        ];
+        envs.extend(extras.iter().map(|(key, value)| (*key, value.clone())));
+        fire_resolved(event, resolved.to_vec(), base_envs, &envs, None);
+    }
+}
+
+/// Pre-resolved `mcp.server.*` hooks plus the names `base_envs_parts` needs,
+/// carried into the context-free `McpFactory::acquire`. Dispatch happens at
+/// the spawn itself — one event per real spawn — so handing back an
+/// already-live server fires nothing.
+#[derive(Debug, Clone, Default)]
+pub struct McpServerHooks {
+    connected: Vec<ResolvedHook>,
+    failed: Vec<ResolvedHook>,
+    session_name: Option<String>,
+    agent_name: Option<String>,
+}
+
+impl McpServerHooks {
+    pub fn resolve(ctx: &RequestContext) -> Self {
+        Self {
+            connected: ctx.resolved_hooks(HookEvent::McpServerConnected),
+            failed: ctx.resolved_hooks(HookEvent::McpServerFailed),
+            session_name: ctx
+                .session
+                .as_ref()
+                .map(|session| session.name().to_string()),
+            agent_name: ctx.agent.as_ref().map(|agent| agent.name().to_string()),
+        }
+    }
+
+    /// `reconnect` marks a spawn for a server key that was live earlier in
+    /// this process; the variable is omitted entirely on a first connect.
+    pub fn fire_connected(&self, server: &str, transport: &str, reconnect: bool) {
+        let mut extras = vec![
+            ("COYOTE_MCP_SERVER", server.to_string()),
+            ("COYOTE_MCP_TRANSPORT", transport.to_string()),
+        ];
+        if reconnect {
+            extras.push(("COYOTE_MCP_RECONNECT", "true".to_string()));
+        }
+        self.fire(HookEvent::McpServerConnected, &self.connected, &extras);
+    }
+
+    /// `auth_required` marks an `McpAuthRequired` failure; the variable is
+    /// omitted on every other error.
+    pub fn fire_failed(
+        &self,
+        server: &str,
+        transport: &str,
+        error: &anyhow::Error,
+        auth_required: bool,
+    ) {
+        let mut extras = vec![
+            ("COYOTE_MCP_SERVER", server.to_string()),
+            ("COYOTE_MCP_TRANSPORT", transport.to_string()),
+            ("COYOTE_ERROR", format!("{error:#}")),
+        ];
+        if auth_required {
+            extras.push(("COYOTE_MCP_AUTH_REQUIRED", "true".to_string()));
+        }
+        self.fire(HookEvent::McpServerFailed, &self.failed, &extras);
+    }
+
+    fn fire(&self, event: HookEvent, resolved: &[ResolvedHook], extras: &[(&str, String)]) {
+        if resolved.is_empty() {
+            return;
+        }
+        let base_envs = base_envs_parts(
+            event,
+            self.session_name.as_deref(),
+            self.agent_name.as_deref(),
+        );
+        fire_resolved(event, resolved.to_vec(), base_envs, extras, None);
+    }
 }
 
 impl RequestContext {
@@ -508,6 +708,21 @@ pub(crate) fn base_envs_parts(
         envs.push(("COYOTE_AGENT_NAME".to_string(), name.to_string()));
     }
     envs
+}
+
+/// `COYOTE_ROLE` extras for the `session.*` and `turn.*` fire sites — the
+/// only two families that carry the variable. Resolved at fire time, because
+/// roles change mid-session (`.role`, `.exit role`, temp roles): the role
+/// held directly on the context wins, then the name of a role a session has
+/// absorbed. Derived roles have no name and report nothing.
+pub fn role_extras(ctx: &RequestContext) -> Vec<(&'static str, String)> {
+    ctx.role
+        .as_ref()
+        .map(|role| role.name())
+        .filter(|name| !name.is_empty())
+        .or_else(|| ctx.session.as_ref().and_then(|session| session.role_name()))
+        .map(|name| vec![("COYOTE_ROLE", name.to_string())])
+        .unwrap_or_default()
 }
 
 async fn write_payload_file(path: &Path, json: &str) -> std::io::Result<()> {
@@ -1405,6 +1620,11 @@ mod tests {
             (HookEvent::JobStarted, "job.started"),
             (HookEvent::JobCompleted, "job.completed"),
             (HookEvent::JobFailed, "job.failed"),
+            (HookEvent::RagSyncStarted, "rag.sync.started"),
+            (HookEvent::RagSyncCompleted, "rag.sync.completed"),
+            (HookEvent::RagSyncFailed, "rag.sync.failed"),
+            (HookEvent::McpServerConnected, "mcp.server.connected"),
+            (HookEvent::McpServerFailed, "mcp.server.failed"),
         ];
         for (event, name) in cases {
             assert_eq!(event.as_str(), name);
@@ -1414,6 +1634,55 @@ mod tests {
             );
         }
         assert_eq!(HookEvent::ALL.len(), cases.len());
+    }
+
+    #[test]
+    fn rag_and_mcp_wildcard_whitelist_entries_are_valid() {
+        for event in [
+            "rag.sync.started",
+            "rag.sync.completed",
+            "rag.sync.failed",
+            "mcp.server.connected",
+            "mcp.server.failed",
+        ] {
+            assert!(
+                entry_is_valid_wildcard(&format!("{event}.*")),
+                "'{event}.*' must validate as an <event>.* wildcard"
+            );
+        }
+        // Family prefixes are not events: like `tool.*`, these are partial
+        // globs that admit nothing.
+        assert!(!entry_is_valid_wildcard("rag.sync.*"));
+        assert!(!entry_is_valid_wildcard("mcp.server.*"));
+    }
+
+    #[test]
+    fn rag_and_mcp_events_stay_behind_the_agent_whitelist_gate() {
+        let mut global = hooks_map("rag.sync.started", &[("watch", "cmd-rag")]);
+        global.extend(hooks_map("mcp.server.connected", &[("watch", "cmd-mcp")]));
+
+        for event in [HookEvent::RagSyncStarted, HookEvent::McpServerConnected] {
+            let resolved = resolve_hooks(event, &global, Some((&[], "gated-agent")), None, None);
+            assert!(
+                resolved.is_empty(),
+                "{} must stay whitelist-gated for agents",
+                event.as_str()
+            );
+        }
+
+        let gate = vec![
+            "rag.sync.started.*".to_string(),
+            "mcp.server.connected.*".to_string(),
+        ];
+        for event in [HookEvent::RagSyncStarted, HookEvent::McpServerConnected] {
+            let resolved = resolve_hooks(event, &global, Some((&gate, "gated-agent")), None, None);
+            assert_eq!(
+                names(&resolved),
+                ["watch"],
+                "an `<event>.*` whitelist entry must admit {}",
+                event.as_str()
+            );
+        }
     }
 
     #[test]

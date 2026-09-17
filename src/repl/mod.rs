@@ -68,7 +68,7 @@ pub(crate) struct TurnBracket(());
 impl TurnBracket {
     #[must_use]
     pub(crate) fn enter(ctx: &RequestContext) -> Self {
-        hooks::fire(HookEvent::TurnStarted, ctx, &[], None);
+        hooks::fire(HookEvent::TurnStarted, ctx, &hooks::role_extras(ctx), None);
         Self(())
     }
 
@@ -79,16 +79,25 @@ impl TurnBracket {
         result: Result<T>,
     ) -> Result<T> {
         if abort_signal.aborted_ctrlc() {
-            hooks::fire(HookEvent::TurnInterrupted, ctx, &[], None);
+            hooks::fire(
+                HookEvent::TurnInterrupted,
+                ctx,
+                &hooks::role_extras(ctx),
+                None,
+            );
         } else {
             match &result {
-                Ok(_) => hooks::fire(HookEvent::TurnCompleted, ctx, &[], None),
-                Err(err) => hooks::fire(
-                    HookEvent::TurnFailed,
+                Ok(_) => hooks::fire(
+                    HookEvent::TurnCompleted,
                     ctx,
-                    &[("COYOTE_ERROR", format!("{err:#}"))],
+                    &hooks::role_extras(ctx),
                     None,
                 ),
+                Err(err) => {
+                    let mut extras = hooks::role_extras(ctx);
+                    extras.push(("COYOTE_ERROR", format!("{err:#}")));
+                    hooks::fire(HookEvent::TurnFailed, ctx, &extras, None);
+                }
             }
         }
         result
@@ -1143,7 +1152,12 @@ pub async fn run_repl_command(
                         abort_signal.clone(),
                     )
                     .await?;
-                    hooks::fire(HookEvent::SessionCompressed, ctx, &[], None);
+                    hooks::fire(
+                        HookEvent::SessionCompressed,
+                        ctx,
+                        &hooks::role_extras(ctx),
+                        None,
+                    );
                     println!("✓ Successfully compressed the session.");
                 }
                 _ => {
@@ -1697,7 +1711,12 @@ fn print_turn_divider() {
 
 async fn auto_compress_session(ctx: &mut RequestContext) {
     match ctx.compress_session().await {
-        Ok(()) => hooks::fire(HookEvent::SessionCompressed, ctx, &[], None),
+        Ok(()) => hooks::fire(
+            HookEvent::SessionCompressed,
+            ctx,
+            &hooks::role_extras(ctx),
+            None,
+        ),
         Err(err) => warn!("Failed to compress the session: {err}"),
     }
 }
@@ -2018,7 +2037,7 @@ pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
 mod tests {
     use super::*;
     use crate::client::{ClientConfig, Model};
-    use crate::config::{AppState, RoleLike, Session, WorkingMode};
+    use crate::config::{AppState, Role, RoleLike, Session, TEMP_ROLE_NAME, WorkingMode};
     use crate::hooks::{HookDef, HooksMap, test_sink};
     use anyhow::anyhow;
     use serial_test::serial;
@@ -2165,6 +2184,64 @@ mod tests {
         assert_eq!(turn_counts(marker), (1, 0, 1, 0));
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn turn_events_carry_the_role_a_session_holds() {
+        let _sink = test_sink::install();
+        let marker = "tb-role-m3x";
+        let mut ctx = ctx_with_hooks(&TURN_EVENTS, marker);
+        // The role lives on the session (as after `.role` inside a session);
+        // fire-time resolution must find it there.
+        let mut session = Session::default();
+        session.set_role(Role::new("dev-role", "Prompt"));
+        ctx.session = Some(session);
+        let abort_signal = create_abort_signal();
+
+        let bracket = TurnBracket::enter(&ctx);
+        let result: Result<()> = Ok(());
+        bracket.finish(&ctx, &abort_signal, result).unwrap();
+
+        let captures: Vec<_> = test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name.starts_with(marker))
+            .collect();
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        for capture in &captures {
+            assert_eq!(
+                capture.envs.get("COYOTE_ROLE").map(String::as_str),
+                Some("dev-role"),
+                "{} must carry the session-held role",
+                capture.hook_name
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn turn_events_omit_the_role_var_when_no_role_is_active() {
+        let _sink = test_sink::install();
+        let marker = "tb-norole-q8j";
+        let ctx = ctx_with_hooks(&TURN_EVENTS, marker);
+        let abort_signal = create_abort_signal();
+
+        let bracket = TurnBracket::enter(&ctx);
+        let result: Result<()> = Ok(());
+        bracket.finish(&ctx, &abort_signal, result).unwrap();
+
+        let captures: Vec<_> = test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name.starts_with(marker))
+            .collect();
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        for capture in &captures {
+            assert!(
+                !capture.envs.contains_key("COYOTE_ROLE"),
+                "{} must omit COYOTE_ROLE without an active role",
+                capture.hook_name
+            );
+        }
+    }
+
     /// Drives a deep REPL future to completion on a thread with extra stack
     /// headroom: nested `run_repl_command`/`compress_session` poll frames
     /// are deep in debug builds and overflow the default test-thread stack
@@ -2309,6 +2386,48 @@ mod tests {
             session_compressed_count(marker),
             1,
             "a successful auto-compression must fire session.compressed exactly once"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn session_compressed_carries_the_active_role_name() {
+        let _sink = test_sink::install();
+        let marker = "compress-role-t6b";
+        run_async(async {
+            let mut ctx = compressible_ctx(marker);
+            // A temp role (`--prompt`) is a real role for COYOTE_ROLE.
+            ctx.role = Some(Role::new(TEMP_ROLE_NAME, "Session role prompt"));
+            auto_compress_session(&mut ctx).await;
+        });
+
+        let capture = test_sink::snapshot()
+            .into_iter()
+            .find(|capture| capture.hook_name == format!("{marker}-session.compressed"))
+            .expect("session.compressed capture");
+        assert_eq!(
+            capture.envs.get("COYOTE_ROLE").map(String::as_str),
+            Some(TEMP_ROLE_NAME)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn session_compressed_omits_the_role_var_when_no_role_is_active() {
+        let _sink = test_sink::install();
+        let marker = "compress-norole-p9c";
+        run_async(async {
+            let mut ctx = compressible_ctx(marker);
+            auto_compress_session(&mut ctx).await;
+        });
+
+        let capture = test_sink::snapshot()
+            .into_iter()
+            .find(|capture| capture.hook_name == format!("{marker}-session.compressed"))
+            .expect("session.compressed capture");
+        assert!(
+            !capture.envs.contains_key("COYOTE_ROLE"),
+            "session.compressed must omit COYOTE_ROLE without an active role"
         );
     }
 

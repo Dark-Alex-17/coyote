@@ -1077,7 +1077,12 @@ impl RequestContext {
         // COYOTE_SESSION_ID and session-held role hooks still resolve; no
         // session means no event.
         if self.session.is_some() {
-            hooks::fire(HookEvent::SessionEnded, self, &[], None);
+            hooks::fire(
+                HookEvent::SessionEnded,
+                self,
+                &hooks::role_extras(self),
+                None,
+            );
         }
         if let Some(mut session) = self.session.take() {
             let sessions_dir = self.sessions_dir();
@@ -4406,6 +4411,7 @@ impl RequestContext {
 
             if !server_ids.is_empty() {
                 let app_ref = &self.app;
+                let mcp_hooks = hooks::McpServerHooks::resolve(self);
                 let acquire_all = async {
                     let mut handles = Vec::new();
                     let mut auth_required = Vec::new();
@@ -4413,7 +4419,7 @@ impl RequestContext {
                         if let Some(spec) = mcp_config.mcp_servers.get(id) {
                             match app_ref
                                 .mcp_factory
-                                .acquire(id, spec, app_ref.mcp_log_path.as_deref())
+                                .acquire(id, spec, app_ref.mcp_log_path.as_deref(), &mcp_hooks)
                                 .await
                             {
                                 Ok(handle) => handles.push((id.clone(), handle)),
@@ -4738,9 +4744,19 @@ impl RequestContext {
         self.refresh_mcp_tool_filters();
         self.init_agent_session_variables(new_session)?;
         if created_new_session {
-            hooks::fire(HookEvent::SessionStarted, self, &[], None);
+            hooks::fire(
+                HookEvent::SessionStarted,
+                self,
+                &hooks::role_extras(self),
+                None,
+            );
         } else {
-            hooks::fire(HookEvent::SessionResumed, self, &[], None);
+            hooks::fire(
+                HookEvent::SessionResumed,
+                self,
+                &hooks::role_extras(self),
+                None,
+            );
         }
         Ok(())
     }
@@ -5334,6 +5350,7 @@ impl RequestContext {
         let vault = self.app.vault.clone();
         let rag_cache = self.rag_cache();
         let working_mode = self.working_mode;
+        let sync_hooks = hooks::RagSyncHooks::resolve(self);
 
         let (rag, rag_key): (Arc<Rag>, Option<RagKey>) = match rag {
             None => {
@@ -5352,6 +5369,7 @@ impl RequestContext {
                             &[],
                             abort_signal.clone(),
                             false,
+                            sync_hooks,
                         )
                         .await?,
                     ),
@@ -5373,8 +5391,16 @@ impl RequestContext {
                                 if working_mode.is_cmd() {
                                     bail!("Unknown RAG '{name}'");
                                 }
-                                Rag::init(&app, name, &rag_path, &[], abort_signal.clone(), true)
-                                    .await
+                                Rag::init(
+                                    &app,
+                                    name,
+                                    &rag_path,
+                                    &[],
+                                    abort_signal.clone(),
+                                    true,
+                                    sync_hooks,
+                                )
+                                .await
                             } else {
                                 Rag::load_async(&app, &vault, name, &rag_path).await
                             }
@@ -5458,6 +5484,7 @@ impl RequestContext {
             false,
             &self.app.config,
             abort_signal,
+            hooks::RagSyncHooks::resolve(self),
         )
         .await?;
         self.rag = Some(Arc::new(rag));
@@ -5488,8 +5515,15 @@ impl RequestContext {
              This will call the embedding API and may take a while.",
             rag.file_count()
         );
-        rag.refresh_document_paths(&document_paths, true, true, &self.app.config, abort_signal)
-            .await?;
+        rag.refresh_document_paths(
+            &document_paths,
+            true,
+            true,
+            &self.app.config,
+            abort_signal,
+            hooks::RagSyncHooks::resolve(self),
+        )
+        .await?;
         self.rag = Some(Arc::new(rag));
         Ok(())
     }

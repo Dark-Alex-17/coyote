@@ -1,5 +1,6 @@
+use crate::hooks::McpServerHooks;
 use crate::mcp::{
-    ConnectedServer, JsonField, McpAuthRequired, McpServer, McpTransportType,
+    ConnectedServer, HttpAuth, JsonField, McpAuthRequired, McpServer, McpTransportType,
     is_auth_required_error, resolve_http_auth, spawn_mcp_server,
 };
 
@@ -95,34 +96,91 @@ impl McpFactory {
         name: &str,
         spec: &McpServer,
         log_path: Option<&Path>,
+        hooks: &McpServerHooks,
     ) -> Result<Arc<ConnectedServer>> {
         let key = McpServerKey::from_spec(name, spec);
 
+        // Reuse of a live server fires no hooks; only a real spawn below
+        // reports anything.
         if let Some(existing) = self.try_get_active(&key) {
             return Ok(existing);
         }
 
-        let (auth, auth_reason) = resolve_http_auth(name, spec).await;
-        let handle = spawn_mcp_server(spec, log_path, auth).await.map_err(|e| {
-            if is_auth_required_error(&e) {
-                e.context(McpAuthRequired {
-                    server: name.to_string(),
-                    reason: auth_reason,
-                })
-            } else {
-                e
+        // The live probe failed, so an entry still present for this key is a
+        // dead weak: the key was connected earlier in this process and the
+        // spawn below is a reconnect.
+        let reconnect = self.active.lock().contains_key(&key);
+
+        let transport = transport_label(&spec.transport_type);
+        let handle = match spawn_server(name, spec, log_path).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                hooks.fire_failed(name, transport, &e, is_auth_required_error(&e));
+                return Err(e);
             }
-        })?;
+        };
         self.insert_active(key, &handle);
+        hooks.fire_connected(name, transport, reconnect);
         Ok(handle)
     }
 }
 
+fn transport_label(transport: &McpTransportType) -> &'static str {
+    match transport {
+        McpTransportType::Stdio => "stdio",
+        McpTransportType::Http => "http",
+        McpTransportType::Sse => "sse",
+    }
+}
+
+async fn spawn_server(
+    name: &str,
+    spec: &McpServer,
+    log_path: Option<&Path>,
+) -> Result<Arc<ConnectedServer>> {
+    let (auth, auth_reason) = resolve_http_auth(name, spec).await;
+    spawn_transport(spec, log_path, auth).await.map_err(|e| {
+        if is_auth_required_error(&e) {
+            e.context(McpAuthRequired {
+                server: name.to_string(),
+                reason: auth_reason,
+            })
+        } else {
+            e
+        }
+    })
+}
+
+async fn spawn_transport(
+    spec: &McpServer,
+    log_path: Option<&Path>,
+    auth: HttpAuth,
+) -> Result<Arc<ConnectedServer>> {
+    #[cfg(test)]
+    if let Some(result) = STUB_SPAWNS.lock().pop() {
+        return result;
+    }
+    spawn_mcp_server(spec, log_path, auth).await
+}
+
+/// Injected spawn outcomes, popped instead of spawning a real transport:
+/// nothing in a test environment speaks MCP over stdio or HTTP, so the
+/// connect path is exercised with fixture handles. Empty means spawn for
+/// real.
+#[cfg(test)]
+static STUB_SPAWNS: Mutex<Vec<Result<Arc<ConnectedServer>>>> = Mutex::new(Vec::new());
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_fixtures::FixtureServer;
+    use crate::config::{AppConfig, AppState, RequestContext, WorkingMode};
+    use crate::hooks::{HookDef, HooksMap, test_sink};
     use crate::mcp::{JsonField, McpServer, McpTransportType};
+    use anyhow::anyhow;
     use indexmap::IndexMap;
+    use rmcp::ServiceExt;
+    use serial_test::serial;
     use std::collections::HashMap;
 
     fn stdio_spec(
@@ -320,5 +378,190 @@ mod tests {
         let factory = McpFactory::default();
         let map = factory.active.lock();
         assert!(map.is_empty());
+    }
+
+    /// Clears injected spawn outcomes on drop so a panicking test cannot
+    /// leak stubs into later tests.
+    struct StubSpawnsGuard;
+
+    impl StubSpawnsGuard {
+        fn push(result: Result<Arc<ConnectedServer>>) -> Self {
+            STUB_SPAWNS.lock().push(result);
+            StubSpawnsGuard
+        }
+    }
+
+    impl Drop for StubSpawnsGuard {
+        fn drop(&mut self) {
+            STUB_SPAWNS.lock().clear();
+        }
+    }
+
+    /// An in-process client/server pair; the returned server half must stay
+    /// alive for the client handle to keep working.
+    async fn fixture_handle() -> (Arc<ConnectedServer>, impl Sized) {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (server, client) = tokio::join!(
+            FixtureServer::default().serve(server_io),
+            ().serve(client_io)
+        );
+        (Arc::new(client.unwrap()), server.unwrap())
+    }
+
+    fn ctx_with_mcp_hooks(marker: &str) -> RequestContext {
+        let mut hooks_map = HooksMap::default();
+        for event in ["mcp.server.connected", "mcp.server.failed"] {
+            hooks_map.insert(
+                event.to_string(),
+                vec![HookDef {
+                    name: format!("{marker}-{event}"),
+                    command: "true".to_string(),
+                }],
+            );
+        }
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            hooks: hooks_map,
+            ..Default::default()
+        });
+        RequestContext::new(Arc::new(app), WorkingMode::Cmd)
+    }
+
+    fn mcp_captures(marker: &str) -> Vec<test_sink::Capture> {
+        test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name.starts_with(marker))
+            .collect()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn acquire_fires_connected_only_on_real_spawns_and_marks_reconnects() {
+        let _sink = test_sink::install();
+        let marker = "mcp-spawn-k7d";
+        let ctx = ctx_with_mcp_hooks(marker);
+        let hooks = McpServerHooks::resolve(&ctx);
+        let factory = McpFactory::default();
+        let spec = stdio_spec("fixture-server-cmd", None, None);
+
+        let (first, _first_server) = fixture_handle().await;
+        let stub = StubSpawnsGuard::push(Ok(first.clone()));
+        let connected = factory.acquire("srv", &spec, None, &hooks).await.unwrap();
+        drop(stub);
+        assert!(Arc::ptr_eq(&connected, &first));
+        let captures = mcp_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        let capture = &captures[0];
+        assert_eq!(capture.hook_name, format!("{marker}-mcp.server.connected"));
+        assert_eq!(
+            capture.envs.get("COYOTE_MCP_SERVER").map(String::as_str),
+            Some("srv")
+        );
+        assert_eq!(
+            capture.envs.get("COYOTE_MCP_TRANSPORT").map(String::as_str),
+            Some("stdio")
+        );
+        assert!(
+            !capture.envs.contains_key("COYOTE_MCP_RECONNECT"),
+            "a first connect must not be marked as a reconnect"
+        );
+
+        let reused = factory.acquire("srv", &spec, None, &hooks).await.unwrap();
+        assert!(Arc::ptr_eq(&reused, &first));
+        assert_eq!(
+            mcp_captures(marker).len(),
+            1,
+            "reusing a live server must fire nothing"
+        );
+
+        // Every holder dropped: the weak in the factory dies, and the next
+        // acquire is a real spawn again — now marked as a reconnect.
+        drop(connected);
+        drop(reused);
+        drop(first);
+        let (second, _second_server) = fixture_handle().await;
+        let _stub = StubSpawnsGuard::push(Ok(second.clone()));
+        let respawned = factory.acquire("srv", &spec, None, &hooks).await.unwrap();
+        assert!(Arc::ptr_eq(&respawned, &second));
+        let captures = mcp_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(
+            captures[1]
+                .envs
+                .get("COYOTE_MCP_RECONNECT")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn acquire_spawn_failure_fires_failed_with_the_error() {
+        let _sink = test_sink::install();
+        let marker = "mcp-fail-v2q";
+        let ctx = ctx_with_mcp_hooks(marker);
+        let hooks = McpServerHooks::resolve(&ctx);
+        let factory = McpFactory::default();
+        // No stub: the nonexistent binary drives the real spawn-error path.
+        let spec = stdio_spec("coyote-nonexistent-mcp-binary-v2q", None, None);
+
+        let result = factory.acquire("bad-srv", &spec, None, &hooks).await;
+
+        assert!(result.is_err());
+        let captures = mcp_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        let capture = &captures[0];
+        assert_eq!(capture.hook_name, format!("{marker}-mcp.server.failed"));
+        assert_eq!(
+            capture.envs.get("COYOTE_MCP_SERVER").map(String::as_str),
+            Some("bad-srv")
+        );
+        assert_eq!(
+            capture.envs.get("COYOTE_MCP_TRANSPORT").map(String::as_str),
+            Some("stdio")
+        );
+        assert!(
+            capture
+                .envs
+                .get("COYOTE_ERROR")
+                .is_some_and(|error| !error.is_empty())
+        );
+        assert!(
+            !capture.envs.contains_key("COYOTE_MCP_AUTH_REQUIRED"),
+            "a plain spawn failure must not be flagged as auth-required"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn acquire_auth_failure_sets_the_auth_required_flag() {
+        let _sink = test_sink::install();
+        let marker = "mcp-auth-h4n";
+        let ctx = ctx_with_mcp_hooks(marker);
+        let hooks = McpServerHooks::resolve(&ctx);
+        let factory = McpFactory::default();
+        let spec = stdio_spec("oauth-cmd", None, None);
+        let _stub = StubSpawnsGuard::push(Err(anyhow!("Auth required: no stored token")));
+
+        let err = factory
+            .acquire("oauth-srv", &spec, None, &hooks)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.downcast_ref::<McpAuthRequired>().is_some(),
+            "the auth error must be wrapped in McpAuthRequired context"
+        );
+        let captures = mcp_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        let capture = &captures[0];
+        assert_eq!(capture.hook_name, format!("{marker}-mcp.server.failed"));
+        assert_eq!(
+            capture
+                .envs
+                .get("COYOTE_MCP_AUTH_REQUIRED")
+                .map(String::as_str),
+            Some("true")
+        );
     }
 }

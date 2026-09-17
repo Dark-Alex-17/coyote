@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::hooks::HooksMap;
+use crate::hooks::{HooksMap, RagSyncHooks};
 use crate::{
     client::Model,
     config::memory,
@@ -356,6 +356,16 @@ impl Agent {
             }
         };
 
+        // Resolved from the config under construction: no context carries
+        // this agent yet, but its whitelist gate and hooks must still apply
+        // to the RAG builds below.
+        let rag_sync_hooks = RagSyncHooks::resolve_for_agent(
+            &app.hooks,
+            &agent_config.global_hooks,
+            &agent_config.hooks,
+            name,
+        );
+
         let rag = if rag_path.exists() {
             let key = RagKey::Agent(name.to_string());
             let app_clone = app.clone();
@@ -388,6 +398,7 @@ impl Agent {
                 let app_clone = app.clone();
                 let rag_path_clone = rag_path.clone();
                 let abort = abort_signal.clone();
+                let sync_hooks = rag_sync_hooks.clone();
                 let rag = app_state
                     .rag_cache
                     .load_with(key, || async move {
@@ -398,6 +409,7 @@ impl Agent {
                             &document_paths,
                             abort,
                             true,
+                            sync_hooks,
                         )
                         .await
                     })
@@ -421,6 +433,7 @@ impl Agent {
                     &loaders,
                     info_flag,
                     abort_signal.clone(),
+                    &rag_sync_hooks,
                 )
                 .await?
             }
@@ -1303,6 +1316,7 @@ async fn init_graph_rags(
     loaders: &HashMap<String, String>,
     info_flag: bool,
     abort_signal: AbortSignal,
+    sync_hooks: &RagSyncHooks,
 ) -> Result<HashMap<String, Arc<Rag>>> {
     let mut rags = HashMap::new();
     if info_flag {
@@ -1379,6 +1393,7 @@ async fn init_graph_rags(
             let path_clone = rag_path.clone();
             let name_clone = node_id.clone();
             let abort = abort_signal.clone();
+            let sync_hooks = sync_hooks.clone();
             app_state
                 .rag_cache
                 .load_with(key, || async move {
@@ -1389,6 +1404,7 @@ async fn init_graph_rags(
                         &document_paths,
                         &config,
                         abort,
+                        sync_hooks,
                     )
                     .await
                 })
