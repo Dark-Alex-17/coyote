@@ -314,6 +314,9 @@ instructions: |
   Diff: <git range like main...HEAD, or 'worktree' for uncommitted changes>
   Rigor: <rigor>   Security posture: <posture>
   Plan / acceptance criteria: <pasted verbatim — enables the adversary lane; omit when none>
+  Prior review decisions: <on re-review rounds ONLY: earlier rounds' resolved/rejected
+  findings verbatim (rejected-finding log lines, round-comment reconciliations) — settled
+  decisions the reviewers must not re-litigate; omit on the first round>
   Local-run recipe / usage suites: <from the plan — enables the probe lane; omit when none>"
   --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
   <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
