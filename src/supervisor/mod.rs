@@ -192,8 +192,18 @@ impl Supervisor {
 
     /// True when any registered agent or job is still running -- i.e. a
     /// cancellation right now would actually interrupt in-flight work.
+    /// Mirrors `cancel_recursive`'s traversal: work buried in a nested child
+    /// supervisor still counts, so a prompt ctrl-c that cancels only a
+    /// grandchild latches like any other interruption.
     pub fn has_active_tasks(&self) -> bool {
-        self.effective_active_count() > 0 || self.active_job_count() > 0
+        self.effective_active_count() > 0
+            || self.active_job_count() > 0
+            || self.agents().any(|agent| {
+                agent
+                    .child_supervisor
+                    .as_ref()
+                    .is_some_and(|child_sup| child_sup.read().has_active_tasks())
+            })
     }
 
     pub fn max_concurrent(&self) -> usize {
@@ -496,6 +506,41 @@ mod tests {
     fn has_active_tasks_true_with_running_job() {
         let mut sup = Supervisor::new(4, 3).with_max_concurrent_jobs(1);
         sup.register(make_job("j1", create_abort_signal())).unwrap();
+        assert!(sup.has_active_tasks());
+    }
+
+    #[test]
+    fn has_active_tasks_true_with_only_grandchild_activity() {
+        // Keep the runtime alive so the grandchild task is never polled and
+        // counts as running.
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let join_handle = rt.spawn(async {
+            Ok::<AgentResult, Error>(AgentResult {
+                id: "done".into(),
+                agent_name: "test".into(),
+                output: "result".into(),
+                exit_status: AgentExitStatus::Completed,
+            })
+        });
+        let grandchild = AgentHandle {
+            id: "g1".to_string(),
+            agent_name: "worker".to_string(),
+            depth: 2,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: create_abort_signal(),
+            join_handle,
+            child_supervisor: None,
+        };
+        let mut child_sup = Supervisor::new(4, 3);
+        child_sup.register(grandchild).unwrap();
+
+        // make_handle's direct task is already finished, so the only live
+        // work sits one supervisor level down.
+        let mut parent_handle = make_handle("a1", "explore", 1);
+        parent_handle.child_supervisor = Some(Arc::new(RwLock::new(child_sup)));
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(parent_handle).unwrap();
+
         assert!(sup.has_active_tasks());
     }
 

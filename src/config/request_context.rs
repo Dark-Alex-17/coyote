@@ -4972,7 +4972,14 @@ impl RequestContext {
         };
 
         // The abort signal, never the error text, decides interrupted: a
-        // ctrl-c'd run is not a failure, so no error env rides along.
+        // ctrl-c'd run is not a failure, so no error env rides along. The
+        // gate is deliberately signal-first -- a latched ctrl-c means
+        // interrupted even with no error in hand -- unlike
+        // SpawnResultHooks::fire, which is error-first: a child that finished
+        // cleanly stays agent.completed under a latched signal because its
+        // output is collectible. Blind spot: a mid-stream ctrl-d aborts live
+        // work via poll_abort_signal yet still classifies as agent.completed,
+        // because ctrl-d always means a deliberate exit (accepted).
         if abort_signal.is_some_and(|signal| signal.aborted_ctrlc()) {
             hooks::fire(
                 HookEvent::AgentInterrupted,
@@ -8617,6 +8624,42 @@ mod tests {
             capture.hook_name != format!("{marker}-agent.failed")
                 && capture.hook_name != format!("{marker}-agent.completed")
         }));
+    }
+
+    #[test]
+    #[serial]
+    fn top_level_agent_ctrlc_without_error_fires_agent_interrupted() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "agent-top-int-noerr-v4d";
+        let agent_name = unique_name("hook_agent");
+        seed_agent_with_hooks(&agent_name, marker);
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort.clone())).unwrap();
+
+        ctx.top_level_agent_started();
+        abort.set_ctrlc();
+        // Signal-first: a latched ctrl-c means interrupted even when the run
+        // surfaced no error at all.
+        ctx.top_level_agent_finished(None, Some(&abort));
+
+        let captures = marker_captures(marker);
+        assert_eq!(
+            captures
+                .iter()
+                .filter(|capture| capture.hook_name == format!("{marker}-agent.interrupted"))
+                .count(),
+            1
+        );
+        assert!(
+            captures
+                .iter()
+                .all(|capture| capture.hook_name != format!("{marker}-agent.completed")),
+            "a ctrl-c'd run must not report completion"
+        );
     }
 
     /// The REPL's advertised exit path -- ctrl-c at an idle prompt (which

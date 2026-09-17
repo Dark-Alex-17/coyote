@@ -1029,7 +1029,10 @@ impl SpawnResultHooks {
     /// Fires `agent.completed`, or — for a failed child — `agent.interrupted`
     /// when its abort signal was ctrl-c'd (REPL ctrl-c or `agent__cancel`),
     /// else `agent.failed`. The signal, never the error text, decides:
-    /// cancellation is not a failure, so no error env rides along.
+    /// cancellation is not a failure, so no error env rides along. Unlike the
+    /// signal-first `top_level_agent_finished` gate, completion wins over a
+    /// latched ctrl-c at this seam — a finished child's output is collectible,
+    /// so the asymmetry is intentional.
     fn fire(self, error: Option<&str>, child_abort: &AbortSignal) {
         let mut extras = vec![
             ("COYOTE_AGENT_ID", self.agent_id),

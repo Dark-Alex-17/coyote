@@ -348,6 +348,12 @@ pub fn fire_resolved(
         let envs: Vec<(String, String)> = envs
             .into_iter()
             .map(|(key, mut value)| {
+                // Values like escalation questions carry agent-authored text;
+                // an interior NUL makes `Command::spawn` fail on Unix, which
+                // would let a child suppress its own hooks. Strip them.
+                if value.contains('\0') {
+                    value.retain(|c| c != '\0');
+                }
                 // `end` is a char boundary by construction, so `truncate` cannot panic.
                 let end = truncate_env_value(&value).len();
                 value.truncate(end);
@@ -629,7 +635,7 @@ async fn run_hook(
             let _ = child.wait().await;
         }
         Err(err) => {
-            debug!(
+            warn!(
                 "Failed to spawn hook '{}' in '{}': {err}",
                 hook.full_name,
                 hook.cwd.display()
@@ -1667,6 +1673,42 @@ mod tests {
 
     #[test]
     #[serial]
+    fn fire_resolved_strips_nul_bytes_from_env_values() {
+        let _guard = test_sink::install();
+        let hook = ResolvedHook {
+            name: "nul-strip-probe-k4v".to_string(),
+            full_name: "escalation.raised.nul-strip-probe-k4v".to_string(),
+            command: "true".to_string(),
+            cwd: env::temp_dir(),
+        };
+
+        fire_resolved(
+            HookEvent::EscalationRaised,
+            vec![hook],
+            Vec::new(),
+            &[(
+                "COYOTE_ESCALATION_QUESTION",
+                "before\u{0000}after".to_string(),
+            )],
+            None,
+        );
+
+        let captures = test_sink::drain();
+        let capture = captures
+            .iter()
+            .find(|capture| capture.hook_name == "nul-strip-probe-k4v")
+            .expect("a NUL in an env value must not suppress the hook");
+        assert_eq!(
+            capture
+                .envs
+                .get("COYOTE_ESCALATION_QUESTION")
+                .map(String::as_str),
+            Some("beforeafter")
+        );
+    }
+
+    #[test]
+    #[serial]
     fn sink_recovers_after_capture_buffer_poisoning() {
         let _guard = test_sink::install();
         test_sink::drain();
@@ -2020,7 +2062,7 @@ mod tests {
             // does the empty directory below demonstrate the orphan unlink
             // rather than a payload file that never existed.
             wait_for("spawn failure log", || {
-                crate::testing::debug_snapshot().iter().any(|message| {
+                crate::testing::warn_snapshot().iter().any(|message| {
                     message.contains("Failed to spawn hook 'tool.started.spawnfail-marker-c9d'")
                 })
             })
@@ -2075,7 +2117,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
-        async fn error_paths_log_debug_only() {
+        async fn empty_command_logs_debug_and_spawn_failure_logs_warn() {
             crate::testing::install_log_collector();
             let empty_cwd = env::temp_dir();
             let hooks = vec![
@@ -2103,12 +2145,18 @@ mod tests {
                     && message.contains("empty command")
                     && message.contains(empty_cwd_display.as_str())
             }));
-            assert!(debugs.iter().any(|message| {
+            // A failed spawn silently suppresses the hook, so it must be
+            // loud enough to notice; a skipped empty command stays debug.
+            let warns = crate::testing::warn_snapshot();
+            assert!(warns.iter().any(|message| {
                 message.contains("Failed to spawn hook 'turn.failed.badcwd-marker-f5b'")
                     && message.contains("/nonexistent/coyote-badcwd-marker-f5b")
             }));
-            let warns = crate::testing::warn_snapshot();
-            assert!(warns.iter().all(|message| !message.contains("marker-f5b")));
+            assert!(
+                warns
+                    .iter()
+                    .all(|message| !message.contains("empty-marker-f5b"))
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]

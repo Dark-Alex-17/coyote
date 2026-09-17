@@ -29,6 +29,10 @@
 #      fresh named session fires exactly one session.started (and no
 #      session.resumed); resuming a persisted session fires exactly one
 #      session.resumed (and no session.started).
+#   J) pressing ctrl-c in a real terminal during a live headless --agent run
+#      fires exactly one agent.interrupted with NO COYOTE_AGENT_ERROR, and
+#      never agent.failed or agent.completed (needs python3 for the pty and
+#      the hanging LLM endpoint; skipped when python3 is unavailable).
 #
 # Not covered here (see src/function/mod.rs tests for tool.* + payload-file
 # coverage instead): a live tool.started firing requires a real LLM round
@@ -494,6 +498,156 @@ wait_for "session.resumed log" scenario_i_resumed
 [ "$(grep -c '^STARTED$' "$SESS_LOG" 2>/dev/null || echo 0)" = "1" ] \
   || fail "resuming a session must not fire session.started: $(cat "$SESS_LOG")"
 echo "PASS: fresh session fires session.started only; resume fires session.resumed only"
+
+echo "== Scenario J: terminal ctrl-c during a live headless --agent run fires agent.interrupted =="
+if ! command -v python3 > /dev/null 2>&1; then
+  echo "SKIP: python3 not available; cannot allocate a pty or hanging LLM endpoint" >&2
+else
+  CFG_J="$WORKDIR/j"
+  mkdir -p "$CFG_J/agents/probe-int"
+  INT_LOG="$WORKDIR/j-int.log"
+
+  # A local "LLM endpoint" that accepts connections and never answers keeps
+  # the agent run in flight (spinner active, its ctrl-c watcher polling)
+  # while the probe delivers ^C. It writes its port to $1 once listening and
+  # touches $2 on the first accepted connection, so the runner below can
+  # gate the ^C on the request being demonstrably in flight.
+  python3 - "$WORKDIR/j-port" "$WORKDIR/j-conn" <<'PY' &
+import socket, sys
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(8)
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+conns = []
+while True:
+    c, _ = s.accept()
+    if not conns:
+        open(sys.argv[2], "w").write("1")
+    conns.append(c)
+PY
+  SRV_J=$!
+  trap 'kill "$SRV_J" 2>/dev/null || true; rm -rf "$WORKDIR"' EXIT
+  wait_for "hang-server port" test -s "$WORKDIR/j-port"
+  PORT_J="$(cat "$WORKDIR/j-port")"
+
+  cat > "$CFG_J/config.yaml" <<EOF
+model: hangc:hang-model
+clients:
+  - type: openai
+    name: hangc
+    auth: none
+    api_key: 'unused'
+    api_base: http://127.0.0.1:$PORT_J/v1
+    models:
+      - name: hang-model
+        max_input_tokens: 100000
+        supports_function_calling: true
+save: false
+memory: false
+stream: false
+EOF
+
+  # Agent-level hooks resolve without any global_hooks whitelisting, so the
+  # probe agent carries its own markers for every terminal agent event.
+  cat > "$CFG_J/agents/probe-int/config.yaml" <<EOF
+name: probe-int
+description: ctrl-c interruption probe agent
+version: 0.1.0
+instructions: |
+  You are a probe agent. Reply briefly.
+hooks:
+  agent.started:
+    - name: mark
+      command: "echo STARTED >> $INT_LOG"
+  agent.completed:
+    - name: mark
+      command: "echo COMPLETED >> $INT_LOG"
+  agent.failed:
+    - name: mark
+      command: "echo \"FAILED err=\${COYOTE_AGENT_ERROR:-unset}\" >> $INT_LOG"
+  agent.interrupted:
+    - name: mark
+      command: "echo \"INTERRUPTED err=\${COYOTE_AGENT_ERROR:-unset}\" >> $INT_LOG"
+EOF
+
+  # Spawn coyote on a real pty (the spinner's ctrl-c watcher only runs on a
+  # terminal), wait until the agent.started marker AND the first accepted
+  # LLM connection prove the run is in flight, then send a literal ^C
+  # through the pty line discipline — exactly what a terminal user does.
+  cat > "$WORKDIR/j-pty.py" <<'PY'
+import os, pty, sys, time
+
+int_log, conn_marker = sys.argv[1], sys.argv[2]
+argv = sys.argv[3:]
+
+pid, master = pty.fork()
+if pid == 0:
+    os.execvp(argv[0], argv)
+
+os.set_blocking(master, False)
+
+def drain():
+    try:
+        while os.read(master, 4096):
+            pass
+    except OSError:
+        pass
+
+def marker_seen():
+    try:
+        with open(int_log) as f:
+            return "STARTED" in f.read()
+    except FileNotFoundError:
+        return False
+
+deadline = time.time() + 15
+while time.time() < deadline:
+    drain()
+    if marker_seen() and os.path.exists(conn_marker):
+        break
+    time.sleep(0.1)
+else:
+    print("TIMEOUT: agent.started marker / LLM connection never appeared", flush=True)
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    sys.exit(3)
+
+os.write(master, b"\x03")  # ^C via the pty line discipline
+
+deadline = time.time() + 15
+while time.time() < deadline:
+    drain()
+    got, status = os.waitpid(pid, os.WNOHANG)
+    if got == pid:
+        if os.WIFSIGNALED(status):
+            print(f"FATAL: coyote died on signal {os.WTERMSIG(status)} — no ctrl-c handler was installed", flush=True)
+            sys.exit(4)
+        sys.exit(0)
+    time.sleep(0.1)
+
+print("TIMEOUT: coyote did not exit within 15s of ^C", flush=True)
+os.kill(pid, 9)
+os.waitpid(pid, 0)
+sys.exit(3)
+PY
+
+  COYOTE_CONFIG_DIR="$CFG_J" python3 "$WORKDIR/j-pty.py" "$INT_LOG" "$WORKDIR/j-conn" \
+    "$BIN" --agent probe-int --no-stream "say exactly: hi" \
+    || fail "pty ctrl-c run did not exit cleanly (see message above)"
+
+  scenario_j_interrupted() { grep -qs '^INTERRUPTED err=unset$' "$INT_LOG"; }
+  wait_for "agent.interrupted log" scenario_j_interrupted
+  [ "$(grep -c '^STARTED$' "$INT_LOG" 2>/dev/null || echo 0)" = "1" ] \
+    || fail "expected exactly one agent.started, got: $(cat "$INT_LOG")"
+  [ "$(grep -c '^INTERRUPTED' "$INT_LOG" 2>/dev/null || echo 0)" = "1" ] \
+    || fail "expected exactly one agent.interrupted, got: $(cat "$INT_LOG")"
+  grep -q '^FAILED' "$INT_LOG" \
+    && fail "ctrl-c must fire agent.interrupted, never agent.failed: $(cat "$INT_LOG")"
+  grep -q '^COMPLETED' "$INT_LOG" \
+    && fail "an interrupted run must not fire agent.completed: $(cat "$INT_LOG")"
+  kill "$SRV_J" 2>/dev/null || true
+  echo "PASS: terminal ctrl-c fires exactly one agent.interrupted with no COYOTE_AGENT_ERROR; never failed/completed"
+fi
 
 echo
 echo "ALL SCENARIOS PASSED"

@@ -527,6 +527,9 @@ Type ".help" for additional help.
         }
 
         if let Some(supervisor) = self.ctx.read().supervisor.clone() {
+            // Leaving the loop is a deliberate exit, never an interruption:
+            // cancelling straggler children here does not latch the abort
+            // signal, so teardown still classifies as agent.completed.
             supervisor.read().cancel_recursive();
         }
 
