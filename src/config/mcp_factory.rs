@@ -81,11 +81,6 @@ pub struct McpFactory {
 }
 
 impl McpFactory {
-    pub fn try_get_active(&self, key: &McpServerKey) -> Option<Arc<ConnectedServer>> {
-        let map = self.active.lock();
-        map.get(key).and_then(|weak| weak.upgrade())
-    }
-
     pub fn insert_active(&self, key: McpServerKey, handle: &Arc<ConnectedServer>) {
         let mut map = self.active.lock();
         map.insert(key, Arc::downgrade(handle));
@@ -101,15 +96,21 @@ impl McpFactory {
         let key = McpServerKey::from_spec(name, spec);
 
         // Reuse of a live server fires no hooks; only a real spawn below
-        // reports anything.
-        if let Some(existing) = self.try_get_active(&key) {
-            return Ok(existing);
-        }
-
-        // The live probe failed, so an entry still present for this key is a
-        // dead weak: the key was connected earlier in this process and the
-        // spawn below is a reconnect.
-        let reconnect = self.active.lock().contains_key(&key);
+        // reports anything. The live probe and the reconnect read share one
+        // lock section so a racing first connect that inserts between them
+        // cannot be misreported as a reconnect. The spawn await below stays
+        // outside the lock, so two racing first connects may still both
+        // spawn (no singleflight); the loser then reports a reconnect.
+        let reconnect = {
+            let map = self.active.lock();
+            if let Some(existing) = map.get(&key).and_then(|weak| weak.upgrade()) {
+                return Ok(existing);
+            }
+            // The live probe failed, so an entry still present for this key
+            // is a dead weak: the key was connected earlier in this process
+            // and the spawn below is a reconnect.
+            map.contains_key(&key)
+        };
 
         let transport = transport_label(&spec.transport_type);
         let handle = match spawn_server(name, spec, log_path).await {
@@ -355,22 +356,6 @@ mod tests {
             }
             _ => panic!("expected Stdio"),
         }
-    }
-
-    #[test]
-    fn factory_try_get_active_returns_none_when_empty() {
-        let factory = McpFactory::default();
-        let spec = stdio_spec("cmd", None, None);
-        let key = McpServerKey::from_spec("s", &spec);
-        assert!(factory.try_get_active(&key).is_none());
-    }
-
-    #[test]
-    fn factory_try_get_active_returns_none_for_unknown_key() {
-        let factory = McpFactory::default();
-        let spec = stdio_spec("cmd", None, None);
-        let key = McpServerKey::from_spec("s", &spec);
-        assert!(factory.try_get_active(&key).is_none());
     }
 
     #[test]

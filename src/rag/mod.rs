@@ -167,10 +167,17 @@ impl Rag {
             sync_hooks.fire_failed(&rag.name, &rag.path, &err);
             return Err(err);
         }
-        sync_hooks.fire_completed(&rag.name, &rag.path, rag.file_count());
-        if rag.save()? {
-            println!("✓ Saved RAG to '{}'.", save_path.display());
+        // rag.sync.completed promises a saved knowledge base, so it fires
+        // only after a successful save; a save error is a sync failure.
+        match rag.save() {
+            Ok(true) => println!("✓ Saved RAG to '{}'.", save_path.display()),
+            Ok(false) => {}
+            Err(err) => {
+                sync_hooks.fire_failed(&rag.name, &rag.path, &err);
+                return Err(err);
+            }
         }
+        sync_hooks.fire_completed(&rag.name, &rag.path, rag.file_count());
         Ok(rag)
     }
 
@@ -325,10 +332,17 @@ impl Rag {
             sync_hooks.fire_failed(&rag.name, &rag.path, &err);
             return Err(err);
         }
-        sync_hooks.fire_completed(&rag.name, &rag.path, rag.file_count());
-        if rag.save()? {
-            println!("✓ Saved RAG to '{}'.", save_path.display());
+        // rag.sync.completed promises a saved knowledge base, so it fires
+        // only after a successful save; a save error is a sync failure.
+        match rag.save() {
+            Ok(true) => println!("✓ Saved RAG to '{}'.", save_path.display()),
+            Ok(false) => {}
+            Err(err) => {
+                sync_hooks.fire_failed(&rag.name, &rag.path, &err);
+                return Err(err);
+            }
         }
+        sync_hooks.fire_completed(&rag.name, &rag.path, rag.file_count());
         Ok(rag)
     }
 
@@ -672,10 +686,17 @@ impl Rag {
             sync_hooks.fire_failed(&self.name, &self.path, &err);
             return Err(err);
         }
-        sync_hooks.fire_completed(&self.name, &self.path, self.file_count());
-        if self.save()? {
-            println!("✓ Saved rag to '{}'.", self.path);
+        // rag.sync.completed promises a saved knowledge base, so it fires
+        // only after a successful save; a save error is a sync failure.
+        match self.save() {
+            Ok(true) => println!("✓ Saved rag to '{}'.", self.path),
+            Ok(false) => {}
+            Err(err) => {
+                sync_hooks.fire_failed(&self.name, &self.path, &err);
+                return Err(err);
+            }
         }
+        sync_hooks.fire_completed(&self.name, &self.path, self.file_count());
         Ok(())
     }
 
@@ -2377,6 +2398,32 @@ mod tests {
         }
     }
 
+    /// An AppConfig whose client list can construct the "test-seeded"
+    /// embeddings client: init_with_config instantiates the client even
+    /// when a sync has nothing to embed.
+    fn seeded_client_app() -> AppConfig {
+        let mut client = ClientConfig::default();
+        if let ClientConfig::OpenAIConfig(config) = &mut client {
+            config.name = Some("test-seeded".to_string());
+            let mut embedder = ModelData::new("test-embedder");
+            embedder.model_type = "embedding".to_string();
+            config.models = vec![embedder];
+        }
+        AppConfig {
+            clients: vec![client],
+            ..Default::default()
+        }
+    }
+
+    fn init_config() -> RagInitConfig {
+        RagInitConfig {
+            embedding_model: Some("test-seeded:test-embedder".to_string()),
+            chunk_size: Some(1000),
+            chunk_overlap: Some(100),
+            ..Default::default()
+        }
+    }
+
     fn yaml_rag(name: &str, path: &Path, data: RagData) -> Rag {
         Rag {
             app_config: Arc::new(AppConfig::default()),
@@ -2491,6 +2538,133 @@ mod tests {
             captures[1].envs.get("COYOTE_RAG_NAME").map(String::as_str),
             Some("kb")
         );
+        assert!(
+            captures[1]
+                .envs
+                .get("COYOTE_ERROR")
+                .is_some_and(|error| !error.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn init_with_config_fires_started_then_completed_after_save() {
+        let _sink = test_sink::install();
+        let marker = "rag-init-ok-q7t";
+        let dir = TempDir::new("init-hooks-ok");
+        // An empty document syncs without embedding anything, so the build
+        // needs no live embeddings endpoint.
+        let doc = dir.path.join("doc.txt");
+        fs::write(&doc, "").unwrap();
+        let save_path = dir.path.join("kb.yaml");
+        let sync_hooks = RagSyncHooks::resolve(&rag_hooks_ctx(marker));
+
+        let rag = Rag::init_with_config(
+            &seeded_client_app(),
+            "kb-init",
+            &save_path,
+            &[doc.display().to_string()],
+            &init_config(),
+            create_abort_signal(),
+            sync_hooks,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rag.file_count(), 1);
+        assert!(
+            save_path.exists(),
+            "completed must only fire after the knowledge base was saved"
+        );
+        let captures = rag_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].hook_name, format!("{marker}-rag.sync.started"));
+        assert_eq!(
+            captures[1].hook_name,
+            format!("{marker}-rag.sync.completed")
+        );
+        assert_eq!(
+            captures[1]
+                .envs
+                .get("COYOTE_RAG_DOC_COUNT")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn init_with_config_fires_failed_when_save_fails() {
+        let _sink = test_sink::install();
+        let marker = "rag-init-save-fail-w2j";
+        let dir = TempDir::new("init-hooks-save-fail");
+        let doc = dir.path.join("doc.txt");
+        fs::write(&doc, "").unwrap();
+        // A regular file where save() expects a parent directory makes the
+        // save fail after a successful sync.
+        let blocker = dir.path.join("blocker");
+        fs::write(&blocker, "not a directory").unwrap();
+        let save_path = blocker.join("kb.yaml");
+        let sync_hooks = RagSyncHooks::resolve(&rag_hooks_ctx(marker));
+
+        let result = Rag::init_with_config(
+            &seeded_client_app(),
+            "kb-init",
+            &save_path,
+            &[doc.display().to_string()],
+            &init_config(),
+            create_abort_signal(),
+            sync_hooks,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "an unwritable save path must fail the init"
+        );
+        let captures = rag_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].hook_name, format!("{marker}-rag.sync.started"));
+        assert_eq!(captures[1].hook_name, format!("{marker}-rag.sync.failed"));
+        assert!(
+            captures[1]
+                .envs
+                .get("COYOTE_ERROR")
+                .is_some_and(|error| !error.is_empty())
+        );
+    }
+
+    // The user-abort arm in abortable_run_with_spinner_rx only exists when
+    // stdout is a terminal, so a unit test cannot reach it; its
+    // bail!("Aborted.") surfaces through the same `synced` Err arm this
+    // sync error drives.
+    #[tokio::test]
+    #[serial]
+    async fn init_with_config_fires_failed_on_sync_error() {
+        let _sink = test_sink::install();
+        let marker = "rag-init-fail-d4n";
+        let dir = TempDir::new("init-hooks-fail");
+        let missing = dir.path.join("missing.txt").display().to_string();
+        let save_path = dir.path.join("kb.yaml");
+        let sync_hooks = RagSyncHooks::resolve(&rag_hooks_ctx(marker));
+
+        let result = Rag::init_with_config(
+            &seeded_client_app(),
+            "kb-init",
+            &save_path,
+            &[missing],
+            &init_config(),
+            create_abort_signal(),
+            sync_hooks,
+        )
+        .await;
+
+        assert!(result.is_err(), "syncing a nonexistent document must fail");
+        assert!(!save_path.exists());
+        let captures = rag_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].hook_name, format!("{marker}-rag.sync.started"));
+        assert_eq!(captures[1].hook_name, format!("{marker}-rag.sync.failed"));
         assert!(
             captures[1]
                 .envs
