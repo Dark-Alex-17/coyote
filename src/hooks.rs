@@ -2234,6 +2234,119 @@ mod tests {
         assert_eq!(resolved[1].cwd, paths::roles_dir());
     }
 
+    async fn wait_for(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..400 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Dispatch tests whose hooks fail before any shell is involved (bad
+    /// cwd, empty command), so they run identically on every OS.
+    mod dispatch_portable {
+        use super::*;
+        use crate::testing::TestConfigDirGuard;
+        use std::fs::create_dir_all;
+        use std::time::Duration;
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial]
+        async fn spawn_failure_removes_the_payload_file() {
+            crate::testing::install_log_collector();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
+            let payload_dir = guard.path.join("payloads");
+            create_dir_all(&payload_dir).unwrap();
+            let _payload_dir = PayloadDirOverrideGuard::new(payload_dir.clone());
+            let hooks = vec![ResolvedHook {
+                name: "spawnfail-marker-c9d".to_string(),
+                full_name: "tool.started.spawnfail-marker-c9d".to_string(),
+                command: "true".to_string(),
+                cwd: guard.path.join("nonexistent-spawnfail-marker-c9d"),
+            }];
+
+            fire_resolved(
+                HookEvent::ToolStarted,
+                hooks,
+                Vec::new(),
+                &[],
+                Some(r#"{"probe":true}"#.to_string()),
+            );
+            drain_pending(Duration::from_secs(10)).await;
+
+            // The unspawnable cwd must have driven the spawn-error branch,
+            // and the payload write before it must have succeeded: only then
+            // does the empty directory below demonstrate the orphan unlink
+            // rather than a payload file that never existed.
+            wait_for("spawn failure log", || {
+                crate::testing::debug_snapshot().iter().any(|message| {
+                    message.contains("Failed to spawn hook 'tool.started.spawnfail-marker-c9d'")
+                })
+            })
+            .await;
+            let debugs = crate::testing::debug_snapshot();
+            assert!(debugs.iter().all(|message| {
+                !(message.contains("spawnfail-marker-c9d")
+                    && message.contains("Failed to write payload file"))
+            }));
+
+            wait_for("payload file removal", || {
+                std::fs::read_dir(&payload_dir)
+                    .unwrap()
+                    .flatten()
+                    .next()
+                    .is_none()
+            })
+            .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial]
+        async fn error_paths_log_debug_only() {
+            crate::testing::install_log_collector();
+            let empty_cwd = env::temp_dir();
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let bad_cwd = env::temp_dir().join(format!("coyote-badcwd-marker-f5b-{unique}"));
+            let hooks = vec![
+                ResolvedHook {
+                    name: "empty-marker-f5b".to_string(),
+                    full_name: "turn.failed.empty-marker-f5b".to_string(),
+                    command: "  ".to_string(),
+                    cwd: empty_cwd.clone(),
+                },
+                ResolvedHook {
+                    name: "badcwd-marker-f5b".to_string(),
+                    full_name: "turn.failed.badcwd-marker-f5b".to_string(),
+                    command: "true".to_string(),
+                    cwd: bad_cwd.clone(),
+                },
+            ];
+
+            fire_resolved(HookEvent::TurnFailed, hooks, Vec::new(), &[], None);
+            drain_pending(Duration::from_secs(10)).await;
+
+            let debugs = crate::testing::debug_snapshot();
+            let empty_cwd_display = empty_cwd.display().to_string();
+            assert!(debugs.iter().any(|message| {
+                message.contains("empty-marker-f5b")
+                    && message.contains("empty command")
+                    && message.contains(empty_cwd_display.as_str())
+            }));
+            let bad_cwd_display = bad_cwd.display().to_string();
+            assert!(debugs.iter().any(|message| {
+                message.contains("Failed to spawn hook 'turn.failed.badcwd-marker-f5b'")
+                    && message.contains(bad_cwd_display.as_str())
+            }));
+            let warns = crate::testing::warn_snapshot();
+            assert!(warns.iter().all(|message| !message.contains("marker-f5b")));
+        }
+    }
+
     #[cfg(unix)]
     mod dispatch {
         use super::*;
@@ -2241,16 +2354,6 @@ mod tests {
         use std::fs::create_dir_all;
         use std::path::PathBuf;
         use std::time::Duration;
-
-        async fn wait_for(what: &str, cond: impl Fn() -> bool) {
-            for _ in 0..400 {
-                if cond() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            panic!("timed out waiting for {what}");
-        }
 
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
@@ -2352,56 +2455,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
-        async fn spawn_failure_removes_the_payload_file() {
-            crate::testing::install_log_collector();
-            let guard = TestConfigDirGuard::new("hooks-dispatch");
-            let payload_dir = guard.path.join("payloads");
-            create_dir_all(&payload_dir).unwrap();
-            let _payload_dir = PayloadDirOverrideGuard::new(payload_dir.clone());
-            let hooks = vec![ResolvedHook {
-                name: "spawnfail-marker-c9d".to_string(),
-                full_name: "tool.started.spawnfail-marker-c9d".to_string(),
-                command: "true".to_string(),
-                cwd: PathBuf::from("/nonexistent/coyote-spawnfail-marker-c9d"),
-            }];
-
-            fire_resolved(
-                HookEvent::ToolStarted,
-                hooks,
-                Vec::new(),
-                &[],
-                Some(r#"{"probe":true}"#.to_string()),
-            );
-            drain_pending(Duration::from_secs(10)).await;
-
-            // The unspawnable cwd must have driven the spawn-error branch,
-            // and the payload write before it must have succeeded: only then
-            // does the empty directory below demonstrate the orphan unlink
-            // rather than a payload file that never existed.
-            wait_for("spawn failure log", || {
-                crate::testing::debug_snapshot().iter().any(|message| {
-                    message.contains("Failed to spawn hook 'tool.started.spawnfail-marker-c9d'")
-                })
-            })
-            .await;
-            let debugs = crate::testing::debug_snapshot();
-            assert!(debugs.iter().all(|message| {
-                !(message.contains("spawnfail-marker-c9d")
-                    && message.contains("Failed to write payload file"))
-            }));
-
-            wait_for("payload file removal", || {
-                std::fs::read_dir(&payload_dir)
-                    .unwrap()
-                    .flatten()
-                    .next()
-                    .is_none()
-            })
-            .await;
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        #[serial]
         async fn drain_pending_waits_for_spawn_not_completion() {
             let guard = TestConfigDirGuard::new("hooks-dispatch");
             let out = guard.path.join("spawned");
@@ -2430,44 +2483,6 @@ mod tests {
 
             std::fs::write(&gate, "").unwrap();
             wait_for("hook completion", || done.exists()).await;
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        #[serial]
-        async fn error_paths_log_debug_only() {
-            crate::testing::install_log_collector();
-            let empty_cwd = env::temp_dir();
-            let hooks = vec![
-                ResolvedHook {
-                    name: "empty-marker-f5b".to_string(),
-                    full_name: "turn.failed.empty-marker-f5b".to_string(),
-                    command: "  ".to_string(),
-                    cwd: empty_cwd.clone(),
-                },
-                ResolvedHook {
-                    name: "badcwd-marker-f5b".to_string(),
-                    full_name: "turn.failed.badcwd-marker-f5b".to_string(),
-                    command: "true".to_string(),
-                    cwd: PathBuf::from("/nonexistent/coyote-badcwd-marker-f5b"),
-                },
-            ];
-
-            fire_resolved(HookEvent::TurnFailed, hooks, Vec::new(), &[], None);
-            drain_pending(Duration::from_secs(10)).await;
-
-            let debugs = crate::testing::debug_snapshot();
-            let empty_cwd_display = empty_cwd.display().to_string();
-            assert!(debugs.iter().any(|message| {
-                message.contains("empty-marker-f5b")
-                    && message.contains("empty command")
-                    && message.contains(empty_cwd_display.as_str())
-            }));
-            assert!(debugs.iter().any(|message| {
-                message.contains("Failed to spawn hook 'turn.failed.badcwd-marker-f5b'")
-                    && message.contains("/nonexistent/coyote-badcwd-marker-f5b")
-            }));
-            let warns = crate::testing::warn_snapshot();
-            assert!(warns.iter().all(|message| !message.contains("marker-f5b")));
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -2667,6 +2682,236 @@ mod tests {
             assert_eq!(names(&resolved), ["own"]);
             assert_eq!(resolved[0].command, "agent-cmd");
             assert_eq!(resolved[0].cwd, paths::agent_data_dir(agent_name));
+        }
+    }
+
+    /// Dispatch through the real `cmd /C` engine branch, plus the Windows
+    /// posture of install and payload placement.
+    #[cfg(windows)]
+    mod windows_dispatch {
+        use super::*;
+        use crate::testing::TestConfigDirGuard;
+        use std::path::PathBuf;
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial]
+        async fn fire_spawns_via_cmd_with_envs() {
+            let guard = TestConfigDirGuard::new("hooks-win-env");
+            let out = guard.path.join("env-out");
+            let command = r#"set > "%HOOK_OUT%.tmp" && move /Y "%HOOK_OUT%.tmp" "%HOOK_OUT%""#;
+            let ctx =
+                ctx_with_global_hooks(hooks_map("turn.completed", &[("win-envdump", command)]));
+
+            fire(
+                HookEvent::TurnCompleted,
+                &ctx,
+                &[("HOOK_OUT", out.display().to_string())],
+                None,
+            );
+
+            wait_for("hook env dump", || out.exists()).await;
+            let env_dump = std::fs::read_to_string(&out).unwrap();
+            let lines: Vec<&str> = env_dump.lines().map(str::trim_end).collect();
+            assert!(lines.contains(&"COYOTE_EVENT=turn.completed"));
+            assert!(lines.contains(&"COYOTE_HOOK_NAME=win-envdump"));
+            let config_dir_line = format!("COYOTE_CONFIG_DIR={}", guard.path.display());
+            assert!(lines.contains(&config_dir_line.as_str()));
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with("COYOTE_EVENT_TIMESTAMP="))
+            );
+            let out_line = format!("HOOK_OUT={}", out.display());
+            assert!(lines.contains(&out_line.as_str()));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial]
+        async fn fire_returns_while_the_hook_still_runs() {
+            let guard = TestConfigDirGuard::new("hooks-win-detach");
+            let bat = guard.path.join("gate-wait.bat");
+            let out = guard.path.join("started");
+            let gate = guard.path.join("gate");
+            let done = guard.path.join("done");
+            // cmd one-liners cannot loop, so the gate wait lives in a batch
+            // file; `ping -n 2` is the batch idiom for a short sleep.
+            std::fs::write(
+                &bat,
+                concat!(
+                    "@echo off\r\n",
+                    "type nul > \"%HOOK_OUT%\"\r\n",
+                    ":wait\r\n",
+                    "if exist \"%HOOK_GATE%\" goto done\r\n",
+                    "ping -n 2 127.0.0.1 >nul\r\n",
+                    "goto wait\r\n",
+                    ":done\r\n",
+                    "type nul > \"%HOOK_DONE%\"\r\n",
+                ),
+            )
+            .unwrap();
+            let ctx = ctx_with_global_hooks(hooks_map(
+                "turn.completed",
+                &[("win-gate-probe", r#"call "%HOOK_BAT%""#)],
+            ));
+
+            fire(
+                HookEvent::TurnCompleted,
+                &ctx,
+                &[
+                    ("HOOK_BAT", bat.display().to_string()),
+                    ("HOOK_OUT", out.display().to_string()),
+                    ("HOOK_GATE", gate.display().to_string()),
+                    ("HOOK_DONE", done.display().to_string()),
+                ],
+                None,
+            );
+
+            wait_for("hook start marker", || out.exists()).await;
+            assert!(
+                !done.exists(),
+                "dispatch must return before the hook completes"
+            );
+
+            std::fs::write(&gate, "").unwrap();
+            wait_for("hook completion", || done.exists()).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial]
+        async fn payload_file_is_written_and_removed() {
+            let guard = TestConfigDirGuard::new("hooks-win-payload");
+            let out = guard.path.join("payload-out");
+            let path_out = guard.path.join("payload-path");
+            let command = r#"copy /Y "%COYOTE_HOOK_PAYLOAD_FILE%" "%HOOK_OUT%" >nul && (echo %COYOTE_HOOK_PAYLOAD_FILE%)> "%HOOK_PATH%""#;
+            let ctx = ctx_with_global_hooks(hooks_map("tool.started", &[("win-payload", command)]));
+            let payload = r#"{"path":"C:/target","recursive":true}"#;
+
+            fire(
+                HookEvent::ToolStarted,
+                &ctx,
+                &[
+                    ("HOOK_OUT", out.display().to_string()),
+                    ("HOOK_PATH", path_out.display().to_string()),
+                ],
+                Some(payload.to_string()),
+            );
+
+            // `echo` terminates the path with CRLF, so a complete read of the
+            // path file also proves the earlier `copy` finished.
+            wait_for("payload path echo", || {
+                std::fs::read_to_string(&path_out).is_ok_and(|path| path.ends_with("\r\n"))
+            })
+            .await;
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), payload);
+
+            let payload_file =
+                PathBuf::from(std::fs::read_to_string(&path_out).unwrap().trim_end());
+            let file_name = payload_file.file_name().unwrap().to_string_lossy();
+            assert!(file_name.starts_with("coyote-hook-tool.started-"));
+            // No PayloadDirOverrideGuard here: the engine must fall through
+            // to the per-user temp dir, which is what scopes payload files to
+            // the owning user on Windows.
+            assert!(payload_file.starts_with(env::temp_dir()));
+            wait_for("payload file removal", || !payload_file.exists()).await;
+        }
+
+        #[test]
+        #[serial]
+        fn install_builtin_hooks_lands_under_a_backslashed_override() {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let hooks_dir = PathBuf::from(format!(
+                "{}\\coyote-win-bs-{unique}\\hooks",
+                env::temp_dir().display()
+            ));
+            let _env = crate::testing::EnvVarGuard::set(
+                crate::utils::get_env_name("hooks_dir"),
+                &hooks_dir,
+            );
+
+            let result = install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None);
+
+            // Capture outcomes first and assert only after the temp dir is
+            // removed, so a failed assertion cannot leak it.
+            let installed = (
+                hooks_dir.join("notify.sh").is_file(),
+                hooks_dir.join("log-events.sh").is_file(),
+            );
+            let _ = std::fs::remove_dir_all(hooks_dir.parent().unwrap());
+
+            result.unwrap();
+            assert!(installed.0, "notify.sh must land under the backslashed dir");
+            assert!(
+                installed.1,
+                "log-events.sh must land under the backslashed dir"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial]
+        async fn hook_cwds_resolve_per_scope_on_windows_paths() {
+            let guard = TestConfigDirGuard::new("hooks-win-cwd");
+            let global = hooks_map("turn.completed", &[("win-cwd-global", "global-cmd")]);
+            let role = hooks_map("turn.completed", &[("win-cwd-role", "role-cmd")]);
+            let agent = hooks_map("turn.completed", &[("win-cwd-agent", "agent-cmd")]);
+
+            let resolved = resolve_hooks(
+                HookEvent::TurnCompleted,
+                &global,
+                None,
+                Some(&role),
+                Some((&agent, "win-cwd-probe")),
+            );
+
+            assert_eq!(
+                names(&resolved),
+                ["win-cwd-global", "win-cwd-role", "win-cwd-agent"]
+            );
+            assert_eq!(resolved[0].cwd, paths::config_dir());
+            assert_eq!(resolved[1].cwd, paths::roles_dir());
+            assert_eq!(resolved[2].cwd, paths::agent_data_dir("win-cwd-probe"));
+
+            let out = guard.path.join("cwd-out");
+            let ctx = ctx_with_global_hooks(hooks_map(
+                "turn.completed",
+                &[("win-cwd-echo", r#"(echo %CD%)> "%HOOK_OUT%""#)],
+            ));
+            fire(
+                HookEvent::TurnCompleted,
+                &ctx,
+                &[("HOOK_OUT", out.display().to_string())],
+                None,
+            );
+
+            wait_for("hook cwd echo", || {
+                std::fs::read_to_string(&out).is_ok_and(|cwd| cwd.ends_with("\r\n"))
+            })
+            .await;
+            // %CD% can surface 8.3 short names or different casing;
+            // canonicalize both sides before comparing.
+            let echoed = std::fs::read_to_string(&out).unwrap();
+            assert_eq!(
+                std::fs::canonicalize(echoed.trim_end()).unwrap(),
+                std::fs::canonicalize(paths::config_dir()).unwrap()
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn install_completes_without_the_unix_exec_bit() {
+            let guard = HooksDirGuard::new("win-hooks-exec-noop");
+
+            install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+
+            let notify = guard.root.join("notify.sh");
+            assert!(notify.is_file());
+            let embedded = HookAssets::get("notify.sh").unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&notify).unwrap(),
+                std::str::from_utf8(&embedded.data).unwrap()
+            );
         }
     }
 }
