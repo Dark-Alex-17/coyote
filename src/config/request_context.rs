@@ -8427,6 +8427,7 @@ mod tests {
         ctx.update_app_config(|app| {
             app.hooks = hooks_map_of(&["session.started", "session.resumed"], marker)
         });
+        ctx.role = Some(Role::new("started-role", "Prompt"));
         let app = ctx.app.config.clone();
         let abort = utils::create_abort_signal();
         run_async(ctx.use_session(&app, Some("hook-fresh"), abort.clone())).unwrap();
@@ -8441,10 +8442,21 @@ mod tests {
                 .map(String::as_str),
             Some("hook-fresh")
         );
+        assert_eq!(
+            captures[0].envs.get("COYOTE_ROLE").map(String::as_str),
+            Some("started-role"),
+            "session.started must carry the active role"
+        );
 
         // Resuming a persisted session fires session.resumed, never
-        // session.started.
-        write_paused_todo_session(&ctx, "hook-resume");
+        // session.started, and carries the role the session holds.
+        let session_path = ctx.session_file("hook-resume");
+        ensure_parent_exists(&session_path).unwrap();
+        write(
+            &session_path,
+            "model: test-seeded:test-chat\nrole_name: resumed-role\nmessages: []\n",
+        )
+        .unwrap();
         let mut resumed_ctx = create_test_ctx();
         resumed_ctx.update_app_config(|app| {
             app.hooks = hooks_map_of(&["session.started", "session.resumed"], marker)
@@ -8466,6 +8478,11 @@ mod tests {
             resumed[0].envs.get("COYOTE_SESSION_ID").map(String::as_str),
             Some("hook-resume")
         );
+        assert_eq!(
+            resumed[0].envs.get("COYOTE_ROLE").map(String::as_str),
+            Some("resumed-role"),
+            "session.resumed must carry the session-held role"
+        );
     }
 
     #[test]
@@ -8482,13 +8499,21 @@ mod tests {
         ctx.exit_session().unwrap();
         assert!(marker_captures(marker).is_empty());
 
-        ctx.session = Some(Session::default());
+        let mut session = Session::default();
+        session.set_role(Role::new("ended-role", "Prompt"));
+        ctx.session = Some(session);
         ctx.exit_session().unwrap();
         ctx.exit_session().unwrap();
+        let captures = marker_captures(marker);
         assert_eq!(
-            marker_captures(marker).len(),
+            captures.len(),
             1,
             "session.ended fires exactly once, only while a session is attached"
+        );
+        assert_eq!(
+            captures[0].envs.get("COYOTE_ROLE").map(String::as_str),
+            Some("ended-role"),
+            "session.ended must fire while the session-held role is still attached"
         );
     }
 

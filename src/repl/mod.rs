@@ -2218,6 +2218,59 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn turn_interrupted_carries_the_role_a_session_holds() {
+        let _sink = test_sink::install();
+        let marker = "tb-role-int-f7c";
+        let mut ctx = ctx_with_hooks(&TURN_EVENTS, marker);
+        let mut session = Session::default();
+        session.set_role(Role::new("dev-role", "Prompt"));
+        ctx.session = Some(session);
+        let abort_signal = create_abort_signal();
+        abort_signal.set_ctrlc();
+
+        let bracket = TurnBracket::enter(&ctx);
+        let result: Result<()> = Ok(());
+        bracket.finish(&ctx, &abort_signal, result).unwrap();
+
+        let interrupted = test_sink::snapshot()
+            .into_iter()
+            .find(|capture| capture.hook_name == format!("{marker}-turn.interrupted"))
+            .expect("turn.interrupted capture");
+        assert_eq!(
+            interrupted.envs.get("COYOTE_ROLE").map(String::as_str),
+            Some("dev-role"),
+            "turn.interrupted must carry the session-held role"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn turn_failed_carries_the_role_a_session_holds() {
+        let _sink = test_sink::install();
+        let marker = "tb-role-fail-z2n";
+        let mut ctx = ctx_with_hooks(&TURN_EVENTS, marker);
+        let mut session = Session::default();
+        session.set_role(Role::new("dev-role", "Prompt"));
+        ctx.session = Some(session);
+        let abort_signal = create_abort_signal();
+
+        let bracket = TurnBracket::enter(&ctx);
+        let result: Result<()> = Err(anyhow!("turn exploded"));
+        bracket.finish(&ctx, &abort_signal, result).unwrap_err();
+
+        let failed = test_sink::snapshot()
+            .into_iter()
+            .find(|capture| capture.hook_name == format!("{marker}-turn.failed"))
+            .expect("turn.failed capture");
+        assert_eq!(
+            failed.envs.get("COYOTE_ROLE").map(String::as_str),
+            Some("dev-role"),
+            "turn.failed must carry the session-held role"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn turn_events_omit_the_role_var_when_no_role_is_active() {
         let _sink = test_sink::install();
         let marker = "tb-norole-q8j";

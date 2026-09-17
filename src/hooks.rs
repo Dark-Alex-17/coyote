@@ -714,7 +714,8 @@ pub(crate) fn base_envs_parts(
 /// only two families that carry the variable. Resolved at fire time, because
 /// roles change mid-session (`.role`, `.exit role`, temp roles): the role
 /// held directly on the context wins, then the name of a role a session has
-/// absorbed. Derived roles have no name and report nothing.
+/// absorbed. Derived roles have no name; resolution then falls through to
+/// the session-held role, if any.
 pub fn role_extras(ctx: &RequestContext) -> Vec<(&'static str, String)> {
     ctx.role
         .as_ref()

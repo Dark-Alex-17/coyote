@@ -100,7 +100,9 @@ impl McpFactory {
         // lock section so a racing first connect that inserts between them
         // cannot be misreported as a reconnect. The spawn await below stays
         // outside the lock, so two racing first connects may still both
-        // spawn (no singleflight); the loser then reports a reconnect.
+        // spawn (no singleflight); the loser then fires a second plain
+        // `connected` (no RECONNECT flag) and its insert overwrites the
+        // winner's map entry.
         let reconnect = {
             let map = self.active.lock();
             if let Some(existing) = map.get(&key).and_then(|weak| weak.upgrade()) {
