@@ -259,7 +259,15 @@ async fn main() -> Result<()> {
         } else {
             AppConfig::from_config(cfg)?
         };
-        let vault = Vault::init(&app_config)?;
+        // Listing servers reads no secrets, so an unconfigured vault (no
+        // Listing servers reads no secrets, so an unconfigured vault (no
+        // password file) must not block the readout; every other MCP flag
+        // (get/remove/add) stays on the strict init.
+        let vault = if mcp_inspect {
+            Vault::init_lenient(&app_config)
+        } else {
+            Vault::init(&app_config)?
+        };
 
         mcp::manage::handle(&cli, &vault)?;
 
