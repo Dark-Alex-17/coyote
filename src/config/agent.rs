@@ -32,7 +32,7 @@ use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::{env, ffi::OsStr, path::Path};
+use std::{env, path::Path};
 
 const DEFAULT_AGENT_NAME: &str = "rag";
 
@@ -89,7 +89,8 @@ pub(crate) fn install_and_reconcile_agent_hooks(
         }
         ensure_parent_exists(&path)?;
         info!("Creating agent hook file: {}", path.display());
-        write_file_atomic(&path, content, Some(0o755))?;
+        write_file_atomic(&path, content, None)?;
+        set_executable_bit_if_script(&path)?;
         written.insert(name.clone());
     }
 
@@ -125,6 +126,15 @@ fn sweep_removed_agent_hooks(bundled_files: &HashMap<String, HashSet<String>>) {
             continue;
         };
         if bundled_files.contains_key(name) {
+            continue;
+        }
+        // A symlinked agent dir is user-arranged: never follow it into a
+        // hooks tree that lives somewhere else.
+        if !entry
+            .path()
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
             continue;
         }
         let hooks_dir = entry.path().join("hooks");
@@ -184,14 +194,9 @@ impl Agent {
 
             let embedded_file = AgentAssets::get(&file)
                 .ok_or_else(|| anyhow!("Failed to load embedded agent file: {}", file.as_ref()))?;
-            let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
+            let content = std::str::from_utf8(&embedded_file.data)
+                .expect("bundled agent asset is not valid UTF-8");
             let file_path = paths::agents_data_dir().join(file.as_ref());
-            let file_extension = file_path
-                .extension()
-                .and_then(OsStr::to_str)
-                .map(|s| s.to_lowercase());
-            #[cfg_attr(not(unix), expect(unused))]
-            let is_script = matches!(file_extension.as_deref(), Some("sh") | Some("py"));
 
             if file_path.exists()
                 && !conflict::should_replace_existing(
@@ -213,17 +218,12 @@ impl Agent {
             info!("Creating agent file: {}", file_path.display());
             let mut agent_file = File::create(&file_path)?;
             agent_file.write_all(content.as_bytes())?;
+            set_executable_bit_if_script(&file_path)?;
             if let Some((agent, hook)) = parse_direct_hook_path(file.as_ref()) {
                 written_hooks
                     .entry(agent.to_string())
                     .or_default()
                     .insert(hook.to_string());
-            }
-
-            #[cfg(unix)]
-            if is_script {
-                use std::{fs, os::unix::fs::PermissionsExt};
-                fs::set_permissions(&file_path, fs::Permissions::from_mode(0o755))?;
             }
         }
 
@@ -303,7 +303,8 @@ impl Agent {
             };
             let embedded = AgentAssets::get(&file)
                 .ok_or_else(|| anyhow!("Failed to load embedded agent file: {}", file.as_ref()))?;
-            let content = unsafe { std::str::from_utf8_unchecked(&embedded.data) };
+            let content = std::str::from_utf8(&embedded.data)
+                .expect("bundled agent hook asset is not valid UTF-8");
             hooks.push((hook.to_string(), content.to_string()));
         }
 
@@ -2058,36 +2059,7 @@ nodes: {}
         assert_eq!(output, expected);
     }
 
-    /// Points the config dir at a fresh temp directory for the guard's
-    /// lifetime and removes it on drop. Tests using it must serialize.
-    struct TestConfigDirGuard {
-        _env: crate::testing::EnvVarGuard,
-        root: PathBuf,
-    }
-
-    impl TestConfigDirGuard {
-        fn new(label: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = env::temp_dir().join(format!("coyote-{label}-{unique}"));
-            std::fs::create_dir_all(&root).unwrap();
-            Self {
-                _env: crate::testing::EnvVarGuard::set(
-                    crate::utils::get_env_name("config_dir"),
-                    &root,
-                ),
-                root,
-            }
-        }
-    }
-
-    impl Drop for TestConfigDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
+    use crate::testing::TestConfigDirGuard;
 
     fn fixture(entries: &[(&str, &str)]) -> Vec<(String, String)> {
         entries
@@ -2219,5 +2191,31 @@ nodes: {}
             "a still-bundled agent with no hook assets must reconcile its hooks dir"
         );
         assert_eq!(read_to_string(dir.join("user.sh")).unwrap(), "user-owned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn sweep_removed_agent_hooks_never_follows_symlinked_agent_dirs() {
+        let guard = TestConfigDirGuard::new("agent-sweep-symlink");
+        let real = guard.path.join("agent-elsewhere");
+        let hooks = real.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(
+            hooks.join(builtin_manifest::BUILTIN_MANIFEST_FILE),
+            "shipped.sh\n",
+        )
+        .unwrap();
+        std::fs::write(hooks.join("shipped.sh"), "stale").unwrap();
+        std::fs::create_dir_all(paths::agents_data_dir()).unwrap();
+        std::os::unix::fs::symlink(&real, paths::agents_data_dir().join("linked")).unwrap();
+
+        sweep_removed_agent_hooks(&HashMap::new());
+
+        assert!(
+            hooks.join("shipped.sh").exists(),
+            "the sweep must never follow a symlinked agent dir"
+        );
+        assert!(hooks.join(builtin_manifest::BUILTIN_MANIFEST_FILE).exists());
     }
 }

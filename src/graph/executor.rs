@@ -1132,14 +1132,12 @@ mod integration_tests {
     use crate::hooks::HookDef;
     #[cfg(unix)]
     use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor, notification};
-    use crate::utils::{create_abort_signal, get_env_name, temp_file};
+    use crate::utils::{create_abort_signal, temp_file};
     use parking_lot::Mutex;
     use serial_test::serial;
-    use std::env;
     use std::fs;
     #[cfg(unix)]
     use std::mem;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn cmd_available(name: &str) -> bool {
         which::which(name).is_ok()
@@ -1267,7 +1265,7 @@ nodes:
             eprintln!("skipping: bash or python3 not available");
             return;
         }
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-executor-tests");
         materialize_probe_agent(0.0);
         let ws = TestWorkspace::new();
         ws.write_script("dispatcher.sh", "#!/bin/bash\necho '{}'\n");
@@ -1681,7 +1679,7 @@ nodes:
             eprintln!("skipping: python3 not available");
             return;
         }
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-executor-tests");
         materialize_probe_agent(0.0);
         let ws = TestWorkspace::new();
 
@@ -2364,47 +2362,7 @@ nodes:
         assert_eq!(events[0].event, "job_completed");
     }
 
-    struct TestConfigDirGuard {
-        key: String,
-        previous: Option<std::ffi::OsString>,
-        path: PathBuf,
-    }
-
-    impl TestConfigDirGuard {
-        fn new() -> Self {
-            let key = get_env_name("config_dir");
-            let previous = env::var_os(&key);
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = env::temp_dir().join(format!("coyote-graph-executor-tests-{unique}"));
-            fs::create_dir_all(&path).unwrap();
-            unsafe {
-                env::set_var(&key, &path);
-            }
-            Self {
-                key,
-                previous,
-                path,
-            }
-        }
-    }
-
-    impl Drop for TestConfigDirGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                unsafe {
-                    env::set_var(&self.key, previous);
-                }
-            } else {
-                unsafe {
-                    env::remove_var(&self.key);
-                }
-            }
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
+    use crate::testing::TestConfigDirGuard;
 
     const PROBE_AGENT: &str = "timeout-probe";
 
@@ -2654,7 +2612,7 @@ nodes:
             eprintln!("skipping: bash or python3 not available");
             return;
         }
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-executor-tests");
         materialize_probe_agent(5.0);
         let ws = TestWorkspace::new();
         // The abort must land after the worker tasks exist (their retirement

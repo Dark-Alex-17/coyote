@@ -167,7 +167,8 @@ impl Macro {
             debug!("Processing macro file: {}", file.as_ref());
             let embedded_file = MacroAssets::get(&file)
                 .ok_or_else(|| anyhow!("Failed to load embedded macro file: {}", file.as_ref()))?;
-            let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
+            let content = std::str::from_utf8(&embedded_file.data)
+                .expect("bundled macro asset is not valid UTF-8");
             let file_path = paths::macros_dir().join(file.as_ref());
 
             if file_path.exists() && !force {
@@ -350,55 +351,13 @@ fn default_true() -> bool {
 mod tests {
     use super::*;
     use crate::config::{AppState, Session, WorkingMode};
+    use crate::testing::TestConfigDirGuard;
     use crate::utils::{create_abort_signal, get_env_name};
     use serial_test::serial;
     use std::fs::{create_dir_all, remove_dir_all, write};
     use std::future::Future;
-    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, str};
-
-    struct TestConfigDirGuard {
-        key: String,
-        previous: Option<std::ffi::OsString>,
-        path: PathBuf,
-    }
-
-    impl TestConfigDirGuard {
-        fn new() -> Self {
-            let key = get_env_name("config_dir");
-            let previous = env::var_os(&key);
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = env::temp_dir().join(format!("coyote-macros-tests-{unique}"));
-            create_dir_all(&path).unwrap();
-            unsafe {
-                env::set_var(&key, &path);
-            }
-            Self {
-                key,
-                previous,
-                path,
-            }
-        }
-    }
-
-    impl Drop for TestConfigDirGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                unsafe {
-                    env::set_var(&self.key, previous);
-                }
-            } else {
-                unsafe {
-                    env::remove_var(&self.key);
-                }
-            }
-            let _ = remove_dir_all(&self.path);
-        }
-    }
 
     fn test_ctx() -> RequestContext {
         RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
@@ -974,7 +933,7 @@ variables:
     #[test]
     #[serial]
     fn non_isolated_steps_run_on_live_ctx_and_mutations_persist() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "live-macro",
             "isolated: false\nsteps:\n  - \".set temperature 0.42\"\n",
@@ -1006,7 +965,7 @@ variables:
     #[test]
     #[serial]
     fn non_isolated_step_failure_aborts_and_restores_flag_and_mode() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "fail-macro",
             "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \".update\"\n  - \".set temperature 0.1\"\n",
@@ -1057,7 +1016,7 @@ variables:
     #[test]
     #[serial]
     fn non_isolated_macro_step_invoking_macro_is_rejected() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "outer-macro",
             "isolated: false\nsteps:\n  - \".inner-macro\"\n",
@@ -1093,7 +1052,7 @@ variables:
     #[test]
     #[serial]
     fn isolated_macro_step_runs_non_isolated_macro_inline_on_fork() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file("iso-outer-macro", "steps:\n  - \".inner-macro\"\n");
         write_macro_file(
             "inner-macro",
@@ -1122,7 +1081,7 @@ variables:
     #[test]
     #[serial]
     fn isolated_macro_still_forks_and_leaves_live_ctx_untouched() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file("iso-macro", "steps:\n  - \".set temperature 0.77\"\n");
         let mut ctx = test_ctx();
         ctx.session = Some(Session::default());
@@ -1152,7 +1111,7 @@ variables:
     #[test]
     #[serial]
     fn guard_restores_prior_flag_values_after_inline_run() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "inner-macro",
             "isolated: false\nsteps:\n  - \".set temperature 0.11\"\n",

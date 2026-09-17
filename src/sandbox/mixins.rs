@@ -197,6 +197,16 @@ pub fn discover() -> Result<Vec<DiscoveredMixin>> {
     ) {
         out.push(read_mixin(path)?);
     }
+    // Hooks directories are deliberately scanned: hook scripts run inside the
+    // sandbox too, so a sidecar mixin next to one can declare its needs. The
+    // agents scan above never descends into `agents/<name>/hooks/`, and the
+    // `.builtin-manifest` living in these dirs is not matched by the
+    // `*.sbx-mixin.yaml` suffix filter.
+    for agent_dir in subdirs_of(&paths::agents_data_dir()) {
+        for path in collect_mixins(&agent_dir.join("hooks"), &[ScanMode::Flat]) {
+            out.push(read_mixin(path)?);
+        }
+    }
     for path in collect_mixins(&paths::rags_dir(), &[ScanMode::Flat]) {
         out.push(read_mixin(path)?);
     }
@@ -204,6 +214,9 @@ pub fn discover() -> Result<Vec<DiscoveredMixin>> {
         out.push(read_mixin(path)?);
     }
     for path in collect_mixins(&paths::roles_dir().join("hooks"), &[ScanMode::Flat]) {
+        out.push(read_mixin(path)?);
+    }
+    for path in collect_mixins(&paths::hooks_dir(), &[ScanMode::Flat]) {
         out.push(read_mixin(path)?);
     }
 
@@ -999,6 +1012,51 @@ network:
         );
         assert!(
             !found.contains(&manifest),
+            "builtin manifest must not be scanned as a mixin: {found:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn discover_scans_global_and_agent_hooks_mixins_but_never_the_manifest() {
+        use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
+        use crate::utils::get_env_name;
+
+        let root = unique_root("discover-hooks-dirs");
+        let hooks = root.join("hooks");
+        let agent_hooks = root.join("agents").join("researcher").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::create_dir_all(&agent_hooks).unwrap();
+        let global_mixin = hooks.join("notify.sbx-mixin.yaml");
+        let agent_mixin = agent_hooks.join("guard.sbx-mixin.yaml");
+        fs::write(&global_mixin, "kind: mixin\n").unwrap();
+        fs::write(&agent_mixin, "kind: mixin\n").unwrap();
+        // The builtin installer's hidden manifest lives in both hooks dirs
+        // but is not a mixin and must never be picked up.
+        fs::write(hooks.join(BUILTIN_MANIFEST_FILE), "notify.sh\n").unwrap();
+        fs::write(agent_hooks.join(BUILTIN_MANIFEST_FILE), "guard.sh\n").unwrap();
+
+        let _config = crate::testing::EnvVarGuard::set(get_env_name("config_dir"), &root);
+        let found: Vec<PathBuf> = discover()
+            .unwrap()
+            .into_iter()
+            .map(|mixin| mixin.path)
+            .collect();
+
+        assert!(
+            found.contains(&global_mixin),
+            "missing global hooks mixin: {found:?}"
+        );
+        assert!(
+            found.contains(&agent_mixin),
+            "missing agent hooks mixin: {found:?}"
+        );
+        assert!(
+            found.iter().all(|path| path
+                .file_name()
+                .is_none_or(|name| name != BUILTIN_MANIFEST_FILE)),
             "builtin manifest must not be scanned as a mixin: {found:?}"
         );
 

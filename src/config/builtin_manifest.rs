@@ -23,6 +23,22 @@ pub(crate) fn is_builtin_manifest_name(name: &str) -> bool {
         .eq_ignore_ascii_case(BUILTIN_MANIFEST_FILE)
 }
 
+/// NTFS 8.3 short names (`BUILTI~1`, `builti~1.sh`) can alias any long
+/// filename on the same volume — including the manifest itself — so an entry
+/// shaped like one is never accepted: it could direct a deletion at a file
+/// the manifest never named.
+fn is_ntfs_short_name_alias(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    let Some((base, digits)) = stem.rsplit_once('~') else {
+        return false;
+    };
+    !base.is_empty()
+        && base.len() <= 8
+        && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '~')
+        && !digits.is_empty()
+        && digits.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Reconciles `dir` against the currently shipped set of builtin filenames:
 /// a file is removed ONLY if it appears in the previous manifest AND is
 /// absent from `shipped`. The manifest is then rewritten to the names this
@@ -83,7 +99,7 @@ fn read_manifest(dir: &Path) -> BTreeSet<String> {
             if line.is_empty() || is_builtin_manifest_name(line) {
                 return false;
             }
-            if !is_plain_file_name(line) {
+            if !is_plain_file_name(line) || is_ntfs_short_name_alias(line) {
                 debug!(
                     "Ignoring suspicious builtin manifest entry in {}: {line:?}",
                     path.display()
@@ -289,5 +305,34 @@ mod tests {
         assert!(!is_builtin_manifest_name("builtin-manifest"));
         assert!(!is_builtin_manifest_name(".builtin-manifesto"));
         assert!(!is_builtin_manifest_name("notify.sh"));
+    }
+
+    #[test]
+    fn ntfs_short_name_aliases_are_detected() {
+        assert!(is_ntfs_short_name_alias("BUILTI~1"));
+        assert!(is_ntfs_short_name_alias("builti~1.sh"));
+        assert!(is_ntfs_short_name_alias("NOTIFY~12"));
+        assert!(is_ntfs_short_name_alias("A~1"));
+        assert!(!is_ntfs_short_name_alias("notify.sh"));
+        assert!(!is_ntfs_short_name_alias("my~hook.sh"));
+        assert!(!is_ntfs_short_name_alias("~1"));
+        assert!(!is_ntfs_short_name_alias("way-too-long~1"));
+        assert!(!is_ntfs_short_name_alias(".builtin-manifest"));
+    }
+
+    #[test]
+    fn ntfs_short_name_entries_never_direct_deletions() {
+        let dir = fresh_dir("builtin-manifest-shortname-");
+        fs::write(dir.join(BUILTIN_MANIFEST_FILE), "BUILTI~1\nbuilti~1.sh\n").unwrap();
+        fs::write(dir.join("BUILTI~1"), "keep").unwrap();
+        fs::write(dir.join("builti~1.sh"), "keep").unwrap();
+
+        reconcile_builtin_dir(&dir, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+
+        assert!(
+            dir.join("BUILTI~1").exists() && dir.join("builti~1.sh").exists(),
+            "8.3-alias-shaped manifest entries must never be removal candidates"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

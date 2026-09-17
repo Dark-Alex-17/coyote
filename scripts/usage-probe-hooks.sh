@@ -52,6 +52,21 @@ fail() {
   exit 1
 }
 
+# Bounded poll: retries the given command every 0.1s until it succeeds or the
+# ~10s deadline expires, then fails loudly. Hooks are fire-and-forget child
+# processes, so every wait on their side effects goes through this helper —
+# never a bare sleep.
+wait_for() {
+  local what="$1"
+  shift
+  local tries=0
+  until "$@"; do
+    tries=$((tries + 1))
+    [ "$tries" -ge 100 ] && fail "timed out waiting for $what"
+    sleep 0.1
+  done
+}
+
 write_dryrun_config() {
   # $1 = config dir, $2..$n = extra YAML fragment lines appended verbatim
   local dir="$1"
@@ -95,7 +110,8 @@ write_dryrun_config "$CFG_A" "hooks:" \
   "      command: \"{ echo \\\"EVENT=\$COYOTE_EVENT PROVIDER=\$COYOTE_LLM_PROVIDER MODEL=\$COYOTE_LLM_MODEL\\\"; } >> $LC_LOG\""
 
 COYOTE_CONFIG_DIR="$CFG_A" "$BIN" --no-stream "say exactly: hi" > /dev/null
-sleep 1
+scenario_a_logs_ready() { [ -s "$TS_LOG" ] && [ -s "$TC_LOG" ] && [ -s "$LC_LOG" ]; }
+wait_for "turn/llm hook logs" scenario_a_logs_ready
 
 [ "$(grep -c '^EVENT=turn.started' "$TS_LOG" 2>/dev/null || echo 0)" = "1" ] \
   || fail "expected exactly one turn.started, got: $(cat "$TS_LOG" 2>/dev/null)"
@@ -120,12 +136,12 @@ CFG_BASE="$WORKDIR/base"
 mkdir -p "$CFG_BASE"
 write_dryrun_config "$CFG_BASE"
 
-exit_b=0
-COYOTE_CONFIG_DIR="$CFG_B" "$BIN" --no-stream "say exactly: hi" > "$WORKDIR/out_b.txt" 2> "$WORKDIR/err_b.txt" || exit_b=$?
-exit_base=0
-COYOTE_CONFIG_DIR="$CFG_BASE" "$BIN" --no-stream "say exactly: hi" > "$WORKDIR/out_base.txt" 2> "$WORKDIR/err_base.txt" || exit_base=$?
+rc_b=0
+COYOTE_CONFIG_DIR="$CFG_B" "$BIN" --no-stream "say exactly: hi" > "$WORKDIR/out_b.txt" 2> "$WORKDIR/err_b.txt" || rc_b=$?
+rc_base=0
+COYOTE_CONFIG_DIR="$CFG_BASE" "$BIN" --no-stream "say exactly: hi" > "$WORKDIR/out_base.txt" 2> "$WORKDIR/err_base.txt" || rc_base=$?
 
-[ "$exit_b" = "$exit_base" ] || fail "exit code differs: with-hooks=$exit_b baseline=$exit_base"
+[ "$rc_b" = "$rc_base" ] || fail "exit code differs: with-hooks=$rc_b baseline=$rc_base"
 diff -q "$WORKDIR/out_b.txt" "$WORKDIR/out_base.txt" > /dev/null || fail "stdout differs when a hook fails/is missing"
 diff -q "$WORKDIR/err_b.txt" "$WORKDIR/err_base.txt" > /dev/null || fail "stderr differs when a hook fails/is missing"
 echo "PASS: failing/missing-script hooks are invisible to stdout/stderr/exit code"
@@ -155,6 +171,12 @@ fi
 # reinstalled from the packaged content.
 echo "# LOCALLY MODIFIED" > "$CFG_C/hooks/notify.sh"
 rm "$CFG_C/hooks/log-events.sh"
+# The refresh also touches the roles and per-agent hook locations: user files
+# living there must survive it untouched.
+AGENT_C="$(ls "$CFG_C/agents" | head -1)"
+mkdir -p "$CFG_C/roles/hooks" "$CFG_C/agents/$AGENT_C/hooks"
+echo "mine-role" > "$CFG_C/roles/hooks/user-role.sh"
+echo "mine-agent" > "$CFG_C/agents/$AGENT_C/hooks/user-agent.sh"
 COYOTE_CONFIG_DIR="$CFG_C" "$BIN" --install-builtins hooks > "$WORKDIR/install2.out" 2>&1
 grep -q "LOCALLY MODIFIED" "$CFG_C/hooks/notify.sh" \
   || fail "non-interactive reinstall overwrote the locally modified notify.sh"
@@ -162,7 +184,15 @@ grep -q "LOCALLY MODIFIED" "$CFG_C/hooks/notify.sh" \
   || fail "reinstall did not restore the deleted log-events.sh"
 grep -q '^#!/usr/bin/env bash' "$CFG_C/hooks/log-events.sh" \
   || fail "log-events.sh was not restored to the packaged script"
-echo "PASS: --install-builtins hooks installs both scripts 0755; re-runs keep modified files and restore missing ones"
+if command -v stat > /dev/null 2>&1; then
+  mode_restored="$(stat -c '%a' "$CFG_C/hooks/log-events.sh" 2>/dev/null || stat -f '%Lp' "$CFG_C/hooks/log-events.sh")"
+  [ "$mode_restored" = "755" ] || fail "restored log-events.sh mode is $mode_restored, expected 755"
+fi
+[ "$(cat "$CFG_C/roles/hooks/user-role.sh")" = "mine-role" ] \
+  || fail "user file in roles/hooks was touched by the refresh"
+[ "$(cat "$CFG_C/agents/$AGENT_C/hooks/user-agent.sh")" = "mine-agent" ] \
+  || fail "user file in the agent hooks dir was touched by the refresh"
+echo "PASS: --install-builtins hooks installs both scripts 0755; re-runs keep modified files (all hook locations) and restore missing ones 0755"
 
 echo "== Scenario C2: cold-start auto-bootstrap fills the hooks dir but never forces =="
 CFG_C2="$WORKDIR/c2"
@@ -198,7 +228,7 @@ write_dryrun_config "$CFG_C3" "hooks:" \
 COYOTE_CONFIG_DIR="$CFG_C3" "$BIN" --install-builtins hooks > /dev/null 2>&1
 COYOTE_CONFIG_DIR="$CFG_C3" COYOTE_HOOK_LOG="$HOOK_LOG" COYOTE_SECRET_PROBE=hunter2 \
   "$BIN" --no-stream "say exactly: hi" > /dev/null
-sleep 1
+wait_for "installed log-events.sh output" test -s "$HOOK_LOG"
 
 [ -f "$HOOK_LOG" ] || fail "installed log-events.sh did not write to COYOTE_HOOK_LOG via relative-path wiring"
 [ "$(grep -c '^=== ' "$HOOK_LOG")" = "1" ] \
@@ -219,6 +249,7 @@ echo "== Scenario D: --agent <bundled> --info fires zero agent.* events =="
 CFG_D="$WORKDIR/d"
 mkdir -p "$CFG_D/agents"
 AGENT_LOG="$WORKDIR/agent-events.log"
+SENTINEL_LOG="$WORKDIR/d-sentinel.log"
 write_dryrun_config "$CFG_D" "hooks:" \
   "  agent.started:" \
   "    - name: probe-agent" \
@@ -228,13 +259,20 @@ write_dryrun_config "$CFG_D" "hooks:" \
   "      command: \"echo AGENT_DONE >> $AGENT_LOG\"" \
   "  agent.failed:" \
   "    - name: probe-agent" \
-  "      command: \"echo AGENT_FAILED >> $AGENT_LOG\""
+  "      command: \"echo AGENT_FAILED >> $AGENT_LOG\"" \
+  "  turn.completed:" \
+  "    - name: sentinel" \
+  "      command: \"echo SENTINEL >> $SENTINEL_LOG\""
 
 AGENT_NAME="$(ls "$REPO_ROOT/assets/agents" | head -1)"
 cp -r "$REPO_ROOT/assets/agents/$AGENT_NAME" "$CFG_D/agents/$AGENT_NAME"
 
 COYOTE_CONFIG_DIR="$CFG_D" "$BIN" --agent "$AGENT_NAME" --info > /dev/null 2>&1
-sleep 1
+# Proving absence needs a positive signal to wait on: a follow-up plain run
+# fires turn.completed, and its sentinel landing bounds how long the --info
+# run's (nonexistent) agent.* children could have taken to write.
+COYOTE_CONFIG_DIR="$CFG_D" "$BIN" --no-stream "say exactly: hi" > /dev/null
+wait_for "scenario D sentinel" test -s "$SENTINEL_LOG"
 [ -s "$AGENT_LOG" ] && fail "expected zero agent.* events from --agent --info, got: $(cat "$AGENT_LOG")"
 echo "PASS: --agent $AGENT_NAME --info fired zero agent.* hook events"
 
@@ -290,10 +328,10 @@ grep -q 'old-hook.sh' "$CFG_F/hooks/.builtin-manifest" \
 # not fail the command.
 printf '\xff\xfe\x00' > "$CFG_F/hooks/.builtin-manifest"
 echo "keep" > "$CFG_F/hooks/orphan.sh"
-exit_f=0
-COYOTE_CONFIG_DIR="$CFG_F" "$BIN" --install-builtins hooks > "$WORKDIR/install_f.out" 2>&1 || exit_f=$?
-[ "$exit_f" = "0" ] \
-  || fail "reinstall failed on a malformed manifest (exit $exit_f): $(cat "$WORKDIR/install_f.out")"
+rc_f=0
+COYOTE_CONFIG_DIR="$CFG_F" "$BIN" --install-builtins hooks > "$WORKDIR/install_f.out" 2>&1 || rc_f=$?
+[ "$rc_f" = "0" ] \
+  || fail "reinstall failed on a malformed manifest (exit $rc_f): $(cat "$WORKDIR/install_f.out")"
 [ -f "$CFG_F/hooks/orphan.sh" ] \
   || fail "a malformed manifest caused a deletion (fail-safe broken)"
 [ -f "$CFG_F/hooks/notify.sh" ] && [ -f "$CFG_F/hooks/log-events.sh" ] \

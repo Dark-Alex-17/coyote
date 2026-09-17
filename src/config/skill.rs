@@ -100,7 +100,8 @@ impl Skill {
 
             let embedded_file = SkillsAsset::get(&file)
                 .ok_or_else(|| anyhow!("Failed to load embedded skill file: {}", file.as_ref()))?;
-            let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
+            let content = std::str::from_utf8(&embedded_file.data)
+                .expect("bundled skill asset is not valid UTF-8");
             let file_path = paths::skills_dir().join(file.as_ref());
 
             if file_path.exists() && !force {

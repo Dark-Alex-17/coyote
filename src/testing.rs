@@ -146,3 +146,32 @@ impl Drop for EnvVarGuard {
         }
     }
 }
+
+/// Points the config dir at a fresh temp directory for the guard's lifetime
+/// and removes it on drop, including on panic. Tests using it must serialize
+/// (`#[serial]`) — the config-dir env var is process-global.
+pub(crate) struct TestConfigDirGuard {
+    _env: EnvVarGuard,
+    pub(crate) path: std::path::PathBuf,
+}
+
+impl TestConfigDirGuard {
+    pub(crate) fn new(label: &str) -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("coyote-{label}-{unique}"));
+        std::fs::create_dir_all(&path).unwrap();
+        Self {
+            _env: EnvVarGuard::set(crate::utils::get_env_name("config_dir"), &path),
+            path,
+        }
+    }
+}
+
+impl Drop for TestConfigDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}

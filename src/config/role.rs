@@ -180,7 +180,8 @@ impl Role {
     pub fn builtin(name: &str) -> Result<Self> {
         let content = RolesAsset::get(&format!("{name}.md"))
             .ok_or_else(|| anyhow!("Unknown role `{name}`"))?;
-        let content = unsafe { std::str::from_utf8_unchecked(&content.data) };
+        let content =
+            std::str::from_utf8(&content.data).expect("bundled role asset is not valid UTF-8");
         Ok(Role::new(name, content))
     }
 
@@ -202,7 +203,8 @@ impl Role {
                     return None;
                 }
                 let embedded = RolesAsset::get(file.as_ref())?;
-                let content = unsafe { std::str::from_utf8_unchecked(&embedded.data) };
+                let content = std::str::from_utf8(&embedded.data)
+                    .expect("bundled role hook asset is not valid UTF-8");
                 Some((name.to_string(), content.to_string()))
             })
             .collect();
@@ -665,7 +667,8 @@ pub(crate) fn install_and_reconcile_role_hooks(
         }
         ensure_parent_exists(&path)?;
         info!("Creating role hook file: {}", path.display());
-        write_file_atomic(&path, content, Some(0o755))?;
+        write_file_atomic(&path, content, None)?;
+        set_executable_bit_if_script(&path)?;
         written.insert(name.clone());
     }
 
@@ -1081,6 +1084,41 @@ Input 1
                 "the manifest must never be executable"
             );
         }
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// The installer writes plain and then applies the shared exec-bit
+    /// predicate: users may keep non-executable support files in hooks
+    /// directories, so only recognized script extensions get 0755.
+    #[cfg(unix)]
+    #[test]
+    fn role_hooks_install_leaves_non_script_files_non_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = hooks_fixture_dir("role-hooks-nonscript-");
+
+        install_and_reconcile_role_hooks(
+            &dir,
+            &fixture(&[("README.md", "docs\n"), ("run.sh", "#!/bin/sh\n")]),
+            InstallMode::Skip,
+            &mut StickyMode::None,
+        )
+        .unwrap();
+
+        let readme_mode = fs::metadata(dir.join("README.md"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            readme_mode & 0o111,
+            0,
+            "a non-script file in a hooks dir must stay non-executable"
+        );
+        let script_mode = fs::metadata(dir.join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(script_mode & 0o777, 0o755);
         let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 

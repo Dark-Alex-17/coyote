@@ -1,5 +1,7 @@
 use crate::config::conflict::{self, InstallMode, StickyMode};
-use crate::config::{RequestContext, builtin_manifest, ensure_parent_exists, paths};
+use crate::config::{
+    RequestContext, builtin_manifest, ensure_parent_exists, paths, set_executable_bit_if_script,
+};
 use crate::function::write_file_atomic;
 
 use anyhow::{Result, anyhow};
@@ -34,7 +36,8 @@ pub fn install_builtin_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Resu
 
         let embedded_file = HookAssets::get(&file)
             .ok_or_else(|| anyhow!("Failed to load embedded hook file: {}", file.as_ref()))?;
-        let content = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
+        let content = std::str::from_utf8(&embedded_file.data)
+            .expect("bundled hook asset is not valid UTF-8");
         let file_path = paths::hooks_dir().join(file.as_ref());
 
         if file_path.exists()
@@ -49,7 +52,8 @@ pub fn install_builtin_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Resu
 
         ensure_parent_exists(&file_path)?;
         info!("Creating hook file: {}", file_path.display());
-        write_file_atomic(&file_path, content, Some(0o755))?;
+        write_file_atomic(&file_path, content, None)?;
+        set_executable_bit_if_script(&file_path)?;
         wrote_any = true;
         if !file.as_ref().contains('/') {
             written.insert(file.as_ref().to_string());
@@ -75,7 +79,11 @@ pub fn install_builtin_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Resu
         );
     }
 
-    if wrote_any && paths::hooks_dir() != paths::config_dir().join("hooks") {
+    // Both sides canonicalize so an override that merely spells the default
+    // path differently (symlinks, `..`, trailing components) does not warn.
+    let hooks_dir = canonical_or_original(&paths::hooks_dir());
+    let default_hooks_dir = canonical_or_original(&paths::config_dir().join("hooks"));
+    if wrote_any && hooks_dir != default_hooks_dir {
         warn!(
             "{} overrides the hooks dir: example scripts install to {}, but relative \
              global-hook commands resolve against {}",
@@ -86,6 +94,10 @@ pub fn install_builtin_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Resu
     }
 
     Ok(())
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// A single named hook: an external command to run when its event fires.
@@ -437,12 +449,31 @@ async fn write_payload_file(path: &Path, json: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     options.mode(0o600);
     let mut file = options.open(path).await?;
+    let written = write_payload_contents(&mut file, json).await;
+    if written.is_err() {
+        // `create_new` succeeded, so the file is ours: never leave a partial
+        // payload orphaned in the shared directory.
+        drop(file);
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    written
+}
+
+async fn write_payload_contents(file: &mut tokio::fs::File, json: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    if PAYLOAD_WRITE_FAILURE.load(Ordering::SeqCst) {
+        return Err(std::io::Error::other("injected payload write failure"));
+    }
     file.write_all(json.as_bytes()).await?;
     file.flush().await
 }
 
 #[cfg(test)]
 static PAYLOAD_DIR_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static PAYLOAD_WRITE_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn payload_dir() -> PathBuf {
     #[cfg(test)]
@@ -454,6 +485,65 @@ fn payload_dir() -> PathBuf {
         return dir;
     }
     std::env::temp_dir()
+}
+
+const STALE_PAYLOAD_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Removes payload files left in the shared payload directory by crashed
+/// processes — `run_hook` deletes its own file after the hook exits, so
+/// anything older than [`STALE_PAYLOAD_MAX_AGE`] is an orphan. Runs once per
+/// startup from `install_builtins`. Only exact `coyote-hook-*.json` names are
+/// candidates; the directory is shared, so nothing else may ever be touched.
+/// Best-effort: failures log at debug and never abort startup.
+pub fn sweep_stale_payload_files() {
+    sweep_payload_files_older_than(STALE_PAYLOAD_MAX_AGE);
+}
+
+fn sweep_payload_files_older_than(max_age: Duration) {
+    let dir = payload_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            debug!(
+                "Skipping stale hook-payload sweep in {}: {err}",
+                dir.display()
+            );
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("coyote-hook-") || !name.ends_with(".json") {
+            continue;
+        }
+        // DirEntry::metadata does not traverse symlinks, so a planted link
+        // is skipped rather than followed.
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age >= max_age);
+        if !stale {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => debug!("Removed stale hook payload file {}", entry.path().display()),
+            Err(err) => debug!(
+                "Failed to remove stale hook payload file {}: {err}",
+                entry.path().display()
+            ),
+        }
+    }
 }
 
 async fn run_hook(
@@ -701,6 +791,131 @@ mod tests {
         }
     }
 
+    /// Points `run_hook`'s payload directory at `path` for the guard's
+    /// lifetime, so payload writes can be aimed at a controlled directory
+    /// without touching the process-global `TMPDIR`.
+    struct PayloadDirOverrideGuard;
+
+    impl PayloadDirOverrideGuard {
+        fn new(path: PathBuf) -> Self {
+            *PAYLOAD_DIR_OVERRIDE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
+            Self
+        }
+    }
+
+    impl Drop for PayloadDirOverrideGuard {
+        fn drop(&mut self) {
+            *PAYLOAD_DIR_OVERRIDE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    /// Makes `write_payload_file` fail after the `create_new` open succeeds,
+    /// simulating a write error on the already-created file.
+    struct PayloadWriteFailureGuard;
+
+    impl PayloadWriteFailureGuard {
+        fn install() -> Self {
+            PAYLOAD_WRITE_FAILURE.store(true, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for PayloadWriteFailureGuard {
+        fn drop(&mut self) {
+            PAYLOAD_WRITE_FAILURE.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn fresh_payload_dir(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("coyote-{label}-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn payload_write_failure_after_creation_unlinks_the_orphan() {
+        let dir = fresh_payload_dir("payload-orphan");
+        let path = dir.join("coyote-hook-tool.started-orphan.json");
+        let _fail = PayloadWriteFailureGuard::install();
+
+        let result = write_payload_file(&path, r#"{"probe":true}"#).await;
+
+        assert!(result.is_err());
+        assert!(
+            !path.exists(),
+            "a payload file created before the write failed must be unlinked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn stale_payload_sweep_removes_only_matching_stale_files() {
+        let dir = fresh_payload_dir("payload-sweep");
+        let _payload_dir = PayloadDirOverrideGuard::new(dir.clone());
+        let stale = dir.join("coyote-hook-tool.started-abc123.json");
+        std::fs::write(&stale, "{}").unwrap();
+        // Everything outside the exact `coyote-hook-*.json` pattern survives,
+        // whatever its age: the payload dir is shared.
+        let bystanders = [
+            dir.join("coyote-hook-tool.started-abc123.json.bak"),
+            dir.join("coyote-hookless.json"),
+            dir.join("other.json"),
+            dir.join("coyote-hook-note.txt"),
+        ];
+        for path in &bystanders {
+            std::fs::write(path, "keep").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("coyote-hook-decoy-dir.json")).unwrap();
+
+        // Zero max age marks every matching file stale without depending on
+        // the wall clock.
+        sweep_payload_files_older_than(Duration::ZERO);
+
+        assert!(!stale.exists(), "a stale payload file must be removed");
+        for path in &bystanders {
+            assert!(path.exists(), "{} must survive the sweep", path.display());
+        }
+        assert!(dir.join("coyote-hook-decoy-dir.json").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn stale_payload_sweep_keeps_files_younger_than_the_threshold() {
+        let dir = fresh_payload_dir("payload-sweep-young");
+        let _payload_dir = PayloadDirOverrideGuard::new(dir.clone());
+        let young = dir.join("coyote-hook-tool.started-young.json");
+        std::fs::write(&young, "{}").unwrap();
+
+        sweep_payload_files_older_than(STALE_PAYLOAD_MAX_AGE);
+
+        assert!(
+            young.exists(),
+            "a freshly written payload file must never be swept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn stale_payload_sweep_tolerates_a_missing_directory() {
+        let dir = env::temp_dir().join("coyote-payload-sweep-missing-dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _payload_dir = PayloadDirOverrideGuard::new(dir);
+
+        sweep_stale_payload_files();
+    }
+
     #[test]
     #[serial]
     fn install_builtin_hooks_installs_executable_scripts_and_honors_force() {
@@ -930,17 +1145,17 @@ mod tests {
         let content = std::str::from_utf8(&embedded.data).unwrap();
         let notify_send = content.find("notify-send").expect("notify-send branch");
         let osascript = content.find("osascript").expect("osascript branch");
-        let echo = content.find("echo \"[$title]").expect("echo fallback");
+        let echo = content.find("echo \"$safe_line\"").expect("echo fallback");
         assert!(notify_send < osascript);
         assert!(osascript < echo);
     }
 
     #[test]
-    fn log_events_script_defaults_to_tmp_log_behind_env_override() {
+    fn log_events_script_defaults_to_xdg_state_log_behind_env_override() {
         let embedded = HookAssets::get("log-events.sh").unwrap();
         let content = std::str::from_utf8(&embedded.data).unwrap();
         assert!(content.contains("COYOTE_HOOK_LOG"));
-        assert!(content.contains("/tmp/coyote-hooks.log"));
+        assert!(content.contains("${XDG_STATE_HOME:-$HOME/.local/state}/coyote/hooks.log"));
     }
 
     #[cfg(unix)]
@@ -979,13 +1194,24 @@ mod tests {
     #[test]
     fn notify_script_falls_back_to_echo_without_notifiers() {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/hooks/notify.sh");
-        // An empty PATH hides notify-send and osascript; echo is a bash
-        // builtin, so only the fallback branch can produce output.
+        // A PATH exposing only tr (needed by the fallback's sanitizer) hides
+        // notify-send and osascript; echo is a bash builtin, so only the
+        // fallback branch can produce output.
+        let tr = ["/usr/bin/tr", "/bin/tr"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.exists())
+            .expect("tr binary");
+        let bin =
+            env::temp_dir().join(format!("coyote-notify-fallback-bin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bin);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(tr, bin.join("tr")).unwrap();
         let mut cmd = std::process::Command::new("/bin/bash");
         cmd.arg(&script)
-            .env("PATH", "")
+            .env("PATH", &bin)
             .env("COYOTE_EVENT", "turn.completed")
-            .env("COYOTE_TOOL_NAME", "demo");
+            .env("COYOTE_TOOL_NAME", "demo\u{1b}]0;evil\u{7}");
         // Detach from any controlling terminal so the script cannot open
         // /dev/tty and must fall back to captured stdout.
         unsafe {
@@ -996,11 +1222,16 @@ mod tests {
             });
         }
         let output = cmd.output().unwrap();
+        let _ = std::fs::remove_dir_all(&bin);
 
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains("turn.completed"), "{stdout}");
         assert!(stdout.contains("tool=demo"), "{stdout}");
+        assert!(
+            !stdout.contains('\u{1b}') && !stdout.contains('\u{7}'),
+            "the fallback must strip control bytes before echoing: {stdout:?}"
+        );
     }
 
     #[test]
@@ -1508,59 +1739,10 @@ mod tests {
     #[cfg(unix)]
     mod dispatch {
         use super::*;
-        use crate::utils::get_env_name;
-        use std::fs::{create_dir_all, remove_dir_all};
+        use crate::testing::TestConfigDirGuard;
+        use std::fs::create_dir_all;
         use std::path::PathBuf;
-        use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-        struct TestConfigDirGuard {
-            _env: crate::testing::EnvVarGuard,
-            path: PathBuf,
-        }
-
-        impl TestConfigDirGuard {
-            fn new() -> Self {
-                let key = get_env_name("config_dir");
-                let unique = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos();
-                let path = env::temp_dir().join(format!("coyote-hooks-tests-{unique}"));
-                create_dir_all(&path).unwrap();
-                Self {
-                    _env: crate::testing::EnvVarGuard::set(key, &path),
-                    path,
-                }
-            }
-        }
-
-        impl Drop for TestConfigDirGuard {
-            fn drop(&mut self) {
-                let _ = remove_dir_all(&self.path);
-            }
-        }
-
-        /// Points `run_hook`'s payload directory at `path` for the guard's
-        /// lifetime, so payload writes can be aimed at a nonexistent
-        /// directory without touching the process-global `TMPDIR`.
-        struct PayloadDirOverrideGuard;
-
-        impl PayloadDirOverrideGuard {
-            fn new(path: PathBuf) -> Self {
-                *PAYLOAD_DIR_OVERRIDE
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
-                Self
-            }
-        }
-
-        impl Drop for PayloadDirOverrideGuard {
-            fn drop(&mut self) {
-                *PAYLOAD_DIR_OVERRIDE
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            }
-        }
+        use std::time::Duration;
 
         async fn wait_for(what: &str, cond: impl Fn() -> bool) {
             for _ in 0..400 {
@@ -1575,7 +1757,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn fire_spawns_detached_with_envs() {
-            let guard = TestConfigDirGuard::new();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
             let out = guard.path.join("env-out");
             let gate = guard.path.join("gate");
             let done = guard.path.join("done");
@@ -1620,7 +1802,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn hook_stdin_is_null_not_inherited() {
-            let guard = TestConfigDirGuard::new();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
             let out = guard.path.join("stdin-out");
             let command = r#"if read -t 5 line; then echo open > "$HOOK_OUT.tmp"; else echo eof > "$HOOK_OUT.tmp"; fi; mv "$HOOK_OUT.tmp" "$HOOK_OUT""#;
             let ctx = ctx_with_global_hooks(hooks_map("turn.started", &[("stdin-probe", command)]));
@@ -1644,7 +1826,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn payload_file_is_written_and_removed() {
-            let guard = TestConfigDirGuard::new();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
             let out = guard.path.join("payload-out");
             let path_out = guard.path.join("payload-path");
             let command = r#"cp "$COYOTE_HOOK_PAYLOAD_FILE" "$HOOK_OUT.tmp" && mv "$HOOK_OUT.tmp" "$HOOK_OUT"; printf '%s' "$COYOTE_HOOK_PAYLOAD_FILE" > "$HOOK_PATH.tmp" && mv "$HOOK_PATH.tmp" "$HOOK_PATH""#;
@@ -1673,7 +1855,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn drain_pending_waits_for_spawn_not_completion() {
-            let guard = TestConfigDirGuard::new();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
             let out = guard.path.join("spawned");
             let gate = guard.path.join("gate");
             let done = guard.path.join("done");
@@ -1744,7 +1926,7 @@ mod tests {
         #[serial]
         async fn failing_hook_never_disturbs_the_engine() {
             crate::testing::install_log_collector();
-            let guard = TestConfigDirGuard::new();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
             let first = guard.path.join("first-out");
             let second = guard.path.join("second-out");
             let command = r#"echo err >&2; : > "$HOOK_OUT"; exit 1"#;
@@ -1781,7 +1963,7 @@ mod tests {
         #[serial]
         async fn payload_file_is_created_with_owner_only_mode() {
             use std::os::unix::fs::PermissionsExt;
-            let guard = TestConfigDirGuard::new();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
             let path = guard.path.join("payload.json");
 
             write_payload_file(&path, r#"{"probe":true}"#)
@@ -1795,7 +1977,7 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn payload_file_write_refuses_existing_paths() {
-            let guard = TestConfigDirGuard::new();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
 
             let plain = guard.path.join("existing.json");
             std::fs::write(&plain, "original").unwrap();
@@ -1814,7 +1996,7 @@ mod tests {
         #[serial]
         async fn payload_write_failure_still_runs_hook_without_payload_env() {
             crate::testing::install_log_collector();
-            let guard = TestConfigDirGuard::new();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
             let out = guard.path.join("env-out");
             let _payload_dir = PayloadDirOverrideGuard::new(guard.path.join("missing-payload-dir"));
             let command = r#"env > "$HOOK_OUT.tmp" && mv "$HOOK_OUT.tmp" "$HOOK_OUT""#;
@@ -1846,7 +2028,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn payload_paths_differ_across_dispatches() {
-            let guard = TestConfigDirGuard::new();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
             let first = guard.path.join("first-path");
             let second = guard.path.join("second-path");
             let command = r#"printf '%s' "$COYOTE_HOOK_PAYLOAD_FILE" > "$HOOK_PATH.tmp" && mv "$HOOK_PATH.tmp" "$HOOK_PATH""#;
@@ -1877,7 +2059,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn payload_paths_differ_within_one_fire() {
-            let guard = TestConfigDirGuard::new();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
             let first = guard.path.join("first-path");
             let second = guard.path.join("second-path");
             let command_first = r#"printf '%s' "$COYOTE_HOOK_PAYLOAD_FILE" > "$HOOK_PATH_FIRST.tmp" && mv "$HOOK_PATH_FIRST.tmp" "$HOOK_PATH_FIRST""#;
@@ -1914,7 +2096,7 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn resolved_hooks_gates_globals_and_adds_agent_hooks_through_context() {
-            let _guard = TestConfigDirGuard::new();
+            let _guard = TestConfigDirGuard::new("hooks-dispatch");
             let mut ctx =
                 ctx_with_global_hooks(hooks_map("tool.started", &[("notify", "global-cmd")]));
             let app = ctx.app.config.clone();

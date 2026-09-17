@@ -419,6 +419,10 @@ impl Default for Config {
 }
 
 pub fn install_builtins() -> Result<()> {
+    // Best-effort housekeeping riding along with the startup installers:
+    // payload files orphaned by crashed processes accumulate in a shared
+    // temp dir and nothing else ever revisits them.
+    hooks::sweep_stale_payload_files();
     Functions::install_builtin_global_tools(false)?;
     Agent::install_builtin_agents(InstallMode::Skip)?;
     Macro::install_macros(false)?;
@@ -1152,6 +1156,32 @@ pub(crate) fn ensure_parent_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The one exec-bit policy for every hook/agent installer: a file is
+/// executable iff `Language::from_extension` recognizes its extension.
+/// Users may keep non-executable support files in hooks directories, so
+/// installers must write plain and then apply this predicate — never
+/// blanket-0755.
+#[cfg(unix)]
+pub(crate) fn set_executable_bit_if_script(path: &Path) -> Result<()> {
+    use crate::function::Language;
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(ext) = path.extension().and_then(std::ffi::OsStr::to_str) else {
+        return Ok(());
+    };
+    if Language::from_extension(ext) == Language::Unsupported {
+        return Ok(());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn set_executable_bit_if_script(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn read_env_value<T>(key: &str) -> Option<Option<T>>
 where
     T: std::str::FromStr,
@@ -1824,33 +1854,7 @@ hooks:
         }
     }
 
-    /// Points the config dir at a fresh temp directory for the guard's
-    /// lifetime and removes it on drop. Tests using it must serialize.
-    struct TestConfigDirGuard {
-        _env: crate::testing::EnvVarGuard,
-        root: PathBuf,
-    }
-
-    impl TestConfigDirGuard {
-        fn new(label: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = env::temp_dir().join(format!("coyote-{label}-{unique}"));
-            fs::create_dir_all(&root).unwrap();
-            Self {
-                _env: crate::testing::EnvVarGuard::set(get_env_name("config_dir"), &root),
-                root,
-            }
-        }
-    }
-
-    impl Drop for TestConfigDirGuard {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
+    use crate::testing::TestConfigDirGuard;
 
     #[test]
     #[serial_test::serial]

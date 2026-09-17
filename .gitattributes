@@ -1,1 +1,5 @@
 assets/config-template.yaml text eol=lf
+assets/hooks/*.sh text eol=lf
+assets/functions/tools/* text eol=lf
+assets/functions/scripts/* text eol=lf
+assets/functions/utils/*.sh text eol=lf
