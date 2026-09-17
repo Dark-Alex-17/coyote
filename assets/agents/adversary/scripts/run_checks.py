@@ -51,11 +51,43 @@ GRAPH_STATE_FILE, so an inherited live state file would silently win.
 import json
 import os
 import signal
+import fcntl
 import subprocess
+import sys
 import time
 
 PER_COMMAND_TIMEOUT_SECS = 900
 TOTAL_DEADLINE_SECS = float(os.environ.get("ADVERSARY_RUN_CHECKS_DEADLINE_SECS") or 3300)
+STACK_LOCK_PATH = os.path.expanduser("~/.cache/coyote/review-stack.lock")
+STACK_LOCK_WAIT_SECS = float(os.environ.get("ADVERSARY_STACK_LOCK_WAIT_SECS") or 1200)
+
+
+def acquire_stack_lock():
+    """Serialize with the probe lane's shared-stack work (advisory flock on a
+    well-known path; the probe is instructed to flock the same file around
+    stack boot/teardown). Bounded wait so a hogged lock can never turn into a
+    false red verification: on timeout we proceed WITHOUT the lock and note it
+    on stderr. The fd is held for the process lifetime (released on exit)."""
+    try:
+        os.makedirs(os.path.dirname(STACK_LOCK_PATH), exist_ok=True)
+        fd = os.open(STACK_LOCK_PATH, os.O_CREAT | os.O_RDWR)
+    except OSError as e:
+        sys.stderr.write(f"WARN: review-stack lock unavailable ({e}); running unlocked\n")
+        return None
+    limit = time.monotonic() + STACK_LOCK_WAIT_SECS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.monotonic() >= limit:
+                os.close(fd)
+                sys.stderr.write(
+                    "WARN: review-stack lock still held after bounded wait — proceeding "
+                    "WITHOUT it; shared-stack collisions with the probe lane are possible\n"
+                )
+                return None
+            time.sleep(5)
 DRAIN_TIMEOUT_SECS = 10
 TAIL_LINES = 50
 MAX_TAIL_CHARS = 8000
@@ -181,6 +213,7 @@ def main():
     )
     deadline = time.monotonic() + TOTAL_DEADLINE_SECS
     results = []
+    _stack_lock = acquire_stack_lock() if cmds else None  # noqa: F841 — held until exit
     for cmd in cmds:
         remaining = deadline - time.monotonic()
         if remaining <= 0:

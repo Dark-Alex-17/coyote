@@ -407,6 +407,11 @@ nodes:
       The workspace may contain test files from an aborted earlier attempt of
       this lane; reconcile rather than duplicate.
 
+      Shared-stack rule: wrap any stack boot/teardown in
+      `flock "$HOME/.cache/coyote/review-stack.lock" <command>` (the adversary's
+      verification stage holds the same lock), and NEVER remove or stop containers
+      you did not create this run — a held port means wait, re-port, or INCONCLUSIVE.
+
       Derive expected behaviors from the plan/contract BEFORE reading
       implementation code, run existing suites first, then author spec-first
       tests for the uncovered delta. Return your USAGE_PROBE verdict.

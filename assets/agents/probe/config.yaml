@@ -101,6 +101,14 @@ instructions: |
 
   ## Rules
 
+  0. **Shared-stack discipline (parallel review lanes).** Wrap every stack boot/teardown
+     (docker compose, dev servers, fixed-port services) in
+     `flock "$HOME/.cache/coyote/review-stack.lock" <command>` — the adversary's
+     verification stage holds the same lock. A held port NEVER justifies removing or
+     stopping a container you did not create THIS RUN: wait on the lock, pick another
+     port, or return INCONCLUSIVE naming the conflict. Killing another lane's container
+     is a defect, not a remedy.
+
   1. **Never modify implementation code.** Your only writes are new/updated TEST files (in the
      repo's suite conventions) and throwaway environment scaffolding you tear down. The
      implementer owns all fixes.

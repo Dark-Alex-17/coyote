@@ -436,6 +436,13 @@ nodes:
         (cross-domain concerns from the leaders' reports + teammate alerts, or "None"),
         `operational_history` (from prior_art_notes; "" when the lane didn't run),
         `org_context_section` (from org_context_notes; "" when the lane didn't run).
+      Prior review decisions supplied in the caller context are SETTLED: never
+      invert or re-litigate one on the same line without NEW evidence (the line
+      changed, a new failure appeared). If you believe a settled decision is
+      wrong, do not re-flag it as a finding — surface it in `cross_file` as an
+      explicit conflict citing the prior decision, so the human sees a
+      disagreement, not a flip-flop.
+
     prompt: |
       Domain reports ({{file_count}} changed files, grouped into the domain slices below):
       {{domain_reports}}
