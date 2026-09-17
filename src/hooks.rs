@@ -173,6 +173,38 @@ impl HookEvent {
             HookEvent::JobFailed => "job.failed",
         }
     }
+
+    /// Every event, in declaration order. Dotted names stay single-sourced
+    /// through `as_str`; this exists so whitelist-glob validation can tell a
+    /// real `<event>.*` from a typo over a nonexistent event.
+    const ALL: [HookEvent; 26] = [
+        HookEvent::TurnStarted,
+        HookEvent::TurnCompleted,
+        HookEvent::TurnInterrupted,
+        HookEvent::TurnFailed,
+        HookEvent::SessionStarted,
+        HookEvent::SessionResumed,
+        HookEvent::SessionEnded,
+        HookEvent::SessionCompressed,
+        HookEvent::ToolStarted,
+        HookEvent::ToolCompleted,
+        HookEvent::ToolFailed,
+        HookEvent::LlmRequestStarted,
+        HookEvent::LlmRequestCompleted,
+        HookEvent::LlmRequestFailed,
+        HookEvent::AgentStarted,
+        HookEvent::AgentCompleted,
+        HookEvent::AgentInterrupted,
+        HookEvent::AgentFailed,
+        HookEvent::EscalationRaised,
+        HookEvent::EscalationAnswered,
+        HookEvent::GraphNodeStarted,
+        HookEvent::GraphNodeCompleted,
+        HookEvent::GraphNodeFailed,
+        HookEvent::JobStarted,
+        HookEvent::JobCompleted,
+        HookEvent::JobFailed,
+    ];
 }
 
 /// An owned snapshot of one hook to run. Detached dispatch tasks, job
@@ -264,13 +296,21 @@ fn resolve_hooks(
     {
         let prefix = format!("{event_name}.");
         for entry in gate {
-            // `<event>.*` is a valid wildcard, not a typo; the other wildcard
-            // forms (`*`, `*.*`, `*.<name>`) never match the event prefix and
-            // skip this check naturally. A partial glob like `tool.st*` is
-            // outside the grammar and stays flagged.
-            if let Some(name) = entry.strip_prefix(&prefix)
-                && name != "*"
-            {
+            // Entries containing `*` are grammatical only in the wildcard
+            // forms `*`, `*.*`, `*.<name>`, and `<event>.*` over a real
+            // event. Anything else (`tool.st*`, `ag*.completed.mark`) is a
+            // typo that admits nothing on any event and never extends a full
+            // event name, so the prefix check below would stay silent about
+            // it — flag it here instead.
+            if entry.contains('*') {
+                if !entry_is_valid_wildcard(entry) {
+                    debug!(
+                        "Ignoring invalid glob global hook whitelist entry '{entry}' for agent '{agent_name}'"
+                    );
+                }
+                continue;
+            }
+            if let Some(name) = entry.strip_prefix(&prefix) {
                 let known = global_hooks
                     .get(event_name)
                     .is_some_and(|defs| defs.iter().any(|def| def.name == name));
@@ -315,6 +355,24 @@ fn gate_entry_admits(entry: &str, event_name: &str, hook_name: &str, full_name: 
         return name == hook_name;
     }
     entry.strip_suffix(".*") == Some(event_name)
+}
+
+/// True when a `*`-containing gate entry is one of the wildcard forms
+/// `gate_entry_admits` understands. `*.<name>` takes a literal hook name
+/// (globbing inside the name is not supported), and `<event>.*` requires a
+/// real event: event names contain dots, so e.g. `tool.*` names the
+/// nonexistent event `tool` rather than a prefix over `tool.started` and
+/// `tool.completed`.
+fn entry_is_valid_wildcard(entry: &str) -> bool {
+    if entry == "*" || entry == "*.*" {
+        return true;
+    }
+    if let Some(name) = entry.strip_prefix("*.") {
+        return !name.contains('*');
+    }
+    entry
+        .strip_suffix(".*")
+        .is_some_and(|event| HookEvent::ALL.iter().any(|known| known.as_str() == event))
 }
 
 fn push_defs(event_name: &str, defs: &[HookDef], cwd: &Path, out: &mut Vec<ResolvedHook>) {
@@ -1399,7 +1457,12 @@ mod tests {
         ];
         for (event, name) in cases {
             assert_eq!(event.as_str(), name);
+            assert!(
+                HookEvent::ALL.contains(&event),
+                "HookEvent::ALL is missing {name}"
+            );
         }
+        assert_eq!(HookEvent::ALL.len(), cases.len());
     }
 
     #[test]
@@ -1666,6 +1729,52 @@ mod tests {
         assert!(debugs.iter().any(|message| {
             message.contains("turn.started.st*-marker-k4w")
                 && message.contains("for agent 'glob-flag-agent-k4w'")
+        }));
+    }
+
+    #[test]
+    fn partial_glob_over_event_prefix_logs_invalid_glob_diagnostic() {
+        crate::testing::install_log_collector();
+        let global = hooks_map("tool.started", &[("st", "cmd-st")]);
+        // `tool.st*` extends no full event name (`tool` is not an event), so
+        // the event-prefix diagnostic can never see it; the glob check must
+        // flag it instead.
+        let gate = vec!["tool.st*".to_string()];
+
+        let resolved = resolve_hooks(
+            HookEvent::ToolStarted,
+            &global,
+            Some((&gate, "prefix-glob-agent-t7c")),
+            None,
+            None,
+        );
+
+        assert!(resolved.is_empty(), "a partial glob admits nothing");
+        let debugs = crate::testing::debug_snapshot();
+        assert!(debugs.iter().any(|message| {
+            message.contains("tool.st*") && message.contains("for agent 'prefix-glob-agent-t7c'")
+        }));
+    }
+
+    #[test]
+    fn inner_glob_entries_log_invalid_glob_diagnostic() {
+        crate::testing::install_log_collector();
+        let global = hooks_map("agent.completed", &[("mark", "cmd-mark")]);
+        let gate = vec!["ag*.completed.mark".to_string()];
+
+        let resolved = resolve_hooks(
+            HookEvent::AgentCompleted,
+            &global,
+            Some((&gate, "inner-glob-agent-m2r")),
+            None,
+            None,
+        );
+
+        assert!(resolved.is_empty(), "an inner glob admits nothing");
+        let debugs = crate::testing::debug_snapshot();
+        assert!(debugs.iter().any(|message| {
+            message.contains("ag*.completed.mark")
+                && message.contains("for agent 'inner-glob-agent-m2r'")
         }));
     }
 
