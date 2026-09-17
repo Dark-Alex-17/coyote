@@ -2264,6 +2264,14 @@
     - high
     - xhigh
     - max
+  - name: zai-org/glm-5.2-maas
+    type: chat
+    max_input_tokens: 1000000
+    input_price: 1.4
+    output_price: 4.4
+    cache_read_price: 0.14
+    max_output_tokens: 64000
+    supports_function_calling: true
   - name: claude-fable-5@default
     type: chat
     max_input_tokens: 1000000
@@ -6977,9 +6985,9 @@
   - name: deepseek/deepseek-v4-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.084
-    output_price: 0.168
-    cache_read_price: 0.0168
+    input_price: 0.0886
+    output_price: 0.1772
+    cache_read_price: 0.0177
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731
@@ -7027,10 +7035,10 @@
   - name: deepseek/deepseek-v4-pro-0813
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.5795
-    output_price: 1.7384
-    cache_read_price: 0.0184
-    max_output_tokens: 393216
+    input_price: 0.66
+    output_price: 1.98
+    cache_read_price: 0.022
+    max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813:batch
     type: chat
@@ -8116,9 +8124,8 @@
   - name: nvidia/nemotron-3-nano-30b-a3b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.05
-    output_price: 0.2
-    cache_read_price: 0.03
+    input_price: 0.06
+    output_price: 0.24
     max_output_tokens: 235929
     supports_function_calling: true
   - name: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
@@ -9797,9 +9804,9 @@
   - name: tencent/hy3
     type: chat
     max_input_tokens: 262144
-    input_price: 0.0825
-    output_price: 0.33
-    cache_read_price: 0.0206
+    input_price: 0.132
+    output_price: 0.528
+    cache_read_price: 0.033
     max_output_tokens: 128000
     supports_function_calling: true
   - name: tencent/hy3-preview
@@ -10180,16 +10187,16 @@
     input_price: 0.15
     output_price: 0.6
     cache_read_price: 0.015
-    max_output_tokens: 393216
+    max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
   - name: ~deepseek/deepseek-pro-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.5795
-    output_price: 1.7384
-    cache_read_price: 0.0184
-    max_output_tokens: 393216
+    input_price: 0.66
+    output_price: 1.98
+    cache_read_price: 0.022
+    max_output_tokens: 384000
     supports_function_calling: true
   - name: ~deepseek/deepseek-v4-flash-latest
     type: chat
@@ -10298,10 +10305,10 @@
   - name: ~z-ai/glm-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.8775
-    output_price: 2.97
-    cache_read_price: 0.1755
-    max_output_tokens: 235929
+    input_price: 0.833
+    output_price: 2.618
+    cache_read_price: 0.1369
+    max_output_tokens: 943718
     supports_function_calling: true
 - provider: github
   models:
