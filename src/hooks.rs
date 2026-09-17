@@ -245,7 +245,9 @@ fn resolve_hooks(
             let full_name = format!("{event_name}.{}", def.name);
             let admitted = match agent_gate {
                 None => true,
-                Some((gate, _)) => gate.contains(&full_name),
+                Some((gate, _)) => gate
+                    .iter()
+                    .any(|entry| gate_entry_admits(entry, event_name, &def.name, &full_name)),
             };
             if admitted {
                 resolved.push(ResolvedHook {
@@ -262,7 +264,13 @@ fn resolve_hooks(
     {
         let prefix = format!("{event_name}.");
         for entry in gate {
-            if let Some(name) = entry.strip_prefix(&prefix) {
+            // `<event>.*` is a valid wildcard, not a typo; the other wildcard
+            // forms (`*`, `*.*`, `*.<name>`) never match the event prefix and
+            // skip this check naturally. A partial glob like `tool.st*` is
+            // outside the grammar and stays flagged.
+            if let Some(name) = entry.strip_prefix(&prefix)
+                && name != "*"
+            {
                 let known = global_hooks
                     .get(event_name)
                     .is_some_and(|defs| defs.iter().any(|def| def.name == name));
@@ -291,6 +299,22 @@ fn resolve_hooks(
     }
 
     resolved
+}
+
+/// Whitelist grammar for a `global_hooks` entry: `<event>.<name>` exact,
+/// `<event>.*` (every hook of that event), `*.<name>` (that hook name on
+/// every event), and `*` / `*.*` (everything). Event names contain dots
+/// while hook names never do, so `*.<name>` compares everything after the
+/// leading `*.` against the hook name alone. Anything else containing `*`
+/// (a partial glob like `tool.st*`) is not a wildcard and admits nothing.
+fn gate_entry_admits(entry: &str, event_name: &str, hook_name: &str, full_name: &str) -> bool {
+    if entry == full_name || entry == "*" || entry == "*.*" {
+        return true;
+    }
+    if let Some(name) = entry.strip_prefix("*.") {
+        return name == hook_name;
+    }
+    entry.strip_suffix(".*") == Some(event_name)
 }
 
 fn push_defs(event_name: &str, defs: &[HookDef], cwd: &Path, out: &mut Vec<ResolvedHook>) {
@@ -1475,6 +1499,174 @@ mod tests {
         );
 
         assert_eq!(names(&resolved), ["b"]);
+    }
+
+    #[test]
+    fn event_star_wildcard_admits_every_hook_of_that_event() {
+        let mut global = hooks_map("turn.started", &[("a", "cmd-a"), ("b", "cmd-b")]);
+        global.extend(hooks_map("turn.completed", &[("other", "cmd-other")]));
+        let gate = vec!["turn.started.*".to_string()];
+
+        let started = resolve_hooks(
+            HookEvent::TurnStarted,
+            &global,
+            Some((&gate, "gated-agent")),
+            None,
+            None,
+        );
+        assert_eq!(names(&started), ["a", "b"]);
+
+        let completed = resolve_hooks(
+            HookEvent::TurnCompleted,
+            &global,
+            Some((&gate, "gated-agent")),
+            None,
+            None,
+        );
+        assert!(
+            completed.is_empty(),
+            "'turn.started.*' must not admit hooks of other events"
+        );
+    }
+
+    #[test]
+    fn star_name_wildcard_admits_that_hook_on_every_event() {
+        let mut global = hooks_map("turn.started", &[("notify", "cmd-1"), ("other", "cmd-2")]);
+        global.extend(hooks_map("tool.completed", &[("notify", "cmd-3")]));
+        let gate = vec!["*.notify".to_string()];
+
+        for event in [HookEvent::TurnStarted, HookEvent::ToolCompleted] {
+            let resolved = resolve_hooks(event, &global, Some((&gate, "gated-agent")), None, None);
+            assert_eq!(
+                names(&resolved),
+                ["notify"],
+                "'*.notify' must admit exactly that hook name on {}",
+                event.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn star_and_star_dot_star_admit_everything() {
+        let mut global = hooks_map("turn.started", &[("a", "cmd-a"), ("b", "cmd-b")]);
+        global.extend(hooks_map("llm.request.failed", &[("c", "cmd-c")]));
+
+        for entry in ["*", "*.*"] {
+            let gate = vec![entry.to_string()];
+            let started = resolve_hooks(
+                HookEvent::TurnStarted,
+                &global,
+                Some((&gate, "gated-agent")),
+                None,
+                None,
+            );
+            assert_eq!(names(&started), ["a", "b"], "gate entry '{entry}'");
+
+            let failed = resolve_hooks(
+                HookEvent::LlmRequestFailed,
+                &global,
+                Some((&gate, "gated-agent")),
+                None,
+                None,
+            );
+            assert_eq!(names(&failed), ["c"], "gate entry '{entry}'");
+        }
+    }
+
+    // Event names contain dots, so `tool.*` names a nonexistent event
+    // `tool`, not a prefix over `tool.started`/`tool.completed` — like any
+    // other partial glob it admits nothing.
+    #[test]
+    fn partial_globs_admit_nothing() {
+        let global = hooks_map("tool.started", &[("st", "cmd-st"), ("stat", "cmd-stat")]);
+        let gate = vec![
+            "tool.st*".to_string(),
+            "tool.started.st*".to_string(),
+            "tool.*".to_string(),
+        ];
+
+        let resolved = resolve_hooks(
+            HookEvent::ToolStarted,
+            &global,
+            Some((&gate, "gated-agent")),
+            None,
+            None,
+        );
+
+        assert!(resolved.is_empty(), "partial globs are not wildcards");
+    }
+
+    #[test]
+    fn escalation_events_stay_ungated_under_wildcard_whitelists() {
+        let mut global = hooks_map("escalation.raised", &[("watch", "cmd-raised")]);
+        global.extend(hooks_map(
+            "escalation.answered",
+            &[("watch", "cmd-answered")],
+        ));
+        // A whitelist naming only unrelated events must not narrow the
+        // escalation resolution: the gate is nulled before any matching.
+        let gate = vec!["turn.started.*".to_string()];
+
+        for event in [HookEvent::EscalationRaised, HookEvent::EscalationAnswered] {
+            let resolved = resolve_hooks(event, &global, Some((&gate, "gated-agent")), None, None);
+            assert_eq!(
+                names(&resolved),
+                ["watch"],
+                "{} must resolve ungated regardless of whitelist content",
+                event.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn wildcard_whitelist_entries_skip_unknown_entry_diagnostics() {
+        crate::testing::install_log_collector();
+        let global = hooks_map("turn.started", &[("a", "cmd-a")]);
+        let gate = vec![
+            "turn.started.*".to_string(),
+            "*".to_string(),
+            "*.*".to_string(),
+            "*.some-name".to_string(),
+        ];
+
+        let resolved = resolve_hooks(
+            HookEvent::TurnStarted,
+            &global,
+            Some((&gate, "wildcard-exempt-agent-q9z")),
+            None,
+            None,
+        );
+
+        assert_eq!(names(&resolved), ["a"]);
+        let debugs = crate::testing::debug_snapshot();
+        assert!(
+            debugs
+                .iter()
+                .all(|message| !message.contains("wildcard-exempt-agent-q9z")),
+            "wildcard entries must not be flagged as unknown"
+        );
+    }
+
+    #[test]
+    fn partial_glob_whitelist_entries_stay_flagged_as_unknown() {
+        crate::testing::install_log_collector();
+        let global = hooks_map("turn.started", &[("a", "cmd-a")]);
+        let gate = vec!["turn.started.st*-marker-k4w".to_string()];
+
+        let resolved = resolve_hooks(
+            HookEvent::TurnStarted,
+            &global,
+            Some((&gate, "glob-flag-agent-k4w")),
+            None,
+            None,
+        );
+
+        assert!(resolved.is_empty(), "an invalid glob must admit nothing");
+        let debugs = crate::testing::debug_snapshot();
+        assert!(debugs.iter().any(|message| {
+            message.contains("turn.started.st*-marker-k4w")
+                && message.contains("for agent 'glob-flag-agent-k4w'")
+        }));
     }
 
     #[test]
