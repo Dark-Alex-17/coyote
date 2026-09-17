@@ -318,6 +318,11 @@ setup:
         fi
       user: '0'
       description: Configure SSH commit signing with a dynamic key command
+    - command: |
+        git config --system url."https://github.com/".insteadOf "git@github.com:"
+        git config --system --add url."https://github.com/".insteadOf "ssh://git@github.com/"
+      user: '0'
+      description: Route SSH GitHub remotes through HTTPS so the proxy can inject credentials
 
   startup:
     - command:
