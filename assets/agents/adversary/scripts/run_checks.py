@@ -31,7 +31,9 @@ in-script degradation would never fire. Each command gets
 min(PER_COMMAND_TIMEOUT_SECS, remaining budget); commands the deadline
 leaves no budget for are recorded as {"cmd", "skipped": "deadline"} entries,
 so the in-script handling stays authoritative. The env var
-ADVERSARY_RUN_CHECKS_DEADLINE_SECS overrides the deadline (test seam).
+ADVERSARY_RUN_CHECKS_DEADLINE_SECS overrides the deadline (test seam), and
+ADVERSARY_STACK_LOCK_PATH overrides the review-stack lock file location
+(isolation seam — see acquire_stack_lock).
 
 Process hygiene: commands run through the shell. On POSIX each command gets
 its own session (start_new_session) and a timeout SIGKILLs the whole process
@@ -51,14 +53,20 @@ GRAPH_STATE_FILE, so an inherited live state file would silently win.
 import json
 import os
 import signal
-import fcntl
 import subprocess
 import sys
 import time
 
+try:
+    import fcntl
+except ImportError:  # non-POSIX (Windows): advisory flock unavailable
+    fcntl = None
+
 PER_COMMAND_TIMEOUT_SECS = 900
 TOTAL_DEADLINE_SECS = float(os.environ.get("ADVERSARY_RUN_CHECKS_DEADLINE_SECS") or 3300)
-STACK_LOCK_PATH = os.path.expanduser("~/.cache/coyote/review-stack.lock")
+STACK_LOCK_PATH = os.environ.get("ADVERSARY_STACK_LOCK_PATH") or os.path.expanduser(
+    "~/.cache/coyote/review-stack.lock"
+)
 STACK_LOCK_WAIT_SECS = float(os.environ.get("ADVERSARY_STACK_LOCK_WAIT_SECS") or 1200)
 
 
@@ -67,7 +75,11 @@ def acquire_stack_lock():
     well-known path; the probe is instructed to flock the same file around
     stack boot/teardown). Bounded wait so a hogged lock can never turn into a
     false red verification: on timeout we proceed WITHOUT the lock and note it
-    on stderr. The fd is held for the process lifetime (released on exit)."""
+    on stderr. The fd is held for the process lifetime (released on exit).
+    On non-POSIX platforms (no fcntl) the lock is skipped entirely."""
+    if fcntl is None:
+        sys.stderr.write("WARN: review-stack lock unsupported on this platform; running unlocked\n")
+        return None
     try:
         os.makedirs(os.path.dirname(STACK_LOCK_PATH), exist_ok=True)
         fd = os.open(STACK_LOCK_PATH, os.O_CREAT | os.O_RDWR)

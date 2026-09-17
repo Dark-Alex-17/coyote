@@ -10443,13 +10443,24 @@ mod tests {
 
     // Scripts' load_state() prefers GRAPH_STATE_FILE over GRAPH_STATE, so an
     // inherited live state file (adversary verifying this repo) must not win.
+    // run_checks.py's review-stack flock defaults to ONE system-wide path;
+    // concurrent tests (or a real review running on this machine) would
+    // contend on it, and the losers' 5s-sleep retry loop burns the tight
+    // test deadlines. Every spawned script gets its own throwaway lock path.
     fn adversary_script_command(script: &str, state: &serde_json::Value) -> Command {
+        static STACK_LOCK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/adversary/scripts")
             .join(script);
+        let lock_path = env::temp_dir().join(format!(
+            "coyote-adversary-test-stack-{}-{}.lock",
+            std::process::id(),
+            STACK_LOCK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let mut cmd = Command::new("python3");
         cmd.arg(&path)
             .env("GRAPH_STATE", state.to_string())
+            .env("ADVERSARY_STACK_LOCK_PATH", &lock_path)
             .env_remove("GRAPH_STATE_FILE");
         cmd
     }
@@ -11039,6 +11050,67 @@ mod tests {
             elapsed < Duration::from_secs(30),
             "the post-kill drain must be bounded by DRAIN_TIMEOUT_SECS, took {elapsed:?}: {results:?}"
         );
+    }
+
+    /// ADVERSARY_STACK_LOCK_PATH must relocate the review-stack flock:
+    /// without it, every concurrent run_checks.py (parallel tests, or a real
+    /// review on the same machine) contends on the one system-wide lock path
+    /// and the losers' retry loop burns the total deadline budget.
+    #[test]
+    #[cfg(unix)]
+    fn adversary_run_checks_stack_lock_path_is_env_overridable() {
+        if !cmd_available("python3") || !cmd_available("sh") {
+            eprintln!("skipping: python3 or sh not available");
+            return;
+        }
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = env::temp_dir().join(format!(
+            "coyote-adversary-run-checks-lockpath-{}-{unique}",
+            std::process::id()
+        ));
+        create_dir_all(&tmp).unwrap();
+        // A not-yet-existing subdir pins the makedirs-on-override behavior.
+        let lock_path = tmp.join("override").join("stack.lock");
+        let lock_env = lock_path.to_str().unwrap();
+        let state = json!({"verification_commands": ["true"]});
+
+        // Two sequential runs with the same override: the lock fd is held
+        // only for the process lifetime, so the second run must acquire
+        // immediately — and both use the OVERRIDDEN location.
+        for run in 0..2 {
+            let out = run_adversary_script_env(
+                "run_checks.py",
+                &state,
+                &[("ADVERSARY_STACK_LOCK_PATH", lock_env)],
+            );
+            assert_eq!(
+                out["exec_results"][0]["exit"], 0,
+                "run {run}: the declared command must run to completion: {out}"
+            );
+            assert!(
+                lock_path.exists(),
+                "run {run}: the stack lock must be taken at the overridden path {}",
+                lock_path.display()
+            );
+        }
+
+        // No declared commands → the lock is skipped entirely: a fresh
+        // override path must never be created.
+        let skipped = tmp.join("skipped.lock");
+        let _ = run_adversary_script_env(
+            "run_checks.py",
+            &json!({}),
+            &[("ADVERSARY_STACK_LOCK_PATH", skipped.to_str().unwrap())],
+        );
+        assert!(
+            !skipped.exists(),
+            "with no declared commands the lock must be skipped, but {} was created",
+            skipped.display()
+        );
+        let _ = remove_dir_all(&tmp);
     }
 
     /// TOTAL_DEADLINE_SECS in run_checks.py and the run_checks node's
