@@ -58,8 +58,46 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::{env, fs, process, sync::Arc};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Stack headroom for the thread that polls the root async future, and for
+/// the runtime's worker threads.
+///
+/// Windows links the process main thread with a ~1 MiB stack (unix defaults
+/// to 8 MiB), and the root future is a compiler-generated state machine
+/// whose debug-build poll frames blow through 1 MiB the moment it is
+/// polled — every binary invocation dies with STATUS_STACK_OVERFLOW
+/// (0xC00000FD) before doing any work. 16 MiB gives comfortable headroom
+/// over the deepest observed frames on every platform.
+const MAIN_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+/// Bootstraps the async entry point on a dedicated thread with an explicit
+/// large stack instead of `#[tokio::main]`, which would poll the root
+/// future on the (small, non-configurable) OS main thread. Everything else
+/// matches the macro expansion: same multi-thread runtime flavor, same
+/// `enable_all()` driver set (so `tokio::signal::ctrl_c()` keeps working),
+/// same `block_on` of the async body, and the `Result` propagates
+/// unchanged. Worker threads get the same headroom because spawned tasks
+/// (graph nodes, subagents) embed the same class of giant state machine.
+/// The thread is named "main" and panics are re-raised on the real main
+/// thread without re-invoking the panic hook, keeping panic output and the
+/// exit code identical to the direct arrangement.
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("main".into())
+        .stack_size(MAIN_STACK_SIZE)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(MAIN_STACK_SIZE)
+                .build()
+                .expect("failed to build the tokio runtime")
+                .block_on(async_main())
+        })
+        .expect("failed to spawn the main bootstrap thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+async fn async_main() -> Result<()> {
     load_env_file()?;
     CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
