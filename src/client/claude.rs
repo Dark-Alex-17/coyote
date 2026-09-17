@@ -407,7 +407,16 @@ pub fn claude_build_chat_completions_body(
                         let mut user_parts = vec![];
                         for (index, tool_result) in tool_results.iter().enumerate() {
                             for block in &tool_result.thinking {
-                                assistant_parts.push(json!(block));
+                                // Only Anthropic thinking blocks replay here;
+                                // Responses reasoning items (and any future
+                                // variant) are dropped.
+                                if matches!(
+                                    block,
+                                    ThinkingBlock::Thinking { .. }
+                                        | ThinkingBlock::RedactedThinking { .. }
+                                ) {
+                                    assistant_parts.push(json!(block));
+                                }
                             }
                             let round_text = if index == 0 && !text.is_empty() {
                                 Some(text.as_str())
@@ -475,7 +484,16 @@ pub fn claude_build_chat_completions_body(
                                 chunk_ids.insert(id);
                             }
                             for block in &tool_result.thinking {
-                                assistant_parts.push(json!(block));
+                                // Only Anthropic thinking blocks replay here;
+                                // Responses reasoning items (and any future
+                                // variant) are dropped.
+                                if matches!(
+                                    block,
+                                    ThinkingBlock::Thinking { .. }
+                                        | ThinkingBlock::RedactedThinking { .. }
+                                ) {
+                                    assistant_parts.push(json!(block));
+                                }
                             }
                             let round_text = if index == 0 && !text.is_empty() {
                                 Some(text.as_str())
@@ -873,6 +891,48 @@ mod tests {
         let messages = body["messages"].as_array().unwrap();
 
         assert_eq!(messages.len(), 1, "body: {body}");
+    }
+
+    #[test]
+    fn replays_only_anthropic_thinking_blocks() {
+        let mixed = ToolResult {
+            call: ToolCall::new(
+                "fs_read".into(),
+                json!({"path": "x"}),
+                Some("toolu_A".into()),
+            ),
+            output: json!("ok"),
+            text: None,
+            thinking: vec![
+                ThinkingBlock::Thinking {
+                    thinking: "hmm".into(),
+                    signature: "sig123".into(),
+                },
+                ThinkingBlock::RedactedThinking {
+                    data: "b64data".into(),
+                },
+                ThinkingBlock::Reasoning {
+                    id: "rs_1".into(),
+                    summary: json!([{ "type": "summary_text", "text": "thinking" }]),
+                    encrypted_content: Some("enc123".into()),
+                },
+            ],
+        };
+
+        for sequence in [false, true] {
+            let body = build_body_with(vec![mixed.clone()], "", sequence, false);
+
+            let content = body["messages"][1]["content"].as_array().unwrap();
+            let types: Vec<_> = content
+                .iter()
+                .map(|block| block["type"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                types,
+                ["thinking", "redacted_thinking", "tool_use"],
+                "body: {body}"
+            );
+        }
     }
 
     #[test]

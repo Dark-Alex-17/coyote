@@ -302,4 +302,28 @@ sync_models_ttl_hours: 24        # Hours before the synced model catalog is cons
 #
 # The claude, bedrock, and vertexai clients also support:
 #   prompt_cache: true                              # Enable Anthropic prompt caching (default: true)
+#
+# The openai and openai-compatible clients also support:
+#   wire_api: responses                             # Which OpenAI wire protocol to use; Possible values: responses and chat
+#                                                   # Defaults when unset: stock openai (no api_base) -> responses;
+#                                                   # openai with a custom api_base -> chat; openai-compatible -> chat.
+#                                                   # Codex OAuth always uses responses (`wire_api: chat` there is a config error)
+#
+# Patches are selected per wire: `chat_completions` patches only ever touch chat bodies. To patch
+# requests on the responses wire, use the `responses` key on the client `patch` block (same
+# <regex> -> url/body/headers shape as chat_completions):
+#   patch:
+#     responses:
+#       <regex>:
+#         body:
+#           <json>
+# Model patches likewise: the top-level `patch` keys apply to the chat wire only, and a
+# `responses:` sub-key applies to the responses wire only:
+#   models:
+#     - name: xxxx
+#       patch:
+#         responses:
+#           body:
+#             <json>
+# Env override per wire: COYOTE_PATCH_<client>_RESPONSES / COYOTE_PATCH_<client>_CHAT_COMPLETIONS
 __CLIENTS_BLOCK__
