@@ -649,5 +649,117 @@ PY
   echo "PASS: terminal ctrl-c fires exactly one agent.interrupted with no COYOTE_AGENT_ERROR; never failed/completed"
 fi
 
+echo "== Scenario K: global_hooks wildcard grammar (exact, <event>.*, *.<name>, *.*, invalid globs) =="
+# Global hooks: agent.started has one hook named 'mark'; agent.completed has
+# two hooks named 'mark' and 'other'. Each sub-case runs the same
+# `--agent wc-probe --macro probe` recipe in its own config dir with a
+# different global_hooks whitelist, then asserts exactly which markers were
+# admitted. The binary drains pending hooks before exiting, so post-exit
+# waits only absorb filesystem latency.
+k_run() {
+  # $1 = label, $2 = marker log, $3.. = global_hooks entries (verbatim)
+  local label="$1" klog="$2"
+  shift 2
+  local kcfg="$WORKDIR/k-$label"
+  mkdir -p "$kcfg/agents/wc-probe" "$kcfg/macros"
+  write_dryrun_config "$kcfg" "hooks:" \
+    "  agent.started:" \
+    "    - name: mark" \
+    "      command: \"echo S-mark >> $klog\"" \
+    "  agent.completed:" \
+    "    - name: mark" \
+    "      command: \"echo C-mark >> $klog\"" \
+    "    - name: other" \
+    "      command: \"echo C-other >> $klog\""
+  {
+    printf 'name: wc-probe\n'
+    printf 'description: wildcard whitelist probe agent\n'
+    printf 'version: 0.1.0\n'
+    printf 'instructions: |\n'
+    printf '  You are a probe agent. Reply briefly.\n'
+    printf 'global_hooks:\n'
+    local entry
+    for entry in "$@"; do
+      printf '  - "%s"\n' "$entry"
+    done
+  } > "$kcfg/agents/wc-probe/config.yaml"
+  printf 'steps:\n  - ".set temperature 0.5"\n' > "$kcfg/macros/probe.yaml"
+  COYOTE_CONFIG_DIR="$kcfg" "$BIN" --agent wc-probe --macro probe > /dev/null 2>&1 \
+    || fail "scenario K ($label): --agent wc-probe --macro probe exited nonzero"
+}
+
+marker_count_is() { # $1 = log, $2 = marker, $3 = expected count
+  local n
+  n="$(grep -c -x -- "$2" "$1" 2>/dev/null)" || n=0
+  [ "${n:-0}" = "$3" ]
+}
+
+# K1: exact <event>.<name> admits only that hook on that event (unchanged).
+KLOG1="$WORKDIR/k1.log"
+k_run exact "$KLOG1" "agent.completed.mark"
+wait_for "K1 C-mark" marker_count_is "$KLOG1" C-mark 1
+marker_count_is "$KLOG1" S-mark 0 || fail "K1: exact entry leaked agent.started: $(cat "$KLOG1")"
+marker_count_is "$KLOG1" C-other 0 || fail "K1: exact entry leaked sibling hook 'other': $(cat "$KLOG1")"
+
+# K2: <event>.* admits every hook of that event, nothing else.
+KLOG2="$WORKDIR/k2.log"
+k_run event-star "$KLOG2" "agent.completed.*"
+wait_for "K2 C-mark" marker_count_is "$KLOG2" C-mark 1
+wait_for "K2 C-other" marker_count_is "$KLOG2" C-other 1
+marker_count_is "$KLOG2" S-mark 0 || fail "K2: agent.completed.* leaked agent.started: $(cat "$KLOG2")"
+
+# K3: *.<name> admits that hook name on every event, nothing else.
+KLOG3="$WORKDIR/k3.log"
+k_run star-name "$KLOG3" "*.mark"
+wait_for "K3 S-mark" marker_count_is "$KLOG3" S-mark 1
+wait_for "K3 C-mark" marker_count_is "$KLOG3" C-mark 1
+marker_count_is "$KLOG3" C-other 0 || fail "K3: *.mark leaked hook 'other': $(cat "$KLOG3")"
+
+# K4: *.* admits everything (the bare * form is pinned by tests/macro_bracketing.rs).
+KLOG4="$WORKDIR/k4.log"
+k_run star-star "$KLOG4" "*.*"
+wait_for "K4 S-mark" marker_count_is "$KLOG4" S-mark 1
+wait_for "K4 C-mark" marker_count_is "$KLOG4" C-mark 1
+wait_for "K4 C-other" marker_count_is "$KLOG4" C-other 1
+
+# K5: partial/inner globs are NOT wildcards — they admit nothing, and the run
+# is otherwise unaffected (exit code checked inside k_run). The exact
+# agent.started.mark entry is the positive signal bounding the absence checks.
+KLOG5="$WORKDIR/k5.log"
+k_run invalid-globs "$KLOG5" "agent.completed.ma*" "agent.*" "ag*.completed.mark" "agent.started.mark"
+wait_for "K5 S-mark" marker_count_is "$KLOG5" S-mark 1
+marker_count_is "$KLOG5" C-mark 0 || fail "K5: a partial glob admitted agent.completed.mark: $(cat "$KLOG5")"
+marker_count_is "$KLOG5" C-other 0 || fail "K5: a partial glob admitted agent.completed.other: $(cat "$KLOG5")"
+echo "PASS: wildcard whitelist grammar admits exactly the spec'd sets; partial globs stay inert"
+
+echo "== Scenario L: --macro without --agent fires zero agent.* events =="
+CFG_L="$WORKDIR/l"
+mkdir -p "$CFG_L/macros"
+L_AGENT_LOG="$WORKDIR/l-agent-events.log"
+L_SENTINEL_LOG="$WORKDIR/l-sentinel.log"
+write_dryrun_config "$CFG_L" "hooks:" \
+  "  agent.started:" \
+  "    - name: mark" \
+  "      command: \"echo STARTED >> $L_AGENT_LOG\"" \
+  "  agent.completed:" \
+  "    - name: mark" \
+  "      command: \"echo COMPLETED >> $L_AGENT_LOG\"" \
+  "  agent.failed:" \
+  "    - name: mark" \
+  "      command: \"echo FAILED >> $L_AGENT_LOG\"" \
+  "  turn.completed:" \
+  "    - name: sentinel" \
+  "      command: \"echo SENTINEL >> $L_SENTINEL_LOG\""
+printf 'steps:\n  - ".set temperature 0.5"\n' > "$CFG_L/macros/probe.yaml"
+COYOTE_CONFIG_DIR="$CFG_L" "$BIN" --macro probe > /dev/null 2>&1 \
+  || fail "scenario L: --macro without --agent exited nonzero"
+# Proving absence needs a positive signal to wait on: a follow-up plain run
+# fires turn.completed, and its sentinel landing bounds how long the macro
+# run's (nonexistent) agent.* children could have taken to write.
+COYOTE_CONFIG_DIR="$CFG_L" "$BIN" --no-stream "say exactly: hi" > /dev/null
+wait_for "scenario L sentinel" test -s "$L_SENTINEL_LOG"
+[ -s "$L_AGENT_LOG" ] && fail "expected zero agent.* events from --macro without --agent, got: $(cat "$L_AGENT_LOG")"
+echo "PASS: --macro without --agent fired zero agent.* hook events and exited cleanly"
+
 echo
 echo "ALL SCENARIOS PASSED"
