@@ -654,8 +654,9 @@ echo "== Scenario K: global_hooks wildcard grammar (exact, <event>.*, *.<name>, 
 # two hooks named 'mark' and 'other'. Each sub-case runs the same
 # `--agent wc-probe --macro probe` recipe in its own config dir with a
 # different global_hooks whitelist, then asserts exactly which markers were
-# admitted. The binary drains pending hooks before exiting, so post-exit
-# waits only absorb filesystem latency.
+# admitted. The binary's exit drain only acknowledges hook SPAWNS — the hook
+# processes finish on their own after exit — so every expected marker gets
+# its own wait_for before any absence check reads the log.
 k_run() {
   # $1 = label, $2 = marker log, $3.. = global_hooks entries (verbatim)
   local label="$1" klog="$2"

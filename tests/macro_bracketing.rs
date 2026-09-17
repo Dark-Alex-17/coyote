@@ -130,21 +130,27 @@ fn run_coyote(dir: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-/// Bounded poll for the expected terminal marker. The binary drains pending
-/// hooks before exiting, so the log is normally complete once `output()`
-/// returns; the poll only absorbs filesystem latency, never paces the run.
-/// Marker matching stays byte-exact on both platforms because `lines()`
-/// strips the CRLF that cmd's echo emits on Windows.
-fn wait_for_marker(log: &Path, needle: &str) -> String {
+/// Bounded poll until every expected marker is present. The binary's exit
+/// drain only acknowledges that each hook process SPAWNED — the hooks
+/// themselves keep running concurrently after `output()` returns, and
+/// nothing orders their writes (the STARTED writer can land after the
+/// terminal one). Waiting on all expected markers, not just the terminal
+/// one, keeps the exact-count assertions below race-free. Marker matching
+/// stays byte-exact on both platforms because `lines()` strips the CRLF
+/// that cmd's echo emits on Windows.
+fn wait_for_markers(log: &Path, needles: &[&str]) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let contents = fs::read_to_string(log).unwrap_or_default();
-        if contents.lines().any(|line| line == needle) {
+        if needles
+            .iter()
+            .all(|needle| contents.lines().any(|line| line == *needle))
+        {
             return contents;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for '{needle}'; log so far: {contents:?}"
+            "timed out waiting for {needles:?}; log so far: {contents:?}"
         );
         thread::sleep(Duration::from_millis(50));
     }
@@ -187,7 +193,7 @@ fn probe_macro_run(label: &str, macro_yaml: &str, args: &[&str], expect_success:
     } else {
         "FAILED"
     };
-    let contents = wait_for_marker(&log, terminal);
+    let contents = wait_for_markers(&log, &["STARTED", terminal]);
     assert_started_and_single_terminal(&contents, terminal);
     contents
 }
