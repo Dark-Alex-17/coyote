@@ -635,7 +635,7 @@ async fn run_hook(
             let _ = child.wait().await;
         }
         Err(err) => {
-            warn!(
+            debug!(
                 "Failed to spawn hook '{}' in '{}': {err}",
                 hook.full_name,
                 hook.cwd.display()
@@ -1413,13 +1413,29 @@ mod tests {
             &[("watch", "cmd-answered")],
         ));
         global.extend(hooks_map("tool.started", &[("watch", "cmd-tool")]));
+        let mut role = hooks_map("escalation.raised", &[("role-watch", "role-raised")]);
+        role.extend(hooks_map(
+            "escalation.answered",
+            &[("role-watch", "role-answered")],
+        ));
+        let mut agent = hooks_map("escalation.raised", &[("own-watch", "agent-raised")]);
+        agent.extend(hooks_map(
+            "escalation.answered",
+            &[("own-watch", "agent-answered")],
+        ));
 
         for event in [HookEvent::EscalationRaised, HookEvent::EscalationAnswered] {
-            let resolved = resolve_hooks(event, &global, Some((&[], "gated-agent")), None, None);
+            let resolved = resolve_hooks(
+                event,
+                &global,
+                Some((&[], "gated-agent")),
+                Some(&role),
+                Some((&agent, "gated-agent")),
+            );
             assert_eq!(
                 names(&resolved),
-                ["watch"],
-                "{} must resolve without a whitelist entry",
+                ["watch", "role-watch", "own-watch"],
+                "{} must resolve global, role, and agent hooks without a whitelist entry",
                 event.as_str()
             );
         }
@@ -2062,7 +2078,7 @@ mod tests {
             // does the empty directory below demonstrate the orphan unlink
             // rather than a payload file that never existed.
             wait_for("spawn failure log", || {
-                crate::testing::warn_snapshot().iter().any(|message| {
+                crate::testing::debug_snapshot().iter().any(|message| {
                     message.contains("Failed to spawn hook 'tool.started.spawnfail-marker-c9d'")
                 })
             })
@@ -2117,7 +2133,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
-        async fn empty_command_logs_debug_and_spawn_failure_logs_warn() {
+        async fn error_paths_log_debug_only() {
             crate::testing::install_log_collector();
             let empty_cwd = env::temp_dir();
             let hooks = vec![
@@ -2145,18 +2161,12 @@ mod tests {
                     && message.contains("empty command")
                     && message.contains(empty_cwd_display.as_str())
             }));
-            // A failed spawn silently suppresses the hook, so it must be
-            // loud enough to notice; a skipped empty command stays debug.
-            let warns = crate::testing::warn_snapshot();
-            assert!(warns.iter().any(|message| {
+            assert!(debugs.iter().any(|message| {
                 message.contains("Failed to spawn hook 'turn.failed.badcwd-marker-f5b'")
                     && message.contains("/nonexistent/coyote-badcwd-marker-f5b")
             }));
-            assert!(
-                warns
-                    .iter()
-                    .all(|message| !message.contains("empty-marker-f5b"))
-            );
+            let warns = crate::testing::warn_snapshot();
+            assert!(warns.iter().all(|message| !message.contains("marker-f5b")));
         }
 
         #[tokio::test(flavor = "multi_thread")]
