@@ -53,7 +53,11 @@ impl AgentNodeExecutor {
             // The child's own abort signal dies inside `run`; the session
             // signal is what a user interrupt fires (the executor bridges it
             // onto the graph abort), so it is the only honest
-            // interrupted-vs-failed discriminator at this seam.
+            // interrupted-vs-failed discriminator at this seam. Blind spot:
+            // agent__cancel sets the child handle's signal, which never
+            // reaches parent_ctx.session_abort, so a node failing during
+            // such a cancellation stays agent.failed while the outer bracket
+            // reports agent.interrupted (narrow window, accepted).
             if parent_ctx
                 .session_abort
                 .as_ref()
@@ -493,6 +497,37 @@ mod tests {
         assert!(
             !captures[0].envs.contains_key("COYOTE_AGENT_ERROR"),
             "an interruption is not a failure and carries no error env"
+        );
+    }
+
+    /// The inverse gate: a failure whose session signal never fired stays
+    /// `agent.failed` with its error env — the presence of a signal alone
+    /// must not reclassify a real failure as an interruption.
+    #[tokio::test]
+    #[serial]
+    async fn execute_failure_without_fired_session_abort_fires_agent_failed() {
+        let _sink = test_sink::install();
+        let marker = "graph-agent-fail-inv-x7q";
+        let mut ctx = ctx_with_agent_hooks(marker);
+        // Past max depth the node fails before touching agent config on disk.
+        ctx.current_depth = default_max_agent_depth();
+        ctx.session_abort = Some(create_abort_signal());
+        let node = node_with("hi", None);
+        let mut state = manager_with(&[]);
+
+        AgentNodeExecutor::execute("test_node", &node, &mut state, &mut ctx, false)
+            .await
+            .expect_err("agent past max depth should fail");
+
+        let captures: Vec<_> = test_sink::snapshot()
+            .into_iter()
+            .filter(|capture| capture.hook_name.starts_with(marker))
+            .collect();
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(captures[0].hook_name, format!("{marker}-agent.failed"));
+        assert!(
+            captures[0].envs.contains_key("COYOTE_AGENT_ERROR"),
+            "a real failure keeps its error env"
         );
     }
 

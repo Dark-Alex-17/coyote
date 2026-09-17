@@ -25,6 +25,10 @@
 #      path refused) and notify.sh's no-notifier/no-tty fallback strips
 #      ANSI/OSC control bytes; the hooks-dir .builtin-manifest is never
 #      installed executable.
+#   I) `--session <name>` discriminates the session events end-to-end: a
+#      fresh named session fires exactly one session.started (and no
+#      session.resumed); resuming a persisted session fires exactly one
+#      session.resumed (and no session.started).
 #
 # Not covered here (see src/function/mod.rs tests for tool.* + payload-file
 # coverage instead): a live tool.started firing requires a real LLM round
@@ -457,6 +461,39 @@ grep -Fq '[coyote] turn.completed tool=evil]0;own[31mred' "$NOTIFY_OUT" \
 ! LC_ALL=C grep -q "$(printf '\033')" "$NOTIFY_OUT" \
   || fail "ANSI/OSC escape bytes leaked through the notify.sh tty fallback"
 echo "PASS: installed hook scripts honor XDG default, 0600, UTC timestamps, symlink refusal, secret filter, and ANSI-stripped notify fallback"
+
+echo "== Scenario I: session.started vs session.resumed via --session =="
+CFG_I="$WORKDIR/i"
+mkdir -p "$CFG_I"
+SESS_LOG="$WORKDIR/i-sess.log"
+write_dryrun_config "$CFG_I" "hooks:" \
+  "  session.started:" \
+  "    - name: probe-sess" \
+  "      command: \"echo STARTED >> $SESS_LOG\"" \
+  "  session.resumed:" \
+  "    - name: probe-sess" \
+  "      command: \"echo RESUMED >> $SESS_LOG\""
+
+# A fresh named session (no file on disk yet) fires session.started only.
+COYOTE_CONFIG_DIR="$CFG_I" "$BIN" --session probe-fresh --no-stream "say exactly: hi" > /dev/null
+wait_for "session.started log" test -s "$SESS_LOG"
+[ "$(grep -c '^STARTED$' "$SESS_LOG" 2>/dev/null || echo 0)" = "1" ] \
+  || fail "expected exactly one session.started for a fresh session, got: $(cat "$SESS_LOG")"
+grep -q '^RESUMED$' "$SESS_LOG" \
+  && fail "a fresh named session must not fire session.resumed: $(cat "$SESS_LOG")"
+
+# A persisted session on disk: resuming it fires session.resumed, and never
+# session.started (the inverse gate).
+mkdir -p "$CFG_I/sessions"
+printf 'model: dryrun:dry-model\nmessages: []\n' > "$CFG_I/sessions/probe-resume.yaml"
+COYOTE_CONFIG_DIR="$CFG_I" "$BIN" --session probe-resume --no-stream "say exactly: hi" > /dev/null
+scenario_i_resumed() { grep -q '^RESUMED$' "$SESS_LOG"; }
+wait_for "session.resumed log" scenario_i_resumed
+[ "$(grep -c '^RESUMED$' "$SESS_LOG" 2>/dev/null || echo 0)" = "1" ] \
+  || fail "expected exactly one session.resumed for a resumed session, got: $(cat "$SESS_LOG")"
+[ "$(grep -c '^STARTED$' "$SESS_LOG" 2>/dev/null || echo 0)" = "1" ] \
+  || fail "resuming a session must not fire session.started: $(cat "$SESS_LOG")"
+echo "PASS: fresh session fires session.started only; resume fires session.resumed only"
 
 echo
 echo "ALL SCENARIOS PASSED"

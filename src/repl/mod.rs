@@ -19,6 +19,7 @@ use crate::config::{AssetCategory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::hooks::{self, HookEvent};
 use crate::render::render_error;
+use crate::supervisor::Supervisor;
 use crate::utils::{
     AbortSignal, SHELL, abortable_run_with_spinner, create_abort_signal, dimmed_text,
     drain_stale_tty_input, run_command, set_text, temp_file,
@@ -512,9 +513,8 @@ Type ".help" for additional help.
                     }
                 }
                 Ok(Signal::CtrlC) => {
-                    self.abort_signal.set_ctrlc();
                     if let Some(supervisor) = self.ctx.read().supervisor.clone() {
-                        supervisor.read().cancel_recursive();
+                        latch_prompt_interrupt(&self.abort_signal, &supervisor);
                     }
                     println!("(To exit, press Ctrl+D or enter \".exit\")\n");
                 }
@@ -1715,6 +1715,21 @@ fn reset_continuation(ctx: &mut RequestContext) {
     ctx.reset_continuation_count();
 }
 
+/// Ctrl-C at the prompt: cancel background work, but only latch the abort
+/// signal when there was live work to cancel. An idle-prompt ctrl-c is a
+/// step on the advertised exit path ("To exit, press Ctrl+D"), not an
+/// interruption, so teardown after the following ctrl-d classifies the run
+/// as completed. Mid-turn ctrl-c never passes through here -- it latches
+/// the signal directly (wait_user_interrupt / poll_abort_signal), so an
+/// interrupted turn followed by ctrl-d still reports agent.interrupted.
+pub(crate) fn latch_prompt_interrupt(abort_signal: &AbortSignal, supervisor: &RwLock<Supervisor>) {
+    let supervisor = supervisor.read();
+    if supervisor.has_active_tasks() {
+        abort_signal.set_ctrlc();
+    }
+    supervisor.cancel_recursive();
+}
+
 fn pause_banner_text(ctx: &RequestContext) -> Option<String> {
     let reason = ctx.auto_continue_paused.as_deref()?;
     if !ctx.todo_list.has_incomplete() {
@@ -2897,5 +2912,64 @@ mod tests {
         ctx.add_todo("write code");
 
         assert_eq!(pause_banner_text(&ctx), None);
+    }
+
+    #[test]
+    fn latch_prompt_interrupt_stays_clear_at_idle_prompt() {
+        let abort = create_abort_signal();
+        let supervisor = RwLock::new(Supervisor::new(4, 3));
+
+        latch_prompt_interrupt(&abort, &supervisor);
+
+        assert!(
+            !abort.aborted_ctrlc(),
+            "ctrl-c with nothing to cancel must not latch as an interruption"
+        );
+    }
+
+    #[test]
+    fn latch_prompt_interrupt_latches_when_cancelling_active_children() {
+        use crate::supervisor::mailbox::Inbox;
+        use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
+
+        // Keep the runtime alive so the spawned task is never polled and the
+        // child counts as running.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let join_handle = rt.spawn(async {
+            Ok(AgentResult {
+                id: "done".into(),
+                agent_name: "test".into(),
+                output: "result".into(),
+                exit_status: AgentExitStatus::Completed,
+            })
+        });
+        let child_signal = create_abort_signal();
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(AgentHandle {
+            id: "a1".to_string(),
+            agent_name: "explore".to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: child_signal.clone(),
+            join_handle,
+            child_supervisor: None,
+        })
+        .unwrap();
+        let supervisor = RwLock::new(sup);
+        let abort = create_abort_signal();
+
+        latch_prompt_interrupt(&abort, &supervisor);
+
+        assert!(
+            abort.aborted_ctrlc(),
+            "cancelling live work is an interruption"
+        );
+        assert!(
+            child_signal.aborted_ctrlc(),
+            "the child must still be cancelled"
+        );
     }
 }

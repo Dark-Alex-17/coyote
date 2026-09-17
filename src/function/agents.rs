@@ -1782,7 +1782,11 @@ fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Val
             let _ = request.reply_tx.send(reply.to_string());
             // Origin envs come from the taken request, not this (replying)
             // context, so `escalation.answered` and `escalation.raised`
-            // describe the same agent for one escalation id.
+            // describe the same agent for one escalation id. "Answered"
+            // means a parent submitted an answer, not that the asker
+            // received it: the reply_tx.send failure is ignored by design,
+            // so the event also fires for an escalation whose asker already
+            // timed out or was cancelled.
             hooks::fire(
                 HookEvent::EscalationAnswered,
                 ctx,
@@ -3397,6 +3401,79 @@ mod tests {
         let result =
             handle_reply_escalation(&mut ctx, &json!({"escalation_id": "x", "reply": "y"}));
         assert!(result.is_err());
+    }
+
+    /// `escalation.answered` belongs to the successful take -> reply arm
+    /// alone: exactly once per escalation, and never from the failure arms
+    /// (unknown id, already-taken id).
+    #[test]
+    #[serial]
+    fn reply_escalation_fires_answered_once_and_never_on_failure_arms() {
+        let _sink = hooks::test_sink::install();
+        let marker = "t049_answered_once";
+        let mut hooks_map = crate::hooks::HooksMap::default();
+        hooks_map.insert(
+            "escalation.answered".to_string(),
+            vec![crate::hooks::HookDef {
+                name: marker.to_string(),
+                command: "true".to_string(),
+            }],
+        );
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            hooks: hooks_map,
+            ..Default::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let queue = Arc::new(EscalationQueue::new());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        queue.submit(EscalationRequest {
+            id: "esc_once".into(),
+            from_agent_id: "a1".into(),
+            from_agent_name: "explore".into(),
+            question: "[input] What do?".into(),
+            options: None,
+            reply_tx: tx,
+        });
+        ctx.escalation_queue = Some(queue);
+
+        // Unknown id: an error result, and no event.
+        let miss = handle_reply_escalation(
+            &mut ctx,
+            &json!({"escalation_id": "missing", "reply": "nope"}),
+        )
+        .unwrap();
+        assert_eq!(miss["status"], "error");
+        assert!(
+            hook_captures_named(marker).is_empty(),
+            "a failed reply must not fire escalation.answered"
+        );
+
+        // The successful take -> reply arm fires it exactly once.
+        let ok = handle_reply_escalation(
+            &mut ctx,
+            &json!({"escalation_id": "esc_once", "reply": "do X"}),
+        )
+        .unwrap();
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(rx.blocking_recv().unwrap(), "do X");
+        let answered = hook_captures_named(marker);
+        assert_eq!(answered.len(), 1, "{answered:?}");
+        assert_eq!(answered[0].envs["COYOTE_ESCALATION_ID"], "esc_once");
+        assert_eq!(answered[0].envs["COYOTE_ESCALATION_REPLY"], "do X");
+
+        // Replying again to the same id hits the already-taken arm: still one.
+        let again = handle_reply_escalation(
+            &mut ctx,
+            &json!({"escalation_id": "esc_once", "reply": "again"}),
+        )
+        .unwrap();
+        assert_eq!(again["status"], "error");
+        assert_eq!(
+            hook_captures_named(marker).len(),
+            1,
+            "a second reply must not re-fire escalation.answered"
+        );
     }
 
     #[test]

@@ -8619,6 +8619,50 @@ mod tests {
         }));
     }
 
+    /// The REPL's advertised exit path -- ctrl-c at an idle prompt (which
+    /// prints "To exit, press Ctrl+D"), then ctrl-d -- is a deliberate exit:
+    /// with no active tasks to cancel the prompt latch stays clear, so
+    /// teardown fires agent.completed, never agent.interrupted.
+    #[test]
+    #[serial]
+    fn idle_prompt_ctrlc_then_ctrld_exit_fires_agent_completed() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "agent-top-idle-cc-w2b";
+        let agent_name = unique_name("hook_agent");
+        seed_agent_with_hooks(&agent_name, marker);
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort.clone())).unwrap();
+        ctx.top_level_agent_started();
+
+        // Ctrl-c at the idle prompt: nothing to cancel, so no latch.
+        let supervisor = Arc::new(RwLock::new(Supervisor::new(4, 3)));
+        crate::repl::latch_prompt_interrupt(&abort, &supervisor);
+        assert!(!abort.aborted_ctrlc());
+
+        // Ctrl-d exits; teardown sees only the ctrl-d flag.
+        abort.set_ctrld();
+        ctx.top_level_agent_finished(None, Some(&abort));
+
+        let captures = marker_captures(marker);
+        assert_eq!(
+            captures
+                .iter()
+                .filter(|capture| capture.hook_name == format!("{marker}-agent.completed"))
+                .count(),
+            1
+        );
+        assert!(
+            captures
+                .iter()
+                .all(|capture| capture.hook_name != format!("{marker}-agent.interrupted")),
+            "a deliberate exit is never an interruption"
+        );
+    }
+
     #[test]
     #[serial]
     fn top_level_agent_helpers_noop_without_agent() {

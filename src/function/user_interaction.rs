@@ -504,6 +504,54 @@ mod tests {
         assert!(!raised[0].envs.contains_key("COYOTE_ESCALATION_REPLY"));
     }
 
+    /// `COYOTE_ESCALATION_QUESTION` rides through the standard env
+    /// truncation: a huge question is trimmed to 2048 bytes on the raised
+    /// seam, never passed through whole.
+    #[tokio::test]
+    #[serial]
+    async fn escalation_question_env_is_truncated_to_2048_bytes() {
+        let _sink = test_sink::install();
+        let marker = "esc-trunc-p9j";
+
+        let queue = Arc::new(EscalationQueue::new());
+        let mut child_ctx = ctx_with_escalation_hooks(marker);
+        child_ctx.escalation_queue = Some(Arc::clone(&queue));
+        child_ctx.self_agent_id = Some("esc-child-trunc".to_string());
+
+        let raise_args = json!({ "question": "q".repeat(3000) });
+        let raise = handle_escalated(&child_ctx, "input", &raise_args);
+        let reply = async {
+            // Bounded poll: on the current-thread runtime the raise future
+            // submits before its first await, so this resolves immediately.
+            let mut request = None;
+            for _ in 0..1000 {
+                if let Some(entry) = queue.pending_summary().first() {
+                    let id = entry["escalation_id"].as_str().unwrap().to_string();
+                    request = queue.take(&id);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let request = request.expect("escalation must reach the queue");
+            let _ = request.reply_tx.send("ok".to_string());
+        };
+        let (raised_result, ()) = tokio::join!(raise, reply);
+        assert_eq!(raised_result.unwrap()["answer"], "ok");
+
+        let raised = marker_captures(marker, "escalation.raised");
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        let question = raised[0]
+            .envs
+            .get("COYOTE_ESCALATION_QUESTION")
+            .expect("QUESTION env must be present on escalation.raised");
+        assert_eq!(
+            question.len(),
+            2048,
+            "QUESTION env must be 2048-byte truncated"
+        );
+        assert!(question.starts_with("[input] qqq"));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn zero_timeout_waits_indefinitely_for_the_reply() {
         let (tx, rx) = oneshot::channel();

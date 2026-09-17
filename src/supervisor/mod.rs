@@ -190,6 +190,12 @@ impl Supervisor {
             .count()
     }
 
+    /// True when any registered agent or job is still running -- i.e. a
+    /// cancellation right now would actually interrupt in-flight work.
+    pub fn has_active_tasks(&self) -> bool {
+        self.effective_active_count() > 0 || self.active_job_count() > 0
+    }
+
     pub fn max_concurrent(&self) -> usize {
         self.max_concurrent
     }
@@ -447,6 +453,50 @@ mod tests {
         let result = sup.register(make_handle("a2", "coder", 1));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("at capacity"));
+    }
+
+    #[test]
+    fn has_active_tasks_false_when_empty_or_all_finished() {
+        let mut sup = Supervisor::new(4, 3);
+        assert!(!sup.has_active_tasks());
+        // make_handle drops its runtime, aborting the task, so the
+        // registered agent is already finished.
+        sup.register(make_handle("a1", "explore", 1)).unwrap();
+        assert!(!sup.has_active_tasks());
+    }
+
+    #[test]
+    fn has_active_tasks_true_with_running_agent() {
+        // Keep the runtime alive so the task is never polled and the agent
+        // counts as running.
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let join_handle = rt.spawn(async {
+            Ok::<AgentResult, Error>(AgentResult {
+                id: "done".into(),
+                agent_name: "test".into(),
+                output: "result".into(),
+                exit_status: AgentExitStatus::Completed,
+            })
+        });
+        let running_handle = AgentHandle {
+            id: "a1".to_string(),
+            agent_name: "explore".to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: create_abort_signal(),
+            join_handle,
+            child_supervisor: None,
+        };
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(running_handle).unwrap();
+        assert!(sup.has_active_tasks());
+    }
+
+    #[test]
+    fn has_active_tasks_true_with_running_job() {
+        let mut sup = Supervisor::new(4, 3).with_max_concurrent_jobs(1);
+        sup.register(make_job("j1", create_abort_signal())).unwrap();
+        assert!(sup.has_active_tasks());
     }
 
     #[test]
