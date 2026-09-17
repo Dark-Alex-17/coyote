@@ -21,6 +21,10 @@ impl ApprovalNodeExecutor {
             .interpolate(&node.question)
             .context("Failed to interpolate approval question")?;
 
+        // No escalation event fires at this seam: a root graph prompts its
+        // user directly (outside the escalation queue), and a child graph's
+        // escalation fires inside `handle_escalated` like any other user__*
+        // call.
         let response = handle_user_tool(
             ctx,
             &format!("{USER_FUNCTION_PREFIX}select"),

@@ -119,6 +119,7 @@ pub enum HookEvent {
     TurnInterrupted,
     TurnFailed,
     SessionStarted,
+    SessionResumed,
     SessionEnded,
     SessionCompressed,
     ToolStarted,
@@ -129,7 +130,10 @@ pub enum HookEvent {
     LlmRequestFailed,
     AgentStarted,
     AgentCompleted,
+    AgentInterrupted,
     AgentFailed,
+    EscalationRaised,
+    EscalationAnswered,
     GraphNodeStarted,
     GraphNodeCompleted,
     GraphNodeFailed,
@@ -146,6 +150,7 @@ impl HookEvent {
             HookEvent::TurnInterrupted => "turn.interrupted",
             HookEvent::TurnFailed => "turn.failed",
             HookEvent::SessionStarted => "session.started",
+            HookEvent::SessionResumed => "session.resumed",
             HookEvent::SessionEnded => "session.ended",
             HookEvent::SessionCompressed => "session.compressed",
             HookEvent::ToolStarted => "tool.started",
@@ -156,7 +161,10 @@ impl HookEvent {
             HookEvent::LlmRequestFailed => "llm.request.failed",
             HookEvent::AgentStarted => "agent.started",
             HookEvent::AgentCompleted => "agent.completed",
+            HookEvent::AgentInterrupted => "agent.interrupted",
             HookEvent::AgentFailed => "agent.failed",
+            HookEvent::EscalationRaised => "escalation.raised",
+            HookEvent::EscalationAnswered => "escalation.answered",
             HookEvent::GraphNodeStarted => "graph.node.started",
             HookEvent::GraphNodeCompleted => "graph.node.completed",
             HookEvent::GraphNodeFailed => "graph.node.failed",
@@ -219,6 +227,17 @@ fn resolve_hooks(
 ) -> Vec<ResolvedHook> {
     let event_name = event.as_str();
     let mut resolved = Vec::new();
+
+    // Escalations are a root/user-level concern: the user wires these hooks
+    // to hear about children asking for help, so requiring every agent to
+    // whitelist them through `global_hooks` would silence exactly the events
+    // they were set up for. The per-agent gate never applies here (this also
+    // skips the unknown-entry diagnostics: whitelisting an escalation hook is
+    // harmless and needs no warning).
+    let agent_gate = match event {
+        HookEvent::EscalationRaised | HookEvent::EscalationAnswered => None,
+        _ => agent_gate,
+    };
 
     if let Some(defs) = global_hooks.get(event_name) {
         let cwd = paths::config_dir();
@@ -1326,6 +1345,7 @@ mod tests {
             (HookEvent::TurnInterrupted, "turn.interrupted"),
             (HookEvent::TurnFailed, "turn.failed"),
             (HookEvent::SessionStarted, "session.started"),
+            (HookEvent::SessionResumed, "session.resumed"),
             (HookEvent::SessionEnded, "session.ended"),
             (HookEvent::SessionCompressed, "session.compressed"),
             (HookEvent::ToolStarted, "tool.started"),
@@ -1336,7 +1356,10 @@ mod tests {
             (HookEvent::LlmRequestFailed, "llm.request.failed"),
             (HookEvent::AgentStarted, "agent.started"),
             (HookEvent::AgentCompleted, "agent.completed"),
+            (HookEvent::AgentInterrupted, "agent.interrupted"),
             (HookEvent::AgentFailed, "agent.failed"),
+            (HookEvent::EscalationRaised, "escalation.raised"),
+            (HookEvent::EscalationAnswered, "escalation.answered"),
             (HookEvent::GraphNodeStarted, "graph.node.started"),
             (HookEvent::GraphNodeCompleted, "graph.node.completed"),
             (HookEvent::GraphNodeFailed, "graph.node.failed"),
@@ -1374,6 +1397,38 @@ mod tests {
         );
 
         assert_eq!(names(&resolved), ["own"]);
+    }
+
+    #[test]
+    fn escalation_events_bypass_the_agent_whitelist_gate() {
+        let mut global = hooks_map("escalation.raised", &[("watch", "cmd-raised")]);
+        global.extend(hooks_map(
+            "escalation.answered",
+            &[("watch", "cmd-answered")],
+        ));
+        global.extend(hooks_map("tool.started", &[("watch", "cmd-tool")]));
+
+        for event in [HookEvent::EscalationRaised, HookEvent::EscalationAnswered] {
+            let resolved = resolve_hooks(event, &global, Some((&[], "gated-agent")), None, None);
+            assert_eq!(
+                names(&resolved),
+                ["watch"],
+                "{} must resolve without a whitelist entry",
+                event.as_str()
+            );
+        }
+
+        let resolved = resolve_hooks(
+            HookEvent::ToolStarted,
+            &global,
+            Some((&[], "gated-agent")),
+            None,
+            None,
+        );
+        assert!(
+            resolved.is_empty(),
+            "non-escalation events stay behind the whitelist gate"
+        );
     }
 
     #[test]

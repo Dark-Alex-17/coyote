@@ -533,7 +533,7 @@ Type ".help" for additional help.
         let exit_result = self.ctx.write().exit_session();
         self.ctx
             .write()
-            .top_level_agent_finished(exit_result.as_ref().err());
+            .top_level_agent_finished(exit_result.as_ref().err(), Some(&self.abort_signal));
         hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
         exit_result
     }

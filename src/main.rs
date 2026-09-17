@@ -587,7 +587,7 @@ async fn run(
             shell_execute(&mut ctx, &SHELL, input, abort_signal.clone()).await
         }
         .await;
-        ctx.top_level_agent_finished(result.as_ref().err());
+        ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
         hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
         return result;
     }
@@ -621,7 +621,7 @@ async fn run(
                 start_directive(&mut ctx, input, cli.code, abort_signal.clone()).await
             }
             .await;
-            ctx.top_level_agent_finished(result.as_ref().err());
+            ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
             hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
             result
         }
@@ -755,7 +755,10 @@ async fn shell_execute(
                     if code == 0 && app.save_shell_history {
                         let _ = append_to_shell_history(&shell.name, &eval_str, code);
                     }
-                    ctx.top_level_agent_finished(None);
+                    // Executing the generated command is a normal exit: no
+                    // abort signal on purpose, this seam can never report an
+                    // interruption.
+                    ctx.top_level_agent_finished(None, None);
                     hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
                     process::exit(code);
                 }

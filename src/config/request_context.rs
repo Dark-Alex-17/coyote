@@ -4741,6 +4741,8 @@ impl RequestContext {
         self.init_agent_session_variables(new_session)?;
         if created_new_session {
             hooks::fire(HookEvent::SessionStarted, self, &[], None);
+        } else {
+            hooks::fire(HookEvent::SessionResumed, self, &[], None);
         }
         Ok(())
     }
@@ -4909,7 +4911,10 @@ impl RequestContext {
 
         // Interactive switch-away closes the top-level agent bracket while
         // the agent is still attached, so agent-scoped hooks resolve.
-        self.top_level_agent_finished(None);
+        // No abort signal on purpose: switching away is a deliberate exit,
+        // never an interruption, even though cancel_recursive tears the
+        // agent's children down just below.
+        self.top_level_agent_finished(None, None);
         if self.agent.take().is_some() {
             if let Some(supervisor) = self.supervisor.clone() {
                 supervisor.read().cancel_recursive();
@@ -4957,10 +4962,26 @@ impl RequestContext {
         );
     }
 
-    pub fn top_level_agent_finished(&mut self, error: Option<&Error>) {
+    pub fn top_level_agent_finished(
+        &mut self,
+        error: Option<&Error>,
+        abort_signal: Option<&AbortSignal>,
+    ) {
         let Some(id) = self.top_level_agent_id.take() else {
             return;
         };
+
+        // The abort signal, never the error text, decides interrupted: a
+        // ctrl-c'd run is not a failure, so no error env rides along.
+        if abort_signal.is_some_and(|signal| signal.aborted_ctrlc()) {
+            hooks::fire(
+                HookEvent::AgentInterrupted,
+                self,
+                &[("COYOTE_AGENT_ID", id)],
+                None,
+            );
+            return;
+        }
 
         match error {
             None => hooks::fire(
@@ -8340,7 +8361,12 @@ mod tests {
         let agent_dir = paths::agent_data_dir(agent_name);
         create_dir_all(&agent_dir).unwrap();
         let mut config = format!("name: {agent_name}\ninstructions: hi\nhooks:\n");
-        for event in ["agent.started", "agent.completed", "agent.failed"] {
+        for event in [
+            "agent.started",
+            "agent.completed",
+            "agent.interrupted",
+            "agent.failed",
+        ] {
             config.push_str(&format!(
                 "  {event}:\n    - name: {marker}-{event}\n      command: 'true'\n"
             ));
@@ -8360,7 +8386,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn use_session_fires_session_started_for_new_sessions_only() {
+    fn use_session_discriminates_session_started_from_session_resumed() {
         let _guard = TestConfigDirGuard::new();
         let sessions_dir = paths::local_dir("sessions");
         create_dir_all(&sessions_dir).unwrap();
@@ -8368,13 +8394,16 @@ mod tests {
         let marker = "sess-started-q8n";
 
         let mut ctx = create_test_ctx();
-        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.started"], marker));
+        ctx.update_app_config(|app| {
+            app.hooks = hooks_map_of(&["session.started", "session.resumed"], marker)
+        });
         let app = ctx.app.config.clone();
         let abort = utils::create_abort_signal();
         run_async(ctx.use_session(&app, Some("hook-fresh"), abort.clone())).unwrap();
 
         let captures = marker_captures(marker);
         assert_eq!(captures.len(), 1, "a new session fires exactly one event");
+        assert_eq!(captures[0].hook_name, format!("{marker}-session.started"));
         assert_eq!(
             captures[0]
                 .envs
@@ -8383,16 +8412,29 @@ mod tests {
             Some("hook-fresh")
         );
 
-        // Resuming a persisted session fires nothing.
+        // Resuming a persisted session fires session.resumed, never
+        // session.started.
         write_paused_todo_session(&ctx, "hook-resume");
         let mut resumed_ctx = create_test_ctx();
-        resumed_ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.started"], marker));
+        resumed_ctx.update_app_config(|app| {
+            app.hooks = hooks_map_of(&["session.started", "session.resumed"], marker)
+        });
         let resumed_app = resumed_ctx.app.config.clone();
         run_async(resumed_ctx.use_session(&resumed_app, Some("hook-resume"), abort)).unwrap();
+        let captures = marker_captures(marker);
+        let started: Vec<_> = captures
+            .iter()
+            .filter(|capture| capture.hook_name == format!("{marker}-session.started"))
+            .collect();
+        let resumed: Vec<_> = captures
+            .iter()
+            .filter(|capture| capture.hook_name == format!("{marker}-session.resumed"))
+            .collect();
+        assert_eq!(started.len(), 1, "resume must not fire session.started");
+        assert_eq!(resumed.len(), 1, "resume fires exactly one session.resumed");
         assert_eq!(
-            marker_captures(marker).len(),
-            1,
-            "resume must not fire session.started"
+            resumed[0].envs.get("COYOTE_SESSION_ID").map(String::as_str),
+            Some("hook-resume")
         );
     }
 
@@ -8469,8 +8511,8 @@ mod tests {
         ctx.top_level_agent_started();
         // Per agent RUN, never per message: re-entering while open is a no-op.
         ctx.top_level_agent_started();
-        ctx.top_level_agent_finished(None);
-        ctx.top_level_agent_finished(None);
+        ctx.top_level_agent_finished(None, None);
+        ctx.top_level_agent_finished(None, None);
 
         let captures = marker_captures(marker);
         let started: Vec<_> = captures
@@ -8519,7 +8561,7 @@ mod tests {
 
         ctx.top_level_agent_started();
         let err = anyhow!("dispatch exploded");
-        ctx.top_level_agent_finished(Some(&err));
+        ctx.top_level_agent_finished(Some(&err), None);
 
         let captures = marker_captures(marker);
         let failed: Vec<_> = captures
@@ -8541,6 +8583,44 @@ mod tests {
 
     #[test]
     #[serial]
+    fn top_level_agent_ctrlc_fires_agent_interrupted_not_failed() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "agent-top-int-r6t";
+        let agent_name = unique_name("hook_agent");
+        seed_agent_with_hooks(&agent_name, marker);
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort.clone())).unwrap();
+
+        ctx.top_level_agent_started();
+        abort.set_ctrlc();
+        // The fired signal, not the error text, decides: even with an error
+        // in hand the bracket reports an interruption.
+        let err = anyhow!("Aborted.");
+        ctx.top_level_agent_finished(Some(&err), Some(&abort));
+
+        let captures = marker_captures(marker);
+        let interrupted: Vec<_> = captures
+            .iter()
+            .filter(|capture| capture.hook_name == format!("{marker}-agent.interrupted"))
+            .collect();
+        assert_eq!(interrupted.len(), 1);
+        assert!(interrupted[0].envs.contains_key("COYOTE_AGENT_ID"));
+        assert!(
+            !interrupted[0].envs.contains_key("COYOTE_AGENT_ERROR"),
+            "an interruption is not a failure and carries no error env"
+        );
+        assert!(captures.iter().all(|capture| {
+            capture.hook_name != format!("{marker}-agent.failed")
+                && capture.hook_name != format!("{marker}-agent.completed")
+        }));
+    }
+
+    #[test]
+    #[serial]
     fn top_level_agent_helpers_noop_without_agent() {
         let _guard = TestConfigDirGuard::new();
         let _sink = test_sink::install();
@@ -8556,7 +8636,7 @@ mod tests {
         ctx.role = Some(Role::new("plain", "prompt"));
 
         ctx.top_level_agent_started();
-        ctx.top_level_agent_finished(None);
+        ctx.top_level_agent_finished(None, None);
 
         assert!(
             marker_captures(marker).is_empty(),
@@ -8582,7 +8662,7 @@ mod tests {
 
         ctx.exit_agent(&app).unwrap();
         // A later exit seam (REPL teardown) must not double-fire.
-        ctx.top_level_agent_finished(None);
+        ctx.top_level_agent_finished(None, None);
 
         let captures = marker_captures(marker);
         assert_eq!(
