@@ -438,11 +438,12 @@ async fn run(
         ctx.use_agent(app.as_ref(), agent, session, abort_signal.clone())
             .await?;
         // The top-level agent bracket does NOT open here: the inspection
-        // flags below (--list-sessions, --info, --macro, --rebuild-rag,
-        // --init-*) return early without running the agent, and an open
-        // bracket on those paths would leak `agent.started` with no
-        // terminal event. It opens at the dispatch sites further down,
-        // where an agent run is actually committed.
+        // flags below (--list-sessions, --info, --rebuild-rag, --init-*)
+        // return early without running the agent, and an open bracket on
+        // those paths would leak `agent.started` with no terminal event.
+        // It opens at the dispatch sites further down, where a run is
+        // actually committed — including the --macro arm, which executes
+        // rather than inspects.
     } else {
         let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
         if let Some(prompt) = &cli.temp_role {
@@ -575,8 +576,13 @@ async fn run(
         }
     }
     if let Some(name) = &cli.macro_name {
-        macro_execute(&mut ctx, name, text.as_deref(), abort_signal.clone()).await?;
-        return Ok(());
+        // Dispatch committed: open the top-level agent bracket only now,
+        // past every inspection-flag early return above.
+        ctx.top_level_agent_started();
+        let result = macro_execute(&mut ctx, name, text.as_deref(), abort_signal.clone()).await;
+        ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
+        hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
+        return result;
     }
     if cli.execute && !is_repl {
         // Dispatch committed: open the top-level agent bracket only now,

@@ -83,12 +83,22 @@ pub async fn macro_execute(
         .bootstrap_tools(app.as_ref(), true, abort_signal.clone())
         .await?;
 
-    for step in &macro_value.steps {
-        let command = Macro::interpolate_command(step, &variables);
-        println!(">> {}", multiline_text(&command));
-        run_repl_command(&mut macro_ctx, abort_signal.clone(), &command).await?;
+    // An in-macro `.agent` step opens the top-level agent bracket on this
+    // fresh context, so it must also close here — on the step-failure path
+    // too, or the run would leak `agent.started` with no terminal event.
+    // Signal-aware like the headless dispatch arms: a ctrl-c'd macro
+    // classifies as interrupted, not failed.
+    let result = async {
+        for step in &macro_value.steps {
+            let command = Macro::interpolate_command(step, &variables);
+            println!(">> {}", multiline_text(&command));
+            run_repl_command(&mut macro_ctx, abort_signal.clone(), &command).await?;
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    macro_ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
+    result
 }
 
 struct MacroModeGuard<'a> {
