@@ -420,6 +420,15 @@ impl TokenUsage {
             && self.cache_read_input_tokens.is_none()
     }
 
+    /// Prompt-side tokens the API reported for one request: fresh input plus
+    /// cache writes and cache reads. The buckets are disjoint (see
+    /// [`Self::cost_usd`]), so the terms sum without adjustment.
+    pub fn total_prompt_tokens(&self) -> u64 {
+        self.input_tokens.unwrap_or(0)
+            + self.cache_creation_input_tokens.unwrap_or(0)
+            + self.cache_read_input_tokens.unwrap_or(0)
+    }
+
     pub fn accumulate(&mut self, other: &TokenUsage) {
         fn add(acc: &mut Option<u64>, value: Option<u64>) {
             if let Some(value) = value {

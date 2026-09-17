@@ -1515,6 +1515,8 @@ async fn ask_inner(
 ) -> Result<()> {
     let mut input = input;
     let mut with_embeddings = with_embeddings;
+    // One compress-and-retry per fresh input; tool-loop iterations share it.
+    let mut retried_after_compress = false;
     loop {
         if input.is_empty() {
             return Ok(());
@@ -1529,6 +1531,10 @@ async fn ask_inner(
         }
 
         let app = Arc::clone(&ctx.app.config);
+
+        if maybe_auto_compress(ctx, app.as_ref()).await.succeeded {
+            input.refresh_session(ctx);
+        }
 
         if graph::active_agent_graph_name(ctx).is_some() {
             ctx.before_chat_completion(&input)?;
@@ -1560,6 +1566,18 @@ async fn ask_inner(
             match result {
                 Ok(v) => v,
                 Err(err) => {
+                    if compress_for_error_retry(
+                        ctx,
+                        app.as_ref(),
+                        retried_after_compress,
+                        &abort_signal,
+                    )
+                    .await
+                    {
+                        input.refresh_session(ctx);
+                        retried_after_compress = true;
+                        continue;
+                    }
                     ctx.on_chat_completion_error(app.as_ref(), &input);
                     return Err(err);
                 }
@@ -1574,6 +1592,7 @@ async fn ask_inner(
         match check_pending_tasks_guardrail(ctx) {
             GuardrailAction::Inject(prompt) => {
                 input = Input::from_str(ctx, &prompt, None)?;
+                retried_after_compress = false;
                 continue;
             }
             GuardrailAction::ForceTerminate(ids) => {
@@ -1617,6 +1636,7 @@ async fn ask_inner(
                 format!("{prompt}\n\n{todo_state}")
             };
             input = Input::from_str(ctx, &full_prompt, None)?;
+            retried_after_compress = false;
             continue;
         }
 
@@ -1637,63 +1657,45 @@ async fn ask_inner(
             }
         }
 
-        let keep_last = ctx.compression_keep_last();
-        let needs_compression = ctx
-            .session
-            .as_ref()
-            .is_some_and(|s| s.needs_compression(app.compression_threshold, keep_last));
+        let agent_can_continue_after_compress =
+            should_continue(ctx) && !abort_signal.aborted_ctrlc();
 
-        if needs_compression {
-            let agent_can_continue_after_compress =
-                should_continue(ctx) && !abort_signal.aborted_ctrlc();
+        // Auto-continue keys off the compression CONDITION, not the outcome:
+        // a transiently failed compression retries at the next turn end, and
+        // gating on success would stall an unattended agent at the pause
+        // banner with incomplete todos.
+        let compression = maybe_auto_compress(ctx, app.as_ref()).await;
+        if compression.fired && agent_can_continue_after_compress {
+            let full_prompt = {
+                let config = ctx.auto_continue_config();
+                let todo_state = ctx.todo_list.render_for_model();
+                let remaining = ctx.todo_list.incomplete_count();
+                ctx.increment_auto_continue_count();
+                let count = ctx.auto_continue_count;
+                let max = config.max_continues;
 
-            if let Some(session) = ctx.session.as_mut() {
-                session.set_compressing(true);
-            }
+                let prompt = config
+                    .continuation_prompt
+                    .as_deref()
+                    .unwrap_or(DEFAULT_CONTINUATION_PROMPT);
 
-            let color = if app.light_theme() {
-                nu_ansi_term::Color::LightGray
-            } else {
-                nu_ansi_term::Color::DarkGray
-            };
-            eprintln!("\n📢 {}", color.italic().paint("Compressing the session."),);
-
-            auto_compress_session(ctx).await;
-            if let Some(session) = ctx.session.as_mut() {
-                session.set_compressing(false);
-            }
-
-            if agent_can_continue_after_compress {
-                let full_prompt = {
-                    let config = ctx.auto_continue_config();
-                    let todo_state = ctx.todo_list.render_for_model();
-                    let remaining = ctx.todo_list.incomplete_count();
-                    ctx.increment_auto_continue_count();
-                    let count = ctx.auto_continue_count;
-                    let max = config.max_continues;
-
-                    let prompt = config
-                        .continuation_prompt
-                        .as_deref()
-                        .unwrap_or(DEFAULT_CONTINUATION_PROMPT);
-
-                    let color = if app.light_theme() {
-                        nu_ansi_term::Color::LightGray
-                    } else {
-                        nu_ansi_term::Color::DarkGray
-                    };
-                    eprintln!(
-                        "\n📋 {}",
-                        color.italic().paint(format!(
-                            "Auto-continuing after compression ({count}/{max}): {remaining} incomplete todo(s) remain"
-                        ))
-                    );
-
-                    format!("{prompt}\n\n{todo_state}")
+                let color = if app.light_theme() {
+                    nu_ansi_term::Color::LightGray
+                } else {
+                    nu_ansi_term::Color::DarkGray
                 };
-                input = Input::from_str(ctx, &full_prompt, None)?;
-                continue;
-            }
+                eprintln!(
+                    "\n📋 {}",
+                    color.italic().paint(format!(
+                        "Auto-continuing after compression ({count}/{max}): {remaining} incomplete todo(s) remain"
+                    ))
+                );
+
+                format!("{prompt}\n\n{todo_state}")
+            };
+            input = Input::from_str(ctx, &full_prompt, None)?;
+            retried_after_compress = false;
+            continue;
         }
 
         print_turn_divider();
@@ -1709,15 +1711,87 @@ fn print_turn_divider() {
     println!();
 }
 
-async fn auto_compress_session(ctx: &mut RequestContext) {
+struct AutoCompressOutcome {
+    fired: bool,
+    succeeded: bool,
+}
+
+async fn maybe_auto_compress(ctx: &mut RequestContext, app: &AppConfig) -> AutoCompressOutcome {
+    let keep_last = ctx.compression_keep_last();
+    let should_compress = ctx.session.as_ref().is_some_and(|session| {
+        session.needs_compression(app.compression_threshold, keep_last)
+            || session.safety_valve_triggered(
+                app.compression_safety_valve,
+                keep_last,
+                ctx.last_prompt_token_usage,
+            )
+    });
+    if !should_compress {
+        return AutoCompressOutcome {
+            fired: false,
+            succeeded: false,
+        };
+    }
+
+    if let Some(session) = ctx.session.as_mut() {
+        session.set_compressing(true);
+    }
+
+    let color = if app.light_theme() {
+        nu_ansi_term::Color::LightGray
+    } else {
+        nu_ansi_term::Color::DarkGray
+    };
+    eprintln!("\n📢 {}", color.italic().paint("Compressing the session."),);
+
+    let compressed = auto_compress_session(ctx).await;
+    if let Some(session) = ctx.session.as_mut() {
+        session.set_compressing(false);
+    }
+    if compressed {
+        ctx.last_prompt_token_usage = None;
+    }
+    AutoCompressOutcome {
+        fired: true,
+        succeeded: compressed,
+    }
+}
+
+async fn compress_for_error_retry(
+    ctx: &mut RequestContext,
+    app: &AppConfig,
+    already_retried: bool,
+    abort_signal: &AbortSignal,
+) -> bool {
+    if already_retried || abort_signal.aborted() {
+        return false;
+    }
+    let keep_last = ctx.compression_keep_last();
+    let valve_triggered = ctx.session.as_ref().is_some_and(|session| {
+        session.safety_valve_triggered(
+            app.compression_safety_valve,
+            keep_last,
+            ctx.last_prompt_token_usage,
+        )
+    });
+    valve_triggered && maybe_auto_compress(ctx, app).await.succeeded
+}
+
+async fn auto_compress_session(ctx: &mut RequestContext) -> bool {
     match ctx.compress_session().await {
-        Ok(()) => hooks::fire(
-            HookEvent::SessionCompressed,
-            ctx,
-            &hooks::role_extras(ctx),
-            None,
-        ),
-        Err(err) => warn!("Failed to compress the session: {err}"),
+        Ok(()) => {
+            hooks::fire(
+                HookEvent::SessionCompressed,
+                ctx,
+                &hooks::role_extras(ctx),
+                None,
+            );
+            true
+        }
+        Err(err) => {
+            warn!("Failed to compress the session: {err}");
+            false
+        }
     }
 }
 
@@ -2036,10 +2110,12 @@ pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{ClientConfig, Model};
+    use crate::client::{ClientConfig, MessageContent, Model, ModelData, ToolCall};
     use crate::config::{AppState, Role, RoleLike, Session, TEMP_ROLE_NAME, WorkingMode};
+    use crate::function::ToolResult;
     use crate::hooks::{HookDef, HooksMap, test_sink};
     use anyhow::anyhow;
+    use serde_json::json;
     use serial_test::serial;
     use std::future::Future;
 
@@ -2357,6 +2433,13 @@ mod tests {
     /// resolvable, and the session already holds a user exchange so
     /// `compress_session` has something to summarize.
     fn compressible_ctx(marker: &str) -> RequestContext {
+        compressible_ctx_with(marker, AppConfig::default())
+    }
+
+    /// `compressible_ctx` with caller-tuned compression settings, so tests
+    /// can drive `needs_compression` and the safety valve; `dry_run` and the
+    /// default client are enforced here to keep compression offline.
+    fn compressible_ctx_with(marker: &str, config: AppConfig) -> RequestContext {
         let mut hooks_map = HooksMap::default();
         hooks_map.insert(
             "session.compressed".to_string(),
@@ -2370,7 +2453,7 @@ mod tests {
             hooks: hooks_map,
             dry_run: true,
             clients: vec![ClientConfig::default()],
-            ..Default::default()
+            ..config
         });
         let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
         let mut session = Session::default();
@@ -2382,6 +2465,7 @@ mod tests {
             .unwrap()
             .add_message(&input, "hi")
             .unwrap();
+        ctx.session.as_mut().unwrap().update_tokens();
         ctx
     }
 
@@ -2432,7 +2516,7 @@ mod tests {
         let marker = "auto-compress-ok-f8r";
         run_async(async {
             let mut ctx = compressible_ctx(marker);
-            auto_compress_session(&mut ctx).await;
+            assert!(auto_compress_session(&mut ctx).await);
         });
 
         assert_eq!(
@@ -2494,7 +2578,7 @@ mod tests {
             // An empty session makes compress_session fail; the seam must
             // swallow the error (no panic, no propagation) and fire nothing.
             ctx.session = Some(Session::default());
-            auto_compress_session(&mut ctx).await;
+            assert!(!auto_compress_session(&mut ctx).await);
         });
 
         assert_eq!(
@@ -2502,6 +2586,427 @@ mod tests {
             0,
             "a failed auto-compression must fire no session.compressed hook"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn maybe_auto_compress_skips_when_neither_threshold_nor_valve_fires() {
+        let _sink = test_sink::install();
+        let marker = "maybe-compress-skip-q7m";
+        run_async(async {
+            let mut ctx = compressible_ctx_with(
+                marker,
+                AppConfig {
+                    compression_keep_last: 1,
+                    ..Default::default()
+                },
+            );
+            let app = Arc::clone(&ctx.app.config);
+
+            assert!(!maybe_auto_compress(&mut ctx, app.as_ref()).await.fired);
+        });
+
+        assert_eq!(session_compressed_count(marker), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn maybe_auto_compress_fires_on_threshold_each_loop_iteration() {
+        // Exercises the shared seam the ask loop calls at the top of every
+        // iteration (tool-loop, guardrail-inject, and auto-continue turns
+        // included) as well as at turn end.
+        let _sink = test_sink::install();
+        let marker = "maybe-compress-threshold-n2x";
+        run_async(async {
+            let mut ctx = compressible_ctx_with(
+                marker,
+                AppConfig {
+                    compression_threshold: 1,
+                    compression_keep_last: 1,
+                    ..Default::default()
+                },
+            );
+            let app = Arc::clone(&ctx.app.config);
+
+            assert!(maybe_auto_compress(&mut ctx, app.as_ref()).await.succeeded);
+            assert!(
+                !ctx.is_compressing_session(),
+                "the compressing flag must be released after compression"
+            );
+        });
+
+        assert_eq!(session_compressed_count(marker), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn maybe_auto_compress_reports_no_success_when_compression_fails() {
+        let _sink = test_sink::install();
+        let marker = "maybe-compress-fail-g4z";
+        run_async(async {
+            let mut ctx = compressible_ctx_with(
+                marker,
+                AppConfig {
+                    compression_threshold: 1,
+                    compression_keep_last: 0,
+                    ..Default::default()
+                },
+            );
+            // A session whose only reclaimable message is non-user: the
+            // threshold fires, but `compress_session` bails on a session
+            // without user messages.
+            {
+                let input = Input::from_str(&ctx, "more context", None).unwrap();
+                let session = ctx.session.as_mut().unwrap();
+                session.add_message(&input, &"y".repeat(400)).unwrap();
+                session.compress("recap".into(), 1);
+            }
+            let app = Arc::clone(&ctx.app.config);
+
+            let outcome = maybe_auto_compress(&mut ctx, app.as_ref()).await;
+            assert!(outcome.fired, "the compression condition must fire");
+            assert!(
+                !outcome.succeeded,
+                "a failed compression must not report success"
+            );
+            assert!(
+                !ctx.is_compressing_session(),
+                "the compressing flag must be released after a failed compression"
+            );
+        });
+
+        assert_eq!(session_compressed_count(marker), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn failed_compression_still_reports_fired_with_kept_tail() {
+        // Pins the turn-end auto-continue gate: with keep_last > 0, a
+        // compression whose condition fired but whose summarization FAILED
+        // must still report `fired`, so an unattended agent auto-continues
+        // and retries the compression at the next turn end instead of
+        // stalling at the pause banner.
+        let _sink = test_sink::install();
+        let marker = "maybe-compress-fired-fail-t8r";
+        run_async(async {
+            let mut ctx = compressible_ctx_with(
+                marker,
+                AppConfig {
+                    compression_threshold: 1,
+                    compression_keep_last: 1,
+                    ..Default::default()
+                },
+            );
+            // A session whose foldable middle is a tool transcript and whose
+            // kept tail is an assistant reply: the threshold fires, but
+            // `compress_session` bails on a session without user messages.
+            {
+                let input = Input::from_str(&ctx, "more context", None)
+                    .unwrap()
+                    .merge_tool_results(
+                        "calling a tool to gather context".into(),
+                        vec![ToolResult::new(ToolCall::default(), json!("ok"))],
+                    );
+                let session = ctx.session.as_mut().unwrap();
+                session.add_message(&input, &"y".repeat(400)).unwrap();
+                session.compress("recap".into(), 2);
+            }
+            let app = Arc::clone(&ctx.app.config);
+
+            let outcome = maybe_auto_compress(&mut ctx, app.as_ref()).await;
+            assert!(outcome.fired, "the compression condition must fire");
+            assert!(
+                !outcome.succeeded,
+                "a failed compression must not report success"
+            );
+        });
+
+        assert_eq!(session_compressed_count(marker), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn loop_top_compression_refresh_rebuilds_from_compressed_session() {
+        let _sink = test_sink::install();
+        let marker = "loop-top-refresh-h5w";
+        run_async(async {
+            let mut ctx = compressible_ctx_with(
+                marker,
+                AppConfig {
+                    compression_threshold: 1,
+                    compression_keep_last: 1,
+                    ..Default::default()
+                },
+            );
+            let app = Arc::clone(&ctx.app.config);
+            let mut input = Input::from_str(&ctx, "next turn", None).unwrap();
+            let stale = serde_json::to_string(&input.build_messages().unwrap()).unwrap();
+
+            assert!(maybe_auto_compress(&mut ctx, app.as_ref()).await.succeeded);
+            input.refresh_session(&ctx);
+
+            let refreshed = serde_json::to_string(&input.build_messages().unwrap()).unwrap();
+            assert_ne!(
+                refreshed, stale,
+                "the request built after a loop-top compression must reflect the compressed session"
+            );
+        });
+
+        assert_eq!(session_compressed_count(marker), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn maybe_auto_compress_fires_on_safety_valve_despite_huge_threshold() {
+        let _sink = test_sink::install();
+        let marker = "maybe-compress-valve-v5c";
+        run_async(async {
+            let mut ctx = compressible_ctx_with(
+                marker,
+                AppConfig {
+                    compression_threshold: 1_000_000,
+                    compression_keep_last: 1,
+                    compression_safety_valve: 0.8,
+                    ..Default::default()
+                },
+            );
+            // A distinct name: `set_model` is a no-op for an unchanged model
+            // id, and the ctx's default session model declares no limit.
+            let mut data = ModelData::new("test-compress-model-limited");
+            data.max_input_tokens = Some(100_000);
+            let model = Model::from_config("openai", &[data]).remove(0);
+            ctx.session.as_mut().unwrap().set_model(model);
+            // The last successful request measured a prompt near the limit
+            // even though the local estimate is tiny.
+            ctx.last_prompt_token_usage = Some(90_000);
+            let app = Arc::clone(&ctx.app.config);
+
+            assert!(maybe_auto_compress(&mut ctx, app.as_ref()).await.succeeded);
+        });
+
+        assert_eq!(session_compressed_count(marker), 1);
+    }
+
+    /// A ctx where only the safety valve can trigger compression: the last
+    /// successful request measured a prompt near the session model's limit
+    /// while the threshold is out of reach.
+    fn valve_tripped_ctx(marker: &str) -> RequestContext {
+        let mut ctx = compressible_ctx_with(
+            marker,
+            AppConfig {
+                compression_threshold: 1_000_000,
+                compression_keep_last: 1,
+                compression_safety_valve: 0.8,
+                ..Default::default()
+            },
+        );
+        let mut data = ModelData::new("test-compress-model-limited");
+        data.max_input_tokens = Some(100_000);
+        let model = Model::from_config("openai", &[data]).remove(0);
+        ctx.session.as_mut().unwrap().set_model(model);
+        ctx.last_prompt_token_usage = Some(90_000);
+        ctx
+    }
+
+    #[test]
+    #[serial]
+    fn successful_compression_clears_stale_prompt_measurement() {
+        let _sink = test_sink::install();
+        let marker = "maybe-compress-stale-p6b";
+        run_async(async {
+            let mut ctx = valve_tripped_ctx(marker);
+            let app = Arc::clone(&ctx.app.config);
+
+            assert!(maybe_auto_compress(&mut ctx, app.as_ref()).await.succeeded);
+            assert_eq!(
+                ctx.last_prompt_token_usage, None,
+                "a successful compression must drop the pre-compression prompt measurement"
+            );
+
+            // A subsequent usage-less turn makes tokens reclaimable again;
+            // the valve must not re-fire from the vanished prompt's
+            // measurement.
+            {
+                let input = Input::from_str(&ctx, "next turn", None).unwrap();
+                let session = ctx.session.as_mut().unwrap();
+                session.add_message(&input, "reply").unwrap();
+            }
+            assert!(!maybe_auto_compress(&mut ctx, app.as_ref()).await.fired);
+        });
+
+        assert_eq!(session_compressed_count(marker), 1);
+    }
+
+    /// Counts `on_chat_completion_error` checkpoints in the session; the
+    /// literal must match `INTERRUPTED_RESPONSE_TEXT`, whose presence is
+    /// pinned by the give-up tests below.
+    fn interrupted_checkpoint_count(ctx: &RequestContext) -> usize {
+        ctx.session.as_ref().map_or(0, |session| {
+            session
+                .messages()
+                .iter()
+                .filter(|message| {
+                    matches!(&message.content, MessageContent::Text(text)
+                        if text.ends_with("[Response interrupted due to error]"))
+                })
+                .count()
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn error_retry_compresses_once_without_checkpointing() {
+        let _sink = test_sink::install();
+        let marker = "error-retry-valve-k1s";
+        run_async(async {
+            let mut ctx = valve_tripped_ctx(marker);
+            let app = Arc::clone(&ctx.app.config);
+            let abort_signal = create_abort_signal();
+
+            assert!(compress_for_error_retry(&mut ctx, app.as_ref(), false, &abort_signal).await);
+            assert!(
+                !ctx.is_compressing_session(),
+                "the compressing flag must be released after compression"
+            );
+            assert_eq!(
+                interrupted_checkpoint_count(&ctx),
+                0,
+                "the retry path must not checkpoint the in-flight turn"
+            );
+        });
+
+        assert_eq!(session_compressed_count(marker), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn error_retry_gives_up_on_second_failure_with_single_checkpoint() {
+        let _sink = test_sink::install();
+        let marker = "error-retry-giveup-p4t";
+        run_async(async {
+            let mut ctx = valve_tripped_ctx(marker);
+            let app = Arc::clone(&ctx.app.config);
+            let abort_signal = create_abort_signal();
+            let input = Input::from_str(&ctx, "still too big", None).unwrap();
+
+            assert!(compress_for_error_retry(&mut ctx, app.as_ref(), false, &abort_signal).await);
+            // The retried request failed too: no second compression, and the
+            // give-up path checkpoints the interrupted turn exactly once.
+            assert!(!compress_for_error_retry(&mut ctx, app.as_ref(), true, &abort_signal).await);
+            ctx.on_chat_completion_error(app.as_ref(), &input);
+            assert_eq!(interrupted_checkpoint_count(&ctx), 1);
+        });
+
+        assert_eq!(session_compressed_count(marker), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn error_retry_declines_when_valve_is_quiet() {
+        let _sink = test_sink::install();
+        let marker = "error-retry-quiet-m8d";
+        run_async(async {
+            let mut ctx = compressible_ctx_with(
+                marker,
+                AppConfig {
+                    compression_keep_last: 1,
+                    ..Default::default()
+                },
+            );
+            let app = Arc::clone(&ctx.app.config);
+            let abort_signal = create_abort_signal();
+            let input = Input::from_str(&ctx, "transient failure", None).unwrap();
+
+            assert!(!compress_for_error_retry(&mut ctx, app.as_ref(), false, &abort_signal).await);
+            // Valve-false errors keep today's behavior: checkpoint and
+            // surface the error immediately, no compression, no retry.
+            ctx.on_chat_completion_error(app.as_ref(), &input);
+            assert_eq!(interrupted_checkpoint_count(&ctx), 1);
+        });
+
+        assert_eq!(session_compressed_count(marker), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn error_retry_flag_blocks_repeat_and_rearms_on_fresh_input() {
+        let _sink = test_sink::install();
+        let marker = "error-retry-flag-c6y";
+        run_async(async {
+            let mut ctx = valve_tripped_ctx(marker);
+            let app = Arc::clone(&ctx.app.config);
+            let abort_signal = create_abort_signal();
+
+            // Tool-loop iterations carry the flag forward: a set flag wins
+            // over a still-firing valve.
+            assert!(!compress_for_error_retry(&mut ctx, app.as_ref(), true, &abort_signal).await);
+            assert_eq!(session_compressed_count(marker), 0);
+            // A fresh input rebuild clears the flag and re-arms the retry.
+            assert!(compress_for_error_retry(&mut ctx, app.as_ref(), false, &abort_signal).await);
+        });
+
+        assert_eq!(session_compressed_count(marker), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn error_retry_refreshed_input_rebuilds_from_compressed_session() {
+        let _sink = test_sink::install();
+        let marker = "error-retry-refresh-j7q";
+        run_async(async {
+            let mut ctx = valve_tripped_ctx(marker);
+            let app = Arc::clone(&ctx.app.config);
+            let abort_signal = create_abort_signal();
+            let mut input = Input::from_str(&ctx, "still too big", None).unwrap();
+            let stale = serde_json::to_string(&input.build_messages().unwrap()).unwrap();
+
+            assert!(compress_for_error_retry(&mut ctx, app.as_ref(), false, &abort_signal).await);
+            // The snapshot captured at construction is untouched by the
+            // compression; retrying without a refresh would re-send the
+            // failed prompt byte for byte.
+            assert_eq!(
+                serde_json::to_string(&input.build_messages().unwrap()).unwrap(),
+                stale
+            );
+
+            input.refresh_session(&ctx);
+            let refreshed = serde_json::to_string(&input.build_messages().unwrap()).unwrap();
+            assert_ne!(refreshed, stale);
+            let rebuilt = Input::from_str(&ctx, "still too big", None).unwrap();
+            assert_eq!(
+                refreshed,
+                serde_json::to_string(&rebuilt.build_messages().unwrap()).unwrap(),
+                "a refreshed input must build the same request as one created after compression"
+            );
+        });
+
+        assert_eq!(session_compressed_count(marker), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn error_retry_declines_when_user_aborted() {
+        let _sink = test_sink::install();
+        let marker = "error-retry-abort-b2n";
+        run_async(async {
+            let mut ctx = valve_tripped_ctx(marker);
+            let app = Arc::clone(&ctx.app.config);
+            let input = Input::from_str(&ctx, "killed mid-request", None).unwrap();
+
+            let ctrlc = create_abort_signal();
+            ctrlc.set_ctrlc();
+            assert!(!compress_for_error_retry(&mut ctx, app.as_ref(), false, &ctrlc).await);
+            let ctrld = create_abort_signal();
+            ctrld.set_ctrld();
+            assert!(!compress_for_error_retry(&mut ctx, app.as_ref(), false, &ctrld).await);
+
+            // A user-killed request keeps today's behavior: checkpoint and
+            // surface the error, no compression, no re-send.
+            ctx.on_chat_completion_error(app.as_ref(), &input);
+            assert_eq!(interrupted_checkpoint_count(&ctx), 1);
+        });
+
+        assert_eq!(session_compressed_count(marker), 0);
     }
 
     #[test]

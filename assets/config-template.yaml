@@ -186,6 +186,7 @@ save_session: null               # Controls the persistence of the session. If t
 compression_threshold: 4000      # Compress the session when the token count reaches or exceeds this threshold
 compression_keep_last: 0         # Number of most-recent messages to keep visible after compression (0 = compress all messages)
 compression_model: null          # Model to use for session compression (e.g. 'openai:gpt-4o-mini'); defaults to the session's current model
+compression_safety_valve: 0.8    # Force compression when the last real request's prompt size (or the local estimate) reaches this fraction of the model's max_input_tokens, even if compression_threshold would not fire (0 = disabled)
 summarization_prompt: null       # The text prompt used for creating a concise summary of session messages. If null, uses built-in default
 summary_context_prompt: null     # The text prompt used for including the summary of the entire session as context to the model. If null, uses built-in default
 max_tool_result_chars: null      # Cap on tool result characters forwarded to the model per call (null = no cap)

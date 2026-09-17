@@ -719,17 +719,50 @@ impl Session {
         self.reclaimable_tokens(keep_last) >= (threshold / COMPRESSION_MIN_RECLAIM_DIVISOR).max(1)
     }
 
-    /// Estimated tokens of the messages that compression would actually fold
-    /// away: everything except the leading system message (whose content is
-    /// carried into the summary message) and the `keep_last` tail (kept verbatim).
-    fn reclaimable_tokens(&self, keep_last: usize) -> usize {
+    /// Whether the prompt is close enough to the model's hard input limit
+    /// that compression must run regardless of how `compression_threshold`
+    /// is configured. Sizes the prompt as the larger of the API-reported
+    /// measurement from the last request that reported usage and the local
+    /// estimate, because the estimate can run well below the provider's
+    /// real count.
+    pub fn safety_valve_triggered(
+        &self,
+        valve: f32,
+        keep_last: usize,
+        last_prompt_tokens: Option<usize>,
+    ) -> bool {
+        if self.compressing || !valve.is_finite() || valve <= 0.0 {
+            return false;
+        }
+        let Some(max_input_tokens) = self.model().max_input_tokens() else {
+            return false;
+        };
+        // With nothing to fold away, compressing is a no-op; firing anyway
+        // would spin compress attempts while a single in-flight turn holds
+        // all the tokens.
+        if self.reclaimable_tokens(keep_last) == 0 {
+            return false;
+        }
+        last_prompt_tokens.unwrap_or(0).max(self.tokens())
+            >= (valve * max_input_tokens as f32) as usize
+    }
+
+    /// The messages that compression would actually fold away: everything
+    /// except the leading system message (whose content is carried into the
+    /// summary message) and the `keep_last` tail (kept verbatim).
+    pub fn foldable_messages(&self, keep_last: usize) -> &[Message] {
         let start = usize::from(
             self.messages
                 .first()
                 .is_some_and(|v| v.role == MessageRole::System),
         );
         let end = self.messages.len().saturating_sub(keep_last).max(start);
-        self.model().total_tokens(&self.messages[start..end])
+        &self.messages[start..end]
+    }
+
+    /// Estimated tokens of the messages compression would fold away.
+    fn reclaimable_tokens(&self, keep_last: usize) -> usize {
+        self.model().total_tokens(self.foldable_messages(keep_last))
     }
 
     pub fn compressing(&self) -> bool {
@@ -1109,7 +1142,7 @@ impl AutoName {
 mod tests {
     use super::*;
     use crate::client::{
-        Message, MessageContent, MessageContentToolCalls, MessageRole, Model, TokenUsage,
+        Message, MessageContent, MessageContentToolCalls, MessageRole, Model, ModelData, TokenUsage,
     };
     use crate::config::{AppConfig, AppState, RequestContext, WorkingMode};
     use crate::function::{Functions, ToolCall, ToolResult};
@@ -1576,6 +1609,85 @@ mod tests {
         assert!(session.tokens() > 100);
         assert!(!session.needs_compression(100, 2));
         assert!(session.needs_compression(100, 1));
+    }
+
+    /// A session with a system message, a large user message, and a small
+    /// assistant reply, on a model with the given input limit. With
+    /// `keep_last = 1` the user message is reclaimable; with `keep_last = 2`
+    /// nothing is.
+    fn valve_session(max_input_tokens: Option<usize>) -> Session {
+        let mut session = Session::default();
+        let mut data = ModelData::new("valve-model");
+        data.max_input_tokens = max_input_tokens;
+        session.set_model(Model::from_config("provider", &[data]).remove(0));
+        session.messages.push(Message::new(
+            MessageRole::System,
+            MessageContent::Text("x".repeat(400)),
+        ));
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("y".repeat(4000)),
+        ));
+        session.messages.push(Message::new(
+            MessageRole::Assistant,
+            MessageContent::Text("ok".to_string()),
+        ));
+        session.update_tokens();
+        session
+    }
+
+    #[test]
+    fn session_safety_valve_fires_from_estimate() {
+        let session = valve_session(Some(1000));
+
+        assert!(session.tokens() >= 800);
+        assert!(session.safety_valve_triggered(0.8, 1, None));
+    }
+
+    #[test]
+    fn session_safety_valve_fires_from_real_usage_over_estimate() {
+        let session = valve_session(Some(1_000_000));
+
+        assert!(!session.safety_valve_triggered(0.8, 1, None));
+        assert!(!session.safety_valve_triggered(0.8, 1, Some(700_000)));
+        assert!(session.safety_valve_triggered(0.8, 1, Some(800_000)));
+    }
+
+    #[test]
+    fn session_safety_valve_disabled_when_zero() {
+        let session = valve_session(Some(1000));
+
+        assert!(!session.safety_valve_triggered(0.0, 1, Some(1_000_000)));
+    }
+
+    #[test]
+    fn session_safety_valve_disabled_when_nan() {
+        let session = valve_session(Some(1000));
+
+        assert!(!session.safety_valve_triggered(f32::NAN, 1, Some(1_000_000)));
+    }
+
+    #[test]
+    fn session_safety_valve_respects_compressing() {
+        let mut session = valve_session(Some(1000));
+        session.set_compressing(true);
+
+        assert!(!session.safety_valve_triggered(0.8, 1, Some(1_000_000)));
+    }
+
+    #[test]
+    fn session_safety_valve_requires_reclaimable_tokens() {
+        let session = valve_session(Some(1000));
+
+        assert!(!session.safety_valve_triggered(0.8, 2, Some(1_000_000)));
+        assert!(session.safety_valve_triggered(0.8, 1, Some(1_000_000)));
+    }
+
+    #[test]
+    fn session_safety_valve_requires_model_max_input_tokens() {
+        let session = valve_session(None);
+
+        assert!(!session.safety_valve_triggered(0.8, 1, Some(1_000_000)));
     }
 
     #[test]

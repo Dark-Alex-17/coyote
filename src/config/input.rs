@@ -68,6 +68,34 @@ impl Input {
         })
     }
 
+    /// An input carrying only `text`: no session history, no RAG, and no
+    /// function declarations. For auxiliary LLM calls (such as session
+    /// summarization) whose requests must not grow with the session.
+    pub fn detached_text(ctx: &RequestContext, text: &str) -> Self {
+        let mut role = Role::new("", "");
+        role.set_model(ctx.current_model().clone());
+        Self {
+            app_config: Arc::clone(&ctx.app.config),
+            stream_enabled: ctx.app.config.stream,
+            session: None,
+            rag: None,
+            functions: None,
+            text: text.to_string(),
+            raw: (text.to_string(), vec![]),
+            patched_text: None,
+            last_reply: None,
+            continue_output: None,
+            regenerate: false,
+            medias: Default::default(),
+            data_urls: Default::default(),
+            tool_calls: None,
+            role,
+            rag_name: None,
+            with_session: false,
+            with_agent: false,
+        }
+    }
+
     pub async fn from_files(
         ctx: &RequestContext,
         raw_text: &str,
@@ -327,6 +355,14 @@ impl Input {
         } else {
             None
         }
+    }
+
+    /// Re-captures `ctx.session` in place of the snapshot taken at
+    /// construction. Session compression mutates the ctx's session, not the
+    /// snapshot, so an input that outlives a compression must refresh before
+    /// building its next request or it re-sends the pre-compression history.
+    pub fn refresh_session(&mut self, ctx: &RequestContext) {
+        self.session = ctx.session.clone();
     }
 
     pub fn session_mut<'a>(&self, session: &'a mut Option<Session>) -> Option<&'a mut Session> {
@@ -658,6 +694,60 @@ mod tests {
         let role = Role::new("explicit", "prompt");
         let (_resolved, with_session, _with_agent) = resolve_role(&ctx, Some(role)).unwrap();
         assert!(!with_session);
+    }
+
+    #[test]
+    fn detached_text_input_carries_no_session_history_or_functions() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let earlier = Input::from_str(&ctx, "earlier question", None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&earlier, "earlier answer")
+            .unwrap();
+
+        let detached = Input::detached_text(&ctx, "summarize the above");
+        let messages = detached.build_messages().unwrap();
+        assert_eq!(messages.len(), 1, "must contain only the detached text");
+        assert!(messages[0].role.is_user());
+        assert_eq!(messages[0].content.to_text(), "summarize the above");
+        assert!(detached.declared_function_names().is_empty());
+        assert!(!detached.with_session());
+        assert!(!detached.with_agent());
+    }
+
+    #[test]
+    fn refresh_session_rebuilds_from_compressed_session() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        for i in 0..4 {
+            let question =
+                Input::from_str(&ctx, &format!("question {i}: {}", "x".repeat(500)), None).unwrap();
+            ctx.session
+                .as_mut()
+                .unwrap()
+                .add_message(&question, &"y".repeat(500))
+                .unwrap();
+        }
+
+        let mut input = Input::from_str(&ctx, "retry me", None).unwrap();
+        let stale = serde_json::to_string(&input.build_messages().unwrap()).unwrap();
+
+        ctx.session.as_mut().unwrap().compress("recap".into(), 1);
+
+        assert_eq!(
+            serde_json::to_string(&input.build_messages().unwrap()).unwrap(),
+            stale,
+            "the snapshot captured at construction must be untouched by compression"
+        );
+
+        input.refresh_session(&ctx);
+        let refreshed = serde_json::to_string(&input.build_messages().unwrap()).unwrap();
+        assert!(
+            refreshed.len() < stale.len(),
+            "a refreshed input must build a strictly smaller request after compression"
+        );
     }
 
     #[test]

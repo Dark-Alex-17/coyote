@@ -16,7 +16,9 @@ use super::{
     list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
-use crate::client::{Model, ModelType, TokenUsage, list_models};
+use crate::client::{
+    Message, MessageContent, MessageRole, Model, ModelType, TokenUsage, list_models,
+};
 use crate::function::{
     FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
     agents::AGENT_FUNCTION_PREFIX,
@@ -51,7 +53,7 @@ use super::memory::{
 };
 use crate::graph;
 use crate::hooks::{self, HookEvent};
-use anyhow::{Context, Error, Result, bail};
+use anyhow::{Context, Error, Result, anyhow, bail};
 use colored::Colorize;
 use gman::providers::SupportedProvider;
 use hooks::{McpServerHooks, RagSyncHooks};
@@ -68,7 +70,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use std::{env, fs};
+use std::{env, fs, slice};
 
 pub(crate) fn expand_enabled_mcp_server_ids(
     app: &AppConfig,
@@ -316,6 +318,13 @@ pub struct RequestContext {
     pub last_token_usage: Option<TokenUsage>,
     pub last_cost: Option<f64>,
 
+    /// Prompt-side tokens from the most recent request that reported usage.
+    /// Unlike `last_token_usage`, this is never clobbered by requests that
+    /// report nothing (e.g. a stream rejected before `message_start`), so the
+    /// compression safety valve always sees the last real prompt
+    /// measurement.
+    pub last_prompt_token_usage: Option<usize>,
+
     pub tool_scope: ToolScope,
 
     pub declared_function_names: HashSet<String>,
@@ -385,6 +394,7 @@ impl RequestContext {
             last_message: None,
             last_token_usage: None,
             last_cost: None,
+            last_prompt_token_usage: None,
             tool_scope: ToolScope::default(),
             declared_function_names: Default::default(),
             node_job_scope: None,
@@ -457,6 +467,7 @@ impl RequestContext {
             last_message: None,
             last_token_usage: None,
             last_cost: None,
+            last_prompt_token_usage: None,
             tool_scope: ToolScope {
                 functions,
                 mcp_runtime,
@@ -522,6 +533,7 @@ impl RequestContext {
             last_message: self.last_message.clone(),
             last_token_usage: self.last_token_usage.clone(),
             last_cost: self.last_cost,
+            last_prompt_token_usage: self.last_prompt_token_usage,
             tool_scope: self.tool_scope.clone(),
             declared_function_names: self.declared_function_names.clone(),
             node_job_scope: None,
@@ -577,6 +589,7 @@ impl RequestContext {
             last_message: None,
             last_token_usage: None,
             last_cost: None,
+            last_prompt_token_usage: None,
             tool_scope: ToolScope {
                 functions: Functions::default(),
                 mcp_runtime: McpRuntime::default(),
@@ -2293,6 +2306,14 @@ impl RequestContext {
                 if let Some(cost) = cost {
                     session.accumulate_cost(cost);
                 }
+            }
+            // Partial usage from an aborted stream lands here on purpose:
+            // it is a genuine API-reported prompt measurement, not noise.
+            // Only usage-less recordings (failed requests) leave the
+            // previous measurement in place.
+            let prompt_tokens = usage.total_prompt_tokens();
+            if prompt_tokens > 0 {
+                self.last_prompt_token_usage = Some(prompt_tokens as usize);
             }
         }
         self.last_token_usage = usage;
@@ -5030,7 +5051,7 @@ impl RequestContext {
         } else {
             role_name = self.role.as_ref().map(|v| v.name().to_string());
         }
-        let name = role_name.ok_or_else(|| anyhow::anyhow!("No role"))?;
+        let name = role_name.ok_or_else(|| anyhow!("No role"))?;
         self.upsert_role(app, &name)?;
         self.use_role(app, &name, abort_signal).await
     }
@@ -5243,14 +5264,31 @@ impl RequestContext {
     }
 
     pub async fn compress_session(&mut self) -> Result<()> {
-        match self.session.as_ref() {
+        async fn timed_fetch(input: Input) -> Result<String> {
+            tokio::time::timeout(Duration::from_secs(120), input.fetch_chat_text())
+                .await
+                .map_err(|_| anyhow!("Compression LLM call timed out after 120 s"))?
+        }
+
+        self.compress_session_impl(timed_fetch).await
+    }
+
+    /// The summarization flow with the LLM call injectable, so tests can
+    /// capture and answer each chunk request without a network round trip.
+    async fn compress_session_impl<F, Fut>(&mut self, fetch: F) -> Result<()>
+    where
+        F: Fn(Input) -> Fut,
+        Fut: Future<Output = Result<String>>,
+    {
+        let session_window = match self.session.as_ref() {
             Some(session) => {
                 if !session.has_user_messages() {
                     bail!("No need to compress since there are no messages in the session")
                 }
+                session.model().max_input_tokens()
             }
             None => bail!("No session"),
-        }
+        };
 
         let prompt = self
             .app
@@ -5259,44 +5297,79 @@ impl RequestContext {
             .clone()
             .unwrap_or_else(|| SUMMARIZATION_PROMPT.into());
 
-        async fn timed_fetch(input: &Input) -> Result<String> {
-            tokio::time::timeout(Duration::from_secs(120), input.fetch_chat_text())
-                .await
-                .map_err(|_| anyhow::anyhow!("Compression LLM call timed out after 120 s"))?
-        }
-
-        let mut input = Input::from_str(self, &prompt, None)?;
-        let compression_model_id = self
+        let compression_model = match self
             .compression_model()
-            .filter(|id| *id != self.current_model().id());
-        let summary = match compression_model_id {
+            .filter(|id| *id != self.current_model().id())
+        {
             Some(model_id) => {
                 match Model::retrieve_model(self.app.config.as_ref(), &model_id, ModelType::Chat) {
-                    Ok(model) => {
-                        input.set_role_model(model);
-                        match timed_fetch(&input).await {
-                            Ok(summary) => summary,
-                            Err(err) => {
-                                eprintln!(
-                                    "Warning: compression model '{model_id}' failed: {err}; falling back to the current model '{}' for session compression",
-                                    self.current_model().id()
-                                );
-                                let input = Input::from_str(self, &prompt, None)?;
-                                timed_fetch(&input).await?
-                            }
-                        }
-                    }
+                    Ok(model) => Some(model),
                     Err(err) => {
                         eprintln!(
                             "Warning: compression model '{model_id}' could not be used ({err}); falling back to the current model '{}' for session compression",
                             self.current_model().id()
                         );
-                        timed_fetch(&input).await?
+                        None
                     }
                 }
             }
-            None => timed_fetch(&input).await?,
+            None => None,
         };
+
+        // Cap each chunk well below the summarizer's window so every request
+        // (prior summary + chunk + prompt) fits, even for sessions that have
+        // grown past the window itself.
+        let window = compression_model
+            .as_ref()
+            .and_then(|model| model.max_input_tokens())
+            .or(session_window)
+            .unwrap_or(SUMMARIZATION_WINDOW_FALLBACK_TOKENS);
+        let chunk_budget = (window as f32 * SUMMARIZATION_CHUNK_BUDGET_RATIO) as usize;
+
+        let keep_last = self.compression_keep_last();
+        let chunks: Vec<String> = self
+            .session
+            .as_ref()
+            .map(|session| {
+                // `Session::compress` archives every message when `keep_last`
+                // covers the whole list, so summarize them all in that case.
+                let mut foldable = session.foldable_messages(keep_last);
+                if foldable.is_empty() {
+                    foldable = session.foldable_messages(0);
+                }
+                slice_summarization_chunks(session.model(), foldable, chunk_budget)
+                    .into_iter()
+                    .map(render_summarization_chunk)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Fold forward, oldest chunk first: each call carries the summary of
+        // everything before it, and the summarization prompt instructs the
+        // model to merge that prior summary into the new one.
+        let mut summary = String::new();
+        for chunk in &chunks {
+            let request = compose_summarization_request(&prompt, &summary, chunk);
+            summary = match compression_model.as_ref() {
+                Some(model) => {
+                    let mut input = Input::detached_text(self, &request);
+                    input.set_role_model(model.clone());
+                    match fetch(input).await {
+                        Ok(summary) => summary,
+                        Err(err) => {
+                            eprintln!(
+                                "Warning: compression model '{}' failed: {err}; falling back to the current model '{}' for session compression",
+                                model.id(),
+                                self.current_model().id()
+                            );
+                            fetch(Input::detached_text(self, &request)).await?
+                        }
+                    }
+                }
+                None => fetch(Input::detached_text(self, &request)).await?,
+            };
+        }
+
         let summary_context_prompt = self
             .app
             .config
@@ -5541,6 +5614,73 @@ fn fork_base_name(name: &str) -> &str {
     name
 }
 
+/// Assumed summarizer window when neither the compression model nor the
+/// session model declares `max_input_tokens`.
+const SUMMARIZATION_WINDOW_FALLBACK_TOKENS: usize = 200_000;
+/// Share of the summarizer's window a single history chunk may occupy; the
+/// rest is headroom for the summarization prompt, the folded-forward prior
+/// summary, and the response.
+const SUMMARIZATION_CHUNK_BUDGET_RATIO: f32 = 0.6;
+
+/// Splits `messages` into consecutive runs whose estimated tokens each stay
+/// within `budget`. A message that alone exceeds the budget forms its own
+/// chunk: messages are the smallest unit summarization can fold.
+fn slice_summarization_chunks<'a>(
+    model: &Model,
+    messages: &'a [Message],
+    budget: usize,
+) -> Vec<&'a [Message]> {
+    let mut chunks = vec![];
+    let mut start = 0;
+    let mut tokens = 0;
+    for (i, message) in messages.iter().enumerate() {
+        let message_tokens = model.total_tokens(slice::from_ref(message));
+        if i > start && tokens + message_tokens > budget {
+            chunks.push(&messages[start..i]);
+            start = i;
+            tokens = 0;
+        }
+        tokens += message_tokens;
+    }
+    if start < messages.len() {
+        chunks.push(&messages[start..]);
+    }
+    chunks
+}
+
+/// Renders messages as a role-prefixed transcript for the summarizer. Tool
+/// transcripts are serialized whole rather than dropped: their results often
+/// carry the facts the summary must preserve.
+fn render_summarization_chunk(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .map(|message| {
+            let role = match message.role {
+                MessageRole::System => "SYSTEM",
+                MessageRole::Assistant => "ASSISTANT",
+                MessageRole::User => "USER",
+                MessageRole::Tool => "TOOL",
+            };
+            let content = match &message.content {
+                MessageContent::ToolCalls(tool_calls) => {
+                    serde_json::to_string(tool_calls).unwrap_or_else(|_| tool_calls.text.clone())
+                }
+                content => content.to_text(),
+            };
+            format!("{role}: {content}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn compose_summarization_request(prompt: &str, prior_summary: &str, chunk: &str) -> String {
+    if prior_summary.is_empty() {
+        format!("{chunk}\n\n{prompt}")
+    } else {
+        format!("{SUMMARY_CONTEXT_PROMPT}{prior_summary}\n\n{chunk}\n\n{prompt}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::mcp_factory::McpFactory;
@@ -5753,6 +5893,30 @@ mod tests {
         assert!(!vars.contains_key("total_input_tokens"));
         assert!(!vars.contains_key("last_cost"));
         assert!(!vars.contains_key("total_cost"));
+    }
+
+    #[test]
+    fn record_token_usage_keeps_last_prompt_tokens_across_failed_requests() {
+        let mut ctx = create_test_ctx();
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(5),
+                cache_creation_input_tokens: Some(40),
+                cache_read_input_tokens: Some(60),
+            }),
+            &priced_model(),
+        );
+
+        assert_eq!(ctx.last_prompt_token_usage, Some(200));
+
+        // A request that fails before the provider reports usage records
+        // `None`: the display field is clobbered by design, but the safety
+        // valve's measurement must survive.
+        ctx.record_token_usage(None, &priced_model());
+
+        assert!(ctx.last_token_usage.is_none());
+        assert_eq!(ctx.last_prompt_token_usage, Some(200));
     }
 
     #[test]
@@ -6025,6 +6189,184 @@ mod tests {
         assert_eq!(
             ctx.compression_model(),
             Some("openai:agent-model".to_string())
+        );
+    }
+
+    fn windowed_model(max_input_tokens: usize) -> Model {
+        let mut data = ModelData::new("test-window");
+        data.max_input_tokens = Some(max_input_tokens);
+        Model::from_config("openai", &[data]).remove(0)
+    }
+
+    fn text_message(role: MessageRole, text: &str) -> Message {
+        Message::new(role, MessageContent::Text(text.to_string()))
+    }
+
+    #[test]
+    fn summarization_chunks_respect_budget_and_preserve_order() {
+        let model = Model::default();
+        // 1000 ascii chars => ~250 estimated tokens per message.
+        let messages: Vec<Message> = (0..10)
+            .map(|i| {
+                let role = if i % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                };
+                text_message(role, &format!("msg-{i:02} {}", "x".repeat(993)))
+            })
+            .collect();
+
+        let budget = 600;
+        let chunks = slice_summarization_chunks(&model, &messages, budget);
+
+        assert!(chunks.len() > 1, "a history over budget must be split");
+        for chunk in &chunks {
+            assert!(
+                model.total_tokens(chunk) <= budget,
+                "each chunk must fit the budget"
+            );
+        }
+        let flattened: Vec<&Message> = chunks.iter().flat_map(|chunk| chunk.iter()).collect();
+        assert_eq!(
+            flattened.len(),
+            messages.len(),
+            "chunks must cover every message"
+        );
+        for (original, chunked) in messages.iter().zip(flattened) {
+            assert_eq!(original.content.to_text(), chunked.content.to_text());
+        }
+
+        assert_eq!(
+            slice_summarization_chunks(&model, &messages, 10_000).len(),
+            1,
+            "a history within budget must stay a single chunk"
+        );
+    }
+
+    #[test]
+    fn summarization_chunk_slicing_isolates_oversized_message() {
+        let model = Model::default();
+        let messages = vec![
+            text_message(MessageRole::User, "small question"),
+            text_message(MessageRole::Assistant, &"y".repeat(8000)),
+            text_message(MessageRole::User, "another small question"),
+        ];
+        let chunks = slice_summarization_chunks(&model, &messages, 100);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks[1].len(),
+            1,
+            "an over-budget message forms its own chunk"
+        );
+    }
+
+    #[test]
+    fn render_summarization_chunk_keeps_tool_transcripts() {
+        let tool_calls = MessageContentToolCalls::new(
+            vec![ToolResult::new(
+                ToolCall::new(
+                    "fs_cat".to_string(),
+                    json!({"path": "notes.txt"}),
+                    Some("call-1".to_string()),
+                ),
+                json!("the file contents"),
+            )],
+            "reading the file".to_string(),
+        );
+        let messages = vec![
+            text_message(MessageRole::User, "read notes.txt"),
+            Message::new(MessageRole::Tool, MessageContent::ToolCalls(tool_calls)),
+        ];
+
+        let rendered = render_summarization_chunk(&messages);
+
+        assert!(rendered.contains("USER: read notes.txt"));
+        assert!(rendered.contains("TOOL: "));
+        assert!(rendered.contains("fs_cat"));
+        assert!(rendered.contains("the file contents"));
+    }
+
+    #[test]
+    fn compress_session_folds_forward_across_chunks() {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_keep_last: 2,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let mut session = Session::default();
+        // A 2_000-token window gives a 1_200-token chunk budget; the session
+        // built below estimates past the window itself.
+        session.set_model(windowed_model(2_000));
+        ctx.session = Some(session);
+        for i in 0..10 {
+            let text = format!("msg-{i:02} {}", "x".repeat(793));
+            let input = Input::from_str(&ctx, &text, Some(Role::new("", ""))).unwrap();
+            ctx.session
+                .as_mut()
+                .unwrap()
+                .add_message(&input, &format!("reply-{i:02}"))
+                .unwrap();
+        }
+        assert!(
+            ctx.session.as_ref().unwrap().tokens() > 2_000,
+            "the session must not fit the summarizer window in one request"
+        );
+
+        let requests = std::cell::RefCell::new(Vec::new());
+        let requests_ref = &requests;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ctx.compress_session_impl(move |input: Input| async move {
+                // The real request pipeline, guard_max_input_tokens included.
+                let data = input.prepare_completion_data(input.role().model(), false)?;
+                requests_ref
+                    .borrow_mut()
+                    .push((input.text(), data.messages, data.functions));
+                Ok(format!("folded-summary-{}", requests_ref.borrow().len()))
+            }))
+            .unwrap();
+
+        let requests = requests.into_inner();
+        assert_eq!(requests.len(), 2, "the foldable middle needs two chunks");
+
+        let (first_text, first_messages, first_functions) = &requests[0];
+        assert!(first_text.contains("msg-00"));
+        assert!(!first_text.contains(SUMMARY_CONTEXT_PROMPT));
+        assert_eq!(first_messages.len(), 1, "detached: no session history");
+        assert!(first_messages[0].role.is_user());
+        assert!(
+            first_functions.is_none(),
+            "detached: no function declarations"
+        );
+
+        let (second_text, second_messages, second_functions) = &requests[1];
+        assert!(second_text.contains(SUMMARY_CONTEXT_PROMPT));
+        assert!(second_text.contains("folded-summary-1"));
+        assert!(second_text.contains("msg-05"));
+        assert!(
+            !second_text.contains("msg-00"),
+            "the first chunk reaches the second call only through its summary"
+        );
+        assert!(
+            !second_text.contains("msg-09"),
+            "the keep_last tail is never summarized"
+        );
+        assert_eq!(second_messages.len(), 1, "detached: no session history");
+        assert!(second_functions.is_none());
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), 3, "summary + keep_last tail");
+        assert!(session.messages()[0].role.is_system());
+        assert!(
+            session.messages()[0]
+                .content
+                .to_text()
+                .contains("folded-summary-2"),
+            "the recap must carry the last folded summary"
         );
     }
 

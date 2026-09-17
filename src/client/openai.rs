@@ -869,17 +869,22 @@ fn reasoning_thinking_block(item: &Value) -> Option<ThinkingBlock> {
 }
 
 /// OpenAI reports cached input under `input_tokens_details` and has no
-/// cache-creation concept, so that field stays `None`.
+/// cache-creation concept, so that field stays `None`. The reported
+/// `input_tokens` total already includes cached reads, so cached tokens are
+/// subtracted here to keep the buckets disjoint like other providers.
 fn openai_parse_responses_usage(usage: &Value) -> Option<TokenUsage> {
     if !usage.is_object() {
         return None;
     }
 
+    let cached_tokens = usage["input_tokens_details"]["cached_tokens"].as_u64();
     Some(TokenUsage {
-        input_tokens: usage["input_tokens"].as_u64(),
+        input_tokens: usage["input_tokens"]
+            .as_u64()
+            .map(|v| v.saturating_sub(cached_tokens.unwrap_or(0))),
         output_tokens: usage["output_tokens"].as_u64(),
         cache_creation_input_tokens: None,
-        cache_read_input_tokens: usage["input_tokens_details"]["cached_tokens"].as_u64(),
+        cache_read_input_tokens: cached_tokens,
     })
 }
 
@@ -1267,10 +1272,29 @@ mod tests {
         let output = openai_extract_responses(&data).unwrap();
 
         let usage = output.usage.unwrap();
-        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.input_tokens, Some(40));
         assert_eq!(usage.output_tokens, Some(20));
         assert_eq!(usage.cache_creation_input_tokens, None);
         assert_eq!(usage.cache_read_input_tokens, Some(60));
+    }
+
+    #[test]
+    fn extract_responses_usage_without_cached_details_keeps_input_intact() {
+        let data = json!({
+            "output": [
+                { "type": "message", "content": [{ "type": "output_text", "text": "answer" }] },
+            ],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+            }
+        });
+
+        let output = openai_extract_responses(&data).unwrap();
+
+        let usage = output.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cache_read_input_tokens, None);
     }
 
     #[test]
@@ -1357,7 +1381,7 @@ mod tests {
         assert!(done);
         let (_, _, _, usage) = handler.take();
         let usage = usage.unwrap();
-        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.input_tokens, Some(40));
         assert_eq!(usage.output_tokens, Some(20));
         assert_eq!(usage.cache_creation_input_tokens, None);
         assert_eq!(usage.cache_read_input_tokens, Some(60));
@@ -1467,7 +1491,7 @@ mod tests {
         let (text, _, _, usage) = handler.take();
         assert_eq!(text, "partial answer");
         let usage = usage.expect("usage should be recorded for truncated turns");
-        assert_eq!(usage.input_tokens, Some(50));
+        assert_eq!(usage.input_tokens, Some(25));
         assert_eq!(usage.output_tokens, Some(10));
         assert_eq!(usage.cache_read_input_tokens, Some(25));
     }
