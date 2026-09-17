@@ -25,21 +25,47 @@ fn fresh_config_dir(label: &str) -> PathBuf {
     tmp_dir
 }
 
+/// Removes the fixture dir even when an assertion panics mid-run, so failed
+/// runs do not accumulate temp dirs.
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Builds the hook command that appends `marker` to `log` in the dialect of
+/// the shell the hook engine dispatches through: `sh -c` elsewhere, `cmd /C`
+/// on Windows. The cmd form parenthesizes the echo because `echo X >> f`
+/// under cmd writes "X " with a trailing space, which would break exact
+/// marker matching. Both forms double-quote the path, so the command also
+/// survives YAML single-quoting and spaces in temp paths.
+fn marker_command(marker: &str, log: &Path) -> String {
+    let log = log.display();
+    if cfg!(windows) {
+        format!(r#"(echo {marker})>> "{log}""#)
+    } else {
+        format!(r#"echo {marker} >> "{log}""#)
+    }
+}
+
 /// Lays out a config dir with a dry_run model, global agent.* hooks that
 /// append one marker line per event to `log`, a `probe-macro` agent that
 /// whitelists everything, and a `probe` macro with the given YAML body.
 fn write_fixture(dir: &Path, log: &Path, macro_yaml: &str) {
-    let log = log.display();
     // Without IS_SANDBOX (scrubbed below) a run insists on a vault password
     // file, so the fixture provides one.
     let vault_pass = dir.join("vault-pass");
     fs::write(&vault_pass, "test-password\n").unwrap();
+    // Paths land in single-quoted YAML scalars: double-quoted ones would read
+    // the backslashes in a Windows temp path (`C:\Users\...`) as escapes.
     fs::write(
         dir.join("config.yaml"),
         format!(
             "model: dryrun:dry-model\n\
              dry_run: true\n\
-             vault_password_file: {vault_pass}\n\
+             vault_password_file: '{vault_pass}'\n\
              clients:\n\
              \x20 - type: openai\n\
              \x20   name: dryrun\n\
@@ -55,17 +81,21 @@ fn write_fixture(dir: &Path, log: &Path, macro_yaml: &str) {
              hooks:\n\
              \x20 agent.started:\n\
              \x20   - name: mark\n\
-             \x20     command: \"echo STARTED >> '{log}'\"\n\
+             \x20     command: '{started}'\n\
              \x20 agent.completed:\n\
              \x20   - name: mark\n\
-             \x20     command: \"echo COMPLETED >> '{log}'\"\n\
+             \x20     command: '{completed}'\n\
              \x20 agent.failed:\n\
              \x20   - name: mark\n\
-             \x20     command: \"echo FAILED >> '{log}'\"\n\
+             \x20     command: '{failed}'\n\
              \x20 agent.interrupted:\n\
              \x20   - name: mark\n\
-             \x20     command: \"echo INTERRUPTED >> '{log}'\"\n",
-            vault_pass = vault_pass.display()
+             \x20     command: '{interrupted}'\n",
+            vault_pass = vault_pass.display(),
+            started = marker_command("STARTED", log),
+            completed = marker_command("COMPLETED", log),
+            failed = marker_command("FAILED", log),
+            interrupted = marker_command("INTERRUPTED", log),
         ),
     )
     .unwrap();
@@ -103,6 +133,8 @@ fn run_coyote(dir: &Path, args: &[&str]) -> Output {
 /// Bounded poll for the expected terminal marker. The binary drains pending
 /// hooks before exiting, so the log is normally complete once `output()`
 /// returns; the poll only absorbs filesystem latency, never paces the run.
+/// Marker matching stays byte-exact on both platforms because `lines()`
+/// strips the CRLF that cmd's echo emits on Windows.
 fn wait_for_marker(log: &Path, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -136,6 +168,7 @@ fn assert_started_and_single_terminal(contents: &str, terminal: &str) {
 
 fn probe_macro_run(label: &str, macro_yaml: &str, args: &[&str], expect_success: bool) -> String {
     let dir = fresh_config_dir(label);
+    let _cleanup = TempDirGuard(dir.clone());
     let log = dir.join("agent-events.log");
     write_fixture(&dir, &log, macro_yaml);
 
@@ -155,7 +188,6 @@ fn probe_macro_run(label: &str, macro_yaml: &str, args: &[&str], expect_success:
         "FAILED"
     };
     let contents = wait_for_marker(&log, terminal);
-    let _ = fs::remove_dir_all(&dir);
     assert_started_and_single_terminal(&contents, terminal);
     contents
 }
