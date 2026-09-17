@@ -600,6 +600,7 @@ mod tests {
                         tool_results: vec![],
                         text: "leftover text".to_string(),
                         sequence: false,
+                        round_starts: vec![],
                     }),
                 ),
             ],

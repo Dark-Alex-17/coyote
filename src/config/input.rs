@@ -1023,6 +1023,7 @@ mod tests {
         assert!(!tool_calls.sequence);
         assert_eq!(tool_calls.tool_results.len(), 1);
         assert!(tool_calls.tool_results[0].text.is_none());
+        assert!(tool_calls.round_starts.is_empty());
     }
 
     #[test]
@@ -1044,6 +1045,29 @@ mod tests {
             tool_calls.tool_results[1].text,
             Some("second text".to_string())
         );
+        assert_eq!(tool_calls.round_starts, vec![1]);
+    }
+
+    /// Regression: rounds where the model emitted only tool calls (no
+    /// narration text) carry no text marker, so `round_starts` is the only
+    /// record of the round boundary — it must be set on every merge.
+    #[test]
+    fn merge_tool_results_records_round_starts_for_textless_rounds() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "test", None)
+            .unwrap()
+            .merge_tool_results(String::new(), vec![tool_result("id-1", "ok")])
+            .merge_tool_results(
+                String::new(),
+                vec![tool_result("id-2", "ok2"), tool_result("id-3", "ok3")],
+            )
+            .merge_tool_results(String::new(), vec![tool_result("id-4", "ok4")]);
+
+        let tool_calls = input.tool_calls().as_ref().unwrap();
+        assert!(tool_calls.sequence);
+        assert_eq!(tool_calls.tool_results.len(), 4);
+        assert!(tool_calls.tool_results.iter().all(|t| t.text.is_none()));
+        assert_eq!(tool_calls.round_starts, vec![1, 3]);
     }
 
     #[test]
