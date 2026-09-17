@@ -4,7 +4,7 @@ use crate::config::{
 };
 use crate::function::write_file_atomic;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Error, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
 use indexmap::IndexMap;
 use rand::distr::{Alphanumeric, SampleString};
@@ -223,12 +223,6 @@ pub struct ResolvedHook {
     pub cwd: PathBuf,
 }
 
-/// Pre-resolved `rag.sync.*` hooks plus the names `base_envs_parts` needs,
-/// carried by value into the context-free RAG build funnels (`Rag::init`,
-/// `Rag::init_with_config`, `Rag::refresh_document_paths`). Resolution
-/// happens where the caller's identity is known; dispatch happens inside the
-/// funnel, bracketing the one real sync it performs — so cache hits, pure
-/// loads, and attaches (which never enter a funnel) fire nothing.
 #[derive(Debug, Clone, Default)]
 pub struct RagSyncHooks {
     started: Vec<ResolvedHook>,
@@ -252,10 +246,6 @@ impl RagSyncHooks {
         }
     }
 
-    /// Resolution for `Agent::init`, which builds agent and graph-node RAGs
-    /// before any context carries the agent: the whitelist gate and the
-    /// agent's own hooks come straight from the config being constructed.
-    /// No session or role exists at that point.
     pub fn resolve_for_agent(
         global_hooks: &HooksMap,
         gate: &[String],
@@ -300,9 +290,7 @@ impl RagSyncHooks {
         );
     }
 
-    /// A user abort mid-sync counts as a failure: the funnel's sync came
-    /// back `Err` either way, and the knowledge base was not (re)built.
-    pub fn fire_failed(&self, rag_name: &str, rag_path: &str, error: &anyhow::Error) {
+    pub fn fire_failed(&self, rag_name: &str, rag_path: &str, error: &Error) {
         self.fire(
             HookEvent::RagSyncFailed,
             &self.failed,
@@ -337,10 +325,6 @@ impl RagSyncHooks {
     }
 }
 
-/// Pre-resolved `mcp.server.*` hooks plus the names `base_envs_parts` needs,
-/// carried into the context-free `McpFactory::acquire`. Dispatch happens at
-/// the spawn itself — one event per real spawn — so handing back an
-/// already-live server fires nothing.
 #[derive(Debug, Clone, Default)]
 pub struct McpServerHooks {
     connected: Vec<ResolvedHook>,
@@ -362,8 +346,6 @@ impl McpServerHooks {
         }
     }
 
-    /// `reconnect` marks a spawn for a server key that was live earlier in
-    /// this process; the variable is omitted entirely on a first connect.
     pub fn fire_connected(&self, server: &str, transport: &str, reconnect: bool) {
         let mut extras = vec![
             ("COYOTE_MCP_SERVER", server.to_string()),
@@ -375,15 +357,7 @@ impl McpServerHooks {
         self.fire(HookEvent::McpServerConnected, &self.connected, &extras);
     }
 
-    /// `auth_required` marks an `McpAuthRequired` failure; the variable is
-    /// omitted on every other error.
-    pub fn fire_failed(
-        &self,
-        server: &str,
-        transport: &str,
-        error: &anyhow::Error,
-        auth_required: bool,
-    ) {
+    pub fn fire_failed(&self, server: &str, transport: &str, error: &Error, auth_required: bool) {
         let mut extras = vec![
             ("COYOTE_MCP_SERVER", server.to_string()),
             ("COYOTE_MCP_TRANSPORT", transport.to_string()),
@@ -710,12 +684,6 @@ pub(crate) fn base_envs_parts(
     envs
 }
 
-/// `COYOTE_ROLE` extras for the `session.*` and `turn.*` fire sites — the
-/// only two families that carry the variable. Resolved at fire time, because
-/// roles change mid-session (`.role`, `.exit role`, temp roles): the role
-/// held directly on the context wins, then the name of a role a session has
-/// absorbed. Derived roles have no name; resolution then falls through to
-/// the session-held role, if any.
 pub fn role_extras(ctx: &RequestContext) -> Vec<(&'static str, String)> {
     ctx.role
         .as_ref()

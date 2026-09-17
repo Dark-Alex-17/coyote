@@ -401,10 +401,6 @@ impl McpRegistry {
         Ok(())
     }
 
-    /// Boot-time connects fire no `mcp.server.*` hooks: this runs from
-    /// `AppState::new`, before any `RequestContext` exists to resolve hook
-    /// scopes against. Hook-observed connects go through
-    /// `McpFactory::acquire`.
     async fn start_server(&self, id: String) -> Result<Option<(String, Arc<ConnectedServer>)>> {
         let spec = self
             .config

@@ -54,6 +54,7 @@ use crate::hooks::{self, HookEvent};
 use anyhow::{Context, Error, Result, bail};
 use colored::Colorize;
 use gman::providers::SupportedProvider;
+use hooks::{McpServerHooks, RagSyncHooks};
 use indexmap::IndexMap;
 use indoc::formatdoc;
 use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
@@ -4411,7 +4412,7 @@ impl RequestContext {
 
             if !server_ids.is_empty() {
                 let app_ref = &self.app;
-                let mcp_hooks = hooks::McpServerHooks::resolve(self);
+                let mcp_hooks = McpServerHooks::resolve(self);
                 let acquire_all = async {
                     let mut handles = Vec::new();
                     let mut auth_required = Vec::new();
@@ -5350,7 +5351,7 @@ impl RequestContext {
         let vault = self.app.vault.clone();
         let rag_cache = self.rag_cache();
         let working_mode = self.working_mode;
-        let sync_hooks = hooks::RagSyncHooks::resolve(self);
+        let sync_hooks = RagSyncHooks::resolve(self);
 
         let (rag, rag_key): (Arc<Rag>, Option<RagKey>) = match rag {
             None => {
@@ -5484,7 +5485,7 @@ impl RequestContext {
             false,
             &self.app.config,
             abort_signal,
-            hooks::RagSyncHooks::resolve(self),
+            RagSyncHooks::resolve(self),
         )
         .await?;
         self.rag = Some(Arc::new(rag));
@@ -5521,7 +5522,7 @@ impl RequestContext {
             true,
             &self.app.config,
             abort_signal,
-            hooks::RagSyncHooks::resolve(self),
+            RagSyncHooks::resolve(self),
         )
         .await?;
         self.rag = Some(Arc::new(rag));

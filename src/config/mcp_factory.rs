@@ -95,22 +95,11 @@ impl McpFactory {
     ) -> Result<Arc<ConnectedServer>> {
         let key = McpServerKey::from_spec(name, spec);
 
-        // Reuse of a live server fires no hooks; only a real spawn below
-        // reports anything. The live probe and the reconnect read share one
-        // lock section so a racing first connect that inserts between them
-        // cannot be misreported as a reconnect. The spawn await below stays
-        // outside the lock, so two racing first connects may still both
-        // spawn (no singleflight); the loser then fires a second plain
-        // `connected` (no RECONNECT flag) and its insert overwrites the
-        // winner's map entry.
         let reconnect = {
             let map = self.active.lock();
             if let Some(existing) = map.get(&key).and_then(|weak| weak.upgrade()) {
                 return Ok(existing);
             }
-            // The live probe failed, so an entry still present for this key
-            // is a dead weak: the key was connected earlier in this process
-            // and the spawn below is a reconnect.
             map.contains_key(&key)
         };
 

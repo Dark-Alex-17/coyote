@@ -356,9 +356,6 @@ impl Agent {
             }
         };
 
-        // Resolved from the config under construction: no context carries
-        // this agent yet, but its whitelist gate and hooks must still apply
-        // to the RAG builds below.
         let rag_sync_hooks = RagSyncHooks::resolve_for_agent(
             &app.hooks,
             &agent_config.global_hooks,

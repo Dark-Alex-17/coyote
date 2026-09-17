@@ -167,8 +167,7 @@ impl Rag {
             sync_hooks.fire_failed(&rag.name, &rag.path, &err);
             return Err(err);
         }
-        // rag.sync.completed promises a saved knowledge base, so it fires
-        // only after a successful save; a save error is a sync failure.
+
         match rag.save() {
             Ok(true) => println!("✓ Saved RAG to '{}'.", save_path.display()),
             Ok(false) => {}
@@ -332,8 +331,7 @@ impl Rag {
             sync_hooks.fire_failed(&rag.name, &rag.path, &err);
             return Err(err);
         }
-        // rag.sync.completed promises a saved knowledge base, so it fires
-        // only after a successful save; a save error is a sync failure.
+
         match rag.save() {
             Ok(true) => println!("✓ Saved RAG to '{}'.", save_path.display()),
             Ok(false) => {}
@@ -686,8 +684,7 @@ impl Rag {
             sync_hooks.fire_failed(&self.name, &self.path, &err);
             return Err(err);
         }
-        // rag.sync.completed promises a saved knowledge base, so it fires
-        // only after a successful save; a save error is a sync failure.
+
         match self.save() {
             Ok(true) => println!("✓ Saved rag to '{}'.", self.path),
             Ok(false) => {}

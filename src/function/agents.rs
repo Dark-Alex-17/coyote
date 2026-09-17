@@ -16,6 +16,7 @@ use crate::graph;
 use crate::repl::DEFAULT_CONTINUATION_PROMPT;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
+use hooks::McpServerHooks;
 use indexmap::IndexMap;
 use log::{debug, warn};
 use parking_lot::RwLock;
@@ -961,7 +962,7 @@ async fn populate_agent_mcp_runtime(ctx: &mut RequestContext, server_ids: &[Stri
         })
         .unwrap_or_default();
 
-    let mcp_hooks = hooks::McpServerHooks::resolve(ctx);
+    let mcp_hooks = McpServerHooks::resolve(ctx);
     for (id, spec) in server_specs {
         let handle = app
             .mcp_factory
