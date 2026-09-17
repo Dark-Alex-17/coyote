@@ -197,11 +197,6 @@ pub fn discover() -> Result<Vec<DiscoveredMixin>> {
     ) {
         out.push(read_mixin(path)?);
     }
-    // Hooks directories are deliberately scanned: hook scripts run inside the
-    // sandbox too, so a sidecar mixin next to one can declare its needs. The
-    // agents scan above never descends into `agents/<name>/hooks/`, and the
-    // `.builtin-manifest` living in these dirs is not matched by the
-    // `*.sbx-mixin.yaml` suffix filter.
     for agent_dir in subdirs_of(&paths::agents_data_dir()) {
         for path in collect_mixins(&agent_dir.join("hooks"), &[ScanMode::Flat]) {
             out.push(read_mixin(path)?);

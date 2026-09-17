@@ -1026,13 +1026,6 @@ impl SpawnResultHooks {
         }
     }
 
-    /// Fires `agent.completed`, or — for a failed child — `agent.interrupted`
-    /// when its abort signal was ctrl-c'd (REPL ctrl-c or `agent__cancel`),
-    /// else `agent.failed`. The signal, never the error text, decides:
-    /// cancellation is not a failure, so no error env rides along. Unlike the
-    /// signal-first `top_level_agent_finished` gate, completion wins over a
-    /// latched ctrl-c at this seam — a finished child's output is collectible,
-    /// so the asymmetry is intentional.
     fn fire(self, error: Option<&str>, child_abort: &AbortSignal) {
         let mut extras = vec![
             ("COYOTE_AGENT_ID", self.agent_id),
@@ -1783,13 +1776,6 @@ fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Val
             let from_agent = request.from_agent_name.clone();
             let question = request.question.clone();
             let _ = request.reply_tx.send(reply.to_string());
-            // Origin envs come from the taken request, not this (replying)
-            // context, so `escalation.answered` and `escalation.raised`
-            // describe the same agent for one escalation id. "Answered"
-            // means a parent submitted an answer, not that the asker
-            // received it: the reply_tx.send failure is ignored by design,
-            // so the event also fires for an escalation whose asker already
-            // timed out or was cancelled.
             hooks::fire(
                 HookEvent::EscalationAnswered,
                 ctx,
@@ -3414,10 +3400,10 @@ mod tests {
     fn reply_escalation_fires_answered_once_and_never_on_failure_arms() {
         let _sink = hooks::test_sink::install();
         let marker = "t049_answered_once";
-        let mut hooks_map = crate::hooks::HooksMap::default();
+        let mut hooks_map = hooks::HooksMap::default();
         hooks_map.insert(
             "escalation.answered".to_string(),
-            vec![crate::hooks::HookDef {
+            vec![hooks::HookDef {
                 name: marker.to_string(),
                 command: "true".to_string(),
             }],

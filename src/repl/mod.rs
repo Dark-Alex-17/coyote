@@ -527,9 +527,6 @@ Type ".help" for additional help.
         }
 
         if let Some(supervisor) = self.ctx.read().supervisor.clone() {
-            // Leaving the loop is a deliberate exit, never an interruption:
-            // cancelling straggler children here does not latch the abort
-            // signal, so teardown still classifies as agent.completed.
             supervisor.read().cancel_recursive();
         }
 
@@ -1718,13 +1715,6 @@ fn reset_continuation(ctx: &mut RequestContext) {
     ctx.reset_continuation_count();
 }
 
-/// Ctrl-C at the prompt: cancel background work, but only latch the abort
-/// signal when there was live work to cancel. An idle-prompt ctrl-c is a
-/// step on the advertised exit path ("To exit, press Ctrl+D"), not an
-/// interruption, so teardown after the following ctrl-d classifies the run
-/// as completed. Mid-turn ctrl-c never passes through here -- it latches
-/// the signal directly (wait_user_interrupt / poll_abort_signal), so an
-/// interrupted turn followed by ctrl-d still reports agent.interrupted.
 pub(crate) fn latch_prompt_interrupt(abort_signal: &AbortSignal, supervisor: &RwLock<Supervisor>) {
     let supervisor = supervisor.read();
     if supervisor.has_active_tasks() {

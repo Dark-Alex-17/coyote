@@ -190,11 +190,6 @@ impl Supervisor {
             .count()
     }
 
-    /// True when any registered agent or job is still running -- i.e. a
-    /// cancellation right now would actually interrupt in-flight work.
-    /// Mirrors `cancel_recursive`'s traversal: work buried in a nested child
-    /// supervisor still counts, so a prompt ctrl-c that cancels only a
-    /// grandchild latches like any other interruption.
     pub fn has_active_tasks(&self) -> bool {
         self.effective_active_count() > 0
             || self.active_job_count() > 0

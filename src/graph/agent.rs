@@ -50,14 +50,6 @@ impl AgentNodeExecutor {
         )
         .await;
         if let Err(e) = &result {
-            // The child's own abort signal dies inside `run`; the session
-            // signal is what a user interrupt fires (the executor bridges it
-            // onto the graph abort), so it is the only honest
-            // interrupted-vs-failed discriminator at this seam. Blind spot:
-            // agent__cancel sets the child handle's signal, which never
-            // reaches parent_ctx.session_abort, so a node failing during
-            // such a cancellation stays agent.failed while the outer bracket
-            // reports agent.interrupted (narrow window, accepted).
             if parent_ctx
                 .session_abort
                 .as_ref()

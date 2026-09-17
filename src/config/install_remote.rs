@@ -1860,12 +1860,6 @@ fn print_plan_summary(plan: &InstallPlan) {
 /// Bundle-shipped hook scripts execute on the user's machine once wired into
 /// config, so every planned file landing in a hook location is called out
 /// individually. Visibility only: installing them needs no extra approval.
-///
-/// Only the locations the engine actually resolves hooks from are announced:
-/// the top-level hooks category, direct children of `agents/<name>/hooks/`,
-/// and direct children of `roles/hooks/`. A `hooks/` directory anywhere else
-/// (e.g. inside a skill or macro subtree) is inert data and announcing it
-/// would be noise.
 fn hook_script_lines(plan: &InstallPlan) -> Vec<String> {
     plan.files
         .iter()
@@ -2864,9 +2858,6 @@ mod tests {
                 file("x/config.yaml", TopCategory::Agents),
                 file("reviewer.md", TopCategory::Roles),
                 file("hello.yaml", TopCategory::Macros),
-                // Only the locations the engine resolves hooks from announce:
-                // a hooks/ directory nested deeper or under another category
-                // is inert data.
                 file("x/hooks/nested/deep.sh", TopCategory::Agents),
                 file("x/sub/hooks/pre.sh", TopCategory::Agents),
                 file("sub/hooks/extra.sh", TopCategory::Roles),

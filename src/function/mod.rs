@@ -2694,7 +2694,7 @@ impl ToolCallTracker {
     }
 }
 
-fn format_call_log(cmd_name: &str, cmd_args: &[String], json_data: &serde_json::Value) -> String {
+fn format_call_log(cmd_name: &str, cmd_args: &[String], json_data: &Value) -> String {
     if *NO_COLOR {
         return format!("Call {cmd_name} {}", cmd_args.join(" "));
     }
@@ -2713,8 +2713,8 @@ fn format_call_log(cmd_name: &str, cmd_args: &[String], json_data: &serde_json::
     )
 }
 
-fn format_json_colored_keys(value: &serde_json::Value) -> String {
-    let serde_json::Value::Object(map) = value else {
+fn format_json_colored_keys(value: &Value) -> String {
+    let Value::Object(map) = value else {
         return dimmed_text(&value.to_string());
     };
     if map.is_empty() {
@@ -3486,16 +3486,15 @@ mod tests {
 
     #[test]
     fn bundled_bash_tools_generate_declarations() {
-        let tools_dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/functions/tools");
+        let tools_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/functions/tools");
         let mut checked = Vec::new();
-        for entry in std::fs::read_dir(&tools_dir).unwrap() {
+        for entry in fs::read_dir(&tools_dir).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().and_then(OsStr::to_str) != Some("sh") {
                 continue;
             }
             let name = path.file_stem().unwrap().to_string_lossy().to_string();
-            let src = std::fs::read_to_string(&path).unwrap();
+            let src = fs::read_to_string(&path).unwrap();
             let (_, declarations) = bash::build_bash_tool(&src, &name)
                 .unwrap_or_else(|e| panic!("bundled tool '{name}' failed to parse: {e}"));
             assert!(
@@ -4673,7 +4672,7 @@ mod tests {
         .unwrap()
         .expect("nonzero exit must return an error payload");
 
-        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let json: Value = serde_json::from_str(&result).unwrap();
         assert!(
             json["tool_call_error"]
                 .as_str()
@@ -4702,7 +4701,7 @@ mod tests {
         .unwrap()
         .expect("nonzero exit must return an error payload");
 
-        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let json: Value = serde_json::from_str(&result).unwrap();
         assert!(
             json["tool_call_error"]
                 .as_str()
@@ -4741,7 +4740,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
-        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let json: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["tool_call_error"], "Tool call 'bash' aborted");
     }
 
@@ -4826,18 +4825,15 @@ mod tests {
         // A shim written moments ago can still be open for writing somewhere
         // in the process (schedule-dependent), making exec fail with
         // ETXTBSY; retry briefly instead of flaking.
-        fn output_with_etxtbsy_retry(
-            command: &mut process::Command,
-        ) -> std::io::Result<process::Output> {
+        fn output_with_etxtbsy_retry(command: &mut Command) -> io::Result<process::Output> {
             let mut attempts = 0;
             loop {
                 match command.output() {
                     Err(err)
-                        if err.kind() == std::io::ErrorKind::ExecutableFileBusy
-                            && attempts < 10 =>
+                        if err.kind() == io::ErrorKind::ExecutableFileBusy && attempts < 10 =>
                     {
                         attempts += 1;
-                        std::thread::sleep(Duration::from_millis(50));
+                        thread::sleep(Duration::from_millis(50));
                     }
                     ret => return ret,
                 }
@@ -4907,7 +4903,7 @@ mod tests {
             return;
         }
 
-        let mut command = process::Command::new(&moved_shim);
+        let mut command = Command::new(&moved_shim);
         command
             .arg("{}")
             .env_remove(&config_env)

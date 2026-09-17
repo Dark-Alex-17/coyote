@@ -2,7 +2,7 @@
 //! silently clobber locally modified files. The bundle installer and the
 //! builtin hook installers all funnel per-file conflicts through
 //! [`resolve_conflict`], so the prompt wording and the sticky
-//! keep-all/replace-all semantics are identical everywhere — including when
+//! keep-all/replace-all semantics are identical everywhere, including when
 //! one sticky scope spans several install locations in a single run.
 
 use crate::utils::IS_STDOUT_TERMINAL;
@@ -12,17 +12,10 @@ use inquire::Select;
 use std::fs;
 use std::path::Path;
 
-/// How an installer treats a destination file that already exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InstallMode {
-    /// Leave existing files untouched. The only mode startup ever uses:
-    /// startup runs on every launch — including the REPL, which is a
-    /// terminal — so it must never prompt.
     Skip,
-    /// Overwrite existing files unconditionally.
     Force,
-    /// Write missing files, silently skip identical ones, and ask per
-    /// differing file.
     Prompt,
 }
 
@@ -42,20 +35,12 @@ pub(crate) enum ConflictAction {
     Replace,
 }
 
-/// What [`resolve_conflict`] does without a terminal: bundle installs bail
-/// (an unattended install must not half-apply a plan silently), builtin hook
-/// refreshes keep the local file (a scripted refresh must neither clobber
-/// local changes nor fail).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NonInteractive {
     Bail,
     Keep,
 }
 
-/// Decides whether an installer should overwrite the existing file at `dst`
-/// with `content` under `mode`. Only called for files that already exist;
-/// missing files are always written without prompting. In `Prompt` mode an
-/// unreadable local file counts as differing, so the user decides.
 pub(crate) fn should_replace_existing(
     dst: &Path,
     content: &str,
@@ -337,9 +322,9 @@ mod tests {
     fn should_replace_existing_skips_identical_content_without_prompting() {
         let _script = prompt_script::install(&[]);
         let dir = crate::utils::temp_file("conflict-identical-", "");
-        std::fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hook.sh");
-        std::fs::write(&path, "same content").unwrap();
+        fs::write(&path, "same content").unwrap();
 
         let mut sticky = StickyMode::None;
         let replace = should_replace_existing(
@@ -351,7 +336,7 @@ mod tests {
         )
         .unwrap();
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
         assert!(!replace);
         assert_eq!(prompt_script::prompts_asked(), 0);
     }
@@ -361,9 +346,9 @@ mod tests {
     fn should_replace_existing_never_prompts_in_skip_or_force_mode() {
         let _script = prompt_script::install(&[]);
         let dir = crate::utils::temp_file("conflict-modes-", "");
-        std::fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hook.sh");
-        std::fs::write(&path, "local edit").unwrap();
+        fs::write(&path, "local edit").unwrap();
 
         let mut sticky = StickyMode::None;
         let skip =
@@ -371,7 +356,7 @@ mod tests {
         let force =
             should_replace_existing(&path, "shipped", "hooks", InstallMode::Force, &mut sticky);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
         assert!(!skip.unwrap());
         assert!(force.unwrap());
         assert_eq!(prompt_script::prompts_asked(), 0);

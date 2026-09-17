@@ -113,7 +113,7 @@ pub(crate) fn install_and_reconcile_agent_hooks(
 /// swept, while files absent from the manifest always survive.
 /// Best-effort: a failure here must not abort the install.
 fn sweep_removed_agent_hooks(bundled_files: &HashMap<String, HashSet<String>>) {
-    let entries = match std::fs::read_dir(paths::agents_data_dir()) {
+    let entries = match read_dir(paths::agents_data_dir()) {
         Ok(entries) => entries,
         Err(err) => {
             warn!("Failed to scan agents dir for removed-agent hooks: {err}");
@@ -156,7 +156,7 @@ fn sweep_removed_agent_hooks(bundled_files: &HashMap<String, HashSet<String>>) {
         }
         // remove_dir only succeeds on an empty directory, so a user file
         // left behind keeps the directory in place.
-        let _ = std::fs::remove_dir(&hooks_dir);
+        let _ = fs::remove_dir(&hooks_dir);
     }
 }
 
@@ -184,9 +184,6 @@ impl Agent {
             paths::agents_data_dir().display()
         );
 
-        // Whole-agent installs run Skip (startup) or Force (reinstall); a
-        // Prompt caller would still get coherent per-file conflict handling,
-        // scoped to this run.
         let mut sticky = StickyMode::None;
         let mut written_hooks: HashMap<String, BTreeSet<String>> = HashMap::new();
         for file in AgentAssets::iter() {
@@ -283,15 +280,7 @@ impl Agent {
         Ok(())
     }
 
-    /// Refreshes only the bundled agents' hook scripts, leaving every other
-    /// agent file alone: the hooks asset category must be able to update all
-    /// hook locations without reinstalling whole agents.
-    /// Every bundled agent's hooks/ directory reconciles, even when the
-    /// current embed ships no hooks for it.
     pub fn install_builtin_agent_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Result<()> {
-        // Every bundled agent gets an entry, hooks or not: an agent whose
-        // hook assets were all dropped still needs its hooks/ directory
-        // reconciled so manifest-owned leftovers are removed.
         let mut shipped: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for file in AgentAssets::iter() {
             let Some((agent, rest)) = file.as_ref().split_once('/') else {
@@ -311,6 +300,7 @@ impl Agent {
         for (agent, files) in &shipped {
             install_and_reconcile_agent_hooks(agent, files, mode, sticky)?;
         }
+
         Ok(())
     }
 
@@ -1496,6 +1486,7 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing;
 
     #[test]
     fn parse_direct_hook_path_accepts_only_direct_hook_children() {
@@ -1610,12 +1601,12 @@ global_hooks:
     #[test]
     #[serial_test::serial]
     fn load_envs_ignores_malformed_global_tools_and_logs_debug() {
-        crate::testing::install_log_collector();
+        testing::install_log_collector();
         let name = "gt-malformed-envtest";
         let yaml = format!("name: {name}\ninstructions: hi\nglobal_tools:\n  - keep_tool.sh\n");
         let mut config: AgentConfig = serde_yaml::from_str(&yaml).unwrap();
         let env_name = normalize_env_name(&format!("{name}_global_tools"));
-        let _guard = crate::testing::EnvVarGuard::set(&env_name, "{not-json");
+        let _guard = testing::EnvVarGuard::set(&env_name, "{not-json");
 
         config.load_envs(&AppConfig::default());
 
@@ -1624,7 +1615,7 @@ global_hooks:
             vec!["keep_tool.sh"],
             "a malformed override must leave the existing value untouched"
         );
-        let debugs = crate::testing::debug_snapshot();
+        let debugs = testing::debug_snapshot();
         assert!(
             debugs.iter().any(|message| {
                 message.contains("Ignoring malformed global_tools env override")
@@ -2076,9 +2067,9 @@ nodes: {}
         let _guard = TestConfigDirGuard::new("agent-hooks-prompt");
         let shipped = fixture(&[("a.sh", "new content\n"), ("b.sh", "new content\n")]);
         let dir = paths::agents_data_dir().join("probe").join("hooks");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.sh"), "local a").unwrap();
-        std::fs::write(dir.join("b.sh"), "local b").unwrap();
+        create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.sh"), "local a").unwrap();
+        fs::write(dir.join("b.sh"), "local b").unwrap();
 
         // First conflict answered per-file, second by the sticky replace-all.
         let script = prompt_script::install(&["replace-all"]);
@@ -2098,7 +2089,7 @@ nodes: {}
         // A sticky mode carried in from an earlier location suppresses all
         // prompting: `--install-builtins hooks` shares one sticky scope
         // across the global, role, and agent hook locations.
-        std::fs::write(dir.join("a.sh"), "local again").unwrap();
+        fs::write(dir.join("a.sh"), "local again").unwrap();
         let script = prompt_script::install(&[]);
         let mut sticky = StickyMode::KeepAll;
         install_and_reconcile_agent_hooks("probe", &shipped, InstallMode::Prompt, &mut sticky)
@@ -2121,7 +2112,7 @@ nodes: {}
             &mut StickyMode::None,
         )
         .unwrap();
-        std::fs::write(dir.join("user.sh"), "user-owned").unwrap();
+        fs::write(dir.join("user.sh"), "user-owned").unwrap();
 
         install_and_reconcile_agent_hooks(
             "probe",
@@ -2182,7 +2173,7 @@ nodes: {}
             &mut StickyMode::None,
         )
         .unwrap();
-        std::fs::write(dir.join("user.sh"), "user-owned").unwrap();
+        fs::write(dir.join("user.sh"), "user-owned").unwrap();
 
         Agent::install_builtin_agent_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
 
@@ -2200,14 +2191,14 @@ nodes: {}
         let guard = TestConfigDirGuard::new("agent-sweep-symlink");
         let real = guard.path.join("agent-elsewhere");
         let hooks = real.join("hooks");
-        std::fs::create_dir_all(&hooks).unwrap();
-        std::fs::write(
+        create_dir_all(&hooks).unwrap();
+        fs::write(
             hooks.join(builtin_manifest::BUILTIN_MANIFEST_FILE),
             "shipped.sh\n",
         )
         .unwrap();
-        std::fs::write(hooks.join("shipped.sh"), "stale").unwrap();
-        std::fs::create_dir_all(paths::agents_data_dir()).unwrap();
+        fs::write(hooks.join("shipped.sh"), "stale").unwrap();
+        create_dir_all(paths::agents_data_dir()).unwrap();
         std::os::unix::fs::symlink(&real, paths::agents_data_dir().join("linked")).unwrap();
 
         sweep_removed_agent_hooks(&HashMap::new());

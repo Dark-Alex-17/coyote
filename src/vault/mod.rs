@@ -332,8 +332,6 @@ impl Vault {
         }
 
         if cli.list_secrets {
-            // Listing is an inspection readout: report sandbox unavailability
-            // instead of failing like the mutating vault flags do.
             if vault.sandbox_mode {
                 println!(
                     "The vault is unavailable in sandbox mode. Use `coyote --list-secrets` on your host."

@@ -111,8 +111,6 @@ impl JobHookSnapshot {
     }
 }
 
-/// Fires `job.started` for a freshly accepted job; both `handle_start`
-/// branches (MCP and process) dispatch through here.
 fn fire_job_started(ctx: &RequestContext, job_id: &str, tool: &str) {
     hooks::fire(
         HookEvent::JobStarted,

@@ -419,9 +419,6 @@ impl Default for Config {
 }
 
 pub fn install_builtins() -> Result<()> {
-    // Best-effort housekeeping riding along with the startup installers:
-    // payload files orphaned by crashed processes accumulate in a shared
-    // temp dir and nothing else ever revisits them.
     hooks::sweep_stale_payload_files();
     Functions::install_builtin_global_tools(false)?;
     Agent::install_builtin_agents(InstallMode::Skip)?;
@@ -530,9 +527,6 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
         AssetCategory::Functions => Functions::install_builtin_global_tools(true)?,
         AssetCategory::Skills => Skill::install_builtin_skills(true)?,
         AssetCategory::Hooks => {
-            // One sticky scope spans all three hook locations, so a
-            // keep-all/replace-all answer carries through the whole refresh,
-            // matching bundle-install semantics.
             let mut sticky = StickyMode::None;
             hooks::install_builtin_hooks(InstallMode::Prompt, &mut sticky)?;
             Role::install_builtin_role_hooks(InstallMode::Prompt, &mut sticky)?;
@@ -759,8 +753,6 @@ impl Config {
 
         if env::var_os(SANDBOX_ENV_FLAG).is_some() {
             if !config_path.exists() {
-                // Inspection-only flags are look-don't-touch: no first-run
-                // config creation, nothing written.
                 if inspection {
                     return Ok(Self::default());
                 }
@@ -778,9 +770,6 @@ impl Config {
             {
                 Some(v) => (Self::load_dynamic(&v)?, String::new()),
                 None => {
-                    // Same look-don't-touch rule: never run the interactive
-                    // first-run wizard (or write a config) for a flag that
-                    // only inspects state.
                     if inspection {
                         return Ok(Self::default());
                     }
@@ -1655,12 +1644,12 @@ hooks:
         use std::fs;
         use std::time;
 
-        let unique = time::SystemTime::now()
+        let unique = SystemTime::now()
             .duration_since(time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let tmp_dir = std::env::temp_dir().join(format!("coyote-sandbox-cfg-{unique}"));
-        fs::create_dir_all(&tmp_dir).unwrap();
+        let tmp_dir = env::temp_dir().join(format!("coyote-sandbox-cfg-{unique}"));
+        create_dir_all(&tmp_dir).unwrap();
         let config_path = tmp_dir.join("config.yaml");
 
         fs::write(
@@ -1670,12 +1659,12 @@ hooks:
         .unwrap();
 
         let config_env = get_env_name("config_file");
-        let prev_config = std::env::var_os(&config_env);
-        let prev_sandbox = std::env::var_os(crate::sandbox::SANDBOX_ENV_FLAG);
+        let prev_config = env::var_os(&config_env);
+        let prev_sandbox = env::var_os(SANDBOX_ENV_FLAG);
 
         unsafe {
-            std::env::set_var(&config_env, &config_path);
-            std::env::set_var(crate::sandbox::SANDBOX_ENV_FLAG, "1");
+            env::set_var(&config_env, &config_path);
+            env::set_var(SANDBOX_ENV_FLAG, "1");
         }
 
         let result = Config::load_with_interpolation(false, false).await;
@@ -1683,12 +1672,12 @@ hooks:
 
         unsafe {
             match prev_config {
-                Some(v) => std::env::set_var(&config_env, v),
-                None => std::env::remove_var(&config_env),
+                Some(v) => env::set_var(&config_env, v),
+                None => env::remove_var(&config_env),
             }
             match prev_sandbox {
-                Some(v) => std::env::set_var(crate::sandbox::SANDBOX_ENV_FLAG, v),
-                None => std::env::remove_var(crate::sandbox::SANDBOX_ENV_FLAG),
+                Some(v) => env::set_var(SANDBOX_ENV_FLAG, v),
+                None => env::remove_var(SANDBOX_ENV_FLAG),
             }
         }
         let _ = fs::remove_dir_all(&tmp_dir);
@@ -1713,17 +1702,17 @@ hooks:
         create_dir_all(&tmp_dir).unwrap();
         let _config_dir = crate::testing::EnvVarGuard::set(get_env_name("config_dir"), &tmp_dir);
         let _config_file = crate::testing::EnvVarGuard::unset(get_env_name("config_file"));
-        let _sandbox = crate::testing::EnvVarGuard::unset(crate::sandbox::SANDBOX_ENV_FLAG);
+        let _sandbox = crate::testing::EnvVarGuard::unset(SANDBOX_ENV_FLAG);
         let _provider = crate::testing::EnvVarGuard::unset(get_env_name("provider"));
         let _platform = crate::testing::EnvVarGuard::unset(get_env_name("platform"));
 
         let result = Config::load_with_interpolation(true, true).await;
 
-        let leftover: Vec<_> = std::fs::read_dir(&tmp_dir)
+        let leftover: Vec<_> = read_dir(&tmp_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = fs::remove_dir_all(&tmp_dir);
         result.expect("inspection flags must load a default config without a config file");
         assert!(
             leftover.is_empty(),
@@ -1743,12 +1732,12 @@ hooks:
         let config_path = tmp_dir.join("config.yaml");
         let _config_file =
             crate::testing::EnvVarGuard::set(get_env_name("config_file"), &config_path);
-        let _sandbox = crate::testing::EnvVarGuard::set(crate::sandbox::SANDBOX_ENV_FLAG, "1");
+        let _sandbox = crate::testing::EnvVarGuard::set(SANDBOX_ENV_FLAG, "1");
 
         let result = Config::load_with_interpolation(true, true).await;
 
         let created = config_path.exists();
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = fs::remove_dir_all(&tmp_dir);
         result.expect("inspection flags must load a default config in sandbox mode too");
         assert!(
             !created,
@@ -1835,7 +1824,7 @@ hooks:
             let written = write_models_override(vec![entry()]).unwrap();
             assert_eq!(written, path);
             let mut tmp_name = path.as_os_str().to_os_string();
-            tmp_name.push(format!(".{}.tmp", std::process::id()));
+            tmp_name.push(format!(".{}.tmp", process::id()));
             assert!(!PathBuf::from(tmp_name).exists());
             let loaded = paths::local_models_override().unwrap();
             assert_eq!(loaded.len(), 1);
@@ -1910,16 +1899,16 @@ hooks:
         assert_eq!(prompt_script::prompts_asked(), 1);
         assert_eq!(sticky, StickyMode::ReplaceAll);
         assert!(
-            fs::read_to_string(&notify)
+            read_to_string(&notify)
                 .unwrap()
                 .starts_with("#!/usr/bin/env bash")
         );
         assert_eq!(
-            fs::read_to_string(role_dir.join("hook.sh")).unwrap(),
+            read_to_string(role_dir.join("hook.sh")).unwrap(),
             "shipped\n"
         );
         assert_eq!(
-            fs::read_to_string(agent_dir.join("hook.sh")).unwrap(),
+            read_to_string(agent_dir.join("hook.sh")).unwrap(),
             "shipped\n"
         );
         drop(script);
@@ -1931,13 +1920,13 @@ hooks:
         refresh(&mut sticky);
         assert_eq!(prompt_script::prompts_asked(), 1);
         assert_eq!(sticky, StickyMode::KeepAll);
-        assert_eq!(fs::read_to_string(&notify).unwrap(), "local global");
+        assert_eq!(read_to_string(&notify).unwrap(), "local global");
         assert_eq!(
-            fs::read_to_string(role_dir.join("hook.sh")).unwrap(),
+            read_to_string(role_dir.join("hook.sh")).unwrap(),
             "local role"
         );
         assert_eq!(
-            fs::read_to_string(agent_dir.join("hook.sh")).unwrap(),
+            read_to_string(agent_dir.join("hook.sh")).unwrap(),
             "local agent"
         );
         drop(script);
@@ -1958,12 +1947,12 @@ hooks:
         let script = prompt_script::install(&[]);
         install_builtins().unwrap();
         assert_eq!(prompt_script::prompts_asked(), 0);
-        assert_eq!(fs::read_to_string(&notify).unwrap(), "# local edit");
+        assert_eq!(read_to_string(&notify).unwrap(), "# local edit");
         drop(script);
 
         let _script = prompt_script::install_non_interactive();
         install_builtins().unwrap();
         assert_eq!(prompt_script::prompts_asked(), 0);
-        assert_eq!(fs::read_to_string(&notify).unwrap(), "# local edit");
+        assert_eq!(read_to_string(&notify).unwrap(), "# local edit");
     }
 }

@@ -417,8 +417,6 @@ impl RequestContext {
         working_mode: WorkingMode,
         info_flag: bool,
     ) -> Result<Self> {
-        // A lenient AppConfig (inspection-only run, no resolvable model)
-        // leaves model_id empty; render those readouts with a default model.
         let model = if info_flag && app.config.model_id.is_empty() {
             Model::default()
         } else {
@@ -4971,15 +4969,6 @@ impl RequestContext {
             return;
         };
 
-        // The abort signal, never the error text, decides interrupted: a
-        // ctrl-c'd run is not a failure, so no error env rides along. The
-        // gate is deliberately signal-first -- a latched ctrl-c means
-        // interrupted even with no error in hand -- unlike
-        // SpawnResultHooks::fire, which is error-first: a child that finished
-        // cleanly stays agent.completed under a latched signal because its
-        // output is collectible. Blind spot: a mid-stream ctrl-d aborts live
-        // work via poll_abort_signal yet still classifies as agent.completed,
-        // because ctrl-d always means a deliberate exit (accepted).
         if abort_signal.is_some_and(|signal| signal.aborted_ctrlc()) {
             hooks::fire(
                 HookEvent::AgentInterrupted,
@@ -10449,7 +10438,7 @@ mod tests {
     // test deadlines. Every spawned script gets its own throwaway lock path.
     fn adversary_script_command(script: &str, state: &serde_json::Value) -> Command {
         static STACK_LOCK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/adversary/scripts")
             .join(script);
         let lock_path = env::temp_dir().join(format!(

@@ -75,8 +75,6 @@ impl AppState {
             }
         }
 
-        // Inspection-only runs are look-don't-touch readouts: skip the
-        // function-binary prune/build, which writes into the config dir.
         let mut functions = if inspection {
             Functions::default()
         } else {

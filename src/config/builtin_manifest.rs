@@ -24,7 +24,7 @@ pub(crate) fn is_builtin_manifest_name(name: &str) -> bool {
 }
 
 /// NTFS 8.3 short names (`BUILTI~1`, `builti~1.sh`) can alias any long
-/// filename on the same volume — including the manifest itself — so an entry
+/// filename on the same volume, including the manifest itself, so an entry
 /// shaped like one is never accepted: it could direct a deletion at a file
 /// the manifest never named.
 fn is_ntfs_short_name_alias(name: &str) -> bool {

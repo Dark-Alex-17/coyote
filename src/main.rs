@@ -58,15 +58,6 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::{env, fs, process, sync::Arc};
 
-/// Stack headroom for the thread that polls the root async future, and for
-/// the runtime's worker threads.
-///
-/// Windows links the process main thread with a ~1 MiB stack (unix defaults
-/// to 8 MiB), and the root future is a compiler-generated state machine
-/// whose debug-build poll frames blow through 1 MiB the moment it is
-/// polled — every binary invocation dies with STATUS_STACK_OVERFLOW
-/// (0xC00000FD) before doing any work. 16 MiB gives comfortable headroom
-/// over the deepest observed frames on every platform.
 const MAIN_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Bootstraps the async entry point on a dedicated thread with an explicit
@@ -151,10 +142,6 @@ async fn async_main() -> Result<()> {
         || cli.list_macros
         || cli.list_skills
         || cli.list_sessions;
-    // Read-only whitelist: --sync-models is excluded because it downloads
-    // and writes models-override.yaml; combined with a readout flag the run
-    // still writes (run() handles --sync-models first), so it disqualifies
-    // the whole invocation.
     let readout_flag = (cli.info
         || cli.list_models
         || cli.list_roles
@@ -191,10 +178,6 @@ async fn async_main() -> Result<()> {
         return config::list_installed_bundles();
     }
 
-    // Inspection flags are look-don't-touch readouts: skip the builtins
-    // bootstrap so a pristine config dir stays empty. On such a dir the
-    // list flags list nothing because nothing is installed, by design.
-    // Agent/role runs still bootstrap: they load builtin tool definitions.
     let mcp_inspect =
         cli.mcp_list && cli.mcp_get.is_none() && cli.mcp_remove.is_none() && cli.mcp_add.is_none();
     let vault_inspect = cli.list_secrets
@@ -297,10 +280,6 @@ async fn async_main() -> Result<()> {
         } else {
             AppConfig::from_config(cfg)?
         };
-        // Listing servers reads no secrets, so an unconfigured vault (no
-        // Listing servers reads no secrets, so an unconfigured vault (no
-        // password file) must not block the readout; every other MCP flag
-        // (get/remove/add) stays on the strict init.
         let vault = if mcp_inspect {
             Vault::init_lenient(&app_config)
         } else {
@@ -351,9 +330,6 @@ async fn async_main() -> Result<()> {
     );
     let mut ctx = RequestContext::bootstrap(app_state, working_mode, info_flag)?;
     let app_config = Arc::clone(&ctx.app.config);
-    // Rebuilding the tool scope prunes and builds function binaries;
-    // inspection-only runs are readouts that never execute tools, so skip
-    // it there too.
     if !inspection_only {
         ctx.bootstrap_tools(&app_config, start_mcp_servers, abort_signal.clone())
             .await?;
@@ -488,7 +464,7 @@ async fn run(
         // return early without running the agent, and an open bracket on
         // those paths would leak `agent.started` with no terminal event.
         // It opens at the dispatch sites further down, where a run is
-        // actually committed — including the --macro arm, which executes
+        // actually committed, including the --macro arm, which executes
         // rather than inspects.
     } else {
         let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
@@ -622,8 +598,6 @@ async fn run(
         }
     }
     if let Some(name) = &cli.macro_name {
-        // Dispatch committed: open the top-level agent bracket only now,
-        // past every inspection-flag early return above.
         ctx.top_level_agent_started();
         let result = macro_execute(&mut ctx, name, text.as_deref(), abort_signal.clone()).await;
         ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
@@ -807,9 +781,6 @@ async fn shell_execute(
                     if code == 0 && app.save_shell_history {
                         let _ = append_to_shell_history(&shell.name, &eval_str, code);
                     }
-                    // Executing the generated command is a normal exit: no
-                    // abort signal on purpose, this seam can never report an
-                    // interruption.
                     ctx.top_level_agent_finished(None, None);
                     hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
                     process::exit(code);

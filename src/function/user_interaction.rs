@@ -180,8 +180,6 @@ fn handle_headless(action: &str, args: &Value) -> Value {
     })
 }
 
-// The root agent prompting its own user is a direct interaction, not an
-// escalation: no escalation event fires on this path.
 fn handle_direct(action: &str, args: &Value) -> Result<Value> {
     match action {
         "select" => handle_direct_ask(args),

@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Notify;
@@ -60,16 +60,10 @@ pub fn install_builtin_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Resu
         }
     }
 
-    // Only direct children of the hooks dir reconcile through the builtin
-    // manifest — the only shape it tracks — so a hook a release stops
-    // shipping is removed while user scripts in the same directory are
-    // never touched.
     let shipped: BTreeSet<String> = HookAssets::iter()
         .map(|file| file.as_ref().to_string())
         .filter(|name| !name.contains('/'))
         .collect();
-    // Reconciliation is best-effort housekeeping: a failure here must not
-    // abort startup (install_builtins), matching the role/agent-side policy.
     if let Err(err) =
         builtin_manifest::reconcile_builtin_dir(&paths::hooks_dir(), &shipped, &written)
     {
@@ -79,8 +73,6 @@ pub fn install_builtin_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Resu
         );
     }
 
-    // Both sides canonicalize so an override that merely spells the default
-    // path differently (symlinks, `..`, trailing components) does not warn.
     let hooks_dir = canonical_or_original(&paths::hooks_dir());
     let default_hooks_dir = canonical_or_original(&paths::config_dir().join("hooks"));
     if wrote_any && hooks_dir != default_hooks_dir {
@@ -174,9 +166,6 @@ impl HookEvent {
         }
     }
 
-    /// Every event, in declaration order. Dotted names stay single-sourced
-    /// through `as_str`; this exists so whitelist-glob validation can tell a
-    /// real `<event>.*` from a typo over a nonexistent event.
     const ALL: [HookEvent; 26] = [
         HookEvent::TurnStarted,
         HookEvent::TurnCompleted,
@@ -260,12 +249,6 @@ fn resolve_hooks(
     let event_name = event.as_str();
     let mut resolved = Vec::new();
 
-    // Escalations are a root/user-level concern: the user wires these hooks
-    // to hear about children asking for help, so requiring every agent to
-    // whitelist them through `global_hooks` would silence exactly the events
-    // they were set up for. The per-agent gate never applies here (this also
-    // skips the unknown-entry diagnostics: whitelisting an escalation hook is
-    // harmless and needs no warning).
     let agent_gate = match event {
         HookEvent::EscalationRaised | HookEvent::EscalationAnswered => None,
         _ => agent_gate,
@@ -296,12 +279,6 @@ fn resolve_hooks(
     {
         let prefix = format!("{event_name}.");
         for entry in gate {
-            // Entries containing `*` are grammatical only in the wildcard
-            // forms `*`, `*.*`, `*.<name>`, and `<event>.*` over a real
-            // event. Anything else (`tool.st*`, `ag*.completed.mark`) is a
-            // typo that admits nothing on any event and never extends a full
-            // event name, so the prefix check below would stay silent about
-            // it — flag it here instead.
             if entry.contains('*') {
                 if !entry_is_valid_wildcard(entry) {
                     debug!(
@@ -341,12 +318,6 @@ fn resolve_hooks(
     resolved
 }
 
-/// Whitelist grammar for a `global_hooks` entry: `<event>.<name>` exact,
-/// `<event>.*` (every hook of that event), `*.<name>` (that hook name on
-/// every event), and `*` / `*.*` (everything). Event names contain dots
-/// while hook names never do, so `*.<name>` compares everything after the
-/// leading `*.` against the hook name alone. Anything else containing `*`
-/// (a partial glob like `tool.st*`) is not a wildcard and admits nothing.
 fn gate_entry_admits(entry: &str, event_name: &str, hook_name: &str, full_name: &str) -> bool {
     if entry == full_name || entry == "*" || entry == "*.*" {
         return true;
@@ -357,12 +328,6 @@ fn gate_entry_admits(entry: &str, event_name: &str, hook_name: &str, full_name: 
     entry.strip_suffix(".*") == Some(event_name)
 }
 
-/// True when a `*`-containing gate entry is one of the wildcard forms
-/// `gate_entry_admits` understands. `*.<name>` takes a literal hook name
-/// (globbing inside the name is not supported), and `<event>.*` requires a
-/// real event: event names contain dots, so e.g. `tool.*` names the
-/// nonexistent event `tool` rather than a prefix over `tool.started` and
-/// `tool.completed`.
 fn entry_is_valid_wildcard(entry: &str) -> bool {
     if entry == "*" || entry == "*.*" {
         return true;
@@ -520,11 +485,6 @@ fn base_envs(event: HookEvent, ctx: &RequestContext) -> Vec<(String, String)> {
     )
 }
 
-/// The single construction site for the base env set every hook receives.
-/// [`base_envs`] feeds it from a live context; detached call sites that
-/// dispatch pre-resolved snapshots after their context is gone pass the
-/// names they captured with the snapshot. The timestamp is taken here, at
-/// fire time, so it reflects when the event actually happened.
 pub(crate) fn base_envs_parts(
     event: HookEvent,
     session_name: Option<&str>,
@@ -596,12 +556,6 @@ fn payload_dir() -> PathBuf {
 
 const STALE_PAYLOAD_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Removes payload files left in the shared payload directory by crashed
-/// processes — `run_hook` deletes its own file after the hook exits, so
-/// anything older than [`STALE_PAYLOAD_MAX_AGE`] is an orphan. Runs once per
-/// startup from `install_builtins`. Only exact `coyote-hook-*.json` names are
-/// candidates; the directory is shared, so nothing else may ever be touched.
-/// Best-effort: failures log at debug and never abort startup.
 pub fn sweep_stale_payload_files() {
     sweep_payload_files_older_than(STALE_PAYLOAD_MAX_AGE);
 }
@@ -618,7 +572,7 @@ fn sweep_payload_files_older_than(max_age: Duration) {
             return;
         }
     };
-    let now = std::time::SystemTime::now();
+    let now = SystemTime::now();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -643,6 +597,7 @@ fn sweep_payload_files_older_than(max_age: Duration) {
         if !stale {
             continue;
         }
+
         match std::fs::remove_file(entry.path()) {
             Ok(()) => debug!("Removed stale hook payload file {}", entry.path().display()),
             Err(err) => debug!(
@@ -840,9 +795,11 @@ mod tests {
     use super::*;
     use crate::config::conflict::prompt_script;
     use crate::config::{AppConfig, AppState, Role, WorkingMode};
+    use crate::{testing, utils};
     use serial_test::serial;
     use std::env;
     use std::sync::Arc;
+    use std::time::UNIX_EPOCH;
 
     fn hooks_map(event: &str, defs: &[(&str, &str)]) -> HooksMap {
         let defs = defs
@@ -871,22 +828,19 @@ mod tests {
     /// Points the hooks dir at a fresh temp directory for the guard's
     /// lifetime and removes it on drop. Tests using it must serialize.
     struct HooksDirGuard {
-        _env: crate::testing::EnvVarGuard,
+        _env: testing::EnvVarGuard,
         root: PathBuf,
     }
 
     impl HooksDirGuard {
         fn new(label: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let root = env::temp_dir().join(format!("coyote-{label}-{unique}"));
             Self {
-                _env: crate::testing::EnvVarGuard::set(
-                    crate::utils::get_env_name("hooks_dir"),
-                    &root,
-                ),
+                _env: testing::EnvVarGuard::set(utils::get_env_name("hooks_dir"), &root),
                 root,
             }
         }
@@ -938,8 +892,8 @@ mod tests {
     }
 
     fn fresh_payload_dir(label: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let dir = env::temp_dir().join(format!("coyote-{label}-{unique}"));
@@ -1026,13 +980,13 @@ mod tests {
     #[test]
     #[serial]
     fn install_builtin_hooks_installs_executable_scripts_and_honors_force() {
-        let env_name = crate::utils::get_env_name("hooks_dir");
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let env_name = utils::get_env_name("hooks_dir");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let root = env::temp_dir().join(format!("coyote-hooks-install-{unique}"));
-        let env_guard = crate::testing::EnvVarGuard::set(&env_name, &root);
+        let env_guard = testing::EnvVarGuard::set(&env_name, &root);
 
         // Capture every outcome first and assert only after cleanup: the
         // guard restores the env var even on panic, but the temp dir removal
@@ -1222,16 +1176,16 @@ mod tests {
     #[test]
     #[serial]
     fn install_builtin_hooks_respelled_default_hooks_dir_does_not_warn() {
-        crate::testing::install_log_collector();
-        let guard = crate::testing::TestConfigDirGuard::new("hooks-warn-respelled");
+        testing::install_log_collector();
+        let guard = testing::TestConfigDirGuard::new("hooks-warn-respelled");
         let guard_path_display = guard.path.display().to_string();
-        let env_name = crate::utils::get_env_name("hooks_dir");
+        let env_name = utils::get_env_name("hooks_dir");
 
         // An override that reaches the default `config_dir()/hooks` through a
         // `..` hop is the default path in disguise: the canonicalized compare
         // must stay quiet even though the strings differ.
         let alias = guard.path.join("hooks").join("..").join("hooks");
-        let env_guard = crate::testing::EnvVarGuard::set(&env_name, &alias);
+        let env_guard = testing::EnvVarGuard::set(&env_name, &alias);
         install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
         drop(env_guard);
 
@@ -1249,7 +1203,7 @@ mod tests {
             let link = guard.path.join("hooks-link");
             std::os::unix::fs::symlink(guard.path.join("hooks"), &link).unwrap();
             std::fs::remove_file(&default_notify).unwrap();
-            let _env_guard = crate::testing::EnvVarGuard::set(&env_name, &link);
+            let _env_guard = testing::EnvVarGuard::set(&env_name, &link);
             install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
             assert!(
                 default_notify.is_file(),
@@ -1259,7 +1213,7 @@ mod tests {
 
         // The warn buffer is process-global, so scope the check to messages
         // naming this test's unique directory.
-        let warns = crate::testing::warn_snapshot();
+        let warns = testing::warn_snapshot();
         assert!(
             warns.iter().all(|message| {
                 !(message.contains("overrides the hooks dir")
@@ -1272,13 +1226,10 @@ mod tests {
     #[test]
     #[serial]
     fn install_builtin_hooks_genuine_override_warns_when_default_dir_is_missing() {
-        crate::testing::install_log_collector();
-        let guard = crate::testing::TestConfigDirGuard::new("hooks-warn-genuine");
+        testing::install_log_collector();
+        let guard = testing::TestConfigDirGuard::new("hooks-warn-genuine");
         let override_dir = guard.path.join("elsewhere-hooks");
-        let _env_guard = crate::testing::EnvVarGuard::set(
-            crate::utils::get_env_name("hooks_dir"),
-            &override_dir,
-        );
+        let _env_guard = testing::EnvVarGuard::set(utils::get_env_name("hooks_dir"), &override_dir);
 
         install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
 
@@ -1294,7 +1245,7 @@ mod tests {
             "scripts must land in the override dir, so wrote_any was true"
         );
         let override_display = override_dir.display().to_string();
-        let warns = crate::testing::warn_snapshot();
+        let warns = testing::warn_snapshot();
         assert!(
             warns.iter().any(|message| {
                 message.contains("overrides the hooks dir") && message.contains(&override_display)
@@ -1683,7 +1634,7 @@ mod tests {
 
     #[test]
     fn wildcard_whitelist_entries_skip_unknown_entry_diagnostics() {
-        crate::testing::install_log_collector();
+        testing::install_log_collector();
         let global = hooks_map("turn.started", &[("a", "cmd-a")]);
         let gate = vec![
             "turn.started.*".to_string(),
@@ -1701,7 +1652,7 @@ mod tests {
         );
 
         assert_eq!(names(&resolved), ["a"]);
-        let debugs = crate::testing::debug_snapshot();
+        let debugs = testing::debug_snapshot();
         assert!(
             debugs
                 .iter()
@@ -1712,7 +1663,7 @@ mod tests {
 
     #[test]
     fn partial_glob_whitelist_entries_stay_flagged_as_unknown() {
-        crate::testing::install_log_collector();
+        testing::install_log_collector();
         let global = hooks_map("turn.started", &[("a", "cmd-a")]);
         let gate = vec!["turn.started.st*-marker-k4w".to_string()];
 
@@ -1725,7 +1676,7 @@ mod tests {
         );
 
         assert!(resolved.is_empty(), "an invalid glob must admit nothing");
-        let debugs = crate::testing::debug_snapshot();
+        let debugs = testing::debug_snapshot();
         assert!(debugs.iter().any(|message| {
             message.contains("turn.started.st*-marker-k4w")
                 && message.contains("for agent 'glob-flag-agent-k4w'")
@@ -1734,7 +1685,7 @@ mod tests {
 
     #[test]
     fn partial_glob_over_event_prefix_logs_invalid_glob_diagnostic() {
-        crate::testing::install_log_collector();
+        testing::install_log_collector();
         let global = hooks_map("tool.started", &[("st", "cmd-st")]);
         // `tool.st*` extends no full event name (`tool` is not an event), so
         // the event-prefix diagnostic can never see it; the glob check must
@@ -1750,7 +1701,7 @@ mod tests {
         );
 
         assert!(resolved.is_empty(), "a partial glob admits nothing");
-        let debugs = crate::testing::debug_snapshot();
+        let debugs = testing::debug_snapshot();
         assert!(debugs.iter().any(|message| {
             message.contains("tool.st*") && message.contains("for agent 'prefix-glob-agent-t7c'")
         }));
@@ -1758,7 +1709,7 @@ mod tests {
 
     #[test]
     fn inner_glob_entries_log_invalid_glob_diagnostic() {
-        crate::testing::install_log_collector();
+        testing::install_log_collector();
         let global = hooks_map("agent.completed", &[("mark", "cmd-mark")]);
         let gate = vec!["ag*.completed.mark".to_string()];
 
@@ -1771,7 +1722,7 @@ mod tests {
         );
 
         assert!(resolved.is_empty(), "an inner glob admits nothing");
-        let debugs = crate::testing::debug_snapshot();
+        let debugs = testing::debug_snapshot();
         assert!(debugs.iter().any(|message| {
             message.contains("ag*.completed.mark")
                 && message.contains("for agent 'inner-glob-agent-m2r'")
@@ -1780,7 +1731,7 @@ mod tests {
 
     #[test]
     fn unknown_whitelist_entries_log_debug_and_stay_inert() {
-        crate::testing::install_log_collector();
+        testing::install_log_collector();
         let global = hooks_map("turn.started", &[("a", "cmd-a")]);
         let gate = vec![
             "turn.started.a".to_string(),
@@ -1796,7 +1747,7 @@ mod tests {
         );
 
         assert_eq!(names(&resolved), ["a"]);
-        let debugs = crate::testing::debug_snapshot();
+        let debugs = testing::debug_snapshot();
         assert!(debugs.iter().any(|message| {
             message.contains("turn.started.nonexistent-marker-xyz")
                 && message.contains("for agent 'gate-agent-xyz'")
@@ -1805,7 +1756,7 @@ mod tests {
 
     #[test]
     fn empty_global_map_short_circuits_whitelist_diagnostics() {
-        crate::testing::install_log_collector();
+        testing::install_log_collector();
         let global = HooksMap::default();
         let role = hooks_map("turn.started", &[("role-only", "role-cmd")]);
         let gate = vec!["turn.started.x-shortcircuit-marker-p3q".to_string()];
@@ -1819,7 +1770,7 @@ mod tests {
         );
 
         assert_eq!(names(&resolved), ["role-only"]);
-        let debugs = crate::testing::debug_snapshot();
+        let debugs = testing::debug_snapshot();
         assert!(
             debugs
                 .iter()
@@ -2084,12 +2035,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     #[serial]
     async fn drain_pending_logs_when_the_timeout_expires() {
-        crate::testing::install_log_collector();
+        testing::install_log_collector();
         let pending = SpawnAckGuard::register();
 
         drain_pending(Duration::from_millis(50)).await;
 
-        let debugs = crate::testing::debug_snapshot();
+        let debugs = testing::debug_snapshot();
         assert!(
             debugs
                 .iter()
@@ -2116,7 +2067,7 @@ mod tests {
     #[test]
     #[serial]
     fn fire_resolved_without_runtime_skips_instead_of_panicking() {
-        crate::testing::install_log_collector();
+        testing::install_log_collector();
         let hook = ResolvedHook {
             name: "no-runtime-marker-a7c".to_string(),
             full_name: "turn.failed.no-runtime-marker-a7c".to_string(),
@@ -2126,7 +2077,7 @@ mod tests {
 
         fire_resolved(HookEvent::TurnFailed, vec![hook], Vec::new(), &[], None);
 
-        let debugs = crate::testing::debug_snapshot();
+        let debugs = testing::debug_snapshot();
         assert!(debugs.iter().any(|message| {
             message.contains("no-runtime-marker-a7c")
                 && message.contains("no Tokio runtime on this thread")
@@ -2136,7 +2087,7 @@ mod tests {
     #[test]
     #[serial]
     fn fire_without_runtime_skips_instead_of_panicking() {
-        crate::testing::install_log_collector();
+        testing::install_log_collector();
         let ctx = ctx_with_global_hooks(hooks_map(
             "turn.failed",
             &[("fire-no-runtime-marker-b8d", "true")],
@@ -2144,7 +2095,7 @@ mod tests {
 
         fire(HookEvent::TurnFailed, &ctx, &[], None);
 
-        let debugs = crate::testing::debug_snapshot();
+        let debugs = testing::debug_snapshot();
         assert!(debugs.iter().any(|message| {
             message.contains("fire-no-runtime-marker-b8d")
                 && message.contains("no Tokio runtime on this thread")
@@ -2153,7 +2104,7 @@ mod tests {
 
     #[test]
     fn debug_capture_excludes_non_hooks_targets() {
-        crate::testing::install_log_collector();
+        testing::install_log_collector();
         let hook = ResolvedHook {
             name: "included-marker-k2v".to_string(),
             full_name: "turn.failed.included-marker-k2v".to_string(),
@@ -2171,7 +2122,7 @@ mod tests {
         );
         fire_resolved(HookEvent::TurnFailed, vec![hook], Vec::new(), &[], None);
 
-        let debugs = crate::testing::debug_snapshot();
+        let debugs = testing::debug_snapshot();
         assert!(
             debugs
                 .iter()
@@ -2192,9 +2143,9 @@ mod tests {
     #[test]
     #[serial]
     fn debug_capture_recovers_after_buffer_poisoning() {
-        crate::testing::install_log_collector();
+        testing::install_log_collector();
         std::thread::spawn(|| {
-            let _held = crate::testing::debug_messages().lock().unwrap();
+            let _held = testing::debug_messages().lock().unwrap();
             panic!("poison the debug buffer");
         })
         .join()
@@ -2208,7 +2159,7 @@ mod tests {
         };
         fire_resolved(HookEvent::TurnFailed, vec![hook], Vec::new(), &[], None);
 
-        let mut debugs = crate::testing::debug_messages()
+        let mut debugs = testing::debug_messages()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(debugs.iter().any(|message| {
@@ -2255,7 +2206,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn spawn_failure_removes_the_payload_file() {
-            crate::testing::install_log_collector();
+            testing::install_log_collector();
             let guard = TestConfigDirGuard::new("hooks-dispatch");
             let payload_dir = guard.path.join("payloads");
             create_dir_all(&payload_dir).unwrap();
@@ -2281,12 +2232,12 @@ mod tests {
             // does the empty directory below demonstrate the orphan unlink
             // rather than a payload file that never existed.
             wait_for("spawn failure log", || {
-                crate::testing::debug_snapshot().iter().any(|message| {
+                testing::debug_snapshot().iter().any(|message| {
                     message.contains("Failed to spawn hook 'tool.started.spawnfail-marker-c9d'")
                 })
             })
             .await;
-            let debugs = crate::testing::debug_snapshot();
+            let debugs = testing::debug_snapshot();
             assert!(debugs.iter().all(|message| {
                 !(message.contains("spawnfail-marker-c9d")
                     && message.contains("Failed to write payload file"))
@@ -2305,10 +2256,10 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn error_paths_log_debug_only() {
-            crate::testing::install_log_collector();
+            testing::install_log_collector();
             let empty_cwd = env::temp_dir();
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let bad_cwd = env::temp_dir().join(format!("coyote-badcwd-marker-f5b-{unique}"));
@@ -2330,7 +2281,7 @@ mod tests {
             fire_resolved(HookEvent::TurnFailed, hooks, Vec::new(), &[], None);
             drain_pending(Duration::from_secs(10)).await;
 
-            let debugs = crate::testing::debug_snapshot();
+            let debugs = testing::debug_snapshot();
             let empty_cwd_display = empty_cwd.display().to_string();
             assert!(debugs.iter().any(|message| {
                 message.contains("empty-marker-f5b")
@@ -2342,7 +2293,7 @@ mod tests {
                 message.contains("Failed to spawn hook 'turn.failed.badcwd-marker-f5b'")
                     && message.contains(bad_cwd_display.as_str())
             }));
-            let warns = crate::testing::warn_snapshot();
+            let warns = testing::warn_snapshot();
             assert!(warns.iter().all(|message| !message.contains("marker-f5b")));
         }
     }
@@ -2488,7 +2439,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn failing_hook_never_disturbs_the_engine() {
-            crate::testing::install_log_collector();
+            testing::install_log_collector();
             let guard = TestConfigDirGuard::new("hooks-dispatch");
             let first = guard.path.join("first-out");
             let second = guard.path.join("second-out");
@@ -2514,7 +2465,7 @@ mod tests {
             );
             wait_for("second hook output", || second.exists()).await;
 
-            let warns = crate::testing::warn_snapshot();
+            let warns = testing::warn_snapshot();
             assert!(
                 warns
                     .iter()
@@ -2558,7 +2509,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn payload_write_failure_still_runs_hook_without_payload_env() {
-            crate::testing::install_log_collector();
+            testing::install_log_collector();
             let guard = TestConfigDirGuard::new("hooks-dispatch");
             let out = guard.path.join("env-out");
             let _payload_dir = PayloadDirOverrideGuard::new(guard.path.join("missing-payload-dir"));
@@ -2582,7 +2533,7 @@ mod tests {
                     .lines()
                     .all(|line| !line.starts_with("COYOTE_HOOK_PAYLOAD_FILE="))
             );
-            let debugs = crate::testing::debug_snapshot();
+            let debugs = testing::debug_snapshot();
             assert!(debugs.iter().any(|message| message.contains(
                 "Failed to write payload file for hook 'tool.started.payload-fallback-marker'"
             )));
@@ -2674,7 +2625,7 @@ mod tests {
             )
             .unwrap();
 
-            ctx.use_agent(&app, agent_name, None, crate::utils::create_abort_signal())
+            ctx.use_agent(&app, agent_name, None, utils::create_abort_signal())
                 .await
                 .unwrap();
 
@@ -2818,18 +2769,15 @@ mod tests {
         #[test]
         #[serial]
         fn install_builtin_hooks_lands_under_a_backslashed_override() {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let hooks_dir = PathBuf::from(format!(
                 "{}\\coyote-win-bs-{unique}\\hooks",
                 env::temp_dir().display()
             ));
-            let _env = crate::testing::EnvVarGuard::set(
-                crate::utils::get_env_name("hooks_dir"),
-                &hooks_dir,
-            );
+            let _env = testing::EnvVarGuard::set(utils::get_env_name("hooks_dir"), &hooks_dir);
 
             let result = install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None);
 
