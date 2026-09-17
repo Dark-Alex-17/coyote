@@ -1112,6 +1112,90 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial]
+    fn install_builtin_hooks_respelled_default_hooks_dir_does_not_warn() {
+        crate::testing::install_log_collector();
+        let guard = crate::testing::TestConfigDirGuard::new("hooks-warn-respelled");
+        let guard_path_display = guard.path.display().to_string();
+        let env_name = crate::utils::get_env_name("hooks_dir");
+
+        // An override that reaches the default `config_dir()/hooks` through a
+        // `..` hop is the default path in disguise: the canonicalized compare
+        // must stay quiet even though the strings differ.
+        let alias = guard.path.join("hooks").join("..").join("hooks");
+        let env_guard = crate::testing::EnvVarGuard::set(&env_name, &alias);
+        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        drop(env_guard);
+
+        let default_notify = guard.path.join("hooks").join("notify.sh");
+        assert!(
+            default_notify.is_file(),
+            "scripts must land in the default dir, so wrote_any was true"
+        );
+
+        // Same disguise via a symlink. One shipped script is removed first so
+        // the run rewrites it: a no-op install would skip the warning check
+        // entirely and prove nothing about the compare.
+        #[cfg(unix)]
+        {
+            let link = guard.path.join("hooks-link");
+            std::os::unix::fs::symlink(guard.path.join("hooks"), &link).unwrap();
+            std::fs::remove_file(&default_notify).unwrap();
+            let _env_guard = crate::testing::EnvVarGuard::set(&env_name, &link);
+            install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+            assert!(
+                default_notify.is_file(),
+                "the removed script must be reinstalled, so wrote_any was true"
+            );
+        }
+
+        // The warn buffer is process-global, so scope the check to messages
+        // naming this test's unique directory.
+        let warns = crate::testing::warn_snapshot();
+        assert!(
+            warns.iter().all(|message| {
+                !(message.contains("overrides the hooks dir")
+                    && message.contains(&guard_path_display))
+            }),
+            "a respelled default hooks dir must not warn: {warns:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_builtin_hooks_genuine_override_warns_when_default_dir_is_missing() {
+        crate::testing::install_log_collector();
+        let guard = crate::testing::TestConfigDirGuard::new("hooks-warn-genuine");
+        let override_dir = guard.path.join("elsewhere-hooks");
+        let _env_guard = crate::testing::EnvVarGuard::set(
+            crate::utils::get_env_name("hooks_dir"),
+            &override_dir,
+        );
+
+        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+
+        // Fresh install: nothing ever created the default dir, so its
+        // canonicalization fails and the compare falls back to the original
+        // path. A genuine override must still be detected.
+        assert!(
+            !guard.path.join("hooks").exists(),
+            "the default hooks dir must not exist for this scenario"
+        );
+        assert!(
+            override_dir.join("notify.sh").is_file(),
+            "scripts must land in the override dir, so wrote_any was true"
+        );
+        let override_display = override_dir.display().to_string();
+        let warns = crate::testing::warn_snapshot();
+        assert!(
+            warns.iter().any(|message| {
+                message.contains("overrides the hooks dir") && message.contains(&override_display)
+            }),
+            "a genuine override must warn even without a default dir: {warns:?}"
+        );
+    }
+
     /// The example hooks are plain scripts, not argc tools: they live outside
     /// `assets/functions/tools/`, so the argc regeneration that runs during
     /// tests must never have stamped them with an ARGC-BUILD block.
@@ -1850,6 +1934,56 @@ mod tests {
             let file_name = payload_file.file_name().unwrap().to_string_lossy();
             assert!(file_name.starts_with("coyote-hook-tool.started-"));
             wait_for("payload file removal", || !payload_file.exists()).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial]
+        async fn spawn_failure_removes_the_payload_file() {
+            crate::testing::install_log_collector();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
+            let payload_dir = guard.path.join("payloads");
+            create_dir_all(&payload_dir).unwrap();
+            let _payload_dir = PayloadDirOverrideGuard::new(payload_dir.clone());
+            let hooks = vec![ResolvedHook {
+                name: "spawnfail-marker-c9d".to_string(),
+                full_name: "tool.started.spawnfail-marker-c9d".to_string(),
+                command: "true".to_string(),
+                cwd: PathBuf::from("/nonexistent/coyote-spawnfail-marker-c9d"),
+            }];
+
+            fire_resolved(
+                HookEvent::ToolStarted,
+                hooks,
+                Vec::new(),
+                &[],
+                Some(r#"{"probe":true}"#.to_string()),
+            );
+            drain_pending(Duration::from_secs(10)).await;
+
+            // The unspawnable cwd must have driven the spawn-error branch,
+            // and the payload write before it must have succeeded: only then
+            // does the empty directory below demonstrate the orphan unlink
+            // rather than a payload file that never existed.
+            wait_for("spawn failure log", || {
+                crate::testing::debug_snapshot().iter().any(|message| {
+                    message.contains("Failed to spawn hook 'tool.started.spawnfail-marker-c9d'")
+                })
+            })
+            .await;
+            let debugs = crate::testing::debug_snapshot();
+            assert!(debugs.iter().all(|message| {
+                !(message.contains("spawnfail-marker-c9d")
+                    && message.contains("Failed to write payload file"))
+            }));
+
+            wait_for("payload file removal", || {
+                std::fs::read_dir(&payload_dir)
+                    .unwrap()
+                    .flatten()
+                    .next()
+                    .is_none()
+            })
+            .await;
         }
 
         #[tokio::test(flavor = "multi_thread")]
