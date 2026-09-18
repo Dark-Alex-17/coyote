@@ -14081,7 +14081,7 @@ mod tests {
             "the degradation note must survive into lanes_summary: {summary}"
         );
         assert!(
-            summary.contains("forced lanes honored exactly"),
+            summary.contains("forced lanes (additive): ['adversary', 'code-review']"),
             "the forced-lanes reason must still be recorded: {summary}"
         );
     }
@@ -15281,7 +15281,7 @@ mod tests {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert_eq!(
             stdout.trim_end(),
-            r#"{"code_review_items": [{"lane": "code-review"}], "adversary_items": [{"lane": "adversary"}], "security_items": [], "probe_items": [], "lanes_summary": "- forced lanes honored exactly: ['adversary', 'code-review']"}"#,
+            r#"{"code_review_items": [{"lane": "code-review"}], "adversary_items": [{"lane": "adversary"}], "security_items": [], "probe_items": [], "lanes_summary": "- code-review: always on \u2014 the gauntlet is only spawned for non-trivial work\n- forced lanes (additive): ['adversary', 'code-review'] \u2014 newly added: ['adversary']\n- adversary: forced without spec/plan context \u2014 it fails closed (DIVERGES) without extractable criteria"}"#,
             "the stamped first-pass payload must be byte-identical to the pre-loop form"
         );
     }
