@@ -6932,9 +6932,9 @@
   - name: deepseek/deepseek-chat
     type: chat
     max_input_tokens: 163840
-    input_price: 0.2574
-    output_price: 1.0287
-    max_output_tokens: 16000
+    input_price: 0.32
+    output_price: 0.89
+    max_output_tokens: 16384
     supports_function_calling: true
   - name: deepseek/deepseek-chat-v3-0324
     type: chat
@@ -7022,10 +7022,10 @@
   - name: deepseek/deepseek-v4-flash-vision-exp
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.22
-    output_price: 0.66
-    cache_read_price: 0.007
-    max_output_tokens: 943718
+    input_price: 0.2156
+    output_price: 0.6468
+    cache_read_price: 0.0069
+    max_output_tokens: 262144
     supports_vision: true
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-vision-exp:batch
@@ -8073,9 +8073,9 @@
   - name: moonshotai/kimi-k3
     type: chat
     max_input_tokens: 1048576
-    input_price: 3.0
-    output_price: 15.0
-    cache_read_price: 0.3
+    input_price: 2.1
+    output_price: 10.95
+    cache_read_price: 0.23
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -9033,9 +9033,10 @@
   - name: openai/gpt-oss-120b
     type: chat
     max_input_tokens: 131072
-    input_price: 0.037
-    output_price: 0.17
-    max_output_tokens: 117964
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.075
+    max_output_tokens: 65536
     supports_function_calling: true
   - name: openai/gpt-oss-120b:batch
     type: chat
@@ -9664,6 +9665,14 @@
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
+  - name: qwen/qwen3.8-27b:free
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.0
+    output_price: 0.0
+    max_output_tokens: 235929
+    supports_vision: true
+    supports_function_calling: true
   - name: qwen/qwen3.8-flash
     type: chat
     max_input_tokens: 1000000
@@ -9766,14 +9775,6 @@
     input_price: 0.65
     output_price: 0.75
     max_output_tokens: 16384
-  - name: stealth/union-alpha
-    type: chat
-    max_input_tokens: 262144
-    input_price: 0.0
-    output_price: 0.0
-    max_output_tokens: 131072
-    supports_vision: true
-    supports_function_calling: true
   - name: stepfun/step-3.5-flash
     type: chat
     max_input_tokens: 262144
@@ -9899,6 +9900,15 @@
     input_price: 0.0
     output_price: 0.0
     max_output_tokens: 262144
+    supports_vision: true
+    supports_function_calling: true
+  - name: unbiased/pareto
+    type: chat
+    max_input_tokens: 262144
+    input_price: 2.5
+    output_price: 7.5
+    cache_read_price: 0.25
+    max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
   - name: undi95/remm-slerp-l2-13b
@@ -10036,10 +10046,10 @@
   - name: z-ai/glm-4.6
     type: chat
     max_input_tokens: 204800
-    input_price: 0.43
-    output_price: 1.75
-    cache_read_price: 0.08
-    max_output_tokens: 16384
+    input_price: 0.5
+    output_price: 2.0
+    cache_read_price: 0.1
+    max_output_tokens: 131072
     supports_function_calling: true
   - name: z-ai/glm-4.6v
     type: chat
@@ -10214,8 +10224,8 @@
   - name: ~deepseek/deepseek-v4-flash-latest
     type: chat
     max_input_tokens: 1310720
-    input_price: 0.03
-    output_price: 0.13
+    input_price: 0.04
+    output_price: 0.1
     cache_read_price: 0.01
     max_output_tokens: 393216
     supports_function_calling: true
