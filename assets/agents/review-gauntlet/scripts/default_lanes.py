@@ -8,8 +8,10 @@ AND a local-run recipe exists (build_items gates probe the same way — a
 probe without a recipe is INCONCLUSIVE by construction),
 plus security when the attack-surface signals (auth/deps/exec) or a hardened
 posture demand it, unioned with any lanes the caller forced (canonicalized
-with the same aliases build_items uses) — which build_items honors exactly,
-so selection degrades WIDER, never narrower. The degradation note goes into
+with the same aliases build_items uses) — which build_items honors
+ADDITIVELY, so selection degrades WIDER, never narrower. Unavailable diff
+signals also widen: unknown surface adds security (and probe when a
+local-run recipe exists). The degradation note goes into
 `lanes_degraded`; build_items folds it into lanes_summary so the final
 report names the degradation.
 
@@ -72,6 +74,11 @@ def main():
         or state.get("security_posture") == "hardened"
     ):
         lanes.add("security")
+    # Unavailable signals = surface UNKNOWN → widen (mirrors build_items).
+    if (state.get("signals_summary") or "") == "signals unavailable":
+        lanes.add("security")
+        if isinstance(probe_context, str) and probe_context.strip():
+            lanes.add("probe")
     # Caller-forced lanes survive degradation — union, never overwrite.
     for lane in state.get("forced_lanes") or []:
         if canon := ALIASES.get(str(lane).strip().lower()):

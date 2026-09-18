@@ -3,9 +3,10 @@
 
 Pure git — no LLM judgment. Every signal is computed from the changed-file
 list and the added lines of the diff. Failures never sink the gauntlet:
-on any error the script reports `signals_error` and leaves the defaults
-(false/empty) in place, which biases lane selection toward the caller's
-context and forced lanes.
+on any error the script reports `signals_error` and marks the signals
+unavailable — downstream (build_items / default_lanes) treats that as
+UNKNOWN surface and degrades WIDER (security on; probe when a recipe
+exists), on top of caller context and forced lanes.
 """
 
 import json
@@ -26,6 +27,19 @@ proj = os.path.expanduser(
     (state.get("project_dir_in") or "").strip() or state.get("project_dir") or "."
 )
 spec = (state.get("diff_spec") or "worktree").strip()
+spec_raw = spec
+# The parse stage should emit a bare revision token, but callers write prose
+# and extraction drifts ("run get_diff --base origin/main" once reached
+# `git diff` verbatim, killing the signals — and with them the security and
+# probe lanes). Deterministically recover a usable spec before giving up.
+_TOKEN = r"[\w./~^@{}-]+"
+if spec not in ("", "worktree") and not re.fullmatch(
+    rf"{_TOKEN}(\.\.\.?{_TOKEN})?", spec
+):
+    if m := re.search(rf"({_TOKEN}\.\.\.?{_TOKEN})", spec):
+        spec = m.group(1)  # a revision range buried in prose
+    elif m := re.search(rf"--base[= ]({_TOKEN})", spec):
+        spec = f"{m.group(1)}...HEAD"  # the get_diff idiom
 
 
 def git(*args):
@@ -112,13 +126,18 @@ try:
             ),
             "docs_only": bool(files)
             and all(re.search(r"\.(md|rst|txt|adoc)$", f, re.I) for f in files),
-            "signals_summary": f"{len(files)} file(s) changed (diff: {spec})",
+            "signals_summary": f"{len(files)} file(s) changed (diff: {spec})"
+            + (f" — spec normalized from {spec_raw!r}" if spec != spec_raw else ""),
         }
     )
 except Exception as e:  # noqa: BLE001 — degraded signals must not sink the gauntlet
+    what = f"diff spec {spec!r}" + (
+        f", normalized from {spec_raw!r}" if spec != spec_raw else ""
+    )
     out["signals_error"] = (
-        f"NOTE: diff signals could not be computed ({e}); "
-        "lane selection falls back to caller context and forced lanes."
+        f"NOTE: diff signals could not be computed ({what}: {e}); surface UNKNOWN — "
+        "lane selection degrades WIDER (security lane added; probe eligible when a "
+        "local-run recipe exists), plus caller context and forced lanes."
     )
     out["signals_summary"] = "signals unavailable"
 

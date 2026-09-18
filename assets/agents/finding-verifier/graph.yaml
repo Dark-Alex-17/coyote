@@ -174,7 +174,7 @@ nodes:
       - fs_read
       - fs_cat
       - fs_grep
-    max_iterations: 14
+    max_iterations: 28
     max_attempts: 2
     state_updates:
       verdict: '{{output}}'

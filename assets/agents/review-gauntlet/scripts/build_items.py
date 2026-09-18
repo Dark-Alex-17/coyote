@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Deterministic lane builder for the review gauntlet.
 
-Selection = hard rules (the floor) ∪ LLM additions; forced lanes override
-everything exactly. Emits one 0-or-1-item list per lane: an empty list makes
-that lane's map node run zero branches (map-over-nothing), which IS the
-skip mechanism — no dynamic routing anywhere.
+Selection = hard rules (the floor) ∪ LLM additions ∪ caller-forced lanes.
+Forcing is ADDITIVE: it can only widen the computed selection — honoring a
+forced list as the exact set once dropped the always-on code-review lane in
+a live run. Emits one 0-or-1-item list per lane: an empty list makes that
+lane's map node run zero branches (map-over-nothing), which IS the skip
+mechanism — no dynamic routing anywhere.
 
 The LLM's add_* flags can only ADD lanes. A flag that is false never
 removes a lane the hard rules selected.
+
+Unavailable diff signals (malformed spec, git failure) mean the surface is
+UNKNOWN — selection degrades WIDER (security on; probe when a recipe
+exists), never narrower.
 
 A re-run pass (retry_gate emitted `retry_lanes`) skips selection: only the
 named lanes get an item, stamped with their attempt number, and every other
@@ -101,56 +107,90 @@ def main():
         (forced.append(canon) if canon else unknown.append(str(lane)))
 
     reasons = []
-    if forced:
-        lanes = set(forced)
-        reasons.append(f"forced lanes honored exactly: {sorted(lanes)}")
-    else:
-        lanes = {"code-review"}
+    lanes = {"code-review"}
+    reasons.append(
+        "code-review: always on — the gauntlet is only spawned for non-trivial work"
+    )
+    if text("plan_context"):
+        lanes.add("adversary")
+        reasons.append("adversary: a spec/plan/acceptance-criteria context is present")
+    if (
+        state.get("touches_auth")
+        or state.get("touches_deps")
+        or state.get("touches_exec")
+        or state.get("security_posture") == "hardened"
+    ):
+        lanes.add("security")
         reasons.append(
-            "code-review: always on — the gauntlet is only spawned for non-trivial work"
+            "security: attack-surface signals (auth/deps/exec) or hardened posture"
         )
-        if text("plan_context"):
-            lanes.add("adversary")
-            reasons.append("adversary: a spec/plan/acceptance-criteria context is present")
-        if (
-            state.get("touches_auth")
-            or state.get("touches_deps")
-            or state.get("touches_exec")
-            or state.get("security_posture") == "hardened"
-        ):
+    if state.get("consumer_surface") and text("probe_context"):
+        lanes.add("probe")
+        reasons.append(
+            "probe: consumer-facing surface changed and a local-run recipe/suite pointer exists"
+        )
+
+    # Unavailable signals (malformed diff spec, git failure) = surface UNKNOWN.
+    # Degrade WIDER, never narrower — a run without signals once silently
+    # dropped the security and probe lanes.
+    if text("signals_summary") == "signals unavailable":
+        if "security" not in lanes:
             lanes.add("security")
             reasons.append(
-                "security: attack-surface signals (auth/deps/exec) or hardened posture"
+                "security: diff signals unavailable — surface unknown, degrading wider"
             )
-        if state.get("consumer_surface") and text("probe_context"):
+        if "probe" not in lanes and text("probe_context"):
             lanes.add("probe")
             reasons.append(
-                "probe: consumer-facing surface changed and a local-run recipe/suite pointer exists"
+                "probe: diff signals unavailable and a local-run recipe/suite pointer "
+                "exists — degrading wider"
             )
 
-        # LLM judgment is additive-only.
-        llm_why = text("lane_reasons")[:300]
-        for flag, lane in (
-            ("add_code_review", "code-review"),
-            ("add_adversary", "adversary"),
-            ("add_security", "security"),
-            ("add_probe", "probe"),
-        ):
-            if state.get(flag) and lane not in lanes:
-                if lane == "probe" and not text("probe_context"):
-                    reasons.append(
-                        "probe: requested by lane judgment but skipped — no local-run "
-                        "recipe/suite pointer (a probe without one is guaranteed INCONCLUSIVE)"
-                    )
-                    continue
-                if lane == "adversary" and not text("plan_context"):
-                    reasons.append(
-                        "adversary: requested by lane judgment but skipped — no spec/plan "
-                        "to check conformance against"
-                    )
-                    continue
-                lanes.add(lane)
-                reasons.append(f"{lane}: added by lane-selection judgment — {llm_why}")
+    # LLM judgment is additive-only.
+    llm_why = text("lane_reasons")[:300]
+    for flag, lane in (
+        ("add_code_review", "code-review"),
+        ("add_adversary", "adversary"),
+        ("add_security", "security"),
+        ("add_probe", "probe"),
+    ):
+        if state.get(flag) and lane not in lanes:
+            if lane == "probe" and not text("probe_context"):
+                reasons.append(
+                    "probe: requested by lane judgment but skipped — no local-run "
+                    "recipe/suite pointer (a probe without one is guaranteed INCONCLUSIVE)"
+                )
+                continue
+            if lane == "adversary" and not text("plan_context"):
+                reasons.append(
+                    "adversary: requested by lane judgment but skipped — no spec/plan "
+                    "to check conformance against"
+                )
+                continue
+            lanes.add(lane)
+            reasons.append(f"{lane}: added by lane-selection judgment — {llm_why}")
+
+    # Caller-forced lanes are ADDITIVE: they widen the computed selection,
+    # never replace it. (Honoring them as the exact set dropped code-review —
+    # documented as always-on — and adversary in a live run.) Forcing also
+    # bypasses the context guards above: the caller demanded the lane, so it
+    # runs, with the expectation named in the summary.
+    if forced:
+        newly = sorted(set(forced) - lanes)
+        lanes |= set(forced)
+        reasons.append(
+            f"forced lanes (additive): {sorted(set(forced))}"
+            + (f" — newly added: {newly}" if newly else " — all already selected")
+        )
+        if "probe" in forced and not text("probe_context"):
+            reasons.append(
+                "probe: forced without a local-run recipe/suite pointer — expect INCONCLUSIVE"
+            )
+        if "adversary" in forced and not text("plan_context"):
+            reasons.append(
+                "adversary: forced without spec/plan context — it fails closed "
+                "(DIVERGES) without extractable criteria"
+            )
 
     if unknown:
         reasons.append(f"ignored unknown forced lane name(s): {unknown}")

@@ -120,7 +120,15 @@ instructions: |
      update — never delete or silence it).
   4. **Clean, local, isolated.** Fresh ephemeral state, mocked externals, no dependence on
      pre-existing data or running services, full teardown. Bounded retries for startup only —
-     never to mask a flaky assertion.
+     never to mask a flaky assertion. Teardown MUST NOT depend on a shell trap firing (a
+     killed or timed-out lane leaks containers — it has happened): pick one unique run
+     prefix up front (e.g. `probe-$$`), give EVERY container you create `--name <prefix>-…`
+     and `--label coyote-probe=<prefix>` (compose: `-p <prefix>`), prefer `docker run --rm`,
+     and make the LAST action before emitting your verdict an explicit sweep:
+     `docker ps -aq --filter label=coyote-probe=<prefix> | xargs -r docker rm -f` (compose:
+     `docker compose -p <prefix> down -v`). The label filter keeps the sweep scoped to YOUR
+     resources — rule 0 still forbids touching anyone else's. A leftover you cannot remove
+     is a finding to REPORT in the verdict, never to silence.
   5. **Classify every failure** as BUG / EXPECTED-CHANGE / ENV per the skill table. The verdict
      depends on the classification being honest.
   6. **Committed tests are the deliverable** alongside the verdict: write them where the repo's

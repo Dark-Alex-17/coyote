@@ -107,10 +107,14 @@ nodes:
       You extract the facts of a review request into structured fields.
       EXTRACTION ONLY — do not decide which review lanes should run.
 
-      - `diff_spec`: the git diff specification the caller named — a ref
-        range ("main...HEAD", "HEAD~3..HEAD"), a single ref, or the literal
-        "worktree" for uncommitted changes against HEAD. When the caller
-        did not name one, use "worktree".
+      - `diff_spec`: the git diff specification the caller named, as a BARE
+        revision token usable verbatim in `git diff <spec>` — a ref range
+        ("main...HEAD", "HEAD~3..HEAD"), a single ref, or the literal
+        "worktree" for uncommitted changes against HEAD. NEVER prose, a
+        command, or a path: from "run get_diff --base origin/main" extract
+        "origin/main...HEAD"; from "diff origin/main...HEAD in ~/code/x"
+        extract "origin/main...HEAD". When the caller did not name one, use
+        "worktree".
       - `project_dir_in`: the repository directory the caller named as holding
         the change (absolute path preferred); empty string when the caller
         named none.
@@ -127,7 +131,8 @@ nodes:
         pointers for black-box probing (how to boot the service, where the
         suites live). Empty string when the caller supplied none.
       - `forced_lanes`: lanes the caller explicitly demanded (verbatim
-        names). Empty array = automatic selection.
+        names). Empty array = automatic selection. Forcing is ADDITIVE
+        downstream: it widens the computed selection, never replaces it.
       - `extra_context`: any remaining caller context reviewers should see,
         condensed.
     prompt: |
@@ -261,7 +266,7 @@ nodes:
   build_items:
     id: build_items
     type: script
-    description: Deterministic lane builder — hard rules are the floor, LLM flags may only add, forced lanes override exactly. Emits one 0-or-1-item list per lane; an empty list skips that lane's map. On a re-run pass (retry_lanes non-empty) it skips selection and emits items only for those lanes, each carrying its attempt number.
+    description: Deterministic lane builder — hard rules are the floor, LLM flags may only add, forced lanes are ADDITIVE (selection only ever widens; unavailable signals widen it too). Emits one 0-or-1-item list per lane; an empty list skips that lane's map. On a re-run pass (retry_lanes non-empty) it skips selection and emits items only for those lanes, each carrying its attempt number.
     script: scripts/build_items.py
     timeout: 30
     next: [map_code_review, map_adversary, map_security, map_probe]

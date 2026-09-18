@@ -14,7 +14,7 @@ flowchart TD
     parse -. "fallback" .-> pfault["parse_fault<br/>(script: PIPELINE-FAULT marker)"]
     pfault --> gate
     signals --> select["select_lanes<br/>(llm: ADDITIVE-only judgment)"]
-    select --> build["build_items<br/>(script: rules floor ∪ additions;<br/>forced lanes override exactly)"]
+    select --> build["build_items<br/>(script: rules floor ∪ additions;<br/>forced lanes add)"]
     select -. "fallback" .-> dlanes["default_lanes<br/>(script: deterministic degraded<br/>selection — wider, never narrower)"]
     dlanes --> build
     build --> mcr["map: code-review"] & madv["map: adversary"] & msec["map: security"] & mpb["map: probe"]
@@ -155,7 +155,7 @@ Plan / acceptance criteria:
 Local-run recipe / usage suites:
 <how to boot the service locally + where existing suites live — enables the probe lane>
 
-Forced lanes: (optional — e.g. 'adversary, probe' to run exactly those)" \
+Forced lanes: (optional, ADDITIVE — e.g. 'adversary, probe' run on top of the computed selection; forcing never drops the always-on floor)" \
   --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
 ```
 
@@ -210,9 +210,9 @@ verbatim.
   (`'[]'` ⇒ "none declared"); a declaration that is not a JSON array of
   strings executes nothing and records a `PIPELINE-FAULT`, which the
   adversary lane reports as DIVERGES and the gate as BLOCKED.
-- Signals failures degrade gracefully: if git can't compute the diff, lane
-  selection falls back to caller context + forced lanes, and the report notes
-  it. The auth-path regex deliberately over-fires (`auth(?!or)` matches
+- Signals failures degrade WIDER: if git can't compute the diff, the surface
+  is unknown — the security lane is added (and probe, when a local-run recipe
+  exists) on top of caller context + forced lanes, and the report notes it. The auth-path regex deliberately over-fires (`auth(?!or)` matches
   auth/authn/authz/oauth but not "author") — the safe direction, since signals
   only ever ADD the security lane.
 - Requires the `code-reviewer`, `adversary`, `security-reviewer`, and `probe`
