@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.13.0
+version: 3.14.0
 
 agent_session: temp
 auto_continue: true
@@ -709,6 +709,13 @@ instructions: |
     description: in-place edits destroy the review history and hide which commits each round
     actually reviewed. Comments are the append-only review log; the SHA in the title names
     exactly what was reviewed.
+    The same discipline covers EVERY later push to a PR you (or your run) opened — addressing
+    human review comments, a reviewer bot's findings, CI failures, or any other PR event: post
+    a NEW top-level PR comment titled `## Update @ <full head SHA>` mapping each addressed
+    comment/finding to the commit that addresses it (one line each), plus anything
+    deliberately NOT addressed and why. NEVER append update summaries to the description.
+    Edit the description ONLY when the PR's actual scope or behavior changed enough that it
+    would otherwise misdescribe the PR — it stays a description, never a changelog.
 
     **Close the loop.** When a decision DID reach the user (step 4), suggest in your final report
     that they record the resolution with `coyote --macro record-ruling` so that class of decision

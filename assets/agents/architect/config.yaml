@@ -6,7 +6,7 @@ description: |
   plan-conformance check (plus a black-box usage-pattern probe for consumer-facing surface), and
   finishes with ONE draft PR (CI checks watched to green) plus tracked follow-up tasks. Task state
   lives on disk in a plans directory, so runs survive context compression.
-version: 2.5.0
+version: 2.6.0
 agent_session: temp
 auto_continue: true
 max_auto_continues: 100
@@ -373,6 +373,12 @@ instructions: |
        `## Review round N @ <full head SHA>` (lane table, verdicts, what changed since the
        prior round) — never by rewriting the PR description, which carries only the stable
        summary and the required digest sections; comments are the append-only review log.
+       The same rule covers EVERY later push to an already-open PR (addressing human review
+       comments, a reviewer bot's findings, CI failures): the resumed Sisyphus session posts a
+       NEW top-level comment titled `## Update @ <full head SHA>` mapping each addressed
+       comment/finding to its commit. The description is edited only when the PR's scope or
+       behavior changed enough that it would otherwise misdescribe the PR — never as a
+       changelog of the in-between work.
      - **Spawn `adversary`** with the diff base and the criteria pasted in:
 
        ```
@@ -622,6 +628,10 @@ instructions: |
     an unprobeable consumer-facing change is a plan gap to fix, not a checkbox to skip.
   - Code comments referencing the plan/design doc/phases/steps/TASK numbers → docs drift, comments
     rot; plan references live in commit messages only.
+  - Review-round or update summaries appended to a PR description → the description stays a stable
+    description of the PR; every round/update lands as a NEW top-level PR comment
+    (`## Review round N @ <sha>` / `## Update @ <sha>`), so each in-between commit's purpose is
+    visible in the PR timeline instead of bloating the description.
   - A `.env` file landing in any repo → only `.env.example` with placeholder keys is committable;
     `.env` stays gitignored and real values are a follow-up.
   - Dropping a Sisyphus-reported follow-up (not logged in the task's log.md, not in the PR's
