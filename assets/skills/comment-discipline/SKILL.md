@@ -1,7 +1,7 @@
 ---
 description: Calibrate comment density and style to the repository's existing conventions before writing code. Detects the repo's comment register (self-documenting / api-documented / comment-heavy) from the sibling files you already read for pattern matching, or from a declared policy in workspace instructions, then dictates when a comment is warranted. Default when signal is weak - write NO comment. Complements ai-slop-remover (which bans comments that restate code in every register).
 ---
-You are about to write or modify code. LLMs systematically over-comment — narrating every block, restating signatures, banner-ing sections — and that default is wrong in most repositories. Before writing, determine the repo's **comment register** and match it, exactly the way you already match imports, naming, and error handling.
+You are about to write or modify code. LLMs systematically over-comment — narrating every block, restating signatures, banner-ing sections — and that default is wrong in most repositories. Before writing, determine the repo's **comment register** and match it, exactly the way you already match imports, naming, and error handling. Across every register, one test governs each comment you write: it must **earn its keep**. If the code already tells the reader, the comment doesn't get written — don't add comments you don't need; make the code tell them instead.
 
 ## Step 0: Check for a declared policy first
 
