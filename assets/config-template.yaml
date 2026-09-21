@@ -277,6 +277,7 @@ sync_models_ttl_hours: 24        # Hours before the synced model catalog is cons
 # All clients have the following configuration:
 # - type: xxxx
 #   name: xxxx                                      # Only use it to distinguish clients with the same client type. Optional
+#   extend_models: true                             # Merge the models below on top of the catalog models for this client instead of replacing them. Optional, default false
 #   models:
 #     - name: xxxx                                  # Chat model
 #       max_input_tokens: 100000

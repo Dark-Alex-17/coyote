@@ -4,13 +4,15 @@ use super::*;
 use anyhow::Result;
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct AzureOpenAIConfig {
     pub name: Option<String>,
     pub api_base: Option<String>,
     pub api_key: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
+    #[serde(default)]
+    pub extend_models: bool,
     pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }

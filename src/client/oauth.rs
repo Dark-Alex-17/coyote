@@ -1457,13 +1457,9 @@ echo_pkce_in_token_exchange: true
         ClientConfig::OpenAICompatibleConfig(OpenAICompatibleConfig {
             name: Some(name.into()),
             api_base: Some("https://api.example/v1".into()),
-            api_key: None,
             auth: auth.map(str::to_string),
             oauth: oauth.map(Box::new),
-            wire_api: None,
-            models: vec![],
-            patch: None,
-            extra: None,
+            ..Default::default()
         })
     }
 
@@ -1474,14 +1470,9 @@ echo_pkce_in_token_exchange: true
     ) -> ClientConfig {
         ClientConfig::ClaudeConfig(ClaudeConfig {
             name: Some(name.into()),
-            api_key: None,
-            api_base: None,
             auth: auth.map(str::to_string),
             oauth: oauth.map(Box::new),
-            models: vec![],
-            prompt_cache: None,
-            patch: None,
-            extra: None,
+            ..Default::default()
         })
     }
 
@@ -1492,15 +1483,9 @@ echo_pkce_in_token_exchange: true
     ) -> ClientConfig {
         ClientConfig::OpenAIConfig(OpenAIConfig {
             name: Some(name.into()),
-            api_key: None,
-            api_base: None,
-            organization_id: None,
             auth: auth.map(str::to_string),
             oauth: oauth.map(Box::new),
-            wire_api: None,
-            models: vec![],
-            patch: None,
-            extra: None,
+            ..Default::default()
         })
     }
 
@@ -1511,13 +1496,9 @@ echo_pkce_in_token_exchange: true
     ) -> ClientConfig {
         ClientConfig::GeminiConfig(GeminiConfig {
             name: Some(name.into()),
-            api_key: None,
-            api_base: None,
             auth: auth.map(str::to_string),
             oauth: oauth.map(Box::new),
-            models: vec![],
-            patch: None,
-            extra: None,
+            ..Default::default()
         })
     }
 

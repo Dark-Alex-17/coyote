@@ -24,6 +24,8 @@ pub struct OpenAIConfig {
     pub wire_api: Option<WireApi>,
     #[serde(default)]
     pub models: Vec<ModelData>,
+    #[serde(default)]
+    pub extend_models: bool,
     pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }

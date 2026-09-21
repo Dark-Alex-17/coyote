@@ -18,6 +18,8 @@ pub struct VertexAIConfig {
     pub adc_file: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
+    #[serde(default)]
+    pub extend_models: bool,
     pub prompt_cache: Option<bool>,
     pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,

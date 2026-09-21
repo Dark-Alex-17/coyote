@@ -20,6 +20,8 @@ pub struct GeminiConfig {
     pub oauth: Option<Box<OAuthConfig>>,
     #[serde(default)]
     pub models: Vec<ModelData>,
+    #[serde(default)]
+    pub extend_models: bool,
     pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }

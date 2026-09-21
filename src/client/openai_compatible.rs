@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use oauth::OAuthConfig;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct OpenAICompatibleConfig {
     pub name: Option<String>,
     pub api_base: Option<String>,
@@ -19,6 +19,8 @@ pub struct OpenAICompatibleConfig {
     pub wire_api: Option<WireApi>,
     #[serde(default)]
     pub models: Vec<ModelData>,
+    #[serde(default)]
+    pub extend_models: bool,
     pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }
@@ -274,12 +276,8 @@ mod tests {
             name: Some("compat-test".into()),
             api_base: Some("https://compat.example/v1".into()),
             api_key: Some("sk-test".into()),
-            auth: None,
-            oauth: None,
             wire_api,
-            models: vec![],
-            patch: None,
-            extra: None,
+            ..Default::default()
         }
     }
 

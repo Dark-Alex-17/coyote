@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 const API_BASE: &str = "https://api.anthropic.com/v1";
 const CLAUDE_CODE_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct ClaudeConfig {
     pub name: Option<String>,
     pub api_key: Option<String>,
@@ -24,6 +24,8 @@ pub struct ClaudeConfig {
     pub oauth: Option<Box<OAuthConfig>>,
     #[serde(default)]
     pub models: Vec<ModelData>,
+    #[serde(default)]
+    pub extend_models: bool,
     pub prompt_cache: Option<bool>,
     pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
@@ -1122,16 +1124,12 @@ mod tests {
     fn claude_config(name: &str, auth: Option<&str>, oauth: Option<OAuthConfig>) -> ClaudeConfig {
         ClaudeConfig {
             name: Some(name.into()),
-            api_key: None,
             api_base: oauth
                 .as_ref()
                 .map(|_| "https://gateway.example/v1".to_string()),
             auth: auth.map(str::to_string),
             oauth: oauth.map(Box::new),
-            models: vec![],
-            prompt_cache: None,
-            patch: None,
-            extra: None,
+            ..Default::default()
         }
     }
 

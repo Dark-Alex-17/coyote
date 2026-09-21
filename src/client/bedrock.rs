@@ -16,7 +16,7 @@ use reqwest::{Client as ReqwestClient, Method, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct BedrockConfig {
     pub name: Option<String>,
     pub access_key_id: Option<String>,
@@ -25,6 +25,8 @@ pub struct BedrockConfig {
     pub session_token: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
+    #[serde(default)]
+    pub extend_models: bool,
     pub prompt_cache: Option<bool>,
     pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,

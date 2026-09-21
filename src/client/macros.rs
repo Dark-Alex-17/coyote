@@ -51,15 +51,24 @@ macro_rules! register_client {
 
                 pub fn list_models(local_config: &$config) -> Vec<Model> {
                     let client_name = Self::name(local_config);
+                    let find_catalog = || $crate::client::ALL_PROVIDER_MODELS.iter().find(|v| {
+                        v.provider == $name ||
+                            ($name == OpenAICompatibleClient::NAME
+                                && local_config.name.as_ref().map(|name| name.starts_with(&v.provider)).unwrap_or_default())
+                    });
                     if local_config.models.is_empty() {
-                        if let Some(v) = $crate::client::ALL_PROVIDER_MODELS.iter().find(|v| {
-                            v.provider == $name ||
-                                ($name == OpenAICompatibleClient::NAME
-                                    && local_config.name.as_ref().map(|name| name.starts_with(&v.provider)).unwrap_or_default())
-                        }) {
-                            return Model::from_config(client_name, &v.models);
+                        match find_catalog() {
+                            Some(v) => Model::from_config(client_name, &v.models),
+                            None => vec![],
                         }
-                        vec![]
+                    } else if local_config.extend_models {
+                        match find_catalog() {
+                            Some(v) => Model::from_config(
+                                client_name,
+                                &$crate::client::catalog::extend_catalog_models(&v.models, &local_config.models),
+                            ),
+                            None => Model::from_config(client_name, &local_config.models),
+                        }
                     } else {
                         Model::from_config(client_name, &local_config.models)
                     }

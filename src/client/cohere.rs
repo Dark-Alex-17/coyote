@@ -16,6 +16,8 @@ pub struct CohereConfig {
     pub api_base: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
+    #[serde(default)]
+    pub extend_models: bool,
     pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }

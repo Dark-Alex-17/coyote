@@ -572,7 +572,7 @@ pub(crate) fn name_overlap(old: &[String], new: &[String]) -> f64 {
     kept as f64 / old.len() as f64
 }
 
-fn overlay_hand_owned(hand: ModelData, api: ModelData) -> ModelData {
+pub(crate) fn overlay_hand_owned(hand: ModelData, api: ModelData) -> ModelData {
     ModelData {
         name: hand.name,
         model_type: hand.model_type,
@@ -602,6 +602,23 @@ fn overlay_hand_owned(hand: ModelData, api: ModelData) -> ModelData {
         default_chunk_size: hand.default_chunk_size.or(api.default_chunk_size),
         max_batch_size: hand.max_batch_size.or(api.max_batch_size),
     }
+}
+
+pub(crate) fn extend_catalog_models(
+    catalog: &[ModelData],
+    overrides: &[ModelData],
+) -> Vec<ModelData> {
+    let mut models = catalog.to_vec();
+    for override_model in overrides {
+        match models.iter_mut().find(|model| {
+            model.name == override_model.name && model.model_type == override_model.model_type
+        }) {
+            Some(model) => *model = overlay_hand_owned(override_model.clone(), model.clone()),
+            None => models.push(override_model.clone()),
+        }
+    }
+
+    models
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1723,5 +1740,48 @@ rules:
                 new.len()
             );
         }
+    }
+
+    fn typed_model(name: &str, model_type: &str) -> ModelData {
+        ModelData {
+            name: name.to_string(),
+            model_type: model_type.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn extend_catalog_models_merges_collisions_field_wise() {
+        let mut catalog_model = ModelData::new("m");
+        catalog_model.max_input_tokens = Some(100_000);
+        catalog_model.input_price = Some(1.0);
+        catalog_model.supports_vision = true;
+        let mut override_model = ModelData::new("m");
+        override_model.input_price = Some(9.0);
+
+        let merged = extend_catalog_models(&[catalog_model], &[override_model]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].input_price, Some(9.0));
+        assert_eq!(merged[0].max_input_tokens, Some(100_000));
+        assert!(merged[0].supports_vision);
+    }
+
+    #[test]
+    fn extend_catalog_models_appends_net_new_after_catalog() {
+        let catalog = [ModelData::new("a"), ModelData::new("b")];
+        let merged = extend_catalog_models(&catalog, &[ModelData::new("c")]);
+        let names: Vec<&str> = merged.iter().map(|model| model.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn extend_catalog_models_collides_on_name_and_type() {
+        let mut catalog_model = typed_model("m", "embedding");
+        catalog_model.default_chunk_size = Some(1500);
+        let merged = extend_catalog_models(&[catalog_model], &[typed_model("m", "reranker")]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].model_type, "embedding");
+        assert_eq!(merged[0].default_chunk_size, Some(1500));
+        assert_eq!(merged[1].model_type, "reranker");
     }
 }

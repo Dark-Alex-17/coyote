@@ -557,4 +557,96 @@ reasoning_levels: [none, low, medium, high]
             "oauth blocks in the shipped models.yaml are limited to providers with no built-in stock oauth path (currently only xai's bundled defaults); adding one for claude/openai/gemini would silently swap stock oauth users onto a non-stock provider"
         );
     }
+
+    #[test]
+    fn config_models_replace_catalog_by_default() {
+        let ClientConfig::ClaudeConfig(config) = serde_yaml::from_str::<ClientConfig>(
+            "type: claude\nmodels:\n  - name: test-replace-model\n",
+        )
+        .unwrap() else {
+            panic!("expected a claude config");
+        };
+        assert!(!config.extend_models);
+
+        let models = crate::client::ClaudeClient::list_models(&config);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name(), "test-replace-model");
+    }
+
+    #[test]
+    fn config_models_extend_catalog_when_flag_set() {
+        let ClientConfig::ClaudeConfig(config) = serde_yaml::from_str::<ClientConfig>(
+            "type: claude\nextend_models: true\nmodels:\n  - name: test-extra-model\n",
+        )
+        .unwrap() else {
+            panic!("expected a claude config");
+        };
+
+        let catalog_len = crate::client::ALL_PROVIDER_MODELS
+            .iter()
+            .find(|v| v.provider == "claude")
+            .map(|v| v.models.len())
+            .unwrap();
+        let models = crate::client::ClaudeClient::list_models(&config);
+        assert_eq!(models.len(), catalog_len + 1);
+        assert_eq!(models.last().unwrap().name(), "test-extra-model");
+    }
+
+    #[test]
+    fn extend_models_with_empty_models_returns_catalog_exactly() {
+        let ClientConfig::ClaudeConfig(config) =
+            serde_yaml::from_str::<ClientConfig>("type: claude\nextend_models: true\n").unwrap()
+        else {
+            panic!("expected a claude config");
+        };
+
+        let catalog = crate::client::ALL_PROVIDER_MODELS
+            .iter()
+            .find(|v| v.provider == "claude")
+            .unwrap();
+        let models = crate::client::ClaudeClient::list_models(&config);
+        assert_eq!(models.len(), catalog.models.len());
+        for (model, catalog_model) in models.iter().zip(catalog.models.iter()) {
+            assert_eq!(model.name(), catalog_model.name);
+        }
+    }
+
+    #[test]
+    fn extend_models_without_catalog_match_returns_config_models_only() {
+        let ClientConfig::OpenAICompatibleConfig(config) = serde_yaml::from_str::<ClientConfig>(
+            "type: openai-compatible\nname: no-such-provider-xyz\nextend_models: true\nmodels:\n  - name: test-only-model\n",
+        )
+        .unwrap() else {
+            panic!("expected an openai-compatible config");
+        };
+
+        assert!(
+            !crate::client::ALL_PROVIDER_MODELS
+                .iter()
+                .any(|v| "no-such-provider-xyz".starts_with(v.provider.as_str())),
+            "test premise: the client name must not prefix-match any catalog provider"
+        );
+        let models = crate::client::OpenAICompatibleClient::list_models(&config);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name(), "test-only-model");
+    }
+
+    #[test]
+    fn extend_models_extends_catalog_via_provider_name_prefix_match() {
+        let ClientConfig::OpenAICompatibleConfig(config) = serde_yaml::from_str::<ClientConfig>(
+            "type: openai-compatible\nname: openrouter-custom\nextend_models: true\nmodels:\n  - name: test-net-new-model\n",
+        )
+        .unwrap() else {
+            panic!("expected an openai-compatible config");
+        };
+
+        let catalog_len = crate::client::ALL_PROVIDER_MODELS
+            .iter()
+            .find(|v| v.provider == "openrouter")
+            .map(|v| v.models.len())
+            .unwrap();
+        let models = crate::client::OpenAICompatibleClient::list_models(&config);
+        assert_eq!(models.len(), catalog_len + 1);
+        assert_eq!(models.last().unwrap().name(), "test-net-new-model");
+    }
 }
