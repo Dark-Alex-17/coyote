@@ -7,7 +7,12 @@ description: |
   delegates the final write-up to a focused sub-agent, checks that the
   cited sources are reachable, and gates the result behind human
   approval. A reviewer's free-form feedback at the approval step feeds
-  back into another research pass.
+  back into another research pass. Each sub-question is researched by a
+  spawned librarian running at deep budgets. Tunable via --variables:
+  reflexion_budget (default 2) caps the automated critique->re-research
+  passes - raise it to let the run churn until the critique passes;
+  autonomy=autonomous skips the human approval gate (REQUIRED when
+  another agent spawns this one).
 
   This is the canonical Coyote graph-agent reference: it exercises every
   node type (script, llm, rag, map, agent, input, approval, end) and
@@ -27,8 +32,16 @@ conversation_starters:
   - 'How does HTTP/3 differ from HTTP/2?'
   - 'Summarize recent advances in solid-state battery chemistry'
 
+variables:
+  - name: reflexion_budget
+    description: "Max automated critique->re-research passes before synthesis proceeds anyway. Default 2; raise it (4-8) for exhaustive runs that should churn until the critique passes."
+    default: '2'
+  - name: autonomy
+    description: "supervised (default): the finished report stops at the human approval gate. autonomous: skip the gate and return the report directly - REQUIRED when another agent spawns this one (a human gate would block the run)."
+    default: 'supervised'
+
 settings:
-  max_loop_iterations: 40
+  max_loop_iterations: 120
   log_state_snapshots: false
   validate_before_run: true
   max_concurrency: 4
@@ -142,23 +155,11 @@ nodes:
 
   research_one_question:
     id: research_one_question
-    type: llm
-    instructions: |
-      You are a web research assistant. Investigate the SINGLE question
-      given to you using your tools: search the web, fetch and read
-      pages, and search arXiv for academic sources.
-
-      Rules:
-        - Every factual claim must be backed by a real source you
-          actually retrieved. Never fabricate URLs, page titles,
-          authors, or DOIs.
-        - Prefer primary and authoritative sources over aggregators.
-        - Where sources disagree, report the disagreement rather than
-          papering over it.
-        - Put the URL (or DOI) inline next to each claim it supports.
-
-      Return organized findings in plain text. Do not include
-      meta-commentary about the process.
+    type: agent
+    agent: librarian
+    # The leaf research primitive: triage -> doc+OSS search -> cited
+    # synthesis. `inputs:` overlays the librarian graph's initial state,
+    # pinning research_depth to deep for every sub-question lane.
     prompt: |
       Research question: {{question}}
 
@@ -166,16 +167,13 @@ nodes:
       {{local_context}}
 
       {{research_feedback}}
-    tools:
-      - web_search_coyote
-      - fetch_url_via_curl
-      - search_arxiv
-      - mcp:ddg-search
-    max_iterations: 10
+    inputs:
+      research_depth: deep
+    timeout: 1900
     max_attempts: 2
     state_updates:
       finding: '{{output}}'
-    # On failure the engine writes "LLM node ...failed: <chain>" into `finding`
+    # On failure the engine writes "Agent node failed: <chain>" into `finding`
     # via the state_updates above BEFORE routing to the fallback. The marker
     # is branch-local: a map branch's fallback must stay inside the branch.
     fallback: question_fault
@@ -312,6 +310,13 @@ nodes:
     id: verify_sources
     type: script
     script: scripts/verify_sources.py
+    next: approval_gate
+
+  approval_gate:
+    id: approval_gate
+    type: script
+    description: Autonomy router - autonomous runs (spawned by another agent) skip the human approval gate and end accepted with the source check + pipeline notes attached; supervised (default) proceeds to the approval node. A crash fails forward via `next` to approve, the safe human-gated direction.
+    script: scripts/approval_gate.py
     next: approve
 
   approve:
@@ -347,6 +352,15 @@ nodes:
     id: end_accepted
     type: end
     output: '{{report}}{{pipeline_notes}}'
+
+  end_autonomous:
+    id: end_autonomous
+    type: end
+    output: |
+      {{report}}
+
+      ----
+      {{source_check}}{{pipeline_notes}}
 
   end_rejected:
     id: end_rejected

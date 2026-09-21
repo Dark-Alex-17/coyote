@@ -10548,7 +10548,10 @@ mod tests {
                 ]
                 .concat(),
             ),
-            ("deep-research".to_string(), unreachable(&["ask_topic"])),
+            (
+                "deep-research".to_string(),
+                unreachable(&["ask_topic", "end_autonomous"]),
+            ),
             ("finding-verifier".to_string(), Vec::new()),
             ("librarian".to_string(), Vec::new()),
             ("review-gauntlet".to_string(), Vec::new()),
@@ -12729,6 +12732,7 @@ mod tests {
             [
                 "code-reviewer/review_domain",
                 "code-reviewer/verify",
+                "deep-research/research_one_question",
                 "deep-research/synthesize",
                 "review-gauntlet/run_adversary",
                 "review-gauntlet/run_code_review",
@@ -17660,11 +17664,20 @@ mod tests {
         assert_eq!(pf.fallback.as_deref(), Some("end_fault"));
 
         // research_one_question: branch-local marker; no `next` so the map
-        // collects the fault as the lane's finding.
-        let NodeType::Llm(question) = &graph.get_node("research_one_question").unwrap().node_type
+        // collects the fault as the lane's finding. The branch spawns a
+        // librarian pinned to deep research budgets via graph inputs.
+        let NodeType::Agent(question) = &graph.get_node("research_one_question").unwrap().node_type
         else {
-            panic!("research_one_question must be an llm node")
+            panic!("research_one_question must be an agent node")
         };
+        assert_eq!(question.agent, "librarian");
+        assert!(
+            question
+                .inputs
+                .as_ref()
+                .is_some_and(|i| i.get("research_depth").is_some_and(|v| v == "deep")),
+            "the librarian lane must be pinned to deep research budgets"
+        );
         assert_eq!(question.fallback.as_deref(), Some("question_fault"));
         assert!(
             question

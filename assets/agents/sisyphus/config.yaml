@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.15.0
+version: 3.17.0
 
 agent_session: temp
 auto_continue: true
@@ -11,6 +11,7 @@ can_spawn_agents: true
 spawnable_agents:
   - explore
   - librarian
+  - deep-research
   - coder
   - oracle
   - code-reviewer
@@ -157,7 +158,8 @@ instructions: |
   | Agent | Use For | Characteristics |
   |-------|---------|-----------------|
   | `explore` | Find patterns in THIS codebase, understand local code | Read-only, returns findings, fan out as many as the task warrants — one per distinct search angle, module, or concern. Large codebases or cross-cutting tasks should spawn 5–15+. |
-  | `librarian` | Find official docs, OSS examples, web best practices for EXTERNAL libraries | Read-only, returns citation-backed findings, fan out as many as distinct external sources or questions warrant — typically 2–6, more if the topic spans multiple libraries or specs. |
+  | `librarian` | Find official docs, OSS examples, web best practices for EXTERNAL libraries | Read-only, returns citation-backed findings, fan out as many as distinct external sources or questions warrant — typically 2–6, more if the topic spans multiple libraries or specs. Default depth = quick-lookup budgets; for a BROAD topic (design research, best-practice surveys, architecture comparisons) pass `--variables {"research_depth": "deep"}` (~3× search/fetch budgets). Still prefer several narrow librarians over one giant one — deep is for questions that are inherently broad, not a substitute for fan-out. |
+  | `deep-research` | Open-ended investigation that must CHURN until solid — plans sub-questions, fans out a deep librarian per question, vets source credibility, runs a critique→re-research loop | Spawn with `--variables {"autonomy": "autonomous"}` — MANDATORY when spawned as a subagent (the supervised default blocks on a human approval gate). Raise `reflexion_budget` (e.g. "6", default 2) to let it churn longer. Expect hours, not minutes; one per investigation — its internal map is the fan-out. |
   | `coder` | Write/edit files, implement features | Graph agent: plan → approval → implement → verify build+tests → self_review → bounded fix-loop |
   | `oracle` | Architecture, complex debugging, review, plan review | Advisory, blocking — never answer the user before collecting Oracle results |
   | `step-runner` | Execute ONE step of a phased plan repo (Phase 8) | Graph agent: orient → staleness check → coder → verify → handoff → user approval gate |

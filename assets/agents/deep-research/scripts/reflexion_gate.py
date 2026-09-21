@@ -2,7 +2,8 @@
 """Reflexion gate for deep-research.
 
 Runs after `critique` has reviewed the current research findings. If the
-critique's verdict is REVISE and the reflexion budget is not spent,
+critique's verdict is REVISE and the reflexion budget (the graph's
+`reflexion_budget` variable, default 2) is not spent,
 loops back to `research` with the critique attached as
 `research_feedback`, so the retry is informed rather than a blind
 re-run. Otherwise it proceeds to `synthesize`.
@@ -26,9 +27,11 @@ import json
 import os
 import re
 
-# Automated revision passes allowed. `research` runs at most
-# MAX_REFLEXION_REVISIONS + 1 times per user pass. Bump to allow more.
-MAX_REFLEXION_REVISIONS = 2
+# Default automated revision passes when the `reflexion_budget` variable
+# is absent or malformed. `research` runs at most budget + 1 times per
+# user pass. Callers raise it via --variables {"reflexion_budget": "6"}
+# to let the run churn until the critique passes.
+DEFAULT_REFLEXION_REVISIONS = 2
 
 
 def load_state():
@@ -69,8 +72,9 @@ def main():
     critique = state.get("critique") or ""
     verdict = parse_verdict(critique)
     attempts = as_int(state.get("research_attempts"))
+    budget = as_int(state.get("reflexion_budget"), DEFAULT_REFLEXION_REVISIONS)
 
-    if verdict == "REVISE" and attempts < MAX_REFLEXION_REVISIONS:
+    if verdict == "REVISE" and attempts < budget:
         feedback = (
             "A reviewer judged the previous research pass incomplete. "
             "Address every point in the critique below:\n\n" + critique

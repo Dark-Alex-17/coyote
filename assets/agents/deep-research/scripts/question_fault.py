@@ -4,10 +4,11 @@
 Reached ONLY via research_one_question's `fallback:` route inside the
 `research_each_question` map branch (branch-local — a map branch's fallback
 must stay inside the branch subgraph). Grounded in engine behavior: on
-llm-node failure the engine writes "LLM node …failed: <chain>" into
-`finding` via the node's state_updates BEFORE routing to the fallback (on
-success the same key holds the researched findings, which never start with
-the "LLM node" prefix). This node normalizes the failure text into a
+branch failure the engine writes its failure text into `finding` via the
+node's state_updates BEFORE routing to the fallback — "Agent node failed:
+<chain>" now that the branch spawns a librarian agent, "LLM node …failed:
+<chain>" for an llm branch (on success the same key holds the researched
+findings, which never start with either prefix). This node normalizes the failure text into a
 PIPELINE-FAULT finding and the chain ends here — the map collects the fault
 as the lane's `finding`, so one dead research lane never sinks the whole
 map. combine_findings later lifts PIPELINE-FAULT findings into
@@ -53,7 +54,7 @@ def main():
     state = load_state()
     raw = state.get("finding")
     detail = raw.strip().replace("\n", " ") if isinstance(raw, str) else ""
-    if not detail.startswith("LLM node"):
+    if not detail.startswith(("LLM node", "Agent node")):
         detail = "the research lane died without recording a failure detail"
     if len(detail) > MAX_DETAIL_CHARS:
         detail = detail[: MAX_DETAIL_CHARS - 1] + "…"

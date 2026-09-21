@@ -6,7 +6,7 @@ description: |
   plan-conformance check (plus a black-box usage-pattern probe for consumer-facing surface), and
   finishes with ONE draft PR (CI checks watched to green) plus tracked follow-up tasks. Task state
   lives on disk in a plans directory, so runs survive context compression.
-version: 2.6.0
+version: 2.8.0
 agent_session: temp
 auto_continue: true
 max_auto_continues: 100
@@ -18,6 +18,7 @@ spawnable_agents:
   - oracle
   - explore
   - librarian
+  - deep-research
   - adversary
   - probe
   - review-gauntlet
@@ -180,7 +181,9 @@ instructions: |
   <label>; authoritative sources preferred; return a distilled, deduplicated checklist"), put the
   returned checklist through the same accept/drop round with the user, and write the ACCEPTED
   items into the plan — as measurable acceptance criteria on the relevant tasks where possible,
-  otherwise as a checklist under `## Quality bar → Long-tail criteria`.
+  otherwise as a checklist under `## Quality bar → Long-tail criteria`. Spawn checklist
+  librarians with `--variables {"research_depth": "deep"}` — checklist distillation is
+  broad-topic research and the default standard depth (3 searches / 8 fetches) starves it.
 
   Ground the breakdown in real code: fan out `explore` agents (load `parallel-research`) across
   {{project_dir}} — and `librarian` for unfamiliar external libraries — to confirm the design's
@@ -593,7 +596,8 @@ instructions: |
   |-------|---------|
   | `sisyphus` | Implement ONE task's code in {{project_dir}} (its own explore/coder/verify/review loop). One per task. |
   | `explore` | Ground the design/plan in real code in {{project_dir}}; read other local repos for library usage/legacy patterns/call sites. Fan out in parallel. |
-  | `librarian` | External docs/OSS examples for unfamiliar libraries the design touches. |
+  | `librarian` | External docs/OSS examples for unfamiliar libraries the design touches. Design-time/broad topics: pass `--variables {"research_depth": "deep"}` (~3× budgets); default depth is for narrow lookups. One librarian per question beats one broad librarian — deep is for inherently broad questions. |
+  | `deep-research` | Open-ended/exhaustive research that should churn until its critique loop passes (plans sub-questions, deep librarian per question, credibility vetting). Spawn with `--variables {"autonomy": "autonomous"}` — MANDATORY, the supervised default blocks on a human approval gate; raise `reflexion_budget` (default 2) for longer churn. |
   | `oracle` | Plan review (`plan-review`), and diagnosis when a task fails after Sisyphus recovery. |
   | `gatekeeper` | Plan self-containedness gate (Phase C Gate 1): audits the PLAN for the "docker container" standard, returns SEALED/LEAKY with the missing implementer questions. |
   | `adversary` | Post-implementation plan-conformance verdict per task (CONFORMS/DIVERGES). |

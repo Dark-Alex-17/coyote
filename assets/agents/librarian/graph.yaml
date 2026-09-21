@@ -6,13 +6,16 @@ description: |
   preamble. The "external grep" sibling of explore (which handles
   internal/codebase grep). Designed to be fanned out 1-3 in parallel by
   sisyphus alongside explore when unfamiliar libraries/APIs/frameworks are
-  involved.
+  involved. Supports research_depth=deep (via --variables) for broad
+  design-time topics: ~3x the search/OSS/fetch budgets of the standard
+  quick-lookup mode.
 
 version: '1.0'
 
 global_tools:
   - web_search_coyote.sh
   - fetch_url_via_curl.sh
+  - search_arxiv.sh
 
 mcp_servers:
   - ddg-search
@@ -26,11 +29,14 @@ variables:
   - name: project_dir
     description: Project directory for context (unused in MVP but reserved for future iterations).
     default: '.'
+  - name: research_depth
+    description: "standard (default) = quick targeted lookup budgets. deep = design-time research: ~3x search/OSS/fetch budgets for broad topics (best-practice checklists, architecture surveys)."
+    default: 'standard'
 
 settings:
   max_loop_iterations: 12
   log_state_snapshots: true
-  timeout: 600
+  timeout: 1800
 
 initial_state:
   language_ecosystem: 'general'
@@ -117,7 +123,7 @@ nodes:
   search:
     id: search
     type: llm
-    description: Identify 3-5 authoritative documentation sources via ddg-search.
+    description: Identify authoritative documentation sources via ddg-search (3-5 standard depth, 6-12 deep).
     skills_enabled: true
     enabled_skills:
       - ai-slop-remover
@@ -129,7 +135,10 @@ nodes:
       Priority order:
         1. Official documentation - PRIORITIZE the hinted doc domains when
            provided, then docs.X.org / readthedocs.io / MDN / vendor docs
-        2. Specifications (RFCs, W3C, ECMA, IEEE)
+        2. Specifications (RFCs, W3C, ECMA, IEEE) and academic sources -
+           the search_arxiv tool is available; use it when the topic is
+           academic/research-flavored (arXiv/DOI links count as
+           authoritative)
         3. Credible secondary references (PEPs, official blog posts) - only
            if 1-2 are sparse
 
@@ -142,14 +151,19 @@ nodes:
 
       ## Search budget and fail-fast rules
 
-      You have a HARD BUDGET of 3 search calls total. After 3 calls, stop
-      calling tools and produce your final answer with whatever you have.
+      Your budget is set by the `Research depth` line in the prompt:
+        - standard -> HARD BUDGET of 3 search calls total.
+        - deep     -> HARD BUDGET of 10 search calls total; spend the extra
+          calls covering DISTINCT subtopics of the research topic, never
+          re-running near-duplicate queries.
+      After the budget is spent, stop calling tools and produce your final
+      answer with whatever you have.
 
       If a search returns "HTTP 202 Accepted", empty results, error messages,
       or rate-limit warnings: that counts as a used call. Do not retry the
       same query - either rephrase OR give up.
 
-      If after 3 calls you have NO usable URLs, output exactly:
+      If after spending the budget you have NO usable URLs, output exactly:
 
         NO_AUTHORITATIVE_SOURCES_FOUND
         Reason: <one line>
@@ -168,9 +182,11 @@ nodes:
         URL: <full url>
         ...
 
-      Output 3-5 source blocks. No prose intro, no closing summary.
+      Output 3-5 source blocks (standard depth) or 6-12 (deep). No prose
+      intro, no closing summary.
     prompt: |
       Research topic: {{initial_prompt}}
+      Research depth: {{research_depth}}
 
       Triage hints:
         - Language/ecosystem: {{language_ecosystem}}
@@ -183,8 +199,9 @@ nodes:
       pathlib` style queries).
     tools:
       - mcp:ddg-search
+      - search_arxiv
       - web_search_coyote
-    max_iterations: 15
+    max_iterations: 30
     state_updates:
       search_output: '{{output}}'
     fallback: synthesize
@@ -193,7 +210,7 @@ nodes:
   search_oss:
     id: search_oss
     type: llm
-    description: Find 2-3 production OSS examples relevant to the topic via the personal-github MCP.
+    description: Find production OSS examples relevant to the topic via the personal-github MCP (2-3 standard depth, 4-8 deep).
     skills_enabled: true
     enabled_skills:
       - ai-slop-remover
@@ -219,8 +236,12 @@ nodes:
 
       ## Search budget and fail-fast rules
 
-      HARD BUDGET: 8 tool calls total. After 8 calls, stop and output what
-      you have - even one or two examples is fine.
+      Your budget is set by the `Research depth` line in the prompt:
+        - standard -> HARD BUDGET of 8 tool calls total; output 2-3 blocks.
+        - deep     -> HARD BUDGET of 20 tool calls total; output 4-8 blocks
+          across DIFFERENT repos/approaches, not near-duplicates.
+      After the budget is spent, stop and output what you have - even one or
+      two examples is fine.
 
       If you find no production examples, output exactly:
 
@@ -240,10 +261,12 @@ nodes:
 
         REPO: ...
 
-      Output 2-3 blocks. The URL should point to a specific file that
+      Output 2-3 blocks (standard depth) or 4-8 (deep). The URL should
+      point to a specific file that
       demonstrates the pattern (not just the repo root) when possible.
     prompt: |
       Research topic: {{initial_prompt}}
+      Research depth: {{research_depth}}
 
       Triage hints:
         - Language/ecosystem: {{language_ecosystem}}
@@ -254,7 +277,7 @@ nodes:
       Filter to {{language_ecosystem}} repositories when the API allows.
     tools:
       - mcp:personal-github
-    max_iterations: 15
+    max_iterations: 30
     state_updates:
       oss_output: '{{output}}'
     fallback: synthesize
@@ -308,8 +331,10 @@ nodes:
         5. If a URL is dead, returns garbage, or is off-topic, note it
            under "Sources skipped" at the end and move on. Do not retry.
 
-      Budget: max 8 fetches total (across both source lists). Skip
-      aggressively.
+      Fetch budget, set by the `Research depth` line in the prompt:
+        - standard -> max 8 fetches total (across both source lists).
+        - deep     -> max 25 fetches total. Depth buys MORE SOURCES, never
+          re-fetching dead or off-topic URLs - skip aggressively either way.
 
       ## Output format
 
@@ -332,6 +357,7 @@ nodes:
       No flattery, no preamble. Start with `## Findings`.
     prompt: |
       Research topic: {{initial_prompt}}
+      Research depth: {{research_depth}}
 
       Documentation sources (from doc search branch):
       {{search_output}}
@@ -340,7 +366,7 @@ nodes:
       {{oss_output}}
     tools:
       - fetch_url_via_curl
-    max_iterations: 20
+    max_iterations: 45
     state_updates:
       findings: '{{output}}'
     fallback: final_format

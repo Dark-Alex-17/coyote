@@ -13,6 +13,13 @@ this agent runs a fixed graph: every request goes through the same
 `plan -> parallel research -> vet -> critique -> synthesize -> verify -> approve`
 pipeline.
 
+Two variables tune a run (pass via `--variables`): `reflexion_budget`
+(default 2) caps the automated critique -> re-research passes — raise it
+to let the run churn until the critique passes — and
+`autonomy: autonomous` skips the final human approval gate so other
+agents can spawn this one autonomously. Each sub-question is researched
+by a spawned `librarian` running at deep budgets.
+
 This agent is also the **canonical reference for the Coyote graph
 system**: it exercises every node type (`script`, `llm`, `rag`, `map`,
 `agent`, `input`, `approval`, `end`) and both static fan-out and
