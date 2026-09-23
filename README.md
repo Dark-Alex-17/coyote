@@ -335,6 +335,28 @@ The appearance of Coyote can be modified using the following settings:
 | `user_agent`         | `null`        | The name of the `User-Agent` that should be passed in the `User-Agent` header on all requests to model providers |
 | `save_shell_history` | `true`        | Enables or disables REPL command history                                                                         |
 
+### Mesh
+The `mesh` block controls the [Coyote Mesh](https://github.com/Dark-Alex-17/coyote/wiki/Mesh), which lets Coyote
+instances discover and message each other. It is off by default, and setting `mesh.enabled: true` requires
+`function_calling_support: true`; config loading is refused otherwise. Values under `mesh` are validated only when
+`mesh.enabled` is `true`; a disabled block is inert.
+
+| Setting                           | Default Value   | Description                                                                                                                                                                  |
+|-----------------------------------|-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `mesh.enabled`                    | `false`         | Join the mesh at startup; nothing leaves the machine while this is `false`                                                                                                   |
+| `mesh.announce`                   | `true`          | Announce this node so peers can see it; `false` is outbound-only (see peers without being seen)                                                                              |
+| `mesh.display_name`               | `null`          | Opt-in plaintext label carried in the announce                                                                                                                               |
+| `mesh.display_name_on_public`     | `false`         | Also carry `display_name` when any interface is `type: public`, where presence is world-visible                                                                              |
+| `mesh.interfaces`                 | `[{type: lan}]` | Interfaces the node joins: `lan` (link-local only; takes no `host`/`port`, at most once), or `private`/`public` with `host` and `port` for a relay. No auto-detection, no fallback |
+| `mesh.brief`                      | `auto`          | `auto` (status card + session digest + user brief), `manual` (card + user brief; no digest, so no model spend), or `off` (status card only)                                  |
+| `mesh.digest_prompt`              | `null`          | Prompt used to build the shareable session digest; `null` uses the built-in default                                                                                          |
+| `mesh.brief_model`                | `null`          | Model used to build the digest; `null` uses the session's current model                                                                                                      |
+| `mesh.envoy_model`                | `null`          | Model the envoy answers peers with; `null` uses the session's current model                                                                                                  |
+| `mesh.knock_retention_hours`      | `24`            | How long unanswered knocks from known identities are kept; must be `1` or more                                                                                               |
+| `mesh.peer_max_concurrent`        | `1`             | Envoy invocations allowed at once per peer identity; must be `1` or more                                                                                                     |
+| `mesh.peer_max_messages_per_hour` | `60`            | Peer messages accepted per identity per hour; must be `1` or more. Further messages are refused with an explicit error to the peer, never silently dropped                   |
+| `mesh.peer_max_tokens_per_hour`   | `100000`        | Model tokens one peer identity may cost per hour; must be `1` or more. Further messages are refused with an explicit error to the peer, never silently dropped               |
+
 ---
 
 ## History

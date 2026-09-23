@@ -242,6 +242,34 @@ document_loaders: {}
                                  #     docx: 'pandoc --to plain $1' # https://pandoc.org
                                  #     jina: 'curl -fsSL https://r.jina.ai/$1 -H "Authorization: Bearer {{JINA_API_KEY}}"' # Requires a Jina API key in the Coyote vault
 
+# ---- Mesh ----
+# Coyote Mesh lets Coyote instances discover and message each other over Reticulum/LXMF.
+# Off by default: with enabled: false nothing initialises, no socket opens and no identity is minted.
+# Values under mesh are validated only when enabled: true; a disabled block is inert.
+# Mesh needs function calling on both sides; enabled: true with function_calling_support: false is refused at load.
+# See the [Mesh documentation](https://github.com/Dark-Alex-17/coyote/wiki/Mesh) for more information
+mesh:
+  enabled: false                 # Join the mesh at startup (default: false). Nothing leaves the machine while this is false
+  announce: true                 # Announce this node so peers can see it (default: true); false = outbound-only, see peers without being seen
+  display_name: null             # Opt-in plaintext label carried in the announce (default: null = nothing but the protocol version is announced)
+  display_name_on_public: false  # Also carry display_name when any interface is type public (default: false; public presence is world-visible)
+  interfaces:                    # Interfaces the node joins. Exactly what is listed here and nothing else; there is no auto-detection and no fallback between types (default: a single lan entry)
+    - type: lan                  # lan = link-local only (Reticulum AutoInterface). Does not cross sbx, WireGuard, Tailscale or OpenVPN; only one process per host can bind it
+    # - type: private            # private = TCP client to a relay your team runs; requires host + port
+    #   host: relay.example.com
+    #   port: 4242
+    # - type: public             # public = same wire shape as private, but the relay is a community node so your presence is world-visible; requires host + port
+    #   host: node.example.com
+    #   port: 4242
+  brief: auto                    # What the envoy serves to trusted peers (default: auto): auto = status card + session digest + user brief; manual = card + user brief only, no model spend; off = card only
+  digest_prompt: null            # Prompt used to build the shareable session digest. If null, uses built-in default
+  brief_model: null              # Model used to build the digest (e.g. 'openai:gpt-4o-mini') (default: null = the session's current model)
+  envoy_model: null              # Model the envoy answers peers with (default: null = the session's current model)
+  knock_retention_hours: 24      # How long unanswered knocks from known identities are kept (default: 24; must be 1 or more)
+  peer_max_concurrent: 1         # Envoy invocations allowed at once per peer identity (default: 1; must be 1 or more)
+  peer_max_messages_per_hour: 60 # Peer messages accepted per identity per hour; further messages are refused with an explicit error to the peer, never silently dropped (default: 60; must be 1 or more)
+  peer_max_tokens_per_hour: 100000 # Model tokens one peer identity may cost per hour; further messages are refused with an explicit error to the peer, never silently dropped (default: 100000; must be 1 or more)
+
 # ---- Appearance ----
 highlight: true                  # Controls syntax highlighting
 raw_markdown: false              # When true, render markdown as raw text with syntax highlighting only. When false (default), transforms markdown syntax (headings, bold, lists, etc.) into styled terminal output

@@ -1,5 +1,6 @@
 use super::bundles::installed_bundle_names;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
+use super::mesh_config::render_mesh_info;
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{INTERRUPTED_RESPONSE_TEXT, Session};
 use super::skill::{SKILL_SCAFFOLD, Skill};
@@ -2245,11 +2246,13 @@ impl RequestContext {
         if let Ok((_, Some(log_path))) = paths::log_config() {
             items.push(("log_path", display_path(&log_path)));
         }
-        let output = items
+        let mut output = items
             .iter()
             .map(|(name, value)| format!("{name:<30}{value}\n"))
             .collect::<Vec<String>>()
             .join("");
+        output.push_str("mesh:\n");
+        output.push_str(&render_mesh_info(&app.mesh));
         Ok(output)
     }
 
@@ -5804,6 +5807,25 @@ mod tests {
 
     fn create_test_ctx() -> RequestContext {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
+    }
+
+    #[test]
+    fn sysinfo_appends_mesh_section_after_the_flat_rows() {
+        let ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let info = ctx.sysinfo(&app).unwrap();
+
+        let (flat, mesh) = info.split_once("\nmesh:\n").expect("mesh: header present");
+        assert!(flat.contains("function_calling_support"), "{flat}");
+        assert!(
+            mesh.starts_with("  enabled                     false\n"),
+            "{mesh}"
+        );
+        assert!(
+            mesh.contains("  interfaces[0]               lan\n"),
+            "{mesh}"
+        );
     }
 
     fn priced_model() -> Model {

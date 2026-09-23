@@ -12,6 +12,7 @@ mod macros;
 mod mcp_factory;
 mod mcp_tool_policy;
 pub(crate) mod memory;
+pub(crate) mod mesh_config;
 pub(crate) mod paths;
 pub(crate) mod prompts;
 mod rag_cache;
@@ -50,6 +51,7 @@ pub use self::macro_policy::{
 pub(crate) use self::mcp_tool_policy::expand_mcp_server_alias;
 #[cfg(test)]
 pub(crate) use self::mcp_tool_policy::{LayerSource, ToolFilter};
+pub use self::mesh_config::MeshConfig;
 #[allow(unused_imports)]
 pub use self::request_context::{
     RenderMode, RequestContext, effective_max_concurrent_jobs, jobs_enabled,
@@ -271,6 +273,9 @@ pub struct Config {
     #[serde(default)]
     pub hooks: HooksMap,
 
+    #[serde(default)]
+    pub mesh: MeshConfig,
+
     pub auto_continue: bool,
     pub max_auto_continues: usize,
     pub inject_todo_instructions: bool,
@@ -361,6 +366,8 @@ impl Default for Config {
             mcp_tools: None,
 
             hooks: Default::default(),
+
+            mesh: Default::default(),
 
             auto_continue: false,
             max_auto_continues: 10,
@@ -1478,6 +1485,62 @@ clients:
         // `global_hooks` is a per-agent whitelist; the global template must never grow it.
         assert!(CONFIG_TEMPLATE.contains("\nhooks:"));
         assert!(!CONFIG_TEMPLATE.contains("global_hooks"));
+    }
+
+    const CONFIG_EXAMPLE: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.yaml"));
+
+    fn mesh_keys_of(yaml: &str) -> HashSet<String> {
+        let root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        root["mesh"]
+            .as_mapping()
+            .expect("mesh: must be a nested mapping")
+            .keys()
+            .map(|k| k.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn config_template_and_example_document_every_mesh_key() {
+        let clients = json!([{ "type": "openai", "api_key": "sk-test" }]);
+        let rendered = render_config_template("openai:gpt-4o", None, &clients).unwrap();
+
+        let serialized = serde_yaml::to_value(MeshConfig::default()).unwrap();
+        let struct_keys: HashSet<String> = serialized
+            .as_mapping()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str().unwrap().to_string())
+            .collect();
+        assert!(!struct_keys.is_empty());
+
+        let template_keys = mesh_keys_of(&rendered);
+        let example_keys = mesh_keys_of(CONFIG_EXAMPLE);
+        for (file, keys) in [
+            ("config-template.yaml", &template_keys),
+            ("config.example.yaml", &example_keys),
+        ] {
+            let missing: Vec<_> = struct_keys.difference(keys).collect();
+            assert!(missing.is_empty(), "{file} lacks mesh keys {missing:?}");
+            let stale: Vec<_> = keys.difference(&struct_keys).collect();
+            assert!(
+                stale.is_empty(),
+                "{file} carries unknown mesh keys {stale:?}"
+            );
+        }
+
+        let cfg = Config::load_from_str(&rendered).unwrap();
+        assert_eq!(cfg.mesh, MeshConfig::default());
+    }
+
+    #[test]
+    fn config_example_loads_with_the_config_loader() {
+        let example = Config::load_from_str(CONFIG_EXAMPLE).unwrap();
+        assert!(!example.mesh.enabled);
+        assert_eq!(
+            example.mesh.interfaces,
+            vec![mesh_config::MeshInterface::Lan]
+        );
     }
 
     #[test]
