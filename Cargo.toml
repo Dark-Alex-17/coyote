@@ -118,18 +118,23 @@ self_update = { version = "0.44", default-features = false, features = [
 qrcode = "0.14"
 
 # Reticulum transport and LXMF wire format, pinned to an exact revision because the
-# published 0.11.0 predates APIs this depends on. This git pin is development-only:
-# it must be replaced by a crates.io version pin before merge, per the dependency
-# policy in CONTRIBUTING.md.
+# published 0.11.0 is fourteen commits behind it and does not contain `lxmf_core::stamp`.
+# Whoever retires this pin can check a candidate release with that one module. The git
+# pin is development-only: it must be replaced by a crates.io version pin before merge,
+# per the dependency policy in CONTRIBUTING.md.
 #
 # Default features are kept deliberately. `reticulum-rs-transport`'s default `storage`
 # feature gates the SQLite-backed message and announce store that the store-and-forward
-# work needs. The cost is that it pulls rusqlite with a bundled SQLite, so a second C
-# library is compiled on every platform.
+# work needs. The cost is that it pulls rusqlite with a bundled SQLite, so the SQLite C
+# amalgamation is compiled on every platform. `bzip2-sys` adds a second, smaller C
+# compile regardless of this feature, being non-optional upstream. Neither is a new
+# prerequisite: `duckdb` above already requires a C toolchain everywhere.
 #
-# `lxmf-wire` (crate lib name `lxmf_core`) pulls `reticulum-rs-core` transitively, so
-# that crate needs no entry of its own. The `reticulum-rs` umbrella is deliberately not
-# used: it hides transport behind a feature and adds surface that goes unused.
+# `lxmf-wire` (lib name `lxmf_core`) pulls `reticulum-rs-core` transitively, so that
+# crate needs no entry of its own; `reticulum-rs-transport`'s lib name is
+# `rns_transport`. The `reticulum-rs` umbrella is deliberately not used: it re-exports
+# these two behind its own feature flags and carries an rpc surface that goes unused,
+# so depending on them directly is the more precise statement of what is needed.
 reticulum-rs-transport = { git = "https://github.com/FreeTAKTeam/LXMF-rs", rev = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe" }
 lxmf-wire = { git = "https://github.com/FreeTAKTeam/LXMF-rs", rev = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe" }
 
@@ -158,10 +163,14 @@ arboard = { version = "3.3.0", default-features = false }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Raw Win32 bindings for locking down the on-disk identity key. Only the ACL, file and
-# process-liveness surface is enabled. `ConvertStringSecurityDescriptorToSecurityDescriptorW`
-# comes from `Win32_Security_Authorization`, and the `LocalFree`/`HLOCAL` pair that releases
-# its security descriptor comes from `Win32_Foundation`, so no allocator feature is needed.
+# Raw Win32 bindings for locking down the on-disk identity key. Each feature below is
+# carried for one piece of that job, named here so the list can be checked without
+# guessing: `Win32_Security_Authorization` for
+# `ConvertStringSecurityDescriptorToSecurityDescriptorW`, `Win32_Foundation` for the
+# `LocalFree`/`HLOCAL` pair that releases the security descriptor it returns,
+# `Win32_Security` for the `ACL` type, `Win32_Storage_FileSystem` for `CreateFileW`, and
+# `Win32_System_Threading` for `OpenProcess` pid-liveness. No allocator feature is
+# needed, `LocalFree` not being one of the `Local*` calls in `Win32_System_Memory`.
 #
 # The higher-level `windows` crate is not used: the surface here is a handful of FFI
 # calls that need `unsafe` either way, so its wrapper types and COM machinery would cost

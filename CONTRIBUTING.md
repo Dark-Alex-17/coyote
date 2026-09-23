@@ -80,30 +80,42 @@ act -W .github/workflows/release.yml --input_type bump=minor
 
 ### No git dependencies at merge
 
-A branch may carry a `git = ` dependency while it is in development, and only when it is pinned to
-an exact `rev` (never a branch or a tag). **No branch may be merged to `main` while `Cargo.toml`
-contains one.** Before merging, this must return nothing:
+A branch may carry a git dependency while it is in development, and only when it is pinned to an
+exact `rev` (never a branch or a tag). **No branch may be merged to `main` while the resolved
+dependency graph contains a git source.** Before merging, this must return nothing:
 
 ```shell
 cargo metadata --format-version 1 | grep '"source":"git+'
 ```
 
 A literal `grep` over `Cargo.toml` is not good enough: it is sensitive to whitespace and quoting,
-and it misses git sources that arrive through `[patch]` or a `.cargo/config.toml` source
-replacement. The reason the rule is absolute is that `cargo publish` rejects a dependency that has
-a `git` key and no `version` key, and the release workflow publishes to crates.io.
+and it sees only the root manifest, missing git sources injected by `[patch]`. The reason the rule
+is absolute is that `cargo publish` rejects a dependency that has a `git` key and no `version`
+key, and the release workflow publishes to crates.io.
 
-Remove the rest of this subsection together with the pins it describes. The in-flight mesh work
+### Outstanding licence obligations
+
+Coyote must not ship a release while an obligation recorded in [NOTICE](./NOTICE) is unmet. There
+is one such obligation today: the mesh dependencies are used under a GPL-2.0-or-later grant, and
+a copy of that licence text is not yet in this repository. Add it, or drop the dependencies,
+before cutting a release that contains them.
+
+### The in-flight mesh pins
+
+Everything in this subsection goes when the pins it describes go. The mesh work
 carries two: `reticulum-rs-transport` and `lxmf-wire`, both at
 LXMF-rs rev `3ed5932da4420e2dd1b9d36283b0e72a364e3ebe`. The published 0.11.0 of those crates is
-fourteen commits behind that revision and is missing APIs the mesh work is built on, so the
-registry release cannot be used yet. The pins are therefore interim: the final state is a
-crates.io version pin, swapped in once upstream cuts a release containing that revision. That swap
-is tracked as TASK-063 in the mesh plan and is a hard merge gate for the mesh pull request.
+fourteen commits behind that revision and does not contain `lxmf_core::stamp`, which the mesh work
+is built on, so the registry release cannot be used yet. The pins are therefore interim: the final
+state is a crates.io version pin, swapped in once upstream cuts a release containing that
+revision, and that swap is a hard merge gate for the mesh pull request. It is tracked as TASK-063
+for anyone working from the mesh plan.
 
-### Build and test cost
+### Build and test cost of the mesh pins
 
-Reference figures, measured 2026-09-23 on Linux aarch64 with 18 cores, debug profile, populated
+A point-in-time record for the dependency change described above, not a standing benchmark. Fill
+the Windows row from the first CI run that includes these dependencies, then leave the table as
+history. Figures measured 2026-09-23 on Linux aarch64 with 18 cores, debug profile, populated
 `target/`. Treat them as an order of magnitude, not a budget: CI runners have far fewer cores, so
 expect several times these numbers there.
 
@@ -119,8 +131,9 @@ The suite itself does not get slower; the cost is compile time and binary size.
 
 `reticulum-rs-transport` keeps its default `storage` feature, which brings `rusqlite` with a
 bundled SQLite in, so the SQLite C amalgamation is now compiled on every platform rather than none.
-`bzip2-sys` adds a second, much smaller C compile. A C toolchain was already required everywhere
-for `duckdb`'s bundled build, so this adds compile time and binary size but no new prerequisite.
+`bzip2-sys` adds a second, much smaller C compile, and does so regardless of that feature. A C
+toolchain was already required everywhere for `duckdb`'s bundled build, so this adds compile time
+and binary size but no new prerequisite.
 
 The Windows figure is the one that matters most, because Windows is where the C compile is
 slowest and where nothing previously exercised `rusqlite`. It cannot be measured outside CI from a

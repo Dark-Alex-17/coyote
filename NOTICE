@@ -64,6 +64,23 @@ Julian R Seward", distributed under a BSD-style license that requires
 redistributions to retain its copyright notice and conditions; that notice
 travels with the bundled source in the `bzip2-sys` crate.
 
+The `dalek` elliptic-curve crates, including `x25519-dalek` which arrives with
+these dependencies, are distributed under the BSD 3-Clause License, Copyright
+(c) 2017-2021 isis agora lovecruft and Copyright (c) 2019-2021 DebugSteven.
+That license requires binary redistributions to reproduce those notices, this
+list of conditions and the disclaimer in the accompanying materials, which is
+what this file is for.
+
+`reticulum-rs-transport` depends on `tokio-serial` unconditionally, which
+brings in `mio-serial` (MIT) and `serialport`. `serialport` is distributed
+under the Mozilla Public License 2.0. It is used unmodified, and MPL-2.0
+section 3.3 permits distributing the larger work under Coyote's own terms;
+the obligation MPL-2.0 section 3.2 attaches is that recipients of a binary be
+told how to obtain the source of the covered files, which are published
+unmodified at https://github.com/serialport/serialport-rs. The same
+obligation already applies to `colored`, a direct dependency under the same
+license.
+
 --------------------------------------------------------------------------------
 Windows platform bindings
 --------------------------------------------------------------------------------

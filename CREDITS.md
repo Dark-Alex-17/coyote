@@ -55,12 +55,16 @@ LXMF-rs is dual-licensed `EPL-2.0 OR GPL-2.0-or-later`, with the Secondary
 Licenses Notice offering GPL-2.0-or-later written into its LICENSE file.
 Coyote relies on the GPL-2.0-or-later arm, the only arm compatible with
 AGPL-3.0-only. Two obligations follow for Coyote: shipping a copy of the GPL
-text, and settling the licence expression for the combined work, neither of
+text, and settling the license expression for the combined work, neither of
 which is done yet. [NOTICE](./NOTICE) records both.
 
-Enabling `reticulum-rs-transport` brings `rusqlite` with a bundled SQLite
-amalgamation (MIT; SQLite itself is public domain) and `bzip2`/`bzip2-sys`
-with a bundled libbzip2 (MIT here; libbzip2 is BSD-style) in transitively.
+`reticulum-rs-transport` brings a few third parties in transitively. Its
+default `storage` feature pulls in `rusqlite` with a bundled SQLite
+amalgamation (MIT; SQLite itself is public domain). Independently of any
+feature it pulls in `bzip2`/`bzip2-sys` with a bundled libbzip2 (MIT here;
+libbzip2 is BSD-style), `x25519-dalek` (BSD 3-Clause), and `tokio-serial`,
+which brings `serialport` (MPL-2.0). [NOTICE](./NOTICE) carries the notices
+and the obligations each of those attaches.
 
 ## windows-sys
 
@@ -77,6 +81,7 @@ derived from AIChat remain under the MIT License (Copyright (c) sigoden),
 preserved in [LICENSE-MIT](./LICENSE-MIT). See [NOTICE](./NOTICE) for the
 combined-licensing summary.
 
-The LXMF-rs dependencies add GPL-2.0-or-later code to that mix. The licence
-expression for the resulting combined work has not been settled and the
-`license` field in `Cargo.toml` has not been changed; see [NOTICE](./NOTICE).
+The LXMF-rs dependencies add GPL-2.0-or-later code to that mix. The license
+expression for the resulting combined work has not been settled, and neither
+the `license` field in `Cargo.toml` nor the summary in `README.md` has been
+changed; see [NOTICE](./NOTICE).
