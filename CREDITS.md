@@ -54,17 +54,19 @@ Qvist ([markqvist/Reticulum](https://github.com/markqvist/Reticulum),
 LXMF-rs is dual-licensed `EPL-2.0 OR GPL-2.0-or-later`, with the Secondary
 Licenses Notice offering GPL-2.0-or-later written into its LICENSE file.
 Coyote relies on the GPL-2.0-or-later arm, the only arm compatible with
-AGPL-3.0-only. Two obligations follow for Coyote: shipping a copy of the GPL
-text, and settling the license expression for the combined work, neither of
-which is done yet. [NOTICE](./NOTICE) records both.
+AGPL-3.0-only. Two obligations follow for Coyote, neither of which is done
+yet: shipping a copy of the GPL text, which blocks a release, and settling
+the license expression for the combined work, which is tracked separately.
+[NOTICE](./NOTICE) records both.
 
 `reticulum-rs-transport` brings a few third parties in transitively. Its
 default `storage` feature pulls in `rusqlite` with a bundled SQLite
 amalgamation (MIT; SQLite itself is public domain). Independently of any
-feature it pulls in `bzip2`/`bzip2-sys` with a bundled libbzip2 (MIT here;
-libbzip2 is BSD-style), `x25519-dalek` (BSD 3-Clause), and `tokio-serial`,
-which brings `serialport` (MPL-2.0). [NOTICE](./NOTICE) carries the notices
-and the obligations each of those attaches.
+feature it pulls in `bzip2`/`bzip2-sys`, which ships libbzip2 and compiles it
+where no system copy is found (MIT here; libbzip2 is BSD-style),
+`x25519-dalek` (BSD 3-Clause), and `tokio-serial`, which brings `serialport`
+(MPL-2.0). [NOTICE](./NOTICE) carries the copyright notices and says what
+each of those obligations is and how far it is discharged.
 
 ## windows-sys
 

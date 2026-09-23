@@ -118,23 +118,28 @@ self_update = { version = "0.44", default-features = false, features = [
 qrcode = "0.14"
 
 # Reticulum transport and LXMF wire format, pinned to an exact revision because the
-# published 0.11.0 is fourteen commits behind it and does not contain `lxmf_core::stamp`.
-# Whoever retires this pin can check a candidate release with that one module. The git
-# pin is development-only: it must be replaced by a crates.io version pin before merge,
-# per the dependency policy in CONTRIBUTING.md.
+# published 0.11.0 is fourteen commits behind it and lacks `lxmf_core::stamp::delivery`
+# (`generate_stamp`, `validate_stamp`, `ticket_stamp`). Note that the pinned revision
+# also calls itself 0.11.0, so retiring this pin needs a release strictly newer than
+# that, carrying that submodule. The git pin is development-only: it must be replaced
+# by a crates.io version pin before merge, per the dependency policy in CONTRIBUTING.md.
 #
-# Default features are kept deliberately. `reticulum-rs-transport`'s default `storage`
-# feature gates the SQLite-backed message and announce store that the store-and-forward
-# work needs. The cost is that it pulls rusqlite with a bundled SQLite, so the SQLite C
-# amalgamation is compiled on every platform. `bzip2-sys` adds a second, smaller C
-# compile regardless of this feature, being non-optional upstream. Neither is a new
-# prerequisite: `duckdb` above already requires a C toolchain everywhere.
+# Both entries are unconditional on purpose. Nothing consumes them yet, so keeping them
+# off a feature flag is what makes every CI leg compile and test them.
+#
+# Default features are kept deliberately too. `reticulum-rs-transport`'s default
+# `storage` feature gates the SQLite-backed message and announce store that the
+# store-and-forward work needs. The cost is that it pulls rusqlite with a bundled
+# SQLite, whose C amalgamation is compiled on every platform. `bzip2-sys` comes in
+# regardless of that feature and compiles a second, much smaller C library on Windows
+# and anywhere pkg-config finds no system libbz2. Neither is a new prerequisite:
+# `duckdb` above already requires a C toolchain everywhere.
 #
 # `lxmf-wire` (lib name `lxmf_core`) pulls `reticulum-rs-core` transitively, so that
 # crate needs no entry of its own; `reticulum-rs-transport`'s lib name is
-# `rns_transport`. The `reticulum-rs` umbrella is deliberately not used: it re-exports
-# these two behind its own feature flags and carries an rpc surface that goes unused,
-# so depending on them directly is the more precise statement of what is needed.
+# `rns_transport`. The `reticulum-rs` umbrella is deliberately not used: it covers only
+# the `rns-*` crates and not `lxmf-wire`, so it cannot replace both entries, and
+# depending on the two directly keeps one mechanism instead of two.
 reticulum-rs-transport = { git = "https://github.com/FreeTAKTeam/LXMF-rs", rev = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe" }
 lxmf-wire = { git = "https://github.com/FreeTAKTeam/LXMF-rs", rev = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe" }
 

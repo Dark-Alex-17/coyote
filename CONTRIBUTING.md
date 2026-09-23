@@ -88,34 +88,42 @@ dependency graph contains a git source.** Before merging, this must return nothi
 cargo metadata --format-version 1 | grep '"source":"git+'
 ```
 
-A literal `grep` over `Cargo.toml` is not good enough: it is sensitive to whitespace and quoting,
-and it sees only the root manifest, missing git sources injected by `[patch]`. The reason the rule
-is absolute is that `cargo publish` rejects a dependency that has a `git` key and no `version`
-key, and the release workflow publishes to crates.io.
+A literal `grep` over `Cargo.toml` is not good enough. It is sensitive to whitespace and quoting,
+and it sees only the root manifest: a git source reached through a dependency's own manifest, or
+a `[patch]` declared in `.cargo/config.toml`, never appears there. The gate is on the resolved
+graph rather than on `cargo publish` succeeding because the two are not the same test: `cargo
+publish` rejects a dependency with a `git` key and no `version` key, but one carrying both
+publishes happily and then resolves against the registry, which is the silent-downgrade case.
 
-### Outstanding licence obligations
+### Outstanding license obligations
 
-Coyote must not ship a release while an obligation recorded in [NOTICE](./NOTICE) is unmet. There
-is one such obligation today: the mesh dependencies are used under a GPL-2.0-or-later grant, and
-a copy of that licence text is not yet in this repository. Add it, or drop the dependencies,
-before cutting a release that contains them.
+Coyote must not ship a release while a release-blocking obligation recorded in
+[NOTICE](./NOTICE) is unmet. NOTICE records two obligations today, of which one is
+release-blocking: the mesh dependencies are used under a GPL-2.0-or-later grant and a copy of
+that license text is not yet in this repository. Add it, or drop the dependencies, before cutting
+a release that contains them. The second, settling the license expression for the combined work,
+is the license owner's call and is tracked separately.
 
 ### The in-flight mesh pins
 
 Everything in this subsection goes when the pins it describes go. The mesh work
 carries two: `reticulum-rs-transport` and `lxmf-wire`, both at
 LXMF-rs rev `3ed5932da4420e2dd1b9d36283b0e72a364e3ebe`. The published 0.11.0 of those crates is
-fourteen commits behind that revision and does not contain `lxmf_core::stamp`, which the mesh work
-is built on, so the registry release cannot be used yet. The pins are therefore interim: the final
-state is a crates.io version pin, swapped in once upstream cuts a release containing that
-revision, and that swap is a hard merge gate for the mesh pull request. It is tracked as TASK-063
-for anyone working from the mesh plan.
+fourteen commits behind that revision and lacks `lxmf_core::stamp::delivery`
+(`generate_stamp`, `validate_stamp`, `ticket_stamp`), which the mesh work is built on, so the
+registry release cannot be used yet. Note that the pinned revision also calls itself 0.11.0, so
+the replacement must be a release strictly newer than 0.11.0 that carries that submodule: pinning
+`version = "0.11.0"` would satisfy the gate above while silently reverting to the release this
+paragraph rejects. The pins are therefore interim, the final state is a crates.io version pin,
+and that swap is a hard merge gate for the mesh pull request. It is tracked internally as
+TASK-063 in the mesh plan.
 
 ### Build and test cost of the mesh pins
 
-A point-in-time record for the dependency change described above, not a standing benchmark. Fill
-the Windows row from the first CI run that includes these dependencies, then leave the table as
-history. Figures measured 2026-09-23 on Linux aarch64 with 18 cores, debug profile, populated
+A point-in-time record for the LXMF-rs and windows-sys dependency addition of 2026-09, not a
+standing benchmark. Fill the Windows row from the first CI run that includes those dependencies,
+then leave the table as history; if it is still empty when the pins are retired, delete the row.
+Figures measured 2026-09-23 on Linux aarch64 with 18 cores, debug profile, populated
 `target/`. Treat them as an order of magnitude, not a budget: CI runners have far fewer cores, so
 expect several times these numbers there.
 
@@ -123,17 +131,18 @@ expect several times these numbers there.
 | --- | --- | --- |
 | `cargo test --all`, test execution only, nothing to compile | 12.9s | 13.0s |
 | `cargo test --all` including the recompile the change forces | 64s | 77s |
-| Clean rebuild of the 24 dependency crates the change adds | not measured | 8s |
-| Of which the bundled SQLite C amalgamation | not measured | 2s |
+| Clean rebuild of the 24 dependency crates the change adds | n/a | 8s |
+| Of which the bundled SQLite C amalgamation | n/a | 2s |
 | `windows-latest` CI leg, total job duration | not measured | TBD, fill from the first CI run |
 
 The suite itself does not get slower; the cost is compile time and binary size.
 
 `reticulum-rs-transport` keeps its default `storage` feature, which brings `rusqlite` with a
 bundled SQLite in, so the SQLite C amalgamation is now compiled on every platform rather than none.
-`bzip2-sys` adds a second, much smaller C compile, and does so regardless of that feature. A C
-toolchain was already required everywhere for `duckdb`'s bundled build, so this adds compile time
-and binary size but no new prerequisite.
+`bzip2-sys` comes in regardless of that feature and adds a second, much smaller C compile on
+Windows and anywhere pkg-config finds no system libbz2. A C toolchain was already required
+everywhere for `duckdb`'s bundled build, so this adds compile time and binary size but no new
+prerequisite.
 
 The Windows figure is the one that matters most, because Windows is where the C compile is
 slowest and where nothing previously exercised `rusqlite`. It cannot be measured outside CI from a
