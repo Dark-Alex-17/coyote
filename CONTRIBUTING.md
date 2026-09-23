@@ -82,15 +82,16 @@ act -W .github/workflows/release.yml --input_type bump=minor
 
 A branch may carry a git dependency while it is in development, and only when it is pinned to an
 exact `rev` (never a branch or a tag). **No branch may be merged to `main` while the resolved
-dependency graph contains a git source.** Before merging, this must return nothing:
+dependency graph contains a git source.** Before merging, this must succeed (POSIX shell):
 
 ```shell
-cargo metadata --format-version 1 --locked > /tmp/meta.json && ! grep -q '"source":"git+' /tmp/meta.json
+meta=$(cargo metadata --format-version 1 --locked) && ! printf '%s' "$meta" | grep -q '"source":"git+'
 ```
 
-Check the exit status, not just the output: written as a bare pipe into `grep`, the gate also
-prints nothing when `cargo metadata` itself fails, and an unresolvable git dependency is exactly
-what makes it fail. `--locked` keeps the gate from rewriting the lockfile it is auditing.
+The gate is judged by exit status, never by output. Written as a bare pipe into `grep` it would
+print nothing both when the graph is clean and when `cargo metadata` fails, and an unresolvable
+git dependency is exactly what makes it fail. `--locked` keeps the gate from rewriting the
+lockfile it is auditing.
 
 A literal `grep` over `Cargo.toml` is not good enough. It is sensitive to whitespace and quoting,
 and it sees only the root manifest: a git source reached through a dependency's own manifest, or
@@ -110,22 +111,20 @@ expression for the combined work, is the license owner's call and is tracked sep
 
 ### The in-flight mesh pins
 
-Everything in this subsection goes when the pins it describes go. The mesh work
-carries two: `reticulum-rs-transport` and `lxmf-wire`, both at
-LXMF-rs rev `3ed5932da4420e2dd1b9d36283b0e72a364e3ebe`. The published 0.11.0 of those crates is
-fourteen commits behind that revision and lacks the delivery-stamp calls re-exported at
+Everything in this subsection goes when the pins it describes go. The mesh work carries two:
+`reticulum-rs-transport` and `lxmf-wire`, both at LXMF-rs rev
+`3ed5932da4420e2dd1b9d36283b0e72a364e3ebe`. The published 0.11.0 of those crates is fourteen
+commits behind that revision and lacks the delivery-stamp calls re-exported at
 `lxmf_core::stamp` (`generate_stamp`, `validate_stamp`, `ticket_stamp`), which the mesh work is
 built on; it carries only the propagation-stamp half. Note that the pinned revision also calls
-itself 0.11.0, so the replacement must be a release strictly newer than 0.11.0 that carries
-those calls: pinning
-`version = "0.11.0"` would satisfy the gate above while silently reverting to the release this
-paragraph rejects. Both crates have to move together, too: they share `reticulum-rs-core`, and a
-registry crate alongside a git one duplicates it. The pins are therefore interim, the final state
-is a crates.io version pin,
-and that swap is a hard merge gate for the mesh pull request. It is tracked internally as
-TASK-063 in the mesh plan.
+itself 0.11.0, so the replacement must be a release strictly newer than 0.11.0 that carries those
+calls: pinning `version = "0.11.0"` would satisfy the gate above while silently reverting to the
+release this paragraph rejects. Both crates have to move together, too: they share
+`reticulum-rs-core`, and a registry crate alongside a git one duplicates it. The pins are
+therefore interim, the final state is a crates.io version pin, and that swap is a hard merge gate
+for the mesh pull request. It is tracked internally as TASK-063 in the mesh plan.
 
-### Build and test cost of the mesh pins
+### Dependency build-cost records
 
 A point-in-time record for the LXMF-rs and windows-sys dependency addition of 2026-09, not a
 standing benchmark. Fill the Windows row from the first CI run that includes those dependencies,

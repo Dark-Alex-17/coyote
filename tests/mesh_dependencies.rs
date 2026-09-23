@@ -91,14 +91,10 @@ fn read_tracked(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{name} is readable"))
 }
 
-/// `CONTRIBUTING.md` is in the manifest's `exclude` list while `tests/` is not, so
-/// it is absent when the suite runs from a packaged `.crate` rather than the repo.
-/// The assertions that read it are skipped there rather than failing on packaging.
-fn read_guide() -> Option<String> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("CONTRIBUTING.md");
-    std::fs::read_to_string(&path)
-        .ok()
-        .map(|text| squash(&text))
+/// Reads a tracked document with its hand-wrapping normalised away, since every
+/// assertion below is about what the prose says, not how it is laid out.
+fn read_prose(name: &str) -> String {
+    squash(&read_tracked(name))
 }
 
 /// Returns the body of `[section]`, up to the next section header.
@@ -310,21 +306,20 @@ fn the_git_pin_is_recorded_as_interim() {
         "the manifest must record that the git pin cannot survive a merge"
     );
 
-    let gate = "cargo metadata --format-version 1 --locked > /tmp/meta.json \
-                && ! grep -q '\"source\":\"git+' /tmp/meta.json";
-    let template = squash(&read_tracked(
+    let gate = squash(
+        "meta=$(cargo metadata --format-version 1 --locked) \
+         && ! printf '%s' \"$meta\" | grep -q '\"source\":\"git+'",
+    );
+    for document in [
+        "CONTRIBUTING.md",
         ".github/PULL_REQUEST_TEMPLATE/pull_request_template.md",
-    ));
-    assert!(
-        template.contains(&squash(gate)),
-        "the pull-request checklist must quote the no-git-sources gate verbatim"
-    );
-
-    let Some(guide) = read_guide() else { return };
-    assert!(
-        guide.contains(&squash(gate)),
-        "the contributor guide must carry the same gate the checklist quotes"
-    );
+    ] {
+        assert!(
+            read_prose(document).contains(&gate),
+            "{document} must quote the no-git-sources gate verbatim; the checklist a \
+             contributor ticks and the guide that explains it cannot drift apart"
+        );
+    }
 }
 
 /// Two maintained crates were passed over for raw bindings, and the reason is a
@@ -361,7 +356,7 @@ fn the_passed_over_win32_crates_stay_recorded() {
 /// row explicitly outstanding, so the gap stays visible instead of reading as zero.
 #[test]
 fn the_dependency_cost_record_is_tracked_and_names_the_windows_gap() {
-    let Some(guide) = read_guide() else { return };
+    let guide = read_prose("CONTRIBUTING.md");
 
     assert!(
         guide.contains("cargo test --all`, test execution only"),
@@ -384,28 +379,41 @@ fn the_dependency_cost_record_is_tracked_and_names_the_windows_gap() {
 /// is how the three drifted apart before.
 #[test]
 fn the_release_gate_names_every_obligation_notice_records() {
-    let notice = read_tracked("NOTICE");
+    let notice = read_prose("NOTICE");
     assert!(
         notice.contains("EPL-2.0 OR GPL-2.0-or-later"),
         "NOTICE must record the dual license the mesh crates actually ship under"
     );
+    // The spelled-out count, the bullets it counts and the single blocking marker all
+    // have to move together, or the three documents drift the way they did before.
     assert!(
-        squash(&notice).contains("Two obligations of Coyote's own"),
-        "NOTICE must state how many obligations it records, so the gate can be checked \
-         against a number and not only against the wording of the ones it names"
+        notice.contains("Two obligations of Coyote's own"),
+        "NOTICE must state how many outstanding obligations it records"
     );
     assert_eq!(
-        squash(&notice).matches("This one blocks a release").count(),
+        read_tracked("NOTICE").matches("\n  - ").count(),
+        2,
+        "NOTICE's obligation bullets must match the count its prose states"
+    );
+    assert_eq!(
+        notice.matches("This one blocks a release").count(),
         1,
         "exactly one recorded obligation is release-blocking; changing that has to be \
          mirrored in the CONTRIBUTING.md gate"
     );
+
+    let credits = read_prose("CREDITS.md");
     assert!(
-        squash(&read_tracked("CREDITS.md")).contains("Two obligations follow for Coyote"),
+        credits.contains("Two obligations follow for Coyote"),
         "the CREDITS.md summary must agree with NOTICE on the count"
     );
+    assert!(
+        credits.contains("GPL-2.0-or-later for the mesh crates and BSD 3-Clause"),
+        "the CREDITS.md summary must agree on the scope of the blocking obligation too, \
+         not only on the count"
+    );
 
-    let Some(gate) = read_guide() else { return };
+    let gate = read_prose("CONTRIBUTING.md");
     for obligation in [
         "the license texts the distributed binary relies on",
         "settling the license expression for the combined work",
