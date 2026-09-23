@@ -338,8 +338,9 @@ The appearance of Coyote can be modified using the following settings:
 ### Mesh
 The `mesh` block controls the [Coyote Mesh](https://github.com/Dark-Alex-17/coyote/wiki/Mesh), which lets Coyote
 instances discover and message each other. It is off by default, and setting `mesh.enabled: true` requires
-`function_calling_support: true`; config loading is refused otherwise. Values under `mesh` are validated only when
-`mesh.enabled` is `true`; a disabled block is inert.
+`function_calling_support: true`; config loading is refused otherwise. Interface entries under `mesh.interfaces` are
+always checked when config is parsed; the remaining `mesh` keys (rate limits, retention, the function-calling
+requirement) are only checked when `mesh.enabled` is `true`.
 
 | Setting                           | Default Value   | Description                                                                                                                                                                  |
 |-----------------------------------|-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|

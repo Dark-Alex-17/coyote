@@ -59,6 +59,7 @@ impl Default for MeshConfig {
 }
 
 impl MeshConfig {
+    // Scaffolding for the mesh runtime: the first consumer of these accessors removes the allows.
     #[allow(dead_code)]
     pub fn interfaces(&self) -> &[MeshInterface] {
         &self.interfaces
@@ -359,6 +360,25 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("use 'lan' for link-local discovery"), "{err}");
+    }
+
+    #[test]
+    fn disabled_block_with_bad_interface_is_refused_at_parse() {
+        let err = interface_error(
+            "mesh:\n  enabled: false\n  interfaces:\n    - type: private\n      host: relay.example.com\n      port: 0\n",
+        );
+        assert!(err.contains("port 0 is out of range"), "{err}");
+    }
+
+    #[test]
+    fn disabled_block_with_out_of_range_rate_limit_parses_and_validates() {
+        let cfg: Config = serde_yaml::from_str(
+            "mesh:\n  enabled: false\n  interfaces: []\n  peer_max_concurrent: 0\n  knock_retention_hours: 0\n",
+        )
+        .unwrap();
+        assert!(!cfg.mesh.enabled);
+        assert_eq!(cfg.mesh.peer_max_concurrent, 0);
+        cfg.mesh.validate(false).unwrap();
     }
 
     #[test]

@@ -318,7 +318,8 @@ document_loaders:
 # ---- Mesh ----
 # Coyote Mesh lets Coyote instances discover and message each other over Reticulum/LXMF.
 # Off by default: with enabled: false nothing initialises, no socket opens and no identity is minted.
-# Values under mesh are validated only when enabled: true; a disabled block is inert.
+# Interface entries under mesh.interfaces are always checked when config is parsed; the remaining mesh keys
+# (rate limits, retention, the function-calling requirement) are only checked when mesh.enabled is true.
 # Mesh needs function calling on both sides; enabled: true with function_calling_support: false is refused at load.
 # See the [Mesh documentation](https://github.com/Dark-Alex-17/coyote/wiki/Mesh) for more information
 mesh:
