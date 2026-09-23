@@ -117,6 +117,22 @@ self_update = { version = "0.44", default-features = false, features = [
 ] }
 qrcode = "0.14"
 
+# Reticulum transport and LXMF wire format, pinned to an exact revision because the
+# published 0.11.0 predates APIs this depends on. This git pin is development-only:
+# it must be replaced by a crates.io version pin before merge, per the dependency
+# policy in CONTRIBUTING.md.
+#
+# Default features are kept deliberately. `reticulum-rs-transport`'s default `storage`
+# feature gates path-table persistence; without it a restart re-discovers every path,
+# which defeats stable destinations. The cost is that it pulls rusqlite with a bundled
+# SQLite, so a second C library is compiled on every platform.
+#
+# `lxmf-wire` (crate lib name `lxmf_core`) pulls `reticulum-rs-core` transitively, so
+# that crate needs no entry of its own. The `reticulum-rs` umbrella is deliberately not
+# used: it hides transport behind a feature and adds surface that goes unused.
+reticulum-rs-transport = { git = "https://github.com/FreeTAKTeam/LXMF-rs", rev = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe" }
+lxmf-wire = { git = "https://github.com/FreeTAKTeam/LXMF-rs", rev = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe" }
+
 [dependencies.reqwest]
 version = "0.13.3"
 features = ["json", "multipart", "stream", "form", "socks", "rustls"]
@@ -140,6 +156,26 @@ arboard = { version = "3.3.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Raw Win32 bindings for locking down the on-disk identity key. Only the ACL, file and
+# process-liveness surface is enabled. `Win32_System_Memory` is needed because the
+# security descriptor that `ConvertStringSecurityDescriptorToSecurityDescriptorW` hands
+# back is released with `LocalFree`.
+#
+# The higher-level `windows` crate is not used: the surface here is a handful of FFI
+# calls that need `unsafe` either way, so its wrapper types and COM machinery would cost
+# compile time for little gain. `windows-acl` (last release 2021-01-11, winapi 0.3, Rust
+# 2015 edition) and `windows-permissions` (last release 2021-06-29, winapi 0.3.9) are
+# both dormant and would each drag a second Win32 binding stack in alongside this one.
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 ctor = "1.0.13"

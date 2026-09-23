@@ -21,4 +21,56 @@ receive Coyote as a combined work, your rights and obligations for the work as
 a whole are governed by the AGPL-3.0-only license; the MIT notice is retained
 to satisfy the attribution requirements of the MIT-licensed portions.
 
+--------------------------------------------------------------------------------
+LXMF-rs (Reticulum transport and LXMF wire format)
+--------------------------------------------------------------------------------
+
+Coyote depends on the `reticulum-rs-transport` and `lxmf-wire` crates from
+LXMF-rs (https://github.com/FreeTAKTeam/LXMF-rs). Upstream declares
+`license = "EPL-2.0 OR GPL-2.0-or-later"` in its package metadata.
+
+Coyote relies on the GPL-2.0-or-later arm of that disjunction, which is the
+only arm compatible with Coyote's AGPL-3.0-only license (GPL-2.0-or-later
+permits GPL-3.0, which AGPL-3.0 section 13 allows to be combined with AGPL
+work). The EPL-2.0 arm is not compatible with the GNU General Public License
+family and is not relied upon here.
+
+Unresolved obligation. The LICENSE file shipped by LXMF-rs is the stock,
+unmodified EPL-2.0 text. Its "Exhibit A - Form of Secondary Licenses Notice"
+is left as the blank template, still carrying the literal placeholder
+"{name license(s), version(s), and exceptions or additional permissions
+here}" in place of a named Secondary License. The EPL-2.0 text itself states,
+immediately below that exhibit, that "Simply including a copy of this
+Agreement, including this Exhibit A is not sufficient to license the Source
+Code under Secondary Licenses." The LXMF-rs repository ships no GPL license
+text and makes no dual-licensing statement outside the package metadata, so
+the GPL arm is at present asserted only in metadata, which is not itself a
+grant of rights. Clarification has been requested from the upstream
+maintainers. Until that is resolved, these dependencies are present for
+development purposes and Coyote should not be distributed as a combined work
+containing them.
+
+Attribution note. The Reticulum layer of LXMF-rs appears to derive from
+Beechat's MIT-licensed Reticulum-rs: `crates/libs/rns-core/src/hash.rs` is
+byte-identical to the Beechat original, while the LXMF-rs tree contains no
+mention of Beechat and does not reproduce the copyright and permission notice
+that the MIT License requires to be retained. This is recorded as an observed
+discrepancy, not as an established finding. If the derivation is confirmed,
+the MIT notice must be restored upstream or reproduced here.
+
+Transitive dependency. `reticulum-rs-transport` enables its default `storage`
+feature, which pulls in `rusqlite` with upstream's `bundled` setting and
+therefore compiles the SQLite C amalgamation into Coyote. `rusqlite` and
+`libsqlite3-sys` are distributed under the MIT License, Copyright (c) The
+rusqlite developers. SQLite itself is in the public domain.
+
+--------------------------------------------------------------------------------
+Windows platform bindings
+--------------------------------------------------------------------------------
+
+On Windows targets, Coyote links against `windows-sys`
+(https://github.com/microsoft/windows-rs), Copyright (c) Microsoft
+Corporation, distributed under "MIT OR Apache-2.0". Coyote uses it under the
+MIT License.
+
 See CREDITS.md for additional background and attribution.

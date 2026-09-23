@@ -42,6 +42,36 @@ AIChat project.
 AIChat is licensed under the MIT License. The MIT license text and its
 copyright notice are preserved in the [LICENSE-MIT](./LICENSE-MIT) file.
 
+## LXMF-rs (Reticulum and LXMF)
+
+Coyote depends on the `reticulum-rs-transport` and `lxmf-wire` crates from
+[LXMF-rs](https://github.com/FreeTAKTeam/LXMF-rs) by FreeTAKTeam. Those crates
+are a Rust implementation of the Reticulum Network Stack and the LXMF
+messaging format, both originally designed and implemented in Python by Mark
+Qvist ([markqvist/Reticulum](https://github.com/markqvist/Reticulum),
+[markqvist/LXMF](https://github.com/markqvist/LXMF)).
+
+LXMF-rs declares `EPL-2.0 OR GPL-2.0-or-later`. Coyote relies on the
+GPL-2.0-or-later arm, the only arm compatible with AGPL-3.0-only. That arm is
+currently asserted only in package metadata: the license text LXMF-rs ships is
+stock EPL-2.0 whose Exhibit A is left as the blank template, which the EPL
+text itself says is not sufficient to license the source under a Secondary
+License. The Reticulum layer also appears to derive from Beechat's
+MIT-licensed Reticulum-rs without the attribution the MIT License requires.
+Both points are recorded in full, with the evidence, in [NOTICE](./NOTICE);
+clarification has been requested upstream, and the second is an observed
+discrepancy rather than an established finding.
+
+Enabling `reticulum-rs-transport` brings `rusqlite` and a bundled SQLite
+amalgamation (MIT; SQLite itself is public domain) in transitively.
+
+## windows-rs
+
+On Windows targets Coyote links against
+[`windows-sys`](https://github.com/microsoft/windows-rs), Copyright (c)
+Microsoft Corporation, distributed under `MIT OR Apache-2.0` and used here
+under the MIT License.
+
 ## Licensing
 
 Coyote as a whole is licensed under the GNU Affero General Public License

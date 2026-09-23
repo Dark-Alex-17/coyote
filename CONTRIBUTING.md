@@ -76,6 +76,44 @@ Then, you can run workflows locally without having to commit and see if the GitH
 act -W .github/workflows/release.yml --input_type bump=minor
 ```
 
+## Dependency policy
+
+### No git dependencies at merge
+
+A branch may carry a `git = ` dependency while it is in development, and only when it is pinned to
+an exact `rev` (never a branch or a tag). **No branch may be merged to `main` while `Cargo.toml`
+contains one.** Before merging, `grep 'git = ' Cargo.toml` must return nothing.
+
+The in-flight mesh work carries two such pins: `reticulum-rs-transport` and `lxmf-wire`, both at
+LXMF-rs rev `3ed5932da4420e2dd1b9d36283b0e72a364e3ebe`. The published 0.11.0 of those crates is
+fourteen commits behind that revision and is missing APIs the mesh work is built on, so the
+registry release cannot be used yet. The pins are therefore interim: the final state is a
+crates.io version pin, swapped in once upstream cuts a release containing that revision. That swap
+is tracked as TASK-063 and is a hard merge gate for the mesh pull request.
+
+### Build and test cost
+
+Reference figures, measured 2026-09-23 on Linux aarch64 with 18 cores, debug profile, warm
+`target/`. Treat them as an order of magnitude, not a budget: CI runners have far fewer cores, so
+expect several times these numbers there.
+
+| Measurement | Before mesh dependencies | After |
+| --- | --- | --- |
+| `cargo test --all` (full suite, warm cache) | 64s | 77s |
+| `cargo clippy --all --all-targets` (warm cache) | n/a | 20s |
+| Clean rebuild of the new dependency subtree (27 crates) | n/a | 8s |
+| Of which the bundled SQLite C amalgamation | n/a | 2s |
+
+`reticulum-rs-transport` keeps its default `storage` feature, which brings `rusqlite` with a
+bundled SQLite in, so the SQLite C amalgamation is now compiled on every platform rather than none.
+`bzip2-sys` adds a second, much smaller C compile. A C toolchain was already required everywhere
+for `duckdb`'s bundled build, so this adds compile time and binary size but no new prerequisite.
+
+The Windows figure is the one that matters most, because Windows is where the C compile is
+slowest and where nothing previously exercised `rusqlite`. It cannot be measured outside CI from a
+non-Windows host: read it off the `windows-latest` leg of the first CI run that includes these
+dependencies, and raise it if that leg regresses materially against its previous duration.
+
  ## Authorship Policy
 
 All code in this repository is written and reviewed by humans. AI-generated code (e.g., Copilot, ChatGPT,
