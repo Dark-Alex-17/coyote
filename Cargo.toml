@@ -123,9 +123,9 @@ qrcode = "0.14"
 # policy in CONTRIBUTING.md.
 #
 # Default features are kept deliberately. `reticulum-rs-transport`'s default `storage`
-# feature gates path-table persistence; without it a restart re-discovers every path,
-# which defeats stable destinations. The cost is that it pulls rusqlite with a bundled
-# SQLite, so a second C library is compiled on every platform.
+# feature gates the SQLite-backed message and announce store that the store-and-forward
+# work needs. The cost is that it pulls rusqlite with a bundled SQLite, so a second C
+# library is compiled on every platform.
 #
 # `lxmf-wire` (crate lib name `lxmf_core`) pulls `reticulum-rs-core` transitively, so
 # that crate needs no entry of its own. The `reticulum-rs` umbrella is deliberately not
@@ -159,9 +159,9 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # Raw Win32 bindings for locking down the on-disk identity key. Only the ACL, file and
-# process-liveness surface is enabled. `Win32_System_Memory` is needed because the
-# security descriptor that `ConvertStringSecurityDescriptorToSecurityDescriptorW` hands
-# back is released with `LocalFree`.
+# process-liveness surface is enabled. `ConvertStringSecurityDescriptorToSecurityDescriptorW`
+# comes from `Win32_Security_Authorization`, and the `LocalFree`/`HLOCAL` pair that releases
+# its security descriptor comes from `Win32_Foundation`, so no allocator feature is needed.
 #
 # The higher-level `windows` crate is not used: the surface here is a handful of FFI
 # calls that need `unsafe` either way, so its wrapper types and COM machinery would cost
@@ -173,7 +173,6 @@ windows-sys = { version = "0.61", features = [
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
-  "Win32_System_Memory",
   "Win32_System_Threading",
 ] }
 

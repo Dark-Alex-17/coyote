@@ -51,21 +51,18 @@ messaging format, both originally designed and implemented in Python by Mark
 Qvist ([markqvist/Reticulum](https://github.com/markqvist/Reticulum),
 [markqvist/LXMF](https://github.com/markqvist/LXMF)).
 
-LXMF-rs declares `EPL-2.0 OR GPL-2.0-or-later`. Coyote relies on the
-GPL-2.0-or-later arm, the only arm compatible with AGPL-3.0-only. That arm is
-currently asserted only in package metadata: the license text LXMF-rs ships is
-stock EPL-2.0 whose Exhibit A is left as the blank template, which the EPL
-text itself says is not sufficient to license the source under a Secondary
-License. The Reticulum layer also appears to derive from Beechat's
-MIT-licensed Reticulum-rs without the attribution the MIT License requires.
-Both points are recorded in full, with the evidence, in [NOTICE](./NOTICE);
-clarification has been requested upstream, and the second is an observed
-discrepancy rather than an established finding.
+LXMF-rs is dual-licensed `EPL-2.0 OR GPL-2.0-or-later`, with the Secondary
+Licenses Notice offering GPL-2.0-or-later written into its LICENSE file.
+Coyote relies on the GPL-2.0-or-later arm, the only arm compatible with
+AGPL-3.0-only. Two obligations follow for Coyote: shipping a copy of the GPL
+text, and settling the licence expression for the combined work, neither of
+which is done yet. [NOTICE](./NOTICE) records both.
 
-Enabling `reticulum-rs-transport` brings `rusqlite` and a bundled SQLite
-amalgamation (MIT; SQLite itself is public domain) in transitively.
+Enabling `reticulum-rs-transport` brings `rusqlite` with a bundled SQLite
+amalgamation (MIT; SQLite itself is public domain) and `bzip2`/`bzip2-sys`
+with a bundled libbzip2 (MIT here; libbzip2 is BSD-style) in transitively.
 
-## windows-rs
+## windows-sys
 
 On Windows targets Coyote links against
 [`windows-sys`](https://github.com/microsoft/windows-rs), Copyright (c)
@@ -79,3 +76,7 @@ v3.0 only (AGPL-3.0-only); see [LICENSE](./LICENSE). Substantial portions
 derived from AIChat remain under the MIT License (Copyright (c) sigoden),
 preserved in [LICENSE-MIT](./LICENSE-MIT). See [NOTICE](./NOTICE) for the
 combined-licensing summary.
+
+The LXMF-rs dependencies add GPL-2.0-or-later code to that mix. The licence
+expression for the resulting combined work has not been settled and the
+`license` field in `Cargo.toml` has not been changed; see [NOTICE](./NOTICE).
