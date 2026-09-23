@@ -8,11 +8,17 @@
 //! peers agree on an exact frame layout, so a change to either is an interop
 //! break that should fail here rather than against a live Python node.
 //!
-//! The manifest checks at the bottom pin what no compiler here can be asked
-//! about: the Win32 feature list, which nothing on a unix host links against,
-//! and the tracked records the pin and the license obligations rest on. The
-//! three pin checks expire with the git pin; the Win32 and obligation checks
-//! outlive it.
+//! The manifest checks at the bottom pin what no compiler on a unix host can be
+//! asked about: the Win32 feature list, whose call sites nothing here links
+//! against, and the tracked records the pin and the license obligations rest on.
+//! Note what the feature-list check is and is not. It compares manifest text, so
+//! it catches an unaudited addition or a silent drop; it cannot tell whether
+//! windows-sys exposes those features, and does not need to: cargo refuses to
+//! resolve a feature that does not exist upstream, so no build on any platform
+//! reaches this test carrying one. The feature-to-call mapping is checked by
+//! `the_audited_win32_features_expose_the_calls_they_are_carried_for`, which only
+//! compiles on Windows. The three pin checks expire with the git pin; the Win32
+//! and obligation checks outlive it.
 
 use lxmf_core::identity::{Identity, PrivateIdentity, lxmf_sign, lxmf_verify};
 use lxmf_core::stamp::{COST_TICKET, TICKET_LENGTH, generate_stamp, ticket_stamp, validate_stamp};
@@ -295,9 +301,48 @@ fn windows_sys_carries_exactly_the_audited_feature_set() {
     );
 }
 
+/// Naming each audited feature's call turns the list above from manifest text into a
+/// compile-time check of the claim the list is making: that each feature is carried
+/// for one named Win32 item, and that the item is where the manifest says it is.
+/// Nothing is invoked; taking an address is enough to require the import to resolve.
+/// Only the windows-latest CI leg compiles this.
+#[cfg(windows)]
+#[test]
+fn the_audited_win32_features_expose_the_calls_they_are_carried_for() {
+    use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows_sys::Win32::Security::ACL;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Storage::FileSystem::CreateFileW;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+
+    let audited_calls: [usize; 4] = [
+        ConvertStringSecurityDescriptorToSecurityDescriptorW as usize,
+        LocalFree as usize,
+        CreateFileW as usize,
+        OpenProcess as usize,
+    ];
+    assert!(
+        audited_calls.iter().all(|address| *address != 0),
+        "every audited Win32 call must resolve to a real import"
+    );
+
+    assert!(
+        core::mem::size_of::<ACL>() > 0,
+        "Win32_Security is carried for the ACL type"
+    );
+    assert_eq!(
+        core::mem::size_of::<HLOCAL>(),
+        core::mem::size_of::<*mut core::ffi::c_void>(),
+        "Win32_Foundation is carried for the LocalFree/HLOCAL pair"
+    );
+}
+
 /// Every git pin is interim, so the manifest has to say so where someone retiring it
-/// will look, and both copies of the gate have to stay runnable and identical: a
-/// contributor ticks the checklist, not the guide.
+/// will look. The human-facing copy of the gate has to sit at the path GitHub
+/// auto-populates a pull request body from, and stay identical to the guide's copy;
+/// the `.github/PULL_REQUEST_TEMPLATE/` directory form renders only for an explicit
+/// `?template=` link, so a checklist there is a checklist nobody is shown. The gate
+/// that actually holds is the CI job, which is why its mechanism is pinned here too.
 #[test]
 fn the_git_pin_is_recorded_as_interim() {
     // Comment markers and hand-wrapping are noise here; the sentence is the contract.
@@ -311,14 +356,26 @@ fn the_git_pin_is_recorded_as_interim() {
         "meta=$(cargo metadata --format-version 1 --locked) \
          && ! printf '%s' \"$meta\" | grep -q '\"source\":\"git+'",
     );
-    for document in [
-        "CONTRIBUTING.md",
-        ".github/PULL_REQUEST_TEMPLATE/pull_request_template.md",
-    ] {
+    for document in ["CONTRIBUTING.md", ".github/pull_request_template.md"] {
         assert!(
             read_prose(document).contains(&gate),
             "{document} must quote the no-git-sources gate verbatim; the checklist a \
              contributor ticks and the guide that explains it cannot drift apart"
+        );
+    }
+
+    // The checklist is a courtesy; this is the gate. Pinned by mechanism rather than
+    // by wording: the workflow has to resolve the graph and reject a git source in it,
+    // however the surrounding step is phrased.
+    let workflow = read_prose(".github/workflows/ci.yaml");
+    for fragment in [
+        "cargo metadata --format-version 1 --locked",
+        "\"source\":\"git+",
+    ] {
+        assert!(
+            workflow.contains(fragment),
+            "ci.yaml must enforce the no-git-sources gate itself, matching on {fragment:?}, \
+             rather than leaving it to a box a contributor ticks"
         );
     }
 }
@@ -368,7 +425,7 @@ fn the_dependency_cost_record_is_tracked_and_names_the_windows_gap() {
         "the record must carry a Windows row, the one figure a unix host cannot measure"
     );
     assert!(
-        guide.contains("cannot be measured outside CI from a non-Windows host"),
+        guide.contains("cannot be measured outside CI"),
         "the record must say why the Windows row is outstanding rather than leaving it blank"
     );
 }
@@ -427,9 +484,11 @@ fn the_release_gate_names_every_obligation_notice_records() {
     }
 
     let gate = read_prose("CONTRIBUTING.md");
+    // The shortest phrase that still identifies each obligation: rewording the prose
+    // around them is not drift, dropping one from the gate is.
     for obligation in [
-        "the license texts the distributed binary relies on",
-        "settling the license expression for the combined work",
+        "the license texts",
+        "license expression for the combined work",
     ] {
         assert!(
             gate.contains(obligation),

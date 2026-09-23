@@ -93,6 +93,13 @@ print nothing both when the graph is clean and when `cargo metadata` fails, and 
 git dependency is exactly what makes it fail. `--locked` keeps the gate from rewriting the
 lockfile it is auditing.
 
+You do not have to remember to run it. The `Merge Gates` job in
+[ci.yaml](.github/workflows/ci.yaml) runs the same check on every pull request and fails the run
+while a git source is in the graph, so the gate holds whether or not anyone ticks the box in the
+pull request template. A development branch that still carries its `rev` pin will show that job
+red on purpose; the red clears when the pin is replaced, not by editing the job. The checklist
+item and this section are the explanation, CI is the enforcement.
+
 A literal `grep` over `Cargo.toml` is not good enough. It is sensitive to whitespace and quoting,
 and it sees only the root manifest: a git source reached through a dependency's own manifest, or
 a `[patch]` declared in `.cargo/config.toml`, never appears there. The gate is on the resolved
@@ -141,14 +148,16 @@ expect several times these numbers there.
 | Of which the bundled SQLite C amalgamation | n/a | 2s |
 | `windows-latest` CI leg, total job duration | not measured | TBD, fill from the first CI run |
 
-The suite itself does not get slower; the cost is compile time and binary size.
+The suite itself does not get slower, and what the table measures is compile time: compile time
+now, binary size once the mesh code lands. Nothing under `src/` consumes these crates yet, so the
+unreferenced code is elided and today's binary is effectively the size it was before. Binary size
+becomes a real cost with the first code that links them in, and is not measured above.
 
 `reticulum-rs-transport` keeps its default `storage` feature, which brings `rusqlite` with a
 bundled SQLite in, so the SQLite C amalgamation is now compiled on every platform rather than none.
 `bzip2-sys` comes in regardless of that feature and adds a second, much smaller C compile on
 Windows and anywhere pkg-config finds no system libbz2. A C toolchain was already required
-everywhere for `duckdb`'s bundled build, so this adds compile time and binary size but no new
-prerequisite.
+everywhere for `duckdb`'s bundled build, so this adds compile time but no new prerequisite.
 
 The Windows figure is the one that matters most, because Windows is where the C compile is
 slowest and where nothing previously exercised `rusqlite`. It cannot be measured outside CI from a
@@ -159,6 +168,48 @@ The eight-target release matrix in `.github/workflows/release.yaml`, four of who
 through `cross` including the musl targets, is not exercised before merge either. `duckdb`'s
 bundled build already forces a C toolchain onto those images, so the two new C compiles should
 follow, but the first release is where that is actually tested.
+
+### What was checked for the windows-sys feature list, and what was not
+
+The `windows-sys` entry in `Cargo.toml` names five Win32 features and one call or type each, and
+the call sites land later with the identity-key work. This is the record of what that list rests
+on, checked 2026-09-23 from Linux aarch64. It goes when the audit it describes stops mattering.
+
+Checked, and reproducible:
+
+```shell
+cargo tree --target x86_64-pc-windows-msvc -e features -i windows-sys@0.61.2
+```
+
+exits 0: the `cfg(windows)` graph resolves, and the 40 `windows-sys` features it enables include
+all five audited ones. The version in the spec is not optional; four `windows-sys` majors are in
+the graph (0.52.0, 0.59.0, 0.60.2, 0.61.2) and a bare `-i windows-sys` exits 101 with
+`specification 'windows-sys' is ambiguous`. Most of those 40 features come from other crates —
+`mio`, `socket2`, `schannel` and `dirs-sys` each enable their own — so the list read off that tree
+is a superset of ours and no substitute for the manifest.
+
+A feature name that does not exist upstream cannot survive *any* build, on any platform. Adding
+`Win32_Bogus_DoesNotExist` to the list makes resolution fail closed at exit 101 with `package
+'coyote-ai' depends on 'windows-sys' with feature 'Win32_Bogus_DoesNotExist' but 'windows-sys'
+does not have that feature`: identically with `--target x86_64-pc-windows-msvc` and with no
+`--target` at all, because feature names are checked when the graph resolves and not when the
+`cfg` is compiled. Every `cargo test` run on every CI leg therefore already proves these five
+names exist in windows-sys 0.61. From the other side, windows-sys 0.61.2 declares all five in its
+own manifest, and each item the list is carried for is in the module the list claims: `LocalFree`
+and `HLOCAL` in `Win32/Foundation`, `ACL` in `Win32/Security`,
+`ConvertStringSecurityDescriptorToSecurityDescriptorW` in `Win32/Security/Authorization`,
+`CreateFileW` in `Win32/Storage/FileSystem`, `OpenProcess` in `Win32/System/Threading`. The
+`cfg(windows)` test in `tests/mesh_dependencies.rs` names those items, so the windows-latest leg
+checks the feature-to-call mapping itself instead of the manifest text that claims it.
+
+**Not** checked, and unverified until the first CI run: anything that compiles or links for a
+Windows target. `cargo check --target x86_64-pc-windows-msvc` cannot run from a Linux host here at
+all. It exits 101 inside dependency build scripts, long before reaching this crate, because the
+host C compiler cannot target Windows: `cc: error: unrecognized command-line option '-m64'`, from
+`ring`'s `cc-rs` invocation, with `rusqlite`, `bzip2-sys` and `duckdb` against the same wall.
+Whether these five features suffice for the identity-key call sites, and whether `cargo build` and
+`cargo test --all` pass on `macos-latest` and `windows-latest`, are answered by the first CI run
+that includes these dependencies and by nothing before it.
 
  ## Authorship Policy
 

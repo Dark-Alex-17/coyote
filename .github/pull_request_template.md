@@ -4,6 +4,8 @@
       `meta=$(cargo metadata --format-version 1 --locked) && ! printf '%s' "$meta" | grep -q '"source":"git+'`).
       Git pins are development-only and must be replaced by a crates.io version pin before merge;
       see [Dependency policy](https://github.com/Dark-Alex-17/coyote/blob/main/CONTRIBUTING.md#dependency-policy).
+      The `Merge Gates` CI job runs the same check, so this box is a courtesy and that job is the
+      gate: leaving it unticked hides nothing.
 
 ### AI assistance (if any):
 - List tools here and files touched by them

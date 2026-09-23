@@ -13,6 +13,32 @@ defaults:
     shell: bash
 
 jobs:
+  merge-gates:
+    name: Merge Gates
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust Toolchain Components
+      uses: dtolnay/rust-toolchain@stable
+
+    # The resolved graph, not the root manifest: a git source reached through a
+    # dependency's own manifest or a `[patch]` never appears in Cargo.toml. `--locked`
+    # keeps the gate from rewriting the lockfile it audits. A branch may carry a git
+    # `rev` pin while it is in development, so a red run here on a development branch
+    # is this gate working, not CI breaking; see CONTRIBUTING.md#dependency-policy.
+    - name: Nothing is pulled from git
+      run: |
+        meta=$(cargo metadata --format-version 1 --locked)
+        if printf '%s' "$meta" | grep -q '"source":"git+'; then
+          printf '%s' "$meta" | grep -o '"source":"git+[^"]*"' | sort -u
+          echo "::error::The resolved dependency graph contains the git sources listed above. Git pins are development-only and must be replaced by a crates.io version pin before merge. See CONTRIBUTING.md#dependency-policy."
+          exit 1
+        fi
+        echo "No git sources in the resolved dependency graph."
+
   all:
     name: All
 

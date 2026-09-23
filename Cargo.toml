@@ -140,9 +140,11 @@ qrcode = "0.14"
 #
 # `lxmf-wire` (lib name `lxmf_core`) pulls `reticulum-rs-core` transitively, so that
 # crate needs no entry of its own; `reticulum-rs-transport`'s lib name is
-# `rns_transport`. The `reticulum-rs` umbrella is deliberately not used: it covers only
-# the `rns-*` crates and not `lxmf-wire`, so it cannot replace both entries, and
-# depending on the two directly keeps one mechanism instead of two.
+# `rns_transport`. The `reticulum-rs` umbrella is deliberately not used, for two
+# independent reasons: it gates transport behind a feature and re-exports surface we do
+# not use, and it covers only the `rns-*` crates and not `lxmf-wire`, so it cannot
+# replace both entries anyway. Depending on the two directly keeps one mechanism
+# instead of two.
 reticulum-rs-transport = { git = "https://github.com/FreeTAKTeam/LXMF-rs", rev = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe" }
 lxmf-wire = { git = "https://github.com/FreeTAKTeam/LXMF-rs", rev = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe" }
 
