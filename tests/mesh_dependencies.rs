@@ -8,10 +8,14 @@
 //! peers agree on an exact frame layout, so a change to either is an interop
 //! break that should fail here rather than against a live Python node.
 //!
-//! The manifest checks at the bottom pin what the Windows leg cannot be asked
-//! about from a unix host, and they expire with the git pin they describe.
+//! The manifest checks at the bottom pin what no compiler here can be asked
+//! about: the Win32 feature list, which nothing on a unix host links against,
+//! and the tracked records the pin and the license obligations rest on. The
+//! three pin checks expire with the git pin; the Win32 and obligation checks
+//! outlive it.
 
 use lxmf_core::identity::{Identity, PrivateIdentity, lxmf_sign, lxmf_verify};
+use lxmf_core::stamp::{COST_TICKET, TICKET_LENGTH, generate_stamp, ticket_stamp, validate_stamp};
 use lxmf_core::{Message, WireMessage};
 use rns_transport::storage::messages::MessagesStore;
 use sha2::{Digest, Sha256};
@@ -85,6 +89,16 @@ fn hex_digest(bytes: &[u8]) -> String {
 fn read_tracked(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{name} is readable"))
+}
+
+/// `CONTRIBUTING.md` is in the manifest's `exclude` list while `tests/` is not, so
+/// it is absent when the suite runs from a packaged `.crate` rather than the repo.
+/// The assertions that read it are skipped there rather than failing on packaging.
+fn read_guide() -> Option<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("CONTRIBUTING.md");
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|text| squash(&text))
 }
 
 /// Returns the body of `[section]`, up to the next section header.
@@ -177,6 +191,37 @@ fn transport_storage_feature_is_enabled() {
     MessagesStore::in_memory().expect("an in-memory message store opens");
 }
 
+/// The stamp API is the whole reason the pin exists, so exercise it rather than
+/// leaving the justification as prose in the manifest. The published release
+/// carries the surrounding `stamp` module without these three calls, so a swap to
+/// any release that still lacks them fails to compile here instead of silently
+/// dropping the feature the mesh work is built on. Note the public path: the
+/// `delivery` module they live in is private, and they are re-exported one level up.
+#[test]
+fn the_stamp_api_the_pin_exists_for_is_reachable() {
+    let message_id = [0x33; 32];
+
+    let stamp = generate_stamp(&message_id, 4).expect("a cost of 4 is mineable");
+    assert!(
+        validate_stamp(Some(&stamp), &message_id, 4, &[]).is_some_and(|value| value >= 4),
+        "a freshly mined stamp must validate at the cost it was mined for"
+    );
+
+    let ticket = vec![0x44; TICKET_LENGTH];
+    let from_ticket = ticket_stamp(&ticket, &message_id);
+    assert_eq!(
+        validate_stamp(Some(&from_ticket), &message_id, 4, &[ticket]),
+        Some(COST_TICKET),
+        "a stamp derived from a held ticket must be worth the ticket cost"
+    );
+
+    assert_eq!(
+        validate_stamp(Some(&[0; 32]), &message_id, 16, &[]),
+        None,
+        "an all-zero stamp carries no work and must be rejected at a real cost"
+    );
+}
+
 #[test]
 fn mesh_crates_are_pinned_to_the_audited_revision() {
     let manifest = read_tracked("Cargo.toml");
@@ -192,6 +237,16 @@ fn mesh_crates_are_pinned_to_the_audited_revision() {
             "{crate_name} must stay pinned to {PINNED_REV}, found: {line}"
         );
     }
+
+    // The manifest is what was declared; the lock is what resolved. Both crates plus
+    // the `reticulum-rs-core` they share must have landed on the audited commit.
+    let resolved = read_tracked("Cargo.lock")
+        .matches(&format!("?rev={PINNED_REV}#{PINNED_REV}"))
+        .count();
+    assert_eq!(
+        resolved, 3,
+        "the lock must resolve all three LXMF-rs crates to {PINNED_REV}"
+    );
 }
 
 /// The mesh crates carry no `cfg` gate, so a break shows up on every platform's CI
@@ -239,29 +294,94 @@ fn windows_sys_carries_exactly_the_audited_feature_set() {
     assert_eq!(
         features, WINDOWS_SYS_FEATURES,
         "the windows-sys feature list changed; each entry backs a named Win32 call, so \
-         adding or dropping one needs the same audit the original list got"
+         adding, dropping or reordering one needs the same audit the original list got"
     );
 }
 
 /// Every git pin is interim, so the manifest has to say so where someone retiring it
-/// will look, and the contributor guide has to carry the runnable gate itself.
+/// will look, and both copies of the gate have to stay runnable and identical: a
+/// contributor ticks the checklist, not the guide.
 #[test]
 fn the_git_pin_is_recorded_as_interim() {
+    // Comment markers and hand-wrapping are noise here; the sentence is the contract.
+    let manifest_prose = squash(&read_tracked("Cargo.toml").replace("\n#", "\n"));
     assert!(
-        read_tracked("Cargo.toml").contains("crates.io version pin before merge"),
+        manifest_prose.contains("crates.io version pin before merge"),
         "the manifest must record that the git pin cannot survive a merge"
     );
 
+    let gate = "cargo metadata --format-version 1 --locked > /tmp/meta.json \
+                && ! grep -q '\"source\":\"git+' /tmp/meta.json";
+    let template = squash(&read_tracked(
+        ".github/PULL_REQUEST_TEMPLATE/pull_request_template.md",
+    ));
     assert!(
-        read_tracked("CONTRIBUTING.md")
-            .contains("cargo metadata --format-version 1 | grep '\"source\":\"git+'"),
-        "the contributor guide must carry the runnable no-git-sources gate"
+        template.contains(&squash(gate)),
+        "the pull-request checklist must quote the no-git-sources gate verbatim"
+    );
+
+    let Some(guide) = read_guide() else { return };
+    assert!(
+        guide.contains(&squash(gate)),
+        "the contributor guide must carry the same gate the checklist quotes"
     );
 }
 
-/// NOTICE is where the license obligations live and CONTRIBUTING.md is where the
-/// release gate reads them back. The gate is allowed to block on a subset, but it
-/// may not silently omit one, so it has to name every obligation NOTICE records.
+/// Two maintained crates were passed over for raw bindings, and the reason is a
+/// judgement that decays: dormancy and an old binding stack. Whoever revisits the
+/// Win32 choice needs that record next to the dependency it justifies, so pin the
+/// facts it rests on rather than only the conclusion.
+#[test]
+fn the_passed_over_win32_crates_stay_recorded() {
+    let manifest = squash(&read_tracked("Cargo.toml"));
+
+    for (crate_name, last_release) in [
+        ("windows-acl", "2021-01-11"),
+        ("windows-permissions", "2021-06-29"),
+    ] {
+        assert!(
+            manifest.contains(crate_name),
+            "the manifest must record why {crate_name} was passed over"
+        );
+        assert!(
+            manifest.contains(last_release),
+            "the record for {crate_name} must keep its last-release date, which is what \
+             makes the dormancy claim checkable"
+        );
+    }
+
+    assert!(
+        manifest.contains("second Win32 binding stack"),
+        "the record must keep the cost of adopting either one"
+    );
+}
+
+/// These dependencies cost compile time, and the Windows figure cannot be taken from
+/// a unix host. The measurement therefore lives in a tracked file with the Windows
+/// row explicitly outstanding, so the gap stays visible instead of reading as zero.
+#[test]
+fn the_dependency_cost_record_is_tracked_and_names_the_windows_gap() {
+    let Some(guide) = read_guide() else { return };
+
+    assert!(
+        guide.contains("cargo test --all`, test execution only"),
+        "the full-suite wall clock must be recorded in the tracked guide"
+    );
+    assert!(
+        guide.contains("windows-latest` CI leg"),
+        "the record must carry a Windows row, the one figure a unix host cannot measure"
+    );
+    assert!(
+        guide.contains("cannot be measured outside CI from a non-Windows host"),
+        "the record must say why the Windows row is outstanding rather than leaving it blank"
+    );
+}
+
+/// NOTICE is where the license obligations live, CREDITS.md summarises them and
+/// CONTRIBUTING.md gates releases on them. The gate may block on a subset, but it
+/// may not silently omit one, so all three have to agree on how many there are and
+/// on which one blocks. Adding a fourth copy of this claim without wiring it in here
+/// is how the three drifted apart before.
 #[test]
 fn the_release_gate_names_every_obligation_notice_records() {
     let notice = read_tracked("NOTICE");
@@ -269,10 +389,25 @@ fn the_release_gate_names_every_obligation_notice_records() {
         notice.contains("EPL-2.0 OR GPL-2.0-or-later"),
         "NOTICE must record the dual license the mesh crates actually ship under"
     );
+    assert!(
+        squash(&notice).contains("Two obligations of Coyote's own"),
+        "NOTICE must state how many obligations it records, so the gate can be checked \
+         against a number and not only against the wording of the ones it names"
+    );
+    assert_eq!(
+        squash(&notice).matches("This one blocks a release").count(),
+        1,
+        "exactly one recorded obligation is release-blocking; changing that has to be \
+         mirrored in the CONTRIBUTING.md gate"
+    );
+    assert!(
+        squash(&read_tracked("CREDITS.md")).contains("Two obligations follow for Coyote"),
+        "the CREDITS.md summary must agree with NOTICE on the count"
+    );
 
-    let gate = squash(&read_tracked("CONTRIBUTING.md"));
+    let Some(gate) = read_guide() else { return };
     for obligation in [
-        "a copy of that license text is not yet in this repository",
+        "the license texts the distributed binary relies on",
         "settling the license expression for the combined work",
     ] {
         assert!(

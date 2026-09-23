@@ -85,8 +85,12 @@ exact `rev` (never a branch or a tag). **No branch may be merged to `main` while
 dependency graph contains a git source.** Before merging, this must return nothing:
 
 ```shell
-cargo metadata --format-version 1 | grep '"source":"git+'
+cargo metadata --format-version 1 --locked > /tmp/meta.json && ! grep -q '"source":"git+' /tmp/meta.json
 ```
+
+Check the exit status, not just the output: written as a bare pipe into `grep`, the gate also
+prints nothing when `cargo metadata` itself fails, and an unresolvable git dependency is exactly
+what makes it fail. `--locked` keeps the gate from rewriting the lockfile it is auditing.
 
 A literal `grep` over `Cargo.toml` is not good enough. It is sensitive to whitespace and quoting,
 and it sees only the root manifest: a git source reached through a dependency's own manifest, or
@@ -99,22 +103,25 @@ publishes happily and then resolves against the registry, which is the silent-do
 
 Coyote must not ship a release while a release-blocking obligation recorded in
 [NOTICE](./NOTICE) is unmet. NOTICE records two obligations today, of which one is
-release-blocking: the mesh dependencies are used under a GPL-2.0-or-later grant and a copy of
-that license text is not yet in this repository. Add it, or drop the dependencies, before cutting
-a release that contains them. The second, settling the license expression for the combined work,
-is the license owner's call and is tracked separately.
+release-blocking: the license texts the distributed binary relies on, GPL-2.0-or-later for the
+mesh crates and BSD 3-Clause for the dalek crates, are not in this repository. Add them, or drop
+the dependencies, before cutting a release that contains them. The second, settling the license
+expression for the combined work, is the license owner's call and is tracked separately.
 
 ### The in-flight mesh pins
 
 Everything in this subsection goes when the pins it describes go. The mesh work
 carries two: `reticulum-rs-transport` and `lxmf-wire`, both at
 LXMF-rs rev `3ed5932da4420e2dd1b9d36283b0e72a364e3ebe`. The published 0.11.0 of those crates is
-fourteen commits behind that revision and lacks `lxmf_core::stamp::delivery`
-(`generate_stamp`, `validate_stamp`, `ticket_stamp`), which the mesh work is built on, so the
-registry release cannot be used yet. Note that the pinned revision also calls itself 0.11.0, so
-the replacement must be a release strictly newer than 0.11.0 that carries that submodule: pinning
+fourteen commits behind that revision and lacks the delivery-stamp calls re-exported at
+`lxmf_core::stamp` (`generate_stamp`, `validate_stamp`, `ticket_stamp`), which the mesh work is
+built on; it carries only the propagation-stamp half. Note that the pinned revision also calls
+itself 0.11.0, so the replacement must be a release strictly newer than 0.11.0 that carries
+those calls: pinning
 `version = "0.11.0"` would satisfy the gate above while silently reverting to the release this
-paragraph rejects. The pins are therefore interim, the final state is a crates.io version pin,
+paragraph rejects. Both crates have to move together, too: they share `reticulum-rs-core`, and a
+registry crate alongside a git one duplicates it. The pins are therefore interim, the final state
+is a crates.io version pin,
 and that swap is a hard merge gate for the mesh pull request. It is tracked internally as
 TASK-063 in the mesh plan.
 
@@ -148,6 +155,11 @@ The Windows figure is the one that matters most, because Windows is where the C 
 slowest and where nothing previously exercised `rusqlite`. It cannot be measured outside CI from a
 non-Windows host: read it off the `windows-latest` leg of the first CI run that includes these
 dependencies, and raise it if that leg regresses materially against its previous duration.
+
+The eight-target release matrix in `.github/workflows/release.yaml`, four of whose legs build
+through `cross` including the musl targets, is not exercised before merge either. `duckdb`'s
+bundled build already forces a C toolchain onto those images, so the two new C compiles should
+follow, but the first release is where that is actually tested.
 
  ## Authorship Policy
 

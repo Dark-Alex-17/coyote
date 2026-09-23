@@ -63,10 +63,11 @@ the license expression for the combined work, which is tracked separately.
 default `storage` feature pulls in `rusqlite` with a bundled SQLite
 amalgamation (MIT; SQLite itself is public domain). Independently of any
 feature it pulls in `bzip2`/`bzip2-sys`, which ships libbzip2 and compiles it
-where no system copy is found (MIT here; libbzip2 is BSD-style),
-`x25519-dalek` (BSD 3-Clause), and `tokio-serial`, which brings `serialport`
-(MPL-2.0). [NOTICE](./NOTICE) carries the copyright notices and says what
-each of those obligations is and how far it is discharged.
+on Windows and wherever pkg-config finds no system copy (MIT here; libbzip2
+is BSD-style), `x25519-dalek` (BSD 3-Clause), and `tokio-serial` with
+`mio-serial` (MIT) and `serialport` (MPL-2.0). [NOTICE](./NOTICE) carries the
+copyright notices where a license requires one, and says what each obligation
+is and how far it is discharged.
 
 ## windows-sys
 
