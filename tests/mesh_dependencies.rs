@@ -91,8 +91,9 @@ fn read_tracked(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{name} is readable"))
 }
 
-/// Reads a tracked document with its hand-wrapping normalised away, since every
-/// assertion below is about what the prose says, not how it is laid out.
+/// Reads a tracked document with its hand-wrapping normalised away. Most assertions
+/// below are about what a document says rather than how it is wrapped; the obligation
+/// bullet count is the exception and reads the raw text on purpose.
 fn read_prose(name: &str) -> String {
     squash(&read_tracked(name))
 }
@@ -390,8 +391,17 @@ fn the_release_gate_names_every_obligation_notice_records() {
         notice.contains("Two obligations of Coyote's own"),
         "NOTICE must state how many outstanding obligations it records"
     );
+    // Counted over the obligations paragraph alone, on the raw text: squashing would
+    // destroy the indentation that makes a bullet a bullet, and counting file-wide
+    // would answer a different question than the one the prose states.
+    let raw = read_tracked("NOTICE");
+    let obligations = raw
+        .split_once("Two obligations of Coyote's own")
+        .and_then(|(_, rest)| rest.split_once("Transitive dependencies."))
+        .map(|(block, _)| block)
+        .expect("NOTICE states its obligations between that sentence and the next section");
     assert_eq!(
-        read_tracked("NOTICE").matches("\n  - ").count(),
+        obligations.matches("\n  - ").count(),
         2,
         "NOTICE's obligation bullets must match the count its prose states"
     );
@@ -402,16 +412,19 @@ fn the_release_gate_names_every_obligation_notice_records() {
          mirrored in the CONTRIBUTING.md gate"
     );
 
-    let credits = read_prose("CREDITS.md");
     assert!(
-        credits.contains("Two obligations follow for Coyote"),
+        read_prose("CREDITS.md").contains("Two obligations follow for Coyote"),
         "the CREDITS.md summary must agree with NOTICE on the count"
     );
-    assert!(
-        credits.contains("GPL-2.0-or-later for the mesh crates and BSD 3-Clause"),
-        "the CREDITS.md summary must agree on the scope of the blocking obligation too, \
-         not only on the count"
-    );
+    // Scope, not just count: narrowing the blocking obligation to one of the two
+    // license texts in either document is the drift this catches.
+    for document in ["CREDITS.md", "CONTRIBUTING.md"] {
+        assert!(
+            read_prose(document).contains("GPL-2.0-or-later for the mesh crates and BSD 3-Clause"),
+            "{document} must agree on the scope of the blocking obligation, not only on \
+             the count"
+        );
+    }
 
     let gate = read_prose("CONTRIBUTING.md");
     for obligation in [

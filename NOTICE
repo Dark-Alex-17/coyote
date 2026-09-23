@@ -39,8 +39,8 @@ work). The EPL-2.0 arm is not compatible with the GNU General Public License
 family and is not relied upon here.
 
 Two obligations of Coyote's own remain outstanding from these dependencies.
-The rest, recorded below, are discharged in place. Neither outstanding one is
-an assertion of wrongdoing upstream.
+The rest are discharged where they are recorded below, or folded into these
+two. Neither of the two is an assertion of wrongdoing upstream.
 
   - License texts the distributed binary relies on are not shipped with it.
     Relying on a GPL arm means shipping a copy of that license, and LXMF-rs
@@ -104,9 +104,9 @@ at https://github.com/mackwic/colored. The MPL-2.0 text itself is at
 https://mozilla.org/MPL/2.0/.
 
 This section records the obligations these dependencies add, not the full
-dependency graph. Coyote's wider MIT- and Apache-licensed tree carries
-notice obligations of its own that predate these dependencies and are not
-enumerated anywhere; closing that gap is a separate piece of work.
+dependency graph. Coyote's wider tree carries notice obligations that predate
+these dependencies, most of them enumerated nowhere; closing that gap is a
+separate piece of work.
 
 --------------------------------------------------------------------------------
 Windows platform bindings

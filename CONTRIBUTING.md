@@ -103,7 +103,7 @@ publishes happily and then resolves against the registry, which is the silent-do
 ### Outstanding license obligations
 
 Coyote must not ship a release while a release-blocking obligation recorded in
-[NOTICE](./NOTICE) is unmet. NOTICE records two obligations today, of which one is
+[NOTICE](./NOTICE) is unmet. NOTICE leaves two obligations outstanding today, of which one is
 release-blocking: the license texts the distributed binary relies on, GPL-2.0-or-later for the
 mesh crates and BSD 3-Clause for the dalek crates, are not in this repository. Add them, or drop
 the dependencies, before cutting a release that contains them. The second, settling the license

@@ -57,8 +57,9 @@ Coyote relies on the GPL-2.0-or-later arm, the only arm compatible with
 AGPL-3.0-only. Two obligations follow for Coyote, neither of which is done
 yet: shipping copies of the license texts the distributed binary relies on,
 GPL-2.0-or-later for the mesh crates and BSD 3-Clause for the dalek crates,
-which blocks a release; and settling the license expression for the combined
-work, which is tracked separately. [NOTICE](./NOTICE) records both.
+of which only `x25519-dalek` arrives with these dependencies, which blocks a
+release; and settling the license expression for the combined work, which is
+tracked separately. [NOTICE](./NOTICE) records both.
 
 `reticulum-rs-transport` brings a few third parties in transitively. Its
 default `storage` feature pulls in `rusqlite` with a bundled SQLite
