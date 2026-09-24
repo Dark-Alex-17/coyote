@@ -3,6 +3,7 @@ use crate::mesh::r3::frame::{
     Envelope, MAX_R3_PAYLOAD_BYTES, RequestFrame, RequestId, ResponseFrame,
 };
 use crate::mesh::r3::receipt::RequestReceipt;
+use crate::mesh::r3::short;
 
 use parking_lot::Mutex;
 use rmpv::Value;
@@ -671,7 +672,7 @@ pub(crate) async fn identify(
         SendPacketOutcome::SentDirect => {
             debug!(
                 "Sent mesh identify for {} on link {}",
-                identity.as_identity().address_hash.to_hex_string(),
+                short(&identity.as_identity().address_hash.to_hex_string()),
                 link_id.to_hex_string()
             );
             Ok(())

@@ -3,6 +3,7 @@ use crate::mesh::r3::client::SizeBranch;
 use crate::mesh::r3::error::RefusalCode;
 use crate::mesh::r3::frame::{Envelope, PathHash, RequestId};
 use crate::mesh::r3::server::{Admission, InboundRequest, Reply, RequestHandler};
+use crate::mesh::r3::short;
 use crate::mesh::trust::{Decision, IdentityStanding, Rule, TrustStore};
 
 use async_trait::async_trait;
@@ -12,23 +13,17 @@ use rns_transport::destination::link::LinkId;
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::Identity;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 pub(crate) const KNOCK_PATH: &str = "/knock";
 pub(crate) const STATUS_PATH: &str = "/status";
 pub(crate) const MESSAGE_PATH: &str = "/message";
 
-/// How much of a hash the logs show.
-const LOGGED_HASH_CHARS: usize = 8;
-
 fn path_name(path_hash: PathHash) -> Option<&'static str> {
     [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH]
         .into_iter()
         .find(|path| PathHash::of(path) == path_hash)
-}
-
-fn short(hash: &str) -> &str {
-    hash.get(..LOGGED_HASH_CHARS).unwrap_or(hash)
 }
 
 /// One request the dispatcher has let through. `identity` is proven on the link and
@@ -137,6 +132,22 @@ impl DispatchError {
     }
 }
 
+/// A path `register` will not hand over because the dispatcher serves it itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReservedPath(pub String);
+
+impl fmt::Display for ReservedPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "The mesh path {} is served by the dispatcher itself and cannot be registered",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ReservedPath {}
+
 enum Route {
     Provided(Arc<dyn Handler>),
     /// A path this node knows but nothing serves yet.
@@ -181,21 +192,50 @@ impl Dispatcher {
     }
 
     /// Serves `path` with `handler`, returning the handler it displaces, if any. A
-    /// placeholder counts as nothing displaced.
+    /// placeholder counts as nothing displaced. `/knock` is the dispatcher's own: registering
+    /// it is refused and the routes are left as they were.
     // Reached by the status and message providers once they land.
     #[allow(dead_code)]
     pub(crate) fn register(
         &self,
         path: &str,
         handler: Arc<dyn Handler>,
-    ) -> Option<Arc<dyn Handler>> {
-        match self
+    ) -> Result<Option<Arc<dyn Handler>>, ReservedPath> {
+        let path_hash = PathHash::of(path);
+        if path_hash == PathHash::of(KNOCK_PATH) {
+            return Err(ReservedPath(path.to_string()));
+        }
+        let displaced = match self
             .routes
             .write()
-            .insert(PathHash::of(path), Route::Provided(handler))?
+            .insert(path_hash, Route::Provided(handler))
         {
-            Route::Provided(previous) => Some(previous),
-            Route::NoProvider(_) => None,
+            Some(Route::Provided(previous)) => Some(previous),
+            Some(Route::NoProvider(_)) | None => None,
+        };
+        Ok(displaced)
+    }
+
+    /// Answers a verdict the store refused under `rule`. A default-closed refusal knocks
+    /// first, since nobody has trusted the instance yet. A blocked identity hears nothing,
+    /// as it would have from `admit`: the block may have landed after `handle` read its
+    /// standing, and the refusal taxonomy promises blocked peers silence either way.
+    pub(super) fn refusal(&self, rule: Rule, knock: KnockEvent, log: &dyn Fn(&str, &str)) -> Reply {
+        let id8 = short(&knock.identity_hash).to_string();
+        match rule {
+            Rule::IdentityBlocked => {
+                log(&id8, "dropped: blocked identity");
+                Reply::Silent
+            }
+            Rule::DefaultClosed => {
+                self.knocks.knock(knock);
+                log(&id8, &format!("refused: {rule:?} (knocked)"));
+                self.refuse()
+            }
+            _ => {
+                log(&id8, &format!("refused: {rule:?}"));
+                self.refuse()
+            }
         }
     }
 
@@ -262,24 +302,18 @@ impl RequestHandler for Dispatcher {
         let rule = verdict.rule;
         match verdict.decision {
             Decision::Refuse => {
-                if rule == Rule::DefaultClosed {
-                    let data =
-                        (request.path_hash == PathHash::of(KNOCK_PATH)).then_some(envelope.body);
-                    self.knocks.knock(KnockEvent {
-                        identity_hash: identity_hex.clone(),
+                let data = (request.path_hash == PathHash::of(KNOCK_PATH)).then_some(envelope.body);
+                self.refusal(
+                    rule,
+                    KnockEvent {
+                        identity_hash: identity_hex,
                         destination_hash: destination_hex,
                         link_id,
                         path_hash: request.path_hash,
                         data,
-                    });
-                    log(
-                        short(&identity_hex),
-                        &format!("refused: {rule:?} (knocked)"),
-                    );
-                } else {
-                    log(short(&identity_hex), &format!("refused: {rule:?}"));
-                }
-                self.refuse()
+                    },
+                    &log,
+                )
             }
             Decision::Allow => {
                 let route = self

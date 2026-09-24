@@ -20,3 +20,10 @@ pub(crate) use receipt::RequestReceipt;
 pub(crate) use server::R3Server;
 #[cfg(test)]
 pub(crate) use server::RequestHandler;
+
+/// How much of a hash the logs show.
+pub(crate) const LOGGED_HASH_CHARS: usize = 8;
+
+pub(crate) fn short(hash: &str) -> &str {
+    hash.get(..LOGGED_HASH_CHARS).unwrap_or(hash)
+}

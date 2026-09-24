@@ -4,6 +4,7 @@ use crate::mesh::r3::error::{R3Error, RefusalCode};
 use crate::mesh::r3::frame::{
     MAX_R3_PAYLOAD_BYTES, PathHash, RequestFrame, RequestId, ResponseFrame,
 };
+use crate::mesh::r3::short;
 
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
@@ -207,7 +208,7 @@ impl R3Server {
             LinkEvent::PeerIdentified(identity) => {
                 debug!(
                     "Mesh peer {} identified on link {}",
-                    identity.address_hash.to_hex_string(),
+                    short(&identity.address_hash.to_hex_string()),
                     link_id.to_hex_string()
                 );
                 self.identified.lock().insert(link_id, *identity);

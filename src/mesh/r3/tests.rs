@@ -305,7 +305,7 @@ mod network {
     };
     use super::super::dispatch::{
         AdmittedRequest, DispatchError, Dispatcher, Handler, KNOCK_PATH, KnockEvent, KnockSink,
-        LoggingKnockSink, MESSAGE_PATH, STATUS_PATH,
+        LoggingKnockSink, MESSAGE_PATH, ReservedPath, STATUS_PATH,
     };
     use super::super::error::{R3Error, RefusalCode};
     use super::super::frame::{
@@ -320,7 +320,7 @@ mod network {
     use crate::mesh::announce::AnnounceAppData;
     use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, SHUTDOWN_GRACE};
     use crate::mesh::test_support::{TempDir, loopback_relay, mesh_paths, private_config};
-    use crate::mesh::trust::{IdentityStanding, TrustChange, TrustOptions, TrustStore};
+    use crate::mesh::trust::{IdentityStanding, Rule, TrustChange, TrustOptions, TrustStore};
     use crate::mesh::{destination_address, mesh_config_dir, rfc3339_utc};
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
@@ -643,7 +643,7 @@ mod network {
         let (trust, tmp) = list.open(tag);
         let sink = Arc::new(SpySink::default());
         let dispatcher = Dispatcher::new(trust, sink.clone());
-        assert!(dispatcher.register(TEST_PATH, recorder).is_none());
+        assert!(dispatcher.register(TEST_PATH, recorder).unwrap().is_none());
         responder.server.set_handler(Arc::new(dispatcher));
         Gate { sink, _tmp: tmp }
     }
@@ -2238,6 +2238,115 @@ mod network {
         ));
     }
 
+    /// Hands `rule` to the dispatcher's refusal seam as `handle` would after the store
+    /// refused, recording every `(id8, outcome)` it logs into `logged`.
+    fn refusal_under(
+        dispatcher: &Dispatcher,
+        rule: Rule,
+        identity: &Identity,
+        logged: &Mutex<Vec<(String, String)>>,
+    ) -> Reply {
+        let knock = KnockEvent {
+            identity_hash: identity.address_hash.to_hex_string(),
+            destination_hash: destination_address(
+                &OriginName::of(&fresh_destination_name()).0,
+                &identity.address_hash,
+            )
+            .to_hex_string(),
+            link_id: LinkId::new_from_rand(OsRng),
+            path_hash: PathHash::of(KNOCK_PATH),
+            data: Some(Value::Nil),
+        };
+        dispatcher.refusal(rule, knock, &|id8, outcome| {
+            logged.lock().push((id8.to_string(), outcome.to_string()))
+        })
+    }
+
+    /// The store may block an identity between `handle` reading its standing and asking
+    /// for a verdict; that verdict refuses under `IdentityBlocked`. The blocked peer still
+    /// hears nothing, exactly as if the standing check had caught it: no refusal bytes and
+    /// no knock.
+    #[test]
+    fn a_verdict_blocked_after_the_standing_check_is_answered_silently() {
+        let identity = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let identity_hex = identity.address_hash.to_hex_string();
+        let (trust, _tmp) = TrustList::default().open("r3-dispatch-blocked-verdict");
+        let sink = Arc::new(SpySink::default());
+        let dispatcher = Dispatcher::new(trust, sink.clone());
+        let logged = Mutex::new(Vec::new());
+
+        let reply = refusal_under(&dispatcher, Rule::IdentityBlocked, &identity, &logged);
+
+        assert!(matches!(reply, Reply::Silent));
+        assert_eq!(sink.count(), 0, "a blocked identity never knocks");
+        assert_eq!(
+            *logged.lock(),
+            vec![(
+                identity_hex[..8].to_string(),
+                "dropped: blocked identity".to_string()
+            )]
+        );
+    }
+
+    /// The other refusals keep their bytes: default-closed knocks and refuses, a denied
+    /// destination refuses without a knock.
+    #[test]
+    fn refusals_other_than_a_blocked_identity_still_answer_no_access() {
+        let identity = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let identity_hex = identity.address_hash.to_hex_string();
+        let (trust, _tmp) = TrustList::default().open("r3-dispatch-refusal-bytes");
+        let sink = Arc::new(SpySink::default());
+        let dispatcher = Dispatcher::new(trust, sink.clone());
+        let logged = Mutex::new(Vec::new());
+
+        let closed = refusal_under(&dispatcher, Rule::DefaultClosed, &identity, &logged);
+        assert!(matches!(closed, Reply::Code(RefusalCode::NoAccess)));
+        assert_eq!(sink.count(), 1, "default-closed knocks");
+
+        let denied = refusal_under(&dispatcher, Rule::DestinationDenied, &identity, &logged);
+        assert!(matches!(denied, Reply::Code(RefusalCode::NoAccess)));
+        assert_eq!(sink.count(), 1, "a denied destination does not knock");
+
+        let id8 = identity_hex[..8].to_string();
+        assert_eq!(
+            *logged.lock(),
+            vec![
+                (id8.clone(), "refused: DefaultClosed (knocked)".to_string()),
+                (id8, "refused: DestinationDenied".to_string()),
+            ]
+        );
+    }
+
+    /// `/knock` is the dispatcher's own. Registering over it is refused, and the built-in
+    /// handler goes on serving it.
+    #[tokio::test]
+    async fn registering_over_knock_is_refused_and_displaces_nothing() {
+        let identity = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let identity_hex = identity.address_hash.to_hex_string();
+        let (trust, _tmp) = TrustList::default()
+            .identity(&identity_hex, true)
+            .open("r3-dispatch-knock-reserved");
+        let sink = Arc::new(SpySink::default());
+        let dispatcher = Dispatcher::new(trust, sink.clone());
+        let usurper = Arc::new(Recorder::default());
+
+        assert!(matches!(
+            dispatcher.register(KNOCK_PATH, usurper.clone()),
+            Err(ReservedPath(path)) if path == KNOCK_PATH
+        ));
+
+        let request = admitted_knock(identity, OriginName::of(&fresh_destination_name()));
+        let reply = RequestHandler::handle(&dispatcher, request).await;
+
+        assert!(matches!(reply, Reply::Value(Value::Nil)));
+        assert_eq!(
+            sink.count(),
+            1,
+            "the built-in knock handler still serves /knock"
+        );
+        assert_eq!(usurper.seen_count(), 0);
+    }
+
     /// An identity untrusted between `admit` and `handle` is no longer in the list at all,
     /// which under the destination rules alone would be default-closed: a knock and a
     /// refusal. `handle` drops it instead, like `admit` would have.
@@ -2969,6 +3078,7 @@ mod network {
                 pair.node_a
                     .dispatcher()
                     .register(path, pair.recorder_a.clone())
+                    .unwrap()
                     .is_none(),
                 "registering over the {path} placeholder displaces nothing"
             );
@@ -3276,10 +3386,16 @@ mod network {
             .unwrap();
         let dispatcher = pair.node_a.dispatcher();
         let replaced = Arc::new(Recorder::default());
-        assert!(dispatcher.register(STATUS_PATH, replaced.clone()).is_none());
+        assert!(
+            dispatcher
+                .register(STATUS_PATH, replaced.clone())
+                .unwrap()
+                .is_none()
+        );
         assert!(
             dispatcher
                 .register(STATUS_PATH, pair.recorder_a.clone())
+                .unwrap()
                 .is_some(),
             "registering a path again returns the provider it replaces"
         );
@@ -3398,6 +3514,7 @@ mod network {
             pair.node_a
                 .dispatcher()
                 .register(STATUS_PATH, pair.recorder_a.clone())
+                .unwrap()
                 .is_none()
         );
         let status = |body: &str| {
@@ -3461,9 +3578,6 @@ mod network {
     /// peer has been knocked for through the sink the runtime installs, refused as
     /// unverifiable, told a path is unknown and served, neither its full identity hash nor
     /// its full instance hash appears anywhere in the debug or warn log.
-    ///
-    /// The two identify lines, "Sent mesh identify for" and "identified on link", predate
-    /// the truncation rule and still print the full identity hash; they are excluded here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serving_path_logs_never_carry_a_full_identity_or_instance_hash() {
         install_log_collector();
@@ -3474,7 +3588,12 @@ mod network {
         let gate_with_logging_sink = |list: &TrustList, tag: &str| {
             let (trust, tmp) = list.open(tag);
             let dispatcher = Dispatcher::new(trust, Arc::new(LoggingKnockSink));
-            assert!(dispatcher.register(TEST_PATH, recorder.clone()).is_none());
+            assert!(
+                dispatcher
+                    .register(TEST_PATH, recorder.clone())
+                    .unwrap()
+                    .is_none()
+            );
             responder.server.set_handler(Arc::new(dispatcher));
             tmp
         };
@@ -3546,12 +3665,8 @@ mod network {
             logs.iter().any(|m| m.contains("Mesh knock from")),
             "the scan must see the runtime's knock sink"
         );
-        let legacy_identify_line = |m: &String| {
-            m.starts_with("Sent mesh identify for ") || m.contains(" identified on link ")
-        };
         let offenders: Vec<&String> = logs
             .iter()
-            .filter(|m| !legacy_identify_line(m))
             .filter(|m| m.contains(&identity) || m.contains(&instance))
             .collect();
         assert!(

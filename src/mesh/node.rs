@@ -366,7 +366,7 @@ impl MeshRuntime {
 
     /// The gate every inbound request passes; providers register their paths on it.
     /// `register` returns the provider it displaced, a placeholder counting as nothing
-    /// displaced; `/knock` is owned by the dispatcher itself.
+    /// displaced; `/knock` is owned by the dispatcher itself and registering it is refused.
     // Reached by the status and message providers once they land.
     #[allow(dead_code)]
     pub(crate) fn dispatcher(&self) -> Arc<Dispatcher> {
