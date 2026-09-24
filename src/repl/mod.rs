@@ -1082,8 +1082,14 @@ pub async fn run_repl_command(
                 }
             },
             ".fork" => {
-                // The mesh runtime consumes this rekey once it exists; nothing re-keys yet.
-                let _rekey = ctx.fork_session(args)?;
+                let forked = ctx.fork_session(args)?;
+                ctx.app.mesh.rekey(forked.rekey).await.with_context(|| {
+                    format!(
+                        "Forked '{}' into '{}', but the mesh node could not be re-keyed onto the fork",
+                        forked.from, forked.to
+                    )
+                })?;
+                println!("Forked '{}' into '{}'", forked.from, forked.to);
             }
             ".save" => match split_first_arg(args) {
                 Some(("role", name)) => {

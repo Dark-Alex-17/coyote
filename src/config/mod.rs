@@ -54,13 +54,13 @@ pub(crate) use self::mcp_tool_policy::{LayerSource, ToolFilter};
 pub use self::mesh_config::MeshConfig;
 #[allow(unused_imports)]
 pub use self::request_context::{
-    RenderMode, RequestContext, effective_max_concurrent_jobs, jobs_enabled,
+    ForkedSession, RenderMode, RequestContext, effective_max_concurrent_jobs, jobs_enabled,
     should_inject_skill_instructions,
 };
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
-pub use self::session::Session;
+pub use self::session::{ForkRekey, Session};
 #[allow(unused_imports)]
 pub use self::skill::Skill;
 #[allow(unused_imports)]

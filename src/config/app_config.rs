@@ -917,6 +917,8 @@ mod tests {
     }
 
     #[test]
+    // A neighbouring test sets COYOTE_FUNCTION_CALLING_SUPPORT, which from_config reads.
+    #[serial_test::serial]
     fn from_config_accepts_mesh_enabled_with_function_calling() {
         let cfg = Config {
             model_id: "test-model".to_string(),

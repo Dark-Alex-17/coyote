@@ -116,6 +116,11 @@ self_update = { version = "0.44", default-features = false, features = [
   "compression-zip-deflate",
 ] }
 qrcode = "0.14"
+tokio-util = "0.7"
+# Pinned to the rand_core generation `reticulum-rs-transport` is built on: its announce
+# builder takes a `CryptoRngCore` from this version and re-exports none, so `rand` 0.10's
+# `OsRng` cannot be passed. Moves together with the transport pin below.
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Reticulum transport and LXMF wire format, pinned to an exact revision because the
 # published 0.11.0 is fourteen commits behind it and lacks the delivery-stamp calls
@@ -127,8 +132,8 @@ qrcode = "0.14"
 # The git pin is development-only: it must be replaced by a crates.io version pin
 # before merge, per the dependency policy in CONTRIBUTING.md.
 #
-# Both entries are unconditional on purpose. No product code consumes them yet, so
-# keeping them off a feature flag is what makes every CI leg compile and test them.
+# Both entries are unconditional on purpose: the mesh runtime in `src/mesh` is not
+# feature-gated, so every CI leg compiles and tests it.
 #
 # Default features are kept deliberately too. `reticulum-rs-transport`'s default
 # `storage` feature gates the SQLite-backed message and announce store that the

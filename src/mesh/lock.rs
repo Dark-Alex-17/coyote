@@ -1,183 +1,140 @@
-use crate::config::{Session, paths};
+use crate::config::Session;
+use crate::mesh::mesh_cache_dir;
 
 use anyhow::{Context, Result, bail};
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{Read, Seek, Write};
+use std::path::Path;
 
-/// Where instance locks live.
-pub(crate) fn lock_dir() -> PathBuf {
-    paths::cache_dir().join("mesh")
-}
-
-/// Marks one session's mesh instance as owned by this process. The lock file carries our pid
-/// and is removed when the value drops; a lock left behind by a dead process is reclaimed.
+/// Marks one session's mesh instance as owned by this process through a kernel advisory lock
+/// on `<cache_dir>/mesh/<instance_id>.lock`. Dropping the guard unlocks explicitly, and a
+/// crashed holder is released by the kernel when its handle closes, so no cleanup is needed.
+/// The file itself is never removed: unlinking would race a concurrent opener onto an
+/// orphaned inode, and a leftover unlocked file is harmless because acquiring simply locks
+/// it again. On Windows the lock is mandatory, so a refusal there may omit the holder's pid:
+/// the locked file cannot be read through another handle.
 #[derive(Debug)]
 pub(crate) struct InstanceLock {
-    path: PathBuf,
+    file: File,
 }
 
 impl InstanceLock {
-    /// Claims `<cache_dir>/mesh/<instance_id>.lock`, refusing while another live process holds it.
+    /// Claims the lock for `instance_id`, refusing while any process, including this one,
+    /// holds it.
     pub(crate) fn acquire(cache_dir: &Path, instance_id: &str) -> Result<Self> {
         if !Session::is_valid_mesh_instance_id(instance_id) {
             bail!(
                 "Mesh instance id '{instance_id}' is malformed: expected 32 lowercase hex characters. The session file's `mesh_instance_id` is corrupt; remove that line from the session file to mint a fresh id."
             );
         }
-        let dir = cache_dir.join("mesh");
+        let dir = mesh_cache_dir(cache_dir);
         fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create directory '{}'", dir.display()))?;
         let path = dir.join(format!("{instance_id}.lock"));
 
-        if let Some(lock) = Self::try_create(&path)? {
-            return Ok(lock);
-        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("Failed to open mesh instance lock '{}'", path.display()))?;
 
-        match read_holder_pid(&path)? {
-            Some(pid) if process_is_alive(pid)? => bail!(
-                "This session already has mesh enabled in another Coyote process (pid {pid}). Run `.mesh on --fresh` here to join the mesh with a new ephemeral destination, or turn mesh off in the other process first."
-            ),
-            Some(pid) => debug!(
-                "Reclaiming mesh instance lock '{}' left by dead pid {pid}",
-                path.display()
-            ),
-            // A hard kill between create and write leaves an empty file behind.
-            None => debug!(
-                "Reclaiming mesh instance lock '{}' with no readable pid",
-                path.display()
-            ),
-        }
-        remove_if_present(&path)?;
-
-        match Self::try_create(&path)? {
-            Some(lock) => Ok(lock),
-            None => bail!(
-                "Another Coyote process is enabling mesh on this session right now. Run `.mesh on --fresh` here to join the mesh with a new ephemeral destination, or retry in a moment."
-            ),
-        }
-    }
-
-    /// `Ok(None)` means the file already exists. The lock value is built before the pid is
-    /// written so a failed write still removes the file on drop.
-    fn try_create(path: &Path) -> Result<Option<Self>> {
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(None),
-            Err(err) => {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => match read_holder_pid(&mut file) {
+                Some(pid) if pid == std::process::id() => bail!(
+                    "This session already has mesh enabled in this Coyote process. Run `.mesh off` first, then `.mesh on` to start it again."
+                ),
+                Some(pid) => bail!(
+                    "This session already has mesh enabled in another Coyote process (pid {pid}). Run `.mesh on --fresh` here to join the mesh with a new ephemeral destination, or turn mesh off in the other process first."
+                ),
+                None => bail!(
+                    "This session already has mesh enabled in another Coyote process. Run `.mesh on --fresh` here to join the mesh with a new ephemeral destination, or turn mesh off in the other process first."
+                ),
+            },
+            Err(TryLockError::Error(err)) => {
                 return Err(err).with_context(|| {
-                    format!("Failed to create mesh instance lock '{}'", path.display())
+                    format!("Failed to take the mesh instance lock '{}'", path.display())
                 });
             }
-        };
-        let lock = Self {
-            path: path.to_path_buf(),
-        };
-        file.write_all(std::process::id().to_string().as_bytes())
-            .and_then(|()| file.sync_all())
+        }
+
+        file.set_len(0)
+            .and_then(|()| file.write_all(std::process::id().to_string().as_bytes()))
             .with_context(|| format!("Failed to write mesh instance lock '{}'", path.display()))?;
-        Ok(Some(lock))
+        Ok(Self { file })
+    }
+
+    #[cfg(test)]
+    fn holder_pid(&mut self) -> Option<u32> {
+        read_holder_pid(&mut self.file)
     }
 }
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn read_holder_pid(path: &Path) -> Result<Option<u32>> {
-    match fs::read_to_string(path) {
-        Ok(content) => Ok(content.trim().parse().ok()),
-        // The holder released between our create attempt and this read.
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err)
-            .with_context(|| format!("Failed to read mesh instance lock '{}'", path.display())),
-    }
-}
-
-fn remove_if_present(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| {
-            format!(
-                "Failed to remove stale mesh instance lock '{}'",
-                path.display()
-            )
-        }),
-    }
-}
-
-/// Whether a process with `pid` exists. A process we lack permission to signal still exists.
-// The only unsafe in this module: a signal-0 probe through libc.
-#[allow(unsafe_code)]
-pub(crate) fn process_is_alive(pid: u32) -> Result<bool> {
-    // No process has pid 0; kill(0, 0) would probe our own process group and always succeed.
-    if pid == 0 {
-        return Ok(false);
-    }
-    #[cfg(unix)]
-    {
-        // A pid outside pid_t range cannot name a process; passing it through would be
-        // interpreted as a process group.
-        let Ok(pid_t) = libc::pid_t::try_from(pid) else {
-            return Ok(false);
-        };
-        // SAFETY: kill with signal 0 only performs the existence and permission checks; no
-        // signal is delivered and no memory is touched.
-        if unsafe { libc::kill(pid_t, 0) } == 0 {
-            return Ok(true);
-        }
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::ESRCH) => Ok(false),
-            Some(libc::EPERM) => Ok(true),
-            _ => Err(err).with_context(|| format!("Failed to check whether pid {pid} is alive")),
+        if let Err(err) = self.file.unlock() {
+            warn!("Failed to release a mesh instance lock: {err}");
         }
     }
-    #[cfg(not(unix))]
-    {
-        bail!(
-            "Process liveness checks are not yet implemented on Windows, so a stale mesh instance lock cannot be reclaimed safely and mesh cannot be enabled on this platform yet."
-        )
-    }
+}
+
+/// The pid the holder wrote, if it is readable. Reads from the start regardless of where the
+/// handle's cursor was left. The content may be empty or partial while the holder is between
+/// `try_lock` and finishing its write, so `None` covers that window as well as unparseable
+/// leftovers and Windows, where reading a region another handle has locked fails. A killed
+/// holder never reaches this path: its death released the kernel lock. The pid is only ever
+/// used to word the refusal, so a stale or reused pid costs nothing but a misleading hint.
+fn read_holder_pid(file: &mut File) -> Option<u32> {
+    let mut content = String::new();
+    file.rewind().ok()?;
+    file.read_to_string(&mut content).ok()?;
+    content.trim().parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_support::TempDir;
     use super::*;
+    use std::path::PathBuf;
 
     const ID_A: &str = "0123456789abcdef0123456789abcdef";
     const ID_B: &str = "fedcba9876543210fedcba9876543210";
     const ID_C: &str = "00000000000000000000000000000001";
     const ID_D: &str = "00000000000000000000000000000002";
-    const ID_E: &str = "00000000000000000000000000000003";
 
     fn lock_path(cache_dir: &Path, id: &str) -> PathBuf {
         cache_dir.join("mesh").join(format!("{id}.lock"))
     }
 
     #[test]
-    fn acquire_writes_pid_and_drop_removes_lock() {
+    fn acquire_writes_pid() {
         let cache = TempDir::new("lock-basic");
-        let path = lock_path(&cache.path, ID_A);
         assert!(
             !cache.path.join("mesh").exists(),
             "the mesh cache dir must not exist before a lock is taken"
         );
 
-        let lock = InstanceLock::acquire(&cache.path, ID_A).unwrap();
+        let mut lock = InstanceLock::acquire(&cache.path, ID_A).unwrap();
 
-        assert_eq!(lock.path, path);
+        assert!(lock_path(&cache.path, ID_A).exists());
+        assert_eq!(lock.holder_pid(), Some(std::process::id()));
+    }
+
+    // LockFileEx is mandatory: on Windows a second handle cannot read the locked region.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_writes_pid_readable_through_another_handle() {
+        let cache = TempDir::new("lock-basic-second-handle");
+        let path = lock_path(&cache.path, ID_A);
+
+        let _lock = InstanceLock::acquire(&cache.path, ID_A).unwrap();
+
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             std::process::id().to_string()
         );
-
-        drop(lock);
-        assert!(!path.exists());
     }
 
     #[test]
@@ -210,107 +167,71 @@ mod tests {
         assert!(!cache.path.join("../escape.lock").exists());
     }
 
+    // LockFileEx is mandatory: on Windows a second handle cannot read the locked region, so
+    // the refusal there cannot tell this process from another.
     #[cfg(unix)]
     #[test]
-    fn acquire_refuses_lock_held_by_live_pid() {
-        let cache = TempDir::new("lock-live");
+    fn second_acquire_in_same_process_fails_naming_this_process_and_remedy() {
+        let cache = TempDir::new("lock-held");
         let path = lock_path(&cache.path, ID_B);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, std::process::id().to_string()).unwrap();
+        let _held = InstanceLock::acquire(&cache.path, ID_B).unwrap();
 
         let err = InstanceLock::acquire(&cache.path, ID_B)
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains(".mesh on --fresh"), "{err}");
+        assert!(err.contains("in this Coyote process"), "{err}");
+        assert!(err.contains(".mesh off"), "{err}");
+        assert!(!err.contains("--fresh"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            std::process::id().to_string(),
+            "a refused acquire must leave the holder's pid alone"
+        );
+    }
+
+    #[test]
+    fn second_acquire_of_held_lock_fails_naming_remedy() {
+        let cache = TempDir::new("lock-held-portable");
+        let mut held = InstanceLock::acquire(&cache.path, ID_B).unwrap();
+
+        let err = InstanceLock::acquire(&cache.path, ID_B)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("already has mesh enabled"), "{err}");
         assert!(
-            err.contains(&format!("pid {}", std::process::id())),
+            err.contains(".mesh off") || err.contains(".mesh on --fresh"),
             "{err}"
         );
-        assert!(
-            path.exists(),
-            "a refused acquire must leave the holder's lock alone"
+        assert_eq!(
+            held.holder_pid(),
+            Some(std::process::id()),
+            "a refused acquire must leave the holder's pid alone"
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn acquire_reclaims_lock_left_by_dead_pid() {
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let dead_pid = child.id();
-        child.wait().unwrap();
-        assert!(!process_is_alive(dead_pid).unwrap());
-
-        let cache = TempDir::new("lock-dead");
+    fn drop_releases_lock_so_reacquire_succeeds() {
+        let cache = TempDir::new("lock-release");
         let path = lock_path(&cache.path, ID_C);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, dead_pid.to_string()).unwrap();
+        let lock = InstanceLock::acquire(&cache.path, ID_C).unwrap();
 
-        let _lock = InstanceLock::acquire(&cache.path, ID_C).unwrap();
+        drop(lock);
 
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            std::process::id().to_string()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn acquire_reclaims_lock_holding_pid_zero() {
-        let cache = TempDir::new("lock-pid-zero");
-        let path = lock_path(&cache.path, ID_E);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "0").unwrap();
-
-        let _lock = InstanceLock::acquire(&cache.path, ID_E).unwrap();
-
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            std::process::id().to_string()
-        );
+        assert!(path.exists(), "releasing must not unlink the lock file");
+        let _again = InstanceLock::acquire(&cache.path, ID_C).unwrap();
     }
 
     #[test]
-    fn acquire_reclaims_empty_lock() {
-        let cache = TempDir::new("lock-empty");
+    fn acquire_takes_over_unlocked_file_with_stale_content() {
+        let cache = TempDir::new("lock-stale");
         let path = lock_path(&cache.path, ID_D);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "").unwrap();
+        fs::write(&path, "4000000000 leftover from an older format").unwrap();
 
-        let _lock = InstanceLock::acquire(&cache.path, ID_D).unwrap();
+        let mut lock = InstanceLock::acquire(&cache.path, ID_D).unwrap();
 
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            std::process::id().to_string()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn process_is_alive_reports_current_process() {
-        assert!(process_is_alive(std::process::id()).unwrap());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn process_is_alive_treats_pid_zero_as_dead() {
-        assert!(!process_is_alive(0).unwrap());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn process_is_alive_treats_out_of_range_pid_as_dead() {
-        assert!(!process_is_alive(u32::MAX - 1).unwrap());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn lock_dir_is_mesh_under_cache_dir() {
-        let cache = TempDir::new("lock-dir");
-        let _env =
-            crate::testing::EnvVarGuard::set(crate::utils::get_env_name("cache_dir"), &cache.path);
-
-        assert_eq!(lock_dir(), cache.path.join("mesh"));
-        assert!(!lock_dir().exists());
+        assert_eq!(lock.holder_pid(), Some(std::process::id()));
     }
 }

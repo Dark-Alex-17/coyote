@@ -34,8 +34,6 @@ fn mint_mesh_instance_id() -> String {
 }
 
 /// What the mesh runtime needs to move the live destination from the original session to its fork.
-// Scaffolding for the mesh runtime: the first consumer of these fields removes the allow.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 #[must_use = "the mesh runtime must re-key the live destination"]
 pub struct ForkRekey {
@@ -280,8 +278,6 @@ impl Session {
 
     /// The id this session's mesh destination is derived from, minted lazily. Sessions that
     /// never join the mesh and were never forked carry none; `fork` is the other minting path.
-    // Scaffolding for the mesh runtime: the first consumer of this method removes the allow.
-    #[allow(dead_code)]
     pub fn ensure_mesh_instance_id(&mut self) -> &str {
         if self.mesh_instance_id.is_none() {
             self.dirty = true;
@@ -1679,6 +1675,7 @@ mod tests {
             mcp_log_path: None,
             mcp_registry: None,
             functions: Functions::default(),
+            mesh: Default::default(),
         });
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
 

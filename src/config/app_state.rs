@@ -4,6 +4,7 @@ use crate::config::AppConfig;
 use crate::config::jobs_enabled;
 use crate::function::Functions;
 use crate::mcp::{McpRegistry, McpServersConfig};
+use crate::mesh::MeshSlot;
 use crate::utils::AbortSignal;
 use crate::vault::{GlobalVault, Vault};
 
@@ -21,6 +22,7 @@ pub struct AppState {
     pub mcp_log_path: Option<PathBuf>,
     pub mcp_registry: Option<Arc<McpRegistry>>,
     pub functions: Functions,
+    pub mesh: Arc<MeshSlot>,
 }
 
 impl AppState {
@@ -35,6 +37,7 @@ impl AppState {
             mcp_log_path: None,
             mcp_registry: None,
             functions: Functions::default(),
+            mesh: Arc::new(MeshSlot::default()),
         }
     }
 
@@ -103,6 +106,7 @@ impl AppState {
             mcp_log_path,
             mcp_registry,
             functions,
+            mesh: Arc::new(MeshSlot::default()),
         })
     }
 }

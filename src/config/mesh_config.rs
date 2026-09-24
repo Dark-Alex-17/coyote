@@ -59,12 +59,11 @@ impl Default for MeshConfig {
 }
 
 impl MeshConfig {
-    // Scaffolding for the mesh runtime: the first consumer of these accessors removes the allows.
-    #[allow(dead_code)]
     pub fn interfaces(&self) -> &[MeshInterface] {
         &self.interfaces
     }
 
+    // Consumed by the envoy's digest step, which has not landed yet.
     #[allow(dead_code)]
     pub fn digest_prompt(&self) -> &str {
         self.digest_prompt.as_deref().unwrap_or(MESH_DIGEST_PROMPT)

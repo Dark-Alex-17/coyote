@@ -13,9 +13,10 @@ static DEBUG_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 /// output so the buffer is not flooded by the rest of the crate. Matching is
 /// module-boundary-aware: only these exact modules or their `::` submodules
 /// qualify, so a sibling like `hooks_registry` would not.
-const DEBUG_TARGET_PREFIXES: [&str; 2] = [
+const DEBUG_TARGET_PREFIXES: [&str; 3] = [
     concat!(env!("CARGO_CRATE_NAME"), "::hooks"),
     concat!(env!("CARGO_CRATE_NAME"), "::config::agent"),
+    concat!(env!("CARGO_CRATE_NAME"), "::mesh"),
 ];
 
 fn captures_warn(metadata: &Metadata) -> bool {

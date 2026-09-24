@@ -110,6 +110,16 @@ pub struct SkillInstructionsConfig {
     pub instructions: Option<String>,
 }
 
+/// A committed fork: both sessions are on disk and the context now holds the fork. The mesh
+/// runtime still has to move its destination, which is why this carries the `ForkRekey`.
+#[derive(Debug, Clone)]
+#[must_use = "the mesh runtime must re-key the live destination"]
+pub struct ForkedSession {
+    pub from: String,
+    pub to: String,
+    pub rekey: ForkRekey,
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryConfig {
     pub enabled: bool,
@@ -572,6 +582,10 @@ impl RequestContext {
         inbox: Arc<Inbox>,
         self_agent_id: String,
     ) -> Self {
+        debug_assert!(
+            app.mesh.get().is_none(),
+            "a child context must be built on an AppState whose mesh slot is empty"
+        );
         let tool_call_tracker = ToolCallTracker::new(4, 10);
 
         Self {
@@ -1130,9 +1144,9 @@ impl RequestContext {
         Ok(())
     }
 
-    /// Forks the active session and switches to the fork. The returned `ForkRekey` is the
-    /// hook point where the mesh runtime moves the live destination to the fork.
-    pub fn fork_session(&mut self, fork_name: Option<&str>) -> Result<ForkRekey> {
+    /// Forks the active session and switches to the fork without printing. The returned
+    /// `ForkedSession` names both sides and carries the `ForkRekey` the mesh runtime needs.
+    pub fn fork_session(&mut self, fork_name: Option<&str>) -> Result<ForkedSession> {
         let current_name = match &self.session {
             Some(s) => s.name().to_string(),
             None => bail!("No active session to fork"),
@@ -1165,9 +1179,12 @@ impl RequestContext {
         fork.save(&fork_name, &fork_path, self.working_mode.is_repl())?;
 
         self.session = Some(fork);
-        println!("Forked '{current_name}' → '{fork_name}'");
 
-        Ok(rekey)
+        Ok(ForkedSession {
+            from: current_name,
+            to: fork_name,
+            rekey,
+        })
     }
 
     pub fn empty_session(&mut self) -> Result<()> {
@@ -7007,10 +7024,13 @@ mod tests {
         let original_id = session.ensure_mesh_instance_id().to_string();
         ctx.session = Some(session);
 
-        let rekey = ctx.fork_session(Some("forked")).unwrap();
+        let forked = ctx.fork_session(Some("forked")).unwrap();
 
         let live = ctx.session.as_ref().unwrap();
         assert_eq!(live.name(), "forked");
+        assert_eq!(forked.from, "original");
+        assert_eq!(forked.to, "forked");
+        let rekey = forked.rekey;
         assert_eq!(
             rekey.original_instance_id.as_deref(),
             Some(original_id.as_str())
@@ -7085,6 +7105,7 @@ mod tests {
             mcp_log_path: None,
             mcp_registry: None,
             functions: Functions::default(),
+            mesh: Default::default(),
         })
     }
 
@@ -7339,6 +7360,7 @@ mod tests {
                 mcp_log_path: None,
                 mcp_registry: None,
                 functions: Functions::default(),
+                mesh: Default::default(),
             })
         };
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -8021,6 +8043,7 @@ mod tests {
                 mcp_log_path: None,
                 mcp_registry: None,
                 functions: Functions::default(),
+                mesh: Default::default(),
             })
         };
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -8160,6 +8183,7 @@ mod tests {
                 mcp_log_path: None,
                 mcp_registry: None,
                 functions: Functions::default(),
+                mesh: Default::default(),
             })
         };
 
@@ -8318,6 +8342,7 @@ mod tests {
                 mcp_log_path: None,
                 mcp_registry: None,
                 functions: Functions::default(),
+                mesh: Default::default(),
             })
         };
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -9584,6 +9609,130 @@ mod tests {
             !names.contains(&"docs.sbx-mixin".to_string()),
             "the sandbox mixin sidecar must not appear as a RAG: {names:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn mesh_runtime_survives_use_agent_and_exit_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-agent").await;
+        let mut ctx = create_test_ctx();
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        let runtime_before = ctx.app.mesh.get().unwrap();
+        let slot_before = Arc::clone(&ctx.app.mesh);
+
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_mesh_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())
+            .await
+            .unwrap();
+        assert!(ctx.agent.is_some());
+        ctx.exit_agent(&app).unwrap();
+        assert!(ctx.agent.is_none());
+
+        assert!(Arc::ptr_eq(&runtime_before, &ctx.app.mesh.get().unwrap()));
+        assert!(Arc::ptr_eq(&slot_before, &ctx.app.mesh));
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn mesh_runtime_survives_set_and_update_app_config() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-set").await;
+        let mut ctx = create_test_ctx();
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        let runtime_before = ctx.app.mesh.get().unwrap();
+        let slot_before = Arc::clone(&ctx.app.mesh);
+        let app_before = Arc::clone(&ctx.app);
+
+        ctx.update("temperature 0.5", utils::create_abort_signal())
+            .await
+            .unwrap();
+        ctx.update_app_config(|app| app.save = true);
+
+        assert!(
+            !Arc::ptr_eq(&app_before, &ctx.app),
+            "the AppState must have been replaced for this test to prove anything"
+        );
+        assert_eq!(ctx.app.config.temperature, Some(0.5));
+        assert!(ctx.app.config.save);
+        assert!(Arc::ptr_eq(&runtime_before, &ctx.app.mesh.get().unwrap()));
+        assert!(Arc::ptr_eq(&slot_before, &ctx.app.mesh));
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    fn mesh_slot_survives_update_app_config_without_a_runtime() {
+        let mut ctx = create_test_ctx();
+        let slot_before = Arc::clone(&ctx.app.mesh);
+        let app_before = Arc::clone(&ctx.app);
+
+        run_async(ctx.update("temperature 0.5", utils::create_abort_signal())).unwrap();
+        ctx.update_app_config(|app| app.save = true);
+
+        assert!(
+            !Arc::ptr_eq(&app_before, &ctx.app),
+            "the AppState must have been replaced for this test to prove anything"
+        );
+        assert_eq!(ctx.app.config.temperature, Some(0.5));
+        assert!(ctx.app.config.save);
+        assert!(Arc::ptr_eq(&slot_before, &ctx.app.mesh));
+        assert!(ctx.app.mesh.get().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn save_session_under_new_name_keeps_mesh_instance_id() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sessions_dir = env::temp_dir().join(format!("coyote-save-as-mesh-{unique}"));
+        let _env = crate::testing::EnvVarGuard::set(get_env_name("sessions_dir"), &sessions_dir);
+
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("orig".to_string());
+        let id = session.ensure_mesh_instance_id().to_string();
+        ctx.session = Some(session);
+
+        ctx.save_session(None).unwrap();
+        ctx.save_session(Some("copy")).unwrap();
+
+        for name in ["orig", "copy"] {
+            let yaml = std::fs::read_to_string(sessions_dir.join(format!("{name}.yaml"))).unwrap();
+            assert!(
+                yaml.contains(&format!("mesh_instance_id: {id}")),
+                "{name}.yaml must carry the id:\n{yaml}"
+            );
+            let on_disk: Session = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(on_disk.mesh_instance_id(), Some(id.as_str()));
+        }
+        assert_eq!(
+            ctx.session.as_ref().unwrap().mesh_instance_id(),
+            Some(id.as_str())
+        );
+
+        remove_dir_all(&sessions_dir).unwrap();
     }
 
     #[test]
@@ -18222,6 +18371,7 @@ mod tests {
                 mcp_log_path: None,
                 mcp_registry: None,
                 functions: Functions::default(),
+                mesh: Default::default(),
             })
         };
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -18392,6 +18542,7 @@ mod tests {
             mcp_log_path: None,
             mcp_registry: None,
             functions: Functions::default(),
+            mesh: Default::default(),
         })
     }
 

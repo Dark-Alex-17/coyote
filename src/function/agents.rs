@@ -7,6 +7,7 @@ use crate::config::{
     list_agents_with_descriptions, load_agent_variables,
 };
 use crate::hooks::{self, HookEvent, ResolvedHook};
+use crate::mesh::MeshSlot;
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
 use crate::supervisor::notification::agent_notification;
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor, TaskKind};
@@ -814,6 +815,23 @@ fn effective_max_agent_depth(parent_ctx: &RequestContext) -> usize {
         .unwrap_or_else(default_max_agent_depth)
 }
 
+/// The child's view of the process: everything shared with the parent except the mesh slot,
+/// which starts empty so a child agent can never reach the process's mesh node. Every child
+/// context is built on this; `RequestContext::new_for_child` debug-asserts the slot is empty.
+fn child_app_state(parent: &AppState) -> Arc<AppState> {
+    Arc::new(AppState {
+        config: Arc::new(parent.config.as_ref().clone()),
+        vault: parent.vault.clone(),
+        mcp_factory: parent.mcp_factory.clone(),
+        rag_cache: parent.rag_cache.clone(),
+        mcp_config: parent.mcp_config.clone(),
+        mcp_log_path: parent.mcp_log_path.clone(),
+        mcp_registry: parent.mcp_registry.clone(),
+        functions: parent.functions.clone(),
+        mesh: Arc::new(MeshSlot::default()),
+    })
+}
+
 /// Spawn an agent synchronously from a graph node and return its accumulated
 /// output. This is similar to `handle_spawn` but runs the child agent in the
 /// current task (no tokio::spawn, no supervisor handle registration) so the
@@ -853,20 +871,11 @@ pub async fn run_agent_for_graph(
     let app_config = Arc::clone(&parent_ctx.app.config);
     let current_model = parent_ctx.current_model().clone();
     let info_flag = parent_ctx.info_flag;
-    let child_app_state = Arc::new(AppState {
-        config: Arc::new(app_config.as_ref().clone()),
-        vault: parent_ctx.app.vault.clone(),
-        mcp_factory: parent_ctx.app.mcp_factory.clone(),
-        rag_cache: parent_ctx.app.rag_cache.clone(),
-        mcp_config: parent_ctx.app.mcp_config.clone(),
-        mcp_log_path: parent_ctx.app.mcp_log_path.clone(),
-        mcp_registry: parent_ctx.app.mcp_registry.clone(),
-        functions: parent_ctx.app.functions.clone(),
-    });
+    let child_app = child_app_state(&parent_ctx.app);
 
     let agent = Agent::init(
         app_config.as_ref(),
-        child_app_state.as_ref(),
+        child_app.as_ref(),
         &current_model,
         info_flag,
         agent_name,
@@ -887,7 +896,7 @@ pub async fn run_agent_for_graph(
     let agent_max_jobs = effective_max_concurrent_jobs(Some(&agent), app_config.as_ref());
 
     let mut child_ctx = RequestContext::new_for_child(
-        Arc::clone(&child_app_state),
+        Arc::clone(&child_app),
         parent_ctx,
         current_depth,
         Arc::clone(&child_inbox),
@@ -1131,19 +1140,10 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let app_config = Arc::clone(&ctx.app.config);
     let current_model = ctx.current_model().clone();
     let info_flag = ctx.info_flag;
-    let child_app_state = Arc::new(AppState {
-        config: Arc::new(app_config.as_ref().clone()),
-        vault: ctx.app.vault.clone(),
-        mcp_factory: ctx.app.mcp_factory.clone(),
-        rag_cache: ctx.app.rag_cache.clone(),
-        mcp_config: ctx.app.mcp_config.clone(),
-        mcp_log_path: ctx.app.mcp_log_path.clone(),
-        mcp_registry: ctx.app.mcp_registry.clone(),
-        functions: ctx.app.functions.clone(),
-    });
+    let child_app = child_app_state(&ctx.app);
     let agent = Agent::init(
         app_config.as_ref(),
-        child_app_state.as_ref(),
+        child_app.as_ref(),
         &current_model,
         info_flag,
         &agent_name,
@@ -1173,7 +1173,7 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let max_depth = agent.max_agent_depth();
     let max_jobs = effective_max_concurrent_jobs(Some(&agent), app_config.as_ref());
     let mut child_ctx = RequestContext::new_for_child(
-        Arc::clone(&child_app_state),
+        Arc::clone(&child_app),
         ctx,
         current_depth,
         Arc::clone(&child_inbox),
@@ -4666,5 +4666,64 @@ mod tests {
         }
         assert_eq!(ctx.pending_tasks_guardrail_count, 0);
         assert!(!ctx.supervisor.as_ref().unwrap().read().has_job("job_1"));
+    }
+
+    #[test]
+    fn child_agents_get_a_fresh_mesh_slot_never_the_parents() {
+        let source = include_str!("agents.rs");
+        // Assembled at runtime so this test's own text does not match the probes.
+        let fresh_slot = format!("mesh: Arc::new({}::default()),", "MeshSlot");
+
+        assert_eq!(
+            source.matches(fresh_slot.as_str()).count(),
+            1,
+            "the fresh-slot spelling {fresh_slot} must appear exactly once, in child_app_state"
+        );
+        for shared_slot in [
+            format!(".mesh.{}()", "clone"),
+            format!(".mesh.{}()", "to_owned"),
+        ] {
+            assert!(
+                !source.contains(&shared_slot),
+                "a child must never share the parent's mesh slot: found {shared_slot}"
+            );
+        }
+        let arc_clone = format!("Arc::{}(", "clone");
+        for (at, _) in source.match_indices(arc_clone.as_str()) {
+            let argument = source[at + arc_clone.len()..]
+                .split(')')
+                .next()
+                .unwrap_or_default();
+            assert!(
+                !argument.ends_with(".mesh"),
+                "a child must never share the parent's mesh slot: found {arc_clone}{argument})"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_app_state_gets_a_fresh_empty_mesh_slot() {
+        let started = crate::mesh::test_support::started_runtime("agents-h2").await;
+        let parent = AppState::test_default();
+        parent.mesh.install(started.runtime.clone()).unwrap();
+
+        let child = child_app_state(&parent);
+
+        assert!(!Arc::ptr_eq(&parent.mesh, &child.mesh));
+        assert!(child.mesh.get().is_none());
+        assert!(parent.mesh.get().is_some());
+        assert!(parent.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    fn child_app_state_never_shares_the_parents_slot() {
+        let parent = AppState::test_default();
+
+        let child = child_app_state(&parent);
+
+        assert!(!Arc::ptr_eq(&parent.mesh, &child.mesh));
+        assert!(child.mesh.get().is_none());
     }
 }
