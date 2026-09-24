@@ -2,18 +2,69 @@
 
 mod announce;
 mod identity;
+pub(crate) mod knocks;
 mod lock;
 mod node;
 mod peers;
 mod r3;
+pub(crate) mod trust;
 
 pub(crate) use node::MeshSlot;
 
+use anyhow::{Context, Result};
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-/// Where mesh state that is safe to lose lives: instance locks and the peer table.
+/// Where mesh state that is safe to lose lives: instance locks, the peer table and the
+/// knock cache.
 pub(crate) fn mesh_cache_dir(cache_dir: &Path) -> PathBuf {
     cache_dir.join("mesh")
+}
+
+/// Where mesh state the user curates lives: the identity key and the trust list.
+pub(crate) fn mesh_config_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join("mesh")
+}
+
+/// RFC 3339 UTC to the second, the timestamp form every human-readable mesh file uses.
+pub(crate) fn rfc3339_utc(time: SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+pub(crate) fn parse_rfc3339(text: &str) -> Option<SystemTime> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(SystemTime::from)
+}
+
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Lower-cased `text` when it is exactly 32 ASCII hex digits. Upstream's hex parser checks
+/// byte length only and slices by byte, so it must never see anything this has not passed.
+pub(crate) fn canonical_hash(text: &str) -> Option<String> {
+    (text.len() == 32 && text.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| text.to_ascii_lowercase())
+}
+
+/// Writes `bytes` to `<path>.tmp` beside `path`, syncs it, then renames it into place, so a
+/// crash mid-write cannot leave a half-written file for the next load to refuse.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory '{}'", parent.display()))?;
+    }
+    let tmp = path.with_added_extension("tmp");
+    File::create(&tmp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&tmp, path))
+        .with_context(|| format!("Failed to write '{}'", path.display()))
 }
 
 #[cfg(test)]
@@ -146,8 +197,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::TempDir;
     use super::*;
-    use std::fs;
 
     #[test]
     fn mesh_cache_dir_is_mesh_under_cache_dir() {
@@ -155,6 +206,49 @@ mod tests {
             mesh_cache_dir(Path::new("/tmp/cache")),
             PathBuf::from("/tmp/cache/mesh")
         );
+    }
+
+    #[test]
+    fn mesh_config_dir_is_mesh_under_config_dir() {
+        assert_eq!(
+            mesh_config_dir(Path::new("/tmp/config")),
+            PathBuf::from("/tmp/config/mesh")
+        );
+    }
+
+    #[test]
+    fn rfc3339_round_trips_to_the_second() {
+        let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+        let text = rfc3339_utc(time);
+        assert_eq!(text, "2026-09-21T14:13:20Z");
+        assert_eq!(parse_rfc3339(&text), Some(time));
+        assert_eq!(parse_rfc3339("yesterday"), None);
+    }
+
+    #[test]
+    fn hex_lower_is_lowercase_zero_padded() {
+        assert_eq!(hex_lower(&[0x00, 0xab, 0xff]), "00abff");
+        assert_eq!(hex_lower(&[]), "");
+    }
+
+    #[test]
+    fn write_atomically_leaves_no_temp_file_and_replaces_content() {
+        let tmp = TempDir::new("write-atomically");
+        let path = tmp.path.join("nested").join("state.json");
+
+        write_atomically(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+
+        write_atomically(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+
+        let blocked = tmp.path.join("file-not-dir");
+        fs::write(&blocked, b"").unwrap();
+        let err = write_atomically(&blocked.join("x.yaml"), b"x").unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains(&blocked.display().to_string()), "{text}");
     }
 
     #[test]

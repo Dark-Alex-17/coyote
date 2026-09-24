@@ -1,3 +1,4 @@
+use crate::mesh::hex_lower;
 use crate::mesh::r3::client::SizeBranch;
 use crate::mesh::r3::error::{R3Error, RefusalCode};
 use crate::mesh::r3::frame::{
@@ -320,10 +321,7 @@ fn resource_request_id(complete: &ResourceComplete) -> RequestId {
     {
         debug!(
             "Mesh request resource advertised id {} but its bytes hash to {}",
-            advertised
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>(),
+            hex_lower(advertised),
             request_id.to_hex_string()
         );
     }

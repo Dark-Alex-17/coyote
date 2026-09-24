@@ -1,4 +1,5 @@
 use crate::config::paths;
+use crate::mesh::mesh_config_dir;
 
 use anyhow::{Context, Result, bail};
 use lxmf_core::identity::PrivateIdentity;
@@ -11,7 +12,7 @@ const PRIVATE_KEY_LENGTH: usize = 64;
 
 /// Where this config dir keeps its mesh identity.
 pub(crate) fn identity_path() -> PathBuf {
-    paths::config_dir().join("mesh").join("identity.key")
+    mesh_config_dir(&paths::config_dir()).join("identity.key")
 }
 
 /// The identity's address hash as hex. This is what peers see, so it is safe to log.

@@ -1,3 +1,4 @@
+use crate::mesh::hex_lower;
 use crate::mesh::r3::error::R3Error;
 
 use rmpv::Value;
@@ -65,7 +66,7 @@ impl RequestId {
     }
 
     pub(crate) fn to_hex_string(self) -> String {
-        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+        hex_lower(&self.0)
     }
 }
 

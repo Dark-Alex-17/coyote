@@ -1,4 +1,5 @@
 use crate::mesh::announce::{HEARTBEAT_SECS, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT};
+use crate::mesh::write_atomically;
 
 use anyhow::{Context, Result};
 use log::warn;
@@ -21,6 +22,10 @@ pub(crate) const PEER_TTL: Duration =
 pub(crate) struct PeerRecord {
     pub destination_hash: String,
     pub identity_hash: String,
+    /// Lower-hex of the announce's 10-byte name hash; it is what lets the trust store prove
+    /// the destination belongs to the identity. Empty when the table predates the field.
+    #[serde(default)]
+    pub name_hash: String,
     pub display_name: Option<String>,
     pub protocol_version: u16,
     pub hops: u8,
@@ -32,6 +37,7 @@ pub(crate) struct PeerRecord {
 pub(crate) struct PeerSighting {
     pub destination_hash: String,
     pub identity_hash: String,
+    pub name_hash: String,
     pub display_name: Option<String>,
     pub protocol_version: u16,
     pub hops: u8,
@@ -84,6 +90,7 @@ impl PeerTable {
         let change = match peers.get_mut(&sighting.destination_hash) {
             Some(record) => {
                 record.identity_hash = sighting.identity_hash;
+                record.name_hash = sighting.name_hash;
                 record.display_name = sighting.display_name;
                 record.protocol_version = sighting.protocol_version;
                 record.hops = sighting.hops;
@@ -96,6 +103,7 @@ impl PeerTable {
                     PeerRecord {
                         destination_hash: sighting.destination_hash,
                         identity_hash: sighting.identity_hash,
+                        name_hash: sighting.name_hash,
                         display_name: sighting.display_name,
                         protocol_version: sighting.protocol_version,
                         hops: sighting.hops,
@@ -139,6 +147,11 @@ impl PeerTable {
         self.inner.lock().values().cloned().collect()
     }
 
+    /// Exact-key lookup; keys are the lower-hex the transport's to_hex_string produces.
+    pub(crate) fn get(&self, destination_hash: &str) -> Option<PeerRecord> {
+        self.inner.lock().get(destination_hash).cloned()
+    }
+
     /// Writes the table only if it changed since the last write. The flag is cleared before
     /// the snapshot is taken so a change that lands mid-write is not lost, and restored on
     /// failure so the next call retries.
@@ -150,19 +163,10 @@ impl PeerTable {
             .inspect_err(|_| self.dirty.store(true, Ordering::Release))
     }
 
-    /// Writes the table to disk via a sibling temp file so a crash mid-write cannot leave a
-    /// half-written table for the next load to refuse.
     fn persist(&self) -> Result<()> {
         let json = serde_json::to_vec_pretty(&self.snapshot())
             .context("Failed to serialize the mesh peer table")?;
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory '{}'", parent.display()))?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, json)
-            .and_then(|()| fs::rename(&tmp, &self.path))
-            .with_context(|| format!("Failed to write mesh peer table '{}'", self.path.display()))
+        write_atomically(&self.path, &json)
     }
 }
 
@@ -201,6 +205,7 @@ mod tests {
         PeerSighting {
             destination_hash: hash.to_string(),
             identity_hash: format!("id-{hash}"),
+            name_hash: format!("name-{hash}"),
             display_name: name.map(str::to_string),
             protocol_version: 1,
             hops: 2,
@@ -249,6 +254,7 @@ mod tests {
         assert_eq!(peers[0].first_seen, t0);
         assert_eq!(peers[0].last_seen, t1);
         assert_eq!(peers[0].identity_hash, "id-aa");
+        assert_eq!(peers[0].name_hash, "name-aa");
         assert_eq!(peers[0].hops, 2);
     }
 
@@ -321,6 +327,32 @@ mod tests {
         assert_eq!(peers[0].destination_hash, "fresh");
         assert_eq!(peers[0].display_name.as_deref(), Some("New"));
         assert_eq!(peers[0].last_seen, t0 + Duration::from_secs(1_000));
+    }
+
+    #[test]
+    fn load_accepts_a_table_written_before_name_hash_was_kept() {
+        let tmp = TempDir::new("peers-no-name-hash");
+        let path = tmp.path.join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut old = serde_json::to_value(vec![PeerRecord {
+            destination_hash: "aa".to_string(),
+            identity_hash: "id-aa".to_string(),
+            name_hash: "unused".to_string(),
+            display_name: None,
+            protocol_version: 1,
+            hops: 1,
+            first_seen: t0,
+            last_seen: t0,
+        }])
+        .unwrap();
+        old[0].as_object_mut().unwrap().remove("name_hash");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let table = PeerTable::load(path, t0).unwrap();
+
+        let peers = table.snapshot();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name_hash, "");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::mesh::peers::{PeerChange, PeerSighting, PeerTable};
 use crate::mesh::r3::{
     R3Client, R3Error, R3Server, RequestHandler, RequestOptions, RequestOutcome,
 };
-use crate::mesh::{identity, mesh_cache_dir};
+use crate::mesh::{hex_lower, identity, mesh_cache_dir};
 
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::RwLock;
@@ -336,8 +336,6 @@ impl MeshRuntime {
         self.interface_labels.clone()
     }
 
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) fn peers(&self) -> Arc<PeerTable> {
         self.peers.clone()
     }
@@ -842,6 +840,7 @@ fn record_announce(
     peers: &PeerTable,
     destination_hash: String,
     identity_hash: String,
+    name_hash: String,
     app_data: &[u8],
     hops: u8,
     now: SystemTime,
@@ -858,6 +857,7 @@ fn record_announce(
         PeerSighting {
             destination_hash: destination_hash.clone(),
             identity_hash,
+            name_hash,
             display_name: decoded.display_name,
             protocol_version: decoded.version,
             hops,
@@ -899,6 +899,7 @@ async fn receive_announces(
             &peers,
             destination_hash,
             identity_hash,
+            hex_lower(&event.name_hash),
             event.app_data.as_slice(),
             event.hops,
             SystemTime::now(),
@@ -1088,6 +1089,7 @@ mod tests {
             &peers,
             coyote_hash.to_string(),
             "identity".to_string(),
+            "name".to_string(),
             &app_data,
             2,
             now,
@@ -1096,6 +1098,7 @@ mod tests {
             &peers,
             other_hash.to_string(),
             "identity".to_string(),
+            "name".to_string(),
             b"LXMF\x00\x01",
             1,
             now,
@@ -1350,6 +1353,7 @@ mod tests {
             PeerSighting {
                 destination_hash: "persisted-on-stop".to_string(),
                 identity_hash: "identity".to_string(),
+                name_hash: "name".to_string(),
                 display_name: None,
                 protocol_version: 1,
                 hops: 1,
@@ -1657,13 +1661,17 @@ mod tests {
             })
         );
 
+        let b_name = DestinationName::new("coyote", &format!("mesh.{}", fresh_instance_id()));
         let b_dest = node_b
-            .add_destination(
-                TransportIdentity::new_from_rand(OsRng),
-                DestinationName::new("coyote", &format!("mesh.{}", fresh_instance_id())),
-            )
+            .add_destination(TransportIdentity::new_from_rand(OsRng), b_name)
             .await;
-        let b_hash = b_dest.lock().await.desc.address_hash.to_hex_string();
+        let (b_hash, b_identity_hash) = {
+            let desc = &b_dest.lock().await.desc;
+            (
+                desc.address_hash.to_hex_string(),
+                desc.identity.address_hash.to_hex_string(),
+            )
+        };
         let b_app_data = AnnounceAppData {
             version: 1,
             display_name: Some("Bea".to_string()),
@@ -1692,6 +1700,8 @@ mod tests {
             .unwrap();
         assert_eq!(bea.display_name.as_deref(), Some("Bea"));
         assert_eq!(bea.protocol_version, 1);
+        assert_eq!(bea.name_hash, hex_lower(b_name.as_name_hash_slice()));
+        assert_eq!(bea.identity_hash, b_identity_hash);
         assert!(
             !snapshot.iter().any(|peer| peer.destination_hash == a_hash),
             "a node must not file its own announce as a peer"

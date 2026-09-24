@@ -77,7 +77,7 @@ impl AnnounceAppData {
 
 /// Control characters plus the zero-width, bidirectional-override and joiner format
 /// characters that let a name render as something it is not.
-fn is_control_or_invisible(c: char) -> bool {
+pub(crate) fn is_control_or_invisible(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
