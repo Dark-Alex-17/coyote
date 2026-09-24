@@ -5,6 +5,7 @@ mod identity;
 mod lock;
 mod node;
 mod peers;
+mod r3;
 
 pub(crate) use node::MeshSlot;
 

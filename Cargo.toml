@@ -152,6 +152,10 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # instead of two.
 reticulum-rs-transport = { git = "https://github.com/FreeTAKTeam/LXMF-rs", rev = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe" }
 lxmf-wire = { git = "https://github.com/FreeTAKTeam/LXMF-rs", rev = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe" }
+# Its `Value` appears in `rns_transport`'s `Link::request_payload` and
+# `unpack_response_envelope` signatures, so it must stay semver-unified with the
+# transport's own `rmpv`. Moves together with the transport pin above.
+rmpv = "1.3"
 
 [dependencies.reqwest]
 version = "0.13.3"

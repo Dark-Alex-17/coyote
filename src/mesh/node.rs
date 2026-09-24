@@ -5,11 +5,15 @@ use crate::mesh::announce::{
 };
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::peers::{PeerChange, PeerSighting, PeerTable};
+use crate::mesh::r3::{
+    R3Client, R3Error, R3Server, RequestHandler, RequestOptions, RequestOutcome,
+};
 use crate::mesh::{identity, mesh_cache_dir};
 
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::RwLock;
 use rand_core::OsRng;
+use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::{DestinationName, SingleInputDestination};
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::PrivateIdentity as TransportIdentity;
@@ -29,8 +33,16 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
-/// How long `stop` waits for registered tasks and interface workers before aborting them.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// One grace window on the transport. `stop` spends at most one on registered tasks and one
+/// on transport teardown, plus any `REKEY_GRACE` a concurrent rekey is spending; `start`
+/// spends one on registering and first announcing the destination, and `abandon_start` and
+/// the `join_lan`/`join_tcp` failure cleanup spend one unwinding. The r3 tests bound their
+/// own teardown with it too.
+pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// How long `rekey` and `announce_now` wait on the transport for each of their steps. The
+/// transport takes its handler lock for every one, and a peer that trips its resource-reject
+/// path can leave that lock held for good.
+pub(crate) const REKEY_GRACE: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for a TCP relay to report itself connected.
 const CONNECT_POLL: Duration = Duration::from_millis(50);
 /// Depth of the host channel a LAN interface feeds the transport through.
@@ -134,11 +146,15 @@ pub(crate) struct MeshRuntime {
     announce: bool,
     cache_dir: PathBuf,
     interface_labels: Vec<String>,
-    /// `None` once `shutdown` has dropped it, which is what cancels the transport's own tasks.
-    transport: Mutex<Option<Transport>>,
+    /// `None` once `shutdown` has released this owner. Requests and the server loop hold
+    /// clones, so the upstream `Drop` that cancels the transport's tasks runs when the last
+    /// of those finishes, not when this lock is emptied.
+    transport: Mutex<Option<Arc<Transport>>>,
     interfaces: Mutex<Vec<JoinedInterface>>,
     destination: Mutex<DestinationState>,
     peers: Arc<PeerTable>,
+    r3_client: Arc<R3Client>,
+    r3_server: Arc<R3Server>,
     cancel: CancellationToken,
     tasks: parking_lot::Mutex<Vec<JoinHandle<()>>>,
 }
@@ -175,7 +191,12 @@ impl MeshRuntime {
         )?);
 
         let transport = Transport::new(TransportConfig::new("coyote", &transport_identity, false));
+        // Every stream is subscribed before an interface is joined so nothing is missed.
         let announces = transport.recv_announces().await;
+        let out_link_events = transport.out_link_events();
+        let in_link_events = transport.in_link_events();
+        let client_resource_events = transport.resource_events();
+        let server_resource_events = transport.resource_events();
         let mut joined = Vec::with_capacity(plans.len());
         for plan in &plans {
             match join_interface(&transport, plan, &options).await {
@@ -186,15 +207,45 @@ impl MeshRuntime {
                 }
             }
         }
-        let (dest, hash) =
-            register_destination(&transport, &transport_identity, &instance_id, &app_data).await;
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        let (dest, hash) = match register_destination(
+            &transport,
+            &transport_identity,
+            &instance_id,
+            &app_data,
+            deadline,
+        )
+        .await
+        {
+            Ok(registered) => registered,
+            Err(err) => {
+                abandon_start(transport, joined).await;
+                return Err(err.context(format!(
+                    "The mesh node's destination could not be registered within {}s",
+                    SHUTDOWN_GRACE.as_secs()
+                )));
+            }
+        };
         let mut last_announce = None;
         if config.announce {
-            match announce_destination(&transport, &dest, &hash, &app_data).await {
-                Ok(sent_at) => last_announce = Some(sent_at),
-                Err(err) => {
+            match timeout_at(
+                deadline,
+                announce_destination(&transport, &dest, &hash, &app_data),
+            )
+            .await
+            {
+                Ok(Ok(sent_at)) => last_announce = Some(sent_at),
+                Ok(Err(err)) => {
                     abandon_start(transport, joined).await;
                     return Err(err);
+                }
+                Err(_) => {
+                    abandon_start(transport, joined).await;
+                    bail!(
+                        "The mesh node's first announce for destination {} was not sent within {}s",
+                        hash.to_hex_string(),
+                        SHUTDOWN_GRACE.as_secs()
+                    );
                 }
             }
         }
@@ -204,6 +255,7 @@ impl MeshRuntime {
         );
 
         // Nothing fallible may follow: a failure once the tasks exist would leak them.
+        let transport = Arc::new(transport);
         let runtime = Arc::new(Self {
             fingerprint,
             transport_identity,
@@ -211,7 +263,7 @@ impl MeshRuntime {
             announce: config.announce,
             cache_dir: paths.cache_dir,
             interface_labels: plans.iter().map(InterfacePlan::label).collect(),
-            transport: Mutex::new(Some(transport)),
+            transport: Mutex::new(Some(transport.clone())),
             interfaces: Mutex::new(joined),
             destination: Mutex::new(DestinationState {
                 dest,
@@ -221,9 +273,22 @@ impl MeshRuntime {
                 last_announce,
             }),
             peers,
+            r3_client: Arc::new(R3Client::new()),
+            r3_server: Arc::new(R3Server::new()),
             cancel: CancellationToken::new(),
             tasks: parking_lot::Mutex::new(Vec::new()),
         });
+        runtime.register_task(tokio::spawn(runtime.r3_client.clone().run(
+            out_link_events,
+            client_resource_events,
+            runtime.cancellation_token(),
+        )));
+        runtime.register_task(tokio::spawn(runtime.r3_server.clone().run(
+            transport,
+            in_link_events,
+            server_resource_events,
+            runtime.cancellation_token(),
+        )));
         runtime.register_task(tokio::spawn(receive_announces(
             announces,
             runtime.peers.clone(),
@@ -286,6 +351,26 @@ impl MeshRuntime {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn max_request_size(&self) -> Option<usize> {
+        let state = self.destination.lock().await;
+        state.dest.lock().await.max_request_size()
+    }
+
+    /// Arms the upstream advertisement-time request cap, which production code leaves off
+    /// because rejecting on it deadlocks the transport (rev 3ed5932). Tests use it to wedge a
+    /// node on purpose and prove the node's waits stay bounded.
+    #[cfg(test)]
+    pub(crate) async fn arm_request_cap_for_test(&self, cap: usize) {
+        let state = self.destination.lock().await;
+        state
+            .dest
+            .lock()
+            .await
+            .set_max_request_size(cap)
+            .expect("the upstream cap setter is infallible");
+    }
+
     /// A token cancelled when the node stops; every task the node owns should watch it.
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancel.child_token()
@@ -294,6 +379,43 @@ impl MeshRuntime {
     /// Adopts a task so `stop` waits for it to finish.
     pub(crate) fn register_task(&self, handle: JoinHandle<()>) {
         self.tasks.lock().push(handle);
+    }
+
+    /// Sends one request to `destination` over a link, proving this node's identity first.
+    // Reached by the mesh dispatcher once it lands.
+    #[allow(dead_code)]
+    pub(crate) async fn request(
+        &self,
+        destination: &DestinationDesc,
+        path: &str,
+        data: rmpv::Value,
+        options: RequestOptions,
+    ) -> Result<RequestOutcome, R3Error> {
+        let transport = self
+            .transport
+            .lock()
+            .await
+            .clone()
+            .ok_or(R3Error::NotRunning)?;
+        let request = self.r3_client.request(
+            &transport,
+            &self.transport_identity,
+            destination,
+            path,
+            data,
+            options,
+        );
+        tokio::select! {
+            () = self.cancel.cancelled() => Err(R3Error::Shutdown),
+            outcome = request => outcome,
+        }
+    }
+
+    /// Installs the sink for inbound requests; until then they are dropped.
+    // Reached by the mesh dispatcher once it lands.
+    #[allow(dead_code)]
+    pub(crate) fn set_request_handler(&self, handler: Arc<dyn RequestHandler>) {
+        self.r3_server.set_handler(handler);
     }
 
     /// Announces the current destination unless it was announced within
@@ -306,9 +428,27 @@ impl MeshRuntime {
         {
             return Ok(false);
         }
-        let transport = self.transport.lock().await;
-        self.send_announce(&mut state, running(&transport)?).await?;
+        let transport = self.running_transport().await?;
+        timeout(REKEY_GRACE, self.send_announce(&mut state, &transport))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "The mesh transport did not send the announce for destination {} within {}s; run `.mesh off` and then `.mesh on` to restart the node",
+                    state.hash.to_hex_string(),
+                    REKEY_GRACE.as_secs()
+                )
+            })??;
         Ok(true)
+    }
+
+    /// A handle on the transport, taken so the `transport` guard is not held across the
+    /// caller's waits and a concurrent `request` or `shutdown` does not queue behind them.
+    async fn running_transport(&self) -> Result<Arc<Transport>> {
+        self.transport
+            .lock()
+            .await
+            .clone()
+            .context("The mesh node has been stopped; run `.mesh on` to start it again")
     }
 
     async fn send_announce(
@@ -321,11 +461,16 @@ impl MeshRuntime {
         Ok(())
     }
 
-    /// Moves the live destination from the original session to its fork: the fork's instance
-    /// lock is taken first so a refused lock leaves the original destination untouched. An
-    /// `Err` always leaves the original destination, instance id and lock in place: every
-    /// fallible step (instance-id check, stopped-transport check, fork lock acquisition)
-    /// happens before the swap.
+    /// Moves the live destination from the original session to its fork. An `Err` always
+    /// leaves the original destination, instance id and lock in place and served: every
+    /// fallible step (instance-id check, stopped-transport check, fork lock acquisition,
+    /// registering the fork's destination) happens before the swap, and the fork's
+    /// destination is registered before the original is released so a transport that stalls
+    /// on the registration leaves the node serving exactly what it served before. The two
+    /// hashes differ (`mesh.{instance_id}`), so both may be registered at once; a release of
+    /// the original that does not finish within `REKEY_GRACE` is logged and the swap goes
+    /// ahead, leaving the original registered until the node stops. Each transport wait is
+    /// bounded because a wedged handler lock would otherwise hold `destination` for good.
     pub(crate) async fn rekey(&self, rekey: ForkRekey) -> Result<()> {
         let mut state = self.destination.lock().await;
         if rekey.original_instance_id.as_deref() != Some(state.instance_id.as_str()) {
@@ -335,18 +480,35 @@ impl MeshRuntime {
                 rekey.original_instance_id.as_deref().unwrap_or("(none)")
             );
         }
-        let transport = self.transport.lock().await;
-        let transport = running(&transport)?;
+        let transport = self.running_transport().await?;
         let lock = InstanceLock::acquire(&self.cache_dir, &rekey.fork_instance_id)?;
 
-        transport.deregister_destination(&state.hash).await;
+        let deadline = tokio::time::Instant::now() + REKEY_GRACE;
         let (dest, hash) = register_destination(
-            transport,
+            &transport,
             &self.transport_identity,
             &rekey.fork_instance_id,
             &self.app_data,
+            deadline,
         )
-        .await;
+        .await
+        .with_context(|| {
+            format!(
+                "The fork's destination could not be registered within {}s, so the node still serves destination {}. Run `.mesh off` and then `.mesh on` in the fork to join the mesh with the fork's own destination.",
+                REKEY_GRACE.as_secs(),
+                state.hash.to_hex_string(),
+            )
+        })?;
+        if timeout_at(deadline, transport.deregister_destination(&state.hash))
+            .await
+            .is_err()
+        {
+            warn!(
+                "The mesh transport did not release destination {} within {}s; it stays registered until the node stops",
+                state.hash.to_hex_string(),
+                REKEY_GRACE.as_secs()
+            );
+        }
         debug!(
             "Re-keyed mesh node {} from instance {} to fork instance {} (destination {})",
             self.fingerprint,
@@ -363,18 +525,26 @@ impl MeshRuntime {
         };
         if self.announce {
             // With `last_announce` still `None`, the next heartbeat tick announces the fork.
-            if let Err(err) = self.send_announce(&mut state, transport).await {
-                warn!(
+            match timeout_at(deadline, self.send_announce(&mut state, &transport)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!(
                     "Failed to announce mesh node {} for fork instance {} after re-keying; the heartbeat will announce it: {err:#}",
                     self.fingerprint, state.instance_id
-                );
+                ),
+                Err(_) => warn!(
+                    "Mesh node {} did not announce fork instance {} within {}s of re-keying; the heartbeat will announce it",
+                    self.fingerprint,
+                    state.instance_id,
+                    REKEY_GRACE.as_secs()
+                ),
             }
         }
         Ok(())
     }
 
     /// Cancels and joins the node's tasks, stops the interfaces, drops the transport and
-    /// releases the instance lock, in that order so nothing outlives what it depends on.
+    /// releases the instance lock, in that order so nothing outlives what it depends on. The
+    /// task joins share one grace window and the transport teardown another.
     async fn shutdown(&self) -> Result<()> {
         self.cancel.cancel();
         let tasks = std::mem::take(&mut *self.tasks.lock());
@@ -394,10 +564,23 @@ impl MeshRuntime {
         let Some(transport) = self.transport.lock().await.take() else {
             return Ok(());
         };
+        // The transport takes its handler lock for each of these, and a peer that trips its
+        // resource-reject path can leave that lock held for good; the deadline is shared so
+        // a wedged transport costs one grace window, not one per step.
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         for iface in interfaces {
-            stop_interface(&transport, iface).await;
+            stop_interface(&transport, iface, deadline).await;
         }
-        transport.deregister_destination(&state.hash).await;
+        if timeout_at(deadline, transport.deregister_destination(&state.hash))
+            .await
+            .is_err()
+        {
+            warn!(
+                "Mesh destination {} could not be deregistered within {}s; dropping the transport",
+                state.hash.to_hex_string(),
+                SHUTDOWN_GRACE.as_secs()
+            );
+        }
         drop(transport);
         state.lock = None;
         if let Err(err) = self.peers.persist_if_dirty() {
@@ -413,25 +596,46 @@ impl MeshRuntime {
     }
 }
 
-fn running(transport: &Option<Transport>) -> Result<&Transport> {
-    transport
-        .as_ref()
-        .context("The mesh node has been stopped; run `.mesh on` to start it again")
-}
-
+/// Registers the destination for `instance_id` and attaches `app_data` to its announces;
+/// each transport wait gives up at `deadline`. A destination registered but left without
+/// its announce data is deregistered again, best effort, and the error says whether that
+/// worked. The destination carries no `max_request_size`: rejecting an advertisement on it
+/// deadlocks the upstream transport (rev 3ed5932), so oversize requests are dropped after
+/// assembly by `R3Server` instead.
 async fn register_destination(
     transport: &Transport,
     identity: &TransportIdentity,
     instance_id: &str,
     app_data: &[u8],
-) -> (Arc<Mutex<SingleInputDestination>>, AddressHash) {
+    deadline: tokio::time::Instant,
+) -> Result<(Arc<Mutex<SingleInputDestination>>, AddressHash)> {
     let name = DestinationName::new("coyote", &format!("mesh.{instance_id}"));
-    let dest = transport.add_destination(identity.clone(), name).await;
-    let hash = dest.lock().await.desc.address_hash;
-    transport
-        .set_destination_announce_app_data(&dest, Some(app_data.to_vec()))
-        .await;
-    (dest, hash)
+    let destination = SingleInputDestination::new(identity.clone(), name);
+    let hash = destination.desc.address_hash;
+    let dest = timeout_at(deadline, transport.register_destination(destination))
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "The mesh transport did not register destination {} in time",
+                hash.to_hex_string()
+            )
+        })?;
+    let app_data = transport.set_destination_announce_app_data(&dest, Some(app_data.to_vec()));
+    if timeout_at(deadline, app_data).await.is_err() {
+        let released = timeout_at(deadline, transport.deregister_destination(&hash))
+            .await
+            .is_ok();
+        bail!(
+            "The mesh transport registered destination {} but did not attach its announce data in time; {}",
+            hash.to_hex_string(),
+            if released {
+                "it was deregistered again"
+            } else {
+                "it could not be deregistered either, so the node serves it without announce data"
+            }
+        );
+    }
+    Ok((dest, hash))
 }
 
 /// Builds and sends one announce for `dest`, returning when it was sent.
@@ -462,8 +666,9 @@ async fn announce_destination(
 /// Unwinds a start that failed once the transport existed: the joined interfaces are stopped
 /// and the transport goes with them, which cancels its own tasks.
 async fn abandon_start(transport: Transport, joined: Vec<JoinedInterface>) {
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
     for iface in joined {
-        stop_interface(&transport, iface).await;
+        stop_interface(&transport, iface, deadline).await;
     }
 }
 
@@ -509,7 +714,13 @@ async fn join_lan(transport: &Transport) -> Result<JoinedInterface> {
             runtime,
         }),
         Err(err) => {
-            transport.stop_interface(host_iface).await;
+            detach_interface(
+                transport,
+                host_iface,
+                "lan",
+                tokio::time::Instant::now() + SHUTDOWN_GRACE,
+            )
+            .await;
             bail!(
                 "Failed to bind the mesh lan interface: {err}. Another process may hold the discovery port; remove the lan entry from mesh.interfaces or stop that process."
             )
@@ -527,7 +738,8 @@ async fn join_tcp(
     let status = client.runtime_status_handle();
     let context = transport.iface_manager().lock().await.new_context(client);
     let hash = *context.channel.address();
-    let mut handle = tokio::spawn(TcpClient::spawn(context));
+    let handle = tokio::spawn(TcpClient::spawn(context));
+    let label = format!("{kind} {endpoint}");
 
     let deadline = Instant::now() + connect_timeout + Duration::from_secs(1);
     let failure = loop {
@@ -537,7 +749,7 @@ async fn join_tcp(
                 return Ok(JoinedInterface::Tcp {
                     hash,
                     handle,
-                    label: format!("{kind} {endpoint}"),
+                    label,
                 });
             }
             // The client's first connect failed; it would now retry forever on its own.
@@ -551,37 +763,74 @@ async fn join_tcp(
             _ => sleep(CONNECT_POLL).await,
         }
     };
-    transport.stop_interface(hash).await;
-    if timeout(SHUTDOWN_GRACE, &mut handle).await.is_err() {
-        handle.abort();
-    }
+    stop_interface(
+        transport,
+        JoinedInterface::Tcp {
+            hash,
+            handle,
+            label,
+        },
+        tokio::time::Instant::now() + SHUTDOWN_GRACE,
+    )
+    .await;
     bail!(
         "Mesh relay {endpoint} (type: {kind}) is unreachable: {failure}. The node cannot join the mesh until that relay is reachable; fix mesh.interfaces or the relay."
     )
 }
 
-async fn stop_interface(transport: &Transport, iface: JoinedInterface) {
+/// Detaches the interface at `iface` from the transport, giving up at `deadline`; `false`
+/// when it did not go.
+async fn detach_interface(
+    transport: &Transport,
+    iface: AddressHash,
+    label: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    if timeout_at(deadline, transport.stop_interface(iface))
+        .await
+        .is_err()
+    {
+        warn!(
+            "Mesh interface {label} could not be detached from the transport within {}s",
+            SHUTDOWN_GRACE.as_secs()
+        );
+        return false;
+    }
+    true
+}
+
+/// Detaches one interface, giving up at `deadline` on every wait against the transport.
+async fn stop_interface(
+    transport: &Transport,
+    iface: JoinedInterface,
+    deadline: tokio::time::Instant,
+) {
     match iface {
         JoinedInterface::Lan {
             host_iface,
             runtime,
         } => {
             runtime.stop().await;
-            transport.stop_interface(host_iface).await;
-            debug!("Left mesh interface lan");
+            if detach_interface(transport, host_iface, "lan", deadline).await {
+                debug!("Left mesh interface lan");
+            }
         }
         JoinedInterface::Tcp {
             hash,
             mut handle,
             label,
         } => {
-            transport.stop_interface(hash).await;
-            if timeout(SHUTDOWN_GRACE, &mut handle).await.is_err() {
+            if !detach_interface(transport, hash, &label, deadline).await {
+                handle.abort();
+                return;
+            }
+            if timeout_at(deadline, &mut handle).await.is_err() {
                 handle.abort();
                 warn!(
                     "Mesh interface {label} did not stop within {}s; aborted it",
                     SHUTDOWN_GRACE.as_secs()
                 );
+                return;
             }
             debug!("Left mesh interface {label}");
         }
@@ -1307,6 +1556,26 @@ mod tests {
         );
         assert!(slot.get().is_none());
         assert!(!slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_on_a_stopped_runtime_is_not_running() {
+        let started = started_runtime("node-request-stopped").await;
+        let runtime = &started.runtime;
+        let peer = SingleInputDestination::new(
+            TransportIdentity::new_from_rand(OsRng),
+            DestinationName::new("coyote", "mesh.peer"),
+        )
+        .desc;
+        runtime.shutdown().await.unwrap();
+
+        let result = runtime
+            .request(&peer, "/echo", rmpv::Value::Nil, RequestOptions::default())
+            .await;
+
+        assert_eq!(result.unwrap_err(), R3Error::NotRunning);
         started.relay_handle.abort();
     }
 

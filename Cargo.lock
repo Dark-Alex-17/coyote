@@ -1789,6 +1789,7 @@ dependencies = [
  "reqwest 0.13.5",
  "reticulum-rs-transport",
  "rmcp",
+ "rmpv",
  "rust-embed",
  "scraper",
  "self_update",
