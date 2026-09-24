@@ -1,18 +1,21 @@
 use crate::mesh::announce::is_control_or_invisible;
 use crate::mesh::node::MeshSlot;
 use crate::mesh::peers::{PeerRecord, PeerTable};
-use crate::mesh::{canonical_hash, mesh_config_dir, parse_rfc3339, rfc3339_utc, write_atomically};
+use crate::mesh::{
+    canonical_hash, destination_address, mesh_config_dir, parse_rfc3339, rfc3339_utc,
+    write_atomically,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
-use rns_transport::hash::{AddressHash, Hash};
+use rns_transport::hash::AddressHash;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sha2::Digest;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 pub(crate) const TRUST_FILE_VERSION: u64 = 1;
 
@@ -205,6 +208,17 @@ struct State {
     seen: BTreeMap<String, SystemTime>,
 }
 
+/// Equality of two hashes that takes the same time whether they differ in the first byte
+/// or the last. The length check folds into the same `Choice` rather than short-circuiting;
+/// both sides are canonical 32-hex in practice, so it only ever guards a malformed input.
+fn same_hash(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    let same_len = left.len().ct_eq(&right.len());
+    let shorter = left.len().min(right.len());
+    let same_prefix = left[..shorter].ct_eq(&right[..shorter]);
+    bool::from(same_len & same_prefix)
+}
+
 /// The user's trust list, mirrored to `<config_dir>/mesh/trust.yaml`.
 ///
 /// Only the mutation methods write the file, and each of them needs a running mesh: a
@@ -221,7 +235,7 @@ pub(crate) struct TrustStore {
     inner: Mutex<State>,
 }
 
-// Reached by the REPL mesh commands and the dispatcher once they land.
+// Reached by the REPL mesh commands once they land.
 #[allow(dead_code)]
 impl TrustStore {
     /// Loads `trust.yaml` under `config_dir`. A missing file is an empty list and nothing is
@@ -255,6 +269,11 @@ impl TrustStore {
     /// identity allow, then default-closed. A blocked identity is refused before either
     /// allow and reported under its own rule. A destination record only allows the identity
     /// it was proven to belong to.
+    ///
+    /// The map lookups are keyed on values the peer already knows and are not treated as a
+    /// timing boundary. The destination binding is the one direct equality against a
+    /// caller-supplied identity, and it runs in constant time (`same_hash`). Callers
+    /// consume the verdict; none of them compares identities again.
     pub(crate) fn authorize(&self, identity_hash: &str, destination_hash: &str) -> Verdict {
         let identity = identity_hash.to_ascii_lowercase();
         let destination = destination_hash.to_ascii_lowercase();
@@ -276,7 +295,7 @@ impl TrustStore {
             .destinations
             .get(&destination)
             .or_else(|| state.session_destinations.get(&destination))
-            .is_some_and(|entry| entry.identity == identity);
+            .is_some_and(|entry| same_hash(&entry.identity, &identity));
         if bound_to_identity {
             return Verdict {
                 decision: Decision::Allow,
@@ -918,7 +937,7 @@ fn verified_announce(
     let record = peers.get(destination_hash)?;
     verified_identity(&record)
         .ok()
-        .filter(|identity| identity.to_hex_string() == entry.identity)
+        .filter(|identity| same_hash(&identity.to_hex_string(), &entry.identity))
         .map(|_| record.last_seen)
 }
 
@@ -1061,16 +1080,18 @@ fn verified_identity(record: &PeerRecord) -> Result<AddressHash> {
             "Peer {destination} was recorded before its name hash was kept, so its identity cannot be verified yet. Wait for its next announce and try again."
         );
     }
-    let name_hash = decode_hex(&record.name_hash).ok_or_else(|| {
-        anyhow!("The peer table holds an unreadable name hash for {destination}; wait for its next announce.")
-    })?;
+    let name_hash = decode_hex(&record.name_hash)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| {
+            anyhow!("The peer table holds an unreadable name hash for {destination}; wait for its next announce.")
+        })?;
     let identity = parse_hash(&record.identity_hash).ok_or_else(|| {
         anyhow!("The peer table holds an unreadable identity hash for {destination}; wait for its next announce.")
     })?;
     let claimed = parse_hash(destination).ok_or_else(|| {
         anyhow!("'{destination}' is not a destination hash: expected 32 hex characters.")
     })?;
-    let expected = expected_destination(&name_hash, &identity);
+    let expected = destination_address(&name_hash, &identity);
     if expected != claimed {
         bail!(
             "Destination {destination} does not match identity {} in the peer table (that identity would announce {}); nothing was trusted.",
@@ -1079,18 +1100,6 @@ fn verified_identity(record: &PeerRecord) -> Result<AddressHash> {
         );
     }
     Ok(identity)
-}
-
-/// Reticulum's destination derivation: the address hash is the truncated SHA-256 of the
-/// name hash followed by the identity's address hash.
-fn expected_destination(name_hash: &[u8], identity: &AddressHash) -> AddressHash {
-    AddressHash::new_from_hash(&Hash::new(
-        Hash::generator()
-            .chain_update(name_hash)
-            .chain_update(identity.as_slice())
-            .finalize()
-            .into(),
-    ))
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -1201,6 +1210,18 @@ mod tests {
 
     fn verdict(decision: Decision, rule: Rule) -> Verdict {
         Verdict { decision, rule }
+    }
+
+    #[test]
+    fn same_hash_is_constant_time_shaped() {
+        let hash = fake_hash(0xab);
+        let mut last_byte_differs = hash.clone();
+        last_byte_differs.replace_range(31..32, "c");
+
+        assert!(same_hash(&hash, &hash));
+        assert!(!same_hash(&hash, &last_byte_differs));
+        assert!(!same_hash("ab", "abc"));
+        assert!(same_hash("", ""));
     }
 
     #[test]

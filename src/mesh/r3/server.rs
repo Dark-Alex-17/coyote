@@ -16,21 +16,29 @@ use rns_transport::transport::{SendPacketOutcome, Transport};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 /// Ceiling on sending one response, covering the link lookup and lock as well as the send.
 pub(crate) const DEFAULT_RESPONSE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Ceiling on reading the peer identity off the transport's link before a request is decoded.
+pub(crate) const PEER_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Requests handled at once; any beyond that are dropped without a reply rather than queued,
+/// so a flood from an unauthenticated peer costs one bounded copy and a link lookup, never a
+/// decode or a handler.
+pub(crate) const MAX_CONCURRENT_INBOUND_REQUESTS: usize = 16;
+/// Ceiling on one handler call. A handler that overruns it answers nothing.
+pub(crate) const HANDLER_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One decoded request as the handler sees it. `identity` is `Some` only once the peer has
 /// proven itself on this link; nothing about the peer is inferred from the link alone.
-/// `requested_at` is the peer's timestamp verbatim (`time.time()` in RNS), so it may be NaN,
-/// infinite or far from this node's clock; clamp it before using it for freshness.
-// Reached by the mesh dispatcher once it lands.
-#[allow(dead_code)]
+/// `requested_at` is the peer's timestamp verbatim (`time.time()` in RNS), so it may be
+/// NaN, infinite or far from this node's clock; clamp it before using it for freshness.
 pub(crate) struct InboundRequest {
     pub link_id: LinkId,
     pub identity: Option<Identity>,
@@ -43,12 +51,16 @@ pub(crate) struct InboundRequest {
 
 /// What the handler answers with. `Silent` sends nothing, the way a `None` response does
 /// in RNS `Link.handle_request`.
-// Reached by the mesh dispatcher once it lands.
-#[allow(dead_code)]
 pub(crate) enum Reply {
     Value(Value),
     Code(RefusalCode),
     Silent,
+}
+
+/// Whether a request's bytes may be decoded at all.
+pub(crate) enum Admission {
+    Admit,
+    Drop,
 }
 
 /// The single sink every inbound request is handed to. Routing by path, trust and
@@ -57,6 +69,9 @@ pub(crate) enum Reply {
 /// (`RefusalCode::from_wire`), so a handler must not return one as a real value.
 #[async_trait]
 pub(crate) trait RequestHandler: Send + Sync {
+    /// Runs before the payload is decoded, with nothing but the link and its proven
+    /// identity. It is synchronous on purpose: nothing here may wait on I/O.
+    fn admit(&self, link_id: LinkId, identity: Option<&Identity>) -> Admission;
     async fn handle(&self, request: InboundRequest) -> Reply;
 }
 
@@ -66,6 +81,10 @@ pub(crate) trait RequestHandler: Send + Sync {
 pub(crate) struct R3Server {
     handler: RwLock<Option<Arc<dyn RequestHandler>>>,
     identified: Mutex<HashMap<LinkId, Identity>>,
+    permits: Arc<Semaphore>,
+    handler_timeout: Duration,
+    #[cfg(test)]
+    decoded: AtomicUsize,
 }
 
 impl R3Server {
@@ -73,6 +92,18 @@ impl R3Server {
         Self {
             handler: RwLock::new(None),
             identified: Mutex::new(HashMap::new()),
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_INBOUND_REQUESTS)),
+            handler_timeout: HANDLER_TIMEOUT,
+            #[cfg(test)]
+            decoded: AtomicUsize::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_handler_timeout_for_test(handler_timeout: Duration) -> Self {
+        Self {
+            handler_timeout,
+            ..Self::new()
         }
     }
 
@@ -83,6 +114,24 @@ impl R3Server {
     #[cfg(test)]
     pub(crate) fn identified_peer_count(&self) -> usize {
         self.identified.lock().len()
+    }
+
+    /// Simulates the identity table falling behind the transport, the way a lost
+    /// `PeerIdentified` event would leave it.
+    #[cfg(test)]
+    pub(crate) fn forget_identities_for_test(&self) {
+        self.identified.lock().clear();
+    }
+
+    /// How many request payloads reached `RequestFrame::decode`.
+    #[cfg(test)]
+    pub(crate) fn decoded_count(&self) -> usize {
+        self.decoded.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_permits(&self) -> usize {
+        self.permits.available_permits()
     }
 
     /// Serves requests until `cancel` fires or the transport goes away, then waits for the
@@ -148,7 +197,7 @@ impl R3Server {
     }
 
     fn on_link_event(
-        &self,
+        self: &Arc<Self>,
         transport: &Arc<Transport>,
         event: LinkEventData,
         cancel: &CancellationToken,
@@ -196,7 +245,7 @@ impl R3Server {
     }
 
     fn on_resource_event(
-        &self,
+        self: &Arc<Self>,
         transport: &Arc<Transport>,
         event: ResourceEvent,
         cancel: &CancellationToken,
@@ -218,14 +267,15 @@ impl R3Server {
         )
     }
 
-    /// Decodes one request and returns the handler task for the loop to spawn, so a
-    /// handler that stalls does not stall the event loop; RNS runs each in a thread. The
-    /// size check here is where inbound requests are capped: after assembly, on our side,
-    /// since the destination carries no `max_request_size` (the upstream reject path
-    /// deadlocks the transport, rev 3ed5932) and the upstream 32 MiB advertisement cap is
-    /// the only bound before that.
+    /// Bounds one request and returns the task that serves it for the loop to spawn, so
+    /// nothing about a request, not even decoding it, runs on the event loop; RNS runs each
+    /// in a thread. The size check here is where inbound requests are capped: after
+    /// assembly, on our side, since the destination carries no `max_request_size` (the
+    /// upstream reject path deadlocks the transport, rev 3ed5932) and the upstream 32 MiB
+    /// advertisement cap is the only bound before that. The task resolves the peer's
+    /// identity, asks the handler whether to decode at all, and only then decodes.
     fn dispatch(
-        &self,
+        self: &Arc<Self>,
         transport: &Arc<Transport>,
         link_id: LinkId,
         request_id: RequestId,
@@ -241,17 +291,6 @@ impl R3Server {
             );
             return None;
         }
-        let frame = match RequestFrame::decode(packed) {
-            Ok(frame) => frame,
-            Err(err) => {
-                debug!(
-                    "Dropped an undecodable mesh request {} on link {}: {err}",
-                    request_id.to_hex_string(),
-                    link_id.to_hex_string()
-                );
-                return None;
-            }
-        };
         let Some(handler) = self.handler.read().clone() else {
             debug!(
                 "Dropped mesh request {} on link {}: no request handler installed",
@@ -260,14 +299,13 @@ impl R3Server {
             );
             return None;
         };
-        let request = InboundRequest {
-            link_id,
-            identity: self.identified.lock().get(&link_id).copied(),
-            request_id,
-            path_hash: frame.path_hash,
-            requested_at: frame.time,
-            data: frame.data,
-            branch,
+        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+            debug!(
+                "Dropped mesh request {} on link {}: all {MAX_CONCURRENT_INBOUND_REQUESTS} handler slots are busy",
+                request_id.to_hex_string(),
+                link_id.to_hex_string()
+            );
+            return None;
         };
         debug!(
             "Received mesh request {} on link {} ({branch:?}, {} bytes)",
@@ -275,11 +313,57 @@ impl R3Server {
             link_id.to_hex_string(),
             packed.len()
         );
+        let server = self.clone();
         let transport = transport.clone();
         let cancel = cancel.clone();
+        let packed = packed.to_vec();
         Some(async move {
+            let _permit = permit;
             let serve = async {
-                let value = match handler.handle(request).await {
+                let Some(identity) = server.resolve_peer(&transport, link_id).await else {
+                    debug!(
+                        "Dropped mesh request {} on link {}: the link is gone",
+                        request_id.to_hex_string(),
+                        link_id.to_hex_string()
+                    );
+                    return;
+                };
+                if let Admission::Drop = handler.admit(link_id, identity.as_ref()) {
+                    return;
+                }
+                #[cfg(test)]
+                server.decoded.fetch_add(1, Ordering::SeqCst);
+                let frame = match RequestFrame::decode(&packed) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        debug!(
+                            "Dropped an undecodable mesh request {} on link {}: {err}",
+                            request_id.to_hex_string(),
+                            link_id.to_hex_string()
+                        );
+                        return;
+                    }
+                };
+                let request = InboundRequest {
+                    link_id,
+                    identity,
+                    request_id,
+                    path_hash: frame.path_hash,
+                    requested_at: frame.time,
+                    data: frame.data,
+                    branch,
+                };
+                let Ok(reply) = timeout(server.handler_timeout, handler.handle(request)).await
+                else {
+                    warn!(
+                        "Mesh request {} on link {} was not handled within {:?}; sent nothing",
+                        request_id.to_hex_string(),
+                        link_id.to_hex_string(),
+                        server.handler_timeout
+                    );
+                    return;
+                };
+                let value = match reply {
                     Reply::Value(value) => value,
                     Reply::Code(code) => code.to_wire(),
                     Reply::Silent => return,
@@ -309,6 +393,32 @@ impl R3Server {
                 () = serve => {}
             }
         })
+    }
+
+    /// Who is on `link_id`, read from the transport's own link first: upstream records the
+    /// proof before it broadcasts `PeerIdentified`, so the link is right even when the event
+    /// was lost to a lag. The identity table only stands in when the link is already gone;
+    /// `None` when neither knows the link, `Some(None)` for a link nobody has proven
+    /// themselves on.
+    async fn resolve_peer(
+        &self,
+        transport: &Transport,
+        link_id: LinkId,
+    ) -> Option<Option<Identity>> {
+        let from_link = timeout(PEER_RESOLVE_TIMEOUT, async {
+            let link = transport.find_in_link(&link_id).await?;
+            let link = link.lock().await;
+            Some(link.identified_peer_identity().copied())
+        })
+        .await;
+        match from_link {
+            Ok(Some(identity)) => Some(identity),
+            Ok(None) | Err(_) => self
+                .identified
+                .lock()
+                .get(&link_id)
+                .map(|identity| Some(*identity)),
+        }
     }
 }
 

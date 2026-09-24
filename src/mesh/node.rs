@@ -5,9 +5,13 @@ use crate::mesh::announce::{
 };
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::peers::{PeerChange, PeerSighting, PeerTable};
+#[cfg(test)]
+use crate::mesh::r3::RequestHandler;
 use crate::mesh::r3::{
-    R3Client, R3Error, R3Server, RequestHandler, RequestOptions, RequestOutcome,
+    Dispatcher, Envelope, LoggingKnockSink, OriginName, R3Client, R3Error, R3Server,
+    RequestOptions, RequestOutcome, RequestReceipt,
 };
+use crate::mesh::trust::TrustStore;
 use crate::mesh::{hex_lower, identity, mesh_cache_dir};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -50,10 +54,11 @@ const LAN_CHANNEL_CAPACITY: usize = 128;
 /// How often the peer table is written back if it changed; `stop` writes it regardless.
 const PEER_PERSIST_INTERVAL_SECS: u64 = 30;
 
-/// Where a node keeps its identity and its disposable state.
+/// Where a node keeps its identity, the user's trust list and its disposable state.
 pub(crate) struct MeshPaths {
     pub identity_path: PathBuf,
     pub cache_dir: PathBuf,
+    pub config_dir: PathBuf,
 }
 
 impl MeshPaths {
@@ -63,6 +68,7 @@ impl MeshPaths {
         Self {
             identity_path: identity::identity_path(),
             cache_dir: paths::cache_dir(),
+            config_dir: paths::config_dir(),
         }
     }
 }
@@ -131,6 +137,8 @@ enum JoinedInterface {
 struct DestinationState {
     dest: Arc<Mutex<SingleInputDestination>>,
     hash: AddressHash,
+    /// The name hash requests claim as their origin; moves with `dest` on a rekey.
+    origin: OriginName,
     instance_id: String,
     /// `None` only once the runtime has stopped and released it.
     lock: Option<InstanceLock>,
@@ -153,8 +161,10 @@ pub(crate) struct MeshRuntime {
     interfaces: Mutex<Vec<JoinedInterface>>,
     destination: Mutex<DestinationState>,
     peers: Arc<PeerTable>,
+    trust: Arc<TrustStore>,
     r3_client: Arc<R3Client>,
     r3_server: Arc<R3Server>,
+    dispatcher: Arc<Dispatcher>,
     cancel: CancellationToken,
     tasks: parking_lot::Mutex<Vec<JoinHandle<()>>>,
 }
@@ -162,7 +172,8 @@ pub(crate) struct MeshRuntime {
 impl MeshRuntime {
     /// Brings a node up for `session` and returns it running. Validation comes first so a bad
     /// config touches nothing on disk; the instance lock is taken before the identity is minted
-    /// so a refused start never creates a key.
+    /// so a refused start never creates a key. A trust list that does not load refuses the
+    /// start outright: the node never serves against a partial list.
     // Reached by the REPL mesh commands once they land.
     #[allow(dead_code)]
     pub(crate) async fn start(
@@ -179,6 +190,7 @@ impl MeshRuntime {
         enabled_view.validate(function_calling_support)?;
         let plans = plan_interfaces(config.interfaces());
         let app_data = announce_app_data(config)?;
+        let trust = Arc::new(TrustStore::open(&paths.config_dir)?);
 
         let instance_id = session.ensure_mesh_instance_id().to_string();
         let lock = InstanceLock::acquire(&paths.cache_dir, &instance_id)?;
@@ -208,7 +220,7 @@ impl MeshRuntime {
             }
         }
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
-        let (dest, hash) = match register_destination(
+        let (dest, hash, origin) = match register_destination(
             &transport,
             &transport_identity,
             &instance_id,
@@ -256,6 +268,9 @@ impl MeshRuntime {
 
         // Nothing fallible may follow: a failure once the tasks exist would leak them.
         let transport = Arc::new(transport);
+        let r3_server = Arc::new(R3Server::new());
+        let dispatcher = Arc::new(Dispatcher::new(trust.clone(), Arc::new(LoggingKnockSink)));
+        r3_server.set_handler(dispatcher.clone());
         let runtime = Arc::new(Self {
             fingerprint,
             transport_identity,
@@ -268,13 +283,16 @@ impl MeshRuntime {
             destination: Mutex::new(DestinationState {
                 dest,
                 hash,
+                origin,
                 instance_id,
                 lock: Some(lock),
                 last_announce,
             }),
             peers,
+            trust,
             r3_client: Arc::new(R3Client::new()),
-            r3_server: Arc::new(R3Server::new()),
+            r3_server,
+            dispatcher,
             cancel: CancellationToken::new(),
             tasks: parking_lot::Mutex::new(Vec::new()),
         });
@@ -340,6 +358,21 @@ impl MeshRuntime {
         self.peers.clone()
     }
 
+    // Reached by the REPL mesh commands once they land.
+    #[allow(dead_code)]
+    pub(crate) fn trust(&self) -> Arc<TrustStore> {
+        self.trust.clone()
+    }
+
+    /// The gate every inbound request passes; providers register their paths on it.
+    /// `register` returns the provider it displaced, a placeholder counting as nothing
+    /// displaced; `/knock` is owned by the dispatcher itself.
+    // Reached by the status and message providers once they land.
+    #[allow(dead_code)]
+    pub(crate) fn dispatcher(&self) -> Arc<Dispatcher> {
+        self.dispatcher.clone()
+    }
+
     #[cfg(test)]
     pub(crate) async fn has_destination(&self, hex: &str) -> bool {
         let hash = AddressHash::new_from_hex_string(hex).unwrap();
@@ -379,8 +412,9 @@ impl MeshRuntime {
         self.tasks.lock().push(handle);
     }
 
-    /// Sends one request to `destination` over a link, proving this node's identity first.
-    // Reached by the mesh dispatcher once it lands.
+    /// Sends one request to `destination` over a link, proving this node's identity first
+    /// and naming its current instance as the origin.
+    // Reached by the REPL mesh commands once they land.
     #[allow(dead_code)]
     pub(crate) async fn request(
         &self,
@@ -395,12 +429,13 @@ impl MeshRuntime {
             .await
             .clone()
             .ok_or(R3Error::NotRunning)?;
+        let envelope = self.envelope(data).await;
         let request = self.r3_client.request(
             &transport,
             &self.transport_identity,
             destination,
             path,
-            data,
+            envelope,
             options,
         );
         tokio::select! {
@@ -409,9 +444,47 @@ impl MeshRuntime {
         }
     }
 
-    /// Installs the sink for inbound requests; until then they are dropped.
-    // Reached by the mesh dispatcher once it lands.
+    /// `request` as a receipt: returns as soon as the request is on its own task and reports
+    /// its progress from there. Stopping the node settles every receipt still in flight,
+    /// link opening included, as `Failed(Shutdown)`.
+    // Reached by the REPL mesh commands and the message tools once they land.
     #[allow(dead_code)]
+    pub(crate) async fn request_with_receipt(
+        &self,
+        destination: &DestinationDesc,
+        path: &str,
+        data: rmpv::Value,
+        options: RequestOptions,
+    ) -> Result<RequestReceipt, R3Error> {
+        let transport = self
+            .transport
+            .lock()
+            .await
+            .clone()
+            .ok_or(R3Error::NotRunning)?;
+        let envelope = self.envelope(data).await;
+        Ok(self.r3_client.request_with_receipt(
+            transport,
+            self.transport_identity.clone(),
+            *destination,
+            path.to_string(),
+            envelope,
+            options,
+            self.cancellation_token(),
+        ))
+    }
+
+    /// `body` in the envelope naming the instance this node speaks for right now, read per
+    /// request so a rekeyed node claims its new instance and never a cached one.
+    async fn envelope(&self, body: rmpv::Value) -> Envelope {
+        Envelope {
+            origin: self.destination.lock().await.origin,
+            body,
+        }
+    }
+
+    /// Replaces the dispatcher `start` installed, so a test can watch requests directly.
+    #[cfg(test)]
     pub(crate) fn set_request_handler(&self, handler: Arc<dyn RequestHandler>) {
         self.r3_server.set_handler(handler);
     }
@@ -482,7 +555,7 @@ impl MeshRuntime {
         let lock = InstanceLock::acquire(&self.cache_dir, &rekey.fork_instance_id)?;
 
         let deadline = tokio::time::Instant::now() + REKEY_GRACE;
-        let (dest, hash) = register_destination(
+        let (dest, hash, origin) = register_destination(
             &transport,
             &self.transport_identity,
             &rekey.fork_instance_id,
@@ -517,6 +590,7 @@ impl MeshRuntime {
         *state = DestinationState {
             dest,
             hash,
+            origin,
             instance_id: rekey.fork_instance_id,
             lock: Some(lock),
             last_announce: None,
@@ -606,10 +680,11 @@ async fn register_destination(
     instance_id: &str,
     app_data: &[u8],
     deadline: tokio::time::Instant,
-) -> Result<(Arc<Mutex<SingleInputDestination>>, AddressHash)> {
+) -> Result<(Arc<Mutex<SingleInputDestination>>, AddressHash, OriginName)> {
     let name = DestinationName::new("coyote", &format!("mesh.{instance_id}"));
     let destination = SingleInputDestination::new(identity.clone(), name);
     let hash = destination.desc.address_hash;
+    let origin = OriginName::of(&destination.desc.name);
     let dest = timeout_at(deadline, transport.register_destination(destination))
         .await
         .map_err(|_| {
@@ -633,7 +708,7 @@ async fn register_destination(
             }
         );
     }
-    Ok((dest, hash))
+    Ok((dest, hash, origin))
 }
 
 /// Builds and sends one announce for `dest`, returning when it was sent.

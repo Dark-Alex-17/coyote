@@ -12,6 +12,8 @@ pub(crate) mod trust;
 pub(crate) use node::MeshSlot;
 
 use anyhow::{Context, Result};
+use rns_transport::hash::{AddressHash, Hash};
+use sha2::Digest;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -41,6 +43,21 @@ pub(crate) fn parse_rfc3339(text: &str) -> Option<SystemTime> {
 
 pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Reticulum's destination derivation: the address hash is the truncated SHA-256 of the
+/// name hash followed by the identity's address hash.
+pub(crate) fn destination_address(
+    name_hash: &[u8; r3::NAME_HASH_LEN],
+    identity: &AddressHash,
+) -> AddressHash {
+    AddressHash::new_from_hash(&Hash::new(
+        Hash::generator()
+            .chain_update(name_hash)
+            .chain_update(identity.as_slice())
+            .finalize()
+            .into(),
+    ))
 }
 
 /// Lower-cased `text` when it is exactly 32 ASCII hex digits. Upstream's hex parser checks
@@ -79,7 +96,7 @@ pub(crate) mod test_support {
 
     #[cfg(unix)]
     use std::net::SocketAddr;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::sync::Arc;
     #[cfg(unix)]
@@ -160,7 +177,30 @@ pub(crate) mod test_support {
         MeshPaths {
             identity_path: tmp.path.join("config").join("mesh").join("identity.key"),
             cache_dir: tmp.path.join("cache"),
+            config_dir: tmp.path.join("config"),
         }
+    }
+
+    /// Every `.rs` file under `src/mesh`, for the tests that grep the module's own source.
+    pub(crate) fn rust_sources() -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        walk(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("mesh"),
+            &mut sources,
+        );
+        sources
     }
 
     #[cfg(unix)]
@@ -197,7 +237,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::TempDir;
+    use super::test_support::{TempDir, rust_sources};
     use super::*;
 
     #[test]
@@ -253,24 +293,7 @@ mod tests {
 
     #[test]
     fn mesh_module_never_names_the_request_ctx() {
-        fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-            for entry in fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    rust_sources(&path, out);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-
-        let mut sources = Vec::new();
-        rust_sources(
-            &Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src")
-                .join("mesh"),
-            &mut sources,
-        );
+        let sources = rust_sources();
         // Assembled at runtime so this test's own text does not match the probes.
         let needles = [
             ["Request", "Context"].concat(),

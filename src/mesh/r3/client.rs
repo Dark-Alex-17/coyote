@@ -1,5 +1,8 @@
 use crate::mesh::r3::error::{R3Error, RefusalCode};
-use crate::mesh::r3::frame::{MAX_R3_PAYLOAD_BYTES, RequestFrame, RequestId, ResponseFrame};
+use crate::mesh::r3::frame::{
+    Envelope, MAX_R3_PAYLOAD_BYTES, RequestFrame, RequestId, ResponseFrame,
+};
+use crate::mesh::r3::receipt::RequestReceipt;
 
 use parking_lot::Mutex;
 use rmpv::Value;
@@ -7,14 +10,15 @@ use rns_transport::PacketContext;
 use rns_transport::delivery::await_link_activation;
 use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::link::{Link, LinkEvent, LinkEventData, LinkId};
+use rns_transport::hash::Hash;
 use rns_transport::identity::PrivateIdentity as TransportIdentity;
 use rns_transport::resource::{ResourceEvent, ResourceEventKind};
 use rns_transport::transport::{SendPacketOutcome, Transport};
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 use tokio::time::{Instant, timeout_at};
@@ -87,7 +91,7 @@ pub(crate) enum SizeBranch {
     Resource,
 }
 
-// Reached by the mesh dispatcher once it lands.
+// `request_id` and the branches wait for a production reader; the tests assert on them.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct RequestOutcome {
@@ -102,51 +106,150 @@ type Correlated = Result<(Value, SizeBranch), R3Error>;
 struct PendingRequest {
     link_id: LinkId,
     reply: oneshot::Sender<Correlated>,
+    /// Fires when the far end proves it holds the request; only a resource gets that proof.
+    delivered: Option<oneshot::Sender<()>>,
+    resource_hash: Option<Hash>,
+}
+
+/// Requests awaiting a response, by request id, and for those sent as a resource the
+/// transfer hash upstream reports outbound progress under.
+#[derive(Default)]
+struct Pending {
+    by_request: HashMap<RequestId, PendingRequest>,
+    by_resource: HashMap<Hash, RequestId>,
+}
+
+impl Pending {
+    fn remove(&mut self, request_id: &RequestId) -> Option<PendingRequest> {
+        let entry = self.by_request.remove(request_id)?;
+        if let Some(hash) = entry.resource_hash {
+            self.by_resource.remove(&hash);
+        }
+        Some(entry)
+    }
+
+    fn remove_link(&mut self, link_id: LinkId) -> Vec<PendingRequest> {
+        let closed: Vec<PendingRequest> = self
+            .by_request
+            .extract_if(|_, entry| entry.link_id == link_id)
+            .map(|(_, entry)| entry)
+            .collect();
+        for hash in closed.iter().filter_map(|entry| entry.resource_hash) {
+            self.by_resource.remove(&hash);
+        }
+        closed
+    }
+}
+
+/// Removes the pending entry when the request future goes away, whichever way it does. A
+/// reply has already removed it and a timeout wants it gone; a caller that drops the future
+/// mid-wait would otherwise leave it until the link closed.
+struct PendingGuard<'a> {
+    client: &'a R3Client,
+    request_id: RequestId,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.client.remove_pending(&self.request_id);
+    }
 }
 
 /// The requesting side: sends requests over out-links and correlates the responses that
 /// arrive on the transport's out-link and resource event streams. One instance serves every
 /// request a node makes; `run` must be spawned before the first request is sent.
 pub(crate) struct R3Client {
-    pending: Mutex<HashMap<RequestId, PendingRequest>>,
+    pending: Mutex<Pending>,
+    /// Set once `run` has exited, under the pending lock, so no request can slip into the
+    /// table after the last drain and wait out its timeout with nobody to answer it.
+    closed: AtomicBool,
 }
 
 impl R3Client {
     pub(crate) fn new() -> Self {
         Self {
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(Pending::default()),
+            closed: AtomicBool::new(false),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
-        self.pending.lock().len()
+        self.pending.lock().by_request.len()
     }
 
     /// Opens (or reuses) a link to `destination`, proves `identity` on it, and sends one
-    /// request for `path`. `link_timeout` covers opening the link and identifying on it;
-    /// `request_timeout` starts once that is done and covers sending the request as well as
-    /// waiting for the response.
+    /// request for `path`, its body in the envelope that names the instance asking.
+    /// `link_timeout` covers opening the link and identifying on it; `request_timeout`
+    /// starts once that is done and covers sending the request as well as waiting for the
+    /// response.
+    ///
+    /// Links are reused per destination for as long as upstream keeps them: its watchdog
+    /// closes an idle link and nothing here closes one sooner. The identity is proven on
+    /// every request regardless; it is one packet, and it also heals a responder that
+    /// missed the first proof.
     pub(crate) async fn request(
         &self,
         transport: &Transport,
         identity: &TransportIdentity,
         destination: &DestinationDesc,
         path: &str,
-        data: Value,
+        envelope: Envelope,
         options: RequestOptions,
     ) -> Result<RequestOutcome, R3Error> {
-        let link_deadline = Deadline::after(options.link_timeout);
-        let link = open_link(transport, destination, path, link_deadline).await?;
-        identify(transport, &link, identity, path, link_deadline).await?;
-        let request_deadline = Deadline::after(options.request_timeout);
-        self.request_on_link(transport, &link, path, data, request_deadline)
-            .await
+        let link = link_to(transport, identity, destination, path, options.link_timeout).await?;
+        self.request_on_link_with(
+            transport,
+            &link,
+            path,
+            envelope,
+            Deadline::after(options.request_timeout),
+            None,
+        )
+        .await
     }
 
-    /// Sends one request over an already active link. The branch is decided the way RNS
-    /// `Link.request` decides it: by comparing the encoded frame against the link's MDU.
-    /// Sending counts against `deadline` as much as waiting for the response does.
+    /// `request`, returned at once as a receipt that reports progress while the request
+    /// runs on its own task. Dropping the receipt abandons the request; `cancel` firing
+    /// fails it with `Shutdown`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn request_with_receipt(
+        self: &Arc<Self>,
+        transport: Arc<Transport>,
+        identity: TransportIdentity,
+        destination: DestinationDesc,
+        path: String,
+        envelope: Envelope,
+        options: RequestOptions,
+        cancel: CancellationToken,
+    ) -> RequestReceipt {
+        let client = self.clone();
+        RequestReceipt::track(cancel, move |delivered| async move {
+            let link = link_to(
+                &transport,
+                &identity,
+                &destination,
+                &path,
+                options.link_timeout,
+            )
+            .await?;
+            client
+                .request_on_link_with(
+                    &transport,
+                    &link,
+                    &path,
+                    envelope,
+                    Deadline::after(options.request_timeout),
+                    Some(delivered),
+                )
+                .await
+        })
+    }
+
+    /// Sends `data` as the request body verbatim, with no envelope, over an already active
+    /// link. Production requests never take this path; tests use it to put a body of their
+    /// own choosing, malformed ones included, in front of the responder.
+    #[cfg(test)]
     pub(crate) async fn request_on_link(
         &self,
         transport: &Transport,
@@ -154,6 +257,46 @@ impl R3Client {
         path: &str,
         data: Value,
         deadline: Deadline,
+    ) -> Result<RequestOutcome, R3Error> {
+        self.send_on_link(transport, link, path, data, deadline, None)
+            .await
+    }
+
+    /// Sends one enveloped request over an already active link. `delivered` fires once the
+    /// far end has proven it holds the request; only a request that travels as a resource
+    /// is proven, so for a packet the hook is dropped unfired, since upstream proves no
+    /// link packet.
+    pub(crate) async fn request_on_link_with(
+        &self,
+        transport: &Transport,
+        link: &Arc<tokio::sync::Mutex<Link>>,
+        path: &str,
+        envelope: Envelope,
+        deadline: Deadline,
+        delivered: Option<oneshot::Sender<()>>,
+    ) -> Result<RequestOutcome, R3Error> {
+        self.send_on_link(
+            transport,
+            link,
+            path,
+            envelope.into_value(),
+            deadline,
+            delivered,
+        )
+        .await
+    }
+
+    /// The branch is decided the way RNS `Link.request` decides it: by comparing the
+    /// encoded frame against the link's MDU. Sending counts against `deadline` as much as
+    /// waiting for the response does.
+    async fn send_on_link(
+        &self,
+        transport: &Transport,
+        link: &Arc<tokio::sync::Mutex<Link>>,
+        path: &str,
+        data: Value,
+        deadline: Deadline,
+        delivered: Option<oneshot::Sender<()>>,
     ) -> Result<RequestOutcome, R3Error> {
         let packed = RequestFrame::new(path, data).encode();
         if packed.len() > MAX_R3_PAYLOAD_BYTES {
@@ -168,7 +311,8 @@ impl R3Client {
                 (*link.id(), link.link_mdu())
             })
             .await?;
-        let (receiver, request_id, request_branch) = if packed.len() <= mdu {
+        let (receiver, request_id, request_branch, _guard) = if packed.len() <= mdu {
+            drop(delivered);
             let packet = deadline
                 .bound(path, link.lock())
                 .await?
@@ -180,24 +324,26 @@ impl R3Client {
                 request_id.to_hex_string(),
                 packed.len()
             );
-            let receiver = self.insert_pending(request_id, link_id);
-            let sent = deadline
+            let receiver = self.insert_pending(request_id, link_id, None)?;
+            let guard = PendingGuard {
+                client: self,
+                request_id,
+            };
+            match deadline
                 .bound(
                     path,
                     transport.send_link_packet_on_bound_iface(link, packet),
                 )
-                .await
-                .and_then(|outcome| match outcome {
-                    SendPacketOutcome::SentDirect => Ok(()),
-                    outcome => Err(R3Error::LinkFailed(format!(
+                .await?
+            {
+                SendPacketOutcome::SentDirect => {}
+                outcome => {
+                    return Err(R3Error::LinkFailed(format!(
                         "request packet not sent: {outcome:?}"
-                    ))),
-                });
-            if let Err(err) = sent {
-                self.remove_pending(&request_id);
-                return Err(err);
+                    )));
+                }
             }
-            (receiver, request_id, SizeBranch::Packet)
+            (receiver, request_id, SizeBranch::Packet, guard)
         } else {
             let request_id = RequestId::of_packed(&packed);
             debug!(
@@ -205,32 +351,27 @@ impl R3Client {
                 request_id.to_hex_string(),
                 packed.len()
             );
-            let receiver = self.insert_pending(request_id, link_id);
-            let sent = deadline
+            let receiver = self.insert_pending(request_id, link_id, delivered)?;
+            let guard = PendingGuard {
+                client: self,
+                request_id,
+            };
+            let resource_hash = deadline
                 .bound(
                     path,
                     transport.send_request_resource(&link_id, request_id.to_vec(), packed, None),
                 )
-                .await
-                .and_then(|sent| {
-                    sent.map(|_| ())
-                        .map_err(|err| R3Error::Send(format!("request resource: {err}")))
-                });
-            if let Err(err) = sent {
-                self.remove_pending(&request_id);
-                return Err(err);
-            }
-            (receiver, request_id, SizeBranch::Resource)
+                .await?
+                .map_err(|err| R3Error::Send(format!("request resource: {err}")))?;
+            self.track_outbound(resource_hash, request_id);
+            (receiver, request_id, SizeBranch::Resource, guard)
         };
 
         let reply = match timeout_at(deadline.at, receiver).await {
             Ok(Ok(reply)) => reply,
             // The sender only goes away with the pending table itself.
             Ok(Err(_)) => Err(R3Error::Shutdown),
-            Err(_) => {
-                self.remove_pending(&request_id);
-                Err(deadline.expired(path))
-            }
+            Err(_) => Err(deadline.expired(path)),
         };
         let (value, response_branch) = reply?;
         if let Some(code) = RefusalCode::from_wire(&value) {
@@ -274,16 +415,39 @@ impl R3Client {
         self.fail_all(R3Error::Shutdown);
     }
 
+    /// `Shutdown` once `run` has exited: a link may outlive the client loop, and a request
+    /// filed after the drain would otherwise wait out its full timeout.
     fn insert_pending(
         &self,
         request_id: RequestId,
         link_id: LinkId,
-    ) -> oneshot::Receiver<Correlated> {
+        delivered: Option<oneshot::Sender<()>>,
+    ) -> Result<oneshot::Receiver<Correlated>, R3Error> {
         let (reply, receiver) = oneshot::channel();
-        self.pending
-            .lock()
-            .insert(request_id, PendingRequest { link_id, reply });
-        receiver
+        let mut pending = self.pending.lock();
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(R3Error::Shutdown);
+        }
+        pending.by_request.insert(
+            request_id,
+            PendingRequest {
+                link_id,
+                reply,
+                delivered,
+                resource_hash: None,
+            },
+        );
+        Ok(receiver)
+    }
+
+    /// Files the transfer hash of a request sent as a resource, unless the request has
+    /// already been settled (a link that closed during the send does that).
+    fn track_outbound(&self, resource_hash: Hash, request_id: RequestId) {
+        let mut pending = self.pending.lock();
+        if let Some(entry) = pending.by_request.get_mut(&request_id) {
+            entry.resource_hash = Some(resource_hash);
+            pending.by_resource.insert(resource_hash, request_id);
+        }
     }
 
     fn remove_pending(&self, request_id: &RequestId) -> Option<PendingRequest> {
@@ -291,8 +455,12 @@ impl R3Client {
     }
 
     fn fail_all(&self, error: R3Error) {
-        let drained = std::mem::take(&mut *self.pending.lock());
-        for (_, pending) in drained {
+        let drained = {
+            let mut pending = self.pending.lock();
+            self.closed.store(true, Ordering::SeqCst);
+            std::mem::take(&mut *pending)
+        };
+        for (_, pending) in drained.by_request {
             let _ = pending.reply.send(Err(error.clone()));
         }
     }
@@ -303,12 +471,7 @@ impl R3Client {
                 self.deliver(event.id, payload.as_slice(), SizeBranch::Packet);
             }
             LinkEvent::Closed => {
-                let closed: Vec<PendingRequest> = self
-                    .pending
-                    .lock()
-                    .extract_if(|_, entry| entry.link_id == event.id)
-                    .map(|(_, entry)| entry)
-                    .collect();
+                let closed = self.pending.lock().remove_link(event.id);
                 if !closed.is_empty() {
                     debug!(
                         "Mesh link {} closed with {} requests pending",
@@ -325,10 +488,48 @@ impl R3Client {
     }
 
     fn on_resource_event(&self, event: ResourceEvent) {
-        if let ResourceEventKind::Complete(complete) = event.kind
-            && complete.is_response
-        {
-            self.deliver(event.link_id, &complete.data, SizeBranch::Resource);
+        match event.kind {
+            ResourceEventKind::Complete(complete) if complete.is_response => {
+                self.deliver(event.link_id, &complete.data, SizeBranch::Resource);
+            }
+            ResourceEventKind::OutboundComplete => {
+                let delivered = {
+                    let mut pending = self.pending.lock();
+                    let request_id = pending.by_resource.get(&event.hash).copied();
+                    request_id.and_then(|request_id| {
+                        let hook = pending.by_request.get_mut(&request_id)?.delivered.take();
+                        Some((request_id, hook))
+                    })
+                };
+                if let Some((request_id, hook)) = delivered {
+                    debug!(
+                        "Mesh request {} was delivered as a resource",
+                        request_id.to_hex_string()
+                    );
+                    if let Some(hook) = hook {
+                        let _ = hook.send(());
+                    }
+                }
+            }
+            ResourceEventKind::OutboundFailed => {
+                let failed = {
+                    let mut pending = self.pending.lock();
+                    let request_id = pending.by_resource.get(&event.hash).copied();
+                    request_id
+                        .and_then(|request_id| Some((request_id, pending.remove(&request_id)?)))
+                };
+                if let Some((request_id, entry)) = failed {
+                    debug!(
+                        "Mesh request {} failed in transfer as a resource on link {}",
+                        request_id.to_hex_string(),
+                        event.link_id.to_hex_string()
+                    );
+                    let _ = entry.reply.send(Err(R3Error::Send(
+                        "request resource failed in transfer".to_string(),
+                    )));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -353,32 +554,55 @@ impl R3Client {
                 return;
             }
         };
-        let pending = match self.pending.lock().entry(frame.request_id) {
-            Entry::Occupied(entry) if entry.get().link_id == link_id => entry.remove(),
-            Entry::Occupied(entry) => {
-                debug!(
-                    "Ignored a mesh response for {} that arrived on link {} instead of {}",
-                    frame.request_id.to_hex_string(),
-                    link_id.to_hex_string(),
-                    entry.get().link_id.to_hex_string()
-                );
-                return;
-            }
-            Entry::Vacant(_) => {
+        let pending = {
+            let mut pending = self.pending.lock();
+            let Some(entry) = pending.by_request.get(&frame.request_id) else {
                 debug!(
                     "Unmatched mesh response {} ({branch:?}); the request timed out or was never ours",
                     frame.request_id.to_hex_string()
                 );
                 return;
+            };
+            if entry.link_id != link_id {
+                debug!(
+                    "Ignored a mesh response for {} that arrived on link {} instead of {}",
+                    frame.request_id.to_hex_string(),
+                    link_id.to_hex_string(),
+                    entry.link_id.to_hex_string()
+                );
+                return;
             }
+            pending.remove(&frame.request_id)
+        };
+        let Some(pending) = pending else {
+            return;
         };
         debug!(
             "Correlated mesh response {} ({branch:?}, {} bytes)",
             frame.request_id.to_hex_string(),
             bytes.len()
         );
+        // A response is proof of delivery too, should it overtake the transfer's own.
+        if let Some(delivered) = pending.delivered {
+            let _ = delivered.send(());
+        }
         let _ = pending.reply.send(Ok((frame.data, branch)));
     }
+}
+
+/// Opens (or reuses) the link to `destination` and proves `identity` on it, both within
+/// `link_timeout`.
+async fn link_to(
+    transport: &Transport,
+    identity: &TransportIdentity,
+    destination: &DestinationDesc,
+    path: &str,
+    link_timeout: Duration,
+) -> Result<Arc<tokio::sync::Mutex<Link>>, R3Error> {
+    let deadline = Deadline::after(link_timeout);
+    let link = open_link(transport, destination, path, deadline).await?;
+    identify(transport, &link, identity, path, deadline).await?;
+    Ok(link)
 }
 
 /// Links to `destination` and waits for activation. A destination without a known path

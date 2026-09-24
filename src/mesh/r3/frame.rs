@@ -3,6 +3,7 @@ use crate::mesh::r3::error::R3Error;
 
 use rmpv::Value;
 use rns_transport::Packet;
+use rns_transport::destination::{DestinationName, NAME_HASH_LENGTH};
 use rns_transport::hash::{ADDRESS_HASH_SIZE, address_hash};
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +14,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// because the upstream reject path deadlocks the transport (rev 3ed5932).
 pub(crate) const MAX_R3_PAYLOAD_BYTES: usize = 256 * 1024;
 
+/// Bytes of a destination name hash, the prefix of the full name hash Reticulum uses to
+/// derive a destination address.
+pub(crate) const NAME_HASH_LEN: usize = NAME_HASH_LENGTH;
+
+const NAME_HASH_KEY: &str = "name_hash";
+const BODY_KEY: &str = "body";
+
 /// `truncated_hash(path)`: SHA-256 of the UTF-8 path, first 16 bytes. Requests carry this,
 /// never the path itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,6 +29,10 @@ pub(crate) struct PathHash([u8; ADDRESS_HASH_SIZE]);
 impl PathHash {
     pub(crate) fn of(path: &str) -> Self {
         Self(address_hash(path.as_bytes()))
+    }
+
+    pub(crate) fn to_hex_string(self) -> String {
+        hex_lower(&self.0)
     }
 }
 
@@ -165,6 +177,65 @@ impl ResponseFrame {
         Ok(Self {
             request_id: RequestId(hash_bytes(&request_id, "response request id")?),
             data,
+        })
+    }
+}
+
+/// The name hash of the instance a requester speaks for. It names nothing on its own: the
+/// dispatcher derives the destination from it and the identity proven on the link, so a
+/// peer can only ever claim an instance of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OriginName(pub [u8; NAME_HASH_LEN]);
+
+impl OriginName {
+    pub(crate) fn of(name: &DestinationName) -> Self {
+        let mut bytes = [0; NAME_HASH_LEN];
+        bytes.copy_from_slice(name.as_name_hash_slice());
+        Self(bytes)
+    }
+}
+
+/// What every request body travels in: the requester's origin beside the body, as a
+/// msgpack map with `name_hash` and `body` keys.
+pub(crate) struct Envelope {
+    pub origin: OriginName,
+    pub body: Value,
+}
+
+impl Envelope {
+    pub(crate) fn into_value(self) -> Value {
+        Value::Map(vec![
+            (
+                Value::from(NAME_HASH_KEY),
+                Value::Binary(self.origin.0.to_vec()),
+            ),
+            (Value::from(BODY_KEY), self.body),
+        ])
+    }
+
+    /// Both keys are required and the name hash must be binary of exactly `NAME_HASH_LEN`
+    /// bytes; keys this version does not know are ignored.
+    pub(crate) fn from_value(value: Value) -> Option<Self> {
+        let Value::Map(entries) = value else {
+            return None;
+        };
+        let mut origin = None;
+        let mut body = None;
+        for (key, value) in entries {
+            match key.as_str() {
+                Some(NAME_HASH_KEY) => {
+                    let Value::Binary(bytes) = value else {
+                        return None;
+                    };
+                    origin = Some(OriginName(bytes.as_slice().try_into().ok()?));
+                }
+                Some(BODY_KEY) => body = Some(value),
+                _ => {}
+            }
+        }
+        Some(Self {
+            origin: origin?,
+            body: body?,
         })
     }
 }

@@ -60,6 +60,7 @@ log4rs = { version = "1.4.0", features = [
 ] }
 shell-words = "1.1.0"
 sha2 = "0.10.8"
+subtle = "2.6.1"
 unicode-width = "0.2.0"
 async-recursion = "1.1.1"
 http = "1.1.0"

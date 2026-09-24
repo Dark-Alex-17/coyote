@@ -1800,6 +1800,7 @@ dependencies = [
  "sha2 0.10.9",
  "shell-words",
  "strum_macros",
+ "subtle",
  "syntect",
  "sys-locale",
  "terminal-colorsaurus",

@@ -46,8 +46,8 @@ two. Neither of the two is an assertion of wrongdoing upstream.
     Relying on a GPL arm means shipping a copy of that license, and LXMF-rs
     ships the EPL-2.0 text and the Secondary Licenses Notice but no copy of
     the GNU General Public License; neither does this repository. The same
-    is true of the BSD 3-Clause text the dalek crates below are under. This
-    one blocks a release.
+    is true of the BSD 3-Clause text the dalek crates and `subtle` below are
+    under. This one blocks a release.
   - Coyote's package metadata still declares `license = "AGPL-3.0-only"`,
     which no longer describes the combined work once these dependencies
     ship. Settling the aggregate expression is the license owner's call and
@@ -86,7 +86,11 @@ recorded here; the license text itself is not shipped, which is the
 release-blocking obligation recorded above. The sibling `curve25519-dalek`
 and `ed25519-dalek` crates are under the same license with their own
 copyright lines; they predate these dependencies and their notices are not
-recorded here either, which the same obligation covers.
+recorded here either, which the same obligation covers. `subtle`, already in
+the tree via `digest` and now a direct dependency for the mesh trust store, is
+under the same BSD 3-Clause License, "Copyright (c) 2016-2017 Isis Agora
+Lovecruft, Henry de Valence. All rights reserved. Copyright (c) 2016-2024 Isis
+Agora Lovecruft. All rights reserved."
 
 `reticulum-rs-transport` depends on `tokio-serial` unconditionally, which
 brings in `mio-serial` and `serialport`. `tokio-serial` is under the MIT
