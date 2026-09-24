@@ -29,6 +29,20 @@ fn cost_is_zero(v: &f64) -> bool {
     *v == 0.0
 }
 
+fn mint_mesh_instance_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// What the mesh runtime needs to move the live destination from the original session to its fork.
+// Scaffolding for the mesh runtime: the first consumer of these fields removes the allow.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+#[must_use = "the mesh runtime must re-key the live destination"]
+pub struct ForkRekey {
+    pub original_instance_id: Option<String>,
+    pub fork_instance_id: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Session {
     #[serde(rename(serialize = "model", deserialize = "model"))]
@@ -92,6 +106,8 @@ pub struct Session {
     agent_variables: AgentVariables,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     agent_instructions: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mesh_instance_id: Option<String>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     compressed_messages: Vec<Message>,
@@ -256,6 +272,52 @@ impl Session {
 
     pub fn role_name(&self) -> Option<&str> {
         self.role_name.as_deref()
+    }
+
+    pub fn mesh_instance_id(&self) -> Option<&str> {
+        self.mesh_instance_id.as_deref()
+    }
+
+    /// The id this session's mesh destination is derived from, minted lazily. Sessions that
+    /// never join the mesh and were never forked carry none; `fork` is the other minting path.
+    // Scaffolding for the mesh runtime: the first consumer of this method removes the allow.
+    #[allow(dead_code)]
+    pub fn ensure_mesh_instance_id(&mut self) -> &str {
+        if self.mesh_instance_id.is_none() {
+            self.dirty = true;
+        }
+        self.mesh_instance_id
+            .get_or_insert_with(mint_mesh_instance_id)
+    }
+
+    /// Whether `id` has the shape `mint_mesh_instance_id` produces: 32 lowercase hex chars.
+    /// Consumers that build filesystem paths from the id check this before touching disk.
+    pub fn is_valid_mesh_instance_id(id: &str) -> bool {
+        id.len() == 32
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    /// Copies this session into a new lineage named `fork_name`: the autoname is dropped and
+    /// the fork always gets its own mesh instance id, even when this session never used the
+    /// mesh. The fork is unsaved and dirty so it cannot be flushed over the original's file.
+    /// The returned `ForkRekey` tells the mesh runtime which destination moves where.
+    pub fn fork(&self, fork_name: String) -> (Session, ForkRekey) {
+        let mut fork = self.clone();
+        fork.set_name(fork_name);
+        fork.clear_autoname();
+        fork.path = None;
+        fork.dirty = true;
+        let fork_instance_id = mint_mesh_instance_id();
+        fork.mesh_instance_id = Some(fork_instance_id.clone());
+        (
+            fork,
+            ForkRekey {
+                original_instance_id: self.mesh_instance_id().map(str::to_string),
+                fork_instance_id,
+            },
+        )
     }
 
     /// Hooks of the role this session holds. `set_role` snapshots them
@@ -1261,6 +1323,117 @@ mod tests {
         let session: Session = serde_yaml::from_str("model: provider:test\nmessages: []").unwrap();
 
         assert_eq!(session.enabled_macros, None);
+    }
+
+    #[test]
+    fn session_without_mesh_instance_id_loads_and_mints_on_first_use() {
+        let mut session: Session =
+            serde_yaml::from_str("model: provider:test\nmessages: []").unwrap();
+        assert_eq!(session.mesh_instance_id(), None);
+        assert!(!session.dirty());
+
+        let minted = session.ensure_mesh_instance_id().to_string();
+
+        assert_eq!(minted.len(), 32);
+        assert!(minted.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(session.mesh_instance_id(), Some(minted.as_str()));
+        assert!(session.dirty());
+
+        session.dirty = false;
+        assert_eq!(
+            session.ensure_mesh_instance_id(),
+            minted,
+            "a second call must return the same id"
+        );
+        assert!(!session.dirty(), "returning an existing id must not dirty");
+    }
+
+    #[test]
+    fn session_mesh_instance_id_survives_yaml_round_trip() {
+        let mut session = Session::default();
+        let minted = session.ensure_mesh_instance_id().to_string();
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(reloaded.mesh_instance_id(), Some(minted.as_str()));
+    }
+
+    #[test]
+    fn session_none_mesh_instance_id_is_not_serialized() {
+        let yaml = serde_yaml::to_string(&Session::default()).unwrap();
+        assert!(!yaml.contains("mesh_instance_id"), "{yaml}");
+    }
+
+    #[test]
+    fn session_fork_mints_fresh_id_and_reports_original() {
+        let mut original = Session::default();
+        original.set_name("orig".to_string());
+        original.set_autoname("topic");
+        let original_id = original.ensure_mesh_instance_id().to_string();
+
+        let (fork, rekey) = original.fork("orig-fork-1".to_string());
+
+        assert_eq!(fork.name(), "orig-fork-1");
+        assert_eq!(fork.autoname(), None);
+        assert_ne!(fork.mesh_instance_id(), Some(original_id.as_str()));
+        assert_eq!(
+            rekey.original_instance_id.as_deref(),
+            Some(original_id.as_str())
+        );
+        assert_eq!(
+            Some(rekey.fork_instance_id.as_str()),
+            fork.mesh_instance_id()
+        );
+        assert!(
+            fork.dirty(),
+            "an unsaved fork must be dirty or flush skips it"
+        );
+        assert_eq!(
+            fork.path, None,
+            "the fork must not inherit the original's file path"
+        );
+        assert_eq!(original.mesh_instance_id(), Some(original_id.as_str()));
+        assert_eq!(original.autoname(), Some("topic"));
+    }
+
+    #[test]
+    fn session_fork_of_session_without_id_still_mints() {
+        let original = Session::default();
+
+        let (fork, rekey) = original.fork("fork".to_string());
+
+        assert_eq!(rekey.original_instance_id, None);
+        assert_eq!(
+            Some(rekey.fork_instance_id.as_str()),
+            fork.mesh_instance_id()
+        );
+    }
+
+    #[test]
+    fn mesh_instance_id_validator_accepts_minted_ids_and_rejects_others() {
+        assert!(Session::is_valid_mesh_instance_id(&mint_mesh_instance_id()));
+        assert!(Session::is_valid_mesh_instance_id(
+            "0123456789abcdef0123456789abcdef"
+        ));
+
+        assert!(!Session::is_valid_mesh_instance_id(""));
+        assert!(!Session::is_valid_mesh_instance_id("../../escape"));
+        assert!(!Session::is_valid_mesh_instance_id(
+            "0123456789ABCDEF0123456789ABCDEF"
+        ));
+        assert!(!Session::is_valid_mesh_instance_id(
+            "0123456789abcdef0123456789abcde"
+        ));
+        assert!(!Session::is_valid_mesh_instance_id(
+            "0123456789abcdef0123456789abcdef0"
+        ));
+        assert!(!Session::is_valid_mesh_instance_id(
+            "0123456789abcdef0123456789abcdeg"
+        ));
+        assert!(!Session::is_valid_mesh_instance_id(
+            &uuid::Uuid::new_v4().hyphenated().to_string()
+        ));
     }
 
     #[test]

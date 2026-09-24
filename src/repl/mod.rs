@@ -1082,7 +1082,8 @@ pub async fn run_repl_command(
                 }
             },
             ".fork" => {
-                ctx.fork_session(args)?;
+                // The mesh runtime consumes this rekey once it exists; nothing re-keys yet.
+                let _rekey = ctx.fork_session(args)?;
             }
             ".save" => match split_first_arg(args) {
                 Some(("role", name)) => {

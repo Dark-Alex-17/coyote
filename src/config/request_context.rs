@@ -2,7 +2,7 @@ use super::bundles::installed_bundle_names;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::mesh_config::render_mesh_info;
 use super::rag_cache::{RagCache, RagKey};
-use super::session::{INTERRUPTED_RESPONSE_TEXT, Session};
+use super::session::{ForkRekey, INTERRUPTED_RESPONSE_TEXT, Session};
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
 use super::skill_registry::SkillRegistry;
@@ -1130,7 +1130,9 @@ impl RequestContext {
         Ok(())
     }
 
-    pub fn fork_session(&mut self, fork_name: Option<&str>) -> Result<()> {
+    /// Forks the active session and switches to the fork. The returned `ForkRekey` is the
+    /// hook point where the mesh runtime moves the live destination to the fork.
+    pub fn fork_session(&mut self, fork_name: Option<&str>) -> Result<ForkRekey> {
         let current_name = match &self.session {
             Some(s) => s.name().to_string(),
             None => bail!("No active session to fork"),
@@ -1148,6 +1150,9 @@ impl RequestContext {
             }
         };
 
+        if fork_name == current_name {
+            bail!("Cannot fork '{current_name}' onto its own name; pick a different fork name");
+        }
         let fork_path = self.session_file(&fork_name);
         if fork_path.exists() {
             bail!("Session '{}' already exists", fork_name);
@@ -1156,15 +1161,13 @@ impl RequestContext {
         self.save_session(None)?;
 
         let session = self.session.as_ref().unwrap();
-        let mut fork = session.clone();
-        fork.set_name(fork_name.clone());
-        fork.clear_autoname();
+        let (mut fork, rekey) = session.fork(fork_name.clone());
         fork.save(&fork_name, &fork_path, self.working_mode.is_repl())?;
 
         self.session = Some(fork);
         println!("Forked '{current_name}' → '{fork_name}'");
 
-        Ok(())
+        Ok(rekey)
     }
 
     pub fn empty_session(&mut self) -> Result<()> {
@@ -6956,6 +6959,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fork_for_branch_keeps_mesh_instance_id_same_session() {
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        let id = session.ensure_mesh_instance_id().to_string();
+        ctx.session = Some(session);
+
+        let branch = ctx.fork_for_branch();
+
+        assert_eq!(
+            branch.session.as_ref().unwrap().mesh_instance_id(),
+            Some(id.as_str()),
+            "a parallel branch runs the same session, not a new lineage"
+        );
+    }
+
+    #[test]
+    fn fork_session_refuses_forking_onto_own_name() {
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("same".to_string());
+        ctx.session = Some(session);
+
+        let err = ctx.fork_session(Some("same")).unwrap_err().to_string();
+
+        assert!(
+            err.contains("Cannot fork 'same' onto its own name"),
+            "{err}"
+        );
+        assert_eq!(ctx.session.as_ref().unwrap().mesh_instance_id(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_gives_fork_fresh_mesh_instance_id_and_leaves_original() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sessions_dir = env::temp_dir().join(format!("coyote-fork-session-mesh-{unique}"));
+        let _env = crate::testing::EnvVarGuard::set(get_env_name("sessions_dir"), &sessions_dir);
+
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("original".to_string());
+        let original_id = session.ensure_mesh_instance_id().to_string();
+        ctx.session = Some(session);
+
+        let rekey = ctx.fork_session(Some("forked")).unwrap();
+
+        let live = ctx.session.as_ref().unwrap();
+        assert_eq!(live.name(), "forked");
+        assert_eq!(
+            rekey.original_instance_id.as_deref(),
+            Some(original_id.as_str())
+        );
+        assert_eq!(
+            Some(rekey.fork_instance_id.as_str()),
+            live.mesh_instance_id()
+        );
+        assert_ne!(rekey.fork_instance_id, original_id);
+
+        let on_disk = |name: &str| -> Session {
+            let yaml = std::fs::read_to_string(sessions_dir.join(format!("{name}.yaml"))).unwrap();
+            serde_yaml::from_str(&yaml).unwrap()
+        };
+        assert_eq!(
+            on_disk("original").mesh_instance_id(),
+            Some(original_id.as_str())
+        );
+        assert_eq!(
+            on_disk("forked").mesh_instance_id(),
+            Some(rekey.fork_instance_id.as_str())
+        );
+
+        remove_dir_all(&sessions_dir).unwrap();
+    }
+
     fn app_state_with_mcp_config(mcp_server_support: bool, server_names: &[&str]) -> Arc<AppState> {
         app_state_with_mcp_command(mcp_server_support, server_names, "echo")
     }
@@ -7053,6 +7134,43 @@ mod tests {
         assert!(
             ctx.role.is_none(),
             "role must be rolled back when MCP startup fails"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn use_role_rollback_snapshot_keeps_mesh_instance_id_same_session() {
+        let _guard = TestConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        write(
+            roles_dir.join("broken_mcp.md"),
+            "---\nenabled_mcp_servers: failing\n---\nYou use MCP servers.",
+        )
+        .unwrap();
+
+        let app_state =
+            app_state_with_mcp_command(true, &["failing"], "/nonexistent/coyote-test-mcp-binary");
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let mut session = Session::default();
+        let id = session.ensure_mesh_instance_id().to_string();
+        ctx.session = Some(session);
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        let result = run_async(ctx.use_role(&app, "broken_mcp", abort));
+
+        assert!(result.is_err());
+        let restored = ctx.session.as_ref().unwrap();
+        assert_eq!(
+            restored.role_name(),
+            None,
+            "the pre-role snapshot must be restored when MCP startup fails"
+        );
+        assert_eq!(
+            restored.mesh_instance_id(),
+            Some(id.as_str()),
+            "the rollback snapshot is the same session and keeps its id"
         );
     }
 

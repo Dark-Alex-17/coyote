@@ -11,6 +11,7 @@ mod repl;
 #[macro_use]
 mod utils;
 mod mcp;
+mod mesh;
 mod parsers;
 mod sandbox;
 mod supervisor;

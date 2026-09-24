@@ -751,6 +751,44 @@ mod tests {
     }
 
     #[test]
+    fn refresh_session_snapshot_keeps_mesh_instance_id_same_session() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let mut input = Input::from_str(&ctx, "hello", None).unwrap();
+        assert_eq!(input.session.as_ref().unwrap().mesh_instance_id(), None);
+
+        let id = ctx
+            .session
+            .as_mut()
+            .unwrap()
+            .ensure_mesh_instance_id()
+            .to_string();
+        input.refresh_session(&ctx);
+
+        assert_eq!(
+            input.session.as_ref().unwrap().mesh_instance_id(),
+            Some(id.as_str()),
+            "a refreshed request snapshot is the same session, not a new lineage"
+        );
+    }
+
+    #[test]
+    fn capture_input_config_snapshot_keeps_mesh_instance_id_same_session() {
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        let id = session.ensure_mesh_instance_id().to_string();
+        ctx.session = Some(session);
+        let role = Role::new("custom", "be helpful");
+
+        let captured = capture_input_config(&ctx, &role);
+
+        assert_eq!(
+            captured.session.as_ref().unwrap().mesh_instance_id(),
+            Some(id.as_str())
+        );
+    }
+
+    #[test]
     fn resolve_paths_detects_last_reply_syntax() {
         let loaders = HashMap::new();
         let (_, _, _, _, _, with_last_reply) =

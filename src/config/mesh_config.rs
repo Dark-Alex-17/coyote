@@ -300,6 +300,15 @@ mod tests {
         assert_eq!(cfg.mesh, MeshConfig::default());
     }
 
+    // The config tolerates unknown keys inside `mesh`, as it does at the top level; interface
+    // entries are the exception. This pins that so adding `deny_unknown_fields` later is a
+    // deliberate change that also updates the docs.
+    #[test]
+    fn mesh_block_ignores_unknown_key_within_mesh() {
+        let cfg: Config = serde_yaml::from_str("mesh: {bogus: 1}\n").unwrap();
+        assert_eq!(cfg.mesh, MeshConfig::default());
+    }
+
     #[test]
     fn mesh_interfaces_lists_exactly_what_was_configured() {
         let cfg: Config =
