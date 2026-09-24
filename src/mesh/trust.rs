@@ -590,6 +590,8 @@ impl TrustStore {
             }
         };
         self.commit(&mut state, file, &format!("trust identity {identity}"))?;
+        // The identity now lives on disk, so a session twin would list the same hash twice.
+        state.session_identities.remove(&identity);
         Ok(change)
     }
 
@@ -732,9 +734,10 @@ impl TrustStore {
         self.commit(&mut state, file, &format!("undeny {destination}"))
     }
 
-    /// Destination records not seen for `older_than`, judged on the fresher of the disk and
-    /// in-memory `last_seen_at`; removed unless `dry_run`. Identities are never pruned: they
-    /// are the user's statement about a person, not about an instance that may be gone.
+    /// Destination records not seen for `older_than`, judged on the freshest of the disk
+    /// `last_seen_at`, the in-memory sighting and a peer-table announce whose identity is
+    /// verified to be the record's; removed unless `dry_run`. Identities are never pruned:
+    /// they are the user's statement about a person, not about an instance that may be gone.
     pub(crate) fn prune_destinations(
         &self,
         mesh: &dyn LiveMesh,
@@ -742,17 +745,18 @@ impl TrustStore {
         now: SystemTime,
         dry_run: bool,
     ) -> Result<Vec<String>> {
-        live(mesh)?;
+        let peers = live(mesh)?;
         let mut state = self.inner.lock();
         let stale: Vec<String> = state
             .file
             .destinations
             .iter()
             .filter(|(hash, entry)| {
+                let on_record = state.effective_last_seen(hash, entry);
+                let last_seen = verified_announce(&peers, hash, entry)
+                    .map_or(on_record, |announced| announced.max(on_record));
                 // A sighting in the future (clock stepped back) reads as just seen.
-                now.duration_since(state.effective_last_seen(hash, entry))
-                    .unwrap_or_default()
-                    >= older_than
+                now.duration_since(last_seen).unwrap_or_default() >= older_than
             })
             .map(|(hash, _)| hash.clone())
             .collect();
@@ -901,6 +905,21 @@ fn refuse_dangling_identities(path: &Path, file: &TrustFile) -> Result<()> {
 
 fn live(mesh: &dyn LiveMesh) -> Result<Arc<PeerTable>> {
     mesh.peers().ok_or_else(|| anyhow!(MESH_OFF))
+}
+
+/// When the peer table's announce for `destination_hash` provably comes from the identity
+/// the record is bound to, the time of that announce. A stranger reusing the hash, or an
+/// announce that cannot be verified, is no evidence the trusted instance is still around.
+fn verified_announce(
+    peers: &PeerTable,
+    destination_hash: &str,
+    entry: &DestinationEntry,
+) -> Option<SystemTime> {
+    let record = peers.get(destination_hash)?;
+    verified_identity(&record)
+        .ok()
+        .filter(|identity| identity.to_hex_string() == entry.identity)
+        .map(|_| record.last_seen)
 }
 
 fn normalize_hash(input: &str) -> String {
@@ -2057,6 +2076,43 @@ mod tests {
             records.iter().all(|r| !r.session),
             "committing a session pair to disk drops its session twins"
         );
+
+        let identity_later = announced("gamma");
+        fx.announce(&identity_later, t(6_000));
+        fx.store
+            .trust_destination_for_session(&fx.mesh, &identity_later.destination_hash, t(6_500))
+            .unwrap();
+        fx.store
+            .trust_identity(
+                &fx.mesh,
+                &identity_later.identity_hash,
+                TrustOptions::default(),
+                t(7_000),
+            )
+            .unwrap();
+
+        let records = fx.store.records();
+        assert_eq!(records.len(), 6);
+        assert_eq!(unique_hashes(&records), 6);
+        let gamma_identity: Vec<&TrustRecord> = records
+            .iter()
+            .filter(|r| r.hash == identity_later.identity_hash)
+            .collect();
+        assert_eq!(
+            gamma_identity.len(),
+            1,
+            "trusting an identity on disk drops its session twin"
+        );
+        assert!(!gamma_identity[0].session);
+        assert!(gamma_identity[0].all_destinations);
+        assert!(
+            records
+                .iter()
+                .find(|r| r.hash == identity_later.destination_hash)
+                .unwrap()
+                .session,
+            "the session destination is untouched by trusting its identity"
+        );
     }
 
     #[test]
@@ -2100,6 +2156,55 @@ mod tests {
             !fx.store
                 .is_trusted_destination(&peer.identity_hash, &fake_hash(0xcd))
         );
+    }
+
+    #[test]
+    fn deny_outranks_block_which_outranks_both_allows_even_when_all_coexist() {
+        let fx = Fixture::new("trust-precedence");
+        let (identity, destination) = (fake_hash(0x1a), fake_hash(0x2b));
+        let ts = "2026-01-01T00:00:00Z";
+        fs::create_dir_all(fx.store.path().parent().unwrap()).unwrap();
+        fs::write(
+            fx.store.path(),
+            format!(
+                "version: 1\n\
+                 identities:\n  {identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: true\n\
+                 destinations:\n  {destination}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n\
+                 denied_destinations:\n  {destination}:\n    added_at: {ts}\n    note: null\n\
+                 blocked_identities:\n  {identity}:\n    added_at: {ts}\n    note: null\n"
+            ),
+        )
+        .unwrap();
+        let store = fx.reopen();
+        let allow_records = |store: &TrustStore| {
+            let mut hashes: Vec<String> = store.records().into_iter().map(|r| r.hash).collect();
+            hashes.sort();
+            hashes
+        };
+        let mut both = vec![identity.clone(), destination.clone()];
+        both.sort();
+
+        assert_eq!(
+            store.authorize(&identity, &destination),
+            verdict(Decision::Refuse, Rule::DestinationDenied)
+        );
+        assert_eq!(allow_records(&store), both);
+
+        store.undeny_destination(&fx.mesh, &destination).unwrap();
+
+        assert_eq!(
+            store.authorize(&identity, &destination),
+            verdict(Decision::Refuse, Rule::IdentityBlocked),
+            "a block must win over a destination record bound to the identity and over all_destinations"
+        );
+        assert!(!store.is_trusted_identity(&identity));
+        assert!(!store.is_trusted_destination(&identity, &destination));
+        assert_eq!(
+            allow_records(&store),
+            both,
+            "the block is judged against surviving allow records, not against their absence"
+        );
+        assert_eq!(store.blocked().len(), 1);
     }
 
     #[test]
@@ -2510,6 +2615,70 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a last_seen_at in the future reads as just seen"
+        );
+    }
+
+    #[test]
+    fn prune_counts_a_peer_table_announce_only_when_it_verifies_as_the_record_identity() {
+        let fx = Fixture::new("trust-prune-peer-table");
+        let reannounced = announced("alpha");
+        let usurped = announced("beta");
+        let stranger = announced("delta");
+        for peer in [&reannounced, &usurped] {
+            fx.announce(peer, t(1_000));
+            fx.store
+                .trust_destination(
+                    &fx.mesh,
+                    &peer.destination_hash,
+                    TrustOptions::default(),
+                    t(1_000),
+                )
+                .unwrap();
+        }
+        fx.announce(&reannounced, t(4_000));
+        fx.mesh.0.observe(
+            PeerSighting {
+                destination_hash: usurped.destination_hash.clone(),
+                identity_hash: stranger.identity_hash.clone(),
+                name_hash: stranger.name_hash.clone(),
+                display_name: Some("Mallory".to_string()),
+                protocol_version: 1,
+                hops: 1,
+            },
+            t(4_000),
+        );
+        let now = t(1_000 + 3_600);
+        let horizon = Duration::from_secs(3_600);
+
+        let dry = fx
+            .store
+            .prune_destinations(&fx.mesh, horizon, now, true)
+            .unwrap();
+        assert_eq!(
+            dry,
+            vec![usurped.destination_hash.clone()],
+            "a fresh announce rescues its destination only when the record's identity provably sent it"
+        );
+        assert_eq!(fx.store.records().len(), 4);
+
+        let removed = fx
+            .store
+            .prune_destinations(&fx.mesh, horizon, now, false)
+            .unwrap();
+        assert_eq!(removed, vec![usurped.destination_hash.clone()]);
+        let destinations: Vec<String> = fx
+            .store
+            .records()
+            .into_iter()
+            .filter(|r| r.tier == Tier::Destination)
+            .map(|r| r.hash)
+            .collect();
+        assert_eq!(destinations, vec![reannounced.destination_hash.clone()]);
+        assert!(
+            fx.store
+                .prune_destinations(&fx.mesh, horizon, now, false)
+                .unwrap()
+                .is_empty()
         );
     }
 
