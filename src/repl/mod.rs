@@ -1082,14 +1082,22 @@ pub async fn run_repl_command(
                 }
             },
             ".fork" => {
-                let forked = ctx.fork_session(args)?;
-                ctx.app.mesh.rekey(forked.rekey).await.with_context(|| {
-                    format!(
-                        "Forked '{}' into '{}', but the mesh node could not be re-keyed onto the fork",
-                        forked.from, forked.to
-                    )
-                })?;
-                println!("Forked '{}' into '{}'", forked.from, forked.to);
+                // The session switch comes last and cannot fail, so a refused rekey never
+                // leaves the context in the fork while the node still serves the original.
+                let pending = ctx.prepare_fork(args)?;
+                match ctx.app.mesh.rekey(pending.rekey.clone()).await {
+                    Ok(()) => {
+                        let forked = ctx.commit_fork(pending);
+                        println!("Forked '{}' into '{}'", forked.from, forked.to);
+                    }
+                    Err(err) => {
+                        let (from, to) = (pending.from.clone(), pending.to.clone());
+                        ctx.abandon_fork(pending);
+                        return Err(err.context(format!(
+                            "Could not fork '{from}' into '{to}': the mesh node could not be re-keyed onto the fork, so you are still in '{from}' and the node still serves it; the fork file was removed"
+                        )));
+                    }
+                }
             }
             ".save" => match split_first_arg(args) {
                 Some(("role", name)) => {
@@ -2121,6 +2129,11 @@ mod tests {
     use crate::config::{AppState, Role, RoleLike, Session, TEMP_ROLE_NAME, WorkingMode};
     use crate::function::ToolResult;
     use crate::hooks::{HookDef, HooksMap, test_sink};
+    use crate::mesh::test_support::TempDir;
+    #[cfg(unix)]
+    use crate::mesh::test_support::started_runtime;
+    use crate::testing::EnvVarGuard;
+    use crate::utils::get_env_name;
     use anyhow::anyhow;
     use serde_json::json;
     use serial_test::serial;
@@ -3647,6 +3660,96 @@ mod tests {
         assert!(
             child_signal.aborted_ctrlc(),
             "the child must still be cancelled"
+        );
+    }
+
+    /// A REPL ctx holding a named session, with sessions saved under a temp dir for the
+    /// guard's lifetime. Callers must be `#[serial]`: the sessions dir is process env.
+    fn fork_ctx(tag: &str) -> (RequestContext, TempDir, EnvVarGuard) {
+        let sessions_dir = TempDir::new(tag);
+        let env = EnvVarGuard::set(get_env_name("sessions_dir"), &sessions_dir.path);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Repl);
+        let mut session = Session::default();
+        session.set_name("original".to_string());
+        ctx.session = Some(session);
+        (ctx, sessions_dir, env)
+    }
+
+    #[test]
+    #[serial]
+    fn fork_command_with_mesh_off_writes_fork_and_switches_to_it() {
+        let (mut ctx, sessions_dir, _env) = fork_ctx("repl-fork-mesh-off");
+        run_async(async {
+            let result = Box::pin(run_repl_command(
+                &mut ctx,
+                create_abort_signal(),
+                ".fork branch",
+            ))
+            .await;
+
+            result.expect("forking with the mesh off must succeed");
+        });
+
+        assert!(sessions_dir.path.join("original.yaml").exists());
+        assert!(sessions_dir.path.join("branch.yaml").exists());
+        let live = ctx.session.as_ref().unwrap();
+        assert_eq!(live.name(), "branch");
+        assert!(live.mesh_instance_id().is_some());
+    }
+
+    /// The rekey is refused hermetically by giving the ctx's session a lineage id other
+    /// than the one the node serves: `MeshRuntime::rekey` bails on that mismatch before it
+    /// takes any lock or touches the transport, so no second process or pre-held lock is
+    /// needed. The fork's own id is minted inside `prepare_fork`, so holding its lock ahead
+    /// of time is not an option.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn fork_command_with_refused_rekey_leaves_context_and_node_on_original() {
+        let (mut ctx, sessions_dir, _env) = fork_ctx("repl-fork-refused");
+        let original_id = ctx
+            .session
+            .as_mut()
+            .unwrap()
+            .ensure_mesh_instance_id()
+            .to_string();
+        run_async(async {
+            let started = started_runtime("repl-fork-refused-node").await;
+            let served_id = started.runtime.instance_id().await;
+            assert_ne!(served_id, original_id);
+            ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+            let err = Box::pin(run_repl_command(
+                &mut ctx,
+                create_abort_signal(),
+                ".fork branch",
+            ))
+            .await
+            .expect_err("a refused rekey must fail the fork");
+
+            let err = format!("{err:#}");
+            assert!(
+                err.contains("Could not fork 'original' into 'branch'"),
+                "{err}"
+            );
+            assert!(err.contains("you are still in 'original'"), "{err}");
+            assert!(
+                err.contains(&format!("serving instance {served_id}")),
+                "{err}"
+            );
+            assert_eq!(started.runtime.instance_id().await, served_id);
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            started.relay_handle.abort();
+        });
+
+        let live = ctx.session.as_ref().unwrap();
+        assert_eq!(live.name(), "original");
+        assert_eq!(live.mesh_instance_id(), Some(original_id.as_str()));
+        assert!(sessions_dir.path.join("original.yaml").exists());
+        assert!(
+            !sessions_dir.path.join("branch.yaml").exists(),
+            "the fork file must be removed when the rekey is refused"
         );
     }
 }

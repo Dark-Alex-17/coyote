@@ -110,14 +110,23 @@ pub struct SkillInstructionsConfig {
     pub instructions: Option<String>,
 }
 
-/// A committed fork: both sessions are on disk and the context now holds the fork. The mesh
-/// runtime still has to move its destination, which is why this carries the `ForkRekey`.
-#[derive(Debug, Clone)]
-#[must_use = "the mesh runtime must re-key the live destination"]
-pub struct ForkedSession {
+/// A fork written to disk but not yet switched to. The context still holds the original so
+/// the caller can re-key the mesh node first and only commit once that succeeded.
+#[derive(Debug)]
+#[must_use = "commit or abandon the fork; otherwise its file lingers and the context is unchanged"]
+pub struct PendingFork {
     pub from: String,
     pub to: String,
     pub rekey: ForkRekey,
+    fork_path: PathBuf,
+    fork: Session,
+}
+
+/// A committed fork: both sessions are on disk and the context now holds the fork.
+#[derive(Debug, Clone)]
+pub struct ForkedSession {
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1126,6 +1135,11 @@ impl RequestContext {
         Ok(())
     }
 
+    /// Saving under a new name (`.save session <name>`) deliberately copies the mesh lineage
+    /// id, `mesh_instance_id`, into the copy, so two saved sessions can share a lineage id.
+    /// Two processes opening both copies with the mesh on are serialised by `InstanceLock`:
+    /// the second acquire is refused, and that process has to run `.mesh on --fresh` to mint
+    /// its own id. Only `.fork` gives the new session a lineage of its own.
     pub fn save_session(&mut self, name: Option<&str>) -> Result<()> {
         let session_name = match &self.session {
             Some(session) => match name {
@@ -1144,9 +1158,11 @@ impl RequestContext {
         Ok(())
     }
 
-    /// Forks the active session and switches to the fork without printing. The returned
-    /// `ForkedSession` names both sides and carries the `ForkRekey` the mesh runtime needs.
-    pub fn fork_session(&mut self, fork_name: Option<&str>) -> Result<ForkedSession> {
+    /// Saves the active session, writes the fork to disk and returns it without switching to
+    /// it, so a caller can re-key the mesh node first and `commit_fork` only once that
+    /// succeeded, or `abandon_fork` if it did not. The context is unchanged either way until
+    /// the fork is committed.
+    pub fn prepare_fork(&mut self, fork_name: Option<&str>) -> Result<PendingFork> {
         let current_name = match &self.session {
             Some(s) => s.name().to_string(),
             None => bail!("No active session to fork"),
@@ -1178,13 +1194,34 @@ impl RequestContext {
         let (mut fork, rekey) = session.fork(fork_name.clone());
         fork.save(&fork_name, &fork_path, self.working_mode.is_repl())?;
 
-        self.session = Some(fork);
-
-        Ok(ForkedSession {
+        Ok(PendingFork {
             from: current_name,
             to: fork_name,
             rekey,
+            fork_path,
+            fork,
         })
+    }
+
+    /// Switches the context to a prepared fork. Cannot fail, so it is safe to run after the
+    /// mesh node has already been re-keyed onto the fork.
+    pub fn commit_fork(&mut self, pending: PendingFork) -> ForkedSession {
+        self.session = Some(pending.fork);
+        ForkedSession {
+            from: pending.from,
+            to: pending.to,
+        }
+    }
+
+    /// Removes the file of a fork that will not be switched to. Best effort: a leftover file
+    /// only makes the name unavailable until it is deleted by hand.
+    pub fn abandon_fork(&self, pending: PendingFork) {
+        if let Err(err) = remove_file(&pending.fork_path) {
+            warn!(
+                "Failed to remove the abandoned fork file '{}': {err}",
+                pending.fork_path.display()
+            );
+        }
     }
 
     pub fn empty_session(&mut self) -> Result<()> {
@@ -6993,13 +7030,13 @@ mod tests {
     }
 
     #[test]
-    fn fork_session_refuses_forking_onto_own_name() {
+    fn prepare_fork_refuses_forking_onto_own_name() {
         let mut ctx = create_test_ctx();
         let mut session = Session::default();
         session.set_name("same".to_string());
         ctx.session = Some(session);
 
-        let err = ctx.fork_session(Some("same")).unwrap_err().to_string();
+        let err = ctx.prepare_fork(Some("same")).unwrap_err().to_string();
 
         assert!(
             err.contains("Cannot fork 'same' onto its own name"),
@@ -7010,7 +7047,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn fork_session_gives_fork_fresh_mesh_instance_id_and_leaves_original() {
+    fn prepare_fork_leaves_context_on_original_until_commit_and_gives_fork_fresh_id() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -7024,13 +7061,20 @@ mod tests {
         let original_id = session.ensure_mesh_instance_id().to_string();
         ctx.session = Some(session);
 
-        let forked = ctx.fork_session(Some("forked")).unwrap();
+        let pending = ctx.prepare_fork(Some("forked")).unwrap();
+
+        let still_live = ctx.session.as_ref().unwrap();
+        assert_eq!(still_live.name(), "original");
+        assert_eq!(still_live.mesh_instance_id(), Some(original_id.as_str()));
+        assert!(sessions_dir.join("forked.yaml").exists());
+        let rekey = pending.rekey.clone();
+
+        let forked = ctx.commit_fork(pending);
 
         let live = ctx.session.as_ref().unwrap();
         assert_eq!(live.name(), "forked");
         assert_eq!(forked.from, "original");
         assert_eq!(forked.to, "forked");
-        let rekey = forked.rekey;
         assert_eq!(
             rekey.original_instance_id.as_deref(),
             Some(original_id.as_str())
@@ -7053,6 +7097,32 @@ mod tests {
             on_disk("forked").mesh_instance_id(),
             Some(rekey.fork_instance_id.as_str())
         );
+
+        remove_dir_all(&sessions_dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn abandon_fork_removes_the_fork_file_and_leaves_context_on_original() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sessions_dir = env::temp_dir().join(format!("coyote-abandon-fork-{unique}"));
+        let _env = crate::testing::EnvVarGuard::set(get_env_name("sessions_dir"), &sessions_dir);
+
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("original".to_string());
+        ctx.session = Some(session);
+        let pending = ctx.prepare_fork(Some("forked")).unwrap();
+        assert!(sessions_dir.join("forked.yaml").exists());
+
+        ctx.abandon_fork(pending);
+
+        assert!(!sessions_dir.join("forked.yaml").exists());
+        assert!(sessions_dir.join("original.yaml").exists());
+        assert_eq!(ctx.session.as_ref().unwrap().name(), "original");
 
         remove_dir_all(&sessions_dir).unwrap();
     }
@@ -9699,6 +9769,8 @@ mod tests {
         assert!(ctx.app.mesh.get().is_none());
     }
 
+    /// Pins the ruling on `save_session`: a save-as copy shares the original's lineage id,
+    /// and `InstanceLock` keeps two processes from serving both copies at once.
     #[test]
     #[serial]
     fn save_session_under_new_name_keeps_mesh_instance_id() {

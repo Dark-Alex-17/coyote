@@ -1,11 +1,12 @@
 use crate::mesh::announce::{HEARTBEAT_SECS, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT};
 
 use anyhow::{Context, Result};
+use log::warn;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -53,21 +54,18 @@ pub(crate) struct PeerTable {
 
 impl PeerTable {
     /// Loads the table at `path`, dropping entries already expired at `now`. A missing file
-    /// is an empty table; an unreadable one is refused so a corrupt cache is noticed.
+    /// is an empty table. A file that cannot be read or parsed (an unclean shutdown can
+    /// leave it truncated or empty) is moved aside to `<path>.corrupt` with a warning and
+    /// the table starts empty: the peer table is disposable cache and must never keep the
+    /// node from starting, but the bytes are kept for a bug report rather than overwritten.
     pub(crate) fn load(path: PathBuf, now: SystemTime) -> Result<Self> {
         let records: Vec<PeerRecord> = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
-                format!(
-                    "Mesh peer table '{}' is not valid JSON. Remove the file to start with an empty peer table; peers re-appear as they announce.",
-                    path.display()
-                )
-            })?,
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(records) => records,
+                Err(err) => set_aside_corrupt(&path, format!("is not valid JSON: {err}")),
+            },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("Failed to read mesh peer table '{}'", path.display())
-                });
-            }
+            Err(err) => set_aside_corrupt(&path, format!("could not be read: {err}")),
         };
         let inner = records
             .into_iter()
@@ -168,6 +166,26 @@ impl PeerTable {
     }
 }
 
+/// Warns about a peer table that cannot be used, renames it to `<path>.corrupt` (replacing
+/// any earlier one) and returns the empty record list the node starts with. A failed rename
+/// is only warned about; the file is cache and nothing downstream depends on the move.
+fn set_aside_corrupt(path: &Path, what_happened: String) -> Vec<PeerRecord> {
+    let aside = path.with_extension("json.corrupt");
+    warn!(
+        "Mesh peer table '{}' {what_happened}. Starting with an empty peer table; peers re-appear as they announce. The file is kept at '{}'.",
+        path.display(),
+        aside.display()
+    );
+    if let Err(err) = fs::rename(path, &aside) {
+        warn!(
+            "Failed to move the unusable mesh peer table '{}' to '{}': {err}",
+            path.display(),
+            aside.display()
+        );
+    }
+    Vec::new()
+}
+
 fn is_expired(record: &PeerRecord, now: SystemTime) -> bool {
     // A `last_seen` in the future (clock stepped back) reads as just seen, not as expired.
     now.duration_since(record.last_seen).unwrap_or_default() >= PEER_TTL
@@ -177,6 +195,7 @@ fn is_expired(record: &PeerRecord, now: SystemTime) -> bool {
 mod tests {
     use super::super::test_support::TempDir;
     use super::*;
+    use crate::testing::{install_log_collector, warn_snapshot};
 
     fn sighting(hash: &str, name: Option<&str>) -> PeerSighting {
         PeerSighting {
@@ -354,18 +373,43 @@ mod tests {
         );
     }
 
-    #[test]
-    fn load_refuses_corrupt_file_naming_path_and_remedy() {
-        let tmp = TempDir::new("peers-corrupt");
+    /// `bytes` is what a previous unclean run left behind; the load must warn naming the
+    /// path, keep the bytes at `peers.json.corrupt` and start empty.
+    fn assert_corrupt_file_is_set_aside(tag: &str, bytes: &[u8]) {
+        install_log_collector();
+        let tmp = TempDir::new(tag);
         let path = tmp.path.join("peers.json");
-        fs::write(&path, "{not json").unwrap();
+        let aside = tmp.path.join("peers.json.corrupt");
+        fs::write(&path, bytes).unwrap();
+        fs::write(&aside, "older corrupt copy").unwrap();
 
-        let err = PeerTable::load(path.clone(), SystemTime::now())
-            .err()
-            .expect("corrupt table must be refused")
-            .to_string();
+        let table = PeerTable::load(path.clone(), SystemTime::now())
+            .expect("a corrupt table must not block the load");
 
-        assert!(err.contains(&path.display().to_string()), "{err}");
-        assert!(err.contains("Remove the file"), "{err}");
+        assert!(table.snapshot().is_empty());
+        assert!(!path.exists(), "the corrupt file must be moved aside");
+        assert_eq!(
+            fs::read(&aside).unwrap(),
+            bytes,
+            "the corrupt bytes must survive at peers.json.corrupt"
+        );
+        let path_text = path.display().to_string();
+        let warns = warn_snapshot();
+        assert!(
+            warns.iter().any(|message| message.contains(&path_text)
+                && message.contains("is not valid JSON")
+                && message.contains(&aside.display().to_string())),
+            "no warning names {path_text}; captured: {warns:#?}"
+        );
+    }
+
+    #[test]
+    fn load_sets_aside_garbage_file_and_starts_empty() {
+        assert_corrupt_file_is_set_aside("peers-corrupt-garbage", b"{not json");
+    }
+
+    #[test]
+    fn load_sets_aside_empty_file_and_starts_empty() {
+        assert_corrupt_file_is_set_aside("peers-corrupt-empty", b"");
     }
 }

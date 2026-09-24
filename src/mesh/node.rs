@@ -322,7 +322,10 @@ impl MeshRuntime {
     }
 
     /// Moves the live destination from the original session to its fork: the fork's instance
-    /// lock is taken first so a refused lock leaves the original destination untouched.
+    /// lock is taken first so a refused lock leaves the original destination untouched. An
+    /// `Err` always leaves the original destination, instance id and lock in place: every
+    /// fallible step (instance-id check, stopped-transport check, fork lock acquisition)
+    /// happens before the swap.
     pub(crate) async fn rekey(&self, rekey: ForkRekey) -> Result<()> {
         let mut state = self.destination.lock().await;
         if rekey.original_instance_id.as_deref() != Some(state.instance_id.as_str()) {
@@ -359,7 +362,13 @@ impl MeshRuntime {
             last_announce: None,
         };
         if self.announce {
-            self.send_announce(&mut state, transport).await?;
+            // With `last_announce` still `None`, the next heartbeat tick announces the fork.
+            if let Err(err) = self.send_announce(&mut state, transport).await {
+                warn!(
+                    "Failed to announce mesh node {} for fork instance {} after re-keying; the heartbeat will announce it: {err:#}",
+                    self.fingerprint, state.instance_id
+                );
+            }
         }
         Ok(())
     }
@@ -1117,6 +1126,33 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_tolerates_corrupt_peer_table_left_by_previous_run() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-corrupt-peers");
+        let paths = mesh_paths(&tmp);
+        let peers_dir = mesh_cache_dir(&paths.cache_dir);
+        std::fs::create_dir_all(&peers_dir).unwrap();
+        std::fs::write(peers_dir.join("peers.json"), b"").unwrap();
+        let mut session = Session::default();
+
+        let runtime = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut session,
+            paths,
+            NodeOptions::default(),
+        )
+        .await
+        .expect("a corrupt peer table must not keep the node from starting");
+
+        assert!(runtime.peers().snapshot().is_empty());
+        assert!(peers_dir.join("peers.json.corrupt").exists());
+        runtime.shutdown().await.unwrap();
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_tears_down_the_relay_socket_and_releases_the_lock() {
         let (addr, relay_handle, relay_closed) = loopback_relay().await;
         let metrics = tokio::runtime::Handle::current().metrics();
@@ -1199,6 +1235,7 @@ mod tests {
     async fn rekey_refuses_when_original_instance_does_not_match() {
         let started = started_runtime("node-rekey-mismatch").await;
         let runtime = &started.runtime;
+        let original_id = runtime.instance_id().await;
         let hash = runtime.destination_hash().await;
 
         let err = runtime
@@ -1212,6 +1249,36 @@ mod tests {
 
         assert!(err.contains(".mesh off"), "{err}");
         assert_eq!(runtime.destination_hash().await, hash);
+        assert_eq!(runtime.instance_id().await, original_id);
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_refuses_when_fork_lock_is_held_and_keeps_original() {
+        let started = started_runtime("node-rekey-locked").await;
+        let runtime = &started.runtime;
+        let original_id = runtime.instance_id().await;
+        let hash = runtime.destination_hash().await;
+        let fork_id = fresh_instance_id();
+        let _held = InstanceLock::acquire(&runtime.cache_dir, &fork_id).unwrap();
+
+        let result = runtime
+            .rekey(ForkRekey {
+                original_instance_id: Some(original_id.clone()),
+                fork_instance_id: fork_id,
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(runtime.instance_id().await, original_id);
+        assert_eq!(runtime.destination_hash().await, hash);
+        assert!(runtime.has_destination(&hash).await);
+        assert!(
+            InstanceLock::acquire(&runtime.cache_dir, &original_id).is_err(),
+            "a refused re-key must keep the original instance lock"
+        );
         runtime.shutdown().await.unwrap();
         started.relay_handle.abort();
     }
