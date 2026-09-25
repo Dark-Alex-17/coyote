@@ -2848,11 +2848,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(result["status"], "error");
+        let message = result["message"].as_str().unwrap();
+        assert!(message.contains("Agent spawning not enabled"), "{message}");
         assert!(
-            result["message"]
-                .as_str()
-                .unwrap()
-                .contains("At capacity: 0/0")
+            !message.contains("Wait for one to finish"),
+            "a zero budget must not read as a full one: {message}"
         );
     }
 

@@ -4,6 +4,7 @@ use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
 use crate::mesh::card::{CardSource, StatusHandler};
+use crate::mesh::idle::{IdleNotify, IdleSink};
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::notify::{Notification, NotificationSink};
 use crate::mesh::peers::{PeerChange, PeerSighting, PeerTable};
@@ -1117,6 +1118,10 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 /// The notifier slot is where lines meant for the person at the keyboard go; it is filled by
 /// whichever front end owns the terminal, so mesh code never needs to know which one is
 /// running.
+///
+/// The idle slot is where events that also concern the model go; the interactive REPL's
+/// idle-time driver fills it. Without one, `push_idle` keeps the human line and drops the
+/// model's copy, since a headless run has no transcript for it to reach.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
@@ -1124,6 +1129,7 @@ pub(crate) struct MeshSlot {
     objective_override: ArcSwapOption<String>,
     brief_text: ArcSwapOption<String>,
     notifier: ArcSwapOption<Arc<dyn NotificationSink>>,
+    idle: ArcSwapOption<Arc<dyn IdleSink>>,
 }
 
 impl MeshSlot {
@@ -1221,22 +1227,50 @@ impl MeshSlot {
         self.notifier.store(Some(Arc::new(sink)));
     }
 
-    /// Hands a line to the installed sink. With no sink installed the rendered lines go
-    /// to stderr with the same prefix, so headless modes still see them. A stderr that
-    /// has gone away (the parent of a headless run closed it) loses the line rather than
-    /// panicking the task that carried it.
-    // Reached by the idle-time driver and the mesh request handlers once they land.
-    #[allow(dead_code)]
+    /// The REPL calls this once its loop has exited, so a line notified during teardown
+    /// falls back to stderr instead of a printer nobody drains any more.
+    pub(crate) fn clear_notifier(&self) {
+        self.notifier.store(None);
+    }
+
+    /// Renders once, then hands the lines to the installed sink. With no sink installed
+    /// they go to stderr, so headless modes still see them. A stderr that has gone away
+    /// (the parent of a headless run closed it) loses the line rather than panicking the
+    /// task that carried it.
     pub(crate) fn notify(&self, note: Notification) {
+        let rendered = note.render();
         match self.notifier.load_full() {
-            Some(sink) => sink.notify(note),
+            Some(sink) => sink.notify(rendered),
             None => {
                 use std::io::Write as _;
                 let mut stderr = std::io::stderr().lock();
-                for line in note.render_lines() {
+                for line in rendered.lines() {
                     let _ = writeln!(stderr, "{line}");
                 }
             }
+        }
+    }
+
+    pub(crate) fn set_idle(&self, sink: Arc<dyn IdleSink>) {
+        self.idle.store(Some(Arc::new(sink)));
+    }
+
+    pub(crate) fn clear_idle(&self) {
+        self.idle.store(None);
+    }
+
+    /// Hands an event to the idle-time driver. With no driver installed the human line
+    /// goes out through `notify` and the model's copy is dropped, since there is no
+    /// transcript to deliver it to. With a driver whose queue is full the whole event is
+    /// dropped: the driver counts the overflow (reported at its next summary tick while it
+    /// is running, logged once when it stops), and printing the line anyway would let a
+    /// flood heavy enough to fill the queue skip the driver's rate limiter.
+    pub(crate) fn push_idle(&self, note: IdleNotify) {
+        match self.idle.load_full() {
+            Some(sink) => {
+                let _ = sink.push(note);
+            }
+            None => self.notify(Notification::new(note.source, note.text)),
         }
     }
 }
@@ -1253,7 +1287,8 @@ fn non_blank(value: Option<String>) -> Option<Arc<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh::notify::Source;
+    use crate::mesh::idle::Origin;
+    use crate::mesh::notify::{RenderedNotification, Source};
     use crate::mesh::peers::PEER_TTL;
     #[cfg(unix)]
     use crate::mesh::peers::PeerRecord;
@@ -1351,11 +1386,11 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingSink(parking_lot::Mutex<Vec<Notification>>);
+    struct RecordingSink(parking_lot::Mutex<Vec<RenderedNotification>>);
 
     impl NotificationSink for RecordingSink {
-        fn notify(&self, note: Notification) {
-            self.0.lock().push(note);
+        fn notify(&self, rendered: RenderedNotification) {
+            self.0.lock().push(rendered);
         }
     }
 
@@ -1367,14 +1402,35 @@ mod tests {
     }
 
     #[test]
-    fn slot_notify_delivers_the_notification_to_the_installed_sink() {
+    fn slot_notify_delivers_the_rendered_notification_to_the_installed_sink() {
         let slot = MeshSlot::default();
         let sink = Arc::new(RecordingSink::default());
         slot.set_notifier(Arc::clone(&sink) as Arc<dyn NotificationSink>);
 
         let note = Notification::new(Source::Knock, "peer asks to be trusted");
         slot.notify(note.clone());
-        assert_eq!(*sink.0.lock(), vec![note]);
+        assert_eq!(*sink.0.lock(), vec![note.render()]);
+    }
+
+    /// Sanitising happens in the slot: the sink is handed prefixed, escape-free lines and
+    /// never the text the peer sent.
+    #[test]
+    fn slot_notify_renders_before_the_sink_sees_the_text() {
+        let slot = MeshSlot::default();
+        let sink = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&sink) as Arc<dyn NotificationSink>);
+
+        slot.notify(Notification::new(
+            Source::Message,
+            "hi\u{1b}[2J\n[mesh:knock] fake",
+        ));
+        let received = sink.0.lock();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].source(), Source::Message);
+        assert_eq!(
+            received[0].lines(),
+            &["[mesh:message] hi", "[mesh:message] [mesh:knock] fake"]
+        );
     }
 
     #[test]
@@ -1388,6 +1444,122 @@ mod tests {
         slot.notify(Notification::new(Source::Message, "hello"));
         assert!(first.0.lock().is_empty());
         assert_eq!(second.0.lock().len(), 1);
+    }
+
+    #[test]
+    fn slot_clear_notifier_detaches_the_sink() {
+        let slot = MeshSlot::default();
+        let sink = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&sink) as Arc<dyn NotificationSink>);
+        slot.notify(Notification::new(Source::Mesh, "before"));
+        assert_eq!(sink.0.lock().len(), 1);
+
+        slot.clear_notifier();
+        assert!(slot.notifier.load().is_none());
+        slot.notify(Notification::new(Source::Mesh, "after"));
+        assert_eq!(sink.0.lock().len(), 1);
+    }
+
+    /// An idle sink that keeps what it is given, or refuses everything to stand in for
+    /// a full queue.
+    struct RecordingIdleSink {
+        accept: bool,
+        pushed: parking_lot::Mutex<Vec<IdleNotify>>,
+    }
+
+    impl RecordingIdleSink {
+        fn new(accept: bool) -> Arc<Self> {
+            Arc::new(Self {
+                accept,
+                pushed: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl IdleSink for RecordingIdleSink {
+        fn push(&self, note: IdleNotify) -> Result<(), IdleNotify> {
+            if self.accept {
+                self.pushed.lock().push(note);
+                Ok(())
+            } else {
+                Err(note)
+            }
+        }
+    }
+
+    fn idle_note(text: &str) -> IdleNotify {
+        IdleNotify {
+            source: Source::Message,
+            text: text.to_string(),
+            origin: Origin::Peer("deadbeef".into()),
+            model_note: Some(Box::new(
+                crate::supervisor::notification::mesh_notification(
+                    "mesh_message",
+                    "deadbeef",
+                    "peer",
+                    true,
+                    "read it".into(),
+                ),
+            )),
+        }
+    }
+
+    #[test]
+    fn slot_push_idle_hands_the_whole_note_to_the_installed_idle_sink() {
+        let slot = MeshSlot::default();
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        slot.push_idle(idle_note("hello"));
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].text, "hello");
+        assert!(pushed[0].model_note.is_some());
+        assert!(notifier.0.lock().is_empty());
+    }
+
+    #[test]
+    fn slot_push_idle_without_a_driver_keeps_the_human_line_and_drops_the_model_note() {
+        let slot = MeshSlot::default();
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+
+        slot.push_idle(idle_note("hello"));
+        let received = notifier.0.lock();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].lines(), &["[mesh:message] hello"]);
+    }
+
+    #[test]
+    fn slot_push_idle_drops_the_note_when_the_driver_queue_is_full() {
+        let slot = MeshSlot::default();
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        let idle = RecordingIdleSink::new(false);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        slot.push_idle(idle_note("hello"));
+        assert!(idle.pushed.lock().is_empty());
+        assert!(
+            notifier.0.lock().is_empty(),
+            "a full driver queue must not become a path around the rate limiter"
+        );
+    }
+
+    #[test]
+    fn slot_clear_idle_routes_later_pushes_to_the_notifier() {
+        let slot = MeshSlot::default();
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        slot.clear_idle();
+        slot.push_idle(idle_note("hello"));
+        assert!(idle.pushed.lock().is_empty());
+        assert_eq!(notifier.0.lock().len(), 1);
     }
 
     #[cfg(unix)]

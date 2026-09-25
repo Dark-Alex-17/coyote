@@ -12,7 +12,7 @@ use taskqueue::TaskQueue;
 
 use anyhow::{Result, bail};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -116,6 +116,11 @@ impl From<JobHandle> for TaskHandle {
 
 pub struct Supervisor {
     handles: HashMap<String, TaskHandle>,
+    /// Agents the idle-time driver started on the mesh's behalf. They are supervised
+    /// for cancellation and collection like any other child but do not spend the
+    /// model's spawn budget: `active_count` and `effective_active_count` leave them
+    /// out, `has_active_tasks` counts them.
+    unmetered: HashSet<String>,
     task_queue: TaskQueue,
     max_concurrent: usize,
     max_depth: usize,
@@ -126,6 +131,7 @@ impl Supervisor {
     pub fn new(max_concurrent: usize, max_depth: usize) -> Self {
         Self {
             handles: HashMap::new(),
+            unmetered: HashSet::new(),
             task_queue: TaskQueue::new(),
             max_concurrent,
             max_depth,
@@ -152,6 +158,11 @@ impl Supervisor {
         })
     }
 
+    fn metered_agents(&self) -> impl Iterator<Item = &AgentHandle> {
+        self.agents()
+            .filter(|handle| !self.unmetered.contains(&handle.id))
+    }
+
     pub fn job(&self, id: &str) -> Option<&JobHandle> {
         match self.handles.get(id) {
             Some(TaskHandle::Job(handle)) => Some(handle),
@@ -174,11 +185,11 @@ impl Supervisor {
     }
 
     pub fn active_count(&self) -> usize {
-        self.agents().count()
+        self.metered_agents().count()
     }
 
     pub fn effective_active_count(&self) -> usize {
-        self.agents()
+        self.metered_agents()
             .filter(|h| !h.join_handle.is_finished())
             .count()
     }
@@ -191,7 +202,7 @@ impl Supervisor {
     }
 
     pub fn has_active_tasks(&self) -> bool {
-        self.effective_active_count() > 0
+        self.agents().any(|agent| !agent.join_handle.is_finished())
             || self.active_job_count() > 0
             || self.agents().any(|agent| {
                 agent
@@ -238,6 +249,7 @@ impl Supervisor {
                         self.max_depth
                     );
                 }
+                self.unmetered.remove(&handle.id);
                 self.handles
                     .insert(handle.id.clone(), TaskHandle::Agent(handle));
             }
@@ -256,12 +268,25 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Registers an agent outside the spawn budget: no capacity or depth check, and it
+    /// never counts towards `max_concurrent`.
+    pub fn register_unmetered(&mut self, handle: AgentHandle) {
+        self.unmetered.insert(handle.id.clone());
+        self.handles
+            .insert(handle.id.clone(), TaskHandle::Agent(handle));
+    }
+
+    pub fn is_unmetered(&self, id: &str) -> bool {
+        self.unmetered.contains(id)
+    }
+
     pub fn is_finished(&self, id: &str) -> Option<bool> {
         self.agent(id).map(|h| h.join_handle.is_finished())
     }
 
     pub fn take(&mut self, id: &str) -> Option<AgentHandle> {
         self.agent(id)?;
+        self.unmetered.remove(id);
         match self.handles.remove(id) {
             Some(TaskHandle::Agent(handle)) => Some(handle),
             _ => None,
@@ -300,10 +325,13 @@ impl Supervisor {
             .collect()
     }
 
-    pub fn list_tasks(&self) -> Vec<(&str, TaskKind, bool)> {
+    /// Every task except the unmetered agents: what the model is answerable for
+    /// reclaiming, so a driver child does not count as its unreclaimed background task.
+    pub fn list_metered_tasks(&self) -> Vec<(&str, TaskKind, bool)> {
         self.handles
-            .values()
-            .map(|handle| match handle {
+            .iter()
+            .filter(|(id, _)| !self.unmetered.contains(*id))
+            .map(|(_, handle)| match handle {
                 TaskHandle::Agent(agent) => (
                     agent.id.as_str(),
                     TaskKind::Agent,
@@ -352,6 +380,7 @@ impl Debug for Supervisor {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Supervisor")
             .field("active_agents", &self.active_count())
+            .field("unmetered_agents", &self.unmetered.len())
             .field("max_concurrent", &self.max_concurrent)
             .field("max_depth", &self.max_depth)
             .finish()
@@ -412,6 +441,30 @@ mod tests {
             output_buf: Arc::new(Mutex::new(RingBuf::default())),
             no_change_checks: 0,
             last_check_state: None,
+        }
+    }
+
+    /// A handle whose task is never polled, so it counts as running. The runtime is
+    /// leaked on purpose: dropping it would abort the task and finish the handle.
+    fn running_handle(id: &str, agent_name: &str, abort_signal: AbortSignal) -> AgentHandle {
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let join_handle = rt.spawn(async {
+            Ok::<AgentResult, Error>(AgentResult {
+                id: "done".into(),
+                agent_name: "test".into(),
+                output: "result".into(),
+                exit_status: AgentExitStatus::Completed,
+            })
+        });
+        mem::forget(rt);
+        AgentHandle {
+            id: id.to_string(),
+            agent_name: agent_name.to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal,
+            join_handle,
+            child_supervisor: None,
         }
     }
 
@@ -717,5 +770,97 @@ mod tests {
         sup.cancel_all();
 
         assert!(sig.aborted());
+    }
+
+    #[test]
+    fn unmetered_agent_is_outside_the_spawn_budget_but_still_active() {
+        let mut sup = Supervisor::new(0, 0);
+        sup.register_unmetered(running_handle("u1", "envoy", create_abort_signal()));
+
+        assert_eq!(sup.active_count(), 0);
+        assert_eq!(sup.effective_active_count(), 0);
+        assert!(sup.has_active_tasks());
+        assert!(sup.has_agent("u1"));
+        assert_eq!(sup.list_agents(), vec![("u1", "envoy")]);
+        assert!(
+            sup.register(make_handle("a1", "explore", 1)).is_err(),
+            "an unmetered child must not widen a zero budget"
+        );
+    }
+
+    #[test]
+    fn unmetered_agent_leaves_room_for_the_metered_budget() {
+        let mut sup = Supervisor::new(1, 3);
+        sup.register_unmetered(running_handle("u1", "envoy", create_abort_signal()));
+        sup.register(running_handle("a1", "explore", create_abort_signal()))
+            .unwrap();
+
+        assert_eq!(sup.effective_active_count(), 1);
+        assert!(sup.register(make_handle("a2", "coder", 1)).is_err());
+    }
+
+    #[test]
+    fn cancel_recursive_reaches_unmetered_agents() {
+        let sig = create_abort_signal();
+        let mut sup = Supervisor::new(0, 0);
+        sup.register_unmetered(running_handle("u1", "envoy", sig.clone()));
+
+        sup.cancel_recursive();
+
+        assert!(sig.aborted());
+    }
+
+    #[test]
+    fn take_forgets_an_unmetered_id() {
+        let mut sup = Supervisor::new(1, 3);
+        sup.register_unmetered(running_handle("u1", "envoy", create_abort_signal()));
+        assert!(sup.take("u1").is_some());
+        assert!(sup.unmetered.is_empty());
+        assert!(!sup.has_active_tasks());
+
+        // The same id registered through the metered path is metered again.
+        sup.register(running_handle("u1", "explore", create_abort_signal()))
+            .unwrap();
+        assert_eq!(sup.effective_active_count(), 1);
+    }
+
+    /// A metered registration under an id that is still marked unmetered replaces the
+    /// handle and its standing: the budget must see the new one.
+    #[test]
+    fn register_over_an_unmetered_id_meters_it_again() {
+        let mut sup = Supervisor::new(1, 3);
+        sup.register_unmetered(running_handle("u1", "envoy", create_abort_signal()));
+        assert!(sup.is_unmetered("u1"));
+
+        sup.register(running_handle("u1", "explore", create_abort_signal()))
+            .unwrap();
+
+        assert!(!sup.is_unmetered("u1"));
+        assert_eq!(sup.effective_active_count(), 1);
+        assert_eq!(sup.list_metered_tasks().len(), 1);
+    }
+
+    #[test]
+    fn list_metered_tasks_leaves_out_unmetered_agents_that_stay_registered() {
+        let mut sup = Supervisor::new(4, 3).with_max_concurrent_jobs(1);
+        sup.register_unmetered(running_handle("u1", "envoy", create_abort_signal()));
+        sup.register(running_handle("a1", "explore", create_abort_signal()))
+            .unwrap();
+        sup.register(make_job("j1", create_abort_signal())).unwrap();
+
+        let mut metered: Vec<&str> = sup
+            .list_metered_tasks()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        metered.sort_unstable();
+        assert_eq!(metered, ["a1", "j1"]);
+        let mut agents: Vec<&str> = sup.list_agents().into_iter().map(|(id, _)| id).collect();
+        agents.sort_unstable();
+        assert_eq!(agents, ["a1", "u1"], "the unmetered child stays listed");
+        assert!(sup.has_agent("u1"));
+        assert!(sup.is_unmetered("u1"));
+        assert!(!sup.is_unmetered("a1"));
+        assert!(!sup.is_unmetered("missing"));
     }
 }

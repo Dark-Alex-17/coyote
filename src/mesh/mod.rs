@@ -3,6 +3,7 @@
 mod announce;
 pub(crate) mod card;
 mod identity;
+pub(crate) mod idle;
 pub(crate) mod knocks;
 mod lock;
 mod node;

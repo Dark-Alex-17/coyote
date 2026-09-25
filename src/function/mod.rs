@@ -25,6 +25,7 @@ use crate::mcp::{
     McpServersConfig, is_mcp_meta_function, render,
 };
 use crate::parsers::{bash, python, typescript};
+use crate::supervisor::notification::{Channel, SystemNotification};
 use agents::AGENT_FUNCTION_PREFIX;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future;
@@ -422,24 +423,31 @@ fn normalize_tool_result(result: Value) -> Value {
     }
 }
 
-/// Drains this context's own notification queue and drops events whose
-/// handle is no longer registered with the supervisor (already collected or
-/// cancelled), so the model is never pointed at a dead id.
-fn drain_live_notifications(ctx: &RequestContext) -> Vec<Value> {
+/// Drains this context's own notification queue: mesh events first and
+/// unconditionally, then the supervisor events whose handle is still
+/// registered. `Channel` explains why the two are vouched for differently.
+pub(crate) fn drain_live_notifications(ctx: &RequestContext) -> Vec<Value> {
     let events = ctx.notification_queue.drain();
     if events.is_empty() {
         return vec![];
     }
 
+    let (mesh, supervised): (Vec<_>, Vec<_>) = events
+        .into_iter()
+        .partition(|event| event.channel == Channel::Mesh);
+    let mut values: Vec<Value> = mesh.iter().map(SystemNotification::to_value).collect();
+
     let Some(supervisor) = ctx.supervisor.as_ref() else {
-        return vec![];
+        return values;
     };
     let sup = supervisor.read();
-    events
-        .into_iter()
-        .filter(|event| sup.has_job(&event.id) || sup.has_agent(&event.id))
-        .map(|event| event.to_value())
-        .collect()
+    values.extend(
+        supervised
+            .into_iter()
+            .filter(|event| sup.has_job(&event.id) || sup.has_agent(&event.id))
+            .map(|event| event.to_value()),
+    );
+    values
 }
 
 /// Single-pass merge of both system channels onto the last tool result of a
@@ -2745,7 +2753,9 @@ mod tests {
     use crate::config::{Agent, AgentConfig, AppConfig, AppState, Session, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use crate::supervisor::mailbox::Inbox;
-    use crate::supervisor::notification::{agent_notification, job_notification};
+    use crate::supervisor::notification::{
+        agent_notification, job_notification, mesh_notification,
+    };
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
         Supervisor,
@@ -3070,6 +3080,69 @@ mod tests {
             .push(agent_notification("agent_explore_1", "explore", true));
 
         assert!(drain_live_notifications(&ctx).is_empty());
+    }
+
+    #[test]
+    fn drain_live_notifications_passes_mesh_events_without_a_supervisor() {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        assert!(ctx.supervisor.is_none());
+        ctx.notification_queue.push(mesh_notification(
+            "mesh_agent_completed",
+            "agent_envoy_1",
+            "envoy",
+            true,
+            "agent__collect --id agent_envoy_1 for output".into(),
+        ));
+
+        let live = drain_live_notifications(&ctx);
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0]["channel"], "mesh");
+        assert_eq!(live[0]["event"], "mesh_agent_completed");
+        assert!(
+            ctx.notification_queue.drain().is_empty(),
+            "drain must consume the queue"
+        );
+    }
+
+    #[test]
+    fn drain_live_notifications_passes_mesh_events_outside_the_id_filter() {
+        let ctx = ctx_with_registered_job("job_live");
+        ctx.notification_queue.push(mesh_notification(
+            "mesh_agent_completed",
+            "agent_unregistered",
+            "envoy",
+            true,
+            String::new(),
+        ));
+        ctx.notification_queue
+            .push(job_notification("job_gone", "execute_command", true));
+
+        let live = drain_live_notifications(&ctx);
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0]["id"], "agent_unregistered");
+        assert_eq!(live[0]["channel"], "mesh");
+    }
+
+    #[test]
+    fn drain_live_notifications_puts_mesh_events_ahead_of_supervisor_events() {
+        let ctx = ctx_with_registered_job("job_live");
+        ctx.notification_queue
+            .push(job_notification("job_live", "execute_command", true));
+        ctx.notification_queue.push(mesh_notification(
+            "mesh_message",
+            "deadbeef",
+            "peer",
+            true,
+            "read it".into(),
+        ));
+
+        let live = drain_live_notifications(&ctx);
+
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0]["channel"], "mesh");
+        assert_eq!(live[1]["id"], "job_live");
     }
 
     #[test]

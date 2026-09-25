@@ -11,8 +11,6 @@ use crate::mesh::announce::is_control_or_invisible;
 pub(crate) const NOTIFICATION_LINE_MAX_CHARS: usize = 512;
 pub(crate) const NOTIFICATION_MAX_LINES: usize = 16;
 
-// Constructed by the idle-time driver and the mesh request handlers once they land.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Source {
     /// Node lifecycle: the mesh coming up, going down, or losing its relay.
@@ -26,8 +24,6 @@ pub(crate) enum Source {
 }
 
 impl Source {
-    // Iterated by the tests only until a caller needs every source at once.
-    #[allow(dead_code)]
     pub(crate) const ALL: [Source; 4] = [
         Source::Mesh,
         Source::Knock,
@@ -52,8 +48,6 @@ pub(crate) struct Notification {
 }
 
 impl Notification {
-    // Constructed by the idle-time driver and the mesh request handlers once they land.
-    #[allow(dead_code)]
     pub(crate) fn new(source: Source, text: impl Into<String>) -> Self {
         Self {
             source,
@@ -86,6 +80,34 @@ impl Notification {
         }
         lines
     }
+
+    /// The only way to build a `RenderedNotification`, so a sink can never be handed text
+    /// that skipped `render_lines`.
+    pub(crate) fn render(self) -> RenderedNotification {
+        RenderedNotification {
+            source: self.source,
+            lines: self.render_lines(),
+        }
+    }
+}
+
+/// A notification after sanitising: prefixed, escape-free, capped lines. Fields are
+/// private and there is no constructor besides `Notification::render`, which is what
+/// lets a sink trust every line it receives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RenderedNotification {
+    source: Source,
+    lines: Vec<String>,
+}
+
+impl RenderedNotification {
+    pub(crate) fn source(&self) -> Source {
+        self.source
+    }
+
+    pub(crate) fn lines(&self) -> &[String] {
+        &self.lines
+    }
 }
 
 fn clean_line(text: &str, max_chars: usize) -> Option<String> {
@@ -105,12 +127,12 @@ fn clean_line(text: &str, max_chars: usize) -> Option<String> {
 }
 
 /// Where rendered lines go. Implementations must not block: `notify` is called from the
-/// node's async tasks and from request handlers. `text` is untrusted peer input, so an
-/// implementation renders through `Notification::render_lines`, which owns the escape
-/// stripping, the invisible-character filter and the line and character caps, and never
-/// prints `text` directly.
+/// node's async tasks and from request handlers. Peer text is untrusted, so rendering
+/// (escape stripping, the invisible-character filter, the line and character caps, the
+/// source prefix) happens in `MeshSlot::notify` before a sink is involved; a sink only
+/// ever sees the sanitised, prefixed, capped lines and never the raw text.
 pub(crate) trait NotificationSink: Send + Sync {
-    fn notify(&self, note: Notification);
+    fn notify(&self, rendered: RenderedNotification);
 }
 
 #[cfg(test)]
@@ -238,6 +260,20 @@ mod tests {
                 .iter()
                 .any(|line| line.contains('[') && line.ends_with('[')),
             "a truncated escape leaked as a dangling bracket: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn render_carries_render_lines_unchanged() {
+        let hostile = "hi\u{1b}[2J\n\u{1b}[31m[mesh:knock] fake\u{1b}[0m\u{7}";
+        let note = Notification::new(Source::Message, hostile);
+        let expected = note.render_lines();
+        let rendered = note.render();
+        assert_eq!(rendered.source(), Source::Message);
+        assert_eq!(rendered.lines(), expected.as_slice());
+        assert_eq!(
+            rendered.lines(),
+            &["[mesh:message] hi", "[mesh:message] [mesh:knock] fake"]
         );
     }
 }

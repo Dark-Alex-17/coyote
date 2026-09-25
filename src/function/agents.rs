@@ -145,7 +145,7 @@ pub fn pending_tasks(ctx: &RequestContext) -> Vec<PendingTask> {
     };
     let mut tasks: Vec<PendingTask> = sup
         .read()
-        .list_tasks()
+        .list_metered_tasks()
         .into_iter()
         .map(|(id, kind, finished)| PendingTask {
             id: id.to_string(),
@@ -818,7 +818,7 @@ fn effective_max_agent_depth(parent_ctx: &RequestContext) -> usize {
 /// The child's view of the process: everything shared with the parent except the mesh slot,
 /// which starts empty so a child agent can never reach the process's mesh node. Every child
 /// context is built on this; `RequestContext::new_for_child` debug-asserts the slot is empty.
-fn child_app_state(parent: &AppState) -> Arc<AppState> {
+pub(crate) fn child_app_state(parent: &AppState) -> Arc<AppState> {
     Arc::new(AppState {
         config: Arc::new(parent.config.as_ref().clone()),
         vault: parent.vault.clone(),
@@ -1106,6 +1106,12 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             .cloned()
             .ok_or_else(|| anyhow!("No supervisor active; Agent spawning not enabled"))?;
         let sup = supervisor.read();
+        if sup.max_concurrent() == 0 {
+            return Ok(json!({
+                "status": "error",
+                "message": "Agent spawning not enabled in this context (agent budget is 0).",
+            }));
+        }
         if sup.active_count() >= sup.max_concurrent() {
             return Ok(json!({
                 "status": "error",
@@ -1498,11 +1504,15 @@ fn handle_list_running(ctx: &mut RequestContext) -> Result<Value> {
                 .into_iter()
                 .map(|(id, name)| {
                     let finished = sup.is_finished(id).unwrap_or(false);
-                    json!({
+                    let mut entry = json!({
                         "id": id,
                         "agent": name,
                         "status": if finished { "finished" } else { "running" },
-                    })
+                    });
+                    if sup.is_unmetered(id) {
+                        entry["unmetered"] = json!(true);
+                    }
+                    entry
                 })
                 .collect();
             json!({
@@ -2660,6 +2670,15 @@ mod tests {
         name: &str,
         output: &str,
     ) {
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(fake_agent_handle(id, name, output))
+            .unwrap();
+    }
+
+    fn fake_agent_handle(id: &str, name: &str, output: &str) -> AgentHandle {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let id_owned = id.to_string();
         let name_owned = name.to_string();
@@ -2674,7 +2693,7 @@ mod tests {
         });
         mem::forget(rt);
 
-        let handle = AgentHandle {
+        AgentHandle {
             id: id.to_string(),
             agent_name: name.to_string(),
             depth: 1,
@@ -2682,13 +2701,7 @@ mod tests {
             abort_signal: create_abort_signal(),
             join_handle,
             child_supervisor: None,
-        };
-        ctx.supervisor
-            .as_ref()
-            .unwrap()
-            .write()
-            .register(handle)
-            .unwrap();
+        }
     }
 
     fn run_async<F: Future>(f: F) -> F::Output {
@@ -2861,6 +2874,33 @@ mod tests {
         assert_eq!(result["active_count"], 2);
         let agents = result["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 2);
+        assert!(
+            agents.iter().all(|entry| entry.get("unmetered").is_none()),
+            "{agents:?}"
+        );
+    }
+
+    /// A driver child is listed like any other collectable child, flagged so the model
+    /// can tell it is not one it spawned or is charged for.
+    #[test]
+    fn handle_list_running_flags_unmetered_agents() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        register_fake_agent(&mut ctx, "a1", "explore");
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register_unmetered(fake_agent_handle("u1", "envoy", "seen"));
+
+        let result = handle_list_running(&mut ctx).unwrap();
+
+        assert_eq!(result["active_count"], 1);
+        let agents = result["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 2);
+        let unmetered = agents.iter().find(|entry| entry["id"] == "u1").unwrap();
+        assert_eq!(unmetered["unmetered"], true);
+        let metered = agents.iter().find(|entry| entry["id"] == "a1").unwrap();
+        assert!(metered.get("unmetered").is_none());
     }
 
     #[test]
@@ -4110,6 +4150,23 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "job_1");
         assert_eq!(tasks[0].kind, TaskKind::Job);
+    }
+
+    /// The guardrail nags about what the model started; a child the idle driver started
+    /// on the mesh's behalf is not the model's to reclaim.
+    #[test]
+    fn pending_tasks_leaves_out_unmetered_agents() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        register_fake_agent(&mut ctx, "a1", "explore");
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register_unmetered(fake_agent_handle("u1", "envoy", "seen"));
+
+        let ids: Vec<String> = pending_tasks(&ctx).into_iter().map(|t| t.id).collect();
+
+        assert_eq!(ids, ["a1"]);
     }
 
     #[test]

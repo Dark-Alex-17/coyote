@@ -45,9 +45,13 @@ const CURSOR_POSITION_REPLY: &str = "\x1b[2;1R";
 
 type Target = Session<OsProcess, OsStream>;
 
+// Mirrored in examples/pty-reedline-target.rs.
 const INJECT_WHEN_BUFFER_ENV: &str = "PTY_TARGET_INJECT_WHEN_BUFFER";
 const INJECT_LINE_ENV: &str = "PTY_TARGET_INJECT_LINE";
+const CONTINUE_ON_CTRLC_ENV: &str = "PTY_TARGET_CONTINUE_ON_CTRLC";
+const INJECT_ON_CTRLC_ENV: &str = "PTY_TARGET_INJECT_ON_CTRLC";
 const INJECTED_LINE: &str = "[mesh] peer said hi";
+const INJECTED_ON_CTRLC_LINE: &str = "[mesh] envoy finished while you were away";
 
 /// Path of the example binary `cargo test` builds alongside the test executable.
 fn target_binary() -> PathBuf {
@@ -64,6 +68,21 @@ fn target_binary() -> PathBuf {
         path.display()
     );
     path
+}
+
+/// The target with every fixture knob cleared, so a test sees only what it sets itself
+/// and never what the environment running `cargo test` happens to carry.
+fn target_command() -> Command {
+    let mut command = Command::new(target_binary());
+    for knob in [
+        INJECT_WHEN_BUFFER_ENV,
+        INJECT_LINE_ENV,
+        CONTINUE_ON_CTRLC_ENV,
+        INJECT_ON_CTRLC_ENV,
+    ] {
+        command.env_remove(knob);
+    }
+    command
 }
 
 fn spawn_target(command: Command) -> Target {
@@ -125,9 +144,7 @@ fn strip_csi(bytes: &[u8]) -> String {
 
 #[test]
 fn a_typed_line_is_read_back_through_the_pty() {
-    let mut command = Command::new(target_binary());
-    command.env_remove(INJECT_WHEN_BUFFER_ENV);
-    let mut session = spawn_target(command);
+    let mut session = spawn_target(target_command());
 
     wait_for(&mut session, "TARGET-READY");
     wait_for(&mut session, "pty");
@@ -146,7 +163,7 @@ fn a_multi_row_injection_paints_each_row_at_column_one_above_the_prompt() {
     const FIRST_ROW: &str = "[mesh:message] one of two";
     const SECOND_ROW: &str = "[mesh:message] two of two";
 
-    let mut command = Command::new(target_binary());
+    let mut command = target_command();
     command.env(INJECT_WHEN_BUFFER_ENV, "hel");
     command.env(INJECT_LINE_ENV, format!("{FIRST_ROW}\n{SECOND_ROW}"));
     let mut session = spawn_target(command);
@@ -189,6 +206,63 @@ fn a_multi_row_injection_paints_each_row_at_column_one_above_the_prompt() {
     wait_for(&mut session, "READ:hello");
 }
 
+/// Ctrl-C at an idle prompt with a line queued across the interrupt, the way an
+/// idle-time notification does: the interrupt is reported, the line is painted, the
+/// prompt comes back, and the next typed line is read whole. The `READ:` report is the
+/// proof that neither the interrupt nor the injected line left the editor in a state
+/// that eats or garbles what follows.
+#[test]
+fn ctrl_c_with_a_line_queued_across_the_interrupt_leaves_the_prompt_usable() {
+    let mut command = target_command();
+    command.env(CONTINUE_ON_CTRLC_ENV, "1");
+    command.env(INJECT_ON_CTRLC_ENV, INJECTED_ON_CTRLC_LINE);
+    let mut session = spawn_target(command);
+
+    wait_for(&mut session, "TARGET-READY");
+    wait_for(&mut session, "ARMED:ctrlc");
+    wait_for(&mut session, "pty");
+
+    session.send("\x03").expect("press ctrl-c");
+    wait_for(&mut session, "SIGNAL:ctrl-c");
+    let before = strip_csi(&wait_for(&mut session, INJECTED_ON_CTRLC_LINE));
+    assert!(
+        before.ends_with('\r'),
+        "injected line did not start at column one: {before:?}"
+    );
+    wait_for(&mut session, "pty");
+
+    session
+        .send("hello\r")
+        .expect("type a line and press enter");
+    wait_for(&mut session, "READ:hello");
+}
+
+/// The other order: the line has already been painted over a half-typed buffer when
+/// Ctrl-C arrives. The interrupt must clear that buffer and hand back a prompt that
+/// reads the next line whole.
+#[test]
+fn ctrl_c_after_a_line_painted_over_a_half_typed_buffer_leaves_the_prompt_usable() {
+    let mut command = target_command();
+    command.env(INJECT_WHEN_BUFFER_ENV, "hel");
+    command.env(INJECT_LINE_ENV, INJECTED_LINE);
+    command.env(CONTINUE_ON_CTRLC_ENV, "1");
+    let mut session = spawn_target(command);
+
+    wait_for(&mut session, "TARGET-READY");
+    wait_for(&mut session, "pty");
+    session.send("hel").expect("type half the word");
+    wait_for(&mut session, INJECTED_LINE);
+
+    session.send("\x03").expect("press ctrl-c");
+    wait_for(&mut session, "SIGNAL:ctrl-c");
+    wait_for(&mut session, "pty");
+
+    session
+        .send("hello\r")
+        .expect("type a line and press enter");
+    wait_for(&mut session, "READ:hello");
+}
+
 /// Prompt integrity: a line printed from outside while the user is mid-word lands
 /// above the prompt, the prompt is redrawn with the partial text intact and the
 /// cursor still at its end, and the keystrokes that follow complete the word the
@@ -197,7 +271,7 @@ fn a_multi_row_injection_paints_each_row_at_column_one_above_the_prompt() {
 /// cursor were untouched rather than merely redrawn correctly.
 #[test]
 fn an_injected_line_leaves_the_half_typed_buffer_and_cursor_intact() {
-    let mut command = Command::new(target_binary());
+    let mut command = target_command();
     command.env(INJECT_WHEN_BUFFER_ENV, "hel");
     command.env(INJECT_LINE_ENV, INJECTED_LINE);
     let mut session = spawn_target(command);

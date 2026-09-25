@@ -1,4 +1,4 @@
-use crate::mesh::notify::{Notification, NotificationSink, Source};
+use crate::mesh::notify::{NotificationSink, RenderedNotification, Source};
 
 use reedline::ExternalPrinter;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,9 +43,8 @@ impl PromptPrinter {
         self.printer.clone()
     }
 
-    // Read by the idle-time driver once it lands.
-    #[allow(dead_code)]
-    pub fn dropped(&self) -> usize {
+    #[cfg(test)]
+    fn dropped(&self) -> usize {
         self.dropped.load(Ordering::Acquire)
     }
 }
@@ -54,7 +53,7 @@ impl NotificationSink for PromptPrinter {
     /// Never blocks: the queue is drained on the editor thread, and a caller waiting on it
     /// from inside a turn would wait until the next prompt. A full queue drops the
     /// notification and the next one that fits carries the count.
-    fn notify(&self, note: Notification) {
+    fn notify(&self, rendered: RenderedNotification) {
         let dropped = self.dropped.swap(0, Ordering::AcqRel);
         let mut rows = Vec::new();
         if dropped > 0 {
@@ -69,8 +68,8 @@ impl NotificationSink for PromptPrinter {
             ));
         }
         rows.extend(wrap_rows(
-            &note.render_lines(),
-            note.source.prefix(),
+            rendered.lines(),
+            rendered.source().prefix(),
             terminal_width(),
         ));
         let payload = rows.join("\n");
@@ -136,6 +135,7 @@ mod tests {
     use super::*;
 
     use crate::mesh::MeshSlot;
+    use crate::mesh::notify::Notification;
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
@@ -144,7 +144,7 @@ mod tests {
     fn notification_reaches_the_attached_printer_with_its_prefix() {
         let printer = PromptPrinter::new();
         let attached = printer.attach();
-        printer.notify(Notification::new(Source::Knock, "hi"));
+        printer.notify(Notification::new(Source::Knock, "hi").render());
         assert_eq!(attached.get_line().as_deref(), Some("[mesh:knock] hi"));
         assert_eq!(printer.dropped(), 0);
     }
@@ -154,13 +154,13 @@ mod tests {
         let printer = PromptPrinter::with_capacity(1);
         let attached = printer.attach();
         for text in ["first", "second", "third"] {
-            printer.notify(Notification::new(Source::Knock, text));
+            printer.notify(Notification::new(Source::Knock, text).render());
         }
         assert_eq!(attached.get_line().as_deref(), Some("[mesh:knock] first"));
         assert_eq!(printer.dropped(), 2);
         assert!(attached.get_line().is_none());
 
-        printer.notify(Notification::new(Source::Message, "fourth"));
+        printer.notify(Notification::new(Source::Message, "fourth").render());
         let payload = attached.get_line().unwrap();
         let rows: Vec<&str> = payload.lines().collect();
         assert_eq!(rows.first(), Some(&"[mesh] (2 notifications dropped)"));
@@ -172,11 +172,11 @@ mod tests {
     fn a_single_drop_is_reported_in_the_singular() {
         let printer = PromptPrinter::with_capacity(1);
         let attached = printer.attach();
-        printer.notify(Notification::new(Source::Mesh, "first"));
-        printer.notify(Notification::new(Source::Mesh, "second"));
+        printer.notify(Notification::new(Source::Mesh, "first").render());
+        printer.notify(Notification::new(Source::Mesh, "second").render());
         assert_eq!(attached.get_line().as_deref(), Some("[mesh] first"));
 
-        printer.notify(Notification::new(Source::Mesh, "third"));
+        printer.notify(Notification::new(Source::Mesh, "third").render());
         let payload = attached.get_line().unwrap();
         assert_eq!(
             payload.lines().next(),
@@ -188,7 +188,7 @@ mod tests {
     fn multi_line_text_is_one_payload_with_every_line_prefixed() {
         let printer = PromptPrinter::new();
         let attached = printer.attach();
-        printer.notify(Notification::new(Source::Message, "one\ntwo\nthree"));
+        printer.notify(Notification::new(Source::Message, "one\ntwo\nthree").render());
         let payload = attached.get_line().unwrap();
         assert!(attached.get_line().is_none());
         let lines: Vec<&str> = payload.lines().collect();
@@ -228,16 +228,20 @@ mod tests {
         assert_eq!(printer.dropped(), 0);
     }
 
-    /// Sanitising happens at the sink: whatever a peer sends, the queue the editor
-    /// drains only ever holds prefixed rows free of escapes and control bytes.
+    /// Sanitising happens before the sink, in `Notification::render`: whatever a peer
+    /// sends, the queue the editor drains only ever holds prefixed rows free of escapes
+    /// and control bytes.
     #[test]
     fn hostile_text_reaches_the_printer_queue_clean_and_prefixed() {
         let printer = PromptPrinter::new();
         let attached = printer.attach();
-        printer.notify(Notification::new(
-            Source::Message,
-            "hi\u{1b}[2J\u{1b}]0;owned\u{7}\r\n\u{1b}[31m[mesh:knock] fake\u{1b}[0m\u{7}",
-        ));
+        printer.notify(
+            Notification::new(
+                Source::Message,
+                "hi\u{1b}[2J\u{1b}]0;owned\u{7}\r\n\u{1b}[31m[mesh:knock] fake\u{1b}[0m\u{7}",
+            )
+            .render(),
+        );
         let payload = attached.get_line().expect("payload queued");
         assert!(
             !payload
@@ -263,7 +267,7 @@ mod tests {
         let attached = printer.attach();
         let overflow = 10;
         for i in 0..PROMPT_PRINTER_CAPACITY + overflow {
-            printer.notify(Notification::new(Source::Mesh, format!("event {i}")));
+            printer.notify(Notification::new(Source::Mesh, format!("event {i}")).render());
         }
         assert_eq!(printer.dropped(), overflow);
         let mut landed = 0;

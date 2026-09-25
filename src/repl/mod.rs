@@ -1,11 +1,13 @@
 mod completer;
 mod highlighter;
+mod idle;
 mod printer;
 mod prompt;
 mod replay;
 
 use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
+use self::idle::IdleDriver;
 use self::printer::PromptPrinter;
 use self::prompt::ReplPrompt;
 
@@ -418,9 +420,7 @@ pub struct Repl {
     editor: Reedline,
     prompt: ReplPrompt,
     abort_signal: AbortSignal,
-    // Read by the idle-time driver once it lands.
-    #[allow(dead_code)]
-    printer: Arc<PromptPrinter>,
+    idle: Option<IdleDriver>,
 }
 
 impl Repl {
@@ -431,17 +431,20 @@ impl Repl {
         ctx.app
             .mesh
             .set_notifier(Arc::clone(&printer) as Arc<dyn NotificationSink>);
+        let app_state = Arc::clone(&ctx.app);
         let ctx = Arc::new(RwLock::new(ctx));
         let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref(), &printer)?;
         let prompt = ReplPrompt::new(Arc::clone(&ctx));
         let abort_signal = create_abort_signal();
+        // Last, so a failed editor set-up leaves no loop task behind.
+        let idle = IdleDriver::start(Arc::clone(&ctx), app_state);
 
         Ok(Self {
             ctx,
             editor,
             prompt,
             abort_signal,
-            printer,
+            idle: Some(idle),
         })
     }
 
@@ -551,6 +554,13 @@ Type ".help" for additional help.
                 }
                 _ => {}
             }
+        }
+
+        // Notifier first: lines from children winding down under `stop` then reach
+        // stderr instead of a printer the loop above no longer drains.
+        self.ctx.read().app.mesh.clear_notifier();
+        if let Some(idle) = self.idle.take() {
+            idle.stop().await;
         }
 
         if let Some(supervisor) = self.ctx.read().supervisor.clone() {
