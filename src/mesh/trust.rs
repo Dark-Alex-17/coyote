@@ -1657,6 +1657,58 @@ mod tests {
     }
 
     #[test]
+    fn labels_keep_a_variation_selector_and_refuse_a_soft_hyphen() {
+        let fx = Fixture::new("trust-text-variation-selector");
+        let identity = fake_hash(0xac);
+        let heart = "Alex \u{2764}\u{FE0F}";
+
+        let change = fx
+            .store
+            .trust_identity(
+                &fx.mesh,
+                &identity,
+                TrustOptions {
+                    label: Some(heart.to_string()),
+                    note: Some("styled \u{9053}\u{E0100}".to_string()),
+                },
+                t(3_000),
+            )
+            .unwrap();
+
+        assert_eq!(change, TrustChange::Added);
+        let records = fx.reopen().records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].label.as_deref(),
+            Some(heart),
+            "a variation selector is kept verbatim in the trust list"
+        );
+        assert_eq!(records[0].note.as_deref(), Some("styled \u{9053}\u{E0100}"));
+
+        let err = fx
+            .store
+            .trust_identity(
+                &fx.mesh,
+                &identity,
+                TrustOptions {
+                    label: Some("so\u{00AD}ft".to_string()),
+                    note: None,
+                },
+                t(3_100),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("label"), "{err}");
+        assert!(err.contains("control or invisible"), "{err}");
+        let records = fx.reopen().records();
+        assert_eq!(
+            records[0].label.as_deref(),
+            Some(heart),
+            "nothing was changed"
+        );
+    }
+
+    #[test]
     fn malformed_hashes_are_refused_without_panicking() {
         let fx = Fixture::new("trust-hash-shapes");
         let non_ascii_32_bytes = format!("\u{20ac}{}", "a".repeat(29));

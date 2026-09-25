@@ -201,12 +201,16 @@ fn dispatch_errors_round_trip_as_maps_and_never_read_as_refusal_codes() {
 /// never matches them. Only the trailing test module is stripped: a `#[cfg(test)]` on an
 /// import or a helper method must not end the scan early.
 ///
-/// The propagation fetch is the client half: it decodes a refusal a node sent us, so it may
-/// name the code only inside an `R3Error::Refused(..)` pattern and must never build one.
+/// The propagation fetch and the knock are the client half: they read a refusal a peer
+/// sent us, so they may name the code only inside an `R3Error::Refused(..)` pattern and
+/// must never build one. A match arm ends in `) =>` (or `)) =>` when the pattern is nested
+/// in an `Err(..)`); a constructed value ends in `);`, so the two never look alike.
 #[test]
 fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
     let needle = ["RefusalCode::", "NoAccess"].concat();
-    let consumed = ["R3Error::Refused(", &needle, ") =>"].concat();
+    let refused = ["R3Error::Refused(", &needle, ")"].concat();
+    let arms = [[&refused, " =>"].concat(), [&refused, ") =>"].concat()];
+    let constructed = [&refused, ");"].concat();
     let markers = [
         ["#[cfg(test)]", "\nmod tests"].concat(),
         ["#[cfg(test)]", "\npub(crate) mod test_support"].concat(),
@@ -231,15 +235,19 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
             assert!(production.contains("impl MeshRuntime"));
         }
         let count = production.matches(&needle).count();
-        if name == "propagation_fetch.rs" {
+        assert!(
+            !production.contains(&constructed),
+            "{name} must never build a refusal outside the dispatcher"
+        );
+        if name == "propagation_fetch.rs" || name == "node.rs" {
             assert!(
                 count > 0,
-                "the fetch must map the node's access refusal to a remedy"
+                "{name} must read the peer's access refusal to act on it"
             );
+            let consumed: usize = arms.iter().map(|arm| production.matches(arm).count()).sum();
             assert_eq!(
-                count,
-                production.matches(&consumed).count(),
-                "the fetch may only decode a received refusal, never name the code elsewhere"
+                count, consumed,
+                "{name} may only match a received refusal, never name the code elsewhere"
             );
             assert!(!production.contains("to_wire"));
             assert!(!production.contains("Reply::Code"));
@@ -334,6 +342,7 @@ mod network {
     use super::super::server::{
         Admission, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, R3Server, Reply, RequestHandler,
     };
+    use crate::config::mesh_config::MeshInterface;
     use crate::config::{ForkRekey, MeshConfig, Session};
     use crate::mesh::announce::AnnounceAppData;
     use crate::mesh::card::{
@@ -341,7 +350,20 @@ mod network {
         PLAN_TITLE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, StatusCard, StatusError,
         StatusHandler, TODO_GOAL_MAX_CHARS, build_card,
     };
-    use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, SHUTDOWN_GRACE};
+    use crate::mesh::idle::{IdleNotify, Origin};
+    use crate::mesh::knock::{
+        ChannelKnockSink, KNOCK_QUEUE_CAPACITY, KnockError, KnockGate, KnockIntro, KnockMessage,
+        KnockOutcome, KnockSurface, KnockVia, decode_knock_message, drain_knocks,
+    };
+    use crate::mesh::knocks::KnockCache;
+    use crate::mesh::node::{
+        KnockOptions, MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, SHUTDOWN_GRACE,
+    };
+    use crate::mesh::notify::Source;
+    use crate::mesh::peers::PeerTable;
+    use crate::mesh::propagation::test_support::{FakeNode, stored_message};
+    use crate::mesh::propagation::{PropagationOptions, pn_announce_app_data};
+    use crate::mesh::propagation_fetch::InboundMessage;
     use crate::mesh::snapshot::{MeshSnapshot, PlanRef, RepoInfo, TurnState};
     use crate::mesh::test_support::{
         Connector, INTEROP_TIMEOUT, LEGACY_LINK_MTU, Listener, TempDir, TrustList, contains_bytes,
@@ -361,6 +383,7 @@ mod network {
     use rns_transport::hash::{AddressHash, Hash};
     use rns_transport::identity::Identity;
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
+    use rns_transport::identity_bridge::{to_core_identity, to_core_private_identity};
     use rns_transport::iface::InterfaceSharedConfig;
     use rns_transport::iface::tcp_client::TcpClient;
     use rns_transport::iface::tcp_server::TcpServer;
@@ -369,12 +392,12 @@ mod network {
     use std::collections::VecDeque;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Weak};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Weak};
     use std::time::{Duration, Instant, SystemTime};
     use tokio::sync::broadcast;
     use tokio::task::JoinHandle;
-    use tokio::time::timeout;
+    use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
 
     /// How long a dropped `Script::Hang` handler takes to go away; see `Abandoned`.
@@ -2244,7 +2267,7 @@ mod network {
     }
 
     /// `/knock` is the dispatcher's own. Registering over it is refused, and the built-in
-    /// handler goes on serving it.
+    /// handler goes on serving it: nil back, nothing knocked, the usurper never entered.
     #[tokio::test]
     async fn registering_over_knock_is_refused_and_displaces_nothing() {
         let identity = *TransportIdentity::new_from_rand(OsRng).as_identity();
@@ -2267,8 +2290,8 @@ mod network {
         assert!(matches!(reply, Reply::Value(Value::Nil)));
         assert_eq!(
             sink.count(),
-            1,
-            "the built-in knock handler still serves /knock"
+            0,
+            "a trusted instance calling /knock has nothing to knock for"
         );
         assert_eq!(usurper.seen_count(), 0);
     }
@@ -2625,11 +2648,17 @@ mod network {
             .await
             .unwrap();
         assert_eq!(outcome.value, Value::Nil);
-        let (identity, destination, path_hash, data) = gate.sink.only();
-        assert_eq!(identity, identity_hex(&requester));
-        assert_eq!(destination, requester_destination_hex(&requester));
-        assert_eq!(path_hash, PathHash::of(KNOCK_PATH));
-        assert_eq!(data, Some(Value::from("hello")));
+        assert_eq!(
+            gate.sink.count(),
+            0,
+            "a trusted instance calling /knock has nothing to knock for"
+        );
+        assert_debug_logged(&format!(
+            "Mesh knock from {} on link {} is not a knock: already trusted from {}",
+            &identity_hex(&requester)[..8],
+            seen.link_id.to_hex_string(),
+            &requester_destination_hex(&requester)[..8]
+        ));
         assert_eq!(recorder.seen_count(), 1);
         requester.stop().await;
         responder.stop().await;
@@ -3513,6 +3542,533 @@ mod network {
             knocked_on
         ));
         pair.stop_node_a().await;
+    }
+
+    /// Records every line the gate surfaces.
+    #[derive(Default)]
+    struct RecordingSurface {
+        notes: Mutex<Vec<IdleNotify>>,
+    }
+
+    impl RecordingSurface {
+        fn count(&self) -> usize {
+            self.notes.lock().len()
+        }
+
+        fn only(&self) -> (Source, Origin, String) {
+            let notes = self.notes.lock();
+            assert_eq!(notes.len(), 1, "exactly one surfaced line");
+            (
+                notes[0].source,
+                notes[0].origin.clone(),
+                notes[0].text.clone(),
+            )
+        }
+    }
+
+    impl KnockSurface for RecordingSurface {
+        fn surface(&self, note: IdleNotify) -> bool {
+            self.notes.lock().push(note);
+            true
+        }
+    }
+
+    /// A surface that blocks the gate on a barrier until the test lets it go, to prove
+    /// nothing on the request path waits for it.
+    struct BlockingSurface {
+        barrier: Barrier,
+        entered: AtomicBool,
+        released: AtomicBool,
+    }
+
+    impl KnockSurface for BlockingSurface {
+        fn surface(&self, _note: IdleNotify) -> bool {
+            self.entered.store(true, Ordering::SeqCst);
+            self.barrier.wait();
+            self.released.store(true, Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// The knock path as `MeshRuntime::start` wires it, in front of `responder`: the real
+    /// dispatcher over `list`, a bounded channel, a drain task and a gate surfacing into
+    /// `surface`.
+    struct KnockRig {
+        gate: Arc<KnockGate>,
+        cancel: CancellationToken,
+        _tmp: TempDir,
+    }
+
+    fn knock_rig(
+        responder: &Responder,
+        list: &TrustList,
+        tag: &str,
+        surface: Weak<dyn KnockSurface>,
+    ) -> KnockRig {
+        let (trust, tmp) = list.open(tag);
+        let (sink, rx) = ChannelKnockSink::new(KNOCK_QUEUE_CAPACITY);
+        responder
+            .server
+            .set_handler(Arc::new(Dispatcher::new(trust.clone(), sink)));
+        let peers =
+            Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
+        let gate = Arc::new(KnockGate::new(trust, peers, KnockCache::new(&tmp.path, 24)));
+        gate.attach(surface);
+        let cancel = CancellationToken::new();
+        tokio::spawn(drain_knocks(rx, gate.clone(), cancel.clone()));
+        KnockRig {
+            gate,
+            cancel,
+            _tmp: tmp,
+        }
+    }
+
+    fn short_knock_options() -> KnockOptions {
+        KnockOptions {
+            request: short_options(),
+            ..KnockOptions::default()
+        }
+    }
+
+    /// Node A knocks node B over a link. B's dispatcher answers `NoAccess`, which is the
+    /// knock landing: A reports `Direct`, B surfaces one line naming both full hashes and
+    /// the intro, and files the knock. A second knock lands too but is surfaced no more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_knock_over_a_link_lands_as_direct_and_is_surfaced_once() {
+        let pair = NodePair::start_as_started("r3-knock-direct").await;
+        pair.introduce_b_to_a().await;
+        let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
+        let a_instance = pair.node_a.destination_hash().await;
+        let surface = Arc::new(RecordingSurface::default());
+        let rig = knock_rig(
+            &pair.responder,
+            &TrustList::default().identity(&a_identity, false),
+            "r3-knock-direct-gate",
+            Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
+        );
+        assert!(
+            pair.node_a.propagation_nodes().select().is_err(),
+            "with no node heard, any fallback would have failed rather than reported Direct"
+        );
+
+        let outcome = pair
+            .node_a
+            .knock(&pair.responder.desc, &KnockIntro::new("hi from A").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            KnockOutcome {
+                via: KnockVia::Direct
+            }
+        );
+        wait_until("node B to surface the knock", || surface.count() == 1).await;
+        let (source, origin, text) = surface.only();
+        assert_eq!(source, Source::Knock);
+        assert_eq!(origin, Origin::Peer(a_identity[..8].to_string()));
+        assert!(text.contains(&format!("(identity {a_identity})")), "{text}");
+        assert!(
+            text.contains(&format!("from instance {a_instance}: \"hi from A\"")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(".mesh trust {a_instance}")),
+            "{text}"
+        );
+        assert!(text.contains(&format!(".mesh info {a_instance}")), "{text}");
+        assert!(
+            text.contains(&format!(".mesh block {a_identity}")),
+            "{text}"
+        );
+        let cached = rig.gate.cache().list(SystemTime::now()).unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].identity_hash, a_identity);
+        assert_eq!(cached[0].destination_hash, a_instance);
+        assert_eq!(cached[0].intro.as_deref(), Some("hi from A"));
+
+        let again = pair
+            .node_a
+            .knock(&pair.responder.desc, &KnockIntro::new("").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(again.via, KnockVia::Direct);
+        wait_until("node B to file the second knock", || {
+            rig.gate.cache().list(SystemTime::now()).unwrap().len() == 2
+        })
+        .await;
+        assert_eq!(surface.count(), 1, "one line per identity per session");
+        assert_eq!(
+            rig.gate.cache().list(SystemTime::now()).unwrap()[0].intro,
+            None
+        );
+        rig.cancel.cancel();
+        pair.stop_node_a().await;
+    }
+
+    /// Node A is already trusted from the instance it knocks from. `/knock` still answers
+    /// nil, but B's dispatcher hands nothing to its knock sink: no line, no cache file, no
+    /// gate state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_trusted_instance_calling_knock_is_acknowledged_and_never_reaches_the_sink() {
+        install_log_collector();
+        let pair = NodePair::start_as_started("r3-knock-trusted").await;
+        pair.introduce_b_to_a().await;
+        let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
+        let a_instance = pair.node_a.destination_hash().await;
+        let (trust, tmp) = TrustList::default()
+            .destination(&a_instance, &a_identity)
+            .open("r3-knock-trusted-gate");
+        let sink = Arc::new(SpySink::default());
+        pair.responder
+            .server
+            .set_handler(Arc::new(Dispatcher::new(trust.clone(), sink.clone())));
+        let peers =
+            Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
+        let gate = KnockGate::new(trust, peers, KnockCache::new(&tmp.path, 24));
+        let surface = Arc::new(RecordingSurface::default());
+        gate.attach(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+
+        let outcome = pair
+            .node_a
+            .knock(
+                &pair.responder.desc,
+                &KnockIntro::new("already in").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.via, KnockVia::Direct);
+        assert_eq!(
+            sink.count(),
+            0,
+            "the sink never hears from a trusted instance"
+        );
+        assert_eq!(surface.count(), 0);
+        assert!(!gate.cache().path().exists());
+        assert!(gate.tracked_identities().is_empty());
+        assert_debug_logged(&format!("Mesh knock from {} on link ", &a_identity[..8]));
+        assert_debug_logged(&format!(
+            " is not a knock: already trusted from {}",
+            &a_instance[..8]
+        ));
+        pair.stop_node_a().await;
+    }
+
+    /// A blocked identity hears nothing from the dispatcher, so its knock looks like an
+    /// unreachable peer to the knocker; with no propagation node heard, the knock fails by
+    /// name. Nothing reaches B's gate: no line, no cache file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blocked_identity_knocking_over_a_link_is_answered_with_silence() {
+        let pair = NodePair::start_as_started("r3-knock-blocked").await;
+        pair.introduce_b_to_a().await;
+        let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
+        let surface = Arc::new(RecordingSurface::default());
+        let rig = knock_rig(
+            &pair.responder,
+            &TrustList::default()
+                .identity(&a_identity, false)
+                .block(&a_identity),
+            "r3-knock-blocked-gate",
+            Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
+        );
+
+        let err = pair
+            .node_a
+            .knock_with(
+                &pair.responder.desc,
+                &KnockIntro::new("let me in").unwrap(),
+                short_knock_options(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, KnockError::NoPropagationNode);
+        assert!(err.to_string().contains(".mesh peers"), "{err}");
+        assert_eq!(pair.responder.server.decoded_count(), 0);
+        assert_eq!(surface.count(), 0);
+        assert!(!rig.gate.cache().path().exists());
+        assert!(rig.gate.tracked_identities().is_empty());
+        rig.cancel.cancel();
+        pair.stop_node_a().await;
+    }
+
+    /// `short_knock_options` with the fallback's window shortened too: a post the node
+    /// accepts spends the whole window waiting, and loopback needs far less of it.
+    fn fallback_knock_options() -> KnockOptions {
+        KnockOptions {
+            request: short_options(),
+            propagation: PropagationOptions {
+                reject_window: Duration::from_millis(300),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A destination nobody serves and node A has never heard announced.
+    fn ghost_destination() -> (TransportIdentity, DestinationDesc) {
+        let identity = TransportIdentity::new_from_rand(OsRng);
+        let desc = SingleInputDestination::new(
+            identity.clone(),
+            DestinationName::new("coyote", "mesh.ghost"),
+        )
+        .desc;
+        (identity, desc)
+    }
+
+    /// A `NodePair` whose node A is also joined to a fake propagation node, announced
+    /// with a zero stamp cost and already filed by A, so an unreachable knock has
+    /// somewhere to fall back to.
+    async fn pair_with_propagation_node(tag: &str) -> (NodePair, FakeNode) {
+        let node = FakeNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+        let port = node.port;
+        let pair = NodePair::start_with(
+            tag,
+            |config| {
+                config.interfaces.push(MeshInterface::Private {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                });
+            },
+            |_| TrustList::default(),
+        )
+        .await;
+        node.announce(&pn_announce_app_data(true, 0, 256)).await;
+        let table = pair.node_a.propagation_nodes();
+        wait_until("node A to learn the propagation node", || {
+            table.select().is_ok()
+        })
+        .await;
+        (pair, node)
+    }
+
+    /// The knock the fake node was handed, read as `ghost`'s node would read it off a
+    /// fetch: decrypted with the ghost's key, checked against `knocker`'s signature and
+    /// then decoded as the fetch path decodes it.
+    fn stored_knock(bytes: &[u8], ghost: &TransportIdentity, knocker: &Identity) -> KnockMessage {
+        let wire = stored_message(bytes, &to_core_private_identity(ghost));
+        assert_eq!(wire.verify(&to_core_identity(knocker)), Ok(true));
+        decode_knock_message(&InboundMessage {
+            transient_id: [0u8; 32],
+            message_id: [0u8; 32],
+            source_identity_hash: knocker.address_hash.to_hex_string(),
+            source_delivery_hash: String::new(),
+            timestamp: wire.payload.timestamp,
+            title: wire.payload.title.map(|bytes| bytes.into_vec()),
+            content: wire.payload.content.map(|bytes| bytes.into_vec()),
+            fields: wire.payload.fields,
+            stamp_value: None,
+        })
+    }
+
+    /// Node A knocks a destination it has no path to, with a propagation node learned:
+    /// the knock is stored there, signed by A, decryptable by the ghost alone, and names
+    /// A's origin so the ghost recomputes A's instance from it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_knock_falls_back_to_the_propagation_node() {
+        let (pair, mut node) = pair_with_propagation_node("r3-knock-fallback").await;
+        let (ghost, ghost_desc) = ghost_destination();
+
+        let outcome = pair
+            .node_a
+            .knock_with(
+                &ghost_desc,
+                &KnockIntro::new("let me in").unwrap(),
+                fallback_knock_options(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            KnockOutcome {
+                via: KnockVia::StoreAndForward
+            }
+        );
+        let received = node.next_received().await;
+        let knock = stored_knock(received.bytes(), &ghost, &pair.a_desc.identity);
+        let origin = OriginName::of(&pair.a_desc.name);
+        assert_eq!(
+            knock,
+            KnockMessage::Knock {
+                name_hash: origin.0,
+                intro: Some("let me in".to_string()),
+            }
+        );
+        assert_eq!(
+            destination_address(&origin.0, &pair.a_desc.identity.address_hash).to_hex_string(),
+            pair.node_a.destination_hash().await
+        );
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// A refusal is the knock landing, so a reachable peer's `NoAccess` never reaches the
+    /// propagation node even when one is known.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_knock_is_direct_and_leaves_the_propagation_node_alone() {
+        let (pair, mut node) = pair_with_propagation_node("r3-knock-refused-no-fallback").await;
+        pair.introduce_b_to_a().await;
+        let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
+        let surface = Arc::new(RecordingSurface::default());
+        let rig = knock_rig(
+            &pair.responder,
+            &TrustList::default().identity(&a_identity, false),
+            "r3-knock-refused-no-fallback-gate",
+            Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
+        );
+
+        let outcome = pair
+            .node_a
+            .knock_with(
+                &pair.responder.desc,
+                &KnockIntro::new("hi from A").unwrap(),
+                fallback_knock_options(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.via, KnockVia::Direct);
+        wait_until("node B to surface the knock", || surface.count() == 1).await;
+        sleep(Duration::from_millis(500)).await;
+        node.nothing_else_received();
+        rig.cancel.cancel();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// A reachable peer answering `/knock` with any refusal other than `NoAccess` did not
+    /// file the knock and is not unreachable either: the knocker gets the refusal back as
+    /// a direct failure, and the propagation node known to it is never posted to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_other_than_no_access_is_a_direct_failure_and_never_stored() {
+        install_log_collector();
+        let (pair, mut node) = pair_with_propagation_node("r3-knock-throttled-no-fallback").await;
+        pair.introduce_b_to_a().await;
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Code(RefusalCode::Throttled)));
+
+        let err = pair
+            .node_a
+            .knock_with(
+                &pair.responder.desc,
+                &KnockIntro::new("hi from A").unwrap(),
+                fallback_knock_options(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            KnockError::Direct(R3Error::Refused(RefusalCode::Throttled))
+        );
+        assert!(
+            err.to_string().starts_with("The knock could not be sent: "),
+            "{err}"
+        );
+        assert!(!err.to_string().contains(".mesh peers"), "{err}");
+        assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(KNOCK_PATH));
+        sleep(Duration::from_millis(500)).await;
+        node.nothing_else_received();
+        // The log collector is process wide, so both lines are matched on this knock's
+        // own destination: another test's fallback must not satisfy or spoil them.
+        let dest8 = pair.responder.desc.address_hash.to_hex_string()[..8].to_string();
+        assert_debug_logged(&format!(
+            "Mesh knock to {dest8} was not filed over the link: "
+        ));
+        assert!(
+            !debug_snapshot().iter().any(|line| {
+                line.contains(&format!("Mesh knock to {dest8} could not be delivered"))
+                    || (line.contains(&dest8) && line.contains("storing it with propagation node"))
+            }),
+            "no fallback may be attempted for a refusal"
+        );
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// With no path to the peer and no propagation node heard, the knock fails by name
+    /// and points at the command that lists the nodes heard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_knock_with_no_propagation_node_fails_by_name() {
+        let started = started_runtime("r3-knock-no-node").await;
+        let (_, ghost_desc) = ghost_destination();
+        assert!(started.runtime.propagation_nodes().select().is_err());
+
+        let err = started
+            .runtime
+            .knock_with(
+                &ghost_desc,
+                &KnockIntro::new("anyone there").unwrap(),
+                fallback_knock_options(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, KnockError::NoPropagationNode);
+        assert!(err.to_string().contains(".mesh peers"), "{err}");
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The requester is refused before the gate has even looked at its knock: the surface
+    /// behind the gate is held on a barrier for the whole request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_knock_surface_never_delays_the_refusal() {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let surface = Arc::new(BlockingSurface {
+            barrier: Barrier::new(2),
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        let rig = knock_rig(
+            &responder,
+            &TrustList::default().identity(&identity_hex(&requester), false),
+            "r3-knock-stalled-surface",
+            Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
+        );
+        let link = identified_link(&requester, &responder, &desc).await;
+
+        let started = Instant::now();
+        let err = request_on(
+            &requester,
+            &link,
+            KNOCK_PATH,
+            KnockIntro::new("knock knock").unwrap().to_r3_body(),
+            Deadline::after(SHORT_REQUEST_TIMEOUT),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert!(started.elapsed() < SHORT_REQUEST_TIMEOUT);
+        wait_until("the gate to reach the stalled surface", || {
+            surface.entered.load(Ordering::SeqCst)
+        })
+        .await;
+        assert!(!surface.released.load(Ordering::SeqCst));
+        assert_eq!(
+            rig.gate.cache().list(SystemTime::now()).unwrap().len(),
+            1,
+            "the knock was filed before the surface was asked to show it"
+        );
+        assert_eq!(
+            rig.gate.tracked_identities().len(),
+            1,
+            "the gate's state is readable while the surface is stalled"
+        );
+        surface.barrier.wait();
+        wait_until("the surface to be released", || {
+            surface.released.load(Ordering::SeqCst)
+        })
+        .await;
+        rig.cancel.cancel();
+        requester.stop().await;
+        responder.stop().await;
     }
 
     /// Every line the serving path logs names a peer by a truncated hash only. After one

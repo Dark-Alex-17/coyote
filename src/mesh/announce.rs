@@ -75,14 +75,43 @@ impl AnnounceAppData {
     }
 }
 
-/// Control characters plus the zero-width, bidirectional-override and joiner format
-/// characters that let a name render as something it is not.
+/// Control characters plus every Unicode format (Cf) character: soft hyphen, zero-width,
+/// bidirectional override, joiner and tag characters, all of which let text render as
+/// something it is not. Announces, trust labels and knock records refuse text containing
+/// one. Variation selectors are not in here: they are nonspacing marks (Mn), not Cf, and a
+/// name like "Alex ❤️" carries one legitimately.
 pub(crate) fn is_control_or_invisible(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+            '\u{00AD}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08E2}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0000}'..='\u{E007F}'
         )
+}
+
+/// Variation selectors (General_Category Mn). `display_text` drops them so rendered peer
+/// text cannot lean on glyph selection, at the price of U+FE0F emoji presentation falling
+/// back to the text glyph; announces and trust labels keep them verbatim and nothing
+/// rejects on them.
+pub(crate) fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
 }
 
 /// The app_data this node announces under `config`. The display name is withheld when any
@@ -108,6 +137,7 @@ pub(crate) fn announce_app_data(config: &MeshConfig) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::config::Session;
+    use std::ops::RangeInclusive;
 
     fn decoded_name(config: &MeshConfig) -> Option<String> {
         let bytes = announce_app_data(config).unwrap();
@@ -253,6 +283,95 @@ mod tests {
         bytes.extend_from_slice("Zoë".as_bytes());
         let decoded = AnnounceAppData::decode(&bytes).unwrap();
         assert_eq!(decoded.display_name.as_deref(), Some("Zoë"));
+    }
+
+    /// Every range `is_control_or_invisible` rejects beyond `char::is_control`.
+    const FORMAT_CHARACTER_RANGES: &[(RangeInclusive<char>, &str)] = &[
+        ('\u{00AD}'..='\u{00AD}', "soft hyphen"),
+        ('\u{0600}'..='\u{0605}', "Arabic number signs"),
+        ('\u{061C}'..='\u{061C}', "Arabic letter mark"),
+        ('\u{06DD}'..='\u{06DD}', "Arabic end of ayah"),
+        ('\u{070F}'..='\u{070F}', "Syriac abbreviation mark"),
+        ('\u{0890}'..='\u{0891}', "Arabic pound and piastre marks"),
+        ('\u{08E2}'..='\u{08E2}', "Arabic disputed end of ayah"),
+        ('\u{180E}'..='\u{180E}', "Mongolian vowel separator"),
+        ('\u{200B}'..='\u{200F}', "zero width and bidi marks"),
+        ('\u{202A}'..='\u{202E}', "bidi embeddings and overrides"),
+        (
+            '\u{2060}'..='\u{206F}',
+            "word joiner through nominal digit shapes",
+        ),
+        ('\u{FEFF}'..='\u{FEFF}', "byte order mark"),
+        ('\u{FFF9}'..='\u{FFFB}', "interlinear annotation"),
+        ('\u{110BD}'..='\u{110BD}', "Kaithi number sign"),
+        ('\u{110CD}'..='\u{110CD}', "Kaithi number sign above"),
+        (
+            '\u{13430}'..='\u{1343F}',
+            "Egyptian hieroglyph format controls",
+        ),
+        ('\u{1BCA0}'..='\u{1BCA3}', "shorthand format controls"),
+        ('\u{1D173}'..='\u{1D17A}', "musical symbol beams and slurs"),
+        ('\u{E0000}'..='\u{E007F}', "tag characters"),
+    ];
+
+    #[test]
+    fn decode_rejects_every_format_character_class() {
+        let decode_name = |name: &str| {
+            let mut bytes = b"COYM\x00\x01".to_vec();
+            bytes.extend_from_slice(name.as_bytes());
+            AnnounceAppData::decode(&bytes)
+        };
+
+        for (range, what) in FORMAT_CHARACTER_RANGES {
+            for c in [*range.start(), *range.end()] {
+                assert!(is_control_or_invisible(c), "{what} U+{:04X}", u32::from(c));
+                assert_eq!(decode_name(&format!("Al{c}ex")), None, "{what}");
+            }
+        }
+        for c in ['\u{00AC}', '\u{0606}', '\u{FE10}', '\u{E01F0}'] {
+            assert!(!is_control_or_invisible(c), "U+{:04X}", u32::from(c));
+            assert!(!is_variation_selector(c), "U+{:04X}", u32::from(c));
+        }
+        for name in [
+            "so\u{00AD}ft",
+            "\u{061C}arabic",
+            "mongol\u{180E}ian",
+            "tag\u{E0041}",
+        ] {
+            assert_eq!(decode_name(name), None, "{name:?}");
+        }
+        assert!(!"Zoë 🌊 ok".chars().any(is_control_or_invisible));
+    }
+
+    #[test]
+    fn variation_selectors_decode_verbatim_and_are_dropped_only_from_display_text() {
+        let heart = "Alex \u{2764}\u{FE0F}";
+        let mut bytes = b"COYM\x00\x01".to_vec();
+        bytes.extend_from_slice(heart.as_bytes());
+        let decoded = AnnounceAppData::decode(&bytes).unwrap();
+        assert_eq!(decoded.display_name.as_deref(), Some(heart));
+        assert_eq!(
+            crate::mesh::display_text(heart, 64).as_deref(),
+            Some("Alex \u{2764}")
+        );
+
+        for c in ['\u{FE00}', '\u{FE0F}', '\u{E0100}', '\u{E01EF}'] {
+            assert!(is_variation_selector(c), "U+{:04X}", u32::from(c));
+            assert!(!is_control_or_invisible(c), "U+{:04X}", u32::from(c));
+        }
+        let encoded = AnnounceAppData {
+            version: 1,
+            display_name: Some(heart.to_string()),
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            AnnounceAppData::decode(&encoded)
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some(heart)
+        );
     }
 
     #[test]

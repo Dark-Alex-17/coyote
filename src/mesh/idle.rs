@@ -34,8 +34,6 @@ pub(crate) const IDLE_COALESCE_MAX_OTHER_PEERS: usize = 64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Origin {
     Local,
-    // Constructed by the mesh request handlers once they land.
-    #[allow(dead_code)]
     Peer(String),
 }
 

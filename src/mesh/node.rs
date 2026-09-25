@@ -5,16 +5,23 @@ use crate::mesh::announce::{
 };
 use crate::mesh::card::{CardSource, StatusHandler};
 use crate::mesh::idle::{IdleNotify, IdleSink};
+use crate::mesh::knock::{
+    ChannelKnockSink, KNOCK_LINK_TIMEOUT, KNOCK_QUEUE_CAPACITY, KNOCK_REQUEST_TIMEOUT, KnockError,
+    KnockGate, KnockIntro, KnockOutcome, KnockRouting, KnockSurface, KnockVia, drain_knocks,
+    knock_message,
+};
+use crate::mesh::knocks::KnockCache;
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::notify::{Notification, NotificationSink};
 use crate::mesh::peers::{PeerChange, PeerSighting, PeerTable};
+use crate::mesh::propagation::{self, PropagationError, PropagationOptions};
 use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
 use crate::mesh::propagation_nodes::PropagationNodeTable;
 #[cfg(test)]
 use crate::mesh::r3::RequestHandler;
 use crate::mesh::r3::{
-    Dispatcher, Envelope, LoggingKnockSink, OriginName, R3Client, R3Error, R3Server,
-    RequestOptions, RequestOutcome, RequestReceipt, STATUS_PATH,
+    Dispatcher, Envelope, KNOCK_PATH, OriginName, R3Client, R3Error, R3Server, RefusalCode,
+    RequestOptions, RequestOutcome, RequestReceipt, STATUS_PATH, short,
 };
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::TrustStore;
@@ -28,7 +35,7 @@ use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::{DestinationName, SingleInputDestination};
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::PrivateIdentity as TransportIdentity;
-use rns_transport::identity_bridge::to_transport_private_identity;
+use rns_transport::identity_bridge::{to_core_private_identity, to_transport_private_identity};
 use rns_transport::iface::auto::{AutoInterfaceConfig, AutoInterfaceDeviceFilter};
 use rns_transport::iface::auto_runtime::{
     AutoDiscoveryRuntime, AutoInterfaceTransportRuntime, AutoRuntimePlan,
@@ -88,6 +95,25 @@ impl Default for NodeOptions {
     fn default() -> Self {
         Self {
             connect_timeout: TcpClient::DEFAULT_CONNECT_TIMEOUT,
+        }
+    }
+}
+
+/// Timeouts for one knock: the direct attempt, then the fallback post.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KnockOptions {
+    pub request: RequestOptions,
+    pub propagation: PropagationOptions,
+}
+
+impl Default for KnockOptions {
+    fn default() -> Self {
+        Self {
+            request: RequestOptions {
+                request_timeout: KNOCK_REQUEST_TIMEOUT,
+                link_timeout: KNOCK_LINK_TIMEOUT,
+            },
+            propagation: PropagationOptions::default(),
         }
     }
 }
@@ -174,9 +200,14 @@ pub(crate) struct MeshRuntime {
     r3_client: Arc<R3Client>,
     r3_server: Arc<R3Server>,
     dispatcher: Arc<Dispatcher>,
+    knock_gate: Arc<KnockGate>,
+    knock_sink: Arc<ChannelKnockSink>,
     /// Held for the length of one propagation fetch; a second caller is refused, never
     /// queued behind the first.
     fetching: Mutex<()>,
+    /// Held across one knock's propagation-node post. `propagate` needs calls for the same
+    /// node serialised, so a second knocker waits here rather than sharing the out-link.
+    posting: Mutex<()>,
     cancel: CancellationToken,
     tasks: parking_lot::Mutex<Vec<JoinHandle<()>>>,
 }
@@ -281,8 +312,14 @@ impl MeshRuntime {
         // Nothing fallible may follow: a failure once the tasks exist would leak them.
         let transport = Arc::new(transport);
         let r3_server = Arc::new(R3Server::new());
-        let dispatcher = Arc::new(Dispatcher::new(trust.clone(), Arc::new(LoggingKnockSink)));
+        let (knock_sink, knock_rx) = ChannelKnockSink::new(KNOCK_QUEUE_CAPACITY);
+        let dispatcher = Arc::new(Dispatcher::new(trust.clone(), knock_sink.clone()));
         r3_server.set_handler(dispatcher.clone());
+        let knock_gate = Arc::new(KnockGate::new(
+            trust.clone(),
+            peers.clone(),
+            KnockCache::new(&paths.cache_dir, config.knock_retention_hours),
+        ));
         let runtime = Arc::new(Self {
             fingerprint,
             transport_identity,
@@ -307,7 +344,10 @@ impl MeshRuntime {
             r3_client: Arc::new(R3Client::new()),
             r3_server,
             dispatcher,
+            knock_gate,
+            knock_sink,
             fetching: Mutex::new(()),
+            posting: Mutex::new(()),
             cancel: CancellationToken::new(),
             tasks: parking_lot::Mutex::new(Vec::new()),
         });
@@ -326,6 +366,11 @@ impl MeshRuntime {
             announces,
             runtime.peers.clone(),
             runtime.propagation_nodes.clone(),
+            runtime.cancellation_token(),
+        )));
+        runtime.register_task(tokio::spawn(drain_knocks(
+            knock_rx,
+            runtime.knock_gate.clone(),
             runtime.cancellation_token(),
         )));
         runtime.register_task(tokio::spawn(sweep_peers(
@@ -399,6 +444,18 @@ impl MeshRuntime {
     /// displaced; `/knock` is owned by the dispatcher itself and registering it is refused.
     pub(crate) fn dispatcher(&self) -> Arc<Dispatcher> {
         self.dispatcher.clone()
+    }
+
+    /// Where every knock lands, from a link or from a propagation node.
+    pub(crate) fn knock_gate(&self) -> Arc<KnockGate> {
+        self.knock_gate.clone()
+    }
+
+    /// Knocks the dispatcher had to drop because the gate's queue was full.
+    // Reached by the REPL mesh commands once they land.
+    #[allow(dead_code)]
+    pub(crate) fn knock_overflow(&self) -> u64 {
+        self.knock_sink.overflow()
     }
 
     #[cfg(test)]
@@ -511,8 +568,98 @@ impl MeshRuntime {
         }
     }
 
+    /// Asks `destination` to trust this node's current instance, with `intro` as the
+    /// words. The link is tried first; a peer that cannot be reached gets the knock held
+    /// by a propagation node until it next fetches.
+    // Reached by the REPL mesh commands once they land.
+    #[allow(dead_code)]
+    pub(crate) async fn knock(
+        &self,
+        destination: &DestinationDesc,
+        intro: &KnockIntro,
+    ) -> Result<KnockOutcome, KnockError> {
+        self.knock_with(destination, intro, KnockOptions::default())
+            .await
+    }
+
+    /// `knock` with its timeouts chosen. The dispatcher answers a knock with `NoAccess` by
+    /// design, so that refusal (or an answer) means the knock landed. Any other refusal
+    /// code did not file the knock and is not unreachability, so it is reported as-is.
+    /// Only the peer-unreachable errors fall back to store-and-forward; an oversize or
+    /// undecodable frame is this node's fault and storing it would not help. Posts to the
+    /// propagation node queue behind `posting`, since `propagate` needs one caller per
+    /// node at a time.
+    pub(crate) async fn knock_with(
+        &self,
+        destination: &DestinationDesc,
+        intro: &KnockIntro,
+        options: KnockOptions,
+    ) -> Result<KnockOutcome, KnockError> {
+        let dest_hex = destination.address_hash.to_hex_string();
+        let dest8 = short(&dest_hex);
+        let unreachable = match self
+            .request(destination, KNOCK_PATH, intro.to_r3_body(), options.request)
+            .await
+        {
+            Ok(_) | Err(R3Error::Refused(RefusalCode::NoAccess)) => {
+                return Ok(KnockOutcome {
+                    via: KnockVia::Direct,
+                });
+            }
+            Err(err @ (R3Error::Timeout { .. } | R3Error::LinkFailed(_) | R3Error::LinkClosed)) => {
+                err
+            }
+            Err(R3Error::NotRunning | R3Error::Shutdown) => return Err(KnockError::NotRunning),
+            Err(err) => {
+                debug!("Mesh knock to {dest8} was not filed over the link: {err}");
+                return Err(KnockError::Direct(err));
+            }
+        };
+        // Selected before queueing behind another post: a knocker with no node to fall
+        // back on is told so at once rather than after someone else's transfer.
+        let node = self
+            .propagation_nodes
+            .select()
+            .map_err(|_| KnockError::NoPropagationNode)?;
+        let _posting = self.posting.lock().await;
+        let node_hex = node.destination.address_hash.to_hex_string();
+        debug!(
+            "Mesh knock to {dest8} could not be delivered over a link ({unreachable}); storing it with propagation node {}",
+            short(&node_hex)
+        );
+        let transport = self
+            .transport
+            .lock()
+            .await
+            .clone()
+            .ok_or(KnockError::NotRunning)?;
+        let sender = to_core_private_identity(&self.transport_identity);
+        let origin = self.destination.lock().await.origin;
+        propagation::propagate(
+            &transport,
+            &sender,
+            &destination.identity,
+            &node,
+            &knock_message(intro, &origin),
+            self.cancellation_token(),
+            &options.propagation,
+        )
+        .await
+        .map_err(|err| match err {
+            PropagationError::Cancelled
+            | PropagationError::Link(R3Error::Shutdown | R3Error::NotRunning) => {
+                KnockError::NotRunning
+            }
+            other => KnockError::Propagation(other),
+        })?;
+        Ok(KnockOutcome {
+            via: KnockVia::StoreAndForward,
+        })
+    }
+
     /// Fetches the messages the nearest announced propagation node holds for this node,
-    /// handing the ones that pass every check to `sink`. The dedup store is read from disk
+    /// handing the ones that pass every check to `sink`, knocks excepted: those go to the
+    /// knock gate and never reach `sink`. The dedup store is read from disk
     /// for each fetch and written back before the node is told to delete anything, so a
     /// message survives a restart between the two as a remembered id rather than a second
     /// delivery. One fetch runs at a time across every Coyote process of this identity;
@@ -536,6 +683,10 @@ impl MeshRuntime {
             .ok_or(FetchError::Link(R3Error::NotRunning))?;
         let node = self.propagation_nodes.select()?;
         let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
+        let routing = KnockRouting {
+            gate: &self.knock_gate,
+            inner: sink,
+        };
         propagation_fetch::fetch(
             &transport,
             &self.r3_client,
@@ -544,7 +695,7 @@ impl MeshRuntime {
             &self.peers,
             &self.trust,
             &mut store,
-            sink,
+            &routing,
             &FetchOptions::default(),
             self.cancellation_token(),
         )
@@ -1139,7 +1290,10 @@ impl MeshSlot {
 
     /// Refuses while a node is already running: two nodes in one process would fight over
     /// the same instance lock and identity. Installing also puts this slot behind the
-    /// node's `/status` provider, held weakly since the slot owns the node.
+    /// node's `/status` provider and knock gate, held weakly since the slot owns the node.
+    /// A knock the gate admits between `MeshRuntime::start` and this call is cached but
+    /// not surfaced, and not marked as surfaced either, so a repeat from that identity
+    /// still earns its one line.
     // Reached by the REPL mesh commands once they land.
     #[allow(dead_code)]
     pub(crate) fn install(self: &Arc<Self>, runtime: Arc<MeshRuntime>) -> Result<()> {
@@ -1155,6 +1309,9 @@ impl MeshSlot {
         runtime
             .dispatcher()
             .register(STATUS_PATH, Arc::new(StatusHandler::new(source)))?;
+        runtime
+            .knock_gate()
+            .attach(Arc::downgrade(self) as Weak<dyn KnockSurface>);
         *slot = Some(runtime);
         Ok(())
     }
@@ -1264,13 +1421,15 @@ impl MeshSlot {
     /// transcript to deliver it to. With a driver whose queue is full the whole event is
     /// dropped: the driver counts the overflow (reported at its next summary tick while it
     /// is running, logged once when it stops), and printing the line anyway would let a
-    /// flood heavy enough to fill the queue skip the driver's rate limiter.
-    pub(crate) fn push_idle(&self, note: IdleNotify) {
+    /// flood heavy enough to fill the queue skip the driver's rate limiter. `false` only
+    /// for that drop.
+    pub(crate) fn push_idle(&self, note: IdleNotify) -> bool {
         match self.idle.load_full() {
-            Some(sink) => {
-                let _ = sink.push(note);
+            Some(sink) => sink.push(note).is_ok(),
+            None => {
+                self.notify(Notification::new(note.source, note.text));
+                true
             }
-            None => self.notify(Notification::new(note.source, note.text)),
         }
     }
 }
@@ -1280,6 +1439,12 @@ fn non_blank(value: Option<String>) -> Option<Arc<String>> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(Arc::new)
+}
+
+impl KnockSurface for MeshSlot {
+    fn surface(&self, note: IdleNotify) -> bool {
+        self.push_idle(note)
+    }
 }
 
 // Tests that start a runtime are unix-only because identity minting writes an owner-only
@@ -1512,7 +1677,7 @@ mod tests {
         let idle = RecordingIdleSink::new(true);
         slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
 
-        slot.push_idle(idle_note("hello"));
+        assert!(slot.push_idle(idle_note("hello")));
         let pushed = idle.pushed.lock();
         assert_eq!(pushed.len(), 1);
         assert_eq!(pushed[0].text, "hello");
@@ -1526,7 +1691,7 @@ mod tests {
         let notifier = Arc::new(RecordingSink::default());
         slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
 
-        slot.push_idle(idle_note("hello"));
+        assert!(slot.push_idle(idle_note("hello")));
         let received = notifier.0.lock();
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].lines(), &["[mesh:message] hello"]);
@@ -1540,7 +1705,10 @@ mod tests {
         let idle = RecordingIdleSink::new(false);
         slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
 
-        slot.push_idle(idle_note("hello"));
+        assert!(
+            !slot.push_idle(idle_note("hello")),
+            "the caller must learn the line was dropped"
+        );
         assert!(idle.pushed.lock().is_empty());
         assert!(
             notifier.0.lock().is_empty(),
@@ -1649,6 +1817,35 @@ mod tests {
             &format!("Ignored announce from {other_hash} (1 hops): not a Coyote node"),
         );
         assert_logged(&debugs, &format!("Aged out mesh peer {coyote_hash}"));
+    }
+
+    #[test]
+    fn record_announce_keeps_an_emoji_name_with_its_presentation_selector() {
+        let tmp = TempDir::new("node-emoji-name");
+        let now = SystemTime::now();
+        let peers = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let name = "Alex \u{2764}\u{FE0F}";
+        let app_data = AnnounceAppData {
+            version: 1,
+            display_name: Some(name.to_string()),
+        }
+        .encode()
+        .unwrap();
+
+        let change = record_announce(
+            &peers,
+            "emoji-peer".to_string(),
+            "identity".to_string(),
+            "name".to_string(),
+            &app_data,
+            1,
+            now,
+        );
+
+        assert_eq!(change, Some(PeerChange::Added));
+        let recorded = peers.snapshot();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].display_name.as_deref(), Some(name));
     }
 
     #[cfg(unix)]

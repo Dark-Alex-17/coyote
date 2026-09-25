@@ -1482,8 +1482,14 @@ async fn process_bodies(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::destination_address;
+    use crate::mesh::knock::{
+        KnockGate, KnockIntro, KnockRouting, KnockSurface, RecordingSurface, knock_message,
+    };
+    use crate::mesh::knocks::KnockCache;
     use crate::mesh::peers::PeerSighting;
-    use crate::mesh::r3::RequestFrame;
+    use crate::mesh::propagation::build_signed_message;
+    use crate::mesh::r3::{OriginName, RequestFrame};
     use crate::mesh::test_support::{TempDir, TrustList, rust_sources};
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
@@ -1491,9 +1497,10 @@ mod tests {
     use lxmf_core::stamp::generate_stamp;
     use parking_lot::Mutex;
     use rand_core::OsRng;
+    use rns_transport::destination::DestinationName;
     use rns_transport::identity_bridge::to_transport_identity;
     use rns_transport::transport::TransportConfig;
-    use std::sync::Arc;
+    use std::sync::{Arc, Weak};
 
     fn packed(value: &Value) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1813,6 +1820,26 @@ mod tests {
         )
     }
 
+    /// A knock as the node serves it on a fetch: `knock_message` from `signer`'s instance
+    /// named by `origin`, sealed for `recipient`.
+    fn knock_body(
+        signer: &CorePrivateIdentity,
+        recipient: &Identity,
+        intro: &str,
+        origin: &OriginName,
+    ) -> Vec<u8> {
+        build_signed_message(
+            signer,
+            &lxmf_delivery_hash(recipient),
+            &knock_message(&KnockIntro::new(intro).unwrap(), origin),
+            1_700_000_000.5,
+        )
+        .unwrap()
+        .pack_propagation_transient_with_rng(&to_core_identity(recipient), OsRng)
+        .unwrap()
+        .0
+    }
+
     /// One recipient, a store and a sink, with whichever trust list and keys a test wants.
     struct Bench {
         recipient: CorePrivateIdentity,
@@ -1843,19 +1870,50 @@ mod tests {
         }
 
         async fn process(&mut self, body: &[u8]) -> BodyOutcome {
-            let pipeline = BodyPipeline {
-                recipient: &self.recipient,
-                delivery: lxmf_delivery_hash(&self.me()),
-                keys: &self.keys,
-                trust: &self.trust,
-                sink: &self.sink,
-                node: "fake",
-            };
-            pipeline
-                .process(body, &mut self.store, SystemTime::now())
-                .await
-                .unwrap()
+            let Self {
+                recipient,
+                keys,
+                trust,
+                sink,
+                store,
+                ..
+            } = self;
+            run_body(recipient, keys, trust, sink, store, body).await
         }
+
+        /// `process` into `sink` in place of the bench's own.
+        async fn process_into(&mut self, body: &[u8], sink: &dyn InboundSink) -> BodyOutcome {
+            let Self {
+                recipient,
+                keys,
+                trust,
+                store,
+                ..
+            } = self;
+            run_body(recipient, keys, trust, sink, store, body).await
+        }
+    }
+
+    async fn run_body(
+        recipient: &CorePrivateIdentity,
+        keys: &MapKeys,
+        trust: &TrustStore,
+        sink: &dyn InboundSink,
+        store: &mut FetchStore,
+        body: &[u8],
+    ) -> BodyOutcome {
+        let pipeline = BodyPipeline {
+            recipient,
+            delivery: lxmf_delivery_hash(&transport_identity_of(recipient)),
+            keys,
+            trust,
+            sink,
+            node: "fake",
+        };
+        pipeline
+            .process(body, store, SystemTime::now())
+            .await
+            .unwrap()
     }
 
     fn discarded(outcome: BodyOutcome) -> Discard {
@@ -2214,6 +2272,66 @@ mod tests {
         assert_eq!(delivered[1].message_id, message_id);
         assert_eq!(delivered[1].stamp_value, Some(value));
         assert_eq!(delivered[0].stamp_value, None);
+    }
+
+    /// The runtime's sink as `fetch_propagated` builds it: a knock from a known identity
+    /// stops at the gate, which surfaces and files it under the instance recomputed from
+    /// the origin and the signer; a message from the same identity passes through.
+    #[tokio::test]
+    async fn a_fetched_knock_stops_at_the_gate_and_a_message_passes_through() {
+        let knocker = CorePrivateIdentity::new_from_rand(OsRng);
+        let knocker_id = transport_identity_of(&knocker);
+        let mut bench = Bench::new(
+            "fetch-knock-routing",
+            TrustList::default().identity(&identity_hex(&knocker_id), false),
+        );
+        bench.keys.know(&knocker_id);
+        let me = bench.me();
+        let peers = Arc::new(
+            PeerTable::load(bench._tmp.path.join("peers.json"), SystemTime::now()).unwrap(),
+        );
+        let gate = KnockGate::new(
+            bench.trust.clone(),
+            peers,
+            KnockCache::new(&bench._tmp.path, 24),
+        );
+        let surface = Arc::new(RecordingSurface::default());
+        gate.attach(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        let inner = CountingSink::default();
+        let routing = KnockRouting {
+            gate: &gate,
+            inner: &inner,
+        };
+        let origin = OriginName::of(&DestinationName::new("coyote", "mesh.knocker"));
+
+        let knock = knock_body(&knocker, &me, "let me in", &origin);
+        assert_eq!(
+            bench.process_into(&knock, &routing).await,
+            BodyOutcome::Delivered
+        );
+
+        assert_eq!(surface.texts().len(), 1);
+        let cached = gate.cache().list(SystemTime::now()).unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].identity_hash, identity_hex(&knocker_id));
+        assert_eq!(
+            cached[0].destination_hash,
+            destination_address(&origin.0, &knocker_id.address_hash).to_hex_string()
+        );
+        assert_eq!(cached[0].intro.as_deref(), Some("let me in"));
+        assert_eq!(inner.count(), 0);
+
+        let message = honest_body(&knocker, &me, b"just a message");
+        assert_eq!(
+            bench.process_into(&message, &routing).await,
+            BodyOutcome::Delivered
+        );
+        assert_eq!(
+            inner.only().content.as_deref(),
+            Some(&b"just a message"[..])
+        );
+        assert_eq!(surface.texts().len(), 1);
+        assert_eq!(gate.cache().list(SystemTime::now()).unwrap().len(), 1);
     }
 
     fn store_at(tmp: &TempDir, now: SystemTime) -> FetchStore {

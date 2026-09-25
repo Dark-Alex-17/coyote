@@ -3,8 +3,7 @@
 //! `crate::supervisor::notification`, whose `SystemNotification` queue is
 //! merged into tool results for the model to read. Nothing here goes to the model.
 
-use crate::config::sanitize_display_text;
-use crate::mesh::announce::is_control_or_invisible;
+use crate::mesh::display_text;
 
 /// Peer-supplied text reaches the terminal through this path, so both dimensions of a
 /// notification are bounded: characters per line and lines per notification.
@@ -67,7 +66,7 @@ impl Notification {
             .text
             .split('\n')
             .map(|piece| piece.strip_suffix('\r').unwrap_or(piece))
-            .filter_map(|piece| clean_line(piece, NOTIFICATION_LINE_MAX_CHARS))
+            .filter_map(|piece| display_text(piece, NOTIFICATION_LINE_MAX_CHARS))
             .map(|line| format!("{prefix} {line}"))
             .collect();
         if lines.is_empty() {
@@ -108,22 +107,6 @@ impl RenderedNotification {
     pub(crate) fn lines(&self) -> &[String] {
         &self.lines
     }
-}
-
-fn clean_line(text: &str, max_chars: usize) -> Option<String> {
-    let cleaned: String = sanitize_display_text(text)
-        .chars()
-        .filter(|c| !is_control_or_invisible(*c))
-        .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let capped = match trimmed.char_indices().nth(max_chars) {
-        Some((cut, _)) => &trimmed[..cut],
-        None => trimmed,
-    };
-    Some(capped.trim_end().to_string())
 }
 
 /// Where rendered lines go. Implementations must not block: `notify` is called from the

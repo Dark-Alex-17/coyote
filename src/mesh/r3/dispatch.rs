@@ -71,8 +71,10 @@ pub(crate) struct KnockEvent {
 }
 
 /// Notes each knock in the debug log and nothing more.
+#[cfg(test)]
 pub(crate) struct LoggingKnockSink;
 
+#[cfg(test)]
 impl KnockSink for LoggingKnockSink {
     fn knock(&self, knock: KnockEvent) {
         debug!(
@@ -187,9 +189,7 @@ impl Dispatcher {
         let mut routes = HashMap::new();
         routes.insert(
             PathHash::of(KNOCK_PATH),
-            Route::Provided(Arc::new(KnockHandler {
-                knocks: knocks.clone(),
-            })),
+            Route::Provided(Arc::new(KnockHandler)),
         );
         for path in [STATUS_PATH, MESSAGE_PATH] {
             routes.insert(PathHash::of(path), Route::NoProvider(path));
@@ -372,29 +372,30 @@ impl RequestHandler for Dispatcher {
     }
 }
 
-fn describe_path(path_hash: PathHash) -> String {
+/// The path's name when this node knows it, else its hash, as the logs name a request.
+pub(crate) fn describe_path(path_hash: PathHash) -> String {
     match path_name(path_hash) {
         Some(name) => name.to_string(),
         None => format!("hash {}", path_hash.to_hex_string()),
     }
 }
 
-/// `/knock` itself: the request body is the introduction, and reaching here means the
-/// knocking instance is already trusted, so the knock is noted and acknowledged with nil.
-struct KnockHandler {
-    knocks: Arc<dyn KnockSink>,
-}
+/// `/knock` itself. Reaching here means the knocking instance is already trusted, so
+/// there is nothing to knock for: the request is acknowledged with nil and never reaches
+/// the knock sink, where a trusted peer looping on `/knock` would push out real knocks.
+struct KnockHandler;
 
 #[async_trait]
 impl Handler for KnockHandler {
     async fn handle(&self, request: AdmittedRequest) -> Reply {
-        self.knocks.knock(KnockEvent {
-            identity_hash: request.identity.address_hash.to_hex_string(),
-            destination_hash: request.destination_hash.to_hex_string(),
-            link_id: request.link_id,
-            path_hash: request.path_hash,
-            data: Some(request.body),
-        });
+        let identity_hex = request.identity.address_hash.to_hex_string();
+        let destination_hex = request.destination_hash.to_hex_string();
+        debug!(
+            "Mesh knock from {} on link {} is not a knock: already trusted from {}",
+            short(&identity_hex),
+            request.link_id.to_hex_string(),
+            short(&destination_hex)
+        );
         Reply::Value(Value::Nil)
     }
 }

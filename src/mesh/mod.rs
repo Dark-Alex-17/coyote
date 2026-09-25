@@ -4,6 +4,7 @@ mod announce;
 pub(crate) mod card;
 mod identity;
 pub(crate) mod idle;
+pub(crate) mod knock;
 pub(crate) mod knocks;
 mod lock;
 mod node;
@@ -18,6 +19,7 @@ pub(crate) mod trust;
 
 pub(crate) use node::MeshSlot;
 
+use crate::config::sanitize_display_text;
 use anyhow::{Context, Result};
 use rns_transport::hash::{AddressHash, Hash};
 use sha2::Digest;
@@ -72,6 +74,27 @@ pub(crate) fn destination_address(
 pub(crate) fn canonical_hash(text: &str) -> Option<String> {
     (text.len() == 32 && text.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| text.to_ascii_lowercase())
+}
+
+/// Peer or local text as this node may show or send it: terminal escape sequences stripped,
+/// every other control character a space, the invisible formatting characters and
+/// variation selectors dropped, trimmed, and cut to `max_chars` characters on a character
+/// boundary with no trailing whitespace. Blank text is `None`. Escapes go first so a
+/// sequence's own bytes never survive as spaces.
+pub(crate) fn display_text(text: &str, max_chars: usize) -> Option<String> {
+    let cleaned: String = sanitize_display_text(text)
+        .chars()
+        .filter(|c| !announce::is_control_or_invisible(*c) && !announce::is_variation_selector(*c))
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let capped = match trimmed.char_indices().nth(max_chars) {
+        Some((cut, _)) => &trimmed[..cut],
+        None => trimmed,
+    };
+    Some(capped.trim_end().to_string())
 }
 
 /// Writes `bytes` to `<path>.tmp` beside `path`, syncs it, then renames it into place, so a

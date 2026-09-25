@@ -1,5 +1,4 @@
-use crate::config::sanitize_display_text;
-use crate::mesh::announce::is_control_or_invisible;
+use crate::mesh::display_text;
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::r3::{
     AdmittedRequest, DispatchError, Handler, R3Error, Reply, RequestOptions, STATUS_PATH,
@@ -49,7 +48,7 @@ pub(crate) const TODO_GOAL_MAX_CHARS: usize = 280;
 /// role, individual todo items or brief text. `repo.name` is the last component of the
 /// repository root and nothing more.
 ///
-/// A decoded card is peer-supplied data. Its text has been through `card_text`, so it is
+/// A decoded card is peer-supplied data. Its text has been through `display_text`, so it is
 /// clean and within the caps, but `since_secs`, `snapshot_age_secs` and `served_at_secs` are
 /// kept as sent: clock skew between peers is normal, so no value is refused as too large,
 /// and a consumer turning them into ages or instants must use saturating arithmetic.
@@ -220,13 +219,13 @@ impl<'a> Fields<'a> {
             .filter(|value| !value.is_nil())
     }
 
-    /// The string at `key` as `card_text` leaves it; `None` when absent or blank.
+    /// The string at `key` as `display_text` leaves it; `None` when absent or blank.
     fn text(&self, key: &str, max_chars: usize) -> Result<Option<String>, StatusError> {
         match self.get(key) {
             None => Ok(None),
             Some(value) => value
                 .as_str()
-                .map(|text| card_text(text, max_chars))
+                .map(|text| display_text(text, max_chars))
                 .ok_or_else(|| malformed(&format!("`{key}` is not a string"))),
         }
     }
@@ -254,26 +253,6 @@ impl<'a> Fields<'a> {
             })
             .transpose()
     }
-}
-
-/// Text as the card may carry it: terminal escape sequences stripped, every other control
-/// character a space, the invisible formatting characters dropped, trimmed, and cut to
-/// `max_chars` characters on a character boundary with no trailing whitespace. Blank text
-/// is `None`.
-fn card_text(text: &str, max_chars: usize) -> Option<String> {
-    let cleaned: String = sanitize_display_text(text)
-        .chars()
-        .filter(|c| !is_control_or_invisible(*c))
-        .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let capped = match trimmed.char_indices().nth(max_chars) {
-        Some((cut, _)) => &trimmed[..cut],
-        None => trimmed,
-    };
-    Some(capped.trim_end().to_string())
 }
 
 fn unix_secs(time: SystemTime) -> u64 {
@@ -304,7 +283,7 @@ pub(crate) fn build_card(
     ]
     .into_iter()
     .flatten()
-    .find_map(|text| card_text(text, OBJECTIVE_MAX_CHARS));
+    .find_map(|text| display_text(text, OBJECTIVE_MAX_CHARS));
     let state = match snapshot.map(|snapshot| snapshot.state) {
         None => CardState {
             code: STATE_UNKNOWN,
@@ -324,19 +303,19 @@ pub(crate) fn build_card(
         .and_then(|repo| {
             let name = repo.root.file_name()?.to_string_lossy();
             Some(CardRepo {
-                name: card_text(&name, REPO_NAME_MAX_CHARS)?,
+                name: display_text(&name, REPO_NAME_MAX_CHARS)?,
                 branch: repo
                     .branch
                     .as_deref()
-                    .and_then(|branch| card_text(branch, BRANCH_MAX_CHARS)),
+                    .and_then(|branch| display_text(branch, BRANCH_MAX_CHARS)),
             })
         });
     let plan = snapshot
         .and_then(|snapshot| snapshot.plan.as_ref())
-        .and_then(|plan| card_text(&plan.title, PLAN_TITLE_MAX_CHARS))
+        .and_then(|plan| display_text(&plan.title, PLAN_TITLE_MAX_CHARS))
         .map(|title| CardPlan { title });
     let todo = snapshot.and_then(|snapshot| {
-        let goal = card_text(&snapshot.todo.goal, TODO_GOAL_MAX_CHARS);
+        let goal = display_text(&snapshot.todo.goal, TODO_GOAL_MAX_CHARS);
         let total = snapshot.todo.todos.len();
         if total == 0 && goal.is_none() {
             return None;
@@ -348,7 +327,7 @@ pub(crate) fn build_card(
         })
     });
     StatusCard {
-        display_name: display_name.and_then(|name| card_text(name, DISPLAY_NAME_MAX_CHARS)),
+        display_name: display_name.and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)),
         objective,
         state,
         repo,
@@ -498,6 +477,7 @@ impl MeshRuntime {
 mod tests {
     use super::*;
     use crate::config::todo::{TodoItem, TodoList};
+    use crate::mesh::announce::is_control_or_invisible;
     use crate::mesh::snapshot::{PlanRef, RepoInfo, SessionInfo};
     use crate::mesh::test_support::{contains_bytes, rust_sources, snapshot_fixture};
     use rns_transport::resource::LINK_PACKET_MDU;
@@ -774,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn card_text_is_stripped_capped_in_chars_and_never_leaks_paths_or_session_data() {
+    fn card_text_goes_through_display_text_and_never_leaks_paths_or_session_data() {
         let snapshot = adversarial_snapshot();
         let display_name = format!("Zed\u{1b}[2J Quill{}", "\u{1f600}".repeat(70));
         let card = build_card(Some(&snapshot), None, None, Some(&display_name), now());
@@ -829,26 +809,26 @@ mod tests {
     }
 
     #[test]
-    fn card_text_caps_on_a_character_boundary() {
+    fn display_text_caps_on_a_character_boundary() {
         let sixty_five_accents = "\u{e9}".repeat(65);
-        let capped = card_text(&sixty_five_accents, 64).unwrap();
+        let capped = display_text(&sixty_five_accents, 64).unwrap();
         assert_eq!(capped.chars().count(), 64);
         assert_eq!(capped.len(), 128);
         assert_eq!(capped, "\u{e9}".repeat(64));
 
         let emoji_at_the_cap = format!("{}\u{1f600}\u{1f600}", "a".repeat(63));
-        let capped = card_text(&emoji_at_the_cap, 64).unwrap();
+        let capped = display_text(&emoji_at_the_cap, 64).unwrap();
         assert_eq!(capped.chars().count(), 64);
         assert!(capped.ends_with('\u{1f600}'));
         assert_eq!(capped.len(), 63 + 4);
 
         let space_at_the_cap = format!("{} {}", "a".repeat(63), "b".repeat(5));
-        let capped = card_text(&space_at_the_cap, 64).unwrap();
+        let capped = display_text(&space_at_the_cap, 64).unwrap();
         assert_eq!(capped, "a".repeat(63));
 
-        assert_eq!(card_text("  \u{1b}[31m \r\n\t ", 64), None);
-        assert_eq!(card_text("\u{200B}\u{FEFF}", 64), None);
-        assert_eq!(card_text("  keep  ", 64).as_deref(), Some("keep"));
+        assert_eq!(display_text("  \u{1b}[31m \r\n\t ", 64), None);
+        assert_eq!(display_text("\u{200B}\u{FEFF}", 64), None);
+        assert_eq!(display_text("  keep  ", 64).as_deref(), Some("keep"));
     }
 
     #[test]

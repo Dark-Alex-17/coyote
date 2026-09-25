@@ -17,12 +17,13 @@ pub(crate) use client::{
     open_link,
 };
 pub(crate) use dispatch::{
-    AdmittedRequest, DispatchError, Dispatcher, Handler, LoggingKnockSink, STATUS_PATH,
+    AdmittedRequest, DispatchError, Dispatcher, Handler, KNOCK_PATH, KnockEvent, KnockSink,
+    STATUS_PATH, describe_path,
 };
 pub(crate) use error::{R3Error, RefusalCode};
-#[cfg(test)]
-pub(crate) use frame::RequestFrame;
 pub(crate) use frame::{Envelope, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName};
+#[cfg(test)]
+pub(crate) use frame::{PathHash, RequestFrame};
 pub(crate) use receipt::RequestReceipt;
 #[cfg(test)]
 pub(crate) use server::{Admission, InboundRequest, RequestHandler};

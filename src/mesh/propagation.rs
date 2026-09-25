@@ -498,8 +498,6 @@ pub(crate) async fn prepare_envelope(
 /// not tell whose verdict arrived (the reference holds one `for_lxmessage` per link,
 /// `LXMRouter.py:2725`). `propagation_enabled` is deliberately not checked here; the node
 /// picker owns that decision.
-// Reached by the outbound message path once it lands.
-#[allow(dead_code)]
 pub(crate) async fn propagate(
     transport: &Transport,
     sender: &PrivateIdentity,
@@ -803,7 +801,260 @@ pub(crate) fn pn_announce_app_data(enabled: bool, cost: i64, per_transfer_kb: i6
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    #[cfg(unix)]
+    use crate::mesh::test_support::{INTEROP_TIMEOUT, closed_port, wait_until};
+    #[cfg(unix)]
+    use rns_transport::destination::SingleInputDestination;
+    #[cfg(unix)]
+    use rns_transport::identity::PrivateIdentity as TransportIdentity;
+    #[cfg(unix)]
+    use rns_transport::iface::tcp_server::TcpServer;
+    #[cfg(unix)]
+    use rns_transport::resource::ResourceComplete;
+    #[cfg(unix)]
+    use rns_transport::transport::TransportConfig;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(unix)]
+    use tokio::sync::mpsc;
+    #[cfg(unix)]
+    use tokio::task::JoinHandle;
+
+    /// `(timestamp, [transient payloads])`, the envelope `LXMessage.py:433` packs.
+    pub(crate) fn decode_envelope(bytes: &[u8]) -> (f64, Vec<Vec<u8>>) {
+        let value = rmpv::decode::read_value(&mut Cursor::new(bytes)).unwrap();
+        let rmpv::Value::Array(outer) = value else {
+            panic!("envelope is not an array: {value}");
+        };
+        assert_eq!(outer.len(), 2, "{outer:?}");
+        let timestamp = outer[0].as_f64().expect("envelope timestamp is a float");
+        let rmpv::Value::Array(inner) = &outer[1] else {
+            panic!("envelope messages are not an array: {}", outer[1]);
+        };
+        let elements = inner
+            .iter()
+            .map(|element| match element {
+                rmpv::Value::Binary(bytes) => bytes.clone(),
+                other => panic!("envelope element is not binary: {other}"),
+            })
+            .collect();
+        (timestamp, elements)
+    }
+
+    /// The one message in a stored envelope, decrypted as `recipient`'s node would on a
+    /// fetch. The stamp is split off unchecked.
+    pub(crate) fn stored_message(envelope: &[u8], recipient: &PrivateIdentity) -> WireMessage {
+        let (_, elements) = decode_envelope(envelope);
+        assert_eq!(elements.len(), 1, "one message per transfer");
+        let element = &elements[0];
+        let (lxmf_data, _) = element.split_at(element.len() - PROPAGATION_STAMP_SIZE);
+        WireMessage::unpack_paper(lxmf_data, recipient).unwrap()
+    }
+
+    /// What the fake node saw arrive on its propagation destination.
+    #[cfg(unix)]
+    pub(crate) enum Received {
+        Packet {
+            context: PacketContext,
+            bytes: Vec<u8>,
+        },
+        Resource(ResourceComplete),
+    }
+
+    #[cfg(unix)]
+    impl Received {
+        pub(crate) fn bytes(&self) -> &[u8] {
+            match self {
+                Self::Packet { bytes, .. } => bytes,
+                Self::Resource(complete) => &complete.data,
+            }
+        }
+    }
+
+    /// A bare transport serving `lxmf.propagation`: it records what arrives and, when
+    /// told to, answers each arrival with the reference's stamp refusal or tears the
+    /// link down. It is a listening post, not a propagation node.
+    #[cfg(unix)]
+    pub(crate) struct FakeNode {
+        pub(crate) transport: Arc<Transport>,
+        pub(crate) dest: Arc<tokio::sync::Mutex<SingleInputDestination>>,
+        pub(crate) desc: DestinationDesc,
+        pub(crate) iface: AddressHash,
+        pub(crate) received: mpsc::UnboundedReceiver<Received>,
+        pub(crate) reject: Arc<AtomicBool>,
+        pub(crate) teardown: Arc<AtomicBool>,
+        pub(crate) drain: JoinHandle<()>,
+        pub(crate) port: u16,
+    }
+
+    #[cfg(unix)]
+    impl FakeNode {
+        /// Listens with `client_mtu` on its server side, which the poster's `TcpClient`
+        /// must match.
+        pub(crate) async fn listen(client_mtu: usize) -> Self {
+            let port = closed_port().await;
+            let transport = Arc::new(Transport::new(TransportConfig::new(
+                "pn",
+                &TransportIdentity::new_from_rand(OsRng),
+                false,
+            )));
+            let tcp = TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
+                .with_client_mtu(client_mtu);
+            let status = tcp.runtime_status_handle();
+            let iface = transport
+                .iface_manager()
+                .lock()
+                .await
+                .spawn(tcp, TcpServer::spawn);
+            wait_until("the fake node to listen", || {
+                status.to_json()["listener_state"].as_str() == Some("listening")
+            })
+            .await;
+            let dest = transport
+                .add_destination(
+                    TransportIdentity::new_from_rand(OsRng),
+                    DestinationName::new("lxmf", PROPAGATION_ASPECT),
+                )
+                .await;
+            let desc = dest.lock().await.desc;
+            let (tx, received) = mpsc::unbounded_channel();
+            let reject = Arc::new(AtomicBool::new(false));
+            let teardown = Arc::new(AtomicBool::new(false));
+            let drain = tokio::spawn(drain(
+                transport.clone(),
+                transport.in_link_events(),
+                transport.resource_events(),
+                tx,
+                reject.clone(),
+                teardown.clone(),
+            ));
+            Self {
+                transport,
+                dest,
+                desc,
+                iface,
+                received,
+                reject,
+                teardown,
+                drain,
+                port,
+            }
+        }
+
+        pub(crate) async fn announce(&self, app_data: &[u8]) {
+            let packet = self
+                .dest
+                .lock()
+                .await
+                .announce(OsRng, Some(app_data))
+                .unwrap();
+            self.transport.send_packet(packet).await;
+        }
+
+        pub(crate) async fn next_received(&mut self) -> Received {
+            timeout(INTEROP_TIMEOUT, self.received.recv())
+                .await
+                .expect("the fake node must receive the transfer")
+                .unwrap()
+        }
+
+        pub(crate) fn nothing_else_received(&mut self) {
+            assert!(
+                self.received.try_recv().is_err(),
+                "the fake node received more than one transfer"
+            );
+        }
+
+        pub(crate) async fn stop(self) {
+            self.drain.abort();
+            self.transport
+                .iface_manager()
+                .lock()
+                .await
+                .stop_interface(self.iface);
+        }
+    }
+
+    /// Forwards data packets and completed resources on the node's in-links, and sends
+    /// `msgpack([ERROR_INVALID_STAMP])` back on the same link when `reject` is set, as
+    /// `LXMRouter.propagation_packet` does (`LXMRouter.py:2134-2136`), or tears the link
+    /// down when `teardown` is set, as `LXMRouter.propagation_resource_concluded` does
+    /// for a rejected resource (`LXMRouter.py:2277-2278`).
+    #[cfg(unix)]
+    async fn drain(
+        transport: Arc<Transport>,
+        mut link_events: broadcast::Receiver<LinkEventData>,
+        mut resource_events: broadcast::Receiver<ResourceEvent>,
+        tx: mpsc::UnboundedSender<Received>,
+        reject: Arc<AtomicBool>,
+        teardown: Arc<AtomicBool>,
+    ) {
+        loop {
+            let (link_id, received) = tokio::select! {
+                event = link_events.recv() => match event {
+                    Ok(LinkEventData { id, event: LinkEvent::Data(payload), .. }) => (
+                        id,
+                        Received::Packet {
+                            context: payload.context(),
+                            bytes: payload.as_slice().to_vec(),
+                        },
+                    ),
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+                event = resource_events.recv() => match event {
+                    Ok(ResourceEvent { link_id, kind: ResourceEventKind::Complete(complete), .. }) => {
+                        (link_id, Received::Resource(complete))
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+            };
+            if reject.load(Ordering::SeqCst) {
+                let mut signal = Vec::new();
+                rmpv::encode::write_value(
+                    &mut signal,
+                    &rmpv::Value::Array(vec![RefusalCode::InvalidStamp.to_wire()]),
+                )
+                .unwrap();
+                let link = transport
+                    .find_in_link(&link_id)
+                    .await
+                    .expect("the in-link the transfer arrived on is still up");
+                let packet = link.lock().await.data_packet(&signal).unwrap();
+                transport
+                    .send_link_packet_on_bound_iface(&link, packet)
+                    .await;
+            }
+            if teardown.load(Ordering::SeqCst) {
+                let link = transport
+                    .find_in_link(&link_id)
+                    .await
+                    .expect("the in-link the transfer arrived on is still up");
+                let packet = link
+                    .lock()
+                    .await
+                    .teardown()
+                    .expect("an active in-link yields a teardown packet");
+                transport
+                    .send_link_packet_on_bound_iface(&link, packet)
+                    .await;
+            }
+            if tx.send(received).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::decode_envelope;
     use super::*;
     use crate::mesh::test_support::rust_sources;
     use crate::testing::{debug_snapshot, install_log_collector};
@@ -1361,27 +1612,6 @@ mod tests {
         );
     }
 
-    /// `(timestamp, [transient payloads])`, the envelope `LXMessage.py:433` packs.
-    fn decode_envelope(bytes: &[u8]) -> (f64, Vec<Vec<u8>>) {
-        let value = rmpv::decode::read_value(&mut Cursor::new(bytes)).unwrap();
-        let rmpv::Value::Array(outer) = value else {
-            panic!("envelope is not an array: {value}");
-        };
-        assert_eq!(outer.len(), 2, "{outer:?}");
-        let timestamp = outer[0].as_f64().expect("envelope timestamp is a float");
-        let rmpv::Value::Array(inner) = &outer[1] else {
-            panic!("envelope messages are not an array: {}", outer[1]);
-        };
-        let elements = inner
-            .iter()
-            .map(|element| match element {
-                rmpv::Value::Binary(bytes) => bytes.clone(),
-                other => panic!("envelope element is not binary: {other}"),
-            })
-            .collect();
-        (timestamp, elements)
-    }
-
     /// Checks the stamp, splits it off, checks the addressing and the transient id, and
     /// decrypts the message as the recipient's node would for a fetch.
     fn unpack_transient(
@@ -1637,15 +1867,11 @@ mod tests {
     mod network {
         use super::*;
         use crate::mesh::node::SHUTDOWN_GRACE;
+        use crate::mesh::propagation::test_support::{FakeNode, Received};
 
-        use rns_transport::destination::SingleInputDestination;
         use rns_transport::iface::tcp_client::TcpClient;
-        use rns_transport::iface::tcp_server::TcpServer;
-        use rns_transport::resource::{LINK_PACKET_MDU, ResourceComplete};
+        use rns_transport::resource::LINK_PACKET_MDU;
         use rns_transport::transport::{AnnounceEvent, TransportConfig};
-        use std::sync::atomic::AtomicBool;
-        use tokio::net::TcpListener;
-        use tokio::sync::mpsc;
         use tokio::task::JoinHandle;
 
         const POLL: Duration = Duration::from_millis(100);
@@ -1654,199 +1880,11 @@ mod tests {
         /// message can reach the packet/resource boundary.
         const LEGACY_LINK_MTU: usize = 500;
 
-        async fn closed_port() -> u16 {
-            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-            port
-        }
-
         async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
             let deadline = Instant::now() + INTEROP_TIMEOUT;
             while !condition() {
                 assert!(Instant::now() < deadline, "timed out waiting for {what}");
                 sleep(POLL).await;
-            }
-        }
-
-        /// What the fake node saw arrive on its propagation destination.
-        enum Received {
-            Packet {
-                context: PacketContext,
-                bytes: Vec<u8>,
-            },
-            Resource(ResourceComplete),
-        }
-
-        /// A bare transport serving `lxmf.propagation`: it records what arrives and, when
-        /// told to, answers each arrival with the reference's stamp refusal or tears the
-        /// link down. It is a listening post, not a propagation node.
-        struct FakeNode {
-            transport: Arc<Transport>,
-            dest: Arc<tokio::sync::Mutex<SingleInputDestination>>,
-            desc: DestinationDesc,
-            iface: AddressHash,
-            received: mpsc::UnboundedReceiver<Received>,
-            reject: Arc<AtomicBool>,
-            teardown: Arc<AtomicBool>,
-            drain: JoinHandle<()>,
-            port: u16,
-        }
-
-        impl FakeNode {
-            async fn listen() -> Self {
-                let port = closed_port().await;
-                let transport = Arc::new(Transport::new(TransportConfig::new(
-                    "pn",
-                    &TransportIdentity::new_from_rand(OsRng),
-                    false,
-                )));
-                let tcp = TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
-                    .with_client_mtu(LEGACY_LINK_MTU);
-                let status = tcp.runtime_status_handle();
-                let iface = transport
-                    .iface_manager()
-                    .lock()
-                    .await
-                    .spawn(tcp, TcpServer::spawn);
-                wait_until("the fake node to listen", || {
-                    status.to_json()["listener_state"].as_str() == Some("listening")
-                })
-                .await;
-                let dest = transport
-                    .add_destination(
-                        TransportIdentity::new_from_rand(OsRng),
-                        DestinationName::new("lxmf", PROPAGATION_ASPECT),
-                    )
-                    .await;
-                let desc = dest.lock().await.desc;
-                let (tx, received) = mpsc::unbounded_channel();
-                let reject = Arc::new(AtomicBool::new(false));
-                let teardown = Arc::new(AtomicBool::new(false));
-                let drain = tokio::spawn(drain(
-                    transport.clone(),
-                    transport.in_link_events(),
-                    transport.resource_events(),
-                    tx,
-                    reject.clone(),
-                    teardown.clone(),
-                ));
-                Self {
-                    transport,
-                    dest,
-                    desc,
-                    iface,
-                    received,
-                    reject,
-                    teardown,
-                    drain,
-                    port,
-                }
-            }
-
-            async fn announce(&self, app_data: &[u8]) {
-                let packet = self
-                    .dest
-                    .lock()
-                    .await
-                    .announce(OsRng, Some(app_data))
-                    .unwrap();
-                self.transport.send_packet(packet).await;
-            }
-
-            async fn next_received(&mut self) -> Received {
-                timeout(INTEROP_TIMEOUT, self.received.recv())
-                    .await
-                    .expect("the fake node must receive the transfer")
-                    .unwrap()
-            }
-
-            fn nothing_else_received(&mut self) {
-                assert!(
-                    self.received.try_recv().is_err(),
-                    "the fake node received more than one transfer"
-                );
-            }
-
-            async fn stop(self) {
-                self.drain.abort();
-                self.transport
-                    .iface_manager()
-                    .lock()
-                    .await
-                    .stop_interface(self.iface);
-            }
-        }
-
-        /// Forwards data packets and completed resources on the node's in-links, and sends
-        /// `msgpack([ERROR_INVALID_STAMP])` back on the same link when `reject` is set, as
-        /// `LXMRouter.propagation_packet` does (`LXMRouter.py:2134-2136`), or tears the link
-        /// down when `teardown` is set, as `LXMRouter.propagation_resource_concluded` does
-        /// for a rejected resource (`LXMRouter.py:2277-2278`).
-        async fn drain(
-            transport: Arc<Transport>,
-            mut link_events: broadcast::Receiver<LinkEventData>,
-            mut resource_events: broadcast::Receiver<ResourceEvent>,
-            tx: mpsc::UnboundedSender<Received>,
-            reject: Arc<AtomicBool>,
-            teardown: Arc<AtomicBool>,
-        ) {
-            loop {
-                let (link_id, received) = tokio::select! {
-                    event = link_events.recv() => match event {
-                        Ok(LinkEventData { id, event: LinkEvent::Data(payload), .. }) => (
-                            id,
-                            Received::Packet {
-                                context: payload.context(),
-                                bytes: payload.as_slice().to_vec(),
-                            },
-                        ),
-                        Ok(_) => continue,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    },
-                    event = resource_events.recv() => match event {
-                        Ok(ResourceEvent { link_id, kind: ResourceEventKind::Complete(complete), .. }) => {
-                            (link_id, Received::Resource(complete))
-                        }
-                        Ok(_) => continue,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    },
-                };
-                if reject.load(Ordering::SeqCst) {
-                    let mut signal = Vec::new();
-                    rmpv::encode::write_value(
-                        &mut signal,
-                        &rmpv::Value::Array(vec![RefusalCode::InvalidStamp.to_wire()]),
-                    )
-                    .unwrap();
-                    let link = transport
-                        .find_in_link(&link_id)
-                        .await
-                        .expect("the in-link the transfer arrived on is still up");
-                    let packet = link.lock().await.data_packet(&signal).unwrap();
-                    transport
-                        .send_link_packet_on_bound_iface(&link, packet)
-                        .await;
-                }
-                if teardown.load(Ordering::SeqCst) {
-                    let link = transport
-                        .find_in_link(&link_id)
-                        .await
-                        .expect("the in-link the transfer arrived on is still up");
-                    let packet = link
-                        .lock()
-                        .await
-                        .teardown()
-                        .expect("an active in-link yields a teardown packet");
-                    transport
-                        .send_link_packet_on_bound_iface(&link, packet)
-                        .await;
-                }
-                if tx.send(received).is_err() {
-                    return;
-                }
             }
         }
 
@@ -1918,7 +1956,7 @@ mod tests {
 
         impl Post {
             async fn start(cost: i64, per_transfer_kb: i64) -> Self {
-                let node = FakeNode::listen().await;
+                let node = FakeNode::listen(LEGACY_LINK_MTU).await;
                 let mut client = Client::connect(node.port).await;
                 node.announce(&pn_app_data(cost, per_transfer_kb)).await;
                 let (desc, app_data) = client.learn(&node.desc.address_hash).await;
