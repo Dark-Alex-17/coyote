@@ -465,10 +465,11 @@ impl DriverLoop {
         }
     }
 
-    /// Local notes always go through. Peer notes spend a token: admitted ones go to the
-    /// prompt at once and queue their model copy; rejected ones are folded into the next
-    /// summary line and their model copy is dropped, since a flood must not reach the
-    /// transcript any more than the prompt.
+    /// Local notes always go through, as do peer notes from a source bounded upstream.
+    /// Other peer notes spend a token: admitted ones go to the prompt at once and queue
+    /// their model copy; rejected ones are folded into the next summary line and their
+    /// model copy is dropped, since a flood must not reach the transcript any more than
+    /// the prompt.
     fn on_notify(&mut self, note: IdleNotify) {
         let IdleNotify {
             source,
@@ -486,7 +487,7 @@ impl DriverLoop {
             }
             Origin::Peer(peer) => {
                 let now = tokio::time::Instant::now().into_std();
-                if self.rate_limiter.admit(source, now) {
+                if exempt_from_folding(source) || self.rate_limiter.admit(source, now) {
                     let pending = model_note.map(|note| PendingNote {
                         note: *note,
                         reapable: false,
@@ -679,6 +680,16 @@ impl DriverLoop {
 
 fn is_completion(note: &SystemNotification) -> bool {
     note.event == AGENT_COMPLETED_EVENT || note.event == AGENT_FAILED_EVENT
+}
+
+/// Knock lines and reply lines are never folded into a summary. A knock is admitted by
+/// the gate once per identity per process, and only for an identity already trusted at
+/// the identity tier (`KnockGate::admit` drops unknown ones), which is what bounds them;
+/// its line carries the full hash the `.mesh trust` hint needs, which a fold would lose.
+/// A reply answers an open question this node asked, so replies are bounded by our own
+/// asks. Folding either would hide a line the peer cannot earn again.
+fn exempt_from_folding(source: Source) -> bool {
+    matches!(source, Source::Knock | Source::Reply)
 }
 
 /// Pushes a note into the queue the context holds now. A completion points the model at
@@ -1573,6 +1584,79 @@ mod tests {
         driver.stop().await;
     }
 
+    /// With one event already queued, the held notes fill the queue to exactly its mesh
+    /// cap. A summary pushed under the cap would then evict the seed and earn the queue's
+    /// own drop summary; pushed outside it, both the seed and the notes survive. The
+    /// driver flushes under a read guard on the context, so draining only once the write
+    /// side is free keeps the drain from splitting the flush, and a poll that finds only
+    /// the seed puts it back so the flush still meets a queue one short of the cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_drivers_held_notes_summary_is_pushed_outside_the_mesh_cap() {
+        const EXCESS: usize = 2;
+        let ctx = test_ctx(None);
+        let sink = install_sink(&ctx);
+        let driver = start_driver(&ctx);
+        let seed = || mesh_notification("seed", "seed", "test", true, "x".into());
+        assert!(
+            ctx.try_read()
+                .unwrap()
+                .notification_queue
+                .push_mesh(seed())
+                .is_none()
+        );
+        let (release, holder) = hold_write_lock(&ctx);
+
+        let pushed = IDLE_PENDING_NOTES_MAX + EXCESS;
+        for i in 0..pushed {
+            driver
+                .handle()
+                .push(note(
+                    &format!("note {i}"),
+                    Some(model_note(&format!("n{i}"))),
+                ))
+                .expect("queued");
+        }
+        wait_until("every human line to reach the sink", || {
+            sink.lines().len() == pushed
+        })
+        .await;
+
+        drop(release);
+        holder.join().unwrap();
+        let mut landed = Vec::new();
+        wait_until("the held notes to land", || {
+            let Some(guard) = ctx.try_write() else {
+                return false;
+            };
+            let drained = guard.notification_queue.drain();
+            if drained.len() == 1 && drained[0].id == "seed" {
+                guard.notification_queue.push_mesh(seed());
+                return false;
+            }
+            landed.extend(drained);
+            landed.len() > IDLE_PENDING_NOTES_MAX
+        })
+        .await;
+        assert_eq!(landed.len(), 1 + IDLE_PENDING_NOTES_MAX + 1);
+        assert_eq!(landed[0].id, "seed", "the seed was not evicted");
+        let held = landed
+            .iter()
+            .filter(|note| note.event == "mesh_message")
+            .count();
+        assert_eq!(held, IDLE_PENDING_NOTES_MAX);
+        let summaries: Vec<&str> = landed
+            .iter()
+            .filter(|note| note.event == MESH_EVENTS_DROPPED_EVENT)
+            .map(|note| note.tool_or_agent.as_str())
+            .collect();
+        assert_eq!(
+            summaries,
+            ["idle-driver"],
+            "a notification-queue summary would mean the driver's summary took the cap"
+        );
+        driver.stop().await;
+    }
+
     /// A completion pushed out of the held-back notes is one the model will never read,
     /// so its handle goes with it at the next flush rather than lingering uncollected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1725,6 +1809,92 @@ mod tests {
         let expected_ids: Vec<String> = (0..pushed).map(|i| format!("l{i}")).collect();
         let landed_ids: Vec<String> = landed.into_iter().map(|note| note.id).collect();
         assert_eq!(landed_ids, expected_ids);
+        driver.stop().await;
+    }
+
+    fn sourced_peer_note(source: Source, peer: &str, text: &str) -> IdleNotify {
+        IdleNotify {
+            source,
+            ..peer_note(peer, text, None)
+        }
+    }
+
+    fn fold_summaries(lines: &[String]) -> Vec<&String> {
+        lines
+            .iter()
+            .filter(|line| line.starts_with("[mesh] (") && line.contains(" more from "))
+            .collect()
+    }
+
+    /// Knocks are gated per identity upstream and replies by this node's own asks, so a
+    /// burst of either past the bucket's capacity shows every line and folds none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn knock_and_reply_lines_are_never_folded() {
+        let ctx = test_ctx(None);
+        let sink = install_sink(&ctx);
+        let driver = start_driver(&ctx);
+
+        let per_source = IDLE_NOTIFY_BURST as usize + 3;
+        let mut expected = Vec::new();
+        for source in [Source::Knock, Source::Reply] {
+            for i in 0..per_source {
+                let peer = format!("{:08x}", i + 1);
+                let text = format!("{source:?} {i}");
+                driver
+                    .handle()
+                    .push(sourced_peer_note(source, &peer, &text))
+                    .expect("queued");
+                expected.push(format!("{} {text}", source.prefix()));
+            }
+        }
+
+        wait_until("every line to reach the sink", || {
+            sink.lines().len() >= expected.len()
+        })
+        .await;
+        assert_eq!(sink.lines(), expected);
+        sleep(IDLE_COALESCE_TICK * 2).await;
+        let lines = sink.lines();
+        assert!(
+            fold_summaries(&lines).is_empty(),
+            "a knock or reply line was folded: {lines:?}"
+        );
+        assert_eq!(lines, expected);
+        driver.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn message_lines_still_fold_past_the_burst() {
+        let ctx = test_ctx(None);
+        let sink = install_sink(&ctx);
+        let driver = start_driver(&ctx);
+
+        let pushed = IDLE_NOTIFY_BURST as usize + 3;
+        for i in 0..pushed {
+            driver
+                .handle()
+                .push(sourced_peer_note(
+                    Source::Message,
+                    "deadbeef",
+                    &format!("message {i}"),
+                ))
+                .expect("queued");
+        }
+
+        wait_until("the fold summary", || {
+            !fold_summaries(&sink.lines()).is_empty()
+        })
+        .await;
+        let lines = sink.lines();
+        let summaries = fold_summaries(&lines);
+        assert_eq!(summaries.len(), 1, "{lines:?}");
+        assert_eq!(summaries[0], "[mesh] (3 more from deadbeef)");
+        let shown: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.starts_with("[mesh:message] "))
+            .collect();
+        assert_eq!(shown.len(), IDLE_NOTIFY_BURST as usize, "{lines:?}");
+        assert_eq!(lines.len(), IDLE_NOTIFY_BURST as usize + 1);
         driver.stop().await;
     }
 
