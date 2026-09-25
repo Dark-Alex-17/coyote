@@ -1,10 +1,12 @@
 mod completer;
 mod highlighter;
+mod printer;
 mod prompt;
 mod replay;
 
 use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
+use self::printer::PromptPrinter;
 use self::prompt::ReplPrompt;
 
 use crate::client::{
@@ -19,6 +21,7 @@ use crate::config::{
 use crate::config::{AssetCategory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::hooks::{self, HookEvent};
+use crate::mesh::notify::NotificationSink;
 use crate::mesh::snapshot::TurnState;
 use crate::render::render_error;
 use crate::supervisor::Supervisor;
@@ -415,14 +418,21 @@ pub struct Repl {
     editor: Reedline,
     prompt: ReplPrompt,
     abort_signal: AbortSignal,
+    // Read by the idle-time driver once it lands.
+    #[allow(dead_code)]
+    printer: Arc<PromptPrinter>,
 }
 
 impl Repl {
     pub fn init(ctx: RequestContext) -> Result<Self> {
         let app = Arc::clone(&ctx.app.config);
         publish_mesh_snapshot(&ctx, TurnState::idle_now());
+        let printer = Arc::new(PromptPrinter::new());
+        ctx.app
+            .mesh
+            .set_notifier(Arc::clone(&printer) as Arc<dyn NotificationSink>);
         let ctx = Arc::new(RwLock::new(ctx));
-        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref())?;
+        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref(), &printer)?;
         let prompt = ReplPrompt::new(Arc::clone(&ctx));
         let abort_signal = create_abort_signal();
 
@@ -431,6 +441,7 @@ impl Repl {
             editor,
             prompt,
             abort_signal,
+            printer,
         })
     }
 
@@ -554,7 +565,11 @@ Type ".help" for additional help.
         exit_result
     }
 
-    fn create_editor(ctx: Arc<RwLock<RequestContext>>, app: &AppConfig) -> Result<Reedline> {
+    fn create_editor(
+        ctx: Arc<RwLock<RequestContext>>,
+        app: &AppConfig,
+        printer: &PromptPrinter,
+    ) -> Result<Reedline> {
         let completer = ReplCompleter::new(Arc::clone(&ctx));
         let highlighter = ReplHighlighter::new();
         let menu = Self::create_menu();
@@ -570,6 +585,7 @@ Type ".help" for additional help.
             .with_menu(menu)
             .with_edit_mode(edit_mode)
             .with_cursor_config(cursor_config)
+            .with_external_printer(printer.attach())
             .with_quick_completions(true)
             .with_partial_completions(true)
             .use_bracketed_paste(true)

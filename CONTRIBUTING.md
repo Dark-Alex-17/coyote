@@ -211,6 +211,18 @@ Whether these five features suffice for the identity-key call sites, and whether
 `cargo test --all` pass on `macos-latest` and `windows-latest`, are answered by the first CI run
 that includes these dependencies and by nothing before it.
 
+### Platform coverage of the pty tests
+
+The pty tests in `tests/pty_repl.rs` are unix-only. Not because `expectrl` lacks a Windows
+backend (it has one, ConPTY), but because the harness drives a raw pty: it sizes the window
+through `ptyprocess` via `get_process_mut()`, answers the cursor position handshake itself, and
+asserts on the raw VT byte stream reedline paints. ConPTY re-renders that stream through its own
+emulator, so those assertions would not transfer. `expectrl` therefore sits under
+`[target.'cfg(unix)'.dev-dependencies]` and the file opens with `#![cfg(unix)]`, so the
+prompt-integrity assertions are not exercised on windows-latest. That lane still compiles
+`examples/pty-reedline-target.rs` and the printer wiring in `src/repl/printer.rs` under
+`-D warnings`.
+
  ## Authorship Policy
 
 All code in this repository is written and reviewed by humans. AI-generated code (e.g., Copilot, ChatGPT,

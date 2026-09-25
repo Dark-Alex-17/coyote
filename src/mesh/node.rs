@@ -5,6 +5,7 @@ use crate::mesh::announce::{
 };
 use crate::mesh::card::{CardSource, StatusHandler};
 use crate::mesh::lock::InstanceLock;
+use crate::mesh::notify::{Notification, NotificationSink};
 use crate::mesh::peers::{PeerChange, PeerSighting, PeerTable};
 use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
 use crate::mesh::propagation_nodes::PropagationNodeTable;
@@ -1112,12 +1113,17 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 /// `Some`. The live `brief_text()` is authoritative, including `None`: a cleared brief must
 /// not fall back to the snapshot's copy. `snapshot().brief.text` is the value at capture,
 /// kept so a snapshot is self-describing.
+///
+/// The notifier slot is where lines meant for the person at the keyboard go; it is filled by
+/// whichever front end owns the terminal, so mesh code never needs to know which one is
+/// running.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
     snapshot: ArcSwapOption<MeshSnapshot>,
     objective_override: ArcSwapOption<String>,
     brief_text: ArcSwapOption<String>,
+    notifier: ArcSwapOption<Arc<dyn NotificationSink>>,
 }
 
 impl MeshSlot {
@@ -1208,6 +1214,31 @@ impl MeshSlot {
     pub(crate) fn brief_text(&self) -> Option<Arc<String>> {
         self.brief_text.load_full()
     }
+
+    /// Installs where human-facing lines go. The interactive REPL installs its prompt
+    /// printer at start-up; headless runs (`-e`, macros, the ACP server) install nothing.
+    pub(crate) fn set_notifier(&self, sink: Arc<dyn NotificationSink>) {
+        self.notifier.store(Some(Arc::new(sink)));
+    }
+
+    /// Hands a line to the installed sink. With no sink installed the rendered lines go
+    /// to stderr with the same prefix, so headless modes still see them. A stderr that
+    /// has gone away (the parent of a headless run closed it) loses the line rather than
+    /// panicking the task that carried it.
+    // Reached by the idle-time driver and the mesh request handlers once they land.
+    #[allow(dead_code)]
+    pub(crate) fn notify(&self, note: Notification) {
+        match self.notifier.load_full() {
+            Some(sink) => sink.notify(note),
+            None => {
+                use std::io::Write as _;
+                let mut stderr = std::io::stderr().lock();
+                for line in note.render_lines() {
+                    let _ = writeln!(stderr, "{line}");
+                }
+            }
+        }
+    }
 }
 
 fn non_blank(value: Option<String>) -> Option<Arc<String>> {
@@ -1222,6 +1253,7 @@ fn non_blank(value: Option<String>) -> Option<Arc<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::notify::Source;
     use crate::mesh::peers::PEER_TTL;
     #[cfg(unix)]
     use crate::mesh::peers::PeerRecord;
@@ -1316,6 +1348,46 @@ mod tests {
             snap.age(snap.captured_at + Duration::from_secs(5)),
             Duration::from_secs(5)
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(parking_lot::Mutex<Vec<Notification>>);
+
+    impl NotificationSink for RecordingSink {
+        fn notify(&self, note: Notification) {
+            self.0.lock().push(note);
+        }
+    }
+
+    #[test]
+    fn slot_without_a_notifier_falls_back_without_panicking() {
+        let slot = MeshSlot::default();
+        assert!(slot.notifier.load().is_none());
+        slot.notify(Notification::new(Source::Mesh, "mesh is on"));
+    }
+
+    #[test]
+    fn slot_notify_delivers_the_notification_to_the_installed_sink() {
+        let slot = MeshSlot::default();
+        let sink = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&sink) as Arc<dyn NotificationSink>);
+
+        let note = Notification::new(Source::Knock, "peer asks to be trusted");
+        slot.notify(note.clone());
+        assert_eq!(*sink.0.lock(), vec![note]);
+    }
+
+    #[test]
+    fn slot_set_notifier_replaces_the_previous_sink() {
+        let slot = MeshSlot::default();
+        let first = Arc::new(RecordingSink::default());
+        let second = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&first) as Arc<dyn NotificationSink>);
+        slot.set_notifier(Arc::clone(&second) as Arc<dyn NotificationSink>);
+
+        slot.notify(Notification::new(Source::Message, "hello"));
+        assert!(first.0.lock().is_empty());
+        assert_eq!(second.0.lock().len(), 1);
     }
 
     #[cfg(unix)]

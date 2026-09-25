@@ -113,13 +113,23 @@ these dependencies, most of them enumerated nowhere; closing that gap is a
 separate piece of work.
 
 --------------------------------------------------------------------------------
-Other direct dependencies
+Other dependencies
 --------------------------------------------------------------------------------
 
 `arc-swap`, already in the tree via `log4rs` and the AWS SDK crates and now a
 direct dependency for the mesh snapshot slot, is distributed under `MIT OR
 Apache-2.0`, Copyright (c) 2017 arc-swap developers; Coyote uses it under the
 MIT License, whose shared permission text is in the LICENSE-MIT file.
+
+`crossbeam`, `crossbeam-channel` and `crossbeam-queue` enter the shipped
+binary through reedline's `external_printer` feature, which the REPL uses to
+print mesh notifications above the prompt; `crossbeam-deque`,
+`crossbeam-epoch` and `crossbeam-utils` were already in the tree. All are
+distributed under `MIT OR Apache-2.0`, Copyright (c) 2019 The Crossbeam Project
+Developers; Coyote uses them under the MIT License, whose shared permission
+text is in the LICENSE-MIT file. The pty test harness crates (`expectrl`,
+`ptyprocess`, `conpty` and its `windows` bindings) are dev-dependencies only
+and never ship.
 
 --------------------------------------------------------------------------------
 Windows platform bindings

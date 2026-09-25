@@ -6,6 +6,7 @@ mod identity;
 pub(crate) mod knocks;
 mod lock;
 mod node;
+pub(crate) mod notify;
 mod peers;
 mod propagation;
 mod propagation_fetch;
