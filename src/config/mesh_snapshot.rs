@@ -2,6 +2,7 @@ use super::RequestContext;
 use crate::mesh::snapshot::{BriefState, MeshSnapshot, PlanRef, RepoInfo, SessionInfo, TurnState};
 
 use std::env;
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 impl RequestContext {
@@ -9,7 +10,11 @@ impl RequestContext {
     /// result outlives the caller's lock on the context. Plans are looked up under the repo
     /// root when one is found, so a turn run from a subdirectory still sees `plans/`.
     pub fn mesh_snapshot(&self, state: TurnState) -> MeshSnapshot {
-        let cwd = env::current_dir().unwrap_or_default();
+        self.mesh_snapshot_at(env::current_dir().unwrap_or_default(), state)
+    }
+
+    /// `mesh_snapshot` as seen from `cwd`.
+    pub fn mesh_snapshot_at(&self, cwd: PathBuf, state: TurnState) -> MeshSnapshot {
         let repo = RepoInfo::discover(&cwd);
         let plan_root = repo.as_ref().map(|r| r.root.as_path()).unwrap_or(&cwd);
         let goal = self.todo_list.goal.trim();
@@ -72,6 +77,11 @@ mod tests {
         RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
     }
 
+    fn write(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
     #[test]
     fn capture_maps_the_context_fields() {
         let mut ctx = create_test_ctx();
@@ -98,6 +108,49 @@ mod tests {
         let mut ctx = create_test_ctx();
         ctx.todo_list.goal = "   ".into();
         assert_eq!(ctx.mesh_snapshot(TurnState::idle_now()).objective, None);
+    }
+
+    #[test]
+    fn capture_at_a_directory_finds_its_repo_branch_and_active_plan() {
+        let tmp = crate::mesh::test_support::TempDir::new("mesh-snapshot-at");
+        let root = tmp.path.join("root");
+        write(&root.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write(
+            &root.join("plans/PLAN-x.md"),
+            "---\nstatus: active\ntitle: Probe\n---\n",
+        );
+        let cwd = root.join("sub/dir");
+        fs::create_dir_all(&cwd).unwrap();
+        let ctx = create_test_ctx();
+
+        let snap = ctx.mesh_snapshot_at(cwd.clone(), TurnState::idle_now());
+
+        assert_eq!(snap.cwd, cwd);
+        let repo = snap.repo.unwrap();
+        assert_eq!(repo.root, root);
+        assert_eq!(repo.branch.as_deref(), Some("main"));
+        assert_eq!(snap.plan.unwrap().title, "Probe");
+    }
+
+    #[test]
+    fn capture_outside_a_repo_still_finds_the_plan_under_cwd() {
+        let tmp = crate::mesh::test_support::TempDir::new("mesh-snapshot-no-repo");
+        let cwd = tmp.path.clone();
+        write(
+            &cwd.join("plans/PLAN-x.md"),
+            "---\nstatus: active\ntitle: Loose\n---\n",
+        );
+        let ctx = create_test_ctx();
+
+        let snap = ctx.mesh_snapshot_at(cwd, TurnState::idle_now());
+
+        assert!(
+            RepoInfo::discover(&tmp.path).is_none(),
+            "temp dir {:?} lies inside a git checkout; cannot test the no-repo branch",
+            tmp.path
+        );
+        assert!(snap.repo.is_none());
+        assert_eq!(snap.plan.unwrap().title, "Loose");
     }
 
     #[test]
@@ -256,28 +309,45 @@ mod tests {
         lines[..test_start.unwrap_or(lines.len())].to_vec()
     }
 
-    /// Indices of the lines calling `site`: the `fn` definition, `use` lines and `//` comments
-    /// do not count.
+    /// `line` with any `//` comment removed, so commented-out calls never match.
+    fn code(line: &str) -> &str {
+        line.split("//").next().unwrap_or("")
+    }
+
+    /// Indices of the lines calling `site`: the `fn` definition, `use` lines and anything
+    /// after `//` do not count.
     fn call_sites(lines: &[&str], site: &str) -> Vec<usize> {
         lines
             .iter()
             .enumerate()
             .filter(|(_, line)| {
-                let trimmed = line.trim_start();
-                line.contains(site)
-                    && !line.contains(&["fn ", site].concat())
-                    && !trimmed.starts_with("use ")
-                    && !trimmed.starts_with("//")
+                let code = code(line);
+                code.contains(site)
+                    && !code.contains(&["fn ", site].concat())
+                    && !code.trim_start().starts_with("use ")
             })
             .map(|(idx, _)| idx)
             .collect()
     }
 
-    fn assert_followed_by(path: &Path, lines: &[&str], idx: usize, needle: &str, window: usize) {
+    /// Whether any of `needles` appears in the `window` lines after `idx`, comments aside.
+    fn followed_by(lines: &[&str], idx: usize, needles: &[&str], window: usize) -> bool {
         let end = (idx + 1 + window).min(lines.len());
+        lines[idx + 1..end]
+            .iter()
+            .any(|l| needles.iter().any(|needle| code(l).contains(needle)))
+    }
+
+    fn assert_followed_by(
+        path: &Path,
+        lines: &[&str],
+        idx: usize,
+        needles: &[&str],
+        window: usize,
+    ) {
         assert!(
-            lines[idx + 1..end].iter().any(|l| l.contains(needle)),
-            "{}:{}: {} is not followed by {needle} within {window} lines",
+            followed_by(lines, idx, needles, window),
+            "{}:{}: {} is not followed by any of {needles:?} within {window} lines",
             path.display(),
             idx + 1,
             lines[idx].trim()
@@ -287,7 +357,7 @@ mod tests {
     fn assert_preceded_by(path: &Path, lines: &[&str], idx: usize, needle: &str, window: usize) {
         let start = idx.saturating_sub(window);
         assert!(
-            lines[start..idx].iter().any(|l| l.contains(needle)),
+            lines[start..idx].iter().any(|l| code(l).contains(needle)),
             "{}:{}: {} is not preceded by {needle} within {window} lines",
             path.display(),
             idx + 1,
@@ -295,11 +365,39 @@ mod tests {
         );
     }
 
+    /// The publish needles name the two functions that store into the slot, so a bare
+    /// capture (`mesh_snapshot(` or `mesh_snapshot_at(`) after a turn does not count.
+    fn publish_needles() -> [String; 2] {
+        [
+            ["publish_mesh_", "snapshot("].concat(),
+            ["refresh_mesh_", "snapshot("].concat(),
+        ]
+    }
+
+    #[test]
+    fn a_bare_capture_after_a_turn_is_not_a_publish() {
+        let needles = publish_needles();
+        let needles: Vec<&str> = needles.iter().map(String::as_str).collect();
+        let turn = ["run_repl_", "command(&mut ctx, signal, &line).await;"].concat();
+        for (follower, publishes) in [
+            ("ctx.mesh_snapshot(state);", false),
+            ("ctx.mesh_snapshot_at(cwd, state);", false),
+            ("publish_mesh_snapshot(&ctx, state);", true),
+            ("refresh_mesh_snapshot(&ctx);", true),
+            ("// refresh_mesh_snapshot(&ctx);", false),
+            ("foo(); // refresh_mesh_snapshot(&ctx);", false),
+        ] {
+            let lines = [turn.as_str(), follower];
+            assert_eq!(followed_by(&lines, 0, &needles, 6), publishes, "{follower}");
+        }
+    }
+
     #[test]
     fn every_turn_site_publishes_a_snapshot_afterwards() {
         // Assembled at runtime so this test's own text does not match the probes.
         let run_repl = ["run_repl_", "command("].concat();
-        let any_publish = ["mesh_", "snapshot("].concat();
+        let any_publish = publish_needles();
+        let any_publish: Vec<&str> = any_publish.iter().map(String::as_str).collect();
         let working = ["working_", "now()"].concat();
         let idle = ["idle_", "now()"].concat();
 
@@ -347,7 +445,7 @@ mod tests {
                 );
                 for idx in sites {
                     assert_preceded_by(path, &lines, idx, &working, 6);
-                    assert_followed_by(path, &lines, idx, &idle, 8);
+                    assert_followed_by(path, &lines, idx, &[&idle], 8);
                 }
             }
         }

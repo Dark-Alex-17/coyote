@@ -3410,7 +3410,7 @@ mod tests {
             );
             assert_eq!(sink.count(), 0);
 
-            let slot = MeshSlot::default();
+            let slot = Arc::new(MeshSlot::default());
             slot.install(started.runtime.clone()).unwrap();
             assert!(slot.stop().await.unwrap());
             started.relay_handle.abort();
@@ -3484,7 +3484,7 @@ mod tests {
                 runtime.fetch_propagated(&*sink).await.unwrap_err(),
                 FetchError::AlreadyRunning
             );
-            let slot = MeshSlot::default();
+            let slot = Arc::new(MeshSlot::default());
             slot.install(runtime.clone()).unwrap();
             assert!(slot.stop().await.unwrap());
             let outcome = timeout(FETCH_DEADLINE, blocked)

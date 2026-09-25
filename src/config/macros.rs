@@ -89,6 +89,8 @@ pub async fn macro_execute(
             let command = Macro::interpolate_command(step, &variables);
             println!(">> {}", multiline_text(&command));
             run_repl_command(&mut macro_ctx, abort_signal.clone(), &command).await?;
+            // Deliberately the outer ctx: the mesh describes the outer session, not the
+            // isolated macro context.
             refresh_mesh_snapshot(ctx);
         }
         Ok(())

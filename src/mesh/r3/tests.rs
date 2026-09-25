@@ -334,12 +334,18 @@ mod network {
     use super::super::server::{
         Admission, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, R3Server, Reply, RequestHandler,
     };
-    use crate::config::{ForkRekey, Session};
+    use crate::config::{ForkRekey, MeshConfig, Session};
     use crate::mesh::announce::AnnounceAppData;
+    use crate::mesh::card::{
+        BRANCH_MAX_CHARS, CardSource, DISPLAY_NAME_MAX_CHARS, OBJECTIVE_MAX_CHARS,
+        PLAN_TITLE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, StatusCard, StatusError,
+        StatusHandler, TODO_GOAL_MAX_CHARS, build_card,
+    };
     use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, SHUTDOWN_GRACE};
+    use crate::mesh::snapshot::{MeshSnapshot, PlanRef, RepoInfo, TurnState};
     use crate::mesh::test_support::{
-        Connector, INTEROP_TIMEOUT, LEGACY_LINK_MTU, Listener, TempDir, TrustList, loopback_relay,
-        mesh_paths, private_config, wait_until,
+        Connector, INTEROP_TIMEOUT, LEGACY_LINK_MTU, Listener, TempDir, TrustList, contains_bytes,
+        loopback_relay, mesh_paths, private_config, snapshot_fixture, started_runtime, wait_until,
     };
     use crate::mesh::trust::{IdentityStanding, Rule, TrustChange, TrustOptions};
     use crate::mesh::{destination_address, mesh_config_dir};
@@ -362,8 +368,9 @@ mod network {
     use rns_transport::transport::{AnnounceEvent, Transport};
     use std::collections::VecDeque;
     use std::fs;
-    use std::sync::Arc;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Weak};
     use std::time::{Duration, Instant, SystemTime};
     use tokio::sync::broadcast;
     use tokio::task::JoinHandle;
@@ -1022,6 +1029,16 @@ mod network {
 
         /// Node A exactly as `start` leaves it, serving through its own dispatcher.
         async fn start_as_started(tag: &str) -> Self {
+            Self::start_with(tag, |_| {}, |_| TrustList::default()).await
+        }
+
+        /// `start_as_started` with node A's config adjusted by `configure` and its trust
+        /// list built from the responder, written before the start that loads it.
+        async fn start_with(
+            tag: &str,
+            configure: impl FnOnce(&mut MeshConfig),
+            trust: impl FnOnce(&Responder) -> TrustList,
+        ) -> Self {
             let recorder_b = Arc::new(Recorder::default());
             // A `MeshRuntime` joins with `TcpClient`'s default MTU, so the responder matches it.
             let responder =
@@ -1036,16 +1053,15 @@ mod network {
             ));
 
             let tmp = TempDir::new(tag);
+            let paths = mesh_paths(&tmp);
+            trust(&responder).write(&paths.config_dir);
+            let mut config = private_config(responder.port);
+            configure(&mut config);
             let mut session = Session::default();
-            let node_a = MeshRuntime::start(
-                &private_config(responder.port),
-                true,
-                &mut session,
-                mesh_paths(&tmp),
-                NodeOptions::default(),
-            )
-            .await
-            .unwrap();
+            let node_a =
+                MeshRuntime::start(&config, true, &mut session, paths, NodeOptions::default())
+                    .await
+                    .unwrap();
             let recorder_a = Arc::new(Recorder::default());
             let a_hash = node_a.destination_hash().await;
             let a_desc = loop {
@@ -1090,6 +1106,23 @@ mod network {
             .await;
         }
 
+        /// Node B asks node A for its status card as `identity`, sending `body`.
+        async fn status_of_a(&self, identity: &TransportIdentity, body: Value) -> StatusCard {
+            let outcome = self
+                .client_b
+                .request(
+                    &self.responder.transport,
+                    identity,
+                    &self.a_desc,
+                    STATUS_PATH,
+                    self.responder.envelope(body),
+                    RequestOptions::default(),
+                )
+                .await
+                .unwrap();
+            StatusCard::from_value(&outcome.value).unwrap()
+        }
+
         /// Arms node A's advertisement-time request cap, which production code leaves off,
         /// and trips it with an oversize request from B. The reject deadlocks A's transport
         /// (upstream rev 3ed5932), which is what the bounded-wait tests need.
@@ -1123,7 +1156,7 @@ mod network {
 
         /// Stops node A through a slot, the way the REPL does, and returns how long it took.
         async fn stop_node_a(self) -> Duration {
-            let slot = MeshSlot::default();
+            let slot = Arc::new(MeshSlot::default());
             slot.install(self.node_a).unwrap();
             let stopping = Instant::now();
             assert!(slot.stop().await.unwrap());
@@ -1924,7 +1957,7 @@ mod network {
             recorder_b.seen_count() == 2
         })
         .await;
-        let slot = MeshSlot::default();
+        let slot = Arc::new(MeshSlot::default());
         slot.install(node_a).unwrap();
 
         let stopping = Instant::now();
@@ -2934,62 +2967,68 @@ mod network {
     async fn mesh_runtime_dispatcher_takes_a_provider_after_start() {
         let pair = NodePair::start_as_started("r3-runtime-register").await;
         let peer = TransportIdentity::new_from_rand(OsRng);
-        let slot = MeshSlot::default();
+        let slot = Arc::new(MeshSlot::default());
         slot.install(pair.node_a.clone()).unwrap();
         pair.node_a
             .trust()
             .trust_identity(
-                &slot,
+                slot.as_ref(),
                 &peer.as_identity().address_hash.to_hex_string(),
                 TrustOptions::default(),
                 SystemTime::now(),
             )
             .unwrap();
-        let ask = |path: &'static str| {
+        let ask = || {
             pair.client_b.request(
                 &pair.responder.transport,
                 &peer,
                 &pair.a_desc,
-                path,
+                MESSAGE_PATH,
                 pair.responder.envelope(Value::from("ping")),
                 short_options(),
             )
         };
 
-        for (served, path) in [STATUS_PATH, MESSAGE_PATH].into_iter().enumerate() {
-            let outcome = ask(path).await.unwrap();
-            assert_eq!(
-                DispatchError::from_value(&outcome.value),
-                Some(DispatchError::NoProvider {
-                    path: path.to_string(),
-                }),
-                "{path} is a placeholder until a provider registers"
-            );
-            assert_eq!(pair.recorder_a.seen_count(), served);
+        assert!(
+            pair.node_a
+                .dispatcher()
+                .register(STATUS_PATH, pair.recorder_a.clone())
+                .unwrap()
+                .is_some(),
+            "installing the node into a slot registered the {STATUS_PATH} provider"
+        );
+        let outcome = ask().await.unwrap();
+        assert_eq!(
+            DispatchError::from_value(&outcome.value),
+            Some(DispatchError::NoProvider {
+                path: MESSAGE_PATH.to_string(),
+            }),
+            "{MESSAGE_PATH} is a placeholder until a provider registers"
+        );
+        assert_eq!(pair.recorder_a.seen_count(), 0);
 
-            assert!(
-                pair.node_a
-                    .dispatcher()
-                    .register(path, pair.recorder_a.clone())
-                    .unwrap()
-                    .is_none(),
-                "registering over the {path} placeholder displaces nothing"
-            );
+        assert!(
+            pair.node_a
+                .dispatcher()
+                .register(MESSAGE_PATH, pair.recorder_a.clone())
+                .unwrap()
+                .is_none(),
+            "registering over the {MESSAGE_PATH} placeholder displaces nothing"
+        );
 
-            let outcome = ask(path).await.unwrap();
-            assert_eq!(outcome.value, Value::from("ping"));
-            assert_eq!(pair.recorder_a.seen_count(), served + 1);
-            let seen = pair.recorder_a.last();
-            assert_eq!(seen.path_hash, PathHash::of(path));
-            assert_eq!(
-                seen.destination,
-                Some(destination_address(
-                    &pair.responder.origin().0,
-                    &peer.as_identity().address_hash
-                )),
-                "the provider sees the requester's instance under the identity it proved"
-            );
-        }
+        let outcome = ask().await.unwrap();
+        assert_eq!(outcome.value, Value::from("ping"));
+        assert_eq!(pair.recorder_a.seen_count(), 1);
+        let seen = pair.recorder_a.last();
+        assert_eq!(seen.path_hash, PathHash::of(MESSAGE_PATH));
+        assert_eq!(
+            seen.destination,
+            Some(destination_address(
+                &pair.responder.origin().0,
+                &peer.as_identity().address_hash
+            )),
+            "the provider sees the requester's instance under the identity it proved"
+        );
         pair.stop_node_a().await;
     }
 
@@ -3058,7 +3097,7 @@ mod network {
             pair.recorder_b.seen_count() == 1
         })
         .await;
-        let slot = MeshSlot::default();
+        let slot = Arc::new(MeshSlot::default());
         slot.install(pair.node_a.clone()).unwrap();
 
         assert!(slot.stop().await.unwrap());
@@ -3271,11 +3310,16 @@ mod network {
         let pair = NodePair::start_as_started("r3-runtime-block-live").await;
         let peer = TransportIdentity::new_from_rand(OsRng);
         let peer_hex = peer.as_identity().address_hash.to_hex_string();
-        let slot = MeshSlot::default();
+        let slot = Arc::new(MeshSlot::default());
         slot.install(pair.node_a.clone()).unwrap();
         pair.node_a
             .trust()
-            .trust_identity(&slot, &peer_hex, TrustOptions::default(), SystemTime::now())
+            .trust_identity(
+                slot.as_ref(),
+                &peer_hex,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
             .unwrap();
         let dispatcher = pair.node_a.dispatcher();
         let replaced = Arc::new(Recorder::default());
@@ -3283,7 +3327,8 @@ mod network {
             dispatcher
                 .register(STATUS_PATH, replaced.clone())
                 .unwrap()
-                .is_none()
+                .is_some(),
+            "the slot's install registered the status provider this replaces"
         );
         assert!(
             dispatcher
@@ -3317,7 +3362,7 @@ mod network {
         let removed = pair
             .node_a
             .trust()
-            .block_identity(&slot, &peer_hex, None, SystemTime::now())
+            .block_identity(slot.as_ref(), &peer_hex, None, SystemTime::now())
             .unwrap();
         assert!(
             removed.is_empty(),
@@ -3383,20 +3428,22 @@ mod network {
         let b_identity = pair.responder.dest.lock().await.identity.clone();
         let b_identity_hex = b_identity.as_identity().address_hash.to_hex_string();
         let b_instance_hex = pair.responder.desc.address_hash.to_hex_string();
-        let slot = MeshSlot::default();
+        let slot = Arc::new(MeshSlot::default());
         slot.install(pair.node_a.clone()).unwrap();
         let trust = pair.node_a.trust();
         // Known identity with no listed instance: where a peer stands after the user trusted
         // one of its instances and later withdrew it.
         trust
             .trust_destination(
-                &slot,
+                slot.as_ref(),
                 &b_instance_hex,
                 TrustOptions::default(),
                 SystemTime::now(),
             )
             .unwrap();
-        trust.untrust_destination(&slot, &b_instance_hex).unwrap();
+        trust
+            .untrust_destination(slot.as_ref(), &b_instance_hex)
+            .unwrap();
         assert_eq!(
             trust.identity_standing(&b_identity_hex),
             IdentityStanding::Trusted {
@@ -3408,7 +3455,8 @@ mod network {
                 .dispatcher()
                 .register(STATUS_PATH, pair.recorder_a.clone())
                 .unwrap()
-                .is_none()
+                .is_some(),
+            "the slot's install registered the status provider this replaces"
         );
         let status = |body: &str| {
             pair.client_b.request(
@@ -3439,7 +3487,7 @@ mod network {
 
         let granted = trust
             .trust_destination(
-                &slot,
+                slot.as_ref(),
                 &b_instance_hex,
                 TrustOptions::default(),
                 SystemTime::now(),
@@ -3622,5 +3670,484 @@ mod network {
         assert_eq!(recorder.seen_count(), MAX_CONCURRENT_INBOUND_REQUESTS + 1);
         requester.stop().await;
         responder.stop().await;
+    }
+
+    /// A `CardSource` of plain data, standing in for the slot behind a status provider.
+    #[derive(Default)]
+    struct FixtureSource {
+        snapshot: Option<MeshSnapshot>,
+        objective_override: Option<String>,
+        display_name: Option<String>,
+    }
+
+    impl FixtureSource {
+        /// Distinctive literals in every field the card carries, so a byte scan of a
+        /// refusal can prove none of them left the node.
+        fn secretive() -> Self {
+            let mut snapshot = snapshot_fixture();
+            snapshot.objective = Some("OBJ-SECRET-7".into());
+            snapshot.repo = Some(RepoInfo {
+                root: PathBuf::from("/home/u/REPO-SECRET-8"),
+                branch: Some("main".into()),
+            });
+            snapshot.plan = Some(PlanRef {
+                path: PathBuf::from("/home/u/REPO-SECRET-8/plans/PLAN-x.md"),
+                title: "PLAN-SECRET-9".into(),
+            });
+            Self {
+                snapshot: Some(snapshot),
+                objective_override: None,
+                display_name: Some("Zed Quill".into()),
+            }
+        }
+
+        /// Every text field at its cap once sanitised, so the card is as large as it gets.
+        fn maximal() -> Self {
+            let mut snapshot = snapshot_fixture();
+            snapshot.objective = Some("o".repeat(OBJECTIVE_MAX_CHARS + 50));
+            snapshot.state = TurnState::working_now();
+            snapshot.repo = Some(RepoInfo {
+                root: PathBuf::from("/r").join("r".repeat(REPO_NAME_MAX_CHARS + 50)),
+                branch: Some("b".repeat(BRANCH_MAX_CHARS + 50)),
+            });
+            snapshot.plan = Some(PlanRef {
+                path: PathBuf::from("/r/plans/PLAN-x.md"),
+                title: "p".repeat(PLAN_TITLE_MAX_CHARS + 50),
+            });
+            snapshot.todo.goal = "g".repeat(TODO_GOAL_MAX_CHARS + 50);
+            snapshot.todo.add("one");
+            Self {
+                snapshot: Some(snapshot),
+                objective_override: None,
+                display_name: Some("n".repeat(DISPLAY_NAME_MAX_CHARS + 50)),
+            }
+        }
+
+        /// The card the provider is expected to serve from this source as of `now`.
+        fn card(&self, now: SystemTime) -> StatusCard {
+            build_card(
+                self.snapshot.as_ref(),
+                self.objective_override.as_deref(),
+                None,
+                self.display_name.as_deref(),
+                now,
+            )
+        }
+    }
+
+    impl CardSource for FixtureSource {
+        fn snapshot(&self) -> Option<Arc<MeshSnapshot>> {
+            self.snapshot.clone().map(Arc::new)
+        }
+
+        fn objective_override(&self) -> Option<Arc<String>> {
+            self.objective_override.clone().map(Arc::new)
+        }
+
+        fn display_name(&self) -> Option<String> {
+            self.display_name.clone()
+        }
+    }
+
+    /// The real status provider behind a call counter, so a test can prove it never ran.
+    struct CountingStatus {
+        inner: StatusHandler,
+        calls: AtomicUsize,
+    }
+
+    impl CountingStatus {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Handler for CountingStatus {
+        async fn handle(&self, request: AdmittedRequest) -> Reply {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.handle(request).await
+        }
+    }
+
+    /// Puts the real dispatcher over `list` in front of `responder`, serving `STATUS_PATH`
+    /// from `source` through a counting wrapper.
+    fn status_gate(
+        responder: &Responder,
+        source: &Arc<FixtureSource>,
+        list: &TrustList,
+        tag: &str,
+    ) -> (Arc<CountingStatus>, TempDir) {
+        let (trust, tmp) = list.open(tag);
+        let dispatcher = Dispatcher::new(trust, Arc::new(LoggingKnockSink));
+        let handler = Arc::new(CountingStatus {
+            inner: StatusHandler::new(Arc::downgrade(source) as Weak<dyn CardSource>),
+            calls: AtomicUsize::new(0),
+        });
+        assert!(
+            dispatcher
+                .register(STATUS_PATH, handler.clone())
+                .unwrap()
+                .is_none()
+        );
+        responder.server.set_handler(Arc::new(dispatcher));
+        (handler, tmp)
+    }
+
+    /// The parts of a card that do not depend on when it was served.
+    fn timeless(mut card: StatusCard) -> StatusCard {
+        card.served_at_secs = 0;
+        card.snapshot_age_secs = None;
+        card
+    }
+
+    const CARD_SECRETS: [&str; 4] = [
+        "Zed Quill",
+        "OBJ-SECRET-7",
+        "REPO-SECRET-8",
+        "PLAN-SECRET-9",
+    ];
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_is_never_served_to_unknown_or_untrusted_requesters() {
+        let source = Arc::new(FixtureSource::secretive());
+        let (responder, requester, desc) = pair(Arc::new(Recorder::default())).await;
+        let identity = identity_hex(&requester);
+        let destination = requester_destination_hex(&requester);
+
+        let (handler, _tmp) = status_gate(
+            &responder,
+            &source,
+            &TrustList::default().destination(&destination, &identity),
+            "r3-status-unidentified",
+        );
+        let mut events = requester.transport.out_link_events();
+        let anonymous = open_link(&requester.transport, &desc, STATUS_PATH, link_deadline())
+            .await
+            .unwrap();
+        let err = request_on(
+            &requester,
+            &anonymous,
+            STATUS_PATH,
+            Value::Nil,
+            Deadline::after(SHORT_REQUEST_TIMEOUT),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, timed_out(STATUS_PATH));
+        assert_eq!(
+            handler.calls(),
+            0,
+            "a link with no proven identity never reaches the provider"
+        );
+        assert!(
+            response_payloads(&mut events).is_empty(),
+            "an unidentified link hears nothing"
+        );
+
+        let (handler, _tmp) = status_gate(
+            &responder,
+            &source,
+            &TrustList::default(),
+            "r3-status-unknown",
+        );
+        let mut events = requester.transport.out_link_events();
+        let link = identified_link(&requester, &responder, &desc).await;
+        let err = request_on(
+            &requester,
+            &link,
+            STATUS_PATH,
+            Value::Nil,
+            Deadline::after(SHORT_REQUEST_TIMEOUT),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, timed_out(STATUS_PATH));
+        assert_eq!(
+            handler.calls(),
+            0,
+            "an unknown identity never reaches the provider"
+        );
+        assert!(
+            response_payloads(&mut events).is_empty(),
+            "an unknown identity hears nothing"
+        );
+
+        let (handler, _tmp) = status_gate(
+            &responder,
+            &source,
+            &TrustList::default().block(&identity),
+            "r3-status-blocked",
+        );
+        let mut events = requester.transport.out_link_events();
+        let err = request_on(
+            &requester,
+            &link,
+            STATUS_PATH,
+            Value::Nil,
+            Deadline::after(SHORT_REQUEST_TIMEOUT),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, timed_out(STATUS_PATH));
+        assert_eq!(
+            handler.calls(),
+            0,
+            "a blocked identity never reaches the provider"
+        );
+        assert!(
+            response_payloads(&mut events).is_empty(),
+            "a blocked identity hears nothing"
+        );
+
+        let (handler, _tmp) = status_gate(
+            &responder,
+            &source,
+            &TrustList::default().identity(&identity, false),
+            "r3-status-untrusted",
+        );
+        let mut events = requester.transport.out_link_events();
+        let err = requester
+            .request(&desc, STATUS_PATH, Value::Nil)
+            .await
+            .unwrap_err();
+        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(
+            handler.calls(),
+            0,
+            "an untrusted instance never reaches the provider"
+        );
+        let payloads = response_payloads(&mut events);
+        assert_eq!(payloads.len(), 1, "one refusal per request");
+        let payload = &payloads[0];
+        assert_eq!(&payload[payload.len() - 2..], &[0xcc, 0xf1]);
+        for secret in CARD_SECRETS {
+            assert!(!contains_bytes(payload, secret), "{secret} left the node");
+        }
+
+        let (handler, _tmp) = status_gate(
+            &responder,
+            &source,
+            &TrustList::default().destination(&destination, &identity),
+            "r3-status-trusted",
+        );
+        let mut events = requester.transport.out_link_events();
+        let now = SystemTime::now();
+        let outcome = requester
+            .request(&desc, STATUS_PATH, Value::Nil)
+            .await
+            .unwrap();
+        assert_eq!(handler.calls(), 1);
+        let card = StatusCard::from_value(&outcome.value).unwrap();
+        assert_eq!(timeless(card.clone()), timeless(source.card(now)));
+        assert_eq!(card.display_name.as_deref(), Some("Zed Quill"));
+        assert_eq!(
+            card.repo.as_ref().map(|repo| repo.name.as_str()),
+            Some("REPO-SECRET-8")
+        );
+        assert!(card.served_at_secs > 0);
+        let payloads = response_payloads(&mut events);
+        assert!(!payloads.is_empty(), "the served card crossed the wire");
+        for payload in &payloads {
+            for path_fragment in ["/home/u", "PLAN-x"] {
+                assert!(
+                    !contains_bytes(payload, path_fragment),
+                    "{path_fragment} left the node inside a served card"
+                );
+            }
+        }
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversize_status_card_round_trips_as_a_resource() {
+        let source = Arc::new(FixtureSource::maximal());
+        let (responder, requester, desc) = pair(Arc::new(Recorder::default())).await;
+        let list = TrustList::default().destination(
+            &requester_destination_hex(&requester),
+            &identity_hex(&requester),
+        );
+        let (handler, _tmp) = status_gate(&responder, &source, &list, "r3-status-oversize");
+
+        let now = SystemTime::now();
+        let outcome = requester
+            .request(&desc, STATUS_PATH, Value::Nil)
+            .await
+            .unwrap();
+        assert_eq!(handler.calls(), 1);
+        assert_eq!(
+            outcome.request_branch,
+            SizeBranch::Packet,
+            "a nil body fits a packet"
+        );
+        assert_eq!(
+            outcome.response_branch,
+            SizeBranch::Resource,
+            "a card at every cap is over the link MDU"
+        );
+        let card = StatusCard::from_value(&outcome.value).unwrap();
+        assert_eq!(timeless(card.clone()), timeless(source.card(now)));
+        assert_eq!(
+            card.objective.as_ref().map(|text| text.chars().count()),
+            Some(OBJECTIVE_MAX_CHARS)
+        );
+
+        let minimal = Arc::new(FixtureSource::default());
+        let (handler, _tmp) = status_gate(&responder, &minimal, &list, "r3-status-minimal");
+        let outcome = requester
+            .request(&desc, STATUS_PATH, Value::Nil)
+            .await
+            .unwrap();
+        assert_eq!(handler.calls(), 1);
+        assert_eq!(outcome.response_branch, SizeBranch::Packet);
+        let card = StatusCard::from_value(&outcome.value).unwrap();
+        assert_eq!(
+            timeless(card),
+            timeless(build_card(None, None, None, None, now))
+        );
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_status_is_typed_and_never_store_and_forward() {
+        let pair = NodePair::start("r3-status-client").await;
+        pair.introduce_b_to_a().await;
+        let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
+        let a_destination = pair.node_a.destination_hash().await;
+        let trusts_a = TrustList::default().destination(&a_destination, &a_identity);
+        let source = Arc::new(FixtureSource {
+            display_name: Some("Bea".into()),
+            ..FixtureSource::secretive()
+        });
+
+        let (handler, _tmp) = status_gate(
+            &pair.responder,
+            &source,
+            &trusts_a,
+            "r3-status-client-served",
+        );
+        let card = pair
+            .node_a
+            .request_status(&pair.responder.desc)
+            .await
+            .unwrap();
+        assert_eq!(handler.calls(), 1);
+        assert_eq!(card.display_name.as_deref(), Some("Bea"));
+        assert_eq!(card.objective.as_deref(), Some("OBJ-SECRET-7"));
+
+        let (handler, _tmp) = status_gate(
+            &pair.responder,
+            &source,
+            &TrustList::default(),
+            "r3-status-client-stranger",
+        );
+        let err = pair
+            .node_a
+            .request_status_with(&pair.responder.desc, short_options())
+            .await
+            .unwrap_err();
+        assert_eq!(err, StatusError::Transport(timed_out(STATUS_PATH)));
+        assert_eq!(handler.calls(), 0);
+
+        let (trust, _tmp) = trusts_a.open("r3-status-client-placeholder");
+        pair.responder
+            .server
+            .set_handler(Arc::new(Dispatcher::new(trust, Arc::new(LoggingKnockSink))));
+        let err = pair
+            .node_a
+            .request_status(&pair.responder.desc)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            StatusError::NotServed(DispatchError::NoProvider {
+                path: STATUS_PATH.to_string(),
+            })
+        );
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(pair.node_a.clone()).unwrap();
+        assert!(slot.stop().await.unwrap());
+        let err = pair
+            .node_a
+            .request_status(&pair.responder.desc)
+            .await
+            .unwrap_err();
+        assert_eq!(err, StatusError::Transport(R3Error::NotRunning));
+        pair.cancel_b.cancel();
+        pair.responder.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn installing_a_runtime_registers_the_status_provider() {
+        let started = started_runtime("r3-status-install").await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+
+        assert!(
+            started
+                .runtime
+                .dispatcher()
+                .register(STATUS_PATH, Arc::new(Recorder::default()))
+                .unwrap()
+                .is_some(),
+            "install must have put a provider where the placeholder was"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The production path end to end: node A serves `/status` through the dispatcher
+    /// `start` installed, from the slot it was installed into, over a trust list that
+    /// admits node B's instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slot_installed_runtime_serves_the_published_snapshot_with_the_override() {
+        let b_identity = TransportIdentity::new_from_rand(OsRng);
+        let b_identity_hash = b_identity.as_identity().address_hash;
+        let pair = NodePair::start_with(
+            "r3-status-slot",
+            |config| config.display_name = Some("Ada".into()),
+            |responder| {
+                let b_destination = destination_address(&responder.origin().0, &b_identity_hash);
+                TrustList::default().destination(
+                    &b_destination.to_hex_string(),
+                    &b_identity_hash.to_hex_string(),
+                )
+            },
+        )
+        .await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(pair.node_a.clone()).unwrap();
+        let mut snapshot = snapshot_fixture();
+        snapshot.objective = Some("from the todo goal".into());
+        snapshot.captured_at = SystemTime::now() - Duration::from_secs(5);
+        slot.publish(snapshot);
+        slot.set_objective_override(Some("from the override".into()));
+
+        let card = pair.status_of_a(&b_identity, Value::Nil).await;
+        assert_eq!(card.objective.as_deref(), Some("from the override"));
+        assert_eq!(card.display_name.as_deref(), Some("Ada"));
+        assert!(
+            card.snapshot_age_secs.is_some_and(|age| age >= 5),
+            "{:?} must be the age of the published snapshot",
+            card.snapshot_age_secs
+        );
+        assert_eq!(card.state.code, STATE_IDLE);
+
+        slot.set_objective_override(None);
+        let card = pair.status_of_a(&b_identity, Value::Nil).await;
+        assert_eq!(card.objective.as_deref(), Some("from the todo goal"));
+
+        let with_body = pair.status_of_a(&b_identity, Value::from("ping")).await;
+        assert_eq!(
+            timeless(with_body),
+            timeless(card),
+            "the status provider ignores the request body"
+        );
+
+        assert!(slot.stop().await.unwrap());
+        pair.cancel_b.cancel();
+        pair.responder.stop().await;
     }
 }

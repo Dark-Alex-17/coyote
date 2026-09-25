@@ -1257,7 +1257,7 @@ mod tests {
         ));
         sleep(Duration::from_millis(50)).await;
 
-        let slot = MeshSlot::default();
+        let slot = Arc::new(MeshSlot::default());
         slot.install(started.runtime.clone()).unwrap();
         assert!(slot.stop().await.unwrap());
         let outcome = timeout(SHUTDOWN_GRACE + Duration::from_secs(1), mine)

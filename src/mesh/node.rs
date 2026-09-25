@@ -3,6 +3,7 @@ use crate::config::{ForkRekey, Session, paths};
 use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
+use crate::mesh::card::{CardSource, StatusHandler};
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::peers::{PeerChange, PeerSighting, PeerTable};
 use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
@@ -11,7 +12,7 @@ use crate::mesh::propagation_nodes::PropagationNodeTable;
 use crate::mesh::r3::RequestHandler;
 use crate::mesh::r3::{
     Dispatcher, Envelope, LoggingKnockSink, OriginName, R3Client, R3Error, R3Server,
-    RequestOptions, RequestOutcome, RequestReceipt,
+    RequestOptions, RequestOutcome, RequestReceipt, STATUS_PATH,
 };
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::TrustStore;
@@ -34,7 +35,7 @@ use rns_transport::iface::tcp_client::TcpClient;
 use rns_transport::iface::{IfaceRole, InterfaceMode};
 use rns_transport::transport::{AnnounceEvent, Transport, TransportConfig};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
@@ -156,6 +157,7 @@ pub(crate) struct MeshRuntime {
     transport_identity: TransportIdentity,
     app_data: Vec<u8>,
     announce: bool,
+    display_name: Option<String>,
     cache_dir: PathBuf,
     interface_labels: Vec<String>,
     /// `None` once `shutdown` has released this owner. Requests and the server loop hold
@@ -284,6 +286,7 @@ impl MeshRuntime {
             transport_identity,
             app_data,
             announce: config.announce,
+            display_name: config.display_name.clone(),
             cache_dir: paths.cache_dir,
             interface_labels: plans.iter().map(InterfacePlan::label).collect(),
             transport: Mutex::new(Some(transport.clone())),
@@ -352,6 +355,13 @@ impl MeshRuntime {
         &self.fingerprint
     }
 
+    /// The configured display name, as the status card carries it to trusted peers.
+    /// `display_name_on_public` gates announces only; the card is exempt because it
+    /// reaches trusted destinations and nobody else.
+    pub(crate) fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
     // Reached by the REPL mesh commands once they land.
     #[allow(dead_code)]
     pub(crate) async fn destination_hash(&self) -> String {
@@ -385,8 +395,6 @@ impl MeshRuntime {
     /// The gate every inbound request passes; providers register their paths on it.
     /// `register` returns the provider it displaced, a placeholder counting as nothing
     /// displaced; `/knock` is owned by the dispatcher itself and registering it is refused.
-    // Reached by the status and message providers once they land.
-    #[allow(dead_code)]
     pub(crate) fn dispatcher(&self) -> Arc<Dispatcher> {
         self.dispatcher.clone()
     }
@@ -1118,16 +1126,23 @@ impl MeshSlot {
     }
 
     /// Refuses while a node is already running: two nodes in one process would fight over
-    /// the same instance lock and identity.
+    /// the same instance lock and identity. Installing also puts this slot behind the
+    /// node's `/status` provider, held weakly since the slot owns the node.
     // Reached by the REPL mesh commands once they land.
     #[allow(dead_code)]
-    pub(crate) fn install(&self, runtime: Arc<MeshRuntime>) -> Result<()> {
+    pub(crate) fn install(self: &Arc<Self>, runtime: Arc<MeshRuntime>) -> Result<()> {
+        // Nothing may `.await` while this guard is held: the status handler reads the same
+        // lock for the display name.
         let mut slot = self.inner.write();
         if slot.is_some() {
             bail!(
                 "Mesh is already on in this process. Run `.mesh off` first, then `.mesh on` to start it again with the current settings."
             );
         }
+        let source = Arc::downgrade(self) as Weak<dyn CardSource>;
+        runtime
+            .dispatcher()
+            .register(STATUS_PATH, Arc::new(StatusHandler::new(source)))?;
         *slot = Some(runtime);
         Ok(())
     }
@@ -1169,7 +1184,7 @@ impl MeshSlot {
     pub(crate) fn snapshot_or_stale_error(&self) -> Result<Arc<MeshSnapshot>> {
         self.snapshot().ok_or_else(|| {
             anyhow!(
-                "No session snapshot has been published yet, so there is nothing to serve. A snapshot is published at every turn boundary (each REPL line, headless run, or ACP prompt); if the mesh was just turned on with `.mesh on`, wait for the current turn to finish or send one more line, then try again."
+                "No session snapshot has been published yet, so there is nothing to serve: this process has not reached its first turn boundary. Every entry point (each REPL line, headless run, or ACP prompt) publishes one when its turn ends, so let the current turn finish or send one line, then try again."
             )
         })
     }
@@ -1180,8 +1195,6 @@ impl MeshSlot {
         self.objective_override.store(non_blank(objective));
     }
 
-    // Reached by the envoy request handlers once they land.
-    #[allow(dead_code)]
     pub(crate) fn objective_override(&self) -> Option<Arc<String>> {
         self.objective_override.load_full()
     }
@@ -1251,7 +1264,7 @@ mod tests {
     fn slot_stale_error_names_the_remedy_until_a_snapshot_lands() {
         let slot = MeshSlot::default();
         let err = slot.snapshot_or_stale_error().unwrap_err().to_string();
-        assert!(err.contains(".mesh"), "{err}");
+        assert!(err.contains("turn boundary"), "{err}");
         slot.publish(snapshot_fixture());
         assert!(slot.snapshot_or_stale_error().is_ok());
     }
@@ -1405,7 +1418,7 @@ mod tests {
         let hash = runtime.destination_hash().await;
         let interface = runtime.interfaces().remove(0);
         assert!(interface.starts_with("private 127.0.0.1:"), "{interface}");
-        let slot = MeshSlot::default();
+        let slot = Arc::new(MeshSlot::default());
         slot.install(runtime).unwrap();
 
         assert!(slot.stop().await.unwrap());
@@ -1636,7 +1649,7 @@ mod tests {
             !peers_path.exists(),
             "a change must not be written before the persist interval or stop"
         );
-        let slot = MeshSlot::default();
+        let slot = Arc::new(MeshSlot::default());
         slot.install(runtime).unwrap();
 
         assert!(slot.stop().await.unwrap());
@@ -1702,7 +1715,7 @@ mod tests {
         );
         assert_eq!(relay_closed.load(Ordering::SeqCst), 0);
         assert!(metrics.num_alive_tasks() > baseline);
-        let slot = MeshSlot::default();
+        let slot = Arc::new(MeshSlot::default());
         slot.install(runtime).unwrap();
 
         assert!(slot.stop().await.unwrap());
@@ -1813,7 +1826,7 @@ mod tests {
     async fn stop_cancels_and_awaits_registered_tasks() {
         let started = started_runtime("node-stop").await;
         let runtime = started.runtime.clone();
-        let slot = MeshSlot::default();
+        let slot = Arc::new(MeshSlot::default());
         let token = runtime.cancellation_token();
         let done = Arc::new(AtomicBool::new(false));
         let task_done = done.clone();
@@ -1859,7 +1872,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn install_refuses_when_a_runtime_is_already_installed() {
         let started = started_runtime("node-install").await;
-        let slot = MeshSlot::default();
+        let slot = Arc::new(MeshSlot::default());
         slot.install(started.runtime.clone()).unwrap();
 
         let err = slot
@@ -1979,7 +1992,7 @@ mod tests {
             "a node must not file its own announce as a peer"
         );
 
-        let slot = MeshSlot::default();
+        let slot = Arc::new(MeshSlot::default());
         slot.install(node_a).unwrap();
         assert!(slot.stop().await.unwrap());
         node_b

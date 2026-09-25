@@ -202,8 +202,6 @@ pub(crate) struct SessionInfo {
 
 /// Plain owned data captured from the session context at a turn boundary. Serving code reads
 /// this instead of the turn's live state, which stays write-locked for the whole turn.
-// Read by the envoy request handlers once they land.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct MeshSnapshot {
     pub(crate) objective: Option<String>,
@@ -211,16 +209,18 @@ pub(crate) struct MeshSnapshot {
     pub(crate) repo: Option<RepoInfo>,
     pub(crate) plan: Option<PlanRef>,
     pub(crate) todo: TodoList,
+    // `brief`, `cwd` and `session` wait for the brief and message providers.
+    #[allow(dead_code)]
     pub(crate) brief: BriefState,
+    #[allow(dead_code)]
     pub(crate) cwd: PathBuf,
     pub(crate) captured_at: SystemTime,
+    #[allow(dead_code)]
     pub(crate) session: SessionInfo,
 }
 
 impl MeshSnapshot {
     /// Saturating: a clock that went backwards reports zero, never panics.
-    // Read by the envoy request handlers once they land.
-    #[allow(dead_code)]
     pub(crate) fn age(&self, now: SystemTime) -> Duration {
         now.duration_since(self.captured_at).unwrap_or_default()
     }

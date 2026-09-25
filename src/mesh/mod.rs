@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod announce;
+pub(crate) mod card;
 mod identity;
 pub(crate) mod knocks;
 mod lock;
@@ -254,8 +255,9 @@ pub(crate) mod test_support {
             self
         }
 
-        pub(crate) fn open(&self, tag: &str) -> (std::sync::Arc<TrustStore>, TempDir) {
-            let tmp = TempDir::new(tag);
+        /// Writes the list as `trust.yaml` under `config_dir`, where a node started with
+        /// that config dir reads it.
+        pub(crate) fn write(&self, config_dir: &Path) {
             let ts = rfc3339_utc(UNIX_EPOCH + Duration::from_secs(1_790_000_000));
             let mut text = String::from("version: 1\n");
             if !self.identities.is_empty() {
@@ -285,9 +287,14 @@ pub(crate) mod test_support {
                     }
                 }
             }
-            let path = mesh_config_dir(&tmp.path).join("trust.yaml");
+            let path = mesh_config_dir(config_dir).join("trust.yaml");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, text).unwrap();
+        }
+
+        pub(crate) fn open(&self, tag: &str) -> (std::sync::Arc<TrustStore>, TempDir) {
+            let tmp = TempDir::new(tag);
+            self.write(&tmp.path);
             (
                 std::sync::Arc::new(TrustStore::open(&tmp.path).unwrap()),
                 tmp,
@@ -496,6 +503,13 @@ pub(crate) mod test_support {
                 role: None,
             },
         }
+    }
+
+    pub(crate) fn contains_bytes(haystack: &[u8], needle: &str) -> bool {
+        let needle = needle.as_bytes();
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     /// Every `.rs` file under `src/mesh`, for the tests that grep the module's own source.

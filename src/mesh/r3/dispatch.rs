@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use rmpv::Value;
 use rns_transport::destination::link::LinkId;
-use rns_transport::hash::AddressHash;
+use rns_transport::hash::{ADDRESS_HASH_SIZE, AddressHash};
 use rns_transport::identity::Identity;
 use std::collections::HashMap;
 use std::fmt;
@@ -31,7 +31,8 @@ fn path_name(path_hash: PathHash) -> Option<&'static str> {
 /// that identity. `requested_at` is the peer's timestamp verbatim (`time.time()` in RNS),
 /// so it may be NaN, infinite or far from this node's clock; clamp it before using it for
 /// freshness.
-// `requested_at` and `branch` wait for the status and message providers.
+// `request_id`, `requested_at` and `branch` wait for the message provider; the status
+// provider reads nothing from the request.
 #[allow(dead_code)]
 pub(crate) struct AdmittedRequest {
     pub link_id: LinkId,
@@ -109,8 +110,9 @@ impl DispatchError {
         ])
     }
 
-    // Read by the requesting side once the status and message callers land.
-    #[allow(dead_code)]
+    /// Reads a dispatch error off the wire. The detail is peer-controlled and ends up in
+    /// user-facing text, so only a path this node knows or a well-formed path hash is
+    /// accepted; anything else reads as no dispatch error at all.
     pub(crate) fn from_value(value: &Value) -> Option<Self> {
         let entries = value.as_map()?;
         let field = |name: &str| {
@@ -118,15 +120,23 @@ impl DispatchError {
                 .iter()
                 .find(|(key, _)| key.as_str() == Some(name))
                 .and_then(|(_, value)| value.as_str())
-                .map(str::to_string)
         };
-        match field("error")?.as_str() {
-            "unknown_path" => Some(Self::UnknownPath {
-                path_hash: field("path_hash")?,
-            }),
-            "no_provider" => Some(Self::NoProvider {
-                path: field("path")?,
-            }),
+        match field("error")? {
+            "unknown_path" => {
+                let path_hash = field("path_hash")?;
+                let well_formed = path_hash.len() == 2 * ADDRESS_HASH_SIZE
+                    && path_hash.chars().all(|c| c.is_ascii_hexdigit());
+                well_formed.then(|| Self::UnknownPath {
+                    path_hash: path_hash.to_string(),
+                })
+            }
+            "no_provider" => {
+                let path = field("path")?;
+                let known = [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH].contains(&path);
+                known.then(|| Self::NoProvider {
+                    path: path.to_string(),
+                })
+            }
             _ => None,
         }
     }
@@ -194,8 +204,6 @@ impl Dispatcher {
     /// Serves `path` with `handler`, returning the handler it displaces, if any. A
     /// placeholder counts as nothing displaced. `/knock` is the dispatcher's own: registering
     /// it is refused and the routes are left as they were.
-    // Reached by the status and message providers once they land.
-    #[allow(dead_code)]
     pub(crate) fn register(
         &self,
         path: &str,
@@ -388,5 +396,42 @@ impl Handler for KnockHandler {
             data: Some(request.body),
         });
         Reply::Value(Value::Nil)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_provider_with_an_unknown_path_is_not_a_dispatch_error() {
+        let value = DispatchError::NoProvider {
+            path: "\u{1b}]0;x\u{07}/status".to_string(),
+        }
+        .to_value();
+        assert_eq!(DispatchError::from_value(&value), None);
+    }
+
+    #[test]
+    fn unknown_path_with_a_malformed_hash_is_not_a_dispatch_error() {
+        let value = DispatchError::UnknownPath {
+            path_hash: "z".repeat(300),
+        }
+        .to_value();
+        assert_eq!(DispatchError::from_value(&value), None);
+    }
+
+    #[test]
+    fn well_formed_dispatch_errors_round_trip() {
+        for error in [
+            DispatchError::NoProvider {
+                path: STATUS_PATH.to_string(),
+            },
+            DispatchError::UnknownPath {
+                path_hash: PathHash::of(STATUS_PATH).to_hex_string(),
+            },
+        ] {
+            assert_eq!(DispatchError::from_value(&error.to_value()), Some(error));
+        }
     }
 }
